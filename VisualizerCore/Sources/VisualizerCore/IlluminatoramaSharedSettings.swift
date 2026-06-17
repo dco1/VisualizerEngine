@@ -1,0 +1,150 @@
+import Foundation
+import Observation
+
+/// Renderer-level knobs that apply to *any* scene rendered through the
+/// Illuminatorama pipeline — both the global overlay (when "Use Illuminatorama
+/// Renderer" is on) and the natively-Illuminatorama scenes (Lab, Room,
+/// InfiniteSoftServe).
+///
+/// These used to live duplicated on each native scene's Settings struct. They
+/// now live once, on `IlluminatoramaSharedSettings.shared`, and the
+/// Illuminatorama Settings modal sheet edits them from anywhere in the app —
+/// including scenes whose own settings panel doesn't expose them.
+///
+/// Per-scene knobs (camera, lighting authoring, RT opt-in, scene-specific
+/// dust/DoF/coil/etc.) stay on the per-scene Settings.
+@MainActor
+@Observable
+public final class IlluminatoramaSharedSettings {
+    /// Process-wide singleton. Native controllers + the IlluminatoramaOverlay
+    /// pull from this each tick; the modal edits it directly.
+    public static let shared = IlluminatoramaSharedSettings()
+
+    // ── Post-FX ───────────────────────────────────────────────────────
+    /// How a Post-FX slider change is applied: instantly, or eased toward the new
+    /// value over a time constant. The renderer reads `.tau` and exponentially
+    /// smooths the Post-FX knobs (exposure, bloom, chromatic aberration, fringe)
+    /// toward their targets each frame, so dragging a slider glides.
+    public var postFXEasing: IlluminatoramaEasing = .smooth
+    public var exposure: Double = 1.0
+    public var bloomThreshold: Double = 1.0
+    public var bloomIntensity: Double = 0.6
+    /// Lens-style transverse chromatic aberration (R/B radial split that grows
+    /// toward the frame edges). OFF by default → an exact shader no-op, so every
+    /// scene is unaffected unless the user opts in from the Illuminatorama
+    /// settings panel. `chromaticAberration` is the strength multiplier (only
+    /// meaningful when enabled).
+    public var chromaticAberrationEnabled: Bool = false
+    public var chromaticAberration: Double = 1.0
+    /// Longitudinal / axial chromatic aberration — "purple fringing": a coloured
+    /// halo on high-contrast edges (frame-uniform, unlike the radial lateral CA
+    /// above). The tint sits on the dark side of a bright edge; its complement
+    /// (≈ green for a violet tint) lands on the bright side, mimicking how a real
+    /// lens focuses wavelengths at slightly different depths. OFF by default → an
+    /// exact shader no-op. `fringe` is the strength; `fringeTintR/G/B` is the
+    /// dark-side tint in sRGB (default a violet).
+    public var fringeEnabled: Bool = false
+    public var fringe: Double = 1.0
+    public var fringeTintR: Double = 0.62
+    public var fringeTintG: Double = 0.12
+    public var fringeTintB: Double = 0.92
+
+    // ── SSAO ──────────────────────────────────────────────────────────
+    public var ssaoIntensity: Double = 0.85
+    public var ssaoRadius: Double = 0.4
+
+    // ── SSR ───────────────────────────────────────────────────────────
+    public var ssrIntensity: Double = 0.7
+    public var ssrMaxDistance: Double = 18.0
+    public var ssrThickness: Double = 0.6
+    public var ssrMaxSteps: Int = 48
+
+    // ── TAA ───────────────────────────────────────────────────────────
+    // Off by default: the velocity-reprojected resolve ghosts too much on
+    // moving geometry. Opt in per-scene via the Illuminatorama settings panel.
+    public var taaEnabled: Bool = false
+    public var taaHistoryBlend: Double = 0.05
+    public var taaJitterPixels: Double = 0.0
+
+    // ── Spatiotemporal denoiser + deband dither ───────────────────────
+    public var denoiserEnabled: Bool = true
+    public var debandDitherEnabled: Bool = true
+    /// Temporal accumulation of the RT diffuse (1-bounce GI) term before its
+    /// spatial denoise — velocity-reprojected exponential history that keeps the
+    /// GI converging under camera motion (kills the wall "crawl" the main TAA
+    /// only resolves when static). Renderer-level; a no-op in non-RT scenes.
+    public var rtGITemporalEnabled: Bool = true
+    /// Current-frame weight in steady state (≈ 1/window). 0.06 ≈ a 16-frame EMA.
+    public var rtGITemporalBlend: Double = 0.06
+
+    // ── IBL ───────────────────────────────────────────────────────────
+    public var iblEnabled: Bool = true
+    public var iblIntensity: Double = 1.0
+    public var dfgLUTEnabled: Bool = true
+
+    // ── DDGI (probe GI) ───────────────────────────────────────────────
+    public var ddgiEnabled: Bool = true
+    public var ddgiIrradianceScale: Double = 1.0
+    public var ddgiHysteresis: Double = 0.99
+    public var ddgiTwoBounceEnabled: Bool = false
+
+    // ── Cascaded shadow maps ──────────────────────────────────────────
+    public var shadowsEnabled: Bool = true
+    public var shadowBias: Double = 0.0003
+    public var shadowSlopeBias: Double = 0.0
+    public var shadowPcfRadius: Int = 1
+    public var shadowMaxDistance: Double = 50.0
+
+    // ── Internal render scale (SSAA) ──────────────────────────────────
+    public var internalRenderScale: Double = 2.0
+
+    public init() {}
+
+    public func exportText() -> String {
+        let fmt = SettingsExportFormat.fmt
+        return """
+        # Illuminatorama shared (renderer) settings
+        # postFXEasing = \(postFXEasing.rawValue)   (enum — informational; Save-defaults skips it)
+        exposure = \(fmt(exposure))
+        bloomThreshold = \(fmt(bloomThreshold))
+        bloomIntensity = \(fmt(bloomIntensity))
+        chromaticAberrationEnabled = \(chromaticAberrationEnabled)
+        chromaticAberration = \(fmt(chromaticAberration))
+        fringeEnabled = \(fringeEnabled)
+        fringe = \(fmt(fringe))
+        fringeTintR = \(fmt(fringeTintR))
+        fringeTintG = \(fmt(fringeTintG))
+        fringeTintB = \(fmt(fringeTintB))
+        ssaoIntensity = \(fmt(ssaoIntensity))
+        ssaoRadius = \(fmt(ssaoRadius))
+        ssrIntensity = \(fmt(ssrIntensity))
+        ssrMaxDistance = \(fmt(ssrMaxDistance))
+        ssrThickness = \(fmt(ssrThickness))
+        ssrMaxSteps = \(ssrMaxSteps)
+        taaEnabled = \(taaEnabled)
+        taaHistoryBlend = \(fmt(taaHistoryBlend))
+        taaJitterPixels = \(fmt(taaJitterPixels))
+        denoiserEnabled = \(denoiserEnabled)
+        debandDitherEnabled = \(debandDitherEnabled)
+        rtGITemporalEnabled = \(rtGITemporalEnabled)
+        rtGITemporalBlend = \(fmt(rtGITemporalBlend))
+        iblEnabled = \(iblEnabled)
+        iblIntensity = \(fmt(iblIntensity))
+        dfgLUTEnabled = \(dfgLUTEnabled)
+        ddgiEnabled = \(ddgiEnabled)
+        ddgiIrradianceScale = \(fmt(ddgiIrradianceScale))
+        ddgiHysteresis = \(fmt(ddgiHysteresis))
+        ddgiTwoBounceEnabled = \(ddgiTwoBounceEnabled)
+        shadowsEnabled = \(shadowsEnabled)
+        shadowBias = \(fmt(shadowBias))
+        shadowSlopeBias = \(fmt(shadowSlopeBias))
+        shadowPcfRadius = \(shadowPcfRadius)
+        shadowMaxDistance = \(fmt(shadowMaxDistance))
+        internalRenderScale = \(fmt(internalRenderScale))
+        """
+    }
+}
+
+extension IlluminatoramaSharedSettings: DefaultsExportableSettings {
+    public static let sourceFilePath: String = #filePath
+}
