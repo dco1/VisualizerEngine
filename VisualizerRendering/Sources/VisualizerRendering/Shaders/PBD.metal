@@ -1031,6 +1031,7 @@ struct PBDSDFBatchUniforms {
     uint  colliderCount;
     float selfRadius;
     float collideStiffness;
+    float collideFriction;   // 0…1 tangential-vel RETENTION on contact (lower = stickier)
 };
 
 struct PBDTubeBoundary {
@@ -1055,12 +1056,11 @@ static void sdfContactBatch(float3 probe,
                              uint ownerID,
                              float selfRadius,
                              float collideStiffness,
+                             float collideFriction,
                              thread float3& pos,
                              thread float3& prev,
                              thread bool& hit) {
     if (col.meta.x == ownerID) return;
-
-    const float collideFriction = 0.70;
 
     uint  kind   = as_type<uint>(col.a.w);
     float radius = col.b.w + selfRadius;
@@ -1082,9 +1082,17 @@ static void sdfContactBatch(float3 probe,
         if (outLen > 1e-6) {
             if (outLen >= radius) return;
             float3 n    = outside / outLen;
-            float  push = radius - outLen;
-            pos  += n * push * collideStiffness;
-            prev += n * push * collideStiffness * 0.5;
+            float  push = (radius - outLen) * collideStiffness;
+            // Tangential friction (same model as the capsule path below) — without
+            // it the box WALLS are frictionless and a stuffed column just slides
+            // down/around them. Lower collideFriction = stickier walls = the column
+            // jams and holds, riding up as a mass.
+            float3 vel  = pos - prev;
+            float  vN   = dot(vel, n);
+            float3 velT = vel - n * vN;
+            pos += n * push;
+            velT *= collideFriction;
+            prev = pos - (velT + n * max(vN, 0.0));
             hit   = true;
             return;
         } else {
@@ -1098,8 +1106,13 @@ static void sdfContactBatch(float3 probe,
             } else {
                 n = float3(0, 0, sign(d.z)); push = dist.z + radius;
             }
-            pos  += n * push * collideStiffness;
-            prev += n * push * collideStiffness * 0.5;
+            push *= collideStiffness;
+            float3 vel  = pos - prev;
+            float  vN   = dot(vel, n);
+            float3 velT = vel - n * vN;
+            pos += n * push;
+            velT *= collideFriction;
+            prev = pos - (velT + n * max(vN, 0.0));
             hit   = true;
             return;
         }
@@ -1236,7 +1249,7 @@ kernel void pbdSDFCollideBatch(
     for (uint k = 0u; k < numProbes; ++k) {
         for (uint c = 0u; c < u.colliderCount; ++c) {
             sdfContactBatch(probes[k], colliders[c], ownID,
-                            u.selfRadius, u.collideStiffness, pos, prev, hit);
+                            u.selfRadius, u.collideStiffness, u.collideFriction, pos, prev, hit);
         }
     }
 

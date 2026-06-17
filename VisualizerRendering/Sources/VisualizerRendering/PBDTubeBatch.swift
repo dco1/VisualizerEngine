@@ -22,6 +22,7 @@ public final class PBDTubeBatch {
         var colliderCount:    UInt32
         var selfRadius:       Float
         var collideStiffness: Float
+        var collideFriction:  Float
     }
 
     // ── Per-tick physics params passed by the scene ───────────────────────────
@@ -45,19 +46,26 @@ public final class PBDTubeBatch {
         /// scene's static box colliders instead. HotdogDrop+/Ultra leave it nil →
         /// byte-identical to before.
         public var floorY: Float?
+        /// 0…1 tangential-velocity RETENTION on contact (inter-tube AND box walls).
+        /// 1.0 = frictionless (old behaviour); lower = stickier → a stuffed column
+        /// JAMS and holds (rides up as a mass) instead of sliding/fluidising. Defaults
+        /// to 0.70 so capsule-collider scenes (HotdogDrop+/Ultra) are unchanged.
+        public var collideFriction: Float
 
         public init(gravity: Float,
                     collideStiffness: Float,
                     velocityRestitution: Float,
                     floorRestitution: Float,
                     selfRadius: Float,
-                    floorY: Float? = nil) {
+                    floorY: Float? = nil,
+                    collideFriction: Float = 0.70) {
             self.gravity            = gravity
             self.collideStiffness   = collideStiffness
             self.velocityRestitution = velocityRestitution
             self.floorRestitution   = floorRestitution
             self.selfRadius         = selfRadius
             self.floorY             = floorY
+            self.collideFriction    = collideFriction
         }
     }
 
@@ -465,7 +473,8 @@ public final class PBDTubeBatch {
             totalParticles:   UInt32(totalParticles),
             colliderCount:    UInt32(cachedColliderTotal),
             selfRadius:       params.selfRadius,
-            collideStiffness: params.collideStiffness
+            collideStiffness: params.collideStiffness,
+            collideFriction:  params.collideFriction
         )
         var tubeCount = UInt32(tubes.count)
         enc.setComputePipelineState(pipelines.sdfBatch)
