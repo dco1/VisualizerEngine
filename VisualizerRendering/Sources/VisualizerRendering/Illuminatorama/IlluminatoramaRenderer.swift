@@ -795,6 +795,19 @@ public final class IlluminatoramaRenderer {
     nonisolated static let raceProbeEnabled = ProcessInfo.processInfo.environment["VIZ_ILLUMI_RACE_PROBE"] == "1"
     nonisolated static let raceProbePin0    = ProcessInfo.processInfo.environment["VIZ_ILLUMI_RACE_PIN0"] == "1"
 
+    // ── Swap-count jitter probe (env-gated; issue #65 "swap-count jitter probe") ──
+    // Measures REAL frame-delivery jitter, not the timer cadence the in-tick
+    // VIZ_EGG_TRACE measures. Every time `promoteCompletedBuffer` actually swaps
+    // `outputTexture` a new fully-rendered frame has been delivered; we timestamp
+    // those swaps and histogram the inter-swap intervals into p50/p95/p99. A tight
+    // p99-near-p50 = smooth delivery; a long tail = the jitter. `VIZ_ILLUMI_SWAP_PROBE=1`
+    // turns it on, writing `swaps=… fps=… p50=… p95=… p99=… max=… (ms)` to
+    // `VIZ_ILLUMI_SWAP_PATH`. Touched only on the main actor (in promoteCompletedBuffer).
+    nonisolated static let swapProbeEnabled = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SWAP_PROBE"] == "1"
+    private let swapProbePath = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SWAP_PATH"]
+    private var swapLastTime: CFTimeInterval = 0
+    private var swapIntervalsMs: [Double] = []
+
     public let device: MTLDevice
     public let commandQueue: MTLCommandQueue
 
@@ -6410,6 +6423,29 @@ public final class IlluminatoramaRenderer {
         prevPresentedIdx = presentedIdx
         presentedIdx = idx
         outputTexture = ldrPool[idx]
+        if Self.swapProbeEnabled { recordSwapInterval() }   // issue #65 jitter probe
+    }
+
+    /// Real frame-delivery jitter probe (issue #65). Records the interval since
+    /// the last `outputTexture` swap and writes a rolling p50/p95/p99 to
+    /// `VIZ_ILLUMI_SWAP_PATH`. Main-actor only (called from promoteCompletedBuffer),
+    /// so no locking. No-op cost when the probe env is off (guarded at the call).
+    private func recordSwapInterval() {
+        let now = CACurrentMediaTime()
+        defer { swapLastTime = now }
+        guard swapLastTime > 0 else { return }   // first swap: no interval yet
+        let ms = (now - swapLastTime) * 1000.0
+        swapIntervalsMs.append(ms)
+        if swapIntervalsMs.count > 4000 { swapIntervalsMs.removeFirst(swapIntervalsMs.count - 4000) }
+        guard let p = swapProbePath, swapIntervalsMs.count >= 2 else { return }
+        let sorted = swapIntervalsMs.sorted()
+        func pct(_ q: Double) -> Double { sorted[min(sorted.count - 1, max(0, Int(q * Double(sorted.count - 1)))) ] }
+        let mean = sorted.reduce(0, +) / Double(sorted.count)
+        let p50 = pct(0.50), p95 = pct(0.95), p99 = pct(0.99)
+        let fps = mean > 0 ? 1000.0 / mean : 0
+        let line = String(format: "swaps=%d fps=%.1f meanMs=%.2f p50=%.2f p95=%.2f p99=%.2f maxMs=%.2f\n",
+                          sorted.count + 1, fps, mean, p50, p95, p99, sorted.last ?? 0)
+        if let d = line.data(using: .utf8) { try? d.write(to: URL(fileURLWithPath: p)) }
     }
 
     /// Choose a pool index to render into this frame: anything that is neither
