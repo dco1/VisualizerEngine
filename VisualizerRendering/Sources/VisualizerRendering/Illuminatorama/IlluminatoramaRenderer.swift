@@ -782,6 +782,19 @@ public final class IlluminatoramaRenderer {
     nonisolated static let maxFramesInFlight = 2
     private let inFlightSemaphore = DispatchSemaphore(value: IlluminatoramaRenderer.maxFramesInFlight)
 
+    // ── Per-frame buffer-race probe (env-gated diagnostic) ──────────────────────
+    // The blocky-lighting / jitter race (see docs/known-issues/illuminatorama-
+    // inflight-buffer-race.md) is invisible to the headless harness because the
+    // snapshot reads a SETTLED frame — but the race CONDITION still occurs in the
+    // headless tick loop. This probe counts it quantitatively, so the bug is now
+    // headless-detectable. `VIZ_ILLUMI_RACE_PROBE=1` turns it on; it writes a
+    // running `raceEvents=N frames=M` to `VIZ_ILLUMI_RACE_PATH`. With the ring fix
+    // the count is 0. `VIZ_ILLUMI_RACE_PIN0=1` pins the ring to slot 0 (reproduces
+    // the pre-fix single-buffer behaviour) so the count goes positive — the
+    // negative control that proves both the bug and the fix without a live window.
+    nonisolated static let raceProbeEnabled = ProcessInfo.processInfo.environment["VIZ_ILLUMI_RACE_PROBE"] == "1"
+    nonisolated static let raceProbePin0    = ProcessInfo.processInfo.environment["VIZ_ILLUMI_RACE_PIN0"] == "1"
+
     public let device: MTLDevice
     public let commandQueue: MTLCommandQueue
 
@@ -6102,6 +6115,10 @@ public final class IlluminatoramaRenderer {
         // pipelined frame (still on the GPU) is reading. Done before the uploads
         // below write into the new slot, and before any encode binds it.
         frameRingIndex = (frameRingIndex + 1) % frameUniformRing.count
+        if Self.raceProbeEnabled {
+            if Self.raceProbePin0 { frameRingIndex = 0 }   // negative control: pre-fix single-buffer
+            presentSync.raceProbeBeginFrame(slot: frameRingIndex)
+        }
         ensureBufferCapacity()  // may set taaNeedsFirstFrame on growth
         updateCascades()
         // Phase 4.10 — compute per-spot shadow matrices + slice indices
@@ -6293,6 +6310,7 @@ public final class IlluminatoramaRenderer {
         // (next tick, main actor) reads this and swaps `outputTexture`. Capturing
         // a plain `Int` keeps the handler `Sendable`-clean.
         let completedIdx = writeIdx
+        let raceSlot = Self.raceProbeEnabled ? frameRingIndex : -1
         let sync = presentSync
         let sem = inFlightSemaphore
         let meter = gpuMeter
@@ -6315,6 +6333,7 @@ public final class IlluminatoramaRenderer {
                 }
             }
             sync.markCompleted(completedIdx)
+            if raceSlot >= 0 { sync.raceProbeCompleteFrame(slot: raceSlot) }
             // Adaptive latency guard (replaces a plain `sem.signal()`): update the
             // GPU-time EMA and release THIS frame's permit — UNLESS frames are heavy
             // enough that a 2nd pipelined frame only adds ~one frame of input latency
@@ -9199,6 +9218,39 @@ private final class IlluminatoramaPresentSync: @unchecked Sendable {
             lock.unlock()
             semaphore.signal()          // normal release
         }
+    }
+
+    // ── Per-frame buffer-race probe (env-gated; see maxFramesInFlight comment) ──
+    // `slotInFlight[s]` = a frame that wrote ring slot `s` is still reading it on
+    // the GPU. `raceProbeBeginFrame` is called (main thread) when a new frame
+    // claims its slot: if that slot is STILL in flight from an earlier frame, the
+    // CPU is about to overwrite a buffer the GPU is reading — the exact race —
+    // so it's counted. `raceProbeCompleteFrame` clears the flag on GPU completion.
+    // Sized to maxFramesInFlight+1 (the ring is maxFramesInFlight; +1 is slack).
+    private var slotInFlight = [Bool](repeating: false, count: IlluminatoramaRenderer.maxFramesInFlight + 1)
+    private var raceEvents = 0
+    private var probeFrames = 0
+    private let racePath = ProcessInfo.processInfo.environment["VIZ_ILLUMI_RACE_PATH"]
+
+    func raceProbeBeginFrame(slot: Int) {
+        lock.lock()
+        probeFrames += 1
+        if slot >= 0, slot < slotInFlight.count {
+            if slotInFlight[slot] { raceEvents += 1 }   // overwriting a slot still read by the GPU
+            slotInFlight[slot] = true
+        }
+        let r = raceEvents, f = probeFrames
+        lock.unlock()
+        if let p = racePath {
+            let line = "raceEvents=\(r) frames=\(f)\n"
+            if let d = line.data(using: .utf8) { try? d.write(to: URL(fileURLWithPath: p)) }
+        }
+    }
+
+    func raceProbeCompleteFrame(slot: Int) {
+        lock.lock()
+        if slot >= 0, slot < slotInFlight.count { slotInFlight[slot] = false }
+        lock.unlock()
     }
 
     /// Record (from the main thread, at commit) that pool buffer `idx` is now in flight.
