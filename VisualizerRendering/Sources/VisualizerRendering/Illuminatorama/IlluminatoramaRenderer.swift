@@ -1261,7 +1261,14 @@ public final class IlluminatoramaRenderer {
     // extension can mutate them. The instance struct is untouched: raster-exclusion
     // is host-side via these sets, so there is no stride change.
     private var superquadricImpostorPipeline: MTLRenderPipelineState?
-    private var superquadricParamBuffer: MTLBuffer
+    /// Ring of `maxFramesInFlight` superquadric-param buffers (see `frameRingIndex`).
+    /// Was single-buffered; with `maxFramesInFlight == 2` the previous frame's
+    /// impostor draw can still be reading slot N while the CPU writes frame N+1,
+    /// so this is now cycled per accepted frame exactly like the instance ping-pong.
+    private var superquadricParamRing: [MTLBuffer]
+    /// `superquadricParamBuffer` resolves to the CURRENT frame's ring slot, so the
+    /// ~40 bind sites that name it need no change.
+    private var superquadricParamBuffer: MTLBuffer { superquadricParamRing[frameRingIndex] }
     private var superquadricParamCapacity: Int
     var impostorMeshKinds: Set<MeshKind> = []
     var rtProxyMeshKinds: Set<MeshKind> = []
@@ -1904,15 +1911,40 @@ public final class IlluminatoramaRenderer {
     private var instanceBufferB: MTLBuffer
     private var instanceCapacity: Int
     private var useBufferA: Bool = true
-    private var pointLightBuffer: MTLBuffer
+    // ── Per-frame input buffers — ring-buffered (maxFramesInFlight) ─────────────
+    // These hold the frame's uniforms + lights + impostor params. They are
+    // `memcpy`'d in place at the top of every `render()` and bound (read-only)
+    // by that frame's GPU passes. At `maxFramesInFlight == 1` an in-place
+    // single buffer was safe. At 2 the CPU encodes frame N+1 (overwriting the
+    // buffer) while the GPU still reads it for frame N → torn lighting (the
+    // blocky floor-reflection band on the eggs) and uneven cadence (POV
+    // jitter, because the camera matrices in the frame uniforms get half-stomped
+    // mid-read). Fix: cycle one slot per accepted frame via `frameRingIndex`,
+    // the same scheme the instance buffer already uses (`useBufferA`) and the
+    // LDR present pool uses (`acquireWriteTarget`). Each property below resolves
+    // to the current ring slot so the bind sites are unchanged.
+    private var pointLightRing: [MTLBuffer]
+    private var pointLightBuffer: MTLBuffer { pointLightRing[frameRingIndex] }
     private var pointLightCapacity: Int
-    private var spotLightBuffer: MTLBuffer
+    private var spotLightRing: [MTLBuffer]
+    private var spotLightBuffer: MTLBuffer { spotLightRing[frameRingIndex] }
     private var spotLightCapacity: Int
-    private var areaLightBuffer: MTLBuffer
+    private var areaLightRing: [MTLBuffer]
+    private var areaLightBuffer: MTLBuffer { areaLightRing[frameRingIndex] }
     private var areaLightCapacity: Int
-    private var extraDirectionalBuffer: MTLBuffer
+    private var extraDirectionalRing: [MTLBuffer]
+    private var extraDirectionalBuffer: MTLBuffer { extraDirectionalRing[frameRingIndex] }
     private var extraDirectionalCapacity: Int
-    private var frameUniformBuffer: MTLBuffer
+    private var frameUniformRing: [MTLBuffer]
+    private var frameUniformBuffer: MTLBuffer { frameUniformRing[frameRingIndex] }
+
+    /// Which ring slot the CURRENT frame writes + binds. Advanced by exactly one
+    /// per ACCEPTED `render()` (after the in-flight semaphore admits the frame),
+    /// so two consecutive in-flight frames always use different slots. Sized to
+    /// `maxFramesInFlight`; the GPU's max concurrency is bounded by the same
+    /// semaphore, so a slot is never both written (CPU, frame N+1) and read
+    /// (GPU, frame N) at once.
+    private var frameRingIndex: Int = 0
 
     private var currentInstanceBuffer: MTLBuffer { useBufferA ? instanceBufferA : instanceBufferB }
     private var previousInstanceBuffer: MTLBuffer { useBufferA ? instanceBufferB : instanceBufferA }
@@ -2640,61 +2672,55 @@ public final class IlluminatoramaRenderer {
 
         // Parallel superquadric-impostor param buffer (one entry per instance,
         // grouped-order-aligned with the instance buffer; see uploadInstances).
-        // Single-buffered — params are read only in the current frame's impostor
-        // draw; motion vectors come from current + previous instance modelMatrix.
-        guard let spb = device.makeBuffer(
-            length: MemoryLayout<IlluminatoramaInstance.SuperquadricParam>.stride * initInstCap,
-            options: .storageModeShared
-        ) else { throw IlluminatoramaError.bufferAllocationFailed("superquadricParams") }
-        spb.label = "Illuminatorama.superquadricParams"
-        self.superquadricParamBuffer = spb
+        // Ring-buffered (maxFramesInFlight) — params are read by the in-flight
+        // frame's impostor draw, which can overlap the next frame's CPU write
+        // when 2 frames pipeline. Motion vectors still come from current +
+        // previous instance modelMatrix (the instance buffer's own ping-pong).
+        let framesInFlight = IlluminatoramaRenderer.maxFramesInFlight
+        let ringDevice = device   // local copy so the helper doesn't touch a still-initializing `self`
+        func makeRing(_ length: Int, _ label: String, _ err: String) throws -> [MTLBuffer] {
+            try (0..<framesInFlight).map { i in
+                guard let b = ringDevice.makeBuffer(length: length, options: .storageModeShared)
+                else { throw IlluminatoramaError.bufferAllocationFailed(err) }
+                b.label = "\(label).\(i)"
+                return b
+            }
+        }
+        self.superquadricParamRing = try makeRing(
+            MemoryLayout<IlluminatoramaInstance.SuperquadricParam>.stride * initInstCap,
+            "Illuminatorama.superquadricParams", "superquadricParams")
         self.superquadricParamCapacity = initInstCap
 
-        guard let pb = device.makeBuffer(
-            length: MemoryLayout<IlluminatoramaPointLight>.stride * initLightCap,
-            options: .storageModeShared
-        ) else { throw IlluminatoramaError.bufferAllocationFailed("pointLights") }
-        pb.label = "Illuminatorama.pointLights"
-        self.pointLightBuffer = pb
+        self.pointLightRing = try makeRing(
+            MemoryLayout<IlluminatoramaPointLight>.stride * initLightCap,
+            "Illuminatorama.pointLights", "pointLights")
         self.pointLightCapacity = initLightCap
 
         // Spot lights are bound at lighting kernel buffer(3). Same default
         // capacity as point lights — Eggs's rail-spotlight layout pushes
         // into the 20+ range so grow-on-demand will kick in early there.
-        guard let sb = device.makeBuffer(
-            length: MemoryLayout<IlluminatoramaSpotLight>.stride * initLightCap,
-            options: .storageModeShared
-        ) else { throw IlluminatoramaError.bufferAllocationFailed("spotLights") }
-        sb.label = "Illuminatorama.spotLights"
-        self.spotLightBuffer = sb
+        self.spotLightRing = try makeRing(
+            MemoryLayout<IlluminatoramaSpotLight>.stride * initLightCap,
+            "Illuminatorama.spotLights", "spotLights")
         self.spotLightCapacity = initLightCap
 
         // Area lights are bound at lighting kernel buffer(4). Few per scene
         // (one softbox / window pane is typical); grow-on-demand covers more.
-        guard let ab = device.makeBuffer(
-            length: MemoryLayout<IlluminatoramaAreaLight>.stride * initLightCap,
-            options: .storageModeShared
-        ) else { throw IlluminatoramaError.bufferAllocationFailed("areaLights") }
-        ab.label = "Illuminatorama.areaLights"
-        self.areaLightBuffer = ab
+        self.areaLightRing = try makeRing(
+            MemoryLayout<IlluminatoramaAreaLight>.stride * initLightCap,
+            "Illuminatorama.areaLights", "areaLights")
         self.areaLightCapacity = initLightCap
 
         // Secondary directional fills are bound at lighting kernel buffer(5).
         // A SCN 3-point rig ships 1–2 (fill + back); grow-on-demand covers more.
-        guard let db = device.makeBuffer(
-            length: MemoryLayout<IlluminatoramaDirectionalLight>.stride * initLightCap,
-            options: .storageModeShared
-        ) else { throw IlluminatoramaError.bufferAllocationFailed("extraDirectionals") }
-        db.label = "Illuminatorama.extraDirectionals"
-        self.extraDirectionalBuffer = db
+        self.extraDirectionalRing = try makeRing(
+            MemoryLayout<IlluminatoramaDirectionalLight>.stride * initLightCap,
+            "Illuminatorama.extraDirectionals", "extraDirectionals")
         self.extraDirectionalCapacity = initLightCap
 
-        guard let fb = device.makeBuffer(
-            length: MemoryLayout<IlluminatoramaFrameUniforms>.stride,
-            options: .storageModeShared
-        ) else { throw IlluminatoramaError.bufferAllocationFailed("frameUniforms") }
-        fb.label = "Illuminatorama.frame"
-        self.frameUniformBuffer = fb
+        self.frameUniformRing = try makeRing(
+            MemoryLayout<IlluminatoramaFrameUniforms>.stride,
+            "Illuminatorama.frame", "frameUniforms")
 
         // Phase 1 ships three procedural primitives. Hosts can also call
         // `setMesh(_:_:)` to swap in their own.
@@ -6070,6 +6096,12 @@ public final class IlluminatoramaRenderer {
         // (so uploadInstances overwrites it with this frame's data), and
         // previousInstanceBuffer now points to last frame's data.
         useBufferA.toggle()
+        // Advance the per-frame input-buffer ring in lockstep. From here on,
+        // `frameUniformBuffer` / the light buffers / `superquadricParamBuffer`
+        // resolve to THIS frame's slot — distinct from the slot the previously
+        // pipelined frame (still on the GPU) is reading. Done before the uploads
+        // below write into the new slot, and before any encode binds it.
+        frameRingIndex = (frameRingIndex + 1) % frameUniformRing.count
         ensureBufferCapacity()  // may set taaNeedsFirstFrame on growth
         updateCascades()
         // Phase 4.10 — compute per-spot shadow matrices + slice indices
@@ -8298,63 +8330,44 @@ public final class IlluminatoramaRenderer {
                 taaNeedsFirstFrame = true
             }
         }
-        // Keep the parallel superquadric param buffer at least as large as the
+        // Grow-on-demand for the ring-buffered per-frame inputs. Reallocate the
+        // WHOLE ring (all maxFramesInFlight slots) so every in-flight frame keeps
+        // a same-size buffer — growing only the current slot would let an
+        // in-flight frame bind the old (too-small) slot next time round the ring.
+        // Slots are uploaded fresh each frame, so there is nothing to copy over.
+        func growRing<T>(_ ring: inout [MTLBuffer], _ capacity: inout Int,
+                         needed: Int, type: T.Type, label: String) {
+            guard needed > capacity else { return }
+            let newCap = max(needed, capacity * 2)
+            var nr: [MTLBuffer] = []
+            nr.reserveCapacity(ring.count)
+            for i in 0..<ring.count {
+                guard let nb = device.makeBuffer(
+                    length: MemoryLayout<T>.stride * newCap, options: .storageModeShared
+                ) else { return }   // alloc failed — keep the old ring, retry next frame
+                nb.label = "\(label).\(i)"
+                nr.append(nb)
+            }
+            ring = nr
+            capacity = newCap
+        }
+        // Keep the parallel superquadric param ring at least as large as the
         // instance buffer (indexed by the same grouped instance id).
-        if instances.count > superquadricParamCapacity {
-            let newCap = max(instances.count, superquadricParamCapacity * 2)
-            if let nb = device.makeBuffer(
-                length: MemoryLayout<IlluminatoramaInstance.SuperquadricParam>.stride * newCap,
-                options: .storageModeShared
-            ) {
-                nb.label = "Illuminatorama.superquadricParams"
-                superquadricParamBuffer = nb
-                superquadricParamCapacity = newCap
-            }
-        }
-        if pointLights.count > pointLightCapacity {
-            let newCap = max(pointLights.count, pointLightCapacity * 2)
-            if let nb = device.makeBuffer(
-                length: MemoryLayout<IlluminatoramaPointLight>.stride * newCap,
-                options: .storageModeShared
-            ) {
-                nb.label = "Illuminatorama.pointLights"
-                pointLightBuffer = nb
-                pointLightCapacity = newCap
-            }
-        }
-        if spotLights.count > spotLightCapacity {
-            let newCap = max(spotLights.count, spotLightCapacity * 2)
-            if let nb = device.makeBuffer(
-                length: MemoryLayout<IlluminatoramaSpotLight>.stride * newCap,
-                options: .storageModeShared
-            ) {
-                nb.label = "Illuminatorama.spotLights"
-                spotLightBuffer = nb
-                spotLightCapacity = newCap
-            }
-        }
-        if areaLights.count > areaLightCapacity {
-            let newCap = max(areaLights.count, areaLightCapacity * 2)
-            if let nb = device.makeBuffer(
-                length: MemoryLayout<IlluminatoramaAreaLight>.stride * newCap,
-                options: .storageModeShared
-            ) {
-                nb.label = "Illuminatorama.areaLights"
-                areaLightBuffer = nb
-                areaLightCapacity = newCap
-            }
-        }
-        if extraDirectionals.count > extraDirectionalCapacity {
-            let newCap = max(extraDirectionals.count, extraDirectionalCapacity * 2)
-            if let nb = device.makeBuffer(
-                length: MemoryLayout<IlluminatoramaDirectionalLight>.stride * newCap,
-                options: .storageModeShared
-            ) {
-                nb.label = "Illuminatorama.extraDirectionals"
-                extraDirectionalBuffer = nb
-                extraDirectionalCapacity = newCap
-            }
-        }
+        growRing(&superquadricParamRing, &superquadricParamCapacity,
+                 needed: instances.count, type: IlluminatoramaInstance.SuperquadricParam.self,
+                 label: "Illuminatorama.superquadricParams")
+        growRing(&pointLightRing, &pointLightCapacity,
+                 needed: pointLights.count, type: IlluminatoramaPointLight.self,
+                 label: "Illuminatorama.pointLights")
+        growRing(&spotLightRing, &spotLightCapacity,
+                 needed: spotLights.count, type: IlluminatoramaSpotLight.self,
+                 label: "Illuminatorama.spotLights")
+        growRing(&areaLightRing, &areaLightCapacity,
+                 needed: areaLights.count, type: IlluminatoramaAreaLight.self,
+                 label: "Illuminatorama.areaLights")
+        growRing(&extraDirectionalRing, &extraDirectionalCapacity,
+                 needed: extraDirectionals.count, type: IlluminatoramaDirectionalLight.self,
+                 label: "Illuminatorama.extraDirectionals")
     }
 
     /// Advance the eased Post-FX shadows toward their slider targets. `Instant`
