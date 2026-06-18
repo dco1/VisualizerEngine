@@ -9183,6 +9183,20 @@ private final class IlluminatoramaGPUMeter: @unchecked Sendable {
     private let path: String?
     private var sumMs: Double = 0
     private var count: Int = 0
+    // Per-frame samples for the percentile distribution. On a shared / contended
+    // machine the MEAN is dominated by occasional contention spikes (WindowServer,
+    // screen-share, a sibling render) and reads ~the same at every SSAA scale, so
+    // it can't show whether a render-cost change actually moved the STEADY frame.
+    // The p50 rejects that tail and isolates the clean steady-state GPU frame —
+    // the number that decides whether vsync can hold 60 (is it < 16.6 ms?). p95/p99
+    // describe the drop-frame tail. Ring-bounded so a long run can't grow unbounded.
+    private var samples: [Double] = []
+    private static let maxSamples = 8192
+    // Last-computed percentiles, refreshed every 30 frames and ALWAYS emitted, so
+    // the sidecar file holds the full distribution no matter which frame the
+    // headless snapshot reads it on (the recompute is throttled, the write is not).
+    private var p50: Double = 0, p95: Double = 0, p99: Double = 0
+    private var minMs: Double = 0, maxMs: Double = 0
     init() { path = ProcessInfo.processInfo.environment["VIZ_ILLUMI_GPUMS_PATH"] }
     func record(_ buf: MTLCommandBuffer) {
         guard let path else { return }
@@ -9191,8 +9205,19 @@ private final class IlluminatoramaGPUMeter: @unchecked Sendable {
         lock.lock()
         sumMs += ms; count += 1
         let avg = sumMs / Double(count); let n = count
+        if samples.count >= Self.maxSamples { samples.removeFirst(Self.maxSamples / 4) }
+        samples.append(ms)
+        // Recompute percentiles every 30 frames (sort is O(n log n); throttle so
+        // the diagnostic doesn't dominate the very thing it measures).
+        if n % 30 == 0 || p50 == 0 {
+            let s = samples.sorted()
+            func pct(_ q: Double) -> Double { s[min(s.count - 1, max(0, Int(Double(s.count) * q)))] }
+            p50 = pct(0.50); p95 = pct(0.95); p99 = pct(0.99)
+            minMs = s.first ?? 0; maxMs = s.last ?? 0
+        }
+        let line = String(format: "gpuMsAvg=%.3f frames=%d p50=%.3f p95=%.3f p99=%.3f min=%.3f max=%.3f\n",
+                          avg, n, p50, p95, p99, minMs, maxMs)
         lock.unlock()
-        let line = "gpuMsAvg=\(avg) frames=\(n)\n"
         if let d = line.data(using: .utf8) { try? d.write(to: URL(fileURLWithPath: path)) }
     }
 }
