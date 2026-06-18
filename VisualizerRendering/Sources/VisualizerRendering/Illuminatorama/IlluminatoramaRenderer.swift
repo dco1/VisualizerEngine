@@ -767,7 +767,7 @@ public final class IlluminatoramaRenderer {
     // presented (both possibly still read by SceneKit / the cover blit) + the
     // TWO buffers that may be in flight at once. `acquireWriteTarget()` excludes
     // all four so a frame never writes a buffer another consumer is reading.
-    static let maxFramesInFlight = 2
+    nonisolated static let maxFramesInFlight = 2
     private let inFlightSemaphore = DispatchSemaphore(value: IlluminatoramaRenderer.maxFramesInFlight)
 
     public let device: MTLDevice
@@ -6233,7 +6233,8 @@ public final class IlluminatoramaRenderer {
         let errPath = ProcessInfo.processInfo.environment["VIZ_ILLUMI_CBERROR_PATH"]
         cb.addCompletedHandler { buf in
             meter.record(buf)
-            pt.resolve(frameGpuMs: (buf.gpuEndTime - buf.gpuStartTime) * 1000.0)
+            let gpuMs = (buf.gpuEndTime - buf.gpuStartTime) * 1000.0
+            pt.resolve(frameGpuMs: gpuMs)
             // Diagnostic (sandbox eats os_log): on a GPU fault, write the error +
             // status to a sidecar file so the headless harness can read WHY the
             // frame faulted (vs the swallowed magenta). No-op without the env var.
@@ -6247,7 +6248,13 @@ public final class IlluminatoramaRenderer {
                 }
             }
             sync.markCompleted(completedIdx)
-            sem.signal()  // release the in-flight slot for the next frame
+            // Adaptive latency guard (replaces a plain `sem.signal()`): update the
+            // GPU-time EMA and release THIS frame's permit — UNLESS frames are heavy
+            // enough that a 2nd pipelined frame only adds ~one frame of input latency
+            // without raising throughput (GPU frame >> tick). In that case HOLD the
+            // permit, shrinking the effective in-flight depth from 2 to 1 so heavy RT
+            // scenes stay responsive. Converges back to 2 when frames get light again.
+            sync.frameCompletedAdaptive(gpuMs: gpuMs, semaphore: sem)
         }
         cb.commit()
 
@@ -9092,6 +9099,56 @@ private final class IlluminatoramaPresentSync: @unchecked Sendable {
     /// pipelined frame is still writing (`maxFramesInFlight = 2`).
     private var inFlight: Set<Int> = []
 
+    // ── Adaptive in-flight depth (latency guard) ───────────────────────────────
+    // Pipelining a 2nd frame (`maxFramesInFlight = 2`) recovers the sub-tick GPU
+    // idle on light/medium scenes (big fps win). But when a frame is much heavier
+    // than the 60 Hz tick (e.g. RT glass + caustics at ~200–600 ms), the 2nd frame
+    // adds ~one whole frame of INPUT LATENCY with no throughput gain, so the scene
+    // feels sluggish to drag. So we shrink the effective depth back to 1 when the
+    // recent GPU frame time is heavy — done WITHOUT touching the render() gate, by
+    // simply HOLDING a semaphore permit in the completion handler instead of
+    // signalling it (and signalling it back when frames get light again).
+    /// EMA of recent GPU frame time (ms). Drives the depth decision.
+    private var gpuMsEMA: Double = 0
+    /// Permits currently held back (0 ⇒ depth 2, 1 ⇒ depth 1). Never exceeds
+    /// `maxFramesInFlight - 1`, so at least one permit always circulates (no deadlock).
+    private var heldPermits: Int = 0
+    /// Current effective depth target, with hysteresis so it doesn't flap.
+    private var depth: Int = IlluminatoramaRenderer.maxFramesInFlight
+    /// Hysteresis band (~2 ticks): pipeline only while the GPU frame is light.
+    private static let pipelineEnterMs = 30.0   // drop to 1→2 when EMA below this
+    private static let pipelineExitMs  = 36.0   // rise to 2→1 when EMA above this
+
+    /// Called from the GPU completion handler in place of `semaphore.signal()`.
+    /// Updates the GPU-time EMA, recomputes the target depth, and either releases
+    /// this frame's permit normally or HOLDS it to converge the effective in-flight
+    /// capacity to that depth. Deadlock-free: `heldPermits` is capped at
+    /// `maxFramesInFlight - 1`, so a permit always remains in circulation.
+    func frameCompletedAdaptive(gpuMs: Double, semaphore: DispatchSemaphore) {
+        lock.lock()
+        if gpuMs > 0 {
+            gpuMsEMA = gpuMsEMA == 0 ? gpuMs : gpuMsEMA * 0.9 + gpuMs * 0.1
+        }
+        if depth >= IlluminatoramaRenderer.maxFramesInFlight {
+            if gpuMsEMA > Self.pipelineExitMs { depth = 1 }
+        } else {
+            if gpuMsEMA < Self.pipelineEnterMs { depth = IlluminatoramaRenderer.maxFramesInFlight }
+        }
+        let targetHeld = max(0, IlluminatoramaRenderer.maxFramesInFlight - depth)
+        if heldPermits < targetHeld {
+            heldPermits += 1            // hold this frame's permit (shrink capacity)
+            lock.unlock()
+        } else if heldPermits > targetHeld {
+            heldPermits -= 1
+            lock.unlock()
+            semaphore.signal()          // this frame's permit …
+            semaphore.signal()          // … plus one previously-held, to grow capacity
+        } else {
+            lock.unlock()
+            semaphore.signal()          // normal release
+        }
+    }
+
     /// Record (from the main thread, at commit) that pool buffer `idx` is now in flight.
     func markInFlight(_ idx: Int) {
         lock.lock()
@@ -9128,6 +9185,10 @@ private final class IlluminatoramaPresentSync: @unchecked Sendable {
         lock.lock()
         completedIdx = -1
         inFlight.removeAll()
+        // Reset the adaptive-depth EMA/target; leave `heldPermits` alone so no
+        // held permit is lost — the next completion self-heals it (targetHeld 0).
+        gpuMsEMA = 0
+        depth = IlluminatoramaRenderer.maxFramesInFlight
         lock.unlock()
     }
 }
