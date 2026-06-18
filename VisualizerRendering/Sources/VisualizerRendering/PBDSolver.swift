@@ -288,6 +288,16 @@ struct TubeExpandUniforms {
     var dipR: Float = 1
     var dipG: Float = 1
     var dipB: Float = 1
+    /// Per-frank BODY colour multiplier written into the tube's vertex-colour
+    /// stream (multiplied into albedo at shading). Default (1,1,1) = the legacy
+    /// white-identity colour, so unbatched/per-instance scenes are unchanged. The
+    /// BATCHED tube path sets this to the frank's per-frank albedo so a SINGLE
+    /// white InstanceRef + the shared colour buffer reproduce per-frank tone in
+    /// one draw call. The dip-coat blends bodyColor → (dipR,dipG,dipB) below the
+    /// waterline, so a dip still reads on top of the per-frank body colour.
+    var bodyR: Float = 1
+    var bodyG: Float = 1
+    var bodyB: Float = 1
     /// Rotation-minimizing frame mode (see PBD.metal — keep in lockstep). When 1
     /// and useStraightLine == 0, the ring frame is propagated along the centerline
     /// instead of rebuilt per-ring, eliminating the pinch/twist a bent Catmull-Rom

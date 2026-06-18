@@ -144,6 +144,15 @@ struct TubeExpandUniforms {
     float dipR;
     float dipG;
     float dipB;
+    // Per-frank BODY colour multiplier (default 1,1,1 = white identity). The
+    // tube-expand kernel writes this as the DRY vertex colour; the dip-coat then
+    // blends bodyColor → (dipR,dipG,dipB) below the waterline. The BATCHED tube
+    // path sets bodyColor to the frank's per-frank albedo so a single white
+    // InstanceRef + the shared colour buffer reproduce per-frank tone in one
+    // draw. Keep in lockstep with PBDSolver.swift TubeExpandUniforms.
+    float bodyR;
+    float bodyG;
+    float bodyB;
     // Rotation-minimizing frame (RMF). When 1 AND useStraightLine == 0, the ring
     // cross-section frame is PROPAGATED along the centerline (rotation-minimizing)
     // instead of rebuilt per-ring by frameFromTangent. frameFromTangent computes
@@ -162,12 +171,16 @@ struct TubeExpandUniforms {
 // waterline gets ±5 cm of per-vertex hash jitter and a 15 cm soft band so the
 // coat edge reads as a paste-dipped line, not a CSG cut.
 static inline float3 dipCoatMultiplier(float3 vert, constant TubeExpandUniforms& u, uint seed) {
-    if (u.dipStrength <= 0.0f) return float3(1.0f);
+    // DRY colour is the per-frank body colour (default 1,1,1 = white identity,
+    // so legacy per-instance scenes are byte-identical). The dip-coat blends the
+    // body colour toward the fluid colour below the waterline.
+    float3 body = float3(u.bodyR, u.bodyG, u.bodyB);
+    if (u.dipStrength <= 0.0f) return body;
     float r2 = vert.x * vert.x + vert.z * vert.z;
-    if (r2 >= u.dipRadius * u.dipRadius) return float3(1.0f);
+    if (r2 >= u.dipRadius * u.dipRadius) return body;
     float jitter = (float((seed * 747796405u) >> 9u) / float(1u << 23u) - 0.5f) * 0.10f;
     float below  = saturate((u.dipY + jitter - vert.y) / 0.15f);
-    return mix(float3(1.0f), float3(u.dipR, u.dipG, u.dipB), below * u.dipStrength);
+    return mix(body, float3(u.dipR, u.dipG, u.dipB), below * u.dipStrength);
 }
 
 // Wrapped spine sampler for the ring treadmill. Reads logical index `k`

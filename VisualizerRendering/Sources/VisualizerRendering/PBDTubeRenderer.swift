@@ -113,6 +113,36 @@ public final class PBDTubeRenderer {
     public var dipStrength: Float = 0
     public var dipColorMul: SIMD3<Float> = SIMD3(1, 1, 1)
 
+    /// Per-frank BODY colour multiplier written into the tube's vertex-colour
+    /// stream (multiplied into albedo at shading). Default (1,1,1) = white
+    /// identity, so per-instance scenes are unchanged. The BATCHED path sets this
+    /// to the frank's per-frank albedo so a single white InstanceRef + the shared
+    /// colour buffer reproduce per-frank tone in one draw. A dip-coat blends this
+    /// body colour → `dipColorMul` below the waterline.
+    public var bodyColorMul: SIMD3<Float> = SIMD3(1, 1, 1)
+
+    /// External-output redirection (batched-tube-mesh path). When set, the
+    /// tube-expand kernel writes THIS tube's vertices into a slice of a SHARED
+    /// set of buffers (owned by `BatchedTubeMesh`) instead of the renderer's
+    /// own per-tube `mesh.*` buffers — so many franks land in one registered
+    /// mesh and draw in ONE call. `vertexBase` is the tube's slot start (in
+    /// vertices); the buffers are bound at `vertexBase * stride`. The kernel's
+    /// own writes are vertex-relative (verts[id*ringSegments + r], cap poles at
+    /// totalRings*ringSegments [+1]), so binding at the slot offset places every
+    /// vertex into [vertexBase, vertexBase + vertsPerTube). `nil` → unchanged
+    /// (writes into `mesh.*` at offset 0).
+    public struct ExternalTubeOutput {
+        public let position: MTLBuffer   // packed_float3, 12-byte stride
+        public let normal: MTLBuffer     // packed_float3, 12-byte stride
+        public let color: MTLBuffer      // float4, 16-byte stride
+        public let vertexBase: Int       // slot start, in vertices
+        public init(position: MTLBuffer, normal: MTLBuffer, color: MTLBuffer, vertexBase: Int) {
+            self.position = position; self.normal = normal
+            self.color = color; self.vertexBase = vertexBase
+        }
+    }
+    public var externalOutput: ExternalTubeOutput? = nil
+
     // Derived: total visual rings written by the tube-expand kernel each frame.
     public var visualRingCount: Int { (spineCount - 1) * subSegments + 1 }
 
@@ -274,9 +304,18 @@ public final class PBDTubeRenderer {
         guard rings > 0 else { return }
         encoder.setComputePipelineState(expandPipeline)
         encoder.setBuffer(solver.particleBuffer.buffer, offset: 0, index: 0)
-        encoder.setBuffer(mesh.positionBuffer.buffer,   offset: 0, index: 1)
-        encoder.setBuffer(mesh.normalBuffer.buffer,     offset: 0, index: 3)
-        encoder.setBuffer(mesh.colorBuffer.buffer,      offset: 0, index: 4)
+        // Batched path: redirect this tube's vertex writes into its slot of the
+        // shared buffers (bound at the slot byte-offset; the kernel's own
+        // vertex-relative indexing fills [vertexBase, vertexBase+vertsPerTube)).
+        if let ext = externalOutput {
+            encoder.setBuffer(ext.position, offset: ext.vertexBase * 12, index: 1) // packed_float3
+            encoder.setBuffer(ext.normal,   offset: ext.vertexBase * 12, index: 3)
+            encoder.setBuffer(ext.color,    offset: ext.vertexBase * 16, index: 4) // float4
+        } else {
+            encoder.setBuffer(mesh.positionBuffer.buffer, offset: 0, index: 1)
+            encoder.setBuffer(mesh.normalBuffer.buffer,   offset: 0, index: 3)
+            encoder.setBuffer(mesh.colorBuffer.buffer,    offset: 0, index: 4)
+        }
 
         let up = fixedUpAxis ?? SIMD3<Float>(0, 0, 0)
         let uPtr = expandUniformBuffer.contents().bindMemory(to: TubeExpandUniforms.self,
@@ -300,6 +339,9 @@ public final class PBDTubeRenderer {
             dipR:            dipColorMul.x,
             dipG:            dipColorMul.y,
             dipB:            dipColorMul.z,
+            bodyR:           bodyColorMul.x,
+            bodyG:           bodyColorMul.y,
+            bodyB:           bodyColorMul.z,
             useRMF:          useRotationMinimizingFrame ? 1 : 0
         )
         encoder.setBuffer(expandUniformBuffer, offset: 0, index: 2)
@@ -317,9 +359,15 @@ public final class PBDTubeRenderer {
         encoder.setComputePipelineState(expandPipeline)
 
         encoder.setBuffer(solver.particleBuffer.buffer, offset: 0, index: 0)
-        encoder.setBuffer(mesh.positionBuffer.buffer,   offset: 0, index: 1)
-        encoder.setBuffer(mesh.normalBuffer.buffer,     offset: 0, index: 3)
-        encoder.setBuffer(mesh.colorBuffer.buffer,      offset: 0, index: 4)
+        if let ext = externalOutput {
+            encoder.setBuffer(ext.position, offset: ext.vertexBase * 12, index: 1)
+            encoder.setBuffer(ext.normal,   offset: ext.vertexBase * 12, index: 3)
+            encoder.setBuffer(ext.color,    offset: ext.vertexBase * 16, index: 4)
+        } else {
+            encoder.setBuffer(mesh.positionBuffer.buffer, offset: 0, index: 1)
+            encoder.setBuffer(mesh.normalBuffer.buffer,   offset: 0, index: 3)
+            encoder.setBuffer(mesh.colorBuffer.buffer,    offset: 0, index: 4)
+        }
 
         let up = fixedUpAxis ?? SIMD3<Float>(0, 0, 0)
         let uPtr = expandUniformBuffer.contents().bindMemory(to: TubeExpandUniforms.self,
@@ -343,6 +391,9 @@ public final class PBDTubeRenderer {
             dipR:            dipColorMul.x,
             dipG:            dipColorMul.y,
             dipB:            dipColorMul.z,
+            bodyR:           bodyColorMul.x,
+            bodyG:           bodyColorMul.y,
+            bodyB:           bodyColorMul.z,
             useRMF:          useRotationMinimizingFrame ? 1 : 0
         )
         encoder.setBuffer(expandUniformBuffer, offset: 0, index: 2)
