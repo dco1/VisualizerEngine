@@ -98,6 +98,14 @@ public protocol SceneController: AnyObject {
     /// tracks here so kinks are caught as an exact location. Defaults to `[]`.
     func splinePolylines() -> [SplinePolyline]
 
+    // ── FPS reporting ────────────────────────────────────────────────
+    /// Set by `AppModel` after load. The controller calls it every ~0.5 s
+    /// with its measured tick rate (Hz) so the toolbar can display the real
+    /// frame rate for scenes whose rendering bypasses the SceneKit render
+    /// thread. SCNView-based scenes leave this at the default (no-op) and
+    /// report FPS via the SCNView render-delegate path instead.
+    var fpsReporter: (@MainActor (Double) -> Void)? { get set }
+
     // ── UI factory ───────────────────────────────────────────────────
     /// Build the settings panel for this scene. The controller captures
     /// `self` (its concrete type) in the closure so `@Bindable` still works
@@ -169,6 +177,13 @@ public extension SceneController {
     var metalView: MTKView? { nil }
     var sceneTimeline: SceneTimeline? { nil }
     var settingsExportText: String { "" }
+    /// SCNView-based scenes don't need this — their FPS comes from the SceneKit
+    /// render-delegate path. The no-op default makes the generic AppModel wiring
+    /// (`ctrl.fpsReporter = ...`) a safe call for every scene type.
+    var fpsReporter: (@MainActor (Double) -> Void)? {
+        get { nil }
+        set { }
+    }
     func applyPerfOverrides(_ overrides: [String: String]) {}
     func captureReviewAngle(yawDeg: Float, pitchDeg: Float,
                             size: SIMD2<Int>) -> MTLTexture? { nil }

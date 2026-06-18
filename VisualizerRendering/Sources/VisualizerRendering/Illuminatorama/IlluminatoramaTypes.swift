@@ -243,7 +243,9 @@ public struct IlluminatoramaFrameUniforms {
     /// former `_padPlush0` slot, so the struct stride is unchanged. Mirrors
     /// `FrameUniforms.chromaticAberration` in the Metal shader.
     public var chromaticAberration: Float = 0
-    public var _padPlush1: Float = 0
+    /// Spherical-aberration radial blur strength (0 = OFF → exact no-op).
+    /// Repurposes the former `_padPlush1` slot — same 4 bytes, stride unchanged.
+    public var sphericalAberration: Float = 0
     // ── Axial chromatic aberration ("purple fringing") ───────────────
     /// Strength of the edge-fringing halo (0 = OFF → exact no-op) plus the
     /// dark-side tint in sRGB; the bright side of an edge gets its complement.

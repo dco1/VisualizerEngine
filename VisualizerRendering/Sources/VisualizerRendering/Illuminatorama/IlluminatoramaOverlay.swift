@@ -356,7 +356,7 @@ public final class IlluminatoramaOverlay {
         offlineUpdater.update(atTime: CACurrentMediaTime())
         extractor.extractFrame(into: renderer)
         applySharedSettings()
-        renderer.render()
+        let rendered = renderer.render()
         // The renderer triple-buffers its output and promotes a freshly
         // *completed* buffer to `outputTexture` each tick (race fix — see
         // `IlluminatoramaRenderer.ldrPool`). Its identity therefore changes
@@ -374,12 +374,15 @@ public final class IlluminatoramaOverlay {
         // `outputTexture` between updates and overstates perceived FPS,
         // especially at higher SSAA scales where the renderer drops
         // below the Timer's 60 Hz cap). Mirrors `FireworksUltraController`.
+        // Only RENDERED frames count: `render()` drops a frame (returns false)
+        // when the GPU hasn't drained the previous frames, so counting every
+        // tick would report the fixed 60 Hz Timer cadence, not real throughput.
         let now = CACurrentMediaTime()
         let dt = max(0, min(0.1, now - lastTickTime))
         lastTickTime = now
         if dt > 0 {
             fpsAccumulatedTime += dt
-            fpsTickCount += 1
+            if rendered { fpsTickCount += 1 }
             if fpsAccumulatedTime >= 0.5 {
                 let hz = Double(fpsTickCount) / fpsAccumulatedTime
                 fpsReporter?(hz)
@@ -395,14 +398,9 @@ public final class IlluminatoramaOverlay {
     private func applySharedSettings() {
         let s = IlluminatoramaSharedSettings.shared
 
-        // Post-FX
+        // Post-FX (shared lens/colour-grade group — see applySharedPostFX)
         renderer.exposure = Float(s.exposure)
-        renderer.bloomThreshold = Float(s.bloomThreshold)
-        renderer.bloomIntensity = Float(s.bloomIntensity)
-        renderer.chromaticAberration = Float(s.chromaticAberrationEnabled ? s.chromaticAberration : 0)
-        renderer.fringe = Float(s.fringeEnabled ? s.fringe : 0)
-        renderer.fringeTint = SIMD3(Float(s.fringeTintR), Float(s.fringeTintG), Float(s.fringeTintB))
-        renderer.postFXEasingTau = s.postFXEasing.tau
+        renderer.applySharedPostFX(s)
 
         // SSAO + SSR
         renderer.ssaoIntensity = Float(s.ssaoIntensity)

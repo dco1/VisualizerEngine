@@ -48,6 +48,12 @@ public final class IlluminatoramaSharedSettings {
     public var fringeTintR: Double = 0.62
     public var fringeTintG: Double = 0.12
     public var fringeTintB: Double = 0.92
+    /// Spherical aberration: a radial blur that grows quadratically from the
+    /// frame centre toward the edges, mimicking how a real lens's outer zones
+    /// focus at a slightly different plane than the paraxial rays. OFF by
+    /// default → exact shader no-op. `sphericalAberration` is the strength.
+    public var sphericalAberrationEnabled: Bool = false
+    public var sphericalAberration: Double = 1.0
 
     // ── SSAO ──────────────────────────────────────────────────────────
     public var ssaoIntensity: Double = 0.85
@@ -115,6 +121,8 @@ public final class IlluminatoramaSharedSettings {
         fringeTintR = \(fmt(fringeTintR))
         fringeTintG = \(fmt(fringeTintG))
         fringeTintB = \(fmt(fringeTintB))
+        sphericalAberrationEnabled = \(sphericalAberrationEnabled)
+        sphericalAberration = \(fmt(sphericalAberration))
         ssaoIntensity = \(fmt(ssaoIntensity))
         ssaoRadius = \(fmt(ssaoRadius))
         ssrIntensity = \(fmt(ssrIntensity))

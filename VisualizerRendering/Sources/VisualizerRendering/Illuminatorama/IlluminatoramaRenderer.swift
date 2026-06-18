@@ -216,6 +216,10 @@ public final class IlluminatoramaRenderer {
     /// its complement. New 16-byte uniform cluster, mirrored byte-for-byte.
     public var fringe: Float = 0
     public var fringeTint: SIMD3<Float> = SIMD3(0.62, 0.12, 0.92)
+    /// Spherical-aberration radial blur strength in the tonemap pass.
+    /// 0 = OFF (default) → exact shader no-op. Maps into the former
+    /// `_padPlush1` slot of `IlluminatoramaFrameUniforms` (stride unchanged).
+    public var sphericalAberration: Float = 0
     /// Post-FX easing time constant (seconds) from the panel's "Easing" picker.
     /// The post-FX knobs above (exposure, bloom, chromatic aberration, fringe) are
     /// treated as TARGETS; each frame `uploadFrameUniforms` eases an internal
@@ -228,6 +232,7 @@ public final class IlluminatoramaRenderer {
     private var easedChromaticAberration: Float = 0
     private var easedFringe: Float = 0
     private var easedFringeTint: SIMD3<Float> = SIMD3(0.62, 0.12, 0.92)
+    private var easedSphericalAberration: Float = 0
     private var lastPostFXEaseTime: CFTimeInterval = 0
     public var time: Float = 0
     /// Vertex-shader tree-wind knobs (#58 #1). `treeWindStrength` is the max
@@ -571,6 +576,13 @@ public final class IlluminatoramaRenderer {
     /// TAA on/off regardless of the panel (e.g. a perf governor disabling it
     /// under load). Prefer leaving it `nil` — the panel should win.
     public var sharedTAAOverride: Bool? = nil
+    /// When true (default), `render()` applies the panel's lens-aberration knobs
+    /// (chromatic + spherical aberration, fringe, post-FX easing) every frame, so
+    /// every Illuminatorama scene — including new ones — inherits them with zero
+    /// per-scene wiring. (Bloom is NOT included: scenes art-direct it, so they opt
+    /// in via `applySharedPostFX`.) A context that must not be driven by the app
+    /// panel (e.g. an isolated AssetLab harness) can set this false.
+    public var appliesSharedLensFX: Bool = true
     /// Weight of the current-frame sample in the resolve blend. Smaller =
     /// smoother and more denoised but slower convergence on disocclusion.
     /// 0.1 is the standard "good default" — visible AA from camera jitter
@@ -2725,6 +2737,11 @@ public final class IlluminatoramaRenderer {
         cb.label = "Illuminatorama.coverBlit"
         let w = drawable.texture.width
         let h = drawable.texture.height
+        // A zero-size drawable means the MTKView has no window yet (tick loop
+        // fires before MetalViewRenderer.makeNSView). Presenting it produces a
+        // nil `priv` in the system's IOSurface callback → EXC_BAD_ACCESS in
+        // layer_private_present_impl. Skip until the view is live.
+        guard w > 0, h > 0 else { return }
         var uvRect = coverUVRect(viewportWidth: w, viewportHeight: h)
 
         let pass = MTLRenderPassDescriptor()
@@ -5987,7 +6004,13 @@ public final class IlluminatoramaRenderer {
     ///   rather than stalling the main thread; the snapshot path passes `true`
     ///   because a dropped export render leaves `outputTexture` on a stale /
     ///   never-rendered pool buffer → captured as magenta (no `cb.error`).
-    public func render(blocking: Bool = false) {
+    /// Returns `true` if this call actually produced a frame, `false` if it
+    /// dropped (GPU still draining the previous frames — the non-blocking
+    /// `inFlightSemaphore` path) or bailed on a transient failure. Callers
+    /// use the result to count FPS against *rendered* frames rather than the
+    /// fixed Timer cadence, and to skip re-presenting a stale `outputTexture`.
+    @discardableResult
+    public func render(blocking: Bool = false) -> Bool {
         // Promote any pool buffer whose render completed since last tick to
         // the presented `outputTexture`. Done first so consumers binding
         // `outputTexture` this tick see the freshest fully-rendered frame.
@@ -5999,9 +6022,10 @@ public final class IlluminatoramaRenderer {
         // frame (no opaque AND no glass) falls back to the flat sky clear.
         guard !instances.isEmpty || !glassInstances.isEmpty || !glassMeshGroups.isEmpty else {
             // Nothing to draw — still clear the output to the sky color so the
-            // host's display quad isn't showing last frame's garbage.
+            // host's display quad isn't showing last frame's garbage. This IS a
+            // produced frame (the sky), so it counts toward FPS.
             blankSky()
-            return
+            return true
         }
         // Throttle: drop this tick if the GPU hasn't drained the previous
         // frame yet (non-blocking wait). Prevents queue saturation from
@@ -6011,7 +6035,9 @@ public final class IlluminatoramaRenderer {
         if blocking {
             inFlightSemaphore.wait()
         } else {
-            guard inFlightSemaphore.wait(timeout: .now()) == .success else { return }
+            // Dropped frame — GPU hasn't drained the previous frames. Report
+            // `false` so the caller doesn't count it as a rendered frame.
+            guard inFlightSemaphore.wait(timeout: .now()) == .success else { return false }
         }
         // ── Panel is the single source of truth for TAA on/off ──────────────
         // Authority lives HERE, once, instead of in every scene controller. The
@@ -6030,6 +6056,15 @@ public final class IlluminatoramaRenderer {
         previousSsrEnabled  = ssrDenoiseEnabled
         if rtGITemporalEnabled && !previousRTGITemporalEnabled { rtGINeedsFirstFrame = true }
         previousRTGITemporalEnabled = rtGITemporalEnabled
+        // ── Panel is the single source of truth for lens aberration too ─────
+        // CA / spherical aberration / fringe (+ post-FX easing) have NO per-scene
+        // overrides anywhere, so apply them HERE once for every Illuminatorama
+        // scene — including the ones that never wired post-FX and every future
+        // scene, which inherit them with zero per-scene code. (Bloom is NOT here:
+        // scenes art-direct it and `render()` runs after their tick, so it opts in
+        // via `applySharedPostFX`.) Targets are set before `uploadFrameUniforms`
+        // below, which eases toward them.
+        if appliesSharedLensFX { applySharedLensFX() }
         // Ping-pong the instance buffer FIRST: after this swap,
         // currentInstanceBuffer is what was previousInstanceBuffer last frame
         // (so uploadInstances overwrites it with this frame's data), and
@@ -6058,7 +6093,7 @@ public final class IlluminatoramaRenderer {
         guard let cb = commandQueue.makeCommandBuffer() else {
             Self.log.error("makeCommandBuffer() returned nil")
             inFlightSemaphore.signal()  // release the slot acquired above
-            return
+            return false
         }
         // Reserve this pool slot until the GPU finishes writing it, so a second
         // pipelined frame (maxFramesInFlight = 2) picks a different buffer. Cleared
@@ -6283,6 +6318,7 @@ public final class IlluminatoramaRenderer {
         if ddgiIrrCacheEnabled {
             irrCacheToggle.toggle()
         }
+        return true
     }
 
     // ── Presented-buffer pool helpers ─────────────────────────────────────────
@@ -8338,6 +8374,7 @@ public final class IlluminatoramaRenderer {
         easedChromaticAberration += (max(0, chromaticAberration) - easedChromaticAberration) * kf
         easedFringe            += (max(0, fringe)        - easedFringe)            * kf
         easedFringeTint        += (fringeTint            - easedFringeTint)        * kf
+        easedSphericalAberration += (max(0, sphericalAberration) - easedSphericalAberration) * kf
     }
 
     private func uploadFrameUniforms() {
@@ -8443,6 +8480,8 @@ public final class IlluminatoramaRenderer {
         // _padPlush0 slot). 0 → exact no-op (the tonemap branch is gated on it).
         // Eased value (see advancePostFXEasing) so slider drags glide.
         u.chromaticAberration = max(0, easedChromaticAberration)
+        // Spherical aberration: radial blur, 0 → exact no-op.
+        u.sphericalAberration = max(0, easedSphericalAberration)
         // Axial chromatic aberration ("purple fringing"): strength + dark-side
         // tint. 0 strength → exact no-op (the tonemap branch is gated on it).
         u.fringe = max(0, easedFringe)

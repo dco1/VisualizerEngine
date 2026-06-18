@@ -175,7 +175,9 @@ struct FrameUniforms {
     // (default) → an exact no-op. Repurposes the former _padPlush0 slot; stride
     // is unchanged. Mirrors IlluminatoramaFrameUniforms.chromaticAberration.
     float    chromaticAberration;
-    float    _padPlush1;
+    // Spherical-aberration radial blur strength (0 = OFF → exact no-op).
+    // Repurposes the former _padPlush1 slot; stride is unchanged.
+    float    sphericalAberration;
     // Axial chromatic aberration ("purple fringing"): edge-halo strength (0 = OFF
     // → exact no-op) + dark-side sRGB tint; the bright side gets the complement.
     // NEW 16-byte cluster (stride 992 → 1008). Four scalar floats (NOT float3 +
@@ -4586,6 +4588,46 @@ fragment float4 illumi_tonemap_fs(
         }
     }
     hdr *= 0.25;
+
+    // ── Spherical aberration ───────────────────────────────────────────────────
+    // A real lens's outer zones focus at a slightly different plane than the
+    // paraxial rays, so off-axis detail loses sharpness while the centre stays
+    // crisp — a radial defocus that grows quadratically from the optical axis
+    // toward the edges. We blur all channels equally (unlike the transverse CA
+    // above, which splits them) in the HDR domain so the softening wraps around
+    // bright highlights before tonemapping, reading as the classic dreamy
+    // soft-focus halation. 0 → branch skipped (exact no-op).
+    if (frame.sphericalAberration > 0.0) {
+        float2 d     = in.uv - 0.5;
+        float  rNorm = saturate(dot(d, d) * 2.0);   // 0 at centre → 1 at corners
+        // Radius (in INTERNAL-resolution texels) scales with both the off-axis
+        // distance and the strength. At SA=1 the corners pull a ~14-texel disc;
+        // at the SA=3 max it's ~42, a heavy soft-focus. Texel-space so the look
+        // is stable across the internal render scale.
+        float  blurPx = rNorm * frame.sphericalAberration * 14.0;
+        if (blurPx > 0.25) {
+            // Filled disc, not a ring: a centre tap plus two concentric 6-tap
+            // rings (offset half a step) so the kernel covers the disc instead
+            // of leaving a hard double-image. Outer ring at full radius, inner
+            // at 55%, centre weighted highest → an approximately Gaussian falloff.
+            float2 rOut = blurPx * invInSize;
+            float2 rIn  = rOut * 0.55;
+            float3 acc  = float3(inHDR.sample(downSampler, in.uv).rgb) * 3.0;
+            float  wsum = 3.0;
+            for (int i = 0; i < 6; ++i) {
+                float aO = (float(i)        ) * (M_PI_F / 3.0);
+                float aI = (float(i) + 0.5) * (M_PI_F / 3.0);
+                acc += float3(inHDR.sample(downSampler, in.uv + float2(cos(aO), sin(aO)) * rOut).rgb) * 1.0;
+                acc += float3(inHDR.sample(downSampler, in.uv + float2(cos(aI), sin(aI)) * rIn).rgb)  * 2.0;
+            }
+            wsum += 6.0 * 1.0 + 6.0 * 2.0;          // 3 + 6 + 12 = 21
+            float3 blurred = acc / wsum;
+            // Blend ramps with off-axis distance AND strength, so the centre is
+            // always sharp and a higher slider both widens AND deepens the haze.
+            float blend = saturate(rNorm * (0.55 + frame.sphericalAberration * 0.45));
+            hdr = mix(hdr, blurred, blend);
+        }
+    }
 
     // Bloom is at half of the INTERNAL resolution. The same normalised UV
     // works directly because `filter::linear` interpolates across mip0

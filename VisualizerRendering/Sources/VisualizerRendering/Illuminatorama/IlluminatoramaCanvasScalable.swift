@@ -1,4 +1,5 @@
 import CoreGraphics
+import Metal
 import VisualizerCore
 import simd
 
@@ -18,6 +19,16 @@ import simd
 @MainActor
 public protocol IlluminatoramaCanvasScalable: SceneController {
     var illuminatoramaRenderer: IlluminatoramaRenderer { get }
+}
+
+/// Every `NativeMetalScene` that is also `IlluminatoramaCanvasScalable` gets
+/// `setRecorderFrameTap` for free: all it takes is forwarding the tap to the
+/// renderer's `onFramePresented` hook, which `present(to:)` already calls each
+/// frame. No per-scene boilerplate needed.
+public extension NativeMetalScene where Self: IlluminatoramaCanvasScalable {
+    func setRecorderFrameTap(_ tap: ((MTLTexture, MTLCommandQueue) -> Void)?) {
+        illuminatoramaRenderer.onFramePresented = tap
+    }
 }
 
 public extension IlluminatoramaCanvasScalable {
