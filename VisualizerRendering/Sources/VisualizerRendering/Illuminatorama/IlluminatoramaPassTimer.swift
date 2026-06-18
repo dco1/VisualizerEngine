@@ -38,6 +38,11 @@ final class IlluminatoramaPassTimer: @unchecked Sendable {
 
     let enabled: Bool
     private let sidecarPath: String?
+    /// Stall attributor (#65): when a frame's GPU time exceeds the deadline, append
+    /// "which pass held the GPU" here. Independent of the steady-state sidecar —
+    /// either path (or both) enables the timestamp sample buffer.
+    private let stallPath: String?
+    private let stallDeadlineMs: Double
     private let sampleBuffer: MTLCounterSampleBuffer?
     /// GPU-tick → nanosecond scale from a CPU/GPU correlation anchor pair.
     private let nsPerTick: Double
@@ -52,14 +57,21 @@ final class IlluminatoramaPassTimer: @unchecked Sendable {
     // lock since multiple frames' handlers can overlap).
     private let lock = NSLock()
     private var frameCount = 0
+    private var stallCount = 0   // # deadline-missing frames seen (stall attributor)
 
     init(device: MTLDevice) {
-        let path = ProcessInfo.processInfo.environment["VIZ_ILLUMI_PASS_PROFILE"]
+        let env = ProcessInfo.processInfo.environment
+        let path = env["VIZ_ILLUMI_PASS_PROFILE"]
+        let stall = env["VIZ_ILLUMI_STALL_PROFILE"]
         sidecarPath = path
+        stallPath = stall
+        stallDeadlineMs = Double(env["VIZ_ILLUMI_STALL_DEADLINE_MS"] ?? "") ?? 16.6
+        // Either profiling path (or both) wants the per-pass timestamps.
+        let wantTiming = (path?.isEmpty == false) || (stall?.isEmpty == false)
         // Capability + counter set.
         let supported = device.supportsCounterSampling(.atStageBoundary)
         let tsSet = device.counterSets?.first { $0.name == MTLCommonCounterSet.timestamp.rawValue }
-        if let path, !path.isEmpty, supported, let tsSet {
+        if wantTiming, supported, let tsSet {
             let desc = MTLCounterSampleBufferDescriptor()
             desc.counterSet = tsSet
             desc.storageMode = .shared
@@ -85,9 +97,10 @@ final class IlluminatoramaPassTimer: @unchecked Sendable {
         } else {
             nsPerTick = 1.0
         }
-        if let path, !path.isEmpty, !enabled {
-            try? "pass-profile UNAVAILABLE (counter sampling unsupported or buffer alloc failed)\n"
-                .write(toFile: path, atomically: true, encoding: .utf8)
+        if !enabled {
+            let msg = "pass-profile UNAVAILABLE (counter sampling unsupported or buffer alloc failed)\n"
+            if let path, !path.isEmpty { try? msg.write(toFile: path, atomically: true, encoding: .utf8) }
+            if let stall, !stall.isEmpty { try? msg.write(toFile: stall, atomically: true, encoding: .utf8) }
         }
     }
 
@@ -117,7 +130,7 @@ final class IlluminatoramaPassTimer: @unchecked Sendable {
     /// completion handler). `frameGpuMs` is the buffer's own gpu time, used as the
     /// ground-truth cross-check.
     func resolve(frameGpuMs: Double) {
-        guard enabled, let sampleBuffer, let sidecarPath else { return }
+        guard enabled, let sampleBuffer, sidecarPath != nil || stallPath != nil else { return }
         let usedLabels = labels                 // snapshot from the encode pass
         let used = usedLabels.count * 2
         guard used > 0 else { return }
@@ -151,12 +164,35 @@ final class IlluminatoramaPassTimer: @unchecked Sendable {
         lock.unlock()
         let perPass = times.sorted { $0.value > $1.value }
 
-        var out = "frame #\(n)  frameGpuMs=\(String(format: "%.3f", frameGpuMs))"
-            + "  sumTimedPassMs=\(String(format: "%.3f", sum))"
-            + "  timedFraction=\(String(format: "%.2f", ratio)) "
-            + (verified ? "VERIFIED (tick→ms scale cross-checks vs frame gpu time)"
-                        : "UNVERIFIED — tick scale suspect or many passes untimed") + "\n"
-        for (l, ms) in perPass { out += String(format: "  %-22@ %.3f ms\n", l as NSString, ms) }
-        try? out.write(toFile: sidecarPath, atomically: true, encoding: .utf8)
+        // ── Steady-state per-pass breakdown (rewritten every frame) ──
+        if let sidecarPath {
+            var out = "frame #\(n)  frameGpuMs=\(String(format: "%.3f", frameGpuMs))"
+                + "  sumTimedPassMs=\(String(format: "%.3f", sum))"
+                + "  timedFraction=\(String(format: "%.2f", ratio)) "
+                + (verified ? "VERIFIED (tick→ms scale cross-checks vs frame gpu time)"
+                            : "UNVERIFIED — tick scale suspect or many passes untimed") + "\n"
+            for (l, ms) in perPass { out += String(format: "  %-22@ %.3f ms\n", l as NSString, ms) }
+            try? out.write(toFile: sidecarPath, atomically: true, encoding: .utf8)
+        }
+
+        // ── Stall attributor (#65): on a deadline miss, APPEND which pass held the
+        // GPU. Answers "when a frame misses, which pass caused it?" — the long-tail
+        // attribution the swap-count jitter probe (frame delivery) can't give.
+        if let stallPath, frameGpuMs > stallDeadlineMs {
+            lock.lock(); stallCount += 1; let sc = stallCount; lock.unlock()
+            let topN = perPass.prefix(3)
+            let culprit = topN.map { (l, ms) -> String in
+                let pctOfFrame = frameGpuMs > 0 ? ms / frameGpuMs * 100 : 0
+                return String(format: "%@ %.2fms(%.0f%%)", l, ms, pctOfFrame)
+            }.joined(separator: ", ")
+            let flag = verified ? "" : " [UNVERIFIED scale]"
+            let line = String(format: "STALL #%d frame#%d frameGpuMs=%.2f (deadline %.1f) top: %@%@\n",
+                              sc, n, frameGpuMs, stallDeadlineMs, culprit, flag)
+            if let d = line.data(using: .utf8) {
+                if let h = FileHandle(forWritingAtPath: stallPath) {
+                    h.seekToEndOfFile(); h.write(d); try? h.close()
+                } else { try? d.write(to: URL(fileURLWithPath: stallPath)) }
+            }
+        }
     }
 }
