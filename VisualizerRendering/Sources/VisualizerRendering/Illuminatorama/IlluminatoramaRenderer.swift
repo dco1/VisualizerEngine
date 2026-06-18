@@ -705,9 +705,10 @@ public final class IlluminatoramaRenderer {
     // after that buffer's command buffer COMPLETES (signalled on a background
     // thread via `presentSync`) is it promoted to `outputTexture` on the next
     // tick. SceneKit thus always samples a fully-rendered buffer, and we never
-    // pay a per-frame `waitUntilCompleted` stall. Three buffers cover the
-    // presented one, the one in flight, and the one SceneKit may still be
-    // reading from its previous composite.
+    // pay a per-frame `waitUntilCompleted` stall. FOUR buffers (`ldrPoolCount`)
+    // cover: the presented one, the one SceneKit may still be reading from its
+    // previous composite, and the TWO that may be in flight at once now that
+    // `maxFramesInFlight = 2` pipelines CPU encode against GPU execution.
     private var ldrPool: [MTLTexture] = []
     private var presentedIdx: Int = 0
     /// The buffer presented on the *previous* tick. SceneKit's compositor can
@@ -738,7 +739,7 @@ public final class IlluminatoramaRenderer {
         return nil
     }()
 
-    // ── Frame throttle (command-queue saturation guard) ────────────────────────
+    // ── Frame throttle / pipelining (command-queue saturation guard) ────────────
     //
     // The overlay ticks `render()` at 60 Hz and commits a command buffer every
     // tick. A heavy scene whose GPU frame costs more than the tick interval
@@ -747,9 +748,26 @@ public final class IlluminatoramaRenderer {
     // symptom that masqueraded as a white frame) the presented buffer never
     // settling on a completed frame for SceneKit to sample. Cap frames in
     // flight and DROP a tick when the GPU hasn't caught up, rather than block.
-    // `maxFramesInFlight = 1` pairs with the 3-buffer present pool: presented +
-    // previously-presented (both possibly read by SceneKit) + one being written.
-    static let maxFramesInFlight = 1
+    //
+    // `maxFramesInFlight = 2` (was 1) is the "live-frame gap" fix. With ONE
+    // frame in flight, the next frame can't begin encoding until the previous
+    // one fully completes on the GPU; the 60 Hz timer then only starts it on the
+    // following tick edge, so a >16.6 ms GPU frame leaves the GPU IDLE from its
+    // completion until the next tick fires (e.g. a 24 ms frame finishes at 24 ms
+    // but the next render() doesn't start until t=33 ms → ~9 ms wasted → the
+    // new-frame rate quantises to 60/ceil(gpuMs/16.6) ≈ 30 fps even though the
+    // GPU only needs ~24 ms). DOUBLE-buffering lets tick N+1 encode + queue the
+    // next frame while frame N is still on the GPU, so the GPU runs back-to-back
+    // and the new-frame rate rises to the GPU-bound ceiling (~1000/gpuMs). This
+    // is the standard CPU/GPU pipelining every realtime renderer uses; it is NOT
+    // the same as removing the throttle (we still DROP when 2 are already in
+    // flight, so the queue stays bounded — no unbounded-growth freeze).
+    //
+    // Pairs with the `ldrPoolCount = 4` present pool: presented + previously-
+    // presented (both possibly still read by SceneKit / the cover blit) + the
+    // TWO buffers that may be in flight at once. `acquireWriteTarget()` excludes
+    // all four so a frame never writes a buffer another consumer is reading.
+    static let maxFramesInFlight = 2
     private let inFlightSemaphore = DispatchSemaphore(value: IlluminatoramaRenderer.maxFramesInFlight)
 
     public let device: MTLDevice
@@ -6042,6 +6060,11 @@ public final class IlluminatoramaRenderer {
             inFlightSemaphore.signal()  // release the slot acquired above
             return
         }
+        // Reserve this pool slot until the GPU finishes writing it, so a second
+        // pipelined frame (maxFramesInFlight = 2) picks a different buffer. Cleared
+        // by `markCompleted` in the completion handler below. Marked after the
+        // makeCommandBuffer guard so a failed allocation doesn't leak the slot.
+        presentSync.markInFlight(writeIdx)
         cb.label = "Illuminatorama.frame"
         passTimer.beginFrame()   // reset per-pass GPU-timer sample assignment (env-gated)
 
@@ -6257,7 +6280,9 @@ public final class IlluminatoramaRenderer {
 
     // ── Presented-buffer pool helpers ─────────────────────────────────────────
 
-    static let ldrPoolCount = 3
+    // 4 = presented + previously-presented (both still readable by consumers) +
+    // the two frames that may be in flight at once (`maxFramesInFlight = 2`).
+    static let ldrPoolCount = 4
 
     /// Allocate one LDR (`bgra8Unorm_srgb`) output texture for the present pool.
     /// sRGB format: the tonemap writes LINEAR and the GPU store applies the sRGB
@@ -6294,18 +6319,20 @@ public final class IlluminatoramaRenderer {
     }
 
     /// Choose a pool index to render into this frame: anything that is neither
-    /// the currently presented buffer NOR the previously presented buffer
-    /// (SceneKit may still be sampling either). With a 3-buffer pool this
-    /// always leaves exactly one slot — the buffer presented two frames ago,
-    /// which the compositor has long since released. Re-encoding a write to a
-    /// buffer whose prior write is still in flight is safe: Metal serialises
-    /// command buffers on this queue in commit order, so the writes can't
-    /// race — it only adds latency, which the present-on-complete gate absorbs.
+    /// the currently presented buffer, NOR the previously presented buffer
+    /// (SceneKit / the cover blit may still be sampling either), NOR a buffer
+    /// whose own render is STILL IN FLIGHT. The in-flight exclusion matters now
+    /// that `maxFramesInFlight = 2`: two consecutive `render()` calls can both be
+    /// queued before either completes, and they must target DIFFERENT buffers or
+    /// the second would clobber the first before it is ever presented. With the
+    /// 4-buffer pool the worst case is presented + prev + one already in flight =
+    /// 3 excluded, leaving exactly one free slot for this frame.
     private func acquireWriteTarget() -> Int {
-        for i in 0..<ldrPool.count where i != presentedIdx && i != prevPresentedIdx {
+        for i in 0..<ldrPool.count
+        where i != presentedIdx && i != prevPresentedIdx && !presentSync.isInFlight(i) {
             return i
         }
-        // Degenerate fallback (pool < 3 or all excluded): avoid the presented.
+        // Degenerate fallback (pool too small or all excluded): avoid the presented.
         return (presentedIdx + 1) % max(1, ldrPool.count)
     }
 
@@ -9059,11 +9086,31 @@ private final class IlluminatoramaGPUMeter: @unchecked Sendable {
 private final class IlluminatoramaPresentSync: @unchecked Sendable {
     private let lock = NSLock()
     private var completedIdx: Int = -1
+    /// Pool slots whose render is queued/running on the GPU but not yet complete.
+    /// Inserted on the main thread (after commit) and removed on the GPU
+    /// completion thread, so `acquireWriteTarget` never picks a buffer a second
+    /// pipelined frame is still writing (`maxFramesInFlight = 2`).
+    private var inFlight: Set<Int> = []
+
+    /// Record (from the main thread, at commit) that pool buffer `idx` is now in flight.
+    func markInFlight(_ idx: Int) {
+        lock.lock()
+        inFlight.insert(idx)
+        lock.unlock()
+    }
+
+    /// True if `idx`'s render is still in flight (used by `acquireWriteTarget`).
+    func isInFlight(_ idx: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return inFlight.contains(idx)
+    }
 
     /// Record (from the GPU completion thread) that pool buffer `idx` is done.
     func markCompleted(_ idx: Int) {
         lock.lock()
         completedIdx = idx
+        inFlight.remove(idx)
         lock.unlock()
     }
 
@@ -9080,6 +9127,7 @@ private final class IlluminatoramaPresentSync: @unchecked Sendable {
     func reset() {
         lock.lock()
         completedIdx = -1
+        inFlight.removeAll()
         lock.unlock()
     }
 }
