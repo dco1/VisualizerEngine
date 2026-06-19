@@ -131,7 +131,7 @@ public struct CoinContact {
     public var tan2: SIMD4<Float>    // xyz=tangent2, w=colour
 }
 
-// Per-substep uniforms. Scalars only (no float3) — alignment-safe. 128 bytes (32 × 4).
+// Per-substep uniforms. Scalars only (no float3) — alignment-safe. 132 bytes (33 × 4).
 struct CoinUniforms {
     var dt: Float = 1.0 / 240.0
     var gravity: Float = 9.8
@@ -165,6 +165,7 @@ struct CoinUniforms {
     var restitutionVelFalloff: Float = 0.0  // COR drop per m/s impact speed (0 = constant COR)
     var restitutionMinE: Float = 0.0        // floor for the velocity-faded COR
     var quadraticDrag: Float = 0.0          // ∝v² aerodynamic drag (accel = −k·|v|·v); 0 = off
+    var dragRefRadius: Float = 0.0          // radius where quadraticDrag is calibrated; drag ∝1/r per body. 0 = flat k
 }
 
 @MainActor
@@ -336,6 +337,11 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// terminal speed ≈ √(g/k)). 0 (default) ⇒ off. A scene using this sets
     /// `linDamping` ≈ 1 so airborne energy is shed only by this physical term.
     public var quadraticDrag: Float = 0.0
+    /// Radius at which `quadraticDrag` is calibrated. When > 0, each body's drag is
+    /// scaled by `dragRefRadius / bodyRadius` (physical A/m ∝ 1/r) — a bigger ball
+    /// drags LESS and flies further, a smaller one drags MORE. 0 (default) ⇒ flat k
+    /// for every body (no size scaling).
+    public var dragRefRadius: Float = 0.0
     /// Colour passes per velocity iteration. The colouring uses ≤ this many colours in
     /// practice (≈8 for a dense pile); contacts in higher colours wait a substep.
     public var solveColors: Int = 16
@@ -1392,7 +1398,7 @@ public final class CoinDEMSolver: PenetrationProbing {
             maxHSpeed: maxHSpeed, maxSpeed: maxSpeed, maxOmega: maxOmega,
             contactSlop: contactSlop, baumgarteBeta: baumgarteBeta, restThreshold: restThreshold,
             restitutionVelFalloff: restitutionVelFalloff, restitutionMinE: restitutionMinE,
-            quadraticDrag: quadraticDrag)
+            quadraticDrag: quadraticDrag, dragRefRadius: dragRefRadius)
         uniformBuffer.contents().bindMemory(to: CoinUniforms.self, capacity: 1).pointee = u
     }
 

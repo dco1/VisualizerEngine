@@ -120,7 +120,17 @@ struct CoinUniforms {
     float restitutionVelFalloff; // COR drop per m/s of impact speed (0 = constant COR)
     float restitutionMinE;       // floor for the velocity-faded COR
     float quadraticDrag;         // ∝v² aerodynamic drag k (accel = −k·|v|·v); 0 = off
+    float dragRefRadius;         // radius where quadraticDrag is calibrated; drag scales ∝1/r per body. 0 = flat k (no size scaling)
 };
+
+// Per-body drag coefficient. Real aerodynamic drag-per-mass A/m ∝ r²/r³ = 1/r, so
+// a BIGGER body drags LESS (and falls/flies further) and a smaller one drags more.
+// dragRefRadius is the radius at which `quadraticDrag` was tuned; 0 ⇒ flat k.
+inline float cdDragK(constant CoinUniforms& u, float bodyRadius) {
+    if (u.dragRefRadius <= 0.0) return u.quadraticDrag;
+    float r = bodyRadius > 1e-4 ? bodyRadius : u.dragRefRadius;
+    return u.quadraticDrag * (u.dragRefRadius / r);
+}
 
 // Velocity-dependent coefficient of restitution. Real materials — a fuzzy tennis
 // ball especially — rebound with a SMALLER fraction of their speed as the impact
@@ -285,7 +295,7 @@ kernel void coinIntegrate(
     // at every velocity. With drag enabled a scene sets linDamping≈1 so the only
     // airborne energy loss is this physically-shaped term.
     if (u.quadraticDrag > 0.0) {
-        v -= u.quadraticDrag * length(v) * v * u.dt;
+        v -= cdDragK(u, c.prevPos.w) * length(v) * v * u.dt;   // drag ∝ 1/r per body
     }
     v   *= u.linDamping;
     coins[id].prevPos.xyz    = x;
@@ -1731,7 +1741,7 @@ kernel void coinIntegrateVelocityCS(
     float3 v = c.vel.xyz;
     v.y -= u.gravity * u.dt;
     if (u.quadraticDrag > 0.0) {
-        v -= u.quadraticDrag * length(v) * v * u.dt;   // ∝v² drag (see coinIntegrate)
+        v -= cdDragK(u, c.prevPos.w) * length(v) * v * u.dt;   // ∝v² drag, ∝1/r per body
     }
     v   *= u.linDamping;
     coins[id].prevPos.xyz = c.posInvMass.xyz;     // for finalize sleep / diagnostics
