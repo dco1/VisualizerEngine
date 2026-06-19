@@ -268,6 +268,15 @@ struct FloodUniforms {
 
 static inline float pf_hash(float x) { return fract(sin(x * 127.1 + 311.7) * 43758.5453); }
 
+// SMOOTH value noise — hash at integer lattice points, smoothstep-interpolated
+// between. Using floor()'d hashes directly (a step function per column) is what made
+// the front read as hard stepped angles; interpolating gives a continuous liquid edge.
+static inline float pf_vnoise(float x, float seed) {
+    float i = floor(x), f = fract(x);
+    float w = f * f * (3.0 - 2.0 * f);
+    return mix(pf_hash(i + seed), pf_hash(i + 1.0 + seed), w);
+}
+
 kernel void paintFlood(texture2d<float, access::read_write> tex [[texture(0)]],
                        constant FloodUniforms& u [[buffer(0)]],
                        uint2 gid [[thread_position_in_grid]]) {
@@ -275,11 +284,16 @@ kernel void paintFlood(texture2d<float, access::read_write> tex [[texture(0)]],
     if (gid.x >= W || gid.y >= H) return;
     float2 uv = (float2(gid) + 0.5) / float2(W, H);
 
-    // Per-column drip "finger" lead: a couple of hash octaves so some columns run
-    // ahead of the bulk front. lead ∈ [0, fingerAmp].
-    float f  = uv.x * u.drip.z;
-    float lead = (0.6 * pf_hash(floor(f) + u.drip.x)
-                + 0.4 * pf_hash(floor(f * 3.17) + u.drip.x * 1.7)) * u.drip.y;
+    // Per-column drip "finger" lead from SMOOTH fractal value noise so the leading
+    // edge undulates continuously (no column steps). Three octaves give broad lobes +
+    // finer ripples; a cubed sparse octave biases toward occasional long thin tendrils
+    // (drips that outrun the sheet). lead ∈ ~[0, fingerAmp].
+    float f = uv.x * u.drip.z;
+    float s = u.drip.x;
+    float broad = pf_vnoise(f,        s);
+    float fine  = pf_vnoise(f * 2.7,  s + 11.0);
+    float tend  = pf_vnoise(f * 0.6,  s + 23.0);
+    float lead = (0.50 * broad + 0.22 * fine + 0.50 * tend * tend * tend) * u.drip.y;
 
     // Front coordinate: how "deep" this texel is along the flow. Columns with a
     // bigger lead are reached earlier (their fc is smaller).
@@ -296,6 +310,25 @@ kernel void paintFlood(texture2d<float, access::read_write> tex [[texture(0)]],
     if (fc <= u.front.x || fc > u.front.y) return;
     float4 prev = tex.read(gid);
     tex.write(float4(u.color.rgb, max(prev.a, u.color.w)), gid);
+}
+
+// ── Front-profile measurement (instrumentation) ───────────────────────────────
+// Per column x, the DEEPEST v (0…1) covered by the target colour — i.e. how far the
+// flood front has descended in that column. Used by the repaint probe to quantify
+// the leading-edge geometry: a blocky (column-quantised) front shows long flat runs
+// with sharp jumps between them; a smooth liquid front changes gradually. -1 = none.
+kernel void paintFrontProfile(texture2d<float, access::read> tex [[texture(0)]],
+                              constant float4& target [[buffer(0)]],   // rgb + tol
+                              device float* profile [[buffer(1)]],
+                              uint x [[thread_position_in_grid]]) {
+    uint W = tex.get_width(), H = tex.get_height();
+    if (x >= W) return;
+    float deepest = -1.0;
+    for (uint y = 0; y < H; y++) {
+        float3 c = tex.read(uint2(x, y)).rgb;
+        if (distance(c, target.rgb) <= target.w) deepest = max(deepest, float(y) / float(H));
+    }
+    profile[x] = deepest;
 }
 
 // ── Coverage measurement (instrumentation) ────────────────────────────────────

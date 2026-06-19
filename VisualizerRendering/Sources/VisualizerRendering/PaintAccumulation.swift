@@ -41,6 +41,7 @@ public final class PaintAccumulation {
     private let resolvePipeline: MTLComputePipelineState
     private let floodPipeline: MTLComputePipelineState
     private let coveragePipeline: MTLComputePipelineState
+    private let frontProfilePipeline: MTLComputePipelineState
 
     /// The persistent canvas. Bound to the surface material's `diffuse.contents`.
     public let texture: MTLTexture
@@ -97,7 +98,8 @@ public final class PaintAccumulation {
               let dy = engine.pipeline("paintDecay"),
               let rs = engine.pipeline("paintResolve"),
               let fl = engine.pipeline("paintFlood"),
-              let cv = engine.pipeline("paintCoverage") else {
+              let cv = engine.pipeline("paintCoverage"),
+              let fp = engine.pipeline("paintFrontProfile") else {
             Self.log.error("paint pipeline lookup failed")
             return nil
         }
@@ -108,6 +110,7 @@ public final class PaintAccumulation {
         self.resolvePipeline = rs
         self.floodPipeline = fl
         self.coveragePipeline = cv
+        self.frontProfilePipeline = fp
 
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
@@ -337,6 +340,28 @@ public final class PaintAccumulation {
         cb.waitUntilCompleted()  // gpu-ok: diagnostic read-back, not the render path
         let p = counter.contents().bindMemory(to: UInt32.self, capacity: 2)
         return Float(p[0]) / Float(max(1, p[1]))
+    }
+
+    /// Per-column deepest v (0…1) covered by `colour` (−1 = none). DIAGNOSTIC ONLY —
+    /// synchronous read-back. Reveals the flood front's leading-edge geometry.
+    public func frontProfile(of colour: SIMD3<Float>, tolerance: Float = 0.06) -> [Float] {
+        guard let buf = engine.device.makeBuffer(
+            length: MemoryLayout<Float>.stride * width, options: .storageModeShared) else { return [] }
+        guard let cb = engine.commandQueue.makeCommandBuffer(),
+              let enc = cb.makeComputeCommandEncoder() else { return [] }
+        enc.setComputePipelineState(frontProfilePipeline)
+        enc.setTexture(texture, index: 0)
+        var t = SIMD4<Float>(colour, tolerance)
+        enc.setBytes(&t, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+        enc.setBuffer(buf, offset: 0, index: 1)
+        let w = frontProfilePipeline.threadExecutionWidth
+        enc.dispatchThreads(MTLSize(width: width, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()  // gpu-ok: diagnostic read-back, not the render path
+        let p = buf.contents().bindMemory(to: Float.self, capacity: width)
+        return Array(UnsafeBufferPointer(start: p, count: width))
     }
 
     private func dispatch2D(_ enc: MTLComputeCommandEncoder, pipeline: MTLComputePipelineState) {
