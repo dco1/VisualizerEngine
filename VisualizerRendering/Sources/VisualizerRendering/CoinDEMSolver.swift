@@ -131,7 +131,7 @@ public struct CoinContact {
     public var tan2: SIMD4<Float>    // xyz=tangent2, w=colour
 }
 
-// Per-substep uniforms. Scalars only (no float3) — alignment-safe. 96 bytes.
+// Per-substep uniforms. Scalars only (no float3) — alignment-safe. 128 bytes (32 × 4).
 struct CoinUniforms {
     var dt: Float = 1.0 / 240.0
     var gravity: Float = 9.8
@@ -162,6 +162,9 @@ struct CoinUniforms {
     var contactSlop: Float = 0.002      // constraint solver: allowed penetration (m)
     var baumgarteBeta: Float = 0.2      // constraint solver: position-bias gain
     var restThreshold: Float = 0.5      // constraint solver: restitution approach-speed gate (m/s)
+    var restitutionVelFalloff: Float = 0.0  // COR drop per m/s impact speed (0 = constant COR)
+    var restitutionMinE: Float = 0.0        // floor for the velocity-faded COR
+    var quadraticDrag: Float = 0.0          // ∝v² aerodynamic drag (accel = −k·|v|·v); 0 = off
 }
 
 @MainActor
@@ -320,6 +323,19 @@ public final class CoinDEMSolver: PenetrationProbing {
     public var baumgarteBeta: Float = 0.2       // split-impulse position-bias gain
     public var restThreshold: Float = 0.5       // restitution approach-speed gate (m/s)
     public var velocityIterations: Int = 8      // sequential-impulse passes per substep
+
+    // ── Realistic-bounce extensions (opt-in; all 0 ⇒ legacy constant-COR/linear) ──
+    /// Coefficient-of-restitution falloff per m/s of impact speed. Real materials —
+    /// a fuzzy tennis ball especially (Cross 2002) — rebound with a smaller fraction
+    /// of their speed as the hit gets harder. `eEff = clamp(restitution − falloff·v,
+    /// restitutionMinE, restitution)`. 0 (default) ⇒ constant COR, exactly as before.
+    public var restitutionVelFalloff: Float = 0.0
+    /// Lower bound for the velocity-faded COR (only consulted when falloff > 0).
+    public var restitutionMinE: Float = 0.0
+    /// ∝v² aerodynamic drag coefficient k (acceleration = −k·|v|·v, units 1/m, so
+    /// terminal speed ≈ √(g/k)). 0 (default) ⇒ off. A scene using this sets
+    /// `linDamping` ≈ 1 so airborne energy is shed only by this physical term.
+    public var quadraticDrag: Float = 0.0
     /// Colour passes per velocity iteration. The colouring uses ≤ this many colours in
     /// practice (≈8 for a dense pile); contacts in higher colours wait a substep.
     public var solveColors: Int = 16
@@ -1374,7 +1390,9 @@ public final class CoinDEMSolver: PenetrationProbing {
             coinCount: UInt32(coinCount), colliderCount: UInt32(colliders.count),
             gridResX: gridRes.x, gridResY: gridRes.y, gridResZ: gridRes.z,
             maxHSpeed: maxHSpeed, maxSpeed: maxSpeed, maxOmega: maxOmega,
-            contactSlop: contactSlop, baumgarteBeta: baumgarteBeta, restThreshold: restThreshold)
+            contactSlop: contactSlop, baumgarteBeta: baumgarteBeta, restThreshold: restThreshold,
+            restitutionVelFalloff: restitutionVelFalloff, restitutionMinE: restitutionMinE,
+            quadraticDrag: quadraticDrag)
         uniformBuffer.contents().bindMemory(to: CoinUniforms.self, capacity: 1).pointee = u
     }
 

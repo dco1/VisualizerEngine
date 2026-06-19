@@ -116,7 +116,20 @@ struct CoinUniforms {
     float contactSlop;    // allowed penetration (m) — recovery only beyond this
     float baumgarteBeta;  // position-bias gain (split-impulse pseudo-velocity)
     float restThreshold;  // restitution only for approach speed beyond this (m/s)
+    // ── Realistic-bounce extensions (opt-in; all 0 ⇒ byte-identical legacy) ──
+    float restitutionVelFalloff; // COR drop per m/s of impact speed (0 = constant COR)
+    float restitutionMinE;       // floor for the velocity-faded COR
+    float quadraticDrag;         // ∝v² aerodynamic drag k (accel = −k·|v|·v); 0 = off
 };
+
+// Velocity-dependent coefficient of restitution. Real materials — a fuzzy tennis
+// ball especially — rebound with a SMALLER fraction of their speed as the impact
+// gets harder (Cross 2002): e falls roughly linearly with impact speed over the
+// few–tens-of-m/s range. falloff == 0 reproduces the constant-COR legacy exactly.
+inline float cdEffectiveCOR(constant CoinUniforms& u, float impactSpeed) {
+    float e = u.restitution - u.restitutionVelFalloff * impactSpeed;
+    return clamp(e, min(u.restitutionMinE, u.restitution), u.restitution);
+}
 
 struct CoinTransform {
     float4 col0;  // basis column 0 (xyz, 0)
@@ -263,10 +276,17 @@ kernel void coinIntegrate(
     CoinBody c = coins[id];
     if (c.posInvMass.w == 0.0) return;  // inactive slot
 
-    // Linear: gravity + light damping, predict COM.
+    // Linear: gravity + drag, predict COM.
     float3 x = c.posInvMass.xyz;
     float3 v = c.vel.xyz;
     v.y -= u.gravity * u.dt;
+    // Real ∝v² aerodynamic drag (opt-in): negligible when slow, biting when fast —
+    // unlike the uniform `linDamping` bleed, which sheds the same FRACTION of speed
+    // at every velocity. With drag enabled a scene sets linDamping≈1 so the only
+    // airborne energy loss is this physically-shaped term.
+    if (u.quadraticDrag > 0.0) {
+        v -= u.quadraticDrag * length(v) * v * u.dt;
+    }
     v   *= u.linDamping;
     coins[id].prevPos.xyz    = x;
     coins[id].posInvMass.xyz = x + v * u.dt;
@@ -968,7 +988,7 @@ kernel void coinFinalize(
             if (ballisticVy > -0.4) {
                 v.y = min(v.y, 0.25);
             } else {
-                v.y = -u.restitution * ballisticVy;
+                v.y = -cdEffectiveCOR(u, -ballisticVy) * ballisticVy;  // impact speed = −ballisticVy
             }
         }
 
@@ -986,7 +1006,7 @@ kernel void coinFinalize(
                 float vInN = dot(c.vel.xyz, axis);   // pre-contact approach (<0 = into surface)
                 if (vInN < -0.8) {
                     float vN = dot(v, axis);
-                    v += (-u.restitution * vInN - vN) * axis;
+                    v += (-cdEffectiveCOR(u, -vInN) * vInN - vN) * axis;  // impact speed = −vInN
                 }
             }
         }
@@ -1710,6 +1730,9 @@ kernel void coinIntegrateVelocityCS(
     }
     float3 v = c.vel.xyz;
     v.y -= u.gravity * u.dt;
+    if (u.quadraticDrag > 0.0) {
+        v -= u.quadraticDrag * length(v) * v * u.dt;   // ∝v² drag (see coinIntegrate)
+    }
     v   *= u.linDamping;
     coins[id].prevPos.xyz = c.posInvMass.xyz;     // for finalize sleep / diagnostics
     coins[id].prevOrient  = c.orient;
@@ -1793,7 +1816,7 @@ kernel void coinSolveVelocityColor(
     float vn = dot(vrel, n);                       // <0 = closing along the normal
 
     // ── REAL normal impulse (restitution only above the threshold) ────────────
-    float restE = (vn < -u.restThreshold) ? u.restitution : 0.0;
+    float restE = (vn < -u.restThreshold) ? cdEffectiveCOR(u, -vn) : 0.0;
     float jnOld = c.rA.w;
     float dJn = -(vn + restE * vn) / kN;           // drive vn → −e·vn
     float jnNew = max(jnOld + dJn, 0.0);           // accumulated, non-adhesive
