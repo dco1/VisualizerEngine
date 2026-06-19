@@ -2101,7 +2101,12 @@ struct PBDSweptTubeUniforms {
     float bodyRadius;      // frank radius (m) — spine centres confined to R − r
     float stiffness;       // 0…1 fraction of the penetration corrected per substep
     float maxPush;         // > 0 → clamp per-substep inward push (m); 0 = unlimited
-    float pad0; float pad1; float pad2;
+    float wallFriction;    // 0…1 RETENTION of the circumferential (around-the-tube)
+                           // velocity per substep while in contact with the wall.
+                           // 1 = frictionless (the marble-in-a-bowl orbiting bug);
+                           // <1 damps the slosh so the dog settles to the channel
+                           // floor and rides there. Does NOT touch along-path speed.
+    float pad1; float pad2;
 };
 
 kernel void pbdSweptTubeConfine(
@@ -2146,20 +2151,35 @@ kernel void pbdSweptTubeConfine(
     float  rLen  = sqrt(a * a + b * b);
     float  rMax  = max(0.0f, u.tubeRadius - u.bodyRadius);
 
-    if (rLen > rMax && rLen > 1e-6) {
-        float2 radial  = float2(a, b) / rLen;             // outward unit in (right,up)
-        float3 inward  = -(radial.x * right + radial.y * up);
-        float  maxPush = (u.maxPush > 0.0) ? u.maxPush : 1e30;
-        float  pen     = min((rLen - rMax) * u.stiffness, maxPush);
-        pos += inward * pen;
-        // Kill the outward radial velocity component so the frank settles against
-        // the wall instead of pinging back out (mirrors pbdSelfCollide's cup-wall).
-        float3 vel = pos - prev;
-        float  vR  = dot(vel, inward);                    // > 0 = inward, < 0 = outward
-        if (vR < 0.0) {
-            vel -= inward * vR;
-            prev = pos - vel;
+    if (rLen > 1e-6) {
+        float2 radial = float2(a, b) / rLen;              // outward unit in (right,up)
+        float3 inward = -(radial.x * right + radial.y * up);
+        float3 vel    = pos - prev;
+
+        // Radial confinement: push back inside the wall + kill the outward radial
+        // velocity so the frank settles against the wall instead of pinging out.
+        if (rLen > rMax) {
+            float maxPush = (u.maxPush > 0.0) ? u.maxPush : 1e30;
+            float pen     = min((rLen - rMax) * u.stiffness, maxPush);
+            pos += inward * pen;
+            vel = pos - prev;
+            float vR = dot(vel, inward);                  // > 0 = inward, < 0 = outward
+            if (vR < 0.0) vel -= inward * vR;
         }
+
+        // Circumferential WALL FRICTION: while in contact with the lower wall,
+        // damp the velocity component that orbits AROUND the tube (perpendicular
+        // to both the radial and the path tangent) so the dog settles to the
+        // channel floor and rides there, instead of sloshing around the pipe like
+        // a marble in a bowl. This is cross-sectional only — it never touches the
+        // along-path (tangent) speed, so the current still carries the dog.
+        if (rLen > 0.55f * rMax && u.wallFriction < 1.0f) {
+            float3 circ = -radial.y * right + radial.x * up;   // ⟂ radial, in the cross-section
+            float  vC   = dot(vel, circ);
+            vel -= circ * vC * (1.0f - u.wallFriction);
+        }
+
+        prev = pos - vel;
     }
 
     particles[id].positionAndInvMass.xyz = pos;
