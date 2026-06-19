@@ -256,6 +256,19 @@ public final class IlluminatoramaRenderer {
     // device + pipeline are available; when false the pass is skipped
     // regardless of `rtEnabled`.
     public var rtEnabled: Bool = false
+    /// Decouples the expensive opaque-geometry RT lighting pass (`rtLightingTLAS`
+    /// ≈ 18–50 ms — RT GI + soft shadows on the scene's *opaque* meshes) from
+    /// `rtEnabled`. Default `true` keeps the historical behaviour: turning
+    /// `rtEnabled` on runs that pass. Set `false` to keep the rest of the RT
+    /// machinery live — the **surface cache** (`surfaceCacheEnabled`, which
+    /// requires `rtEnabled`) and **glass caustics** that splat into it — while
+    /// skipping the opaque RT-lighting pass. The opaque geometry then renders
+    /// with the cheaper deferred lighting (same fallback the `rtEnabled = false`
+    /// path already uses), and glass still refracts/reflects it via the TLAS.
+    /// This is the "I want caustics, not RT GI on my floor" case (Glass Lab):
+    /// caustics need the cache (hence `rtEnabled`), but were dragging the
+    /// ~18 ms opaque pass along with them for no visible gain.
+    public var rtOpaqueLightingEnabled: Bool = true
     /// When true, the scene extractor bakes a world-space triangle soup from
     /// the scene it walks and feeds it to `setRTGeometry` (dirty-rebuilt), so
     /// RT GI + soft shadows + reflections work on ANY extracted overlay scene —
@@ -6258,7 +6271,14 @@ public final class IlluminatoramaRenderer {
         // ray counts) for nothing. The opaque floor then renders with the cheaper
         // deferred lighting; glass still refracts/reflects it via the TLAS. The soup
         // `else` branch already self-gates on `rtEnabled`.
-        if rtTLASActive && rtEnabled {
+        //
+        // `rtOpaqueLightingEnabled` (default true) is a SECOND gate so a scene that
+        // needs the surface cache / caustics (which require `rtEnabled`) can still
+        // skip THIS opaque pass without losing the cache. With it false here, the
+        // opaque geometry falls back to deferred lighting (exactly as in the
+        // `rtEnabled == false` case), the surface-cache update + caustic splat still
+        // run, and the glass still refracts via the live TLAS. See the flag's doc.
+        if rtTLASActive && rtEnabled && rtOpaqueLightingEnabled {
             encodeRTLightingTLASPass(cb)
         } else if !rtTLASActive {
             encodeRTLightingPass(cb)
