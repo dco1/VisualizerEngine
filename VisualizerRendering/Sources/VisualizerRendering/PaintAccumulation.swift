@@ -39,6 +39,8 @@ public final class PaintAccumulation {
     private let clearPipeline: MTLComputePipelineState
     private let decayPipeline: MTLComputePipelineState
     private let resolvePipeline: MTLComputePipelineState
+    private let floodPipeline: MTLComputePipelineState
+    private let coveragePipeline: MTLComputePipelineState
 
     /// The persistent canvas. Bound to the surface material's `diffuse.contents`.
     public let texture: MTLTexture
@@ -93,7 +95,9 @@ public final class PaintAccumulation {
               let dp = engine.pipeline("paintDripStep"),
               let cp = engine.pipeline("paintClear"),
               let dy = engine.pipeline("paintDecay"),
-              let rs = engine.pipeline("paintResolve") else {
+              let rs = engine.pipeline("paintResolve"),
+              let fl = engine.pipeline("paintFlood"),
+              let cv = engine.pipeline("paintCoverage") else {
             Self.log.error("paint pipeline lookup failed")
             return nil
         }
@@ -102,6 +106,8 @@ public final class PaintAccumulation {
         self.clearPipeline = cp
         self.decayPipeline = dy
         self.resolvePipeline = rs
+        self.floodPipeline = fl
+        self.coveragePipeline = cv
 
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba16Float, width: width, height: height, mipmapped: false)
@@ -273,6 +279,64 @@ public final class PaintAccumulation {
                             threadsPerThreadgroup: MTLSize(width: w, height: h, depth: 1))
         enc.endEncoding()
         atlas.blitLiveSlice(slice, from: staging, on: cb)
+    }
+
+    // ── Repaint flood front ────────────────────────────────────────
+    /// Which way the new-colour wave flows across this canvas.
+    public enum FloodAxis { case wallDown, floorRadial }
+
+    /// Mirrors `FloodUniforms` in PaintAccumulation.metal.
+    private struct FloodUniforms {
+        var color: SIMD4<Float>   // rgb + wetness
+        var front: SIMD4<Float>   // prevPos, curPos, seamV, mode
+        var drip:  SIMD4<Float>   // seed, fingerAmp, fingerFreq, feather
+    }
+
+    /// Advance a repaint wave one frame: write `newColour` into the band the front
+    /// swept between `prevPos` and `curPos` (in front-coordinate space — v for a wall
+    /// flowing down, |v−seamV| for a floor spreading from the wall seam). Only the
+    /// fresh band is written, so dabs that landed on already-covered texels survive.
+    /// `fingerAmp`/`fingerFreq` give the leading edge its dripping rivulets.
+    public func floodFront(newColour: SIMD3<Float>, axis: FloodAxis,
+                           prevPos: Float, curPos: Float, seamV: Float = 0,
+                           fingerAmp: Float = 0.12, fingerFreq: Float = 90,
+                           feather: Float = 0.02, wetness: Float = 1.0,
+                           seed: Float = 0) {
+        guard curPos > prevPos else { return }
+        guard let cb = engine.commandQueue.makeCommandBuffer(),
+              let enc = cb.makeComputeCommandEncoder() else { return }
+        cb.label = "PaintAccumulation.flood"
+        enc.setComputePipelineState(floodPipeline)
+        enc.setTexture(texture, index: 0)
+        var u = FloodUniforms(
+            color: SIMD4(newColour, wetness),
+            front: SIMD4(prevPos, curPos, seamV, axis == .wallDown ? 0 : 1),
+            drip:  SIMD4(seed, fingerAmp, fingerFreq, feather))
+        enc.setBytes(&u, length: MemoryLayout<FloodUniforms>.stride, index: 0)
+        dispatch2D(enc, pipeline: floodPipeline)
+        enc.endEncoding()
+        cb.commit()
+    }
+
+    /// Fraction of texels (0…1) whose RGB matches `colour` within `tolerance`.
+    /// DIAGNOSTIC ONLY — synchronous read-back; never call on the render path.
+    public func coverageFraction(of colour: SIMD3<Float>, tolerance: Float = 0.06) -> Float {
+        guard let counter = engine.device.makeBuffer(
+            length: MemoryLayout<UInt32>.stride * 2, options: .storageModeShared) else { return 0 }
+        memset(counter.contents(), 0, MemoryLayout<UInt32>.stride * 2)
+        guard let cb = engine.commandQueue.makeCommandBuffer(),
+              let enc = cb.makeComputeCommandEncoder() else { return 0 }
+        enc.setComputePipelineState(coveragePipeline)
+        enc.setTexture(texture, index: 0)
+        var t = SIMD4<Float>(colour, tolerance)
+        enc.setBytes(&t, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+        enc.setBuffer(counter, offset: 0, index: 1)
+        dispatch2D(enc, pipeline: coveragePipeline)
+        enc.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()  // gpu-ok: diagnostic read-back, not the render path
+        let p = counter.contents().bindMemory(to: UInt32.self, capacity: 2)
+        return Float(p[0]) / Float(max(1, p[1]))
     }
 
     private func dispatch2D(_ enc: MTLComputeCommandEncoder, pipeline: MTLComputePipelineState) {

@@ -251,3 +251,64 @@ kernel void paintClear(texture2d<float, access::write> tex [[texture(0)]],
     if (gid.x >= tex.get_width() || gid.y >= tex.get_height()) return;
     tex.write(c.rgba, gid);
 }
+
+// ── Repaint flood front ───────────────────────────────────────────────────────
+// A wave of a NEW colour pours over the canvas, covering everything (old paint and
+// freshly-stamped ball dabs alike). It is NOT a composite-time override: it WRITES
+// the new colour into the buffer along an advancing front, so once a texel is
+// covered it becomes the new substrate and balls paint ON TOP of it afterward. To
+// avoid re-erasing those later dabs, each dispatch writes ONLY the band the front
+// swept THIS frame — (prevPos, curPos] in "front-coordinate" space. A per-column
+// hash offset makes the leading edge drip in fingers (a waterfall, not a wipe).
+struct FloodUniforms {
+    float4 color;    // rgb = new colour, w = wetness written into alpha
+    float4 front;    // x = prevPos, y = curPos, z = seamV (floor), w = mode (0 = wall-down, 1 = floor-radial)
+    float4 drip;     // x = seed, y = fingerAmp, z = fingerFreq, w = feather
+};
+
+static inline float pf_hash(float x) { return fract(sin(x * 127.1 + 311.7) * 43758.5453); }
+
+kernel void paintFlood(texture2d<float, access::read_write> tex [[texture(0)]],
+                       constant FloodUniforms& u [[buffer(0)]],
+                       uint2 gid [[thread_position_in_grid]]) {
+    uint W = tex.get_width(), H = tex.get_height();
+    if (gid.x >= W || gid.y >= H) return;
+    float2 uv = (float2(gid) + 0.5) / float2(W, H);
+
+    // Per-column drip "finger" lead: a couple of hash octaves so some columns run
+    // ahead of the bulk front. lead ∈ [0, fingerAmp].
+    float f  = uv.x * u.drip.z;
+    float lead = (0.6 * pf_hash(floor(f) + u.drip.x)
+                + 0.4 * pf_hash(floor(f * 3.17) + u.drip.x * 1.7)) * u.drip.y;
+
+    // Front coordinate: how "deep" this texel is along the flow. Columns with a
+    // bigger lead are reached earlier (their fc is smaller).
+    float fc = (u.front.w < 0.5)
+             ? (uv.y - lead)                       // wall: flow DOWN in +v
+             : (abs(uv.y - u.front.z) - lead);     // floor: spread OUT from the seam row
+
+    // Write only the band the front crossed THIS frame: (prevPos, curPos]. Each
+    // texel is written exactly once (the frame the front reaches it), so dabs balls
+    // lay on already-covered texels survive. FULL replacement — a wet paint front has
+    // a defined leading edge; its organic raggedness comes from the per-column finger
+    // lead above (and the drip agents seeded ahead of it), not a per-texel fade,
+    // which — with write-once — would leave 15% of the old colour showing forever.
+    if (fc <= u.front.x || fc > u.front.y) return;
+    float4 prev = tex.read(gid);
+    tex.write(float4(u.color.rgb, max(prev.a, u.color.w)), gid);
+}
+
+// ── Coverage measurement (instrumentation) ────────────────────────────────────
+// Counts texels whose RGB matches a target colour within a tolerance. counter[0] =
+// matches, counter[1] = total. Used by the repaint probe to prove the wave reaches
+// 100% coverage and to time it; never on the per-frame render path.
+kernel void paintCoverage(texture2d<float, access::read> tex [[texture(0)]],
+                          constant float4& target [[buffer(0)]],   // rgb + tol in w
+                          device atomic_uint* counter [[buffer(1)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= tex.get_width() || gid.y >= tex.get_height()) return;
+    atomic_fetch_add_explicit(&counter[1], 1u, memory_order_relaxed);
+    float3 c = tex.read(gid).rgb;
+    if (distance(c, target.rgb) <= target.w)
+        atomic_fetch_add_explicit(&counter[0], 1u, memory_order_relaxed);
+}
