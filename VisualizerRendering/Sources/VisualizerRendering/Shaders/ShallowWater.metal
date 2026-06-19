@@ -58,7 +58,7 @@ struct SWEUniforms {
     uint  Nwidth;
     uint  riderCount;
     float totalLength;
-    float pad0;
+    float maxDepth;   // hard ceiling on water column h (m); 0 = uncapped. Was pad0.
     float pad1;
     float pad2;
 };
@@ -161,6 +161,14 @@ kernel void sweAdvance(
     // slightly negative; clamp keeps `√(g·h)` real downstream.
     Unew.x = max(Unew.x, 0.0f);
 
+    // h ≤ maxDepth — the solver is a lidless height field, so nothing otherwise
+    // stops water piling deeper than the tube it lives in (the closed-loop
+    // pooling that lofted franks out the open top). Cap to the tube's holding
+    // depth so neither the surface nor the riders can rise above the tube. The
+    // velocity clamp below already ASSUMES this h_max for CFL; this enforces it.
+    // 0 = uncapped (any other future caller that leaves maxDepth unset).
+    if (u.maxDepth > 0.0f) Unew.x = min(Unew.x, u.maxDepth);
+
     // Velocity clamp — must stay under the CFL bound for the cross-width
     // direction. With dxW ≈ 2.5 cm and the substep dt held to ≤ 4 ms by
     // ShallowWaterSim.maxSubDt, dxW/subDt ≈ 6.25 m/s, and the gravity wave
@@ -260,8 +268,15 @@ struct SurfaceUniforms {
     float microNormalAmp;    // strength of high-frequency normal perturbation
     float microNormalFreq;   // spatial frequency (cycles per metre) of the noise
     float foamMaskGain;      // multiplier on foam-field → vertex-color whiteness
-    float pad0;
-    float pad1;
+    float clipUpY;           // > 0 → collapse the surface ring to the centerline
+                             // where the cradle up.y falls below this (inverted /
+                             // steep spans can't hold an open free surface: loop
+                             // top, corkscrew, splashdown dive). 0 = never clip.
+    float looping;           // 1 = closed loop (wrap the last ring to the first,
+                             // seamless recirculation). 0 = ONE-WAY: clamp the
+                             // path-sample lookup so the final ring does NOT wrap
+                             // back to the inlet — that wrap is what stretched the
+                             // splashdown surface into a vertical spike (Descent).
     float pad2;
 };
 
@@ -302,13 +317,32 @@ kernel void surfaceFromSWE(
 
     float ringF = float(ring) / float(u.rings - 1);
     float fIdx  = ringF * float(u.pathSamples);
-    uint  i0    = uint(floor(fIdx)) % u.pathSamples;
-    uint  i1    = (i0 + 1u) % u.pathSamples;
+    uint  i0, i1;
+    if (u.looping != 0.0f) {
+        i0 = uint(floor(fIdx)) % u.pathSamples;
+        i1 = (i0 + 1u) % u.pathSamples;
+    } else {
+        // One-way: clamp (no wrap) so the final ring stays at the splashdown end
+        // instead of stretching back up to the inlet (the vertical-spike bug).
+        i0 = min(uint(floor(fIdx)), u.pathSamples - 1u);
+        i1 = min(i0 + 1u, u.pathSamples - 1u);
+    }
     float frac  = fIdx - floor(fIdx);
 
     float3 pos   = mix(pathPos[i0].xyz,   pathPos[i1].xyz,   frac);
     float3 right = normalize(mix(pathRight[i0].xyz, pathRight[i1].xyz, frac));
     float3 up    = normalize(mix(pathUp[i0].xyz,    pathUp[i1].xyz,    frac));
+
+    // Inverted / steep-span clip: where the channel tilts past the threshold an
+    // open free surface is unphysical (it would render on the loop ceiling or
+    // spike on the splashdown dive). Collapse the whole ring to the centerline
+    // (coincident verts → zero-area triangles → invisible) with alpha 0.
+    if (u.clipUpY > 0.0f && up.y < u.clipUpY) {
+        positions[id]    = float4(pos, 1.0f);
+        normals[id]      = float4(up, 0.0f);
+        vertexColors[id] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+        return;
+    }
 
     // 1:1 cell → vertex map (rings == Narc, segments == Nwidth).
     uint cell = ring * u.segments + seg;

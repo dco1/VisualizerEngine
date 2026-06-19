@@ -2069,3 +2069,99 @@ kernel void pbdTubeExpand(
         colors [capBase + 1u] = float4(dipCoatMultiplier(verts[capBase + 1u], u, 0xA002u), 0.75f);
     }
 }
+
+
+// ── KERNEL: swept-tube interior confinement (Hotdog Waterslide Descent) ──────
+//
+// Keeps a frank's spine particles INSIDE the analytic swept tube — an inside-out
+// cylinder of radius `tubeRadius` swept along the path centerline. The SDF
+// `PBDCollider` primitives (sphere/capsule/box) can only push particles OUT of a
+// solid shape, so a *curved tube interior* needs a dedicated one-sided
+// constraint: the swept-tube generalisation of the vertical cup-wall already in
+// `pbdSelfCollide` (`wallEnabled` / `wallRadius`).
+//
+// Per particle: search a LOCAL arc window around the owning frank's current
+// arc-centre `sCenter` (passed per dispatch) for the nearest path sample, build
+// that sample's cross-section basis (right, up), and if the particle's radial
+// offset exceeds `tubeRadius − bodyRadius`, push it back inward and cancel the
+// outward radial velocity. Windowing by the frank's OWN sCenter is what makes a
+// path that passes near itself safe — a frank is only ever confined to ITS
+// strand of track, never grabbed by a different nearby strand.
+//
+// Dispatched per frank (one tube's spine = one dispatch), so `particles` is that
+// frank's spine buffer and `sCenter` is its scalar arc-centre. The path buffers
+// are shared, read-only, uniform-arc samples (sample i at arc = totalLength·i/N).
+struct PBDSweptTubeUniforms {
+    uint  particleCount;   // spine particles for THIS frank
+    uint  pathSamples;     // number of uniform-arc samples in the path buffers
+    float totalLength;     // path length (m)
+    float sCenter;         // this frank's current arc-centre (m)
+    float windowArc;       // ± arc searched around sCenter for the nearest sample (m)
+    float tubeRadius;      // flume interior radius (m)
+    float bodyRadius;      // frank radius (m) — spine centres confined to R − r
+    float stiffness;       // 0…1 fraction of the penetration corrected per substep
+    float maxPush;         // > 0 → clamp per-substep inward push (m); 0 = unlimited
+    float pad0; float pad1; float pad2;
+};
+
+kernel void pbdSweptTubeConfine(
+    device PBDParticle*            particles [[ buffer(0) ]],
+    device const float4*           pathPos   [[ buffer(1) ]],   // xyz = centerline pos
+    device const float4*           pathRight [[ buffer(2) ]],   // xyz = cradle right
+    device const float4*           pathUp    [[ buffer(3) ]],   // xyz = cradle up
+    constant PBDSweptTubeUniforms& u         [[ buffer(4) ]],
+    uint id [[ thread_position_in_grid ]]
+) {
+    if (id >= u.particleCount) return;
+    if (u.pathSamples < 2u) return;
+    PBDParticle p = particles[id];
+    if (p.positionAndInvMass.w == 0.0) return;  // pinned (cheap guard; franks are dynamic)
+
+    float3 pos  = p.positionAndInvMass.xyz;
+    float3 prev = p.prevPositionAndPad.xyz;
+
+    float dxS = u.totalLength / float(u.pathSamples);
+    if (dxS < 1e-6) return;
+    int last    = int(u.pathSamples) - 1;
+    int iCenter = int(round(u.sCenter / dxS));
+    int halfN   = int(ceil(u.windowArc / dxS)) + 1;
+    int iLo = max(0,    iCenter - halfN);
+    int iHi = min(last, iCenter + halfN);
+
+    // Nearest centerline sample in the local window (one-way path, no wrap).
+    int   best   = iLo;
+    float bestD2 = 1e30;
+    for (int i = iLo; i <= iHi; ++i) {
+        float3 d  = pos - pathPos[i].xyz;
+        float  d2 = dot(d, d);
+        if (d2 < bestD2) { bestD2 = d2; best = i; }
+    }
+
+    float3 c     = pathPos[best].xyz;
+    float3 right = pathRight[best].xyz;
+    float3 up    = pathUp[best].xyz;
+    float3 off   = pos - c;
+    float  a     = dot(off, right);
+    float  b     = dot(off, up);
+    float  rLen  = sqrt(a * a + b * b);
+    float  rMax  = max(0.0f, u.tubeRadius - u.bodyRadius);
+
+    if (rLen > rMax && rLen > 1e-6) {
+        float2 radial  = float2(a, b) / rLen;             // outward unit in (right,up)
+        float3 inward  = -(radial.x * right + radial.y * up);
+        float  maxPush = (u.maxPush > 0.0) ? u.maxPush : 1e30;
+        float  pen     = min((rLen - rMax) * u.stiffness, maxPush);
+        pos += inward * pen;
+        // Kill the outward radial velocity component so the frank settles against
+        // the wall instead of pinging back out (mirrors pbdSelfCollide's cup-wall).
+        float3 vel = pos - prev;
+        float  vR  = dot(vel, inward);                    // > 0 = inward, < 0 = outward
+        if (vR < 0.0) {
+            vel -= inward * vR;
+            prev = pos - vel;
+        }
+    }
+
+    particles[id].positionAndInvMass.xyz = pos;
+    particles[id].prevPositionAndPad.xyz = prev;
+}

@@ -110,6 +110,15 @@ public final class PBDTubeBatch {
     /// collider buffer at the start of every substep CB (cheap — tens of entries).
     private var staticStaging: MTLBuffer?
 
+    /// Optional extra constraint pass, run once per substep on the shared compute
+    /// encoder AFTER the final floor pass and BEFORE tube-expand — so the mesh
+    /// reflects whatever it corrects. The scene owns the pipeline + any buffers
+    /// and dispatches per tube inside the closure (mirroring `dispatchFloor`).
+    /// `nil` (the default) ⇒ byte-identical to the historical tick for every
+    /// existing caller (HotdogDrop+/Ultra/Press). Used by the Hotdog Waterslide
+    /// Descent for its inside-out swept-tube confinement (`pbdSweptTubeConfine`).
+    public var extraConstraintPass: ((MTLComputeCommandEncoder, [PBDTubeRenderer]) -> Void)?
+
     // ── Constraint layout + collider-slot cache ────────────────────────────────
     // Rebuilt only on spawn/cull (when `markDirty()` is called). Reused across
     // every substep within the same tick to avoid heap allocations at 240 Hz.
@@ -315,6 +324,14 @@ public final class PBDTubeBatch {
             }
             for tube in tubes { tube.solver.dispatchFloor(into: enc) }
             enc.memoryBarrier(scope: .buffers)
+
+            // Phase 3c: optional scene confinement pass (e.g. swept-tube interior).
+            // nil for every existing caller → no-op. Runs after the floor so the
+            // expand below meshes the confined positions.
+            if let extraConstraintPass {
+                extraConstraintPass(enc, tubes)
+                enc.memoryBarrier(scope: .buffers)
+            }
 
             // Phase 4: expand tube mesh — reads final positions, writes
             // the Illuminatorama-visible position + normal buffers.
