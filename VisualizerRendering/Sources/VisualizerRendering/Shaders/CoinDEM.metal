@@ -995,7 +995,11 @@ kernel void coinFinalize(
         // RESTING on a surface (n.y>0.3). A real downward impact bounces; a gentle
         // position-fix hop is capped so a settled pile doesn't drift upward.
         if (support) {
-            if (ballisticVy > -0.4) {
+            // Below restThreshold the impact is too gentle to read as a real bounce —
+            // it just hops a few mm in place (the visible "bouncing in place" jitter),
+            // so cap it instead of bouncing. A scene with a high restitution wants this
+            // raised so the sub-threshold tail of in-place micro-bounces dies cleanly.
+            if (ballisticVy > -u.restThreshold) {
                 v.y = min(v.y, 0.25);
             } else {
                 v.y = -cdEffectiveCOR(u, -ballisticVy) * ballisticVy;  // impact speed = −ballisticVy
