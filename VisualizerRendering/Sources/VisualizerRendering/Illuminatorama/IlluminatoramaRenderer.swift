@@ -900,6 +900,19 @@ public final class IlluminatoramaRenderer {
     /// from each glass instance's `rdrf.w` (the reserved "fresnelPower" slot).
     public var glassCheapMode: Int = 0
 
+    /// THIN-FILM IRIDESCENCE for cheap-glass mode 2 (soap bubbles — Bubble Lab).
+    /// Master strength of the interference coat added on top of the screen-space
+    /// refraction. 0 (default) → an EXACT no-op, so every other cheap-glass scene
+    /// is unaffected. The coat colour is computed in-shader from the optical path
+    /// difference `2·n·d·cosθ` at R/G/B wavelengths — real two-beam interference,
+    /// not a scrolled texture. Per-bubble thickness variation rides in each glass
+    /// instance's `dispersionPad.y`.
+    public var thinFilmStrength: Float = 0
+    /// Base soap-film thickness in nanometres at the equator (interference order).
+    public var thinFilmThicknessNm: Float = 320
+    /// Refractive index of the film itself (water + surfactant ≈ 1.33).
+    public var thinFilmIOR: Float = 1.33
+
     private var glassRTPipeline: MTLRenderPipelineState?       // illumi_glass_rt_fs (traces TLAS)
     private var glassFallbackPipeline: MTLRenderPipelineState? // illumi_glass_fallback_fs (Fresnel+sky)
     private var glassDepthState: MTLDepthStencilState?
@@ -7058,6 +7071,11 @@ public final class IlluminatoramaRenderer {
         u.cheapGlassMode = cheap ? UInt32(glassCheapMode) : 0
         u.viewW = Float(hdrCompositeTexture.width)
         u.viewH = Float(hdrCompositeTexture.height)
+        // Thin-film iridescence (cheap mode 2 only; default strength 0 = no-op).
+        u.time = time
+        u.thinFilmStrength = (cheap && glassCheapMode == 2) ? max(0, thinFilmStrength) : 0
+        u.filmThicknessNm = max(1, thinFilmThicknessNm)
+        u.filmIOR = max(1.01, thinFilmIOR)
         memcpy(glassRTUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaGlassRTUniforms>.stride)
 
         // Screen-space cheap glass (mode 2) samples the scene BEHIND the pane: copy
@@ -7592,7 +7610,7 @@ public final class IlluminatoramaRenderer {
     private func encodeSSAOPass(_ cb: MTLCommandBuffer) {
         let halfW = max(1, width / 2)
         let halfH = max(1, height / 2)
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "ssao") else { return }
         enc.label = "Illuminatorama.ssao"
         enc.setComputePipelineState(ssaoPipeline)
         enc.setTexture(depthTexture, index: 0)
@@ -7607,7 +7625,7 @@ public final class IlluminatoramaRenderer {
         guard ssaoDenoiseEnabled else { return }
         let halfW = max(1, width / 2)
         let halfH = max(1, height / 2)
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "ssao.spatial") else { return }
         enc.label = "Illuminatorama.ssao.spatial"
         enc.setComputePipelineState(ssaoSpatialPipeline)
         enc.setTexture(aoTexture,        index: 0)   // raw AO input
@@ -7623,7 +7641,7 @@ public final class IlluminatoramaRenderer {
         guard ssaoDenoiseEnabled else { return }
         let halfW = max(1, width / 2)
         let halfH = max(1, height / 2)
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "ssao.temporal") else { return }
         enc.label = "Illuminatorama.ssao.temporal"
         enc.setComputePipelineState(ssaoTemporalPipeline)
         enc.setTexture(aoFilteredTexture,        index: 0)  // filtered current
@@ -7761,7 +7779,7 @@ public final class IlluminatoramaRenderer {
     // 2) Temporal — accumulate history with YCoCg variance clamp.
     // 3) Composite — hdrComposite = hdrTexture + denoisedSSR.
     private func encodeSSRGather(_ cb: MTLCommandBuffer) {
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "ssr.gather") else { return }
         enc.label = "Illuminatorama.ssr.gather"
         enc.setComputePipelineState(ssrGatherPipeline)
         enc.setTexture(hdrTexture,       index: 0)
@@ -7776,7 +7794,7 @@ public final class IlluminatoramaRenderer {
 
     private func encodeSSRTemporalPass(_ cb: MTLCommandBuffer) {
         guard ssrDenoiseEnabled else { return }
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "ssr.temporal") else { return }
         enc.label = "Illuminatorama.ssr.temporal"
         enc.setComputePipelineState(ssrTemporalPipeline)
         enc.setTexture(ssrRawTexture,             index: 0)  // current gather
@@ -7790,7 +7808,7 @@ public final class IlluminatoramaRenderer {
     }
 
     private func encodeSSRComposite(_ cb: MTLCommandBuffer) {
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "ssr.composite") else { return }
         enc.label = "Illuminatorama.ssr.composite"
         enc.setComputePipelineState(ssrCompositePipeline)
         enc.setTexture(hdrTexture,        index: 0)  // base lighting
@@ -8113,7 +8131,7 @@ public final class IlluminatoramaRenderer {
     /// disabled — bloom + tonemap then read directly from hdrCompositeTexture.
     private func encodeTAAResolve(_ cb: MTLCommandBuffer) {
         guard taaEnabled else { return }
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "taa") else { return }
         enc.label = "Illuminatorama.taa"
         enc.setComputePipelineState(taaResolvePipeline)
         enc.setTexture(hdrCompositeTexture,     index: 0)
@@ -8300,7 +8318,7 @@ public final class IlluminatoramaRenderer {
     private func encodeBloomPasses(_ cb: MTLCommandBuffer) {
         let halfW = max(1, width / 2)
         let halfH = max(1, height / 2)
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "bloom") else { return }
         enc.label = "Illuminatorama.bloom"
 
         enc.setComputePipelineState(bloomThresholdPipeline)

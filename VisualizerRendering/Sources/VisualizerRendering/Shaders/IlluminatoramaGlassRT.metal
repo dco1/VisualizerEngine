@@ -103,6 +103,11 @@ struct GlassRTUniforms {
     uint   dispersionEnabled;   // global gate; per-instance value still required
     uint   cheapGlassMode;      // 0 = plain fallback, 1 = synthetic, 2 = screen-space
     float  viewW; float viewH;  // viewport px (mode 2: clipPos.xy → backdrop UV)
+    // ── Thin-film iridescence (soap bubbles — Bubble Lab) ────────────────────
+    float  time;                // swirl-animation clock (seconds)
+    float  thinFilmStrength;    // 0 = OFF (exact no-op for every other scene)
+    float  filmThicknessNm;     // base film thickness (nm) at the equator
+    float  filmIOR;             // soap-film refractive index (~1.33)
 };
 
 // Mirror of FrameUniforms' leading fields the glass VS needs (viewProjection is
@@ -138,6 +143,53 @@ static inline float2 dirToEquirectUV(float3 d) {
 static inline float3 sampleSky(texture2d<float, access::sample> sky, float3 dir, float scale) {
     constexpr sampler s(filter::linear, s_address::repeat, t_address::clamp_to_edge);
     return sky.sample(s, dirToEquirectUV(normalize(dir))).rgb * scale;
+}
+
+// ── THIN-FILM INTERFERENCE (soap-bubble iridescence) ─────────────────────────
+// Reflected colour from a single thin dielectric film over a higher-index
+// boundary. The reflected spectrum is modulated by the optical path difference
+//   OPD = 2·n·d·cosθt        (θt = refraction angle INSIDE the film)
+// with a half-wave (π) shift added for the "hard" reflection off the denser
+// film. We sample the interference comb at R/G/B reference wavelengths and build
+// an RGB approximation — the same realtime trick Belcour & Barla (2017) and the
+// Filament / Standard-Surface thin-film coats use. This is REAL interference
+// math, not a scrolled rainbow texture.
+static inline float3 thinFilmIridescence(float thicknessNm, float cosI, float filmIOR) {
+    float sin2 = (1.0 - cosI * cosI) / (filmIOR * filmIOR);     // Snell
+    float cosT = sqrt(max(0.0, 1.0 - sin2));                    // cosθ inside film
+    float opd  = 2.0 * filmIOR * thicknessNm * cosT;           // nm
+    const float3 lambda = float3(680.0, 550.0, 440.0);         // R, G, B (nm)
+    float3 phase = (2.0 * M_PI_F) * (opd / lambda) + M_PI_F;   // + half-wave shift
+    float3 c = 0.5 + 0.5 * cos(phase);                         // two-beam intensity
+    // Soften toward the pastel magenta-gold-cyan-green of a real DRAINING film:
+    // ease the band contrast (no c² over-sharpening → less "oil-slick") and pull
+    // ~15% toward luminance so the rings read pastel, not full-primary.
+    c = c * (0.6 + 0.4 * c);                                    // gentle contrast
+    float lum = dot(c, float3(0.299, 0.587, 0.114));
+    return mix(float3(lum), c, 0.85);
+}
+
+// Cheap smooth value noise (3D) + 2-octave fbm for the swirling drainage /
+// turbulence of the film thickness. Animation comes from advecting the sample
+// point by `time` (NOT reseeding), so it stays stable under TAA.
+static inline float vnHash3(float3 p) {
+    p = fract(p * 0.3183099 + 0.1);
+    p *= 17.0;
+    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+}
+static inline float valueNoise3(float3 x) {
+    float3 i = floor(x), f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
+    float n000 = vnHash3(i + float3(0,0,0)), n100 = vnHash3(i + float3(1,0,0));
+    float n010 = vnHash3(i + float3(0,1,0)), n110 = vnHash3(i + float3(1,1,0));
+    float n001 = vnHash3(i + float3(0,0,1)), n101 = vnHash3(i + float3(1,0,1));
+    float n011 = vnHash3(i + float3(0,1,1)), n111 = vnHash3(i + float3(1,1,1));
+    float nx00 = mix(n000, n100, f.x), nx10 = mix(n010, n110, f.x);
+    float nx01 = mix(n001, n101, f.x), nx11 = mix(n011, n111, f.x);
+    return mix(mix(nx00, nx10, f.y), mix(nx01, nx11, f.y), f.z);
+}
+static inline float filmFbm(float3 p) {
+    return 0.65 * valueNoise3(p) + 0.35 * valueNoise3(p * 2.7 + 11.3);
 }
 
 // World normal of a triangle hit from the per-instance normal matrix.
@@ -601,6 +653,49 @@ fragment float4 illumi_glass_fallback_fs(
             // the Fresnel edge fold in strongly at grazing so the silhouette pops.
             float Fp = saturate(F * 1.3 + 0.02);
             float3 color = mix(transmitted, refl, Fp) + edge * Fp + glint;
+
+            // ── SOAP-BUBBLE thin-film shell ─────────────────────────────────
+            // OFF unless a host opts in (`thinFilmStrength > 0`) → the opaque
+            // fold-in path below is the EXACT prior behaviour for every other
+            // cheap-glass scene (Hot Dog Press, …). When on, the shell is a
+            // TRANSMISSIVE film: the body returns a low alpha so the scene AND
+            // bubbles behind it show through (real bubble centres are windows),
+            // and the iridescence is SILHOUETTE-WEIGHTED so it concentrates at
+            // the rim and fades to a whisper through the centre. Composited via
+            // straight alpha over the back-to-front-sorted framebuffer.
+            if (u.thinFilmStrength > 0.0) {
+                // Film thickness over the shell: gravity DRAINAGE thins the top
+                // (high N.y → thinner) + a fine swirling turbulence advected by
+                // time (NOT reseeded → TAA-stable). Per-bubble scale in dispPad.y.
+                float drain = mix(1.30, 0.40, saturate(N.y * 0.5 + 0.5));
+                float perBubble = max(0.2, gi.dispersionPad.y);
+                float3 sp = in.worldPos * 15.0
+                          + float3(0.0, -u.time * 0.5, u.time * 0.18);
+                float swirl = filmFbm(sp);
+                float thick = u.filmThicknessNm * perBubble * drain
+                            * (0.6 + 0.8 * swirl);
+                float3 irid = thinFilmIridescence(thick, cosI, max(1.05, u.filmIOR));
+
+                float coatW = pow(graze, 2.2);              // silhouette weight
+                // Bright, thin, near-white Fresnel rim — a HOT LIP that brightens
+                // steeply only in the last few degrees toward the silhouette (high
+                // exponent), the "film catching light" cue against the dark tank.
+                float rimW = pow(graze, 9.0);
+                // The shell's own contribution: a faint refracted scene that bites
+                // toward the rim (the lensing), the interference film (whisper in
+                // the centre, strong at the rim), a sky reflection, the rim, glint.
+                float3 srcRGB = behind * (F * 0.9)
+                              + irid * (u.thinFilmStrength * (0.04 + coatW))
+                              + refl * (0.10 + 0.5 * F)
+                              + float3(1.0) * (rimW * 1.15)
+                              + glint;
+                float iridLum = dot(irid, float3(0.299, 0.587, 0.114));
+                // Mostly TRANSPARENT in the centre (~0.05), opaque toward the rim.
+                float a = saturate(0.05 + coatW * 1.25 + rimW * 1.0
+                                   + specA * 0.7
+                                   + iridLum * u.thinFilmStrength * 0.04);
+                return float4(srcRGB, a);
+            }
             return float4(color, 1.0);                       // opaque (folds scene in)
         }
 

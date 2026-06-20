@@ -600,6 +600,18 @@ struct IlluminatoramaGlassRTUniforms {
     var cheapGlassMode: UInt32 = 0
     /// Viewport size in pixels (mode 2 maps `clipPos.xy` → backdrop UV).
     var viewW: Float = 0; var viewH: Float = 0
+    // ── Thin-film iridescence (soap bubbles — Bubble Lab) ────────────
+    /// Animation clock (seconds) for the swirling film-thickness field. Driven
+    /// from `renderer.time`.
+    var time: Float = 0
+    /// Master strength of the thin-film interference coat added in cheap mode 2.
+    /// 0 = OFF → an EXACT no-op (every other cheap-glass scene is unaffected).
+    var thinFilmStrength: Float = 0
+    /// Base soap-film thickness in nanometres at the bubble's equator (the
+    /// interference order). ~100–600 nm is the visible first/second-order range.
+    var filmThicknessNm: Float = 320
+    /// Refractive index of the soap film itself (water+surfactant ≈ 1.33).
+    var filmIOR: Float = 1.33
 }
 
 /// Per-frame uniforms for the glass caustics kernels. Mirror of `CausticUniforms`
