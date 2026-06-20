@@ -21,6 +21,22 @@ public final class SceneTimeline {
     private var bindingOrder: [String]
     private var lastAppliedTime: Double?
 
+    /// Live audio/MIDI modulation layer. Runs every `apply()` right after the
+    /// keyframe pass, blending source signals additively onto each binding's
+    /// base value (issue #63). Held here so every timeline-capable scene gets
+    /// modulation with no per-controller wiring.
+    public let modulation = ModulationRouter()
+
+    /// dt of the most recent `advance(by:)`, captured even when the playhead
+    /// isn't moving, so the modulation envelopes advance in real time while the
+    /// transport is paused (modulation is a live layer, not playhead-gated).
+    private var lastDt: Double = 1.0 / 60.0
+
+    /// Keyframe values written by the most recent keyframe pass, reused as the
+    /// moving base for modulation so it composes with (rather than replaces)
+    /// timeline automation.
+    private var lastSampled: [String: Double] = [:]
+
     /// Playhead time at the previous record tick, used to pin a "hold" keyframe
     /// at the old value just before a change so a setting reads as held-then-moved
     /// rather than ramping from the record-start anchor across an idle stretch.
@@ -29,6 +45,18 @@ public final class SceneTimeline {
     private var recLastValues: [String: Double] = [:]
 
     public var selectedTrackID: UUID?
+
+    /// Click-to-reveal signal (issue #63): a purple, modulation-driven settings
+    /// control sets this to its binding name to ask the app to open the Timeline
+    /// and scroll to that lane. `revealTick` bumps on every request so repeat
+    /// clicks of the same control re-fire even when the name is unchanged.
+    public private(set) var revealModulationName: String?
+    public private(set) var revealTick: Int = 0
+
+    public func requestRevealModulation(_ bindingName: String) {
+        revealModulationName = bindingName
+        revealTick &+= 1
+    }
 
     public init(
         duration: Double = 10,
@@ -76,6 +104,25 @@ public final class SceneTimeline {
 
     public func binding(named name: String) -> KeyframeBinding? {
         bindings[name]
+    }
+
+    /// Find the binding driving a given settings property (issue #63). The
+    /// key-path is the binding's `identity`, so a key-path-built settings control
+    /// links to its binding exactly.
+    public func binding(forIdentity identity: AnyKeyPath) -> KeyframeBinding? {
+        bindings.values.first { $0.identity == identity }
+    }
+
+    /// Whether the property at `identity` is currently modulated.
+    public func isModulated(identity: AnyKeyPath) -> Bool {
+        guard let name = binding(forIdentity: identity)?.name else { return false }
+        return modulation.isModulated(name)
+    }
+
+    /// Ask the app to reveal the lane for the property at `identity`.
+    public func requestRevealModulation(identity: AnyKeyPath) {
+        guard let name = binding(forIdentity: identity)?.name else { return }
+        requestRevealModulation(name)
     }
 
     // ── Track add / remove / reorder ─────────────────────────────
@@ -128,14 +175,72 @@ public final class SceneTimeline {
         // it — applying would overwrite the user's live edits. Stand down.
         if isRecording { return }
         let t = currentTime
-        if !isPlaying, let last = lastAppliedTime, last == t {
-            return
+
+        // The keyframe pass is cached: only re-sample when the playhead moved
+        // (or on the first apply after a seek). Modulation, by contrast, is a
+        // live layer that must run EVERY frame regardless of transport state.
+        let timeUnchanged = (!isPlaying && lastAppliedTime == t)
+        if !timeUnchanged {
+            lastAppliedTime = t
+            lastSampled.removeAll(keepingCapacity: true)
+            for track in tracks {
+                guard let v = track.sample(at: t) else { continue }
+                lastSampled[track.name] = v
+                bindings[track.name]?.set(v)
+            }
         }
-        lastAppliedTime = t
-        for track in tracks {
-            guard let v = track.sample(at: t) else { continue }
-            bindings[track.name]?.set(v)
+
+        // Live modulation, blended on top of the keyframe base. No-op (and
+        // skips the per-frame source pump) when nothing is assigned.
+        if !modulation.assignments.isEmpty {
+            ModulationRegistry.shared.frame(dt: lastDt)
+            modulation.apply(bindings: bindings, keyframeValues: lastSampled, dt: lastDt)
         }
+    }
+
+    /// Restore a binding to a value (used when modulation is removed and the
+    /// setting should return to its captured base).
+    public func setBinding(named name: String, to value: Double) {
+        bindings[name]?.set(value)
+    }
+
+    // ── Modulation (UI-facing convenience) ───────────────────────
+    // Wrap the router so views never have to fetch a binding's current value or
+    // thread the base-restore closure themselves.
+
+    /// Bindings not yet driven by any modulation assignment — the "add a
+    /// modulation lane" menu source.
+    public var unmodulatedBindings: [KeyframeBinding] {
+        allBindings.filter { !modulation.isModulated($0.name) }
+    }
+
+    @discardableResult
+    public func addModulation(
+        bindingName: String,
+        sourceID: String,
+        channelID: String
+    ) -> ModulationAssignment? {
+        guard let b = bindings[bindingName] else { return nil }
+        return modulation.assign(
+            bindingName: bindingName,
+            sourceID: sourceID,
+            channelID: channelID,
+            currentValue: b.get()
+        )
+    }
+
+    public func removeModulation(_ id: UUID) {
+        modulation.remove(id) { [weak self] name, base in
+            self?.setBinding(named: name, to: base)
+        }
+        lastAppliedTime = nil   // force a re-sample so a keyframed base reasserts
+    }
+
+    public func clearModulation() {
+        modulation.clear { [weak self] name, base in
+            self?.setBinding(named: name, to: base)
+        }
+        lastAppliedTime = nil
     }
 
     // ── Automation recording ─────────────────────────────────────
@@ -213,6 +318,10 @@ public final class SceneTimeline {
     // ── Playhead ─────────────────────────────────────────────────
 
     public func advance(by dt: Double) {
+        // Capture dt unconditionally — modulation envelopes advance in real time
+        // even while the transport is paused (the early-returns below skip only
+        // playhead movement, not the live modulation layer driven from apply()).
+        if dt > 0 { lastDt = dt }
         if isRecording {
             recordTick(dt: dt)
             return
