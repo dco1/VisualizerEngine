@@ -612,6 +612,12 @@ struct IlluminatoramaGlassRTUniforms {
     var filmThicknessNm: Float = 320
     /// Refractive index of the soap film itself (water+surfactant ≈ 1.33).
     var filmIOR: Float = 1.33
+    // ── Oscillation-mode surface undulation (soap bubbles) ───────────
+    /// Radial vertex-displacement amplitude (object-space units, sphere r=1).
+    /// 0 = OFF → the glass VS skips displacement (every other scene unaffected).
+    var wobbleAmp: Float = 0
+    /// Global rate multiplier for the beating oscillation modes.
+    var wobbleFreq: Float = 1
 }
 
 /// Per-frame uniforms for the glass caustics kernels. Mirror of `CausticUniforms`

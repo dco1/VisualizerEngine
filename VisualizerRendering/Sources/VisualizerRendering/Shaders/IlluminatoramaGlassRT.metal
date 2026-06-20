@@ -108,6 +108,9 @@ struct GlassRTUniforms {
     float  thinFilmStrength;    // 0 = OFF (exact no-op for every other scene)
     float  filmThicknessNm;     // base film thickness (nm) at the equator
     float  filmIOR;             // soap-film refractive index (~1.33)
+    // ── Oscillation-mode surface undulation (soap bubbles) ───────────────────
+    float  wobbleAmp;           // 0 = OFF (no vertex displacement); radial mode amplitude
+    float  wobbleFreq;          // global rate multiplier for the beating modes
 };
 
 // Mirror of FrameUniforms' leading fields the glass VS needs (viewProjection is
@@ -257,20 +260,73 @@ struct GlassVSOut {
     uint   instanceID [[flat]];
 };
 
+// ── OSCILLATION-MODE SURFACE UNDULATION (wobbling soap bubble / droplet) ──────
+// Radial displacement of a unit-sphere surface point `d` (|d|=1) by a sum of
+// angular modes that beat against each other at different rates — the normal
+// modes of an oscillating liquid drop (Rayleigh drop oscillations): low orders
+// stretch the bubble prolate/oblate, higher orders push triangular and star
+// lobes. This is the per-VERTEX deformation an affine model-matrix transform
+// physically cannot produce (a linear map only makes ellipsoids). Returns a
+// roughly [-1,1] radial offset; the host scales it by `wobbleAmp`.
+static inline float bubbleWobbleField(float3 d, float t, float ph, float freq) {
+    // Real Rayleigh drop oscillation is dominated by LOW-order modes — big, smooth
+    // lobes that beat against each other — with only a whisper of finer ripple.
+    // Heavy high-order content reads as lumpy cauliflower, not a wobbling bubble.
+    float s = 0.0;
+    // l≈2 — the bubble breathes between prolate and oblate (the dominant motion).
+    s += 0.85 * sin(M_PI_F * d.y + t * 1.30 * freq + ph);
+    s += 0.70 * sin(M_PI_F * d.x - t * 1.10 * freq + ph * 1.7);
+    s += 0.60 * sin(M_PI_F * d.z + t * 0.95 * freq + ph * 2.3);
+    // l≈3 — gentle triangular lobes.
+    s += 0.34 * sin(1.5 * M_PI_F * (d.x + d.y) + t * 1.55 * freq + ph * 0.7);
+    s += 0.30 * sin(1.5 * M_PI_F * (d.z - d.y) - t * 1.40 * freq + ph * 1.9);
+    // l≈4 — just a hint of finer ripple.
+    s += 0.12 * sin(2.5 * M_PI_F * d.x + 2.0 * M_PI_F * d.z + t * 1.80 * freq + ph);
+    return s * 0.39;
+}
+
 vertex GlassVSOut illumi_glass_rt_vs(
     uint                         vid       [[vertex_id]],
     uint                         iid       [[instance_id]],
     const device GlassVertex*    verts     [[buffer(0)]],
     constant GlassFrameUniforms& frame     [[buffer(1)]],
-    const device GlassInstance*  instances [[buffer(2)]])
+    const device GlassInstance*  instances [[buffer(2)]],
+    constant GlassRTUniforms&    gu        [[buffer(3)]])
 {
     GlassVertex v = verts[vid];
     GlassInstance inst = instances[iid];
-    float4 worldP = inst.modelMatrix * float4(v.position, 1.0);
+
+    float3 objPos = v.position;
+    float3 objNrm = v.normal;
+    // Oscillation-mode undulation (soap bubbles). OFF (exact passthrough) unless
+    // the host sets wobbleAmp > 0 — every other glass scene is unaffected.
+    if (gu.wobbleAmp > 0.0) {
+        float3 d  = normalize(v.position);          // unit-sphere surface dir
+        float  ph = inst.dispersionPad.z;           // per-bubble phase
+        float  fr = gu.wobbleFreq * max(0.2, inst.dispersionPad.w);  // per-bubble rate
+        float  amp = gu.wobbleAmp;
+        // Displaced radius at d and at two tangent neighbours → finite-difference
+        // the perturbed normal so shading/Fresnel follow the lobes.
+        float3 t1, t2; onb(d, t1, t2);
+        float  e  = 0.06;
+        float3 dA = normalize(d + t1 * e);
+        float3 dB = normalize(d + t2 * e);
+        float  r0 = 1.0 + amp * bubbleWobbleField(d,  gu.time, ph, fr);
+        float  rA = 1.0 + amp * bubbleWobbleField(dA, gu.time, ph, fr);
+        float  rB = 1.0 + amp * bubbleWobbleField(dB, gu.time, ph, fr);
+        float3 p0 = d  * r0;
+        float3 pA = dA * rA;
+        float3 pB = dB * rB;
+        objPos = p0;
+        float3 n = normalize(cross(pA - p0, pB - p0));
+        objNrm = (dot(n, d) < 0.0) ? -n : n;
+    }
+
+    float4 worldP = inst.modelMatrix * float4(objPos, 1.0);
     GlassVSOut o;
     o.clipPos     = frame.viewProjection * worldP;
     o.worldPos    = worldP.xyz;
-    o.worldNormal = (inst.normalMatrix * float4(v.normal, 0.0)).xyz;
+    o.worldNormal = (inst.normalMatrix * float4(objNrm, 0.0)).xyz;
     o.instanceID  = iid;
     return o;
 }

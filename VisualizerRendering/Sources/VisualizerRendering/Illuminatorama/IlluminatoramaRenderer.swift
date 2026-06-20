@@ -912,6 +912,14 @@ public final class IlluminatoramaRenderer {
     public var thinFilmThicknessNm: Float = 320
     /// Refractive index of the film itself (water + surfactant ≈ 1.33).
     public var thinFilmIOR: Float = 1.33
+    /// OSCILLATION-MODE surface undulation for the bubble shells (the glass VS
+    /// displaces each vertex radially by a sum of beating angular modes — real
+    /// per-vertex lobing an affine transform can't produce). 0 (default) → no
+    /// displacement, so every other glass scene is unaffected. Radial amplitude
+    /// in object-space units (the unit sphere has r = 1).
+    public var bubbleWobbleAmp: Float = 0
+    /// Global rate multiplier for the beating oscillation modes.
+    public var bubbleWobbleFreq: Float = 1
 
     private var glassRTPipeline: MTLRenderPipelineState?       // illumi_glass_rt_fs (traces TLAS)
     private var glassFallbackPipeline: MTLRenderPipelineState? // illumi_glass_fallback_fs (Fresnel+sky)
@@ -7076,6 +7084,9 @@ public final class IlluminatoramaRenderer {
         u.thinFilmStrength = (cheap && glassCheapMode == 2) ? max(0, thinFilmStrength) : 0
         u.filmThicknessNm = max(1, thinFilmThicknessNm)
         u.filmIOR = max(1.01, thinFilmIOR)
+        // Oscillation-mode undulation — only on the cheap path (bubble shells).
+        u.wobbleAmp = cheap ? max(0, bubbleWobbleAmp) : 0
+        u.wobbleFreq = max(0.01, bubbleWobbleFreq)
         memcpy(glassRTUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaGlassRTUniforms>.stride)
 
         // Screen-space cheap glass (mode 2) samples the scene BEHIND the pane: copy
@@ -7126,6 +7137,7 @@ public final class IlluminatoramaRenderer {
             enc.setCullMode(.none)                        // two-sided glass (fallback / synthetic)
         }
         enc.setVertexBuffer(frameUniformBuffer, offset: 0, index: 1)   // viewProjection is first
+        enc.setVertexBuffer(glassRTUniformBuffer, offset: 0, index: 3) // VS reads time/wobble for oscillation-mode undulation
         enc.setFragmentBuffer(glassRTUniformBuffer, offset: 0, index: 1)
         enc.setFragmentTexture(equirectSky ?? dummySkyTexture, index: 0)
         // Backdrop (cheap mode 2) — bind a dummy otherwise so the slot is valid.
