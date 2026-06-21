@@ -362,13 +362,31 @@ static inline float3 applyTreeWind(float3 wp, float4 windAttr, float time,
     return wp;
 }
 
+// Issue #65 — per-vertex motion vectors for animated GPU meshes (fluid /
+// marching-cubes / MLS-MPM surfaces). When false (the default for every
+// ordinary instanced draw) `illumi_vs` is BYTE-FOR-BYTE its old self: the
+// previous-frame object-space position is just `v.position`, so velocity comes
+// purely from the per-instance model matrix delta (rigid spin/translation).
+// When true (the dedicated G-buffer GPU-mesh draw specializes this on), the
+// previous object-space position is read from a side `prevPositions` buffer the
+// host blits each frame — so a deforming surface whose model matrix is identity
+// still writes a real screen-space velocity (curr vertex − prev vertex). Both
+// cases compose: a rigid GPU mesh has prevPos == currPos so velocity falls back
+// to the matrix delta, exactly as before.
+constant bool kUsePrevVerts [[function_constant(10)]];
+
 vertex VSOut illumi_vs(
     uint                       vid           [[vertex_id]],
     uint                       iid           [[instance_id]],
     const device Vertex*       verts         [[buffer(0)]],
     constant FrameUniforms&    frame         [[buffer(1)]],
     const device Instance*     instances     [[buffer(2)]],
-    const device Instance*     prevInstances [[buffer(4)]]
+    const device Instance*     prevInstances [[buffer(4)]],
+    // Only bound (and only exists) when kUsePrevVerts — marking the argument with
+    // the function constant means the false variant declares no buffer(5) binding
+    // at all, so the base pipeline never has to bind it (avoids the dead-binding
+    // validation abort documented in metal_dead_buffer_binding_validation_abort).
+    const device packed_float3* prevPositions [[buffer(5), function_constant(kUsePrevVerts)]]
 ) {
     Vertex v = verts[vid];
     Instance inst = instances[iid];
@@ -386,8 +404,14 @@ vertex VSOut illumi_vs(
     // Previous-frame world position uses the previous-frame model matrix —
     // captures per-instance motion (spin, translation) on top of camera
     // motion. The renderer ping-pongs an instance buffer so prevInstances
-    // holds last frame's data at the same instance index.
-    float4 prevWorldP = prevInst.modelMatrix * float4(v.position, 1.0);
+    // holds last frame's data at the same instance index. For deforming GPU
+    // meshes (kUsePrevVerts) the previous OBJECT-space position is the per-vertex
+    // value from last frame, not v.position, so the vertex motion is captured too.
+    float3 prevObjP = v.position;
+    if (kUsePrevVerts) {
+        prevObjP = float3(prevPositions[vid]);
+    }
+    float4 prevWorldP = prevInst.modelMatrix * float4(prevObjP, 1.0);
     prevWorldP.xyz = applyTreeWind(prevWorldP.xyz, v.tangent, frame.time,
                                    frame._padPhase2A, frame._padPhase2B);
     // Phase 4.5 — transform the object-space tangent into world. Using

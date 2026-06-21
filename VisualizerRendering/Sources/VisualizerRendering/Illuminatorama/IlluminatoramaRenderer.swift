@@ -832,6 +832,14 @@ public final class IlluminatoramaRenderer {
     // fed a NEGATIVE motionBlurStrength sentinel and renders the colourised velocity
     // buffer instead of the scene (the "per-object velocity overlay" validator).
     nonisolated static let mvDebugOverlay = ProcessInfo.processInfo.environment["VIZ_ILLUMI_MV_DEBUG"] == "1"
+    // Issue #65 — headless motion-blur override. Motion blur is otherwise driven
+    // only by the panel, so a headless render can't exercise it; `VIZ_ILLUMI_MOTIONBLUR`
+    // (a float, e.g. `1.0`) forces `motionBlurStrength` for every renderer in the
+    // process so the velocity-buffer streak can be render-verified. `nil` when unset.
+    nonisolated static let motionBlurEnvOverride: Float? = {
+        guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_MOTIONBLUR"] else { return nil }
+        return Float(v)
+    }()
     private let swapProbePath = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SWAP_PATH"]
     private var swapLastTime: CFTimeInterval = 0
     private var swapIntervalsMs: [Double] = []
@@ -1283,6 +1291,11 @@ public final class IlluminatoramaRenderer {
     }
 
     private let gbufferPipeline: MTLRenderPipelineState
+    /// Issue #65 — G-buffer pipeline specialized with `kUsePrevVerts = true`. Used
+    /// ONLY for the deforming GPU-mesh draws so their `illumi_vs` reads last frame's
+    /// per-vertex positions from buffer(5) and writes a real motion vector. Every
+    /// other draw keeps `gbufferPipeline` (kUsePrevVerts = false), unchanged.
+    private let gbufferPipelinePrevVerts: MTLRenderPipelineState
     private let shadowPipeline: MTLRenderPipelineState
     private let depthState: MTLDepthStencilState
     private let lightingPipeline: MTLComputePipelineState
@@ -2102,7 +2115,16 @@ public final class IlluminatoramaRenderer {
         // G-buffer render pipeline (vertex + fragment).
         let pdesc = MTLRenderPipelineDescriptor()
         pdesc.label = "Illuminatorama.gbuffer"
-        pdesc.vertexFunction = library.makeFunction(name: "illumi_vs")
+        // Issue #65 — `illumi_vs` now references function_constant(10) kUsePrevVerts,
+        // so even the BASE variant must be specialized (a plain makeFunction(name:)
+        // aborts at pipeline validation for any referenced-but-unset constant). The
+        // base sets it false → byte-identical to the old behaviour; the prev-verts
+        // pipeline below sets it true and gains the buffer(5) per-vertex prev read.
+        let vsBaseConsts = MTLFunctionConstantValues()
+        var userPrevVertsFalse = false
+        vsBaseConsts.setConstantValue(&userPrevVertsFalse, type: .bool, index: 10)
+        pdesc.vertexFunction = try library.makeFunction(name: "illumi_vs",
+                                                        constantValues: vsBaseConsts)
         pdesc.fragmentFunction = library.makeFunction(name: "illumi_fs")
         pdesc.colorAttachments[0].pixelFormat = .rgba16Float
         pdesc.colorAttachments[1].pixelFormat = .rgba16Float
@@ -2114,6 +2136,17 @@ public final class IlluminatoramaRenderer {
         // Vertex via [[vertex_id]]. Simpler than wiring a vertex descriptor
         // and matches the Swift/Metal struct mirror more directly.
         self.gbufferPipeline = try device.makeRenderPipelineState(descriptor: pdesc)
+
+        // Issue #65 — second G-buffer pipeline with kUsePrevVerts = true. Reuses
+        // the SAME descriptor (identical attachment formats / fragment); only the
+        // specialized vertex function differs. Bound for deforming GPU-mesh draws.
+        let vsPrevConsts = MTLFunctionConstantValues()
+        var usePrevVertsTrue = true
+        vsPrevConsts.setConstantValue(&usePrevVertsTrue, type: .bool, index: 10)
+        pdesc.label = "Illuminatorama.gbuffer.prevVerts"
+        pdesc.vertexFunction = try library.makeFunction(name: "illumi_vs",
+                                                        constantValues: vsPrevConsts)
+        self.gbufferPipelinePrevVerts = try device.makeRenderPipelineState(descriptor: pdesc)
 
         // Perfect analytic superquadric impostor — same G-buffer attachment
         // formats so it renders into the SAME G-buffer pass/encoder (no extra
@@ -3088,8 +3121,23 @@ public final class IlluminatoramaRenderer {
         let uvBuffer: MTLBuffer?
         /// Optional per-vertex RGBA color stream (stride-16 float4) → albedo.
         let colorBuffer: MTLBuffer?
+        /// Issue #65 — side copy of LAST frame's `positionBuffer` (packed_float3 ×
+        /// vertexCount), blitted each frame AFTER the G-buffer draw. The G-buffer
+        /// GPU-mesh draw binds this at vertex buffer(5) so the kUsePrevVerts
+        /// `illumi_vs` variant can reconstruct per-vertex velocity (curr − prev)
+        /// for TAA / motion blur. NOT `positionBuffer` ping-ponged — that buffer is
+        /// consumed by the RT BLAS/TLAS refit + shadows + G-buffer, so a swap would
+        /// desync the acceleration structure. A dedicated side buffer is isolated.
+        let prevPositionBuffer: MTLBuffer
+        /// False until the first frame primes `prevPositionBuffer = positionBuffer`
+        /// (so frame 1 reads prev == curr → zero velocity, no spurious streak).
+        var primed: Bool
     }
     private var gpuRepackTasks: [GPURepackTask] = []
+    /// Byte stride of a `packed_float3` — the layout of both the host position
+    /// buffer and the issue-#65 `prevPositionBuffer` side copy. NOT SIMD3<Float>'s
+    /// 16-byte stride; the GPU repack kernel + motion-vector vs read `packed_float3`.
+    private static let gpuMeshPrevStride = MemoryLayout<Float>.size * 3
 
     /// Register a compute-fed geometry described by an
     /// `IlluminatoramaGPUMeshDescriptor`. Allocates the Illuminatorama-
@@ -3127,6 +3175,16 @@ public final class IlluminatoramaRenderer {
         mesh.doubleSided = descriptor.doubleSided
         let kind = MeshKind.custom("gpuMesh#\(UUID().uuidString)")
         meshes[kind] = mesh
+        // Issue #65 — side buffer for last frame's positions. Matches the
+        // host position buffer's PACKED float3 layout (12-byte stride, NOT
+        // SIMD3's 16) so the per-frame blit is a straight byte copy and the
+        // `packed_float3*` shader read indexes correctly. See gpuMeshPrevStride.
+        let prevPosBytes = Self.gpuMeshPrevStride * descriptor.vertexCount
+        guard let prevPositionBuffer = device.makeBuffer(
+                length: max(prevPosBytes, 16), options: .storageModePrivate) else {
+            return nil
+        }
+        prevPositionBuffer.label = "Illuminatorama.gpuMesh.prevPositions"
         gpuRepackTasks.append(GPURepackTask(
             kind: kind,
             positionBuffer: descriptor.positionBuffer,
@@ -3134,7 +3192,9 @@ public final class IlluminatoramaRenderer {
             vertexBuffer: vertexBuffer,
             vertexCount: descriptor.vertexCount,
             uvBuffer: descriptor.uvBuffer,
-            colorBuffer: descriptor.colorBuffer
+            colorBuffer: descriptor.colorBuffer,
+            prevPositionBuffer: prevPositionBuffer,
+            primed: false
         ))
         return IlluminatoramaMeshHandle(kind: kind, mesh: mesh, renderer: self)
     }
@@ -3213,6 +3273,40 @@ public final class IlluminatoramaRenderer {
             enc.dispatchThreadgroups(groups, threadsPerThreadgroup: threadgroup)
         }
         enc.endEncoding()
+    }
+
+    /// Issue #65 — capture the current GPU-mesh positions into each task's
+    /// `prevPositionBuffer` so the NEXT frame's G-buffer draw can reconstruct a
+    /// per-vertex motion vector (curr − prev).
+    ///
+    /// Two phases, both pure blits (no ping-pong of `positionBuffer`, which the RT
+    /// refit / shadows / G-buffer all consume):
+    ///   • `prime: true`  — run BEFORE the G-buffer pass, only for not-yet-primed
+    ///     meshes: seeds `prevPositionBuffer = positionBuffer` so frame 1 reads
+    ///     prev == curr → zero velocity (no spurious first-frame streak).
+    ///   • `prime: false` — run AFTER the G-buffer pass (which read last frame's
+    ///     prev): copies THIS frame's positions forward for next frame. Metal's
+    ///     automatic hazard tracking serializes this blit after the pass's reads.
+    private func encodeGPUMeshPrevCapture(_ cb: MTLCommandBuffer, prime: Bool) {
+        let work = prime ? gpuRepackTasks.contains { !$0.primed }
+                         : !gpuRepackTasks.isEmpty
+        guard work else { return }
+        guard let blit = cb.makeBlitCommandEncoder() else { return }
+        blit.label = prime ? "Illuminatorama.gpuMesh.mvPrime"
+                           : "Illuminatorama.gpuMesh.mvCapture"
+        for i in gpuRepackTasks.indices {
+            if prime && gpuRepackTasks[i].primed { continue }
+            let task = gpuRepackTasks[i]
+            let bytes = Self.gpuMeshPrevStride * task.vertexCount
+            guard bytes > 0,
+                  task.positionBuffer.length >= bytes,
+                  task.prevPositionBuffer.length >= bytes else { continue }
+            blit.copy(from: task.positionBuffer, sourceOffset: 0,
+                      to: task.prevPositionBuffer, destinationOffset: 0,
+                      size: bytes)
+            if prime { gpuRepackTasks[i].primed = true }
+        }
+        blit.endEncoding()
     }
 
     // ── Phase 4.11 — particle emitter registration ───────────────────
@@ -6289,9 +6383,17 @@ public final class IlluminatoramaRenderer {
         // vertex layout. Must run before shadow / G-buffer reads.
         encodeGPURepacks(cb)
 
+        // Issue #65 — on a GPU mesh's FIRST frame, seed prev = current so its
+        // motion vector starts at zero (no first-frame streak). Subsequent frames
+        // are seeded by the post-G-buffer capture below.
+        encodeGPUMeshPrevCapture(cb, prime: true)
+
         encodeShadowPasses(cb)
         encodeSpotShadowPasses(cb)
         encodeGBufferPass(cb)
+        // Issue #65 — now that the G-buffer draw has read THIS frame's prev
+        // positions, copy the current positions forward to be next frame's prev.
+        encodeGPUMeshPrevCapture(cb, prime: false)
         encodeIBLBakeIfNeeded(cb)
         encodeDDGIFrame(cb)
         // Phase 4.39: SSAO → bilateral spatial → temporal → lighting (reads denoised AO).
@@ -7300,6 +7402,14 @@ public final class IlluminatoramaRenderer {
         // Killed the prior per-instance inner loop — FloatingFlowers+
         // drops from ~1500 draw calls per frame to ~10.
         let instStride = MemoryLayout<IlluminatoramaInstance>.stride
+        // Issue #65 — map each deforming GPU-mesh kind to its prev-position side
+        // buffer so those groups can draw with the kUsePrevVerts pipeline. Built
+        // once per pass (gpuRepackTasks is tiny — one entry per registered mesh).
+        var prevPosByKind: [MeshKind: MTLBuffer] = [:]
+        for task in gpuRepackTasks { prevPosByKind[task.kind] = task.prevPositionBuffer }
+        // Track which pipeline is bound to avoid redundant state switches when the
+        // groups are all ordinary meshes (the common case).
+        var prevVertsBound = false
         for group in meshGroups {
             // Superquadric impostor box kinds are drawn by the impostor pipeline
             // below; RT-proxy kinds exist only in the TLAS. Both are skipped here.
@@ -7311,6 +7421,17 @@ public final class IlluminatoramaRenderer {
             // camera; the fragment shader flips the normal for back faces.
             enc.setCullMode(mesh.doubleSided ? .none : .back)
             let off = instStride * group.start
+            // Issue #65 — deforming GPU meshes draw with the kUsePrevVerts pipeline
+            // and bind their per-vertex prev positions at buffer(5); every other
+            // group uses the base pipeline (which declares no buffer(5)).
+            let prevPos = prevPosByKind[group.kind]
+            if prevPos != nil {
+                if !prevVertsBound { enc.setRenderPipelineState(gbufferPipelinePrevVerts) }
+                prevVertsBound = true
+            } else if prevVertsBound {
+                enc.setRenderPipelineState(gbufferPipeline)
+                prevVertsBound = false
+            }
             enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
             enc.setVertexBuffer(frameUniformBuffer, offset: 0, index: 1)
             enc.setVertexBuffer(currentInstanceBuffer, offset: off, index: 2)
@@ -7321,6 +7442,9 @@ public final class IlluminatoramaRenderer {
             // because the host's `instances` order is stable across
             // frames for a static scene topology.
             enc.setVertexBuffer(previousInstanceBuffer, offset: off, index: 4)
+            // Issue #65 — per-vertex previous positions for the deforming-mesh
+            // motion vector. Only the kUsePrevVerts pipeline reads buffer(5).
+            if let prevPos { enc.setVertexBuffer(prevPos, offset: 0, index: 5) }
             enc.drawIndexedPrimitives(
                 type: .triangle,
                 indexCount: mesh.indexCount,
@@ -8849,8 +8973,10 @@ public final class IlluminatoramaRenderer {
         // Colour-grade LUT (issue #65). 0 → no-op; size feeds the half-texel inset.
         u.colorLUTAmount    = max(0, min(1, colorLUTAmount))
         u.colorLUTSize      = Float(colorLUTSize)
-        // Velocity-buffer motion blur (issue #65). 0 → no-op.
-        u.motionBlurStrength = Self.mvDebugOverlay ? -1.0 : max(0, motionBlurStrength)
+        // Velocity-buffer motion blur (issue #65). 0 → no-op. The env override
+        // (VIZ_ILLUMI_MOTIONBLUR) wins over the panel value for headless verify.
+        let effMotionBlur = Self.motionBlurEnvOverride ?? motionBlurStrength
+        u.motionBlurStrength = Self.mvDebugOverlay ? -1.0 : max(0, effMotionBlur)
         u.motionBlurMaxPx    = max(0, motionBlurMaxPx)
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
