@@ -828,6 +828,10 @@ public final class IlluminatoramaRenderer {
     // turns it on, writing `swaps=… fps=… p50=… p95=… p99=… max=… (ms)` to
     // `VIZ_ILLUMI_SWAP_PATH`. Touched only on the main actor (in promoteCompletedBuffer).
     nonisolated static let swapProbeEnabled = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SWAP_PROBE"] == "1"
+    // Issue #65 — velocity / motion-vector debug overlay. When set, the tonemap is
+    // fed a NEGATIVE motionBlurStrength sentinel and renders the colourised velocity
+    // buffer instead of the scene (the "per-object velocity overlay" validator).
+    nonisolated static let mvDebugOverlay = ProcessInfo.processInfo.environment["VIZ_ILLUMI_MV_DEBUG"] == "1"
     private let swapProbePath = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SWAP_PATH"]
     private var swapLastTime: CFTimeInterval = 0
     private var swapIntervalsMs: [Double] = []
@@ -8846,7 +8850,7 @@ public final class IlluminatoramaRenderer {
         u.colorLUTAmount    = max(0, min(1, colorLUTAmount))
         u.colorLUTSize      = Float(colorLUTSize)
         // Velocity-buffer motion blur (issue #65). 0 → no-op.
-        u.motionBlurStrength = max(0, motionBlurStrength)
+        u.motionBlurStrength = Self.mvDebugOverlay ? -1.0 : max(0, motionBlurStrength)
         u.motionBlurMaxPx    = max(0, motionBlurMaxPx)
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }

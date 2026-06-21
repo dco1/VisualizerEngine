@@ -4582,6 +4582,24 @@ fragment float4 illumi_tonemap_fs(
 
     float2 inSize  = float2(inHDR.get_width(), inHDR.get_height());
     float2 invInSize = 1.0 / inSize;
+
+    // ── Velocity / motion-vector debug overlay (issue #65) ───────────────────────
+    // Sentinel: a NEGATIVE motionBlurStrength (set by the host only when
+    // VIZ_ILLUMI_MV_DEBUG=1) replaces the image with a colourised view of the
+    // screen-space velocity buffer — the "per-object velocity overlay" validator.
+    // Grey = no motion; red/green shift = +x/+y screen motion; darkening = speed.
+    // The ONLY reliable way to confirm which objects write motion vectors (camera,
+    // ping-ponged instances) and which don't (MLS-MPM/fluid surfaces) before TAA or
+    // motion blur start trusting them. Costs nothing in normal (strength ≥ 0) renders.
+    if (frame.motionBlurStrength < 0.0) {
+        constexpr sampler velSampler(filter::linear, address::clamp_to_edge, coord::normalized);
+        float2 v   = float2(inVel.sample(velSampler, in.uv).rg);
+        float  mag = length(v);
+        float2 a   = v * 40.0;                       // amplify (per-frame UV motion is tiny)
+        float3 c   = float3(0.5 + a.x, 0.5 + a.y, 0.5 - 0.5 * saturate(mag * 40.0));
+        return float4(saturate(c), 1.0);
+    }
+
     // `in.uv` is the output pixel centre in normalised coords, equivalent to
     // the compute path's `(gid+0.5)/outSize`. The 4-tap offsets are ±0.5
     // INPUT texels, i.e. ±0.5*invInSize in normalised space.
