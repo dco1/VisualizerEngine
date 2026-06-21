@@ -1233,8 +1233,22 @@ public final class IlluminatoramaRenderer {
     private var giAtrousA: MTLTexture           // full-res rgba16Float
     private var giAtrousB: MTLTexture           // full-res rgba16Float
     /// Enable the SVGF à-trous variance-guided cascade for the RT GI diffuse term.
-    /// When off, falls back to the fixed-radius bilateral denoise. Default on.
-    public var svgfEnabled: Bool = true
+    /// When off, falls back to the fixed-radius bilateral denoise (still reading the
+    /// temporally-accumulated GI, so motion stability is preserved).
+    ///
+    /// DEFAULT OFF (issue #65 — Illuminatorama Room masonry banding). The à-trous
+    /// samples at a DILATED 2^level stride; on a near-converged surface (low spatial
+    /// variance) the dilated taps leave a structured grid residual instead of a clean
+    /// blur, which the RT-GI temporal accumulation then locks in as a persistent
+    /// masonry/brick pattern on smooth walls. Per-frame Monte-Carlo grain hid it
+    /// before the temporal pass landed; once the grain is averaged away the grid
+    /// shows. It is NOT an edge-stop tuning issue (disabling the depth/normal/
+    /// luminance weights makes it worse, not better) — it's the dilated-sampling
+    /// structure itself. The contiguous-tap bilateral fallback (`illumi_rt_denoise`)
+    /// produces a clean, temporally-stable result and is cheaper (skips the 4-pass
+    /// cascade), so it's the default until the à-trous residual is fixed. HotdogPress
+    /// and CoinPusher already disabled it per-scene for the same class of artifact.
+    public var svgfEnabled: Bool = false
     /// Number of à-trous cascade levels (1–5). Three levels cover a spatial
     /// reach of 1+2+4 = 7px radius; five levels cover 1+2+4+8+16 = 31px.
     public var svgfLevels: Int = 3
