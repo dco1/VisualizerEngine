@@ -203,7 +203,7 @@ kernel void foamImpactSpawn(
     if (vel.y > -U.minDownVel) return;
     if (speed < U.minSpeed) return;
 
-    uint burst = min(7u, 2u + uint(speed * 0.4f));
+    uint burst = min(4u, 1u + uint(speed * 0.3f));   // fewer, chunkier blobs (gloopy, not fine spray)
     uint base  = atomic_fetch_add_explicit(nextSlot, burst, memory_order_relaxed);
 
     for (uint b = 0; b < burst; ++b) {
