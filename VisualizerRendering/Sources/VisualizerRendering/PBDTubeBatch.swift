@@ -423,9 +423,17 @@ public final class PBDTubeBatch {
                 enc.memoryBarrier(scope: .buffers)
             }
 
-            // Phase 4: expand tube mesh — reads final positions, writes
-            // the Illuminatorama-visible position + normal buffers.
-            for tube in tubes { tube.dispatchTubeExpand(into: enc) }
+            // Phase 4 — tube-mesh expand. It only WRITES the render mesh from the
+            // final particle positions and is read nowhere inside the solve, so
+            // every substep but the last is wasted work (the biggest-compute
+            // per-tube dispatch: ringCount×ringSegments threads/tube). OPT-IN
+            // OPTIMISATION (`flatSolveEnabled`, Ultra-only): defer it to a single
+            // post-loop pass below — same mesh output, (substeps−1)×N fewer expand
+            // dispatches. Default (Plus/Press/Waterslide): keep the original
+            // per-substep expand so they are byte-identical / un-revisited.
+            if !flatSolveEnabled {
+                for tube in tubes { tube.dispatchTubeExpand(into: enc) }
+            }
             enc.endEncoding()
 
             let sema = inflightSemaphore
@@ -440,6 +448,30 @@ public final class PBDTubeBatch {
             accumulator -= fixedDt
             steps += 1
             substepsRun += 1
+        }
+
+        // Phase 4 (moved, Ultra-only): expand the tube meshes ONCE from the final
+        // solved positions. Same queue → runs after the last substep's writes.
+        // Skipped when no substep ran (positions unchanged → last mesh still valid).
+        if flatSolveEnabled, steps > 0 {
+            if inflightSemaphore.wait(timeout: .now()) == .timedOut { return }
+            guard let cb = queue.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else {
+                inflightSemaphore.signal(); return
+            }
+            cb.label = "PBDTubeBatch.expand"
+            enc.label = "PBDTubeBatch.expand"
+            for tube in tubes { tube.dispatchTubeExpand(into: enc) }
+            enc.endEncoding()
+            let sema = inflightSemaphore
+            cb.addCompletedHandler { cb in
+                if let err = cb.error {
+                    os_log(.error, "PBDTubeBatch expand GPU error: %{public}@",
+                           err.localizedDescription)
+                }
+                sema.signal()
+            }
+            cb.commit()
         }
     }
 
