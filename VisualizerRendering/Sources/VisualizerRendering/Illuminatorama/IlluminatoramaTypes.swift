@@ -256,6 +256,16 @@ public struct IlluminatoramaFrameUniforms {
     public var fringeTintR: Float = 0.62
     public var fringeTintG: Float = 0.12
     public var fringeTintB: Float = 0.92
+    // ── Vignette + film grain (issue #65 post-FX) ────────────────────
+    /// Lens vignette + film-stock grain, applied at the tail of the tonemap pass.
+    /// Both 0 by default → an EXACT shader no-op for every scene. A NEW 16-byte
+    /// trailing cluster (stride 1008 → 1024); field-for-field mirror of the Metal
+    /// `FrameUniforms`. `vignetteExtent` is the normalised radius kept fully bright;
+    /// `filmGrainSize` is the grain cell size in output pixels.
+    public var vignetteStrength: Float = 0
+    public var vignetteExtent: Float = 0.55
+    public var filmGrainStrength: Float = 0
+    public var filmGrainSize: Float = 1.5
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20

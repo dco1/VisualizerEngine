@@ -19,6 +19,10 @@ public extension IlluminatoramaRenderer {
         fringe              = Float(s.fringeEnabled ? s.fringe : 0)
         fringeTint          = SIMD3(Float(s.fringeTintR), Float(s.fringeTintG), Float(s.fringeTintB))
         sphericalAberration = Float(s.sphericalAberrationEnabled ? s.sphericalAberration : 0)
+        vignetteStrength    = Float(s.vignetteEnabled ? s.vignette : 0)
+        vignetteExtent      = Float(s.vignetteExtent)
+        filmGrainStrength   = Float(s.filmGrainEnabled ? s.filmGrain : 0)
+        filmGrainSize       = Float(s.filmGrainSize)
         postFXEasingTau     = s.postFXEasing.tau
     }
 

@@ -186,6 +186,15 @@ struct FrameUniforms {
     float    fringeTintR;
     float    fringeTintG;
     float    fringeTintB;
+    // Vignette + film grain (issue #65 post-FX). Applied at the very tail of the
+    // tonemap pass (after ACES + saturation + fringe, before the deband dither).
+    // Both 0 by default → an EXACT no-op for every existing scene. NEW 16-byte
+    // cluster (stride 1008 → 1024); field-for-field mirror of the Swift
+    // IlluminatoramaFrameUniforms.
+    float    vignetteStrength;   // 0 = off; corner-darkening amount (0..1)
+    float    vignetteExtent;     // 0..1 radius (frac of half-diagonal) kept bright
+    float    filmGrainStrength;  // 0 = off; grain amplitude
+    float    filmGrainSize;      // grain cell size in OUTPUT px (>= 1)
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift
@@ -4694,6 +4703,36 @@ fragment float4 illumi_tonemap_fs(
             : (1.0 - float3(frame.fringeTintR, frame.fringeTintG, frame.fringeTintB));
         float3 tintLinear = pow(tintSRGB, 2.2);
         mapped = saturate(mapped + tintLinear * (edge * frame.fringe * 0.5));
+    }
+
+    // ── Vignette ────────────────────────────────────────────────────────────
+    // Optical lens falloff: brightness tapers toward the frame corners. `extent`
+    // is the normalised radius (fraction of the half-diagonal) that stays fully
+    // bright; beyond it the image is multiplied down by a smoothstep ramp toward
+    // (1 - strength) at the very corner. 0 strength → exact no-op.
+    if (frame.vignetteStrength > 0.0) {
+        float2 d = in.uv - 0.5;
+        float r = length(d) * 1.41421356;            // 0 centre → 1 corner
+        float ext = clamp(frame.vignetteExtent, 0.0, 0.99);
+        float v = smoothstep(ext, 1.0, r);           // 0 inside extent → 1 at corner
+        float fall = 1.0 - frame.vignetteStrength * v;
+        mapped *= max(fall, 0.0);
+    }
+
+    // ── Film grain ──────────────────────────────────────────────────────────
+    // Per-frame film-stock grain: high-frequency noise reseeded every frame (so it
+    // reads as natural grain, NOT a crawling low-frequency pattern), modulated by
+    // luminance so it peaks in the mids and fades in highlights/blacks the way real
+    // film does. `filmGrainSize` quantises the sampling grid into cells of that many
+    // output pixels. 0 strength → exact no-op.
+    if (frame.filmGrainStrength > 0.0) {
+        float cell = max(frame.filmGrainSize, 1.0);
+        float2 gp = floor(in.position.xy / cell);
+        float n = fract(sin(dot(gp, float2(12.9898, 78.233)) + frame.time * 91.7) * 43758.5453);
+        n -= 0.5;                                     // ∈ [-0.5, 0.5]
+        float lumG = dot(mapped, float3(0.2126, 0.7152, 0.0722));
+        float mask = 4.0 * lumG * (1.0 - lumG);       // parabola: 1 at mid-grey, 0 at ends
+        mapped = saturate(mapped + n * frame.filmGrainStrength * mask);
     }
 
     // ── Phase 4.39: debanding dither ──────────────────────────────────────────

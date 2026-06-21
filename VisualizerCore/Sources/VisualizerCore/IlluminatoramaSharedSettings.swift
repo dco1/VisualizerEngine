@@ -54,6 +54,20 @@ public final class IlluminatoramaSharedSettings {
     /// default → exact shader no-op. `sphericalAberration` is the strength.
     public var sphericalAberrationEnabled: Bool = false
     public var sphericalAberration: Double = 1.0
+    /// Lens vignette — darkens the frame corners (an optical falloff that draws the
+    /// eye to the centre). OFF by default → an exact shader no-op. `vignette` is the
+    /// corner-darkening strength; `vignetteExtent` is the fraction of the frame
+    /// (from the centre) kept fully bright before the falloff begins.
+    public var vignetteEnabled: Bool = false
+    public var vignette: Double = 0.35
+    public var vignetteExtent: Double = 0.55
+    /// Film-stock grain — per-frame, luminance-masked noise over the final image
+    /// (peaks in the mids, fades in highlights/blacks like real film). OFF by
+    /// default → an exact shader no-op. `filmGrain` is the amplitude; `filmGrainSize`
+    /// is the grain cell size in pixels.
+    public var filmGrainEnabled: Bool = false
+    public var filmGrain: Double = 0.06
+    public var filmGrainSize: Double = 1.5
 
     // ── SSAO ──────────────────────────────────────────────────────────
     public var ssaoIntensity: Double = 0.85
@@ -123,6 +137,12 @@ public final class IlluminatoramaSharedSettings {
         fringeTintB = \(fmt(fringeTintB))
         sphericalAberrationEnabled = \(sphericalAberrationEnabled)
         sphericalAberration = \(fmt(sphericalAberration))
+        vignetteEnabled = \(vignetteEnabled)
+        vignette = \(fmt(vignette))
+        vignetteExtent = \(fmt(vignetteExtent))
+        filmGrainEnabled = \(filmGrainEnabled)
+        filmGrain = \(fmt(filmGrain))
+        filmGrainSize = \(fmt(filmGrainSize))
         ssaoIntensity = \(fmt(ssaoIntensity))
         ssaoRadius = \(fmt(ssaoRadius))
         ssrIntensity = \(fmt(ssrIntensity))

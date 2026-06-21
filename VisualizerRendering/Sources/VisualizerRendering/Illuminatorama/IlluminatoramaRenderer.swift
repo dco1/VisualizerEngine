@@ -220,6 +220,17 @@ public final class IlluminatoramaRenderer {
     /// 0 = OFF (default) → exact shader no-op. Maps into the former
     /// `_padPlush1` slot of `IlluminatoramaFrameUniforms` (stride unchanged).
     public var sphericalAberration: Float = 0
+    /// Lens vignette (issue #65): `vignetteStrength` is the corner-darkening amount
+    /// (0 = OFF → exact shader no-op) and `vignetteExtent` the normalised radius
+    /// kept fully bright before the falloff begins. Film-stock grain:
+    /// `filmGrainStrength` is the amplitude (0 = OFF → exact no-op) and
+    /// `filmGrainSize` the grain cell size in output px. NEW 16-byte uniform
+    /// cluster, mirrored byte-for-byte. Applied directly (not eased) — strength
+    /// ramps are gentle enough not to need the glide the blur knobs use.
+    public var vignetteStrength: Float = 0
+    public var vignetteExtent: Float = 0.55
+    public var filmGrainStrength: Float = 0
+    public var filmGrainSize: Float = 1.5
     /// Post-FX easing time constant (seconds) from the panel's "Easing" picker.
     /// The post-FX knobs above (exposure, bloom, chromatic aberration, fringe) are
     /// treated as TARGETS; each frame `uploadFrameUniforms` eases an internal
@@ -8606,6 +8617,11 @@ public final class IlluminatoramaRenderer {
         u.fringeTintR = easedFringeTint.x
         u.fringeTintG = easedFringeTint.y
         u.fringeTintB = easedFringeTint.z
+        // Vignette + film grain (issue #65). Applied directly (no easing) — 0 → no-op.
+        u.vignetteStrength  = max(0, vignetteStrength)
+        u.vignetteExtent    = max(0, min(1, vignetteExtent))
+        u.filmGrainStrength = max(0, filmGrainStrength)
+        u.filmGrainSize     = max(1, filmGrainSize)
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
 
