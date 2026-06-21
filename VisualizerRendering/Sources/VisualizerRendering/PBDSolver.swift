@@ -1407,6 +1407,56 @@ public final class PBDSolver {
         )
     }
 
+    // ── Flat-batched constraint/velocity (PBDTubeBatch flat-solve path) ───────
+    // These reuse this solver's compiled `constraintPipeline` / `velocityPipeline`
+    // (the kernel is identical regardless of which solver instance owns the
+    // pipeline) but bind CALLER-PROVIDED flat buffers: ONE particle buffer and
+    // ONE constraint buffer spanning every tube, with constraint indices already
+    // remapped to global flat particle indices. One dispatch per colour group
+    // replaces the per-tube loop — see PBDTubeBatch.runFlatConstraintColour. The
+    // math is identical: within a colour no two constraints share a particle, and
+    // distinct tubes never share particles, so the corrections are independent of
+    // dispatch granularity.
+
+    /// Pipelines exposed so a batched caller can size threadgroups.
+    public var constraintMaxThreads: Int { constraintPipeline.maxTotalThreadsPerThreadgroup }
+    public var velocityMaxThreads:   Int { velocityPipeline.maxTotalThreadsPerThreadgroup }
+
+    /// Dispatch one constraint colour group over a flat particle+constraint+lambda
+    /// buffer. `constraintByteOffset` / `lambdaByteOffset` select the colour's
+    /// contiguous slice; `uniform` carries dt + ringCount(0) + a constraintCount
+    /// ≥ `count`.
+    public func dispatchConstraintFlat(into enc: MTLComputeCommandEncoder,
+                                       particles: MTLBuffer,
+                                       constraints: MTLBuffer, constraintByteOffset: Int,
+                                       lambda: MTLBuffer, lambdaByteOffset: Int,
+                                       uniform: MTLBuffer, count: Int) {
+        guard count > 0 else { return }
+        enc.setComputePipelineState(constraintPipeline)
+        enc.setBuffer(particles,   offset: 0,                    index: 0)
+        enc.setBuffer(constraints, offset: constraintByteOffset, index: 1)
+        enc.setBuffer(uniform,     offset: 0,                    index: 2)
+        enc.setBuffer(lambda,      offset: lambdaByteOffset,     index: 3)
+        let w = min(count, constraintPipeline.maxTotalThreadsPerThreadgroup)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+    }
+
+    /// Dispatch one velocity post-solve colour group over the flat buffers.
+    public func dispatchVelocityFlat(into enc: MTLComputeCommandEncoder,
+                                     particles: MTLBuffer,
+                                     constraints: MTLBuffer, constraintByteOffset: Int,
+                                     uniform: MTLBuffer, count: Int) {
+        guard count > 0 else { return }
+        enc.setComputePipelineState(velocityPipeline)
+        enc.setBuffer(particles,   offset: 0,                    index: 0)
+        enc.setBuffer(constraints, offset: constraintByteOffset, index: 1)
+        enc.setBuffer(uniform,     offset: 0,                    index: 2)
+        let w = min(count, velocityPipeline.maxTotalThreadsPerThreadgroup)
+        enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+    }
+
     /// Bind buffers + dispatch the SDF inter-body collide kernel into a
     /// caller-owned encoder. No-op when there are no colliders or no particles.
     public func dispatchSDFCollide(into encoder: MTLComputeCommandEncoder) {

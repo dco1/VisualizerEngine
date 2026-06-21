@@ -96,6 +96,27 @@ public final class PBDTubeBatch {
     private var colliderBuffer:   MTLBuffer?
     private var colliderCapacity: Int = 0
 
+    // ── Flat-batched constraint solve ──────────────────────────────────────────
+    /// Scene opt-in. When true AND every tube is an open chain (ringCount == 0),
+    /// the constraint + velocity phases run as ONE dispatch per colour group over
+    /// a flat cross-tube constraint buffer instead of one dispatch PER TUBE per
+    /// colour — collapsing the dominant ~38·N dispatches/substep to ~34. The math
+    /// is identical (within a colour, constraints touch disjoint particles). Off
+    /// by default so every existing scene is byte-for-byte unchanged. Set by the
+    /// scene (HotdogDropUltra) before its first tick.
+    public var flatSolveEnabled = false
+    /// Flat constraint buffer: all tubes' constraints, GROUPED BY COLOUR then tube,
+    /// with `.i`/`.j` remapped to global flat particle indices. Rebuilt on
+    /// markDirty (spawn/cull/respawn changes rest lengths).
+    private var flatConstraintBuffer:  MTLBuffer?
+    private var flatLambdaBuffer:       MTLBuffer?
+    private var flatConstraintUniform:  MTLBuffer?
+    private var flatConstraintCapacity: Int = 0
+    private var flatColourStart = [Int](repeating: 0, count: 6)
+    private var flatColourCount = [Int](repeating: 0, count: 6)
+    private var flatConstraintTotal = 0
+    private var flatConstraintsDirty = true
+
     // ── Static scene colliders ─────────────────────────────────────────────────
     /// Fixed collider capsules from the scene (e.g. HotdogDropUltra's mustard-tub
     /// wall ring). Written into slots [0, count) of the shared collider buffer
@@ -137,6 +158,11 @@ public final class PBDTubeBatch {
     /// guarantees the fluid CB sees the PBD writes without an explicit fence.
     public var commandQueue: MTLCommandQueue { queue }
 
+    /// True when the flat-batched constraint/velocity solve is active for the
+    /// current tube set (homogeneous open-chain topology). Exposed so a scene's
+    /// perf HUD can report the dispatch-count collapse. Set each tick by `tick`.
+    public private(set) var flatSolveActive = false
+
     /// The current shared SDF collider buffer + count, or nil if no substeps
     /// have run yet. Fluid solvers bind this to expose hot-dog capsule shapes.
     public var colliderBinding: PBDSolver.ColliderBinding? {
@@ -164,6 +190,7 @@ public final class PBDTubeBatch {
     public func markDirty() {
         layoutsDirty = true
         flatDirty    = true
+        flatConstraintsDirty = true
     }
 
     // MARK: - Tick
@@ -218,11 +245,36 @@ public final class PBDTubeBatch {
             let iters       = tubes[0].solver.constraintIterations
             let vrestActive = params.velocityRestitution < 1.0
 
+            // ── Flat-solve eligibility ────────────────────────────────────────
+            // Opt-in + every tube an OPEN chain (the flat constraint layout has no
+            // ring-seam handling) + the batch pipelines/flat particle buffer ready.
+            let batchPipelines = SimPipelineCache.shared.pbdPipelines(for: tubes[0].solver.device)
+            let hasBatchFlat   = batchPipelines != nil && flatBuffer != nil
+            let allOpenChains  = tubes.allSatisfy { $0.solver.ringCount == 0 }
+            let flatRun = flatSolveEnabled && allOpenChains && hasBatchFlat
+                && rebuildFlatConstraintsIfDirty(tubes: tubes)
+            flatSolveActive = flatRun
+            if flatRun, let ubuf = flatConstraintUniform {
+                // Constraint + velocity kernels read only dt, ringCount(0),
+                // constraintCount(≥ any colour count), velRestitution from this.
+                let u = PBDUniforms(
+                    dt: fixedDt, gravity: 0, damping: 0, floorY: 0,
+                    particleCount: 0, constraintCount: UInt32(flatConstraintTotal),
+                    velRestitution: params.velocityRestitution, ringCount: 0)
+                ubuf.contents().bindMemory(to: PBDUniforms.self, capacity: 1).pointee = u
+            }
+
             // Lambda reset can overlap with the first compute pass on hardware
             // that supports blit + compute concurrency; use a separate encoder.
             if let blit = cb.makeBlitCommandEncoder() {
                 blit.label = "PBDTubeBatch.lambdaReset"
-                for tube in tubes { tube.solver.dispatchLambdaReset(into: blit) }
+                if flatRun, let lbuf = flatLambdaBuffer, flatConstraintTotal > 0 {
+                    // One fill over the whole flat lambda range replaces N per-tube
+                    // fills (XPBD resets λ = 0 at the start of every substep).
+                    blit.fill(buffer: lbuf, range: 0..<(flatConstraintTotal * MemoryLayout<Float>.stride), value: 0)
+                } else {
+                    for tube in tubes { tube.solver.dispatchLambdaReset(into: blit) }
+                }
                 // Static scene colliders → slots [0, count) of the private
                 // collider buffer. Re-blitted every substep so buffer reallocs
                 // (capacity growth) never leave stale/garbage static entries;
@@ -272,40 +324,59 @@ public final class PBDTubeBatch {
             }
             enc.memoryBarrier(scope: .buffers)
 
-            let batchPipelines = SimPipelineCache.shared.pbdPipelines(for: tubes[0].solver.device)
-            let hasBatchFlat   = batchPipelines != nil && flatBuffer != nil
-
-            // Phase 3: constraint loop — each colour group is one batch dispatch.
-            for _ in 0..<iters {
-                runConstraintColour(enc, tubes: tubes) { l in (l.primaryEvenStart, l.primaryEvenCount) }
-                runConstraintColour(enc, tubes: tubes) { l in (l.primaryOddStart,  l.primaryOddCount)  }
-                runConstraintColour(enc, tubes: tubes) { l in (l.bendAStart,       l.bendACount)       }
-                runConstraintColour(enc, tubes: tubes) { l in (l.bendBStart,       l.bendBCount)       }
-                runConstraintColour(enc, tubes: tubes) { l in (l.bendCStart,       l.bendCCount)       }
-                runConstraintColour(enc, tubes: tubes) { l in (l.longRangeStart,   l.longRangeCount)   }
-
-                if hasBatchFlat, let flat = flatBuffer, let p = batchPipelines {
-                    copyToFlat(enc,   tubes: tubes, flat: flat, pipelines: p)
-                    enc.memoryBarrier(scope: .buffers)
+            if flatRun, let flat = flatBuffer, let p = batchPipelines,
+               let solver0 = tubes.first?.solver {
+                // ── FLAT PATH: particles stay in the flat buffer across the whole
+                // iteration loop. Constraint + velocity colours are ONE dispatch
+                // each (vs one PER TUBE). Identical op-sequence to the per-tube
+                // path (P → constraints → SDF → … → velocity), just coarser
+                // dispatches over disjoint-particle colour groups.
+                copyToFlat(enc, tubes: tubes, flat: flat, pipelines: p)
+                enc.memoryBarrier(scope: .buffers)
+                for _ in 0..<iters {
+                    for c in 0..<6 { runFlatConstraintColour(enc, solver: solver0, colour: c) }
                     dispatchBatchSDF(enc, tubes: tubes, pipelines: p, params: params)
                     enc.memoryBarrier(scope: .buffers)
-                    copyFromFlat(enc, tubes: tubes, flat: flat, pipelines: p)
-                    enc.memoryBarrier(scope: .buffers)
-                } else {
-                    // Fallback while the batch pipeline is still warming up.
-                    for tube in tubes { tube.solver.dispatchSDFCollide(into: enc) }
-                    enc.memoryBarrier(scope: .buffers)
                 }
-            }
+                if vrestActive {
+                    for c in 0..<6 { runFlatVelocityColour(enc, solver: solver0, colour: c) }
+                }
+                copyFromFlat(enc, tubes: tubes, flat: flat, pipelines: p)
+                enc.memoryBarrier(scope: .buffers)
+            } else {
+                // ── PER-TUBE PATH (unchanged; every non-opted-in scene) ─────────
+                // Phase 3: constraint loop — each colour group is one batch dispatch.
+                for _ in 0..<iters {
+                    runConstraintColour(enc, tubes: tubes) { l in (l.primaryEvenStart, l.primaryEvenCount) }
+                    runConstraintColour(enc, tubes: tubes) { l in (l.primaryOddStart,  l.primaryOddCount)  }
+                    runConstraintColour(enc, tubes: tubes) { l in (l.bendAStart,       l.bendACount)       }
+                    runConstraintColour(enc, tubes: tubes) { l in (l.bendBStart,       l.bendBCount)       }
+                    runConstraintColour(enc, tubes: tubes) { l in (l.bendCStart,       l.bendCCount)       }
+                    runConstraintColour(enc, tubes: tubes) { l in (l.longRangeStart,   l.longRangeCount)   }
 
-            // Phase 3a: XPBD velocity post-solve (same colour-group barriers).
-            if vrestActive {
-                runVelocityColour(enc, tubes: tubes) { l in (l.primaryEvenStart, l.primaryEvenCount) }
-                runVelocityColour(enc, tubes: tubes) { l in (l.primaryOddStart,  l.primaryOddCount)  }
-                runVelocityColour(enc, tubes: tubes) { l in (l.bendAStart,       l.bendACount)       }
-                runVelocityColour(enc, tubes: tubes) { l in (l.bendBStart,       l.bendBCount)       }
-                runVelocityColour(enc, tubes: tubes) { l in (l.bendCStart,       l.bendCCount)       }
-                runVelocityColour(enc, tubes: tubes) { l in (l.longRangeStart,   l.longRangeCount)   }
+                    if hasBatchFlat, let flat = flatBuffer, let p = batchPipelines {
+                        copyToFlat(enc,   tubes: tubes, flat: flat, pipelines: p)
+                        enc.memoryBarrier(scope: .buffers)
+                        dispatchBatchSDF(enc, tubes: tubes, pipelines: p, params: params)
+                        enc.memoryBarrier(scope: .buffers)
+                        copyFromFlat(enc, tubes: tubes, flat: flat, pipelines: p)
+                        enc.memoryBarrier(scope: .buffers)
+                    } else {
+                        // Fallback while the batch pipeline is still warming up.
+                        for tube in tubes { tube.solver.dispatchSDFCollide(into: enc) }
+                        enc.memoryBarrier(scope: .buffers)
+                    }
+                }
+
+                // Phase 3a: XPBD velocity post-solve (same colour-group barriers).
+                if vrestActive {
+                    runVelocityColour(enc, tubes: tubes) { l in (l.primaryEvenStart, l.primaryEvenCount) }
+                    runVelocityColour(enc, tubes: tubes) { l in (l.primaryOddStart,  l.primaryOddCount)  }
+                    runVelocityColour(enc, tubes: tubes) { l in (l.bendAStart,       l.bendACount)       }
+                    runVelocityColour(enc, tubes: tubes) { l in (l.bendBStart,       l.bendBCount)       }
+                    runVelocityColour(enc, tubes: tubes) { l in (l.bendCStart,       l.bendCCount)       }
+                    runVelocityColour(enc, tubes: tubes) { l in (l.longRangeStart,   l.longRangeCount)   }
+                }
             }
 
             // Phase 3b: floor → post-floor SDF → final floor.
@@ -444,6 +515,113 @@ public final class PBDTubeBatch {
             length: MemoryLayout<SDFBatchUniforms>.size,
             options: .storageModeShared)
         sdfBatchUniBuf?.label = "PBDTubeBatch.sdfBatchUnis"
+    }
+
+    /// Colour-group slices of a tube's `ConstraintLayout`, in the SAME order the
+    /// per-tube path dispatches them (so the flat path is order-equivalent).
+    private static let colourSlices: [(PBDSolver.ConstraintLayout) -> (Int, Int)] = [
+        { ($0.primaryEvenStart, $0.primaryEvenCount) },
+        { ($0.primaryOddStart,  $0.primaryOddCount)  },
+        { ($0.bendAStart,       $0.bendACount)       },
+        { ($0.bendBStart,       $0.bendBCount)       },
+        { ($0.bendCStart,       $0.bendCCount)       },
+        { ($0.longRangeStart,   $0.longRangeCount)   },
+    ]
+
+    /// Rebuild the flat cross-tube constraint buffer (grouped by colour → tube),
+    /// remapping each tube's local particle indices to global flat indices. Only
+    /// runs on markDirty (spawn/cull/respawn) — never inside the substep loop.
+    /// Returns false if it couldn't build (caller falls back to the per-tube path).
+    @discardableResult
+    private func rebuildFlatConstraintsIfDirty(tubes: [PBDTubeRenderer]) -> Bool {
+        guard flatConstraintsDirty else { return flatConstraintTotal > 0 }
+        flatConstraintsDirty = false
+        flatConstraintTotal = 0
+
+        // Per-tube flat particle base = cumulative particle count.
+        var bases = [Int](repeating: 0, count: tubes.count)
+        var pacc = 0
+        for (t, tube) in tubes.enumerated() { bases[t] = pacc; pacc += tube.solver.particleBuffer.count }
+
+        // Total constraints across all tubes.
+        var total = 0
+        for tube in tubes { total += tube.solver.constraintBuffer.count }
+        guard total > 0 else { return false }
+
+        // (Re)allocate the flat constraint + lambda + uniform buffers.
+        if flatConstraintBuffer == nil || flatConstraintCapacity < total {
+            let newCap = max(total + 64, flatConstraintCapacity * 2, 256)
+            flatConstraintBuffer = device.makeBuffer(
+                length: newCap * MemoryLayout<PBDConstraint>.stride, options: .storageModeShared)
+            flatConstraintBuffer?.label = "PBDTubeBatch.flatConstraints"
+            flatLambdaBuffer = device.makeBuffer(
+                length: newCap * MemoryLayout<Float>.stride, options: .storageModePrivate)
+            flatLambdaBuffer?.label = "PBDTubeBatch.flatLambda"
+            flatConstraintCapacity = newCap
+        }
+        if flatConstraintUniform == nil {
+            flatConstraintUniform = device.makeBuffer(
+                length: MemoryLayout<PBDUniforms>.stride, options: .storageModeShared)
+            flatConstraintUniform?.label = "PBDTubeBatch.flatConstraintUni"
+        }
+        guard let cbuf = flatConstraintBuffer else { return false }
+        let dst = cbuf.contents().bindMemory(to: PBDConstraint.self, capacity: flatConstraintCapacity)
+
+        // Pack grouped by colour, then tube — each colour becomes one contiguous,
+        // independently-dispatchable slice.
+        var cursor = 0
+        for c in 0..<6 {
+            flatColourStart[c] = cursor
+            let slice = Self.colourSlices[c]
+            for (t, tube) in tubes.enumerated() {
+                let layout = tube.solver.constraintLayout
+                let (s, cnt) = slice(layout)
+                guard cnt > 0 else { continue }
+                let src = tube.solver.constraintBuffer.contents
+                let base = UInt32(bases[t])
+                for k in 0..<cnt {
+                    var con = src[s + k]
+                    con.i &+= base
+                    con.j &+= base
+                    dst[cursor] = con
+                    cursor += 1
+                }
+            }
+            flatColourCount[c] = cursor - flatColourStart[c]
+        }
+        flatConstraintTotal = cursor
+        return cursor > 0
+    }
+
+    /// One constraint colour group as a SINGLE flat dispatch across all tubes.
+    @inline(__always)
+    private func runFlatConstraintColour(_ enc: MTLComputeCommandEncoder,
+                                         solver: PBDSolver, colour: Int) {
+        let count = flatColourCount[colour]
+        guard count > 0,
+              let cbuf = flatConstraintBuffer, let lbuf = flatLambdaBuffer,
+              let ubuf = flatConstraintUniform, let pbuf = flatBuffer else { return }
+        solver.dispatchConstraintFlat(
+            into: enc, particles: pbuf,
+            constraints: cbuf, constraintByteOffset: flatColourStart[colour] * MemoryLayout<PBDConstraint>.stride,
+            lambda: lbuf, lambdaByteOffset: flatColourStart[colour] * MemoryLayout<Float>.stride,
+            uniform: ubuf, count: count)
+        enc.memoryBarrier(scope: .buffers)
+    }
+
+    /// One velocity colour group as a SINGLE flat dispatch across all tubes.
+    @inline(__always)
+    private func runFlatVelocityColour(_ enc: MTLComputeCommandEncoder,
+                                       solver: PBDSolver, colour: Int) {
+        let count = flatColourCount[colour]
+        guard count > 0,
+              let cbuf = flatConstraintBuffer, let ubuf = flatConstraintUniform,
+              let pbuf = flatBuffer else { return }
+        solver.dispatchVelocityFlat(
+            into: enc, particles: pbuf,
+            constraints: cbuf, constraintByteOffset: flatColourStart[colour] * MemoryLayout<PBDConstraint>.stride,
+            uniform: ubuf, count: count)
+        enc.memoryBarrier(scope: .buffers)
     }
 
     private func copyToFlat(_ enc: MTLComputeCommandEncoder,
