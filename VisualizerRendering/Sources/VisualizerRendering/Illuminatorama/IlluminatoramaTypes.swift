@@ -266,6 +266,15 @@ public struct IlluminatoramaFrameUniforms {
     public var vignetteExtent: Float = 0.55
     public var filmGrainStrength: Float = 0
     public var filmGrainSize: Float = 1.5
+    // ── Colour-grade LUT (issue #65) ─────────────────────────────────
+    /// 3D colour-grading LUT applied in the tonemap pass. `colorLUTAmount` 0 = OFF
+    /// → exact shader no-op; `colorLUTSize` is the per-axis LUT resolution for the
+    /// half-texel sampling correction. NEW 16-byte trailing cluster (stride 1024 →
+    /// 1040, two trailing pads); field-for-field mirror of the Metal `FrameUniforms`.
+    public var colorLUTAmount: Float = 0
+    public var colorLUTSize: Float = 33
+    public var _padPostFX0: Float = 0
+    public var _padPostFX1: Float = 0
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20

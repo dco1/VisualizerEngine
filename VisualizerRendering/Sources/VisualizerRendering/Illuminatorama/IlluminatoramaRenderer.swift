@@ -1029,6 +1029,19 @@ public final class IlluminatoramaRenderer {
     // the lighting kernel; the `dfgLUTEnabled` knob above gates sampling so
     // we can A/B against the Lagarde fallback without recompiling.
     private let dfgLUT: MTLTexture
+    // Issue #65 — 3D colour-grading LUT slot. A `type3D` cube sampled in the
+    // tonemap pass AFTER all other post (display-space grade). Baked to identity
+    // on init so the default is an EXACT no-op; a scene replaces it via
+    // `setColorLUT(...)` (or `loadCubeLUT(...)`). `colorLUTAmount` (0 = off) blends
+    // the graded result over the ungraded one. `colorLUTSize` is the per-axis
+    // resolution used for the half-texel sampling correction.
+    private var colorLUT: MTLTexture
+    private var colorLUTSize: Int = IlluminatoramaRenderer.colorLUTDefaultSize
+    /// 0 = OFF (default) → the tonemap LUT branch is an exact no-op. 1 = full grade.
+    public var colorLUTAmount: Float = 0
+    /// Last built-in look baked into `colorLUT`, so `applySharedColorGrade` only
+    /// rebakes the (CPU-built) LUT texture when the chosen look actually changes.
+    private var appliedColorGradeLook: IlluminatoramaColorGradeLook = .none
     // #60 task 5 increment 2 — LTC area-light specular LUTs (Minv + magnitude),
     // baked once on init. `ltcValidated` is true only when the bake matched
     // brute-force ground truth; the lighting kernel falls back to MRP otherwise.
@@ -2587,6 +2600,15 @@ public final class IlluminatoramaRenderer {
         }
         dfg.label = "Illuminatorama.dfgLUT"
         self.dfgLUT = dfg
+
+        // Issue #65 — identity colour-grade LUT (3D). Built on CPU and uploaded;
+        // identity means the tonemap LUT sample returns the input unchanged, so
+        // the default is an exact no-op until a scene calls `setColorLUT`.
+        guard let lut = Self.makeIdentityColorLUT(device: device,
+                                                  size: Self.colorLUTDefaultSize) else {
+            throw IlluminatoramaError.bufferAllocationFailed("Illuminatorama.colorLUT")
+        }
+        self.colorLUT = lut
 
         // #60 task 5 increment 2 — bake the LTC area-light specular LUTs once,
         // self-validated against brute-force MC of the GGX BRDF. Falls back to the
@@ -6161,7 +6183,7 @@ public final class IlluminatoramaRenderer {
         // scenes art-direct it and `render()` runs after their tick, so it opts in
         // via `applySharedPostFX`.) Targets are set before `uploadFrameUniforms`
         // below, which eases toward them.
-        if appliesSharedLensFX { applySharedLensFX() }
+        if appliesSharedLensFX { applySharedLensFX(); applySharedColorGrade() }
         // Ping-pong the instance buffer FIRST: after this swap,
         // currentInstanceBuffer is what was previousInstanceBuffer last frame
         // (so uploadInstances overwrites it with this frame's data), and
@@ -8362,6 +8384,166 @@ public final class IlluminatoramaRenderer {
         enc.endEncoding()
     }
 
+    // ── Issue #65: colour-grading LUT ─────────────────────────────────────────
+
+    /// IEEE-754 binary32 → binary16 (half) bit pattern for `rgba16Float` uploads.
+    @inline(__always)
+    private static func float32to16(_ v: Float) -> UInt16 { Float16(v).bitPattern }
+
+    /// Build an identity 3D LUT (`rgba16Float`, `size³`) where the texel at
+    /// (r,g,b) holds the colour (r,g,b)/(size-1). Sampling it with a colour in
+    /// [0,1]³ (half-texel-corrected) returns that colour unchanged — an exact
+    /// no-op grade. Uploaded once; `.shared` storage so the CPU bake is visible.
+    private static func makeIdentityColorLUT(device: MTLDevice, size: Int) -> MTLTexture? {
+        let d = MTLTextureDescriptor()
+        d.textureType = .type3D
+        d.pixelFormat = .rgba16Float
+        d.width = size; d.height = size; d.depth = size
+        d.usage = [.shaderRead]
+        d.storageMode = .shared
+        guard let tex = device.makeTexture(descriptor: d) else { return nil }
+        tex.label = "Illuminatorama.colorLUT"
+        var data = [UInt16](repeating: 0, count: size * size * size * 4)
+        let inv = 1.0 / Float(size - 1)
+        var i = 0
+        for b in 0..<size {
+            for g in 0..<size {
+                for r in 0..<size {
+                    data[i+0] = float32to16(Float(r) * inv)
+                    data[i+1] = float32to16(Float(g) * inv)
+                    data[i+2] = float32to16(Float(b) * inv)
+                    data[i+3] = float32to16(1.0)
+                    i += 4
+                }
+            }
+        }
+        let bpr = size * 4 * MemoryLayout<UInt16>.size
+        let bpi = bpr * size
+        data.withUnsafeBytes { raw in
+            tex.replace(region: MTLRegionMake3D(0, 0, 0, size, size, size),
+                        mipmapLevel: 0, slice: 0,
+                        withBytes: raw.baseAddress!,
+                        bytesPerRow: bpr, bytesPerImage: bpi)
+        }
+        return tex
+    }
+
+    /// Replace the colour-grade LUT from packed RGBA float data laid out as the
+    /// standard .cube ordering (red fastest, then green, then blue). `rgba` must
+    /// hold `size³` SIMD4 entries. Pass `nil` to reset to identity. The grade only
+    /// shows when `colorLUTAmount > 0`. Display-space (the LUT is sampled after
+    /// tonemapping, on the sRGB-encoded colour).
+    @discardableResult
+    public func setColorLUT(size: Int, rgba: [SIMD4<Float>]?) -> Bool {
+        guard let rgba else {
+            if let id = Self.makeIdentityColorLUT(device: device, size: Self.colorLUTDefaultSize) {
+                colorLUT = id; colorLUTSize = Self.colorLUTDefaultSize; return true
+            }
+            return false
+        }
+        guard size >= 2, rgba.count == size * size * size else { return false }
+        let d = MTLTextureDescriptor()
+        d.textureType = .type3D
+        d.pixelFormat = .rgba16Float
+        d.width = size; d.height = size; d.depth = size
+        d.usage = [.shaderRead]
+        d.storageMode = .shared
+        guard let tex = device.makeTexture(descriptor: d) else { return false }
+        tex.label = "Illuminatorama.colorLUT(custom)"
+        var data = [UInt16](repeating: 0, count: rgba.count * 4)
+        for (j, c) in rgba.enumerated() {
+            data[j*4+0] = Self.float32to16(c.x)
+            data[j*4+1] = Self.float32to16(c.y)
+            data[j*4+2] = Self.float32to16(c.z)
+            data[j*4+3] = Self.float32to16(1.0)
+        }
+        let bpr = size * 4 * MemoryLayout<UInt16>.size
+        let bpi = bpr * size
+        data.withUnsafeBytes { raw in
+            tex.replace(region: MTLRegionMake3D(0, 0, 0, size, size, size),
+                        mipmapLevel: 0, slice: 0,
+                        withBytes: raw.baseAddress!,
+                        bytesPerRow: bpr, bytesPerImage: bpi)
+        }
+        colorLUT = tex; colorLUTSize = size
+        return true
+    }
+
+    /// Parse an Adobe/Resolve `.cube` 3D LUT and install it. Returns false on a
+    /// malformed file. Supports `LUT_3D_SIZE` + `r g b` rows (the common subset).
+    @discardableResult
+    public func loadCubeLUT(contentsOf url: URL) -> Bool {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return false }
+        var size = 0
+        var entries: [SIMD4<Float>] = []
+        for raw in text.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            if line.uppercased().hasPrefix("LUT_3D_SIZE") {
+                size = Int(line.split(separator: " ").last.map(String.init) ?? "") ?? 0
+                if size > 1 { entries.reserveCapacity(size*size*size) }
+                continue
+            }
+            let comps = line.split(separator: " ").compactMap { Float($0) }
+            if comps.count == 3 { entries.append(SIMD4(comps[0], comps[1], comps[2], 1)) }
+        }
+        guard size > 1, entries.count == size*size*size else { return false }
+        return setColorLUT(size: size, rgba: entries)
+    }
+
+    /// Generate one of the built-in procedural grades as packed RGBA LUT data
+    /// (.cube order, red fastest). Returns nil for `.none` (caller installs the
+    /// identity LUT). The grade is computed in DISPLAY (~sRGB) space, matching how
+    /// the tonemap samples the LUT.
+    static func generateColorGradeLUT(look: IlluminatoramaColorGradeLook,
+                                      size: Int) -> [SIMD4<Float>]? {
+        guard look != .none, size >= 2 else { return nil }
+        func luma(_ c: SIMD3<Float>) -> Float { c.x*0.2126 + c.y*0.7152 + c.z*0.0722 }
+        func contrast(_ c: SIMD3<Float>, _ k: Float) -> SIMD3<Float> { (c - 0.5) * k + 0.5 }
+        func smooth(_ e0: Float, _ e1: Float, _ x: Float) -> Float {
+            let t = max(0, min(1, (x - e0) / (e1 - e0))); return t * t * (3 - 2 * t)
+        }
+        var out = [SIMD4<Float>](); out.reserveCapacity(size*size*size)
+        let inv = 1.0 / Float(size - 1)
+        for b in 0..<size { for g in 0..<size { for r in 0..<size {
+            var c = SIMD3(Float(r), Float(g), Float(b)) * inv
+            switch look {
+            case .none: break
+            case .tealOrange:
+                let t = smooth(0.2, 0.85, luma(c))
+                let shadow = SIMD3<Float>(-0.02, 0.03, 0.08)   // push shadows teal
+                let high   = SIMD3<Float>( 0.09, 0.02, -0.07)  // push highlights orange
+                c += shadow * (1 - t) + high * t
+                c = contrast(c, 1.10)
+            case .warm:
+                c *= SIMD3<Float>(1.07, 1.01, 0.90); c = contrast(c, 1.05)
+            case .cool:
+                c *= SIMD3<Float>(0.92, 1.00, 1.09); c = contrast(c, 1.05)
+            case .noir:
+                let l = luma(c); c = contrast(SIMD3(l, l, l), 1.22)
+            case .vibrant:
+                let l = luma(c); c = l + (c - l) * 1.45; c = contrast(c, 1.06)
+            }
+            c = simd_clamp(c, SIMD3<Float>(repeating: 0), SIMD3<Float>(repeating: 1))
+            out.append(SIMD4(c, 1))
+        }}}
+        return out
+    }
+
+    /// Apply the shared panel's colour grade (issue #65). Rebakes the LUT only when
+    /// the chosen look changes (the CPU bake is a per-frame no-op in steady state),
+    /// and sets `colorLUTAmount` each frame. Called from `render()` alongside the
+    /// other shared-FX appliers, so every Illuminatorama scene inherits it.
+    func applySharedColorGrade(_ s: IlluminatoramaSharedSettings = .shared) {
+        if s.colorGradeLook != appliedColorGradeLook {
+            appliedColorGradeLook = s.colorGradeLook
+            let data = Self.generateColorGradeLUT(look: s.colorGradeLook,
+                                                  size: Self.colorLUTDefaultSize)
+            setColorLUT(size: Self.colorLUTDefaultSize, rgba: data)
+        }
+        colorLUTAmount = (s.colorGradeLook == .none) ? 0 : Float(s.colorLUTAmount)
+    }
+
     private func encodeTonemapPass(_ cb: MTLCommandBuffer) {
         // Phase 4.28 — RENDER pass (not compute). Draws a fullscreen triangle
         // into `tonemapWriteTarget`; the end-of-pass `.store` is what makes the
@@ -8378,6 +8560,10 @@ public final class IlluminatoramaRenderer {
         enc.setRenderPipelineState(tonemapPipeline)
         enc.setFragmentTexture(bloomTonemapSource, index: 0)
         enc.setFragmentTexture(bloomBlurVHalf, index: 1)
+        // Issue #65 — 3D colour-grade LUT at texture(2). Always bound (identity by
+        // default), so the shader never branches on nil; the grade is gated by
+        // `colorLUTAmount` in the uniforms.
+        enc.setFragmentTexture(colorLUT, index: 2)
         enc.setFragmentBuffer(frameUniformBuffer, offset: 0, index: 0)
         // Phase 4.21 — exposure buffer at buffer(1). The fragment reads
         // `expoState.smoothedExposure` when `frame.autoExposureEnabled`
@@ -8622,6 +8808,9 @@ public final class IlluminatoramaRenderer {
         u.vignetteExtent    = max(0, min(1, vignetteExtent))
         u.filmGrainStrength = max(0, filmGrainStrength)
         u.filmGrainSize     = max(1, filmGrainSize)
+        // Colour-grade LUT (issue #65). 0 → no-op; size feeds the half-texel inset.
+        u.colorLUTAmount    = max(0, min(1, colorLUTAmount))
+        u.colorLUTSize      = Float(colorLUTSize)
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
 
@@ -8818,6 +9007,9 @@ public final class IlluminatoramaRenderer {
     private static let prefilteredMipCount: Int = 6
     // Phase 3.2 — 128² is standard; the signal is smooth so larger is wasteful.
     private static let dfgLUTSize: Int = 128
+    // Issue #65 — colour-grade LUT default per-axis resolution. 33 is the .cube
+    // de-facto standard (matches DaVinci / most authoring tools).
+    static let colorLUTDefaultSize: Int = 33
     // Phase 3.1 — DDGI tile sizes. irrTileSize=6 is the standard minimum for
     // diffuse irradiance (the signal is low-frequency). depthTileSize=14 is
     // larger to reduce mean-distance bias from undersampled directions.

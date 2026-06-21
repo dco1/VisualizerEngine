@@ -195,6 +195,14 @@ struct FrameUniforms {
     float    vignetteExtent;     // 0..1 radius (frac of half-diagonal) kept bright
     float    filmGrainStrength;  // 0 = off; grain amplitude
     float    filmGrainSize;      // grain cell size in OUTPUT px (>= 1)
+    // Issue #65 — 3D colour-grade LUT (texture(2) of illumi_tonemap_fs). 0 = OFF
+    // → exact no-op. `colorLUTSize` is the per-axis resolution for the half-texel
+    // sampling correction. NEW 16-byte cluster (stride 1024 → 1040); mirror of
+    // the Swift IlluminatoramaFrameUniforms.
+    float    colorLUTAmount;     // 0 = off; blend of graded over ungraded
+    float    colorLUTSize;       // per-axis LUT resolution (e.g. 33)
+    float    _padPostFX0;
+    float    _padPostFX1;
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift
@@ -4558,6 +4566,7 @@ fragment float4 illumi_tonemap_fs(
     TonemapVSOut                    in       [[stage_in]],
     texture2d<half, access::sample> inHDR    [[texture(0)]],
     texture2d<half, access::sample> inBloom  [[texture(1)]],
+    texture3d<half, access::sample> colorLUT [[texture(2)]],
     constant FrameUniforms&         frame    [[buffer(0)]],
     // Phase 4.21 — auto-exposure read (see below).
     const device ExposureState&     expoState [[buffer(1)]]
@@ -4733,6 +4742,23 @@ fragment float4 illumi_tonemap_fs(
         float lumG = dot(mapped, float3(0.2126, 0.7152, 0.0722));
         float mask = 4.0 * lumG * (1.0 - lumG);       // parabola: 1 at mid-grey, 0 at ends
         mapped = saturate(mapped + n * frame.filmGrainStrength * mask);
+    }
+
+    // ── Colour-grade LUT (issue #65) ──────────────────────────────────────────
+    // A 3D LUT applied in DISPLAY space: encode the linear `mapped` to ~sRGB, look
+    // it up in the LUT cube (the standard .cube authoring space), decode back to
+    // linear, and blend by `colorLUTAmount`. Half-texel correction keeps the
+    // lookup inside texel centres so the trilinear filter doesn't clamp-bias the
+    // extremes. 0 amount → exact no-op (and the identity-baked default LUT is a
+    // no-op even at amount 1).
+    if (frame.colorLUTAmount > 0.0) {
+        constexpr sampler lutSampler(filter::linear, address::clamp_to_edge, coord::normalized);
+        float  n   = max(frame.colorLUTSize, 2.0);
+        float3 src = pow(saturate(mapped), float3(1.0 / 2.2));     // linear → ~sRGB
+        float3 uvw = src * ((n - 1.0) / n) + (0.5 / n);           // half-texel inset
+        float3 graded = float3(colorLUT.sample(lutSampler, uvw).rgb);
+        graded = pow(saturate(graded), float3(2.2));               // ~sRGB → linear
+        mapped = mix(mapped, graded, saturate(frame.colorLUTAmount));
     }
 
     // ── Phase 4.39: debanding dither ──────────────────────────────────────────

@@ -68,6 +68,11 @@ public final class IlluminatoramaSharedSettings {
     public var filmGrainEnabled: Bool = false
     public var filmGrain: Double = 0.06
     public var filmGrainSize: Double = 1.5
+    /// Colour-grade LUT look (issue #65). `.none` → exact no-op; any other look
+    /// bakes a procedural 3D LUT the renderer blends by `colorLUTAmount`. A scene
+    /// can override with a bespoke `.cube` via `IlluminatoramaRenderer.loadCubeLUT`.
+    public var colorGradeLook: IlluminatoramaColorGradeLook = .none
+    public var colorLUTAmount: Double = 1.0
 
     // ── SSAO ──────────────────────────────────────────────────────────
     public var ssaoIntensity: Double = 0.85
@@ -143,6 +148,8 @@ public final class IlluminatoramaSharedSettings {
         filmGrainEnabled = \(filmGrainEnabled)
         filmGrain = \(fmt(filmGrain))
         filmGrainSize = \(fmt(filmGrainSize))
+        # colorGradeLook = \(colorGradeLook.rawValue)   (enum — informational; Save-defaults skips it)
+        colorLUTAmount = \(fmt(colorLUTAmount))
         ssaoIntensity = \(fmt(ssaoIntensity))
         ssaoRadius = \(fmt(ssaoRadius))
         ssrIntensity = \(fmt(ssrIntensity))
