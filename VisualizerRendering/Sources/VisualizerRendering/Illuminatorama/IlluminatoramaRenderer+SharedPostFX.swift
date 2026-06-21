@@ -23,6 +23,8 @@ public extension IlluminatoramaRenderer {
         vignetteExtent      = Float(s.vignetteExtent)
         filmGrainStrength   = Float(s.filmGrainEnabled ? s.filmGrain : 0)
         filmGrainSize       = Float(s.filmGrainSize)
+        motionBlurStrength  = Float(s.motionBlurEnabled ? s.motionBlur : 0)
+        motionBlurMaxPx     = Float(s.motionBlurMaxPx)
         postFXEasingTau     = s.postFXEasing.tau
     }
 

@@ -68,6 +68,14 @@ public final class IlluminatoramaSharedSettings {
     public var filmGrainEnabled: Bool = false
     public var filmGrain: Double = 0.06
     public var filmGrainSize: Double = 1.5
+    /// Velocity-buffer motion blur — streaks moving objects + camera pans along their
+    /// screen motion (a camera-shutter look). OFF by default → exact shader no-op.
+    /// `motionBlur` is the strength (≈ shutter fraction; ~0.5 ≈ a natural 180° look);
+    /// `motionBlurMaxPx` caps the streak length in pixels so a fast pan can't smear
+    /// the whole frame.
+    public var motionBlurEnabled: Bool = false
+    public var motionBlur: Double = 0.5
+    public var motionBlurMaxPx: Double = 48
     /// Colour-grade LUT look (issue #65). `.none` → exact no-op; any other look
     /// bakes a procedural 3D LUT the renderer blends by `colorLUTAmount`. A scene
     /// can override with a bespoke `.cube` via `IlluminatoramaRenderer.loadCubeLUT`.
@@ -148,6 +156,9 @@ public final class IlluminatoramaSharedSettings {
         filmGrainEnabled = \(filmGrainEnabled)
         filmGrain = \(fmt(filmGrain))
         filmGrainSize = \(fmt(filmGrainSize))
+        motionBlurEnabled = \(motionBlurEnabled)
+        motionBlur = \(fmt(motionBlur))
+        motionBlurMaxPx = \(fmt(motionBlurMaxPx))
         # colorGradeLook = \(colorGradeLook.rawValue)   (enum — informational; Save-defaults skips it)
         colorLUTAmount = \(fmt(colorLUTAmount))
         ssaoIntensity = \(fmt(ssaoIntensity))

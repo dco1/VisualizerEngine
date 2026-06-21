@@ -273,8 +273,12 @@ public struct IlluminatoramaFrameUniforms {
     /// 1040, two trailing pads); field-for-field mirror of the Metal `FrameUniforms`.
     public var colorLUTAmount: Float = 0
     public var colorLUTSize: Float = 33
-    public var _padPostFX0: Float = 0
-    public var _padPostFX1: Float = 0
+    // Velocity-buffer motion blur (issue #65). Repurposes the two trailing post-FX
+    // pads — stride unchanged. 0 strength → exact no-op. `motionBlurStrength` scales
+    // the per-frame screen velocity (≈ shutter fraction); `motionBlurMaxPx` clamps
+    // the streak length in output px. Field-for-field mirror of the Metal struct.
+    public var motionBlurStrength: Float = 0
+    public var motionBlurMaxPx: Float = 48
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20

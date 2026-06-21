@@ -201,8 +201,12 @@ struct FrameUniforms {
     // the Swift IlluminatoramaFrameUniforms.
     float    colorLUTAmount;     // 0 = off; blend of graded over ungraded
     float    colorLUTSize;       // per-axis LUT resolution (e.g. 33)
-    float    _padPostFX0;
-    float    _padPostFX1;
+    // Velocity-buffer motion blur (issue #65). Repurposes the two trailing post-FX
+    // pads — stride unchanged. 0 strength → exact no-op (the tonemap keeps its plain
+    // 4-tap path). `motionBlurStrength` scales the per-frame screen velocity (≈ a
+    // shutter fraction); `motionBlurMaxPx` clamps the streak length in OUTPUT px.
+    float    motionBlurStrength; // was _padPostFX0
+    float    motionBlurMaxPx;    // was _padPostFX1
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift
@@ -4567,6 +4571,7 @@ fragment float4 illumi_tonemap_fs(
     texture2d<half, access::sample> inHDR    [[texture(0)]],
     texture2d<half, access::sample> inBloom  [[texture(1)]],
     texture3d<half, access::sample> colorLUT [[texture(2)]],
+    texture2d<half, access::sample> inVel    [[texture(3)]],   // screen-space velocity (UV/frame)
     constant FrameUniforms&         frame    [[buffer(0)]],
     // Phase 4.21 — auto-exposure read (see below).
     const device ExposureState&     expoState [[buffer(1)]]
@@ -4585,7 +4590,28 @@ fragment float4 illumi_tonemap_fs(
         float2(-0.5,  0.5), float2( 0.5,  0.5)
     };
     float3 hdr = float3(0.0);
-    if (frame.chromaticAberration > 0.0) {
+    if (frame.motionBlurStrength > 0.0) {
+        // ── Velocity-buffer motion blur (issue #65) ──────────────────────────────
+        // Gather inHDR along the per-frame screen velocity — a camera-shutter streak.
+        // `inVel` stores (currNDC − prevNDC)·(0.5, −0.5) in UV, written by the
+        // G-buffer pass from the CURRENT and PREVIOUS view-projection AND the
+        // ping-ponged previous-instance model matrix, so it carries per-object motion
+        // (spin/translate) as well as camera motion. Symmetric N-tap centred on the
+        // pixel; the streak length scales with `motionBlurStrength` (≈ shutter
+        // fraction) and is clamped to `motionBlurMaxPx`. 0 strength skips this branch,
+        // preserving the exact CA / 4-tap path below.
+        float2 vel = float2(inVel.sample(downSampler, in.uv).rg) * frame.motionBlurStrength;
+        float  maxUV = max(0.0, frame.motionBlurMaxPx) * max(invInSize.x, invInSize.y);
+        float  vlen = length(vel);
+        if (vlen > maxUV && vlen > 1e-6) vel *= maxUV / vlen;
+        const int MB = 9;
+        float3 acc = float3(0.0);
+        for (int s = 0; s < MB; ++s) {
+            float t = (float(s) / float(MB - 1)) - 0.5;   // [-0.5, 0.5] across the streak
+            acc += float3(inHDR.sample(downSampler, in.uv + vel * t).rgb);
+        }
+        hdr = acc / float(MB);
+    } else if (frame.chromaticAberration > 0.0) {
         // Lens-style transverse chromatic aberration: split the red channel
         // outward and the blue channel inward along the radius from the frame
         // centre, growing toward the edges (zero in the middle, like a real
@@ -4599,13 +4625,14 @@ fragment float4 illumi_tonemap_fs(
             hdr.g += float(inHDR.sample(downSampler, uv).g);
             hdr.b += float(inHDR.sample(downSampler, uv - caOff).b);
         }
+        hdr *= 0.25;
     } else {
         for (int i = 0; i < 4; ++i) {
             float2 uv = in.uv + offsets[i] * invInSize;
             hdr += float3(inHDR.sample(downSampler, uv).rgb);
         }
+        hdr *= 0.25;
     }
-    hdr *= 0.25;
 
     // ── Spherical aberration ───────────────────────────────────────────────────
     // A real lens's outer zones focus at a slightly different plane than the

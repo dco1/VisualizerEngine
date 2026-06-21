@@ -1039,6 +1039,14 @@ public final class IlluminatoramaRenderer {
     private var colorLUTSize: Int = IlluminatoramaRenderer.colorLUTDefaultSize
     /// 0 = OFF (default) → the tonemap LUT branch is an exact no-op. 1 = full grade.
     public var colorLUTAmount: Float = 0
+    /// Velocity-buffer motion blur (issue #65). `motionBlurStrength` scales the
+    /// per-frame screen velocity (≈ shutter fraction; ~0.5 is a natural 180° look);
+    /// 0 = OFF → the tonemap gather is skipped (exact no-op). `motionBlurMaxPx` caps
+    /// the streak length in output px so a fast pan can't smear the whole frame.
+    /// Driven by camera AND per-object motion (the renderer ping-pongs the instance
+    /// buffer, so spinning/translating instances streak correctly).
+    public var motionBlurStrength: Float = 0
+    public var motionBlurMaxPx: Float = 48
     /// Last built-in look baked into `colorLUT`, so `applySharedColorGrade` only
     /// rebakes the (CPU-built) LUT texture when the chosen look actually changes.
     private var appliedColorGradeLook: IlluminatoramaColorGradeLook = .none
@@ -8587,6 +8595,9 @@ public final class IlluminatoramaRenderer {
         // default), so the shader never branches on nil; the grade is gated by
         // `colorLUTAmount` in the uniforms.
         enc.setFragmentTexture(colorLUT, index: 2)
+        // Issue #65 — screen-space velocity at texture(3) for motion blur. Always
+        // bound; gated by `motionBlurStrength` (0 = the tonemap skips the gather).
+        enc.setFragmentTexture(velocityTexture, index: 3)
         enc.setFragmentBuffer(frameUniformBuffer, offset: 0, index: 0)
         // Phase 4.21 — exposure buffer at buffer(1). The fragment reads
         // `expoState.smoothedExposure` when `frame.autoExposureEnabled`
@@ -8834,6 +8845,9 @@ public final class IlluminatoramaRenderer {
         // Colour-grade LUT (issue #65). 0 → no-op; size feeds the half-texel inset.
         u.colorLUTAmount    = max(0, min(1, colorLUTAmount))
         u.colorLUTSize      = Float(colorLUTSize)
+        // Velocity-buffer motion blur (issue #65). 0 → no-op.
+        u.motionBlurStrength = max(0, motionBlurStrength)
+        u.motionBlurMaxPx    = max(0, motionBlurMaxPx)
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
 
