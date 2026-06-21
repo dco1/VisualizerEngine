@@ -212,6 +212,14 @@ public final class PBDTubeBatch {
     /// encodes integrate → build-colliders → constraint-loop → velocity-postsolve
     /// → floor → tube-expand, all in a single `MTLComputeCommandEncoder` with
     /// explicit buffer barriers between phases.
+    /// Live perf instrumentation: substeps actually encoded vs dropped because the
+    /// 3-deep in-flight ring was full (the GPU couldn't keep up). A high drop
+    /// fraction means the physics is running SLOWER than wall-clock under load —
+    /// the cost the GPU-fenced probe hides. Read + reset by a scene's fps probe.
+    public private(set) var substepsRun = 0
+    public private(set) var substepsDropped = 0
+    public func resetSubstepCounters() { substepsRun = 0; substepsDropped = 0 }
+
     public func tick(tubes: [PBDTubeRenderer], dt: Double, params: Params) {
         guard !tubes.isEmpty else { return }
 
@@ -224,6 +232,7 @@ public final class PBDTubeBatch {
         while accumulator >= fixedDt && steps < 4 {
             if inflightSemaphore.wait(timeout: .now()) == .timedOut {
                 accumulator -= fixedDt
+                substepsDropped += 1
                 break
             }
             rebuildLayoutsIfDirty(tubes: tubes)
@@ -430,6 +439,7 @@ public final class PBDTubeBatch {
             cb.commit()
             accumulator -= fixedDt
             steps += 1
+            substepsRun += 1
         }
     }
 
