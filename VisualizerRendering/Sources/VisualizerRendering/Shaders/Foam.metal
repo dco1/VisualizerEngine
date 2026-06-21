@@ -150,6 +150,79 @@ kernel void foamSpawn(
     foam[slot] = fp;
 }
 
+// ── KERNEL 1b — Impact spawn (from a PBD collider's particles) ───────────────
+//
+// One thread per PBD particle (e.g. a hot-dog spine particle in the flat batch
+// buffer). A thick, viscous fluid on a coarse MPM grid barely moves its own
+// PARTICLES on impact, so `foamSpawn` (which reads fluid-particle speed) is too
+// sparse to read as a splash. This kernel instead sprays a foam CROWN directly
+// where a solid is punching INTO the bath: a particle that sits in the surface
+// band, is moving fast, and is heading DOWN. Fully on the GPU — replaces the
+// old CPU `emitImpactFoam` that read every spine particle and wrote the foam
+// buffer from the main thread (a CPU↔GPU race + non-resident physics).
+
+// Layout must match PBDParticle (PBD.metal / PBDSolver.swift): two float4s.
+struct ImpactParticle {
+    float4 positionAndInvMass;  // xyz = position
+    float4 prevPositionAndPad;  // xyz = previous-substep position (→ velocity)
+};
+
+struct FoamImpactUniforms {
+    uint  particleCount;
+    uint  foamCapacity;
+    uint  frameSeed;
+    float surfaceY;
+    float bandLo;       // surfaceY - below
+    float bandHi;       // surfaceY + above
+    float minSpeed;     // m/s
+    float minDownVel;   // require vy < -minDownVel
+    float lifeMax;      // s
+    float emitY;        // spawn height (just above the surface, clears the mustard)
+    float invDt;        // 1 / substep dt  (→ m/s from a per-substep displacement)
+    float outMin, outMax;   // outward fan speed range
+    float upMin,  upMax;    // upward crown speed range
+};
+
+kernel void foamImpactSpawn(
+    device const ImpactParticle* particles [[ buffer(0) ]],
+    device FoamParticle*         foam      [[ buffer(1) ]],
+    device atomic_uint*          nextSlot  [[ buffer(2) ]],
+    constant FoamImpactUniforms& U         [[ buffer(3) ]],
+    uint pid [[ thread_position_in_grid ]])
+{
+    if (pid >= U.particleCount) return;
+
+    ImpactParticle p = particles[pid];
+    float3 pos  = p.positionAndInvMass.xyz;
+    float3 prev = p.prevPositionAndPad.xyz;
+    float3 vel  = (pos - prev) * U.invDt;
+    float  speed = length(vel);
+
+    // Impact gate: in the surface band, fast, descending.
+    if (pos.y > U.bandHi || pos.y < U.bandLo) return;
+    if (vel.y > -U.minDownVel) return;
+    if (speed < U.minSpeed) return;
+
+    uint burst = min(7u, 2u + uint(speed * 0.4f));
+    uint base  = atomic_fetch_add_explicit(nextSlot, burst, memory_order_relaxed);
+
+    for (uint b = 0; b < burst; ++b) {
+        uint  slot = (base + b) % U.foamCapacity;
+        float3 r   = rand3(pid, U.frameSeed ^ (b * 0x9E37u + 1u));
+        float  ang = (r.x * 2.0f - 1.0f) * M_PI_F;
+        float  outR = mix(U.outMin, U.outMax, r.y);
+        float  up   = mix(U.upMin,  U.upMax,  r.z);
+        float  life = U.lifeMax * mix(0.55f, 1.0f, rand01(pid, U.frameSeed ^ (b * 0xBEEFu + 7u)));
+
+        FoamParticle fp;
+        fp.positionLife = float4(pos.x + cos(ang) * 0.15f, U.emitY, pos.z + sin(ang) * 0.15f, life);
+        fp.velocityAge  = float4(cos(ang) * outR + vel.x * 0.15f,
+                                 up,
+                                 sin(ang) * outR + vel.z * 0.15f, 0.0f);
+        foam[slot] = fp;
+    }
+}
+
 // ── KERNEL 2 — Advect ───────────────────────────────────────────────────────
 //
 // One thread per foam slot. Skips dead slots (life ≤ 0). For live ones:

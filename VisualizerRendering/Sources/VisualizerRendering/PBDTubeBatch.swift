@@ -88,6 +88,16 @@ public final class PBDTubeBatch {
 
     // ── Flat particle buffer (GPU-only, sized for all tubes' particles) ───────
     private var flatBuffer:      MTLBuffer?
+    private var flatParticleCount = 0
+    /// The flat all-tubes particle buffer + its particle count, valid after a
+    /// tick (holds every tube's solved spine particles contiguously, PBDParticle
+    /// layout). Exposed so a scene can run GPU passes over ALL franks' particles
+    /// in one dispatch — e.g. HotdogDropUltra's GPU impact-foam spawn — instead
+    /// of a per-tube CPU loop. nil before the first tick / with no tubes.
+    public var flatParticleBinding: (buffer: MTLBuffer, count: Int)? {
+        guard let buf = flatBuffer, flatParticleCount > 0 else { return nil }
+        return (buf, flatParticleCount)
+    }
     private var boundaryBuffer:  MTLBuffer?   // [start: UInt32, count: UInt32] per tube
     private var sdfBatchUniBuf:  MTLBuffer?   // SDFBatchUniforms, written each substep
     private var flatDirty        = true
@@ -491,6 +501,7 @@ public final class PBDTubeBatch {
 
         let totalParticles = tubes.reduce(0) { $0 + $1.solver.particleBuffer.count }
         guard totalParticles > 0 else { return }
+        flatParticleCount = totalParticles
 
         flatBuffer = device.makeBuffer(
             length: totalParticles * MemoryLayout<PBDParticle>.stride,

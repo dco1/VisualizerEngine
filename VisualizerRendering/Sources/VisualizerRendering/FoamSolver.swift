@@ -70,6 +70,9 @@ public final class FoamSolver {
     public let device: MTLDevice
     private let spawnPipeline:  MTLComputePipelineState
     private let advectPipeline: MTLComputePipelineState
+    /// Optional impact-spawn pipeline (foam crown from a collider's PBD
+    /// particles). nil if the kernel is missing — `encodeImpactSpawn` no-ops.
+    private let impactPipeline: MTLComputePipelineState?
 
     // ── Storage ───────────────────────────────────────────────────────────────
 
@@ -187,6 +190,7 @@ public final class FoamSolver {
         self.device          = device
         self.spawnPipeline   = spawnP
         self.advectPipeline  = advectP
+        self.impactPipeline  = engine.pipeline("foamImpactSpawn")
         self.particleBuffer  = pBuf
         self.nextSlotBuffer  = slotBuf
         self.uniformBuffer   = uBuf
@@ -259,6 +263,64 @@ public final class FoamSolver {
             )
             enc.endEncoding()
         }
+    }
+
+    // ── Impact spawn (GPU) ─────────────────────────────────────────────────────
+
+    /// Swift mirror of `FoamImpactUniforms` in Foam.metal.
+    private struct ImpactUniforms {
+        var particleCount: UInt32
+        var foamCapacity:  UInt32
+        var frameSeed:     UInt32
+        var surfaceY:      Float
+        var bandLo:        Float
+        var bandHi:        Float
+        var minSpeed:      Float
+        var minDownVel:    Float
+        var lifeMax:       Float
+        var emitY:         Float
+        var invDt:         Float
+        var outMin:        Float
+        var outMax:        Float
+        var upMin:         Float
+        var upMax:         Float
+    }
+
+    /// Spray a foam crown directly where a solid's particles punch into the bath
+    /// — one GPU thread per source particle (e.g. the hot-dog spine particles in
+    /// `PBDTubeBatch`'s flat buffer). Replaces the CPU impact-foam loop; fully
+    /// GPU-resident. `source` must have `ImpactParticle` layout (two float4s:
+    /// positionAndInvMass, prevPositionAndPad). `invDt` converts the per-substep
+    /// displacement (pos-prev) to m/s. No-op if the kernel is unavailable.
+    public func encodeImpactSpawn(to commandBuffer: MTLCommandBuffer,
+                                  source: MTLBuffer, sourceCount: Int,
+                                  surfaceY: Float, invDt: Float,
+                                  frameSeed: UInt32) {
+        guard let pipeline = impactPipeline, sourceCount > 0 else { return }
+        var u = ImpactUniforms(
+            particleCount: UInt32(sourceCount),
+            foamCapacity:  UInt32(particleBuffer.capacity),
+            frameSeed:     frameSeed,
+            surfaceY:      surfaceY,
+            bandLo:        surfaceY - 0.6,
+            bandHi:        surfaceY + 0.45,
+            minSpeed:      2.4,
+            minDownVel:    1.0,
+            lifeMax:       lifeMax,
+            emitY:         surfaceY + 0.35,
+            invDt:         invDt,
+            outMin: 0.6, outMax: 2.6, upMin: 2.2, upMax: 4.8)
+        guard let enc = commandBuffer.makeComputeCommandEncoder() else { return }
+        enc.label = "Foam.impactSpawn"
+        enc.setComputePipelineState(pipeline)
+        enc.setBuffer(source,               offset: 0, index: 0)
+        enc.setBuffer(particleBuffer.buffer, offset: 0, index: 1)
+        enc.setBuffer(nextSlotBuffer,        offset: 0, index: 2)
+        enc.setBytes(&u, length: MemoryLayout<ImpactUniforms>.stride, index: 3)
+        let w = min(sourceCount, pipeline.maxTotalThreadsPerThreadgroup)
+        enc.dispatchThreads(MTLSize(width: sourceCount, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+        enc.endEncoding()
     }
 
     /// Clear all foam particles by parking them under the floor and resetting
