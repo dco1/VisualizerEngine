@@ -7107,14 +7107,23 @@ public final class IlluminatoramaRenderer {
         u.surfAtlasW = cacheOn ? UInt32(surfAtlasW) : 0
         u.surfAtlasH = cacheOn ? UInt32(surfAtlasH) : 0
         u.dispersionEnabled = rtGlassDispersionEnabled ? 1 : 0
-        // Cheap glass: only on the non-RT path, and only if a host opted in.
-        let cheap = !useRT && glassCheapMode != 0
-        u.cheapGlassMode = cheap ? UInt32(glassCheapMode) : 0
+        // Graceful RT-glass degradation (issue #65): a scene that asked for RT glass
+        // (`rtGlassEnabled`) but whose TLAS isn't live this frame — unsupported
+        // device, not built yet, or no glass in the TLAS — auto-falls back to the
+        // best screen-space cheap glass (mode 2, refractive + thin-film) instead of
+        // the flat Fresnel-only fallback, with NO per-scene `glassCheapMode` wiring.
+        // An explicit `glassCheapMode` still wins if a host set one.
+        let autoCheapFallback = rtGlassEnabled && !useRT
+        let effectiveCheapMode = glassCheapMode != 0 ? glassCheapMode
+                               : (autoCheapFallback ? 2 : 0)
+        // Cheap glass: only on the non-RT path, and only if opted in OR auto-fallback.
+        let cheap = !useRT && effectiveCheapMode != 0
+        u.cheapGlassMode = cheap ? UInt32(effectiveCheapMode) : 0
         u.viewW = Float(hdrCompositeTexture.width)
         u.viewH = Float(hdrCompositeTexture.height)
         // Thin-film iridescence (cheap mode 2 only; default strength 0 = no-op).
         u.time = time
-        u.thinFilmStrength = (cheap && glassCheapMode == 2) ? max(0, thinFilmStrength) : 0
+        u.thinFilmStrength = (cheap && effectiveCheapMode == 2) ? max(0, thinFilmStrength) : 0
         u.filmThicknessNm = max(1, thinFilmThicknessNm)
         u.filmIOR = max(1.01, thinFilmIOR)
         // Oscillation-mode undulation — only on the cheap path (bubble shells).
@@ -7125,7 +7134,7 @@ public final class IlluminatoramaRenderer {
         // Screen-space cheap glass (mode 2) samples the scene BEHIND the pane: copy
         // the pre-glass composite into a backdrop texture (can't sample the render
         // target we're about to write). One full-frame GPU blit; no ray tracing.
-        let useBackdrop = cheap && glassCheapMode == 2
+        let useBackdrop = cheap && effectiveCheapMode == 2
         if useBackdrop {
             if glassBackdropTexture?.width != hdrCompositeTexture.width
                 || glassBackdropTexture?.height != hdrCompositeTexture.height {
@@ -7152,7 +7161,7 @@ public final class IlluminatoramaRenderer {
         pass.depthAttachment.storeAction = .dontCare     // no depth write
         guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return }
         enc.label = useRT ? "Illuminatorama.glass.rt"
-            : (cheap ? "Illuminatorama.glass.cheap\(glassCheapMode)" : "Illuminatorama.glass.fallback")
+            : (cheap ? "Illuminatorama.glass.cheap\(effectiveCheapMode)\(autoCheapFallback && glassCheapMode == 0 ? "-auto" : "")" : "Illuminatorama.glass.fallback")
         enc.setRenderPipelineState(pipeline)
         enc.setDepthStencilState(glassDepth)
         // Perf: the RT path's bounce loop traces the WHOLE glass volume from the
@@ -7161,7 +7170,7 @@ public final class IlluminatoramaRenderer {
         // the glass fragments on convex glass, identical output. (CCW-front matches
         // the G-buffer winding.) The Fresnel+sky FALLBACK still wants both surfaces,
         // so it stays two-sided.
-        if useRT || (cheap && glassCheapMode == 2) {
+        if useRT || (cheap && effectiveCheapMode == 2) {
             // Screen-space cheap glass traces from the FRONT pane (samples the scene
             // behind it), so back faces are wasted/double-darkening — cull them.
             enc.setCullMode(.back)
