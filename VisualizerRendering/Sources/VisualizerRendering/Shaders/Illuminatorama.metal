@@ -207,6 +207,21 @@ struct FrameUniforms {
     // shutter fraction); `motionBlurMaxPx` clamps the streak length in OUTPUT px.
     float    motionBlurStrength; // was _padPostFX0
     float    motionBlurMaxPx;    // was _padPostFX1
+    // Screen-space contact shadows (issue #65). A short screen-space ray march
+    // toward the PRIMARY directional sun, in the deferred lighting pass, that
+    // catches the fine contact occlusion the cascaded shadow maps + RT soft
+    // shadows miss at object-base scale (a chip on felt, an egg on a floor).
+    // `contactShadowStrength` 0 = OFF → an EXACT no-op (the lighting kernel
+    // skips the march entirely), matching the vignette/grain/LUT post-FX
+    // pattern. `contactShadowLength` is the march reach in WORLD units;
+    // `contactShadowSteps` the sample count (8–16); `contactShadowThickness`
+    // the occluder-depth window in world units (acne / over-darkening guard).
+    // NEW 16-byte cluster (stride 1040 → 1056); field-for-field mirror of the
+    // Swift IlluminatoramaFrameUniforms.
+    float    contactShadowStrength;   // 0 = off; direct-sun attenuation amount (0..1)
+    float    contactShadowLength;     // march reach, world units
+    uint     contactShadowSteps;      // ray-march sample count
+    float    contactShadowThickness;  // occluder depth window, world units
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift
@@ -2320,6 +2335,65 @@ static inline float3 desaturateFill(float3 c, float amount) {
     return mix(c, float3(lum), k);
 }
 
+// ── Screen-space contact shadows (issue #65) ─────────────────────────────────
+//
+// A SHORT screen-space ray march toward the sun that catches the fine contact
+// occlusion the cascaded shadow maps + RT soft shadows miss at object-base
+// scale (a chip resting on felt, an egg on a floor, a prop on a table). We
+// march a handful of steps in VIEW space from the shaded fragment toward the
+// light, project each step back to screen space, and read the G-buffer depth
+// there: if the scene surface sits in FRONT of the ray sample by more than a
+// small self-shadow bias but less than `thickness` (a real thin occluder, not
+// the far background), the sun is occluded at that step. Returns an occlusion
+// fraction in [0,1] (0 = unoccluded) that the caller scales by
+// `contactShadowStrength`; a hit nearer the fragment returns a stronger value
+// so the darkening is densest right at the contact and fades along the ray
+// (this also softens the discrete ray-step boundary). The caller skips this
+// entirely when strength == 0, so it's an exact no-op by default.
+static inline float illumiContactShadow(
+    depth2d<float, access::read> gDepth,
+    constant FrameUniforms&      frame,
+    float3                       viewPos,    // fragment position, view space
+    float3                       LviewN,     // normalized view-space dir TOWARD the light
+    uint2                        dims,       // depth-buffer (width, height)
+    float                        lengthWS,   // march reach, world units
+    uint                         steps,
+    float                        thickness,  // occluder depth window, world units
+    float                        ndotl       // surface NdotL toward the sun
+) {
+    // Back-facing or grazing-to-sun fragments are already unlit by NdotL and
+    // self-occlude trivially — skip them to avoid contact-shadow acne.
+    if (ndotl <= 0.02 || steps == 0u || lengthWS <= 0.0) return 0.0;
+
+    float  stepLen = lengthWS / float(steps);
+    // Self-shadow guard: lift the ray off the originating surface and require
+    // an occluder to be at least this far in front before it counts.
+    float  bias    = max(lengthWS * 0.05, 1e-4);
+    float3 rayPos  = viewPos + LviewN * bias;
+
+    for (uint i = 0u; i < steps; ++i) {
+        rayPos += LviewN * stepLen;
+        float4 clip = frame.projection * float4(rayPos, 1.0);
+        if (clip.w <= 1e-5) break;
+        float3 ndc = clip.xyz / clip.w;
+        float2 uv  = ndc.xy * float2(0.5, -0.5) + 0.5;
+        if (any(uv < float2(0.0)) || any(uv > float2(1.0))) break;  // ray left the screen
+        uint2  px  = min(uint2(uv * float2(dims)), dims - 1u);
+        float  sceneDepth = gDepth.read(px);
+        if (sceneDepth >= 0.99999) continue;                        // sky — no occluder
+
+        // Reconstruct the scene surface's view-space Z at this pixel and compare
+        // distances-into-scene (camera looks down -Z, so distance == -z).
+        float4 sView      = frame.invProjection * float4(ndc.xy, sceneDepth, 1.0);
+        float  sceneViewZ = sView.z / sView.w;
+        float  diff       = (-rayPos.z) - (-sceneViewZ);  // >0: ray is BEHIND the surface
+        if (diff > bias && diff < bias + thickness) {
+            return 1.0 - float(i) / float(steps);         // densest at the contact
+        }
+    }
+    return 0.0;
+}
+
 kernel void illumi_lighting(
     texture2d<half,  access::read>          gAlbedoMet      [[texture(0)]],
     texture2d<half,  access::read>          gNormalRgh      [[texture(1)]],
@@ -2400,6 +2474,22 @@ kernel void illumi_lighting(
     float NdotL_sun = saturate(dot(N, Ld));
     float visibility = sunVisibility(shadowMap, shadowSampler, frame,
                                      worldPos, NdotL_sun);
+    // ── Screen-space contact shadows (issue #65) ────────────────────────────
+    // Fold a short screen-space ray-march occlusion into the sun visibility so
+    // EVERY sun-driven term below (direct BRDF, leaf/plush transmission, the
+    // casing clearcoat, plush sheen) darkens consistently at object contacts.
+    // Off-by-default: `contactShadowStrength == 0` skips the march entirely.
+    if (frame.contactShadowStrength > 0.0 && visibility > 0.0) {
+        float3 viewPos = (frame.view * float4(worldPos, 1.0)).xyz;
+        float3 LviewN  = normalize((frame.view * float4(Ld, 0.0)).xyz);
+        float  occ = illumiContactShadow(gDepth, frame, viewPos, LviewN,
+                                         uint2(w, h),
+                                         frame.contactShadowLength,
+                                         frame.contactShadowSteps,
+                                         frame.contactShadowThickness,
+                                         NdotL_sun);
+        visibility *= saturate(1.0 - frame.contactShadowStrength * occ);
+    }
     // Terms kept separate so the per-term split-render (frame.debugTerm) can
     // isolate any one of them; the normal path just sums them at the end.
     float3 directSun = brdf(N, V, Ld, albedo, metallic, roughness,

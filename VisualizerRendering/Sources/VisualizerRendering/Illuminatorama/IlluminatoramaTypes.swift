@@ -279,6 +279,20 @@ public struct IlluminatoramaFrameUniforms {
     // the streak length in output px. Field-for-field mirror of the Metal struct.
     public var motionBlurStrength: Float = 0
     public var motionBlurMaxPx: Float = 48
+    /// Screen-space contact shadows (issue #65). A short screen-space ray march
+    /// toward the PRIMARY directional sun in the deferred lighting pass that
+    /// catches the fine contact occlusion the cascaded shadow maps + RT soft
+    /// shadows miss at object-base scale (a chip on felt, an egg on a floor).
+    /// `contactShadowStrength` 0 = OFF → an EXACT shader no-op (the march is
+    /// skipped). `contactShadowLength` is the march reach in WORLD units;
+    /// `contactShadowSteps` the sample count (8–16); `contactShadowThickness`
+    /// the occluder-depth window in world units (acne / over-darkening guard).
+    /// NEW 16-byte trailing cluster (stride 1040 → 1056); field-for-field
+    /// mirror of the Metal `FrameUniforms`.
+    public var contactShadowStrength: Float = 0
+    public var contactShadowLength: Float = 0.05
+    public var contactShadowSteps: UInt32 = 12
+    public var contactShadowThickness: Float = 0.02
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20

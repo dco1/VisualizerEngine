@@ -25,6 +25,14 @@ public extension IlluminatoramaRenderer {
         filmGrainSize       = Float(s.filmGrainSize)
         motionBlurStrength  = Float(s.motionBlurEnabled ? s.motionBlur : 0)
         motionBlurMaxPx     = Float(s.motionBlurMaxPx)
+        // Screen-space contact shadows (issue #65) — universal off-by-default
+        // knob, no scene overrides it. Panel stores length/thickness in CM;
+        // the renderer/shader work in WORLD units (scenes are metre-scaled), so
+        // convert here (÷100). Strength 0 → an exact shader no-op.
+        contactShadowStrength  = Float(s.contactShadowEnabled ? s.contactShadowStrength : 0)
+        contactShadowLength    = Float(s.contactShadowLengthCm * 0.01)
+        contactShadowSteps     = UInt32(max(1, min(32, s.contactShadowSteps)))
+        contactShadowThickness = Float(s.contactShadowThicknessCm * 0.01)
         postFXEasingTau     = s.postFXEasing.tau
     }
 

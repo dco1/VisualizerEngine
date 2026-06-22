@@ -128,6 +128,22 @@ public final class IlluminatoramaSharedSettings {
     public var shadowPcfRadius: Int = 1
     public var shadowMaxDistance: Double = 50.0
 
+    // ── Screen-space contact shadows (issue #65) ──────────────────────
+    /// A short screen-space ray march toward the primary directional sun in the
+    /// deferred lighting pass, catching the fine contact occlusion the cascaded
+    /// shadow maps + RT soft shadows miss at object-base scale (a chip on felt,
+    /// an egg on a floor, a prop on a table). OFF by default → an exact shader
+    /// no-op. `contactShadowStrength` is the direct-sun attenuation amount (0..1);
+    /// `contactShadowLengthCm` the march reach and `contactShadowThicknessCm` the
+    /// occluder-depth window — both in CENTIMETRES (scenes are metre-scaled, so
+    /// the renderer converts ÷100 to world units); `contactShadowSteps` the
+    /// ray-march sample count (8–16 is plenty for the short reach).
+    public var contactShadowEnabled: Bool = false
+    public var contactShadowStrength: Double = 0.7
+    public var contactShadowLengthCm: Double = 5.0
+    public var contactShadowThicknessCm: Double = 2.0
+    public var contactShadowSteps: Int = 12
+
     // ── Internal render scale (SSAA) ──────────────────────────────────
     public var internalRenderScale: Double = 2.0
 
@@ -186,6 +202,11 @@ public final class IlluminatoramaSharedSettings {
         shadowSlopeBias = \(fmt(shadowSlopeBias))
         shadowPcfRadius = \(shadowPcfRadius)
         shadowMaxDistance = \(fmt(shadowMaxDistance))
+        contactShadowEnabled = \(contactShadowEnabled)
+        contactShadowStrength = \(fmt(contactShadowStrength))
+        contactShadowLengthCm = \(fmt(contactShadowLengthCm))
+        contactShadowThicknessCm = \(fmt(contactShadowThicknessCm))
+        contactShadowSteps = \(contactShadowSteps)
         internalRenderScale = \(fmt(internalRenderScale))
         """
     }

@@ -840,6 +840,15 @@ public final class IlluminatoramaRenderer {
         guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_MOTIONBLUR"] else { return nil }
         return Float(v)
     }()
+    // Issue #65 — headless contact-shadow override. Contact shadows are otherwise
+    // driven only by the panel, so a headless render can't exercise them;
+    // `VIZ_ILLUMI_CONTACTSHADOW` (a float strength, e.g. `0.85`) forces
+    // `contactShadowStrength` for every renderer in the process so the contact
+    // darkening can be render-verified A/B. `nil` when unset.
+    nonisolated static let contactShadowEnvOverride: Float? = {
+        guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_CONTACTSHADOW"] else { return nil }
+        return Float(v)
+    }()
     private let swapProbePath = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SWAP_PATH"]
     private var swapLastTime: CFTimeInterval = 0
     private var swapIntervalsMs: [Double] = []
@@ -1059,6 +1068,18 @@ public final class IlluminatoramaRenderer {
     /// buffer, so spinning/translating instances streak correctly).
     public var motionBlurStrength: Float = 0
     public var motionBlurMaxPx: Float = 48
+    /// Screen-space contact shadows (issue #65). A short screen-space ray march
+    /// toward the PRIMARY directional sun in the deferred lighting pass, catching
+    /// the fine contact occlusion the cascaded shadow maps + RT soft shadows miss
+    /// at object-base scale (a chip on felt, an egg on a floor). 0 strength =
+    /// OFF → an exact shader no-op (the march is skipped). `contactShadowLength`
+    /// is the march reach in WORLD units; `contactShadowSteps` the sample count;
+    /// `contactShadowThickness` the occluder-depth window (acne guard). Driven
+    /// from the panel via `applySharedLensFX` (universal off-by-default knob).
+    public var contactShadowStrength: Float = 0
+    public var contactShadowLength: Float = 0.05
+    public var contactShadowSteps: UInt32 = 12
+    public var contactShadowThickness: Float = 0.02
     /// Last built-in look baked into `colorLUT`, so `applySharedColorGrade` only
     /// rebakes the (CPU-built) LUT texture when the chosen look actually changes.
     private var appliedColorGradeLook: IlluminatoramaColorGradeLook = .none
@@ -8978,6 +8999,15 @@ public final class IlluminatoramaRenderer {
         let effMotionBlur = Self.motionBlurEnvOverride ?? motionBlurStrength
         u.motionBlurStrength = Self.mvDebugOverlay ? -1.0 : max(0, effMotionBlur)
         u.motionBlurMaxPx    = max(0, motionBlurMaxPx)
+        // Screen-space contact shadows (issue #65). 0 strength → no-op (the
+        // lighting kernel skips the march). Length/thickness are world units.
+        // The env override (VIZ_ILLUMI_CONTACTSHADOW) wins over the panel value
+        // for headless A/B verify.
+        let effContactShadow = Self.contactShadowEnvOverride ?? contactShadowStrength
+        u.contactShadowStrength  = max(0, min(1, effContactShadow))
+        u.contactShadowLength    = max(0, contactShadowLength)
+        u.contactShadowSteps     = min(max(contactShadowSteps, 1), 32)
+        u.contactShadowThickness = max(0, contactShadowThickness)
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
 
