@@ -461,6 +461,16 @@ public final class IlluminatoramaRenderer {
         /// B0 instrumentation for the cache-domain denoiser. TLAS path only, like
         /// `surfaceCacheGI`. See docs/illuminatorama/phase5-radiance-cache-streaming.md.
         case surfaceCacheVariance = 9
+        /// Raw G-buffer channels (issue #65). Unlike 1–9 these are NOT lighting
+        /// terms: the deferred kernel's `switch` defaults to the full composite
+        /// for them, and a debug branch in `illumi_tonemap_fs` instead REPLACES
+        /// the image with the stored G-buffer channel *before* tonemapping, so
+        /// the readout is the true value (albedo/normal/roughness/metalness/
+        /// depth/velocity). Drives the app's Debug-view picker; exact no-op for
+        /// `.normal` (0). `velocity` reuses the same colourisation as the env
+        /// `VIZ_ILLUMI_MV_DEBUG` motion-vector overlay.
+        case albedo = 10, gbufferNormal = 11, roughness = 12
+        case metalness = 13, depth = 14, velocity = 15
     }
     public var debugTerm: DebugTerm = .normal
     /// Tracked by the renderer each frame (set from the host's
@@ -1309,26 +1319,49 @@ public final class IlluminatoramaRenderer {
     private var ssrSampleCount: MTLTexture      // full-res
     private var giSampleCount: MTLTexture       // full-res
     // SVGF à-trous cascade textures for RT GI (when svgfEnabled).
-    private var giVariance: MTLTexture          // full-res r16Float
+    // Color ping-pongs {giAtrousA, giAtrousB}; variance ping-pongs {giVariance,
+    // giVarianceB}. The two pairs MUST stay disjoint — an à-trous level reads one
+    // signal at dilated neighbour taps while writing the other to its own texel, so
+    // any shared texture is an in-place read/write race that corrupts colour in a
+    // dilated-stride pattern (the issue-#65 masonry). Three buffers can't keep both
+    // ping-pongs disjoint; hence the fourth.
+    private var giVariance: MTLTexture          // full-res r16Float (variance A)
+    private var giVarianceB: MTLTexture         // full-res r16Float (variance B)
     private var giAtrousA: MTLTexture           // full-res rgba16Float
     private var giAtrousB: MTLTexture           // full-res rgba16Float
     /// Enable the SVGF à-trous variance-guided cascade for the RT GI diffuse term.
     /// When off, falls back to the fixed-radius bilateral denoise (still reading the
     /// temporally-accumulated GI, so motion stability is preserved).
     ///
-    /// DEFAULT OFF (issue #65 — Illuminatorama Room masonry banding). The à-trous
-    /// samples at a DILATED 2^level stride; on a near-converged surface (low spatial
-    /// variance) the dilated taps leave a structured grid residual instead of a clean
-    /// blur, which the RT-GI temporal accumulation then locks in as a persistent
-    /// masonry/brick pattern on smooth walls. Per-frame Monte-Carlo grain hid it
-    /// before the temporal pass landed; once the grain is averaged away the grid
-    /// shows. It is NOT an edge-stop tuning issue (disabling the depth/normal/
-    /// luminance weights makes it worse, not better) — it's the dilated-sampling
-    /// structure itself. The contiguous-tap bilateral fallback (`illumi_rt_denoise`)
-    /// produces a clean, temporally-stable result and is cheaper (skips the 4-pass
-    /// cascade), so it's the default until the à-trous residual is fixed. HotdogPress
-    /// and CoinPusher already disabled it per-scene for the same class of artifact.
+    /// The issue-#65 masonry banding is FIXED (see `encodeSVGFCascade`). Root cause
+    /// was NOT the dilated sampling (the earlier hypothesis) but a texture-aliasing
+    /// race in the cascade ping-pong: with only three scratch buffers, colour and
+    /// variance shared `giAtrousB`, so each level≥1 read one signal at dilated
+    /// neighbour taps while writing the other to the same texel at self — an in-place
+    /// read/write race that corrupted colour in a dilated-stride pattern (the
+    /// masonry). Per-frame grain hid it; temporal averaging exposed it. The fix is a
+    /// fourth buffer (`giVarianceB`) so colour `{A,B}` and variance `{Var,VarB}` stay
+    /// disjoint. MEASURED on illuminatoramaRoom (high-pass wall residual, lower =
+    /// cleaner): broken 0.96% RMS → fixed 0.12%, vs the bilateral's 0.17% — i.e. the
+    /// cascade now denoises BETTER than the bilateral, as intended.
+    ///
+    /// DEFAULT still OFF, now purely on PERF: the cascade (variance + N à-trous +
+    /// composite) is ~+12% GPU frame time vs the single-pass bilateral on the Room
+    /// (measured), so it stays opt-in pending a quality/perf call. Re-enable per
+    /// scene (`renderer.svgfEnabled = true`) where the extra denoise is worth the
+    /// cost. HotdogPress and CoinPusher explicitly keep it off.
     public var svgfEnabled: Bool = false
+    /// Diagnostic A/B override: `VIZ_ILLUMI_SVGF=1`/`0` forces the SVGF cascade
+    /// on/off for every Illuminatorama renderer in the process, so a headless
+    /// render can exercise the à-trous path (issue #65) without touching the
+    /// default. `nil` when unset. Read once. `effectiveSVGFEnabled` consults it.
+    private static let svgfEnvOverride: Bool? = {
+        guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SVGF"] else { return nil }
+        return v == "1" || v.lowercased() == "true"
+    }()
+    /// The SVGF toggle after applying the env A/B override. Use this in the
+    /// render path; `svgfEnabled` stays the plain stored property the panel sets.
+    var effectiveSVGFEnabled: Bool { Self.svgfEnvOverride ?? svgfEnabled }
     /// Number of à-trous cascade levels (1–5). Three levels cover a spatial
     /// reach of 1+2+4 = 7px radius; five levels cover 1+2+4+8+16 = 31px.
     public var svgfLevels: Int = 3
@@ -1337,8 +1370,37 @@ public final class IlluminatoramaRenderer {
     public var svgfSigmaL: Float = 4.0
     /// Depth edge-stopping weight (σ_Z). Default 1.0.
     public var svgfSigmaZ: Float = 1.0
-    /// Normal edge-stopping exponent (σ_N). Higher = tighter. Default 128.
-    public var svgfSigmaN: Float = 128.0
+    /// Normal edge-stopping exponent (σ_N). Higher = tighter. The clean bilateral
+    /// fallback uses 16; at 128 the `dot(n,nN)^σN` weight amplifies the fp16
+    /// oct-encoded normal g-buffer's quantization steps into structured wNorm
+    /// jumps — banding contours on a smooth wall (issue #65). 16 matches the
+    /// bilateral and keeps the weight smooth across coplanar fp16 normals.
+    public var svgfSigmaN: Float = 16.0
+    /// Luminance edge-stop floor, RELATIVE to local luminance (issue #65). The
+    /// canonical SVGF luminance bandwidth `σ = σ_L·√Var + ε` assumes a temporally
+    /// tracked, MC-noisy variance that stays positive on converged surfaces. This
+    /// RT-GI is deterministic per frame, so Var genuinely → 0 once converged and a
+    /// tiny fixed ε turns the edge-stop into a near-binary contour gate that bands
+    /// the smooth wall into horizontal masonry. This floor sets ε =
+    /// `svgfLumFloor · max(lumCenter, 0.02)`: large enough that a smooth
+    /// low-amplitude gradient (Δlum ≪ floor) blurs freely, small enough that a
+    /// genuine high-contrast GI discontinuity (shadow edge, Δlum ≫ floor) is still
+    /// preserved. 0.6 ≈ gate onset around a ~30–40% luminance step.
+    public var svgfLumFloor: Float = 0.6
+    /// Diagnostic A/B override for `svgfLumFloor` (`VIZ_ILLUMI_SVGF_LUMFLOOR`).
+    private static let svgfLumFloorEnv: Float? = {
+        guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SVGF_LUMFLOOR"],
+              let f = Float(v) else { return nil }
+        return f
+    }()
+    private var effectiveSVGFLumFloor: Float { Self.svgfLumFloorEnv ?? svgfLumFloor }
+    /// Diagnostic A/B override for cascade level count (`VIZ_ILLUMI_SVGF_LEVELS`).
+    private static let svgfLevelsEnv: Int? = {
+        guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SVGF_LEVELS"],
+              let i = Int(v) else { return nil }
+        return i
+    }()
+    private var effectiveSVGFLevels: Int { Self.svgfLevelsEnv ?? svgfLevels }
 
     // ── Phase 4.39: denoiser source selectors ────────────────────────
     // These let the lighting and composite passes bind the right texture
@@ -2862,6 +2924,7 @@ public final class IlluminatoramaRenderer {
         self.ssrSampleCount      = t.ssrSampleCount
         self.giSampleCount       = t.giSampleCount
         self.giVariance          = t.giVariance
+        self.giVarianceB         = t.giVarianceB
         self.giAtrousA           = t.giAtrousA
         self.giAtrousB           = t.giAtrousB
         self.sssDiffuseTexture   = t.sssDiffuse
@@ -6258,6 +6321,7 @@ public final class IlluminatoramaRenderer {
             self.ssrSampleCount      = t.ssrSampleCount
             self.giSampleCount       = t.giSampleCount
             self.giVariance          = t.giVariance
+            self.giVarianceB         = t.giVarianceB
             self.giAtrousA           = t.giAtrousA
             self.giAtrousB           = t.giAtrousB
             self.sssDiffuseTexture   = t.sssDiffuse
@@ -6365,6 +6429,12 @@ public final class IlluminatoramaRenderer {
         // write no longer leaks the toggle out of sync — it's overwritten here
         // each frame before any TAA gating reads it.
         taaEnabled = Self.taaEnvOverride ?? sharedTAAOverride ?? IlluminatoramaSharedSettings.shared.taaEnabled
+        // Same authority model for the SVGF GI denoiser: the panel toggle drives it
+        // for every Illuminatorama scene. (`effectiveSVGFEnabled` still layers the
+        // VIZ_ILLUMI_SVGF env A/B override on top.) Safe to apply universally — the
+        // cascade self-gates on `rtGITemporalEnabled`, so scenes that force temporal
+        // off (CoinPusher, HotdogPress) stay on the bilateral path regardless.
+        svgfEnabled = IlluminatoramaSharedSettings.shared.svgfEnabled
         // Track enable-transitions so a re-enable re-primes each temporal history.
         if taaEnabled && !previousTaaEnabled { taaNeedsFirstFrame = true }
         previousTaaEnabled = taaEnabled
@@ -6554,7 +6624,7 @@ public final class IlluminatoramaRenderer {
             encodeRTGITemporalAccum(cb)
             // Phase 4.44 — SVGF à-trous cascade replaces the fixed-radius
             // bilateral when enabled. Falls back to the original bilateral path.
-            if svgfEnabled && rtGITemporalEnabled && rtEnabled && rtSupported {
+            if effectiveSVGFEnabled && rtGITemporalEnabled && rtEnabled && rtSupported {
                 encodeSVGFCascade(cb)
             } else {
                 // Bilateral-clean the RT diffuse (shadow+GI) buffer into the
@@ -8283,7 +8353,7 @@ public final class IlluminatoramaRenderer {
 
     private struct SVGFAtrousUniforms {
         var width: UInt32; var height: UInt32; var stepSize: UInt32; var _pad0: UInt32 = 0
-        var sigmaL: Float; var sigmaZ: Float; var sigmaN: Float; var _pad1: Float = 0
+        var sigmaL: Float; var sigmaZ: Float; var sigmaN: Float; var lumFloor: Float = 0
     }
 
     /// SVGF denoiser for the RT GI term: variance estimate + N à-trous cascade
@@ -8294,11 +8364,11 @@ public final class IlluminatoramaRenderer {
     /// Only runs when `svgfEnabled && rtGITemporalEnabled && rtEnabled`.
     /// Replaces `encodeRTDenoiseComposite` for the GI term on this path.
     private func encodeSVGFCascade(_ cb: MTLCommandBuffer) {
-        guard svgfEnabled,
+        guard effectiveSVGFEnabled,
               rtGITemporalEnabled, rtEnabled, rtSupported,
               rtPipeline != nil, rtAccel != nil, rtTriangleCount > 0 else { return }
 
-        let levels = max(1, min(5, svgfLevels))
+        let levels = max(1, min(5, effectiveSVGFLevels))
         let W = UInt32(width), H = UInt32(height)
 
         // Pass 1: variance estimate from the accumulated GI.
@@ -8315,22 +8385,25 @@ public final class IlluminatoramaRenderer {
             enc.endEncoding()
         }
 
-        // À-trous cascade: ping-pong color between giAtrousA/B.
-        // Variance ping-pongs between giVariance and giAtrousB (variance never
-        // aliases the color output since they're separate textures).
+        // À-trous cascade. Colour ping-pongs {giAtrousA, giAtrousB}; variance
+        // ping-pongs {giVariance, giVarianceB} — the two pairs are DISJOINT so no
+        // pass ever reads one signal at dilated neighbour taps while writing the
+        // other to the same texture at self. The old layout reused giAtrousB for
+        // both colour and variance, so each level≥1 had an in-place read/write race
+        // that corrupted colour in a dilated-stride pattern → the masonry (#65).
         //
         // Trace:
-        //   level 0: colorIn=giHistory  varIn=giVariance  → colorOut=giAtrousA  varOut=giAtrousB
-        //   level 1: colorIn=giAtrousA  varIn=giAtrousB   → colorOut=giAtrousB  varOut=giVariance
-        //   level 2: colorIn=giAtrousB  varIn=giVariance  → colorOut=giAtrousA  varOut=giAtrousB
-        //   … and so on. Final result always lives in `lastColorOut`.
+        //   level 0: cIn=giHistory  vIn=giVariance  → cOut=giAtrousA  vOut=giVarianceB
+        //   level 1: cIn=giAtrousA  vIn=giVarianceB → cOut=giAtrousB  vOut=giVariance
+        //   level 2: cIn=giAtrousB  vIn=giVariance  → cOut=giAtrousA  vOut=giVarianceB
+        //   … colour and variance never share a texture. Result in `lastColorOut`.
         var lastColorOut = giAtrousA
         for level in 0..<levels {
             let stepSize = UInt32(1 << level)
             let cIn  = level == 0 ? currentRTGIHistoryTexture : (level % 2 == 1 ? giAtrousA : giAtrousB)
-            let cOut = level % 2 == 0 ? giAtrousA : giAtrousB
-            let vIn  = level % 2 == 0 ? giVariance : giAtrousB
-            let vOut = level % 2 == 0 ? giAtrousB  : giVariance
+            let cOut = level % 2 == 0 ? giAtrousA  : giAtrousB
+            let vIn  = level % 2 == 0 ? giVariance : giVarianceB
+            let vOut = level % 2 == 0 ? giVarianceB : giVariance
             lastColorOut = cOut
 
             guard let enc = cb.makeComputeCommandEncoder() else { return }
@@ -8343,8 +8416,10 @@ public final class IlluminatoramaRenderer {
             enc.setTexture(cOut,             index: 4)
             enc.setTexture(vOut,             index: 5)
             var u = SVGFAtrousUniforms(width: W, height: H, stepSize: stepSize,
-                                        sigmaL: svgfSigmaL, sigmaZ: svgfSigmaZ, sigmaN: svgfSigmaN)
+                                        sigmaL: svgfSigmaL, sigmaZ: svgfSigmaZ, sigmaN: svgfSigmaN,
+                                        lumFloor: effectiveSVGFLumFloor)
             enc.setBytes(&u, length: MemoryLayout<SVGFAtrousUniforms>.stride, index: 0)
+            enc.setBuffer(frameUniformBuffer, offset: 0, index: 1)  // invProjection for linear depth
             dispatch(enc, pipeline: svgfAtrousPipeline, width: width, height: height)
             enc.endEncoding()
         }
@@ -8856,6 +8931,13 @@ public final class IlluminatoramaRenderer {
         // Issue #65 — screen-space velocity at texture(3) for motion blur. Always
         // bound; gated by `motionBlurStrength` (0 = the tonemap skips the gather).
         enc.setFragmentTexture(velocityTexture, index: 3)
+        // Issue #65 — G-buffer channels at texture(4..6) for the Debug-view
+        // readouts (albedo / normal / roughness / metalness / depth). Always
+        // bound; the fragment only reads them when `debugTerm >= 10` (the
+        // G-buffer cases), so a default `.normal` render never samples them.
+        enc.setFragmentTexture(gbufferAlbedoMet, index: 4)
+        enc.setFragmentTexture(gbufferNormalRgh, index: 5)
+        enc.setFragmentTexture(depthTexture, index: 6)
         enc.setFragmentBuffer(frameUniformBuffer, offset: 0, index: 0)
         // Phase 4.21 — exposure buffer at buffer(1). The fragment reads
         // `expoState.smoothedExposure` when `frame.autoExposureEnabled`
@@ -9301,7 +9383,8 @@ public final class IlluminatoramaRenderer {
         var aoSampleCount: MTLTexture    // half-res r16Float — accumulated frame count per SSAO pixel
         var ssrSampleCount: MTLTexture   // full-res r16Float — accumulated frame count per SSR pixel
         var giSampleCount: MTLTexture    // full-res r16Float — accumulated frame count per RT GI pixel
-        var giVariance: MTLTexture       // full-res r16Float — spatial variance of accumulated GI
+        var giVariance: MTLTexture       // full-res r16Float — variance ping-pong A
+        var giVarianceB: MTLTexture      // full-res r16Float — variance ping-pong B
         var giAtrousA: MTLTexture        // full-res rgba16Float — à-trous ping-pong A
         var giAtrousB: MTLTexture        // full-res rgba16Float — à-trous ping-pong B
         // Issue #65 — screen-space SSS. `sssDiffuse` holds the diffuse-lit term the
@@ -9696,6 +9779,9 @@ public final class IlluminatoramaRenderer {
         let giVar = try make(label: "Illuminatorama.svgf.giVariance",
                              format: .r16Float, w: internalW, h: internalH,
                              usage: [.shaderRead, .shaderWrite])
+        let giVarB = try make(label: "Illuminatorama.svgf.giVarianceB",
+                              format: .r16Float, w: internalW, h: internalH,
+                              usage: [.shaderRead, .shaderWrite])
         let giAtrousA = try make(label: "Illuminatorama.svgf.giAtrousA",
                                  format: .rgba16Float, w: internalW, h: internalH,
                                  usage: [.shaderRead, .shaderWrite])
@@ -9755,7 +9841,7 @@ public final class IlluminatoramaRenderer {
             rtGIHistoryA: rtGiHistA, rtGIHistoryB: rtGiHistB,
             irrCacheA: irrCA, irrCacheB: irrCB,
             aoSampleCount: aoCount, ssrSampleCount: ssrCount, giSampleCount: giCount,
-            giVariance: giVar, giAtrousA: giAtrousA, giAtrousB: giAtrousB,
+            giVariance: giVar, giVarianceB: giVarB, giAtrousA: giAtrousA, giAtrousB: giAtrousB,
             sssDiffuse: sssDiffuse, sssBlurTmp: sssBlurTmp, sssBlurOut: sssBlurOut
         )
     }

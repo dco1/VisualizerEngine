@@ -109,6 +109,11 @@ public final class IlluminatoramaSharedSettings {
     public var rtGITemporalEnabled: Bool = true
     /// Current-frame weight in steady state (≈ 1/window). 0.06 ≈ a 16-frame EMA.
     public var rtGITemporalBlend: Double = 0.06
+    /// Use the SVGF à-trous variance-guided cascade for the RT GI term instead of
+    /// the fixed-radius bilateral. Cleaner (denoises wider, low-frequency blotches
+    /// the bilateral can't reach — issue #65 masonry is fixed) but a few extra
+    /// full-res passes, so it's OFF by default and a per-scene/perf opt-in.
+    public var svgfEnabled: Bool = false
 
     // ── IBL ───────────────────────────────────────────────────────────
     public var iblEnabled: Bool = true
@@ -143,6 +148,7 @@ public final class IlluminatoramaSharedSettings {
     public var contactShadowLengthCm: Double = 5.0
     public var contactShadowThicknessCm: Double = 2.0
     public var contactShadowSteps: Int = 12
+
     // ── Subsurface scattering (issue #65) ─────────────────────────────
     /// Jimenez-style separable screen-space SSS for skin / wax / marble / food.
     /// OFF by default → an exact pipeline no-op. `sssStrength` blends the blurred
@@ -159,6 +165,14 @@ public final class IlluminatoramaSharedSettings {
 
     // ── Internal render scale (SSAA) ──────────────────────────────────
     public var internalRenderScale: Double = 2.0
+
+    // ── Debug view (issue #65) ────────────────────────────────────────
+    /// Which diagnostic view the pipeline presents. `.composite` (the default)
+    /// is the production image — an exact no-op for every scene. Any other case
+    /// isolates a lighting term / RT surface-cache term / raw G-buffer channel
+    /// so a flat or wrong-looking render can be decomposed. Transient (never
+    /// persisted via Save-defaults). See `IlluminatoramaDebugView`.
+    public var debugView: IlluminatoramaDebugView = .composite
 
     public init() {}
 
@@ -203,6 +217,7 @@ public final class IlluminatoramaSharedSettings {
         debandDitherEnabled = \(debandDitherEnabled)
         rtGITemporalEnabled = \(rtGITemporalEnabled)
         rtGITemporalBlend = \(fmt(rtGITemporalBlend))
+        svgfEnabled = \(svgfEnabled)
         iblEnabled = \(iblEnabled)
         iblIntensity = \(fmt(iblIntensity))
         dfgLUTEnabled = \(dfgLUTEnabled)

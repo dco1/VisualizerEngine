@@ -133,6 +133,12 @@ public final class IlluminatoramaOverlay {
         if let raw = env["VIZ_ILLUMI_DEBUG_TERM"], let v = UInt32(raw),
            let term = IlluminatoramaRenderer.DebugTerm(rawValue: v) {
             renderer.debugTerm = term
+            // Also mirror into the shared setting: `render()`'s per-frame
+            // `applySharedLensFX` copies `shared.debugView → renderer.debugTerm`,
+            // which would otherwise clobber this env value back to `.composite`.
+            if let dv = IlluminatoramaDebugView(rawValue: Int(v)) {
+                IlluminatoramaSharedSettings.shared.debugView = dv
+            }
         }
         if let raw = env["VIZ_ILLUMI_STATIC_EXPOSURE"] {
             renderer.autoExposureEnabled = false

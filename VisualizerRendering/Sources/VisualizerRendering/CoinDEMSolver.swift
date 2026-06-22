@@ -65,14 +65,33 @@ public struct CoinBody {
     }
 }
 
-// Static (or kinematic) environment collider. 64 bytes. Matches CoinDEM.metal.
+// Static (or kinematic) environment collider. 80 bytes. Matches CoinDEM.metal.
 public struct CoinStaticCollider {
-    public var a:    SIMD4<Float>   // plane: xyz=normal, w=tag(0) ; box: xyz=centre, w=tag(1)
-    public var b:    SIMD4<Float>   // plane: w=offset d ; box: xyz=halfExtents
-    public var vel:  SIMD4<Float>   // xyz = kinematic surface velocity, w = friction (reserved)
-    public var meta: SIMD4<UInt32>  // x = flags (bit0 = one-way ledge)
+    public var a:      SIMD4<Float>   // plane: xyz=normal, w=tag(0) ; box: xyz=centre, w=tag(1)
+    public var b:      SIMD4<Float>   // plane: w=offset d ; box: xyz=halfExtents
+    public var vel:    SIMD4<Float>   // xyz = kinematic surface velocity, w = friction (reserved)
+    public var meta:   SIMD4<UInt32>  // x = flags (bit0 = one-way ledge)
+    public var orient: SIMD4<Float>   // oriented-box (kind 3) quaternion (x,y,z,w); identity otherwise
 
-    enum Kind: UInt32 { case plane = 0, box = 1, pusherPlate = 2 }
+    enum Kind: UInt32 { case plane = 0, box = 1, pusherPlate = 2, orientedBox = 3, cylinder = 4 }
+
+    private static let identityQuat = SIMD4<Float>(0, 0, 0, 1)
+
+    /// A CYLINDER-interior segment — the marble is constrained INSIDE a cylinder of
+    /// `radius` whose axis passes through `center` along `axis` for ±`halfLength`.
+    /// `lowerHalfOnly` makes it a half-pipe (only the lower hemisphere relative to
+    /// `up` pushes; the top is open). Smooth curved surface → no corners to stick on.
+    /// Resolved on the constraint path's sphere case (CoinDEM.metal kind 4).
+    public static func cylinder(center: SIMD3<Float>, axis: SIMD3<Float>, radius: Float,
+                                up: SIMD3<Float>, halfLength: Float,
+                                lowerHalfOnly: Bool) -> CoinStaticCollider {
+        CoinStaticCollider(
+            a: SIMD4(center, Float(bitPattern: Kind.cylinder.rawValue)),
+            b: SIMD4(simd_normalize(axis), radius),
+            vel: SIMD4(simd_normalize(up), halfLength),
+            meta: SIMD4(lowerHalfOnly ? 1 : 0, 0, 0, 0),
+            orient: identityQuat)
+    }
 
     /// A reciprocating pusher plate that only ever pushes coins FORWARD (+Z),
     /// never down/up — so coins at the paddle/shelf corner can't be squeezed into
@@ -85,7 +104,8 @@ public struct CoinStaticCollider {
         CoinStaticCollider(
             a: SIMD4(center, Float(bitPattern: Kind.pusherPlate.rawValue)),
             b: SIMD4(halfExtents, 0),
-            vel: SIMD4(velocity, 0), meta: SIMD4(0, 0, 0, 0))
+            vel: SIMD4(velocity, 0), meta: SIMD4(0, 0, 0, 0),
+            orient: identityQuat)
     }
 
     /// Half-space `n · x ≥ d`. Coins are pushed back to the surface.
@@ -94,7 +114,8 @@ public struct CoinStaticCollider {
         return CoinStaticCollider(
             a: SIMD4(n, Float(bitPattern: Kind.plane.rawValue)),
             b: SIMD4(0, 0, 0, offset),
-            vel: .zero, meta: SIMD4(0, 0, 0, 0))
+            vel: .zero, meta: SIMD4(0, 0, 0, 0),
+            orient: identityQuat)
     }
 
     /// Axis-aligned box. `oneWay` lets coins fall off the top but not be shoved
@@ -108,7 +129,22 @@ public struct CoinStaticCollider {
             a: SIMD4(center, Float(bitPattern: Kind.box.rawValue)),
             b: SIMD4(halfExtents, 0),
             vel: SIMD4(velocity, 0),
-            meta: SIMD4(oneWay ? 1 : 0, 0, 0, 0))
+            meta: SIMD4(oneWay ? 1 : 0, 0, 0, 0),
+            orient: identityQuat)
+    }
+
+    /// An ORIENTED box — a box rotated by `orientation` (local→world). The local
+    /// axes are X/Y/Z with the given `halfExtents`. Resolved on the constraint
+    /// path only (the path the ball/plank scenes use); proper sphere-vs-OBB
+    /// contact for marbles rolling on a tilted plank. See CoinDEM.metal kind 3.
+    public static func orientedBox(center: SIMD3<Float>, halfExtents: SIMD3<Float>,
+                                   orientation: simd_quatf) -> CoinStaticCollider {
+        let q = orientation.normalized
+        return CoinStaticCollider(
+            a: SIMD4(center, Float(bitPattern: Kind.orientedBox.rawValue)),
+            b: SIMD4(halfExtents, 0),
+            vel: .zero, meta: SIMD4(0, 0, 0, 0),
+            orient: SIMD4(q.imag.x, q.imag.y, q.imag.z, q.real))
     }
 }
 
@@ -387,6 +423,9 @@ public final class CoinDEMSolver: PenetrationProbing {
     private var nextSlot: Int = 0
     private(set) public var highWater: Int = 0
     public var activeCount: Int { highWater - freeSlots.count }
+    /// Substeps encoded on the LAST `encode(...)` call — for instrumentation /
+    /// slow-motion detection (`steps × fixedDt / wallDt` ≈ realtime ratio).
+    private(set) public var lastStepCount: Int = 0
 
     private var colliders: [CoinStaticCollider] = []
 
@@ -526,7 +565,7 @@ public final class CoinDEMSolver: PenetrationProbing {
         var hashCap = 1; while hashCap < contactCap * 2 { hashCap <<= 1 }   // next power of two ≥ 2·cap
         guard
             let coins = SimBuffer<CoinBody>(device: dev, capacity: maxCoins, label: "Coin.bodies"),
-            let cols  = SimBuffer<CoinStaticCollider>(device: dev, capacity: 64, label: "Coin.colliders"),
+            let cols  = SimBuffer<CoinStaticCollider>(device: dev, capacity: 256, label: "Coin.colliders"),
             let xform = dev.makeBuffer(length: MemoryLayout<CoinTransform>.stride * maxCoins,
                                        options: .storageModeShared),
             // Four float4 per coin: [Δpos.xyz, contactCount], [Δrot.xyz, supportFlag],
@@ -877,8 +916,13 @@ public final class CoinDEMSolver: PenetrationProbing {
         for slot in 0..<highWater where ptr[slot].posInvMass.w != 0 {
             lptr[slot] = SIMD2(-1, 0)
             ptr[slot] = .inactive
-            freeSlots.append(slot)
         }
+        // Fully reset the slot bookkeeping so `encode` (which dispatches over
+        // `highWater`) does NO work on an emptied field — otherwise a cleared
+        // field keeps paying the full per-frame solver cost forever.
+        freeSlots.removeAll(keepingCapacity: true)
+        nextSlot = 0
+        highWater = 0
     }
 
     /// Read-only snapshot of an active coin's COM (safe after the frame's command
@@ -915,6 +959,41 @@ public final class CoinDEMSolver: PenetrationProbing {
         let ptr = coinBuffer.buffer.contents().bindMemory(to: CoinBody.self, capacity: maxCoins)
         guard ptr[slot].posInvMass.w != 0 else { return }
         ptr[slot].vel.x = v.x; ptr[slot].vel.y = v.y; ptr[slot].vel.z = v.z
+    }
+
+    /// Directly set an active body's COM (world space). Used to DRIVE a body the
+    /// user is dragging by the mouse — pair with `setKinematicHold` so the body
+    /// is frozen-immovable while the host writes its position each frame. Mutates
+    /// the shared buffer between frames; the next `encode` reads it.
+    public func setPosition(ofSlot slot: Int, to p: SIMD3<Float>) {
+        guard slot >= 0, slot < highWater else { return }
+        let ptr = coinBuffer.buffer.contents().bindMemory(to: CoinBody.self, capacity: maxCoins)
+        guard ptr[slot].posInvMass.w != 0 else { return }
+        ptr[slot].posInvMass.x = p.x; ptr[slot].posInvMass.y = p.y; ptr[slot].posInvMass.z = p.z
+    }
+
+    /// Hold (or release) a body KINEMATICALLY — a real infinite-mass moving
+    /// collider, not a faked freeze. A held body is what a mouse-grabbed object
+    /// should be: the integrator applies no gravity and never moves it, and the
+    /// contact solve treats it as immovable (invMass 0), so the awake pile
+    /// genuinely collides against it while the host drives its COM with
+    /// `setPosition`. Releasing returns it to a normal dynamic body — set its
+    /// throw with `setVelocity` first if you want it to fly on let-go.
+    ///
+    /// IMPLEMENTATION: this reuses the per-body `asleep` flag, which the
+    /// constraint-path kernels already honour as exactly "no gravity / no move /
+    /// immovable neighbour". That requires the **constraint** solver
+    /// (`solverMode = .constraint`) and **sleep disabled** (`sleepEnabled =
+    /// false`) so the island-sleep kernels don't overwrite the flag the host
+    /// owns. Both are asserted so a future caller can't silently lose the hold.
+    public func setKinematicHold(_ slot: Int, _ held: Bool) {
+        guard slot >= 0, slot < highWater else { return }
+        assert(solverMode == .constraint,
+               "setKinematicHold requires solverMode == .constraint (the legacy path ignores asleep[])")
+        assert(!sleepEnabled,
+               "setKinematicHold requires sleepEnabled == false (host owns asleep[])")
+        let a = asleepBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)
+        a[slot] = held ? 1 : 0
     }
 
     // ── Encode ────────────────────────────────────────────────────────────────
@@ -964,6 +1043,7 @@ public final class CoinDEMSolver: PenetrationProbing {
             accumulator -= fixedDt
             steps += 1
         }
+        lastStepCount = steps
         if steps == 0 { return }   // not enough wall time accumulated for a substep
 
         // Island detection + sleeping (constraint path): freeze settled islands so a
@@ -1094,8 +1174,7 @@ public final class CoinDEMSolver: PenetrationProbing {
                     enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
                     enc.setBuffer(self.contactBuffer, offset: 0, index: 1)
                     enc.setBuffer(self.contactCountBuffer, offset: 0, index: 2)
-                    enc.setBuffer(self.uniformBuffer, offset: 0, index: 3)
-                    enc.setBytes(&cc, length: MemoryLayout<UInt32>.size, index: 4)
+                    enc.setBytes(&cc, length: MemoryLayout<UInt32>.size, index: 3)   // coinWarmStartApply doesn't read u; the old uniform@3 bind was unused (aborts under Metal API validation)
                 }
             }
         }
@@ -1146,8 +1225,7 @@ public final class CoinDEMSolver: PenetrationProbing {
     private func encodeSleepUpdate(_ cb: MTLCommandBuffer, coinCount: Int) {
         dispatch(cb, islandInitPipeline, threads: coinCount, label: "Coin.cs.islandInit") { enc in
             enc.setBuffer(self.islandLabelBuffer, offset: 0, index: 0)
-            enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 1)
-            enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
+            enc.setBuffer(self.uniformBuffer, offset: 0, index: 1)   // coinIslandInit reads only label + u; the old coins@1 bind was unused (aborts under Metal API validation)
         }
         for _ in 0..<islandUnionRounds {
             dispatch(cb, islandUnionPipeline, threads: maxContacts, label: "Coin.cs.islandUnion") { enc in
@@ -1247,6 +1325,7 @@ public final class CoinDEMSolver: PenetrationProbing {
             enc.setBuffer(self.cellCounts, offset: 0, index: 1)
             enc.setBuffer(self.cellOffsets, offset: 0, index: 2)
             enc.setBuffer(self.sortedIndices, offset: 0, index: 3)
+            enc.setBuffer(self.uniformBuffer, offset: 0, index: 4)   // coinScatter reads grid dims from u[0] — was unbound (aborts under Metal API validation; matches encodeBroadphase/encodeSubstep)
         }
         dispatch(cb, measurePipeline, threads: coinCount, label: "Coin.measure") { enc in
             enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)

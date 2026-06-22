@@ -4048,11 +4048,17 @@ kernel void illumi_rt_gi_temporal(
 
 struct SVGFAtrousUniforms {
     uint  width;   uint  height;  uint stepSize; uint _pad0;
-    float sigmaL;  float sigmaZ;  float sigmaN;  float _pad1;
+    float sigmaL;  float sigmaZ;  float sigmaN;  float lumFloor;
 };
 
 // B3-spline 1-D à-trous weights (sum = 1). 2D weight = h[i+2] × h[j+2].
 static constant float kAtrousH1[5] = { 1.0/16.0, 1.0/4.0, 3.0/8.0, 1.0/4.0, 1.0/16.0 };
+
+// 3×3 Gaussian weights [[1,2,1],[2,4,2],[1,2,1]]/16 for prefiltering variance
+// before it drives the luminance edge-stop (canonical SVGF — Schied 2017 §4.2).
+// Without this the per-pixel variance carries its own spatial structure straight
+// into the weight field. Indexed h3x3[j+1][i+1].
+static constant float kGauss3[3] = { 0.25, 0.5, 0.25 };  // separable 1-D (sum=1)
 
 // Per-pixel variance estimate from a 3×3 spatial neighbourhood of the
 // accumulated GI luminance. Outputs R16Float (single channel).
@@ -4089,6 +4095,7 @@ kernel void illumi_svgf_atrous(
     texture2d<half,  access::write> giOut     [[texture(4)]],  // filtered color
     texture2d<half,  access::write> varOut    [[texture(5)]],  // filtered variance
     constant SVGFAtrousUniforms&    u         [[buffer(0)]],
+    constant FrameUniforms&         frame     [[buffer(1)]],   // invProjection
     uint2                           gid       [[thread_position_in_grid]]
 ) {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -4101,10 +4108,51 @@ kernel void illumi_svgf_atrous(
         return;
     }
 
+    // Center view-space (linear eye) depth + its screen-space gradient. The
+    // gradient lets the depth edge-stop normalise by the EXPECTED depth change
+    // from the surface slope (canonical SVGF — Schied 2017 §4.1), so a smooth
+    // receding plane passes freely at ANY à-trous stride. The old raw-hardware-
+    // depth weight used a fixed denominator: as the stride dilates, the depth
+    // delta grows but the threshold doesn't, so wDepth fell off in a stride-
+    // structured, view-dependent way → the horizontal masonry on the wall (#65).
+    float2 invWH = 1.0 / float2(u.width, u.height);
+    float2 ndcC  = (float2(gid) + 0.5) * invWH * 2.0 - 1.0; ndcC.y = -ndcC.y;
+    float  zC    = viewPosFromDepth(ndcC, centerDepth, frame.invProjection).z;
+    // Forward differences for ∂z/∂x, ∂z/∂y (clamped at the right/bottom edge).
+    uint2  gx    = uint2(min(gid.x + 1u, u.width  - 1u), gid.y);
+    uint2  gy    = uint2(gid.x, min(gid.y + 1u, u.height - 1u));
+    float  dX    = gDepth.read(gx).r, dY = gDepth.read(gy).r;
+    float2 ndcX  = (float2(gx) + 0.5) * invWH * 2.0 - 1.0; ndcX.y = -ndcX.y;
+    float2 ndcY  = (float2(gy) + 0.5) * invWH * 2.0 - 1.0; ndcY.y = -ndcY.y;
+    float  dzdx  = (dX >= 0.99999) ? 0.0 : (viewPosFromDepth(ndcX, dX, frame.invProjection).z - zC);
+    float  dzdy  = (dY >= 0.99999) ? 0.0 : (viewPosFromDepth(ndcY, dY, frame.invProjection).z - zC);
+
     float3 giCenter  = float3(giIn.read(gid).rgb);
     float3 nCenter   = octDecode(float2(gNormal.read(gid).rg));
-    float  varCenter = float(varIn.read(gid).r);
     float  lumCenter = dot(giCenter, float3(0.2126, 0.7152, 0.0722));
+
+    // Canonical SVGF: prefilter the variance with a separable 3×3 Gaussian before
+    // it drives the luminance edge-stop, so the weight field is smooth rather than
+    // carrying the raw variance's own structure.
+    float gVar = 0.0;
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            int2 c = clamp(int2(gid) + int2(i, j),
+                           int2(0), int2(int(u.width) - 1, int(u.height) - 1));
+            gVar += kGauss3[i + 1] * kGauss3[j + 1] * float(varIn.read(uint2(c)).r);
+        }
+    }
+
+    // Luminance edge-stop bandwidth (Schied 2017 §4.1): σ = σ_L·√Var + ε, used
+    // LINEARLY against |Δlum| (not Δlum² over Var — that squared form collapses to
+    // a near-binary contour gate as Var→0). This RT-GI is deterministic per frame,
+    // so on a converged surface Var genuinely vanishes; a fixed 1e-4 ε then gates
+    // the smooth vertical ramp into horizontal masonry bands (issue #65). The floor
+    // is therefore luminance-RELATIVE (`u.lumFloor·max(lumCenter,·)`): a smooth
+    // low-amplitude gradient blurs freely while a real high-contrast GI edge
+    // (shadow boundary) — where the variance estimate is large — still survives.
+    float lumSigma = u.sigmaL * sqrt(max(gVar, 0.0))
+                   + u.lumFloor * max(lumCenter, 0.02);
 
     float3 colorSum  = float3(0.0);
     float  varSum    = 0.0;
@@ -4123,19 +4171,28 @@ kernel void illumi_svgf_atrous(
             // B3-spline kernel weight for this tap position.
             float hW = kAtrousH1[i + 2] * kAtrousH1[j + 2];
 
-            // Depth edge-stopping (raw hardware depth difference).
-            float wDepth = exp(-abs(centerDepth - nd) / (u.sigmaZ * centerDepth + 1e-5));
+            // Depth edge-stopping — gradient-normalised LINEAR (view-space) depth.
+            // Expected eye-depth change from the surface slope over this tap offset;
+            // the denominator scales with the stride so a smooth plane stays w≈1 at
+            // every cascade level, while a true depth discontinuity (different
+            // surface) still rejects. ε keeps fronto-parallel surfaces stable.
+            float  zN       = viewPosFromDepth(
+                ((float2(np) + 0.5) * invWH * 2.0 - 1.0) * float2(1.0, -1.0),
+                nd, frame.invProjection).z;
+            float  expDz    = dzdx * float(i * step) + dzdy * float(j * step);
+            float  wDepth   = exp(-abs(zN - zC) / (u.sigmaZ * abs(expDz) + 1e-2));
 
             // Normal edge-stopping.
             float3 nN   = octDecode(float2(gNormal.read(np).rg));
             float  wNorm = pow(max(0.0, dot(nCenter, nN)), u.sigmaN);
 
             // Luminance edge-stopping — variance-guided (the SVGF key insight):
-            // high variance → wide constraint → more spatial denoising.
+            // high variance → wide constraint → more spatial denoising. Linear
+            // |Δlum|/σ form with the prefiltered, relative-floored bandwidth above.
             float3 giN  = float3(giIn.read(np).rgb);
             float  lumN = dot(giN, float3(0.2126, 0.7152, 0.0722));
-            float  lDif = lumCenter - lumN;
-            float  wLum = exp(-(lDif * lDif) / (u.sigmaL * u.sigmaL * varCenter + 1e-4));
+            float  lDif = abs(lumCenter - lumN);
+            float  wLum = exp(-lDif / lumSigma);
 
             float w    = hW * wDepth * wNorm * wLum;
             colorSum  += giN * w;
@@ -4891,6 +4948,12 @@ fragment float4 illumi_tonemap_fs(
     texture2d<half, access::sample> inBloom  [[texture(1)]],
     texture3d<half, access::sample> colorLUT [[texture(2)]],
     texture2d<half, access::sample> inVel    [[texture(3)]],   // screen-space velocity (UV/frame)
+    // Issue #65 — G-buffer channels for the Debug-view readouts (texture 4..6).
+    // Only read when `frame.debugTerm >= 10` (the G-buffer cases); a default
+    // `.normal` render never touches them.
+    texture2d<half,  access::read>  gAlbedoMet [[texture(4)]], // .rgb albedo, .a metalness
+    texture2d<half,  access::read>  gNormalRgh [[texture(5)]], // .xy oct-normal, .z roughness
+    depth2d<float,   access::read>  gDepth     [[texture(6)]],
     constant FrameUniforms&         frame    [[buffer(0)]],
     // Phase 4.21 — auto-exposure read (see below).
     const device ExposureState&     expoState [[buffer(1)]]
@@ -4917,6 +4980,50 @@ fragment float4 illumi_tonemap_fs(
         float2 a   = v * 40.0;                       // amplify (per-frame UV motion is tiny)
         float3 c   = float3(0.5 + a.x, 0.5 + a.y, 0.5 - 0.5 * saturate(mag * 40.0));
         return float4(saturate(c), 1.0);
+    }
+
+    // ── G-buffer debug views (issue #65) ─────────────────────────────────────────
+    // `debugTerm >= 10` replaces the composite with a RAW G-buffer channel, read
+    // BEFORE tonemapping so the readout is the true stored value. Cases 0–9 are the
+    // deferred-lighting-term isolations handled in `illumi_lighting` (its switch
+    // defaults to the full composite for >= 10), so this branch is the ONLY place
+    // these draw — and an exact no-op when `debugTerm < 10` (every scene's default
+    // is 0). Nearest-texel reads (no filtering) for a faithful per-pixel channel view.
+    if (frame.debugTerm >= 10u) {
+        uint2 gp = uint2(in.uv * float2(gAlbedoMet.get_width(), gAlbedoMet.get_height()));
+        switch (frame.debugTerm) {
+            case 10u: // Albedo — base colour (linear).
+                return float4(float3(gAlbedoMet.read(gp).rgb), 1.0);
+            case 11u: { // World normal, remapped from [-1,1] to [0,1].
+                float3 N = octDecode(float2(gNormalRgh.read(gp).rg));
+                return float4(N * 0.5 + 0.5, 1.0);
+            }
+            case 12u: { // Roughness (greyscale).
+                float r = float(gNormalRgh.read(gp).b);
+                return float4(r, r, r, 1.0);
+            }
+            case 13u: { // Metalness (greyscale).
+                float m = float(gAlbedoMet.read(gp).a);
+                return float4(m, m, m, 1.0);
+            }
+            case 14u: { // Depth — non-linear NDC z, ramped so the foreground is legible.
+                uint2 dp = uint2(in.uv * float2(gDepth.get_width(), gDepth.get_height()));
+                float d  = saturate(gDepth.read(dp));
+                // depth32 crushes most of a perspective scene near z=1; pow() spreads
+                // the high range, and the invert makes near = white / far = black.
+                float vis = 1.0 - pow(d, 24.0);
+                return float4(vis, vis, vis, 1.0);
+            }
+            case 15u: { // Screen-space velocity — same colourisation as the MV overlay.
+                constexpr sampler velS(filter::linear, address::clamp_to_edge, coord::normalized);
+                float2 v   = float2(inVel.sample(velS, in.uv).rg);
+                float  mag = length(v);
+                float2 a   = v * 40.0;
+                float3 c   = float3(0.5 + a.x, 0.5 + a.y, 0.5 - 0.5 * saturate(mag * 40.0));
+                return float4(saturate(c), 1.0);
+            }
+            default: break;
+        }
     }
 
     // `in.uv` is the output pixel centre in normalised coords, equivalent to

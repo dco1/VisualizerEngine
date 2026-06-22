@@ -848,6 +848,85 @@ final class CoinDEMSolverTests: XCTestCase {
         XCTAssertEqual(b.posInvMass.y, rodR, accuracy: rodR * 1.8, "rod COM rests ~one radius above the floor")
     }
 
+    // ── KINEMATIC HOLD (mouse grab): a held body is a real infinite-mass collider —
+    // the integrator applies no gravity and never moves it, so it stays exactly where
+    // the host puts it (Superquadric Lab's click-drag pickup). Releasing returns it to
+    // a dynamic body that carries the throw velocity. Reuses the `asleep` flag, so it
+    // REQUIRES the constraint path + sleep disabled (host owns asleep[]). ─────────────
+    func testKinematicHoldFreezesDrivesAndReleases() throws {
+        let (solver, queue) = try makeSolver()
+        solver.solverMode = .constraint
+        solver.sleepEnabled = false          // host owns asleep[] (the hold flag)
+        solver.gravity = 9.8
+        let R: Float = 0.1
+        let slot = solver.spawnSphere(at: SIMD3(0, 0.5, 0), radius: R)!
+
+        // 1. HOLD: with gravity on, a frozen body must NOT fall.
+        solver.setKinematicHold(slot, true)
+        step(solver, queue, frames: 120)     // 2 s — would free-fall ~19 m if not held
+        var p = solver.position(of: slot)!
+        XCTAssertEqual(p.y, 0.5, accuracy: 1e-3, "a held body must not fall under gravity")
+        XCTAssertEqual(p.x, 0.0, accuracy: 1e-3, "a held body must not drift")
+        XCTAssertLessThan(simd_length(solver.velocity(of: slot)!), 1e-3, "held body carries no velocity")
+
+        // 2. DRIVE: the host moves the held body each frame (the drag). It must track
+        //    the commanded position exactly, not lag or be pulled off by gravity.
+        for f in 1...60 {
+            solver.setPosition(ofSlot: slot, to: SIMD3(Float(f) * 0.005, 0.5, 0))
+            step(solver, queue, frames: 1)
+        }
+        p = solver.position(of: slot)!
+        XCTAssertEqual(p.x, 0.3, accuracy: 1e-3, "held body tracks the commanded drag position")
+        XCTAssertEqual(p.y, 0.5, accuracy: 1e-3, "drag keeps it at the commanded height")
+
+        // 3. RELEASE with a throw: it returns to a dynamic body — gravity + the handed
+        //    velocity take over (it flies +x and starts to fall).
+        solver.setKinematicHold(slot, false)
+        solver.setVelocity(ofSlot: slot, to: SIMD3(3, 0, 0))
+        step(solver, queue, frames: 6)       // sample mid-flight (it lands fast from 0.5 m)
+        let pr = solver.position(of: slot)!
+        let vr = solver.velocity(of: slot)!
+        print("KINEMATIC release pos=\(pr) vel=\(vr)")
+        XCTAssertGreaterThan(pr.x, 0.35, "released body flies forward (carries the throw velocity)")
+        XCTAssertLessThan(pr.y, 0.5, "released body falls under gravity again")
+        XCTAssertLessThan(vr.y, -0.5, "gravity is acting on the released (no-longer-kinematic) body")
+    }
+
+    // ── KINEMATIC HOLD shoves the pile: a held body driven INTO a resting dynamic body
+    // pushes it away (the held body is immovable — invMass 0 — so only the neighbour
+    // moves). This is the "rest of the pile bounces off the grabbed object" behaviour. ─
+    func testKinematicHeldBodyShovesNeighbour() throws {
+        let (solver, queue) = try makeSolver()
+        solver.solverMode = .constraint
+        solver.sleepEnabled = false
+        solver.gravity = 9.8
+        let R: Float = 0.1
+        // A free dynamic sphere resting on the floor.
+        let target = solver.spawnSphere(at: SIMD3(0.25, R, 0), radius: R)!
+        // The grabbed sphere, held, starting clear to the −x side.
+        let held = solver.spawnSphere(at: SIMD3(-0.4, R, 0), radius: R)!
+        solver.setKinematicHold(held, true)
+        step(solver, queue, frames: 30)                       // let the free one settle
+        let x0 = solver.position(of: target)!.x
+
+        // Drag the held sphere straight at the resting one.
+        for f in 1...70 {
+            solver.setPosition(ofSlot: held, to: SIMD3(-0.4 + Float(f) * 0.01, R, 0))
+            step(solver, queue, frames: 1)
+        }
+        // Stop dragging (held stays parked at x=0.3) and let the shoved body finish
+        // separating — while actively ramming there's transient overlap, as in real life.
+        step(solver, queue, frames: 40)
+        let pTarget = solver.position(of: target)!
+        let pHeld = solver.position(of: held)!
+        print("SHOVE targetX \(x0)→\(pTarget.x)  heldX=\(pHeld.x)")
+        XCTAssertEqual(pHeld.x, 0.3, accuracy: 1e-3, "the held body went exactly where it was driven (immovable)")
+        XCTAssertGreaterThan(pTarget.x, x0 + 0.05, "the held body shoved the resting body forward")
+        XCTAssertGreaterThan(pTarget.x, pHeld.x, "the shoved body ends up ahead of the held one (pushed out of the way)")
+        XCTAssertEqual(solver.measurePenetration(threshold: 0.01).penetratingPairs, 0,
+                       "no real interpenetration after the shove (resting contact within slop is fine)")
+    }
+
     // ── MIXED coins + cubes settle together in a bin: exercises the box–disc contact
     // path (a disc collided as its bounding box) alongside box–box and disc–disc. ────
     func testMixedBoxesAndDiscsSettle() throws {

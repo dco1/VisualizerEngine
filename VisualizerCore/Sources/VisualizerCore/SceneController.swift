@@ -185,6 +185,31 @@ public extension SceneController {
         set { }
     }
     func applyPerfOverrides(_ overrides: [String: String]) {}
+
+    // ── Shared activation (GPU conservation) ─────────────────────────
+    /// The single entry point `AppModel` uses to (de)activate a scene when the
+    /// sidebar selection changes. Do NOT call `setActive` directly from the app.
+    ///
+    /// This centralises the one piece of lifecycle every scene must get right
+    /// but historically hand-rolled (and several forgot): pausing a native
+    /// `MTKView`'s vsync present so a *backgrounded* scene stops driving the GPU.
+    /// Only the active scene's view is hosted in the SwiftUI hierarchy, but a
+    /// retained `NativeMetalScene` whose `MTKView.isPaused` is left `false` keeps
+    /// its display link presenting — burning GPU the active scene needs. Pausing
+    /// it here, for every `NativeMetalScene` uniformly, fixes that in one place.
+    ///
+    /// After the shared MTKView pause, this forwards to the scene's own
+    /// `setActive`, which owns the scene-specific tick/spawn/render-timer control.
+    /// Scenes therefore no longer need to touch `metalView.isPaused` themselves.
+    func applyActivation(_ active: Bool) {
+        // `NativeMetalScene.metalView` is non-optional and correctly witnessed;
+        // the `SceneController.metalView` requirement is nil for these (the
+        // stored-`let` vs optional-requirement trap documented on NativeMetalScene),
+        // so route through the refining protocol to reach the real view.
+        (self as? NativeMetalScene)?.metalView.isPaused = !active
+        setActive(active)
+    }
+
     func captureReviewAngle(yawDeg: Float, pitchDeg: Float,
                             size: SIMD2<Int>) -> MTLTexture? { nil }
     func captureHeroSettled(size: SIMD2<Int>) -> MTLTexture? { nil }

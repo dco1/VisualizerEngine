@@ -72,15 +72,18 @@ struct CoinBody {
     float4 shapeExtents;// w = shape tag (0 = disc/cylinder, 1 = box, 2 = sphere); box: xyz = half-extents, sphere: x = radius
 };
 
-// Plane:  a.xyz = unit normal, a.w = type tag(0);  b.w = plane offset d  (n·x = d)
-// Box:    a.xyz = centre,      a.w = type tag(1);  b.xyz = half-extents
-// Pusher: a.xyz = centre,      a.w = type tag(2);  b.xyz = half-extents; vel.xyz = plate vel
+// Plane:    a.xyz = unit normal, a.w = type tag(0);  b.w = plane offset d  (n·x = d)
+// Box:      a.xyz = centre,      a.w = type tag(1);  b.xyz = half-extents
+// Pusher:   a.xyz = centre,      a.w = type tag(2);  b.xyz = half-extents; vel.xyz = plate vel
+// OBox:     a.xyz = centre,      a.w = type tag(3);  b.xyz = half-extents; orient = unit quat (local→world)
 struct CoinStaticCollider {
     float4 a;
     float4 b;
-    float4 vel;   // xyz = surface velocity (kinematic pusher), w = friction (reserved)
-    uint4  meta;  // x = flags (bit0 = one-way: push only when approaching from +normal), yzw reserved
+    float4 vel;    // xyz = surface velocity (kinematic pusher), w = friction (reserved)
+    uint4  meta;   // x = flags (bit0 = one-way: push only when approaching from +normal), yzw reserved
+    float4 orient; // oriented-box (kind 3) rotation quaternion (x,y,z,w); identity for other kinds
 };
+// `cdQuatRotate` / `cdQuatRotateInv` are defined below (shared with the body solver).
 
 struct CoinUniforms {
     float dt;
@@ -1354,12 +1357,32 @@ kernel void coinMeasurePenetration(
             float minDepth = 1e30;
             bool  separated = false;
             if (cdIsSphere(ci) || cdIsSphere(cj)) {
-                // Sphere-involved pair: the same orientation-independent overlap the
-                // solver de-penetrates with (a non-sphere neighbour uses its bounding
-                // sphere, matching coinContactSolve's sphere branch).
-                float ri = cdIsSphere(ci) ? Ri : sqrt(Ri*Ri + hi*hi);
-                float rj = cdIsSphere(cj) ? Rj : sqrt(Rj*Rj + hj*hj);
-                minDepth = (ri + rj) - length(D);
+                // Sphere-involved pair: the EXACT contact the constraint-path
+                // narrowphase (coinGenerateContacts) de-penetrates with — sphere↔sphere
+                // is centre distance; sphere↔box clamps the centre to the box, sphere↔disc
+                // clamps to the capped cylinder. (The old code used the box's *bounding
+                // sphere* here, which matched only the legacy Jacobi solver and grossly
+                // over-reported a sphere resting beside a box — a false positive for any
+                // constraint-path scene.)
+                bool iSphere = cdIsSphere(ci);
+                float3 cs = iSphere ? xi : xj;  float rs = iSphere ? Ri : Rj;
+                float3 co = iSphere ? xj : xi;  float4 qo = iSphere ? qj : qi;
+                CoinBody O = iSphere ? cj : ci;
+                if (cdIsSphere(O)) {
+                    minDepth = (Ri + Rj) - length(D);
+                } else {
+                    float3 lp = cdQuatRotateInv(qo, cs - co);
+                    float3 closestLocal;
+                    if (cdIsBox(O)) {
+                        closestLocal = clamp(lp, -cdBodyHalfExtents(O), cdBodyHalfExtents(O));
+                    } else {
+                        float Ro = cdRadiusOf(O), hO = cdHalfThickOf(O);
+                        float radial = length(lp.xz);
+                        float2 rd = radial > 1e-6 ? lp.xz / radial : float2(1, 0);
+                        closestLocal = float3(rd.x * min(radial, Ro), clamp(lp.y, -hO, hO), rd.y * min(radial, Ro));
+                    }
+                    minDepth = rs - length(lp - closestLocal);
+                }
                 if (minDepth <= 0.0) separated = true;
             } else if (cdIsBox(ci) || cdIsBox(cj)) {
                 // Box-involved pair → the same oriented box–box SAT the solver
@@ -1598,6 +1621,66 @@ kernel void coinGenerateContacts(
                 else                                    { n = float3(0,0,sign(dd.z)); push = dist.z; }
                 if (oneWay && n.y < 0.5) continue;
                 cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, pw, xi, xi, push);
+            }
+        } else if (kind == 3u) {                         // oriented box (plank / ramp)
+            float3 ctr = col.a.xyz, he = col.b.xyz;
+            float4 q = col.orient;
+            if (cdIsSphere(ci)) {
+                // Sphere vs OBB: closest point on the box to the sphere centre,
+                // in the box's local frame, then back to world.
+                float3 lp = cdQuatRotateInv(q, xi - ctr);
+                float3 cl = clamp(lp, -he, he);
+                float3 dlt = lp - cl;
+                float dist2 = dot(dlt, dlt);
+                if (dist2 > 1e-10) {                      // centre outside the box
+                    float dist = sqrt(dist2);
+                    float pen = Ri - dist;
+                    if (pen > 0.0) {
+                        float3 n = cdQuatRotate(q, dlt / dist);
+                        cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, 0u, k, n, xi - Ri*n, xi, xi, pen);
+                    }
+                } else {                                  // centre inside: push out least-penetration axis
+                    float3 d = he - abs(lp);
+                    float3 nL = (d.x < d.y && d.x < d.z) ? float3(sign(lp.x),0,0)
+                              : (d.y < d.z)              ? float3(0,sign(lp.y),0)
+                              :                            float3(0,0,sign(lp.z));
+                    float pen = min(d.x, min(d.y, d.z)) + Ri;
+                    float3 n = cdQuatRotate(q, nL);
+                    cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, 0u, k, n, xi - Ri*n, xi, xi, pen);
+                }
+            } else {
+                for (int p = 0; p < CD_NPTS; ++p) {
+                    float3 lp = cdQuatRotateInv(q, fp[p] - ctr);
+                    if (abs(lp.x) >= he.x || abs(lp.y) >= he.y || abs(lp.z) >= he.z) continue;
+                    float3 d = he - abs(lp);
+                    float3 nL; float push;
+                    if (d.x < d.y && d.x < d.z) { nL = float3(sign(lp.x),0,0); push = d.x; }
+                    else if (d.y < d.z)         { nL = float3(0,sign(lp.y),0); push = d.y; }
+                    else                        { nL = float3(0,0,sign(lp.z)); push = d.z; }
+                    float3 n = cdQuatRotate(q, nL);
+                    cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, fp[p], xi, xi, push);
+                }
+            }
+        } else if (kind == 4u && cdIsSphere(ci)) {       // cylinder segment (pipe / half-pipe)
+            // a.xyz = axis centre, b.xyz = axis dir (unit), b.w = radius R,
+            // vel.xyz = "up" dir, vel.w = half-length, meta.x bit0 = lower-half only.
+            float3 ctr = col.a.xyz, ax = col.b.xyz, up = col.vel.xyz;
+            float R = col.b.w, halfLen = col.vel.w;
+            bool lowerOnly = (col.meta.x & 1u) != 0u;
+            float3 d = xi - ctr;
+            float along = dot(d, ax);
+            if (along >= -halfLen && along <= halfLen) {   // within this segment's length
+                float3 radial = d - ax * along;
+                float dr = length(radial);
+                if (dr > 1e-5 && dr < R) {                 // ONLY when the centre is INSIDE the tube
+                    float3 rn = radial / dr;                // outward from axis
+                    bool active = !lowerOnly || dot(rn, up) < 0.05;   // half-pipe: lower hemisphere
+                    float pen = (dr + Ri) - R;             // marble surface vs inner wall (>0 ⇒ touching)
+                    if (active && pen > 0.0) {
+                        float3 n = -rn;                     // push toward the axis
+                        cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, 0u, k, n, xi + rn * Ri, xi, xi, pen);
+                    }
+                }
             }
         }
         // kind == 2 (pusher) is a kinematic position shove handled by the legacy path
@@ -1983,8 +2066,7 @@ kernel void coinWarmStartApply(
     device CoinBody*          coins        [[ buffer(0) ]],
     device CoinContact*       contacts     [[ buffer(1) ]],
     device const atomic_uint& contactCount [[ buffer(2) ]],
-    constant CoinUniforms&    u            [[ buffer(3) ]],
-    constant uint&            currentColor [[ buffer(4) ]],
+    constant uint&            currentColor [[ buffer(3) ]],
     uint cid [[ thread_position_in_grid ]])
 {
     uint ncon = atomic_load_explicit(&contactCount, memory_order_relaxed);
@@ -2050,8 +2132,7 @@ kernel void coinFinalizeCS(
 
 kernel void coinIslandInit(
     device uint*           label    [[ buffer(0) ]],
-    device const CoinBody* coins    [[ buffer(1) ]],
-    constant CoinUniforms& u        [[ buffer(2) ]],
+    constant CoinUniforms& u        [[ buffer(1) ]],
     uint id [[ thread_position_in_grid ]])
 {
     if (id >= u.coinCount) return;

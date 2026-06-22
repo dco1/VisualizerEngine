@@ -34,10 +34,19 @@ public extension IlluminatoramaRenderer {
         contactShadowSteps     = UInt32(max(1, min(32, s.contactShadowSteps)))
         contactShadowThickness = Float(s.contactShadowThicknessCm * 0.01)
         // Screen-space subsurface scattering (issue #65) — universal off-by-default
+        // knob, no scene overrides it. Strength 0 → an exact pipeline no-op (the
+        // blur/composite passes aren't even encoded). Radius is mm (the shader
+        // projects it to screen px per-pixel via depth).
         sssStrength = Float(s.sssEnabled ? s.sssStrength : 0)
         sssRadius   = Float(s.sssRadiusMm)
         sssTint     = SIMD3(Float(s.sssTintR), Float(s.sssTintG), Float(s.sssTintB))
         postFXEasingTau     = s.postFXEasing.tau
+        // Debug view (issue #65). Mirror the shared picker into `debugTerm` for
+        // EVERY Illuminatorama renderer each frame (this runs from `render()` via
+        // `appliesSharedLensFX`), so the Debug-view picker works on any scene with
+        // zero per-scene wiring. `.composite` (rawValue 0 → `.normal`) is the
+        // default and an exact no-op. The integer mirror matches `DebugTerm`.
+        debugTerm = IlluminatoramaRenderer.DebugTerm(rawValue: s.debugView.debugTermRaw) ?? .normal
     }
 
     /// The shared lens FX (above) **plus the panel's bloom**.
