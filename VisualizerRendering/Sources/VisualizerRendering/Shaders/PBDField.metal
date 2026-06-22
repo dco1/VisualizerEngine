@@ -224,6 +224,11 @@ kernel void pbdGrassExpand(
     uint outBase = id * 2u;
     verts  [outBase + 0u] = pos - perp * halfWidth;
     verts  [outBase + 1u] = pos + perp * halfWidth;
-    normals[outBase + 0u] = nrm;
-    normals[outBase + 1u] = nrm;
+    // Fan the two edge normals outward along ±perp (~29°) so the ribbon shades
+    // like a rounded / V-channel blade cross-section — bright on the lit edge,
+    // falling off to the shadowed edge — instead of a single flat billboard
+    // normal that makes every blade one cardboard-cutout tone under any light.
+    float fan = 0.55;
+    normals[outBase + 0u] = normalize(nrm - perp * fan);
+    normals[outBase + 1u] = normalize(nrm + perp * fan);
 }
