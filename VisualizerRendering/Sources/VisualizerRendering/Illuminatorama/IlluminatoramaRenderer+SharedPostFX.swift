@@ -33,6 +33,10 @@ public extension IlluminatoramaRenderer {
         contactShadowLength    = Float(s.contactShadowLengthCm * 0.01)
         contactShadowSteps     = UInt32(max(1, min(32, s.contactShadowSteps)))
         contactShadowThickness = Float(s.contactShadowThicknessCm * 0.01)
+        // Screen-space subsurface scattering (issue #65) — universal off-by-default
+        sssStrength = Float(s.sssEnabled ? s.sssStrength : 0)
+        sssRadius   = Float(s.sssRadiusMm)
+        sssTint     = SIMD3(Float(s.sssTintR), Float(s.sssTintG), Float(s.sssTintB))
         postFXEasingTau     = s.postFXEasing.tau
     }
 

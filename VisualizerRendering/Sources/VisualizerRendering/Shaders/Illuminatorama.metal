@@ -222,6 +222,24 @@ struct FrameUniforms {
     float    contactShadowLength;     // march reach, world units
     uint     contactShadowSteps;      // ray-march sample count
     float    contactShadowThickness;  // occluder depth window, world units
+    // Screen-space subsurface scattering (issue #65). Jimenez-style separable SSS
+    // for skin / wax / marble / food. SSS pixels are flagged in normalRoughness.w
+    // (vertex-colour alpha ∈ [0.90,0.98] → 0.95h). `sssStrength` 0 = OFF → the
+    // lighting pass skips the side-buffer write and the host doesn't encode the
+    // blur/composite passes → an EXACT no-op for every existing scene. `sssRadius`
+    // is the diffusion mean-free-path in MILLIMETRES (projected to screen px per
+    // pixel via depth); `sssTint*` scales the per-channel scatter distance (default
+    // reddish skin profile → warm bleed). NEW 32-byte trailing region (two 16-byte
+    // clusters, stride 1056 → 1088); field-for-field mirror of the Swift
+    // IlluminatoramaFrameUniforms. The three pads keep the final cluster aligned.
+    float    sssStrength;   // 0 = off; blend of blurred over sharp diffuse (0..1)
+    float    sssRadius;     // diffusion radius, millimetres
+    float    sssTintR;      // per-channel scatter-distance scale (R)
+    float    sssTintG;      // per-channel scatter-distance scale (G)
+    float    sssTintB;      // per-channel scatter-distance scale (B)
+    float    sssDebugForceAll;  // 1 = treat every opaque pixel as SSS (headless verify)
+    float    _padSSS1;
+    float    _padSSS2;
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift
@@ -1902,6 +1920,26 @@ static inline float3 brdf(
     return (diff + spec) * lightColor * NdotL;
 }
 
+// Issue #65 — the DIFFUSE-ONLY half of `brdf`, byte-for-byte the same diffuse
+// term `brdf` adds to the composite (same Fresnel kd = (1-F)(1-metallic), same
+// Lambert albedo/π · NdotL). The screen-space SSS pass uses it to peel the
+// diffuse-lit irradiance off SSS-flagged pixels into a side buffer: because it
+// reproduces `brdf`'s diffuse exactly, the composite (`hdr += s·(blur(D) − D)`)
+// collapses to "replace the sharp diffuse with the blurred diffuse" at s = 1,
+// leaving specular / emission / clearcoat untouched. No-op everywhere else.
+static inline float3 brdfDiffuse(
+    float3 N, float3 V, float3 L, float3 albedo, float metallic, float3 lightColor
+) {
+    float NdotL = saturate(dot(N, L));
+    if (NdotL <= 0.0) return float3(0);
+    float3 H = normalize(V + L);
+    float  HdotV = saturate(dot(H, V));
+    float3 F0 = mix(float3(0.04), albedo, metallic);
+    float3 F  = fresnelSchlick(HdotV, F0);
+    float3 kd = (1.0 - F) * (1.0 - metallic);
+    return kd * albedo / M_PI_F * lightColor * NdotL;
+}
+
 // ── Rectangular area light (#60 task 5) ─────────────────────────────────────
 // Replaces the 4.24 five-spot `.area` approximation. The DIFFUSE term is the
 // EXACT closed-form polygon clamped-cosine integral — Linearly-Transformed-
@@ -2421,6 +2459,11 @@ kernel void illumi_lighting(
     // #60 task 5 increment 2 — LTC area-light specular LUTs (Minv + magnitude).
     texture2d<float, access::sample>        ltcMat          [[texture(16)]],
     texture2d<float, access::sample>        ltcMag          [[texture(17)]],
+    // Issue #65 — screen-space SSS diffuse side buffer. rgb = the diffuse-lit
+    // irradiance of an SSS-flagged pixel; a = the SSS mask (1 = blur this pixel,
+    // 0 = leave it). Written ONLY when frame.sssStrength > 0 (else the binding is
+    // an unread dummy and the write is skipped, so non-SSS scenes pay nothing).
+    texture2d<half,  access::write>         sssOut          [[texture(18)]],
     constant FrameUniforms&                 frame           [[buffer(0)]],
     const device PointLight*                pointLights     [[buffer(1)]],
     constant DDGIUniforms&                  ddgi            [[buffer(2)]],
@@ -2448,6 +2491,8 @@ kernel void illumi_lighting(
         float3 dir = normalize(farWorld.xyz / farWorld.w - frame.cameraWorldPos);
         float3 sky = sampleSkyEquirect(skyEquirect, dir);
         outHDR.write(half4(half3(sky), 1.0h), gid);
+        // Issue #65 — sky is never SSS; clear its mask so the composite skips it.
+        if (frame.sssStrength > 0.0) sssOut.write(half4(0.0h), gid);
         return;
     }
 
@@ -2462,6 +2507,18 @@ kernel void illumi_lighting(
 
     float3 worldPos = worldPosFromDepth(ndc, depth, frame.invViewProjection);
     float3 V = normalize(frame.cameraWorldPos - worldPos);
+
+    // Issue #65 — screen-space SSS. SSS-flagged pixels carry ≈0.95h in
+    // normalRoughness.w (vertex-colour alpha ∈ [0.90,0.98]; above the foliage 0.0
+    // / plush 0.55 / casing 0.75 bands, below opaque 1.0). When the scene opts in
+    // (frame.sssStrength > 0) we accumulate the DIFFUSE-only lit term alongside the
+    // normal composite — sun·vis + points + spots + fill-directionals + diffuse-IBL
+    // + ambient — and hand it to the separable blur via `sssOut`. The whole branch
+    // is dead for non-SSS scenes (sssStrength == 0) and non-SSS pixels (mask 0).
+    bool   sssBand  = (nrH.a > 0.90h && nrH.a < 0.99h);
+    bool   sssForce = (frame.sssDebugForceAll > 0.5) && (nrH.a > 0.5h); // headless verify
+    bool   isSSS    = (frame.sssStrength > 0.0) && (sssBand || sssForce);
+    float3 sssDiffuse = float3(0.0);
 
     // Directional light, attenuated by the cascaded-shadow visibility term.
     // sample_compare returns 1.0 when `reference COMPARE_FUNC sample` holds.
@@ -2494,6 +2551,8 @@ kernel void illumi_lighting(
     // isolate any one of them; the normal path just sums them at the end.
     float3 directSun = brdf(N, V, Ld, albedo, metallic, roughness,
                             frame.directionalLightColor) * visibility;
+    if (isSSS) sssDiffuse += brdfDiffuse(N, V, Ld, albedo, metallic,
+                                         frame.directionalLightColor) * visibility;
 
     // ── Leaf thin-sheet transmission (issue #58 / #20 item 2) ───────────────
     // Leaves are flagged in normalRoughness.w (0 = foliage; opaque geometry is
@@ -2561,6 +2620,7 @@ kernel void illumi_lighting(
         float window = saturate(1.0 - pow(dist / pl.radius, 4.0));
         atten *= window * window;
         pointSum += brdf(N, V, L, albedo, metallic, roughness, pl.color * atten);
+        if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic, pl.color * atten);
     }
 
     // Spot lights — same distance attenuation as point lights, multiplied
@@ -2626,6 +2686,8 @@ kernel void illumi_lighting(
         if (visibility <= 0.0) continue;
         spotSum += brdf(N, V, L, albedo, metallic, roughness,
                         sl.color * atten * visibility);
+        if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic,
+                                             sl.color * atten * visibility);
     }
 
     // Rectangular area lights (#60 task 5) — closed-form polygon diffuse + MRP
@@ -2648,6 +2710,7 @@ kernel void illumi_lighting(
     for (uint i = 0; i < frame.directionalLightCount; ++i) {
         DirectionalLight dl = extraDirectionals[i];
         dirFillSum += brdf(N, V, dl.dir, albedo, metallic, roughness, dl.color);
+        if (isSSS) sssDiffuse += brdfDiffuse(N, V, dl.dir, albedo, metallic, dl.color);
     }
 
     // SSAO (half-res, gid/2). Only the indirect term is modulated — direct
@@ -2791,6 +2854,12 @@ kernel void illumi_lighting(
         dbgAmbient = amb * ao;
     }
 
+    // Issue #65 — fold the indirect DIFFUSE (diffuse-IBL irradiance + ambient
+    // supplement) into the SSS side buffer. `dbgSpecularIBL` is deliberately
+    // excluded — specular must stay sharp under SSS. (In the no-IBL branch
+    // dbgDiffuseIBL is 0 and dbgAmbient carries the hemispheric diffuse.)
+    if (isSSS) sssDiffuse += dbgDiffuseIBL + dbgAmbient;
+
     // ── Sausage-casing clearcoat (HotdogDropUltra) ──────────────────────────
     // Casing pixels carry 0.75 in normalRoughness.w (foliage = 0, opaque = 1).
     // HotdogDrop+'s frank is a SATIN base (roughness mottle mean ≈ 0.48) under
@@ -2856,6 +2925,14 @@ kernel void illumi_lighting(
         default: break;                           // 0 = full composite
     }
     outHDR.write(half4(half3(color), 1.0h), gid);
+
+    // Issue #65 — hand the diffuse-lit term to the separable SSS blur. rgb = the
+    // diffuse irradiance peeled off above; a = the SSS mask (1 = blur, 0 = leave).
+    // Skipped entirely when the scene hasn't opted in (sssStrength == 0), so the
+    // binding is an unread dummy and non-SSS scenes pay nothing here.
+    if (frame.sssStrength > 0.0) {
+        sssOut.write(half4(half3(sssDiffuse), isSSS ? 1.0h : 0.0h), gid);
+    }
 }
 
 // ── Screen-space ambient occlusion ───────────────────────────────────────────
@@ -2876,6 +2953,134 @@ static inline float3 viewPosFromDepth(float2 ndcXY, float depth, float4x4 invPro
     float4 clip = float4(ndcXY, depth, 1.0);
     float4 view = invProj * clip;
     return view.xyz / view.w;
+}
+
+// ── Screen-space subsurface scattering (issue #65) ───────────────────────────
+//
+// A Jimenez-style SEPARABLE screen-space SSS for skin / wax / marble / food.
+// The deferred lighting pass peeled the diffuse-lit irradiance off SSS-flagged
+// pixels into a side buffer (rgb = diffuse, a = mask). We diffuse it laterally
+// with a 1-D blur run twice (horizontal then vertical) — separable being the
+// whole point of the technique (Jimenez 2015): a true 2-D diffusion profile is
+// closely approximated by two 1-D passes at a fraction of the cost. A composite
+// then blends the blurred diffuse back over the sharp diffuse and the rest of
+// the lit image (specular / emission / clearcoat) stays untouched.
+//
+// The kernel is PHYSICAL in two ways the project cares about (no scrolling-
+// texture fakery): (1) the blur width is the diffusion mean-free-path in
+// MILLIMETRES projected to screen pixels per-pixel from depth + the projection,
+// so an object diffuses by a real-world distance regardless of how big it is on
+// screen; (2) the profile is a two-lobe Gaussian sum (narrow core + wide tail)
+// whose per-channel width scales by `sssTint`, reproducing the wavelength-
+// dependent scatter that makes the red bleed reach farther than green/blue —
+// the signature of skin/wax. Depth-aware tap rejection stops the diffusion
+// bleeding across silhouettes onto the background or a foreground occluder.
+
+// Two-lobe diffusion profile weight at radius `r` (px), per RGB channel. The
+// per-channel sigma scales by `tint` so a reddish tint scatters red farthest.
+// Not normalised here — the kernel renormalises by the accumulated weight, which
+// also handles taps dropped at silhouettes.
+static inline float3 sssProfileWeight(float r, float radiusPx, float3 tint) {
+    float3 sNarrow = max(radiusPx * 0.30 * tint, float3(0.5));
+    float3 sWide   = max(radiusPx * 1.00 * tint, float3(0.5));
+    float  r2      = r * r;
+    float3 gN = exp(-r2 / (2.0 * sNarrow * sNarrow));
+    float3 gW = exp(-r2 / (2.0 * sWide   * sWide));
+    return 0.55 * gN + 0.45 * gW;   // core-weighted (sharper centre, soft tail)
+}
+
+constant int kSSSTaps = 12;                 // samples per side along the 1-D axis
+constant float kSSSMaxRadiusPx = 64.0;      // clamp so a near object can't smear the frame
+
+// One separable pass. `dir` is (1,0) for horizontal, (0,1) for vertical. Non-SSS
+// pixels (mask 0) pass straight through so the second pass and the composite see
+// the untouched diffuse for the rest of the image.
+kernel void illumi_sss_blur(
+    texture2d<half,  access::read>  src    [[texture(0)]],   // diffuse rgb + mask a
+    depth2d<float,   access::read>  gDepth [[texture(1)]],
+    texture2d<half,  access::write> dst    [[texture(2)]],
+    constant FrameUniforms&         frame  [[buffer(0)]],
+    constant float2&                dir    [[buffer(1)]],
+    uint2                           gid    [[thread_position_in_grid]]
+) {
+    uint w = dst.get_width();
+    uint h = dst.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+
+    half4 center = src.read(gid);
+    if (center.a < 0.5h) { dst.write(center, gid); return; }   // not SSS — passthrough
+
+    float depthC = gDepth.read(gid);
+    float2 ndc = (float2(gid) + 0.5) / float2(w, h) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    float3 vposC = viewPosFromDepth(ndc, depthC, frame.invProjection);
+    float  viewZ = max(1e-3, -vposC.z);
+
+    // mm → screen px at this depth: perspective px-per-metre = 0.5·H·P[1][1]/zEye.
+    float pxPerMetre = 0.5 * float(h) * frame.projection[1][1] / viewZ;
+    float radiusPx   = clamp(frame.sssRadius * 0.001 * pxPerMetre, 0.0, kSSSMaxRadiusPx);
+    if (radiusPx < 0.75) { dst.write(center, gid); return; }   // sub-pixel — nothing to blur
+
+    float3 tint = max(float3(frame.sssTintR, frame.sssTintG, frame.sssTintB), float3(0.0));
+    // Depth window for tap rejection: a fraction of the diffusion reach in world
+    // units, so the blur stays on the surface and doesn't leak past a silhouette.
+    float depthSigma = max(frame.sssRadius * 0.001 * 1.5, 1e-3);
+
+    float3 sum  = float3(0.0);
+    float3 wsum = float3(0.0);
+    for (int i = -kSSSTaps; i <= kSSSTaps; ++i) {
+        float  t     = float(i) / float(kSSSTaps);   // -1 … 1
+        float  offPx = t * radiusPx;
+        float2 sxy   = float2(gid) + dir * offPx;
+        int2   sc    = int2(round(sxy));
+        if (sc.x < 0 || sc.y < 0 || sc.x >= int(w) || sc.y >= int(h)) continue;
+        uint2  scu = uint2(sc);
+        half4  s   = src.read(scu);
+        if (s.a < 0.5h) continue;                    // don't pull from non-SSS neighbours
+
+        // Depth-aware: reject taps whose surface sits far from the centre in eye Z.
+        float  dS    = gDepth.read(scu);
+        float2 sndc  = (float2(scu) + 0.5) / float2(w, h) * 2.0 - 1.0;
+        sndc.y = -sndc.y;
+        float  vzS   = max(1e-3, -viewPosFromDepth(sndc, dS, frame.invProjection).z);
+        float  dz    = vzS - viewZ;
+        float  depthW = exp(-(dz * dz) / (2.0 * depthSigma * depthSigma));
+
+        float3 prof = sssProfileWeight(abs(offPx), radiusPx, tint) * depthW;
+        sum  += float3(s.rgb) * prof;
+        wsum += prof;
+    }
+
+    float3 outRGB = float3(center.rgb);
+    outRGB.r = wsum.r > 1e-5 ? sum.r / wsum.r : outRGB.r;
+    outRGB.g = wsum.g > 1e-5 ? sum.g / wsum.g : outRGB.g;
+    outRGB.b = wsum.b > 1e-5 ? sum.b / wsum.b : outRGB.b;
+    dst.write(half4(half3(outRGB), center.a), gid);
+}
+
+// Composite the blurred diffuse back over the lit HDR. For SSS pixels only,
+// `hdr += sssStrength · (blurred − sharp)`: at strength 1 this exactly replaces
+// the sharp diffuse (already in HDR) with the blurred diffuse, leaving specular /
+// emission / clearcoat as they were; at strength 0 it adds nothing (and the host
+// doesn't even encode this pass). read_write at the same gid is per-pixel safe.
+kernel void illumi_sss_composite(
+    texture2d<half, access::read_write> hdr      [[texture(0)]],
+    texture2d<half, access::read>       diffOrig [[texture(1)]],  // sharp diffuse + mask
+    texture2d<half, access::read>       diffBlur [[texture(2)]],  // blurred diffuse
+    constant FrameUniforms&             frame    [[buffer(0)]],
+    uint2                               gid      [[thread_position_in_grid]]
+) {
+    uint w = hdr.get_width();
+    uint h = hdr.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+
+    half4 o = diffOrig.read(gid);
+    if (o.a < 0.5h) return;                          // non-SSS — leave HDR untouched
+
+    half4  b     = diffBlur.read(gid);
+    float3 delta = (float3(b.rgb) - float3(o.rgb)) * frame.sssStrength;
+    half4  c     = hdr.read(gid);
+    hdr.write(half4(half3(float3(c.rgb) + delta), c.a), gid);
 }
 
 static inline float ssaoHash12(float2 p) {

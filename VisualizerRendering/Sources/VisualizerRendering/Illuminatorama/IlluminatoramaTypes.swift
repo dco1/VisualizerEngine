@@ -293,6 +293,33 @@ public struct IlluminatoramaFrameUniforms {
     public var contactShadowLength: Float = 0.05
     public var contactShadowSteps: UInt32 = 12
     public var contactShadowThickness: Float = 0.02
+    // ── Screen-space subsurface scattering (issue #65) ───────────────
+    /// Jimenez-style separable screen-space SSS for skin / wax / marble / food.
+    /// The deferred lighting pass writes the diffuse-lit term of SSS-flagged
+    /// pixels (vertex-colour alpha ∈ [0.90, 0.98] → `normalRoughness.w` ≈ 0.95h)
+    /// into a side buffer; a separable blur diffuses it by `sssRadius` (the
+    /// per-channel diffusion mean-free-path in MILLIMETRES, scaled by `sssTint`);
+    /// a composite blends it back: `hdr += sssStrength · (blurred − sharp)`.
+    /// `sssStrength` 0 = OFF → the lighting pass skips the side-buffer write and
+    /// the blur/composite passes aren't encoded at all → an EXACT no-op for every
+    /// existing scene (matches the vignette/grain/motion-blur off-by-default
+    /// pattern). `sssTint` biases which wavelengths scatter farthest — the default
+    /// reddish skin profile (1.0, 0.4, 0.25) gives the characteristic warm bleed;
+    /// marble ≈ (1,1,1), wax ≈ (1, 0.7, 0.45). NEW 32-byte trailing region (two
+    /// 16-byte clusters; stride 1056 → 1088). The three trailing pads keep the
+    /// final cluster 16-byte-aligned; field-for-field mirror of the Metal
+    /// `FrameUniforms`.
+    public var sssStrength: Float = 0
+    public var sssRadius: Float = 8.0     // diffusion radius, millimetres
+    public var sssTintR: Float = 1.0
+    public var sssTintG: Float = 0.4
+    public var sssTintB: Float = 0.25
+    /// Headless-verify convenience (VIZ_ILLUMI_SSS_FORCEALL): 1 = treat EVERY
+    /// opaque pixel as SSS-flagged so the effect can be render-verified without
+    /// re-tagging a mesh. 0 in normal use → only the [0.90,0.98] flag band scatters.
+    public var sssDebugForceAll: Float = 0
+    public var _padSSS1: Float = 0
+    public var _padSSS2: Float = 0
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20

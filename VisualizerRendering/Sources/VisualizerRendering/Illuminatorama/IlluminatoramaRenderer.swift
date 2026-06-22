@@ -849,6 +849,24 @@ public final class IlluminatoramaRenderer {
         guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_CONTACTSHADOW"] else { return nil }
         return Float(v)
     }()
+    // Issue #65 — headless SSS override. SSS is otherwise driven only by the panel.
+    // `VIZ_ILLUMI_SSS` (a float strength, e.g. `1.0`) forces `sssStrength` for every
+    // renderer in the process so the light-bleed can be render-verified A/B; the
+    // optional `VIZ_ILLUMI_SSS_FORCEALL=1` companion treats EVERY opaque pixel as
+    // SSS-flagged (so any scene's props can be verified without re-tagging a mesh).
+    // `nil` when unset.
+    nonisolated static let sssStrengthEnvOverride: Float? = {
+        guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SSS"] else { return nil }
+        return Float(v)
+    }()
+    nonisolated static let sssForceAllEnv: Bool =
+        (ProcessInfo.processInfo.environment["VIZ_ILLUMI_SSS_FORCEALL"] == "1")
+    // Optional headless radius override (mm), so a verify run can crank the
+    // diffusion reach without re-authoring panel state. `nil` when unset.
+    nonisolated static let sssRadiusEnvOverride: Float? = {
+        guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SSS_RADIUS"] else { return nil }
+        return Float(v)
+    }()
     private let swapProbePath = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SWAP_PATH"]
     private var swapLastTime: CFTimeInterval = 0
     private var swapIntervalsMs: [Double] = []
@@ -1080,6 +1098,18 @@ public final class IlluminatoramaRenderer {
     public var contactShadowLength: Float = 0.05
     public var contactShadowSteps: UInt32 = 12
     public var contactShadowThickness: Float = 0.02
+    /// Screen-space subsurface scattering (issue #65). Jimenez-style separable SSS
+    /// for skin / wax / marble / food. `sssStrength` 0 = OFF → the lighting pass
+    /// skips the side-buffer write and the blur/composite passes aren't encoded →
+    /// an EXACT no-op (the off-by-default universal pattern). `sssRadius` is the
+    /// diffusion mean-free-path in MILLIMETRES; `sssTint` scales the per-channel
+    /// scatter distance (default reddish skin profile → warm bleed; marble ≈ 1,1,1;
+    /// wax ≈ 1,0.7,0.45). A mesh opts a surface in by tagging its vertices with
+    /// colour alpha ∈ [0.90,0.98] (→ `normalRoughness.w` ≈ 0.95h). Driven from the
+    /// panel via `applySharedLensFX` (universal off-by-default knob).
+    public var sssStrength: Float = 0
+    public var sssRadius: Float = 8.0   // diffusion radius, millimetres
+    public var sssTint: SIMD3<Float> = SIMD3(1.0, 0.4, 0.25)
     /// Last built-in look baked into `colorLUT`, so `applySharedColorGrade` only
     /// rebakes the (CPU-built) LUT texture when the chosen look actually changes.
     private var appliedColorGradeLook: IlluminatoramaColorGradeLook = .none
@@ -1244,6 +1274,15 @@ public final class IlluminatoramaRenderer {
     private var currentSSRHistoryTexture: MTLTexture { ssrHistoryToggle ? ssrHistoryB : ssrHistoryA }
     private var previousSSRHistoryTexture: MTLTexture { ssrHistoryToggle ? ssrHistoryA : ssrHistoryB }
 
+    // Issue #65 — screen-space SSS buffers (full-res, rgba16Float). The lighting
+    // pass writes the diffuse-lit term of SSS-flagged pixels into `sssDiffuse`;
+    // the separable blur ping-pongs sssDiffuse → sssBlurTmp (H) → sssBlurOut (V);
+    // the composite reads sssDiffuse (sharp) + sssBlurOut (blurred). Idle unless a
+    // scene sets `sssStrength > 0` (the blur/composite passes aren't even encoded).
+    private var sssDiffuseTexture: MTLTexture
+    private var sssBlurTmpTexture: MTLTexture
+    private var sssBlurOutTexture: MTLTexture
+
     // RT-GI temporal accumulation: the rtDiffuse term gets its own
     // velocity-reprojected exponential history so the 1-bounce GI keeps
     // converging under camera motion (the main TAA can't). Ping-pong, full-res.
@@ -1329,6 +1368,10 @@ public final class IlluminatoramaRenderer {
     private let ssaoTemporalPipeline: MTLComputePipelineState
     private let ssrTemporalPipeline: MTLComputePipelineState
     private let ssrCompositePipeline: MTLComputePipelineState
+    // Issue #65 — screen-space SSS. One blur kernel run twice (H then V, direction
+    // passed via setBytes) + a composite kernel.
+    private let sssBlurPipeline: MTLComputePipelineState
+    private let sssCompositePipeline: MTLComputePipelineState
     private let rtDenoisePipeline: MTLComputePipelineState
     private let rtGITemporalPipeline: MTLComputePipelineState
     private let svgfVariancePipeline: MTLComputePipelineState  // Phase 4.44 SVGF
@@ -2298,6 +2341,13 @@ public final class IlluminatoramaRenderer {
         guard let ssrComposite = cache.pipelineState(name: "illumi_ssr_composite", device: device) else {
             throw IlluminatoramaError.pipelineCreationFailed("illumi_ssr_composite")
         }
+        // Issue #65 — screen-space SSS (separable blur + composite).
+        guard let sssBlur = cache.pipelineState(name: "illumi_sss_blur", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_sss_blur")
+        }
+        guard let sssComposite = cache.pipelineState(name: "illumi_sss_composite", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_sss_composite")
+        }
         guard let rtDenoise = cache.pipelineState(name: "illumi_rt_denoise", device: device) else {
             throw IlluminatoramaError.pipelineCreationFailed("illumi_rt_denoise")
         }
@@ -2361,6 +2411,8 @@ public final class IlluminatoramaRenderer {
         self.ssrGatherPipeline    = ssrGather
         self.ssrTemporalPipeline  = ssrTemporal
         self.ssrCompositePipeline = ssrComposite
+        self.sssBlurPipeline      = sssBlur
+        self.sssCompositePipeline = sssComposite
         self.rtDenoisePipeline    = rtDenoise
         self.rtGITemporalPipeline = rtGITemporal
         self.svgfVariancePipeline = svgfVar
@@ -2812,6 +2864,9 @@ public final class IlluminatoramaRenderer {
         self.giVariance          = t.giVariance
         self.giAtrousA           = t.giAtrousA
         self.giAtrousB           = t.giAtrousB
+        self.sssDiffuseTexture   = t.sssDiffuse
+        self.sssBlurTmpTexture   = t.sssBlurTmp
+        self.sssBlurOutTexture   = t.sssBlurOut
 
         // Triple-buffer the presented LDR texture (see `ldrPool` docs above).
         // `t.ldr` becomes pool slot 0 (== outputTexture); allocate two more.
@@ -6205,6 +6260,9 @@ public final class IlluminatoramaRenderer {
             self.giVariance          = t.giVariance
             self.giAtrousA           = t.giAtrousA
             self.giAtrousB           = t.giAtrousB
+            self.sssDiffuseTexture   = t.sssDiffuse
+            self.sssBlurTmpTexture   = t.sssBlurTmp
+            self.sssBlurOutTexture   = t.sssBlurOut
             // Preserve outputTexture identity for SSAA-only changes — see
             // the docstring. On an output-size change, rebuild the whole
             // presented-buffer pool at the new size (reusing `t.ldr` as
@@ -6422,6 +6480,11 @@ public final class IlluminatoramaRenderer {
         encodeSSAOSpatialFilter(cb)
         encodeSSAOTemporalPass(cb)
         encodeLightingPass(cb)
+        // Issue #65 — screen-space SSS: diffuse the lit irradiance of SSS-flagged
+        // pixels and blend it back into hdrTexture BEFORE SSR/RT/TAA/bloom read it,
+        // so the soft light-bleed propagates through the rest of the pipeline. No-op
+        // (and not encoded) unless a scene set sssStrength > 0.
+        encodeSSSPasses(cb)
         // Phase 4.43 — additive particle / external-point draws (emitter
         // sparks + dust motes) MOVED to AFTER the TAA resolve (see
         // `encodePostResolveFX`). They have no motion vectors of their own,
@@ -7989,6 +8052,9 @@ public final class IlluminatoramaRenderer {
         enc.setTexture(irrCacheCurrent,  index: 15)
         enc.setTexture(ltcMatTexture, index: 16)
         enc.setTexture(ltcMagTexture, index: 17)
+        // Issue #65 — SSS diffuse side buffer. Always bound (the kernel only writes
+        // it when frame.sssStrength > 0, so non-SSS scenes leave it idle).
+        enc.setTexture(sssDiffuseTexture, index: 18)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
         enc.setBuffer(pointLightBuffer, offset: 0, index: 1)
         enc.setBuffer(ddgiUniformBuffer, offset: 0, index: 2)
@@ -8041,6 +8107,49 @@ public final class IlluminatoramaRenderer {
         enc.setTexture(hdrCompositeTexture, index: 2) // output
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
         dispatch(enc, pipeline: ssrCompositePipeline, width: width, height: height)
+        enc.endEncoding()
+    }
+
+    /// Issue #65 — true if a scene has opted into SSS this frame (matches the
+    /// `effSSS` derivation in `uploadFrameUniforms`, env override included). Gates
+    /// the whole blur/composite chain so non-SSS scenes encode NOTHING extra.
+    private var sssEnabled: Bool {
+        (Self.sssStrengthEnvOverride ?? sssStrength) > 0
+    }
+
+    /// Screen-space subsurface scattering (issue #65): separable blur of the
+    /// diffuse-lit term the lighting pass peeled into `sssDiffuseTexture`, then a
+    /// composite back into `hdrTexture` BEFORE SSR/RT/TAA read it. Three sub-passes:
+    /// blur-H (sssDiffuse → sssBlurTmp) · blur-V (sssBlurTmp → sssBlurOut) ·
+    /// composite (hdr += sssStrength·(sssBlurOut − sssDiffuse) on SSS pixels). No-op
+    /// — and not encoded at all — unless a scene set `sssStrength > 0`.
+    private func encodeSSSPasses(_ cb: MTLCommandBuffer) {
+        guard sssEnabled else { return }
+        // Separable blur: one kernel, two passes, direction via setBytes.
+        func blur(_ src: MTLTexture, _ dst: MTLTexture, dir: SIMD2<Float>, label: String) {
+            guard let enc = timedComputeEncoder(cb, label) else { return }
+            enc.label = "Illuminatorama.\(label)"
+            enc.setComputePipelineState(sssBlurPipeline)
+            enc.setTexture(src,          index: 0)
+            enc.setTexture(depthTexture, index: 1)
+            enc.setTexture(dst,          index: 2)
+            enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
+            var d = dir
+            enc.setBytes(&d, length: MemoryLayout<SIMD2<Float>>.stride, index: 1)
+            dispatch(enc, pipeline: sssBlurPipeline, width: width, height: height)
+            enc.endEncoding()
+        }
+        blur(sssDiffuseTexture, sssBlurTmpTexture, dir: SIMD2(1, 0), label: "sss.blurH")
+        blur(sssBlurTmpTexture, sssBlurOutTexture, dir: SIMD2(0, 1), label: "sss.blurV")
+
+        guard let enc = timedComputeEncoder(cb, "sss.composite") else { return }
+        enc.label = "Illuminatorama.sss.composite"
+        enc.setComputePipelineState(sssCompositePipeline)
+        enc.setTexture(hdrTexture,        index: 0)  // read_write: blurred diffuse blended in place
+        enc.setTexture(sssDiffuseTexture, index: 1)  // sharp diffuse + mask
+        enc.setTexture(sssBlurOutTexture, index: 2)  // blurred diffuse
+        enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
+        dispatch(enc, pipeline: sssCompositePipeline, width: width, height: height)
         enc.endEncoding()
     }
 
@@ -9008,6 +9117,16 @@ public final class IlluminatoramaRenderer {
         u.contactShadowLength    = max(0, contactShadowLength)
         u.contactShadowSteps     = min(max(contactShadowSteps, 1), 32)
         u.contactShadowThickness = max(0, contactShadowThickness)
+        // Screen-space subsurface scattering (issue #65). 0 strength → no-op (the
+        // lighting pass skips the side-buffer write; the blur/composite passes
+        // aren't encoded). The env override (VIZ_ILLUMI_SSS) wins for headless verify.
+        let effSSS = Self.sssStrengthEnvOverride ?? sssStrength
+        u.sssStrength = max(0, min(1, effSSS))
+        u.sssRadius   = max(0, Self.sssRadiusEnvOverride ?? sssRadius)
+        u.sssTintR    = max(0, sssTint.x)
+        u.sssTintG    = max(0, sssTint.y)
+        u.sssTintB    = max(0, sssTint.z)
+        u.sssDebugForceAll = Self.sssForceAllEnv ? 1.0 : 0.0
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
 
@@ -9185,6 +9304,14 @@ public final class IlluminatoramaRenderer {
         var giVariance: MTLTexture       // full-res r16Float — spatial variance of accumulated GI
         var giAtrousA: MTLTexture        // full-res rgba16Float — à-trous ping-pong A
         var giAtrousB: MTLTexture        // full-res rgba16Float — à-trous ping-pong B
+        // Issue #65 — screen-space SSS. `sssDiffuse` holds the diffuse-lit term the
+        // lighting pass peels off SSS-flagged pixels (rgb) + the mask (a); the blur
+        // ping-pongs sssDiffuse → sssBlurTmp (H) → sssBlurOut (V); the composite
+        // reads sssDiffuse (sharp) + sssBlurOut (blurred). Only written/read when a
+        // scene sets sssStrength > 0; otherwise allocated-but-idle.
+        var sssDiffuse: MTLTexture       // full-res rgba16Float — diffuse + mask
+        var sssBlurTmp: MTLTexture       // full-res rgba16Float — horizontal-blur intermediate
+        var sssBlurOut: MTLTexture       // full-res rgba16Float — separable-blur result
     }
 
     // ── Phase 2.5 cascade constants ───────────────────────────────────────────
@@ -9582,6 +9709,16 @@ public final class IlluminatoramaRenderer {
         let irrCB = try make(label: "Illuminatorama.ddgi.irrCacheB",
                              format: .rgba16Float, w: internalW, h: internalH,
                              usage: [.shaderRead, .shaderWrite, .renderTarget])
+        // Issue #65 — screen-space SSS buffers (full-res, idle unless sssStrength > 0).
+        let sssDiffuse = try make(label: "Illuminatorama.sss.diffuse",
+                                  format: .rgba16Float, w: internalW, h: internalH,
+                                  usage: [.shaderRead, .shaderWrite])
+        let sssBlurTmp = try make(label: "Illuminatorama.sss.blurTmp",
+                                  format: .rgba16Float, w: internalW, h: internalH,
+                                  usage: [.shaderRead, .shaderWrite])
+        let sssBlurOut = try make(label: "Illuminatorama.sss.blurOut",
+                                  format: .rgba16Float, w: internalW, h: internalH,
+                                  usage: [.shaderRead, .shaderWrite])
         let bb = try make(label: "Illuminatorama.bloom.bright",
                           format: .rgba16Float, w: halfW, h: halfH,
                           usage: [.shaderRead, .shaderWrite])
@@ -9618,7 +9755,8 @@ public final class IlluminatoramaRenderer {
             rtGIHistoryA: rtGiHistA, rtGIHistoryB: rtGiHistB,
             irrCacheA: irrCA, irrCacheB: irrCB,
             aoSampleCount: aoCount, ssrSampleCount: ssrCount, giSampleCount: giCount,
-            giVariance: giVar, giAtrousA: giAtrousA, giAtrousB: giAtrousB
+            giVariance: giVar, giAtrousA: giAtrousA, giAtrousB: giAtrousB,
+            sssDiffuse: sssDiffuse, sssBlurTmp: sssBlurTmp, sssBlurOut: sssBlurOut
         )
     }
 }

@@ -143,6 +143,19 @@ public final class IlluminatoramaSharedSettings {
     public var contactShadowLengthCm: Double = 5.0
     public var contactShadowThicknessCm: Double = 2.0
     public var contactShadowSteps: Int = 12
+    // ── Subsurface scattering (issue #65) ─────────────────────────────
+    /// Jimenez-style separable screen-space SSS for skin / wax / marble / food.
+    /// OFF by default → an exact pipeline no-op. `sssStrength` blends the blurred
+    /// diffuse over the sharp diffuse; `sssRadiusMm` is the diffusion mean-free-
+    /// path in MILLIMETRES; `sssTintR/G/B` scale the per-channel scatter distance
+    /// (default reddish skin profile → warm bleed; marble ≈ 1,1,1; wax ≈ 1,0.7,0.45).
+    /// A surface opts in by tagging its mesh vertices with colour alpha ∈ [0.90,0.98].
+    public var sssEnabled: Bool = false
+    public var sssStrength: Double = 0.8
+    public var sssRadiusMm: Double = 8.0
+    public var sssTintR: Double = 1.0
+    public var sssTintG: Double = 0.4
+    public var sssTintB: Double = 0.25
 
     // ── Internal render scale (SSAA) ──────────────────────────────────
     public var internalRenderScale: Double = 2.0
@@ -207,6 +220,12 @@ public final class IlluminatoramaSharedSettings {
         contactShadowLengthCm = \(fmt(contactShadowLengthCm))
         contactShadowThicknessCm = \(fmt(contactShadowThicknessCm))
         contactShadowSteps = \(contactShadowSteps)
+        sssEnabled = \(sssEnabled)
+        sssStrength = \(fmt(sssStrength))
+        sssRadiusMm = \(fmt(sssRadiusMm))
+        sssTintR = \(fmt(sssTintR))
+        sssTintG = \(fmt(sssTintG))
+        sssTintB = \(fmt(sssTintB))
         internalRenderScale = \(fmt(internalRenderScale))
         """
     }
