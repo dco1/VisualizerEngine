@@ -303,18 +303,27 @@ public final class IlluminatoramaMesh {
             return nil
         }
 
-        let positions = floatTriples(from: geometry.sources(for: .vertex).first)
-        guard let positions = positions else {
+        let rawPositions = floatTriples(from: geometry.sources(for: .vertex).first)
+        guard let rawPositions = rawPositions else {
             log.debug("SCNGeometry \(type(of: geometry)) has no readable vertex source")
             return nil
         }
         // Empty meshes (placeholder SCNGeometry, particle stand-ins, etc.) would
         // otherwise reach MTLDevice.makeBuffer(length: 0) and trip the Metal
         // debug-layer assert. Drop them at conversion time.
-        guard !positions.isEmpty else {
+        guard !rawPositions.isEmpty else {
             log.debug("SCNGeometry \(type(of: geometry)) has 0 vertices; skipping")
             return nil
         }
+        // Recover authored primitive size/orientation. SceneKit's parametric
+        // primitives (SCNBox, SCNCylinder, SCNCone, SCNSphere, …) store their
+        // vertex SOURCE in a canonical UNIT object space (box = ±0.5,
+        // cylinder = ±0.5) and fold the authored width/height/length/radius
+        // into geometry-intrinsic scaling that `sources(for:.vertex)` never
+        // exposes — only `geometry.boundingBox` reflects it. Reading the unit
+        // source verbatim is what collapsed large SCNBoxes toward a unit cube
+        // and sheared rotated/flat SCNCylinders in the gasStation scene.
+        let positions = normaliseToBoundingBox(rawPositions, geometry: geometry)
         guard element.primitiveCount > 0 else {
             log.debug("SCNGeometry \(type(of: geometry)) has 0 primitives; skipping")
             return nil
@@ -437,6 +446,63 @@ public final class IlluminatoramaMesh {
         ]
         let indices: [UInt16] = [0, 2, 1, 0, 3, 2]
         return IlluminatoramaMesh(device: device, vertices: verts, indices: indices)
+    }
+
+    // ── Unit-primitive size recovery ──────────────────────────────────────────
+
+    /// Map a geometry's raw object-space vertex positions onto the coordinate
+    /// frame SceneKit itself reports via `geometry.boundingBox`.
+    ///
+    /// SceneKit's parametric primitives (`SCNBox`, `SCNCylinder`, `SCNCone`,
+    /// `SCNSphere`, `SCNCapsule`, `SCNTube`, `SCNPlane`, …) keep their vertex
+    /// SOURCE in a canonical UNIT object space and fold the authored
+    /// width/height/length/radius into geometry-intrinsic scaling that
+    /// `sources(for:.vertex)` does NOT bake into the returned positions — only
+    /// `boundingBox` reflects the real extent. Reading the unit source verbatim
+    /// is what shrank large SCNBoxes to a unit cube and sheared rotated/flat
+    /// SCNCylinders (the rotation in the node's model matrix then acts on the
+    /// wrong proportions).
+    ///
+    /// For a hand-built `SCNGeometry` the auto-computed `boundingBox` equals the
+    /// vertex AABB exactly, so the mapping is the identity and the original
+    /// positions are returned untouched (no allocation, no float drift) — the
+    /// early-out below covers that common case. The correction only fires when
+    /// the reported bounds actually disagree with the vertex bounds, i.e. for a
+    /// SceneKit parametric primitive whose source is unit-normalised.
+    private static func normaliseToBoundingBox(_ positions: [SIMD3<Float>],
+                                                geometry: SCNGeometry) -> [SIMD3<Float>] {
+        let bb = geometry.boundingBox
+        let bbMin = SIMD3<Float>(Float(bb.min.x), Float(bb.min.y), Float(bb.min.z))
+        let bbMax = SIMD3<Float>(Float(bb.max.x), Float(bb.max.y), Float(bb.max.z))
+        let bbSize = bbMax - bbMin
+        // A zero / inverted reported box (e.g. a primitive that hasn't realised
+        // its layout) is not a usable correction target — keep the source verbatim.
+        guard bbSize.x > 0 || bbSize.y > 0 || bbSize.z > 0 else { return positions }
+
+        var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var hi = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        for p in positions { lo = simd_min(lo, p); hi = simd_max(hi, p) }
+        let vertSize = hi - lo
+
+        // Per-axis scale that maps the vertex AABB onto the reported box. A
+        // degenerate axis (flat plane → vertSize ≈ 0, e.g. SCNPlane in Z) keeps
+        // scale 1 so we never divide by ~0; its extent is 0 either way.
+        let eps: Float = 1e-6
+        var scale = SIMD3<Float>(1, 1, 1)
+        for a in 0..<3 {
+            if vertSize[a] > eps && bbSize[a] > eps { scale[a] = bbSize[a] / vertSize[a] }
+        }
+        let vertCenter = (lo + hi) * 0.5
+        let bbCenter = (bbMin + bbMax) * 0.5
+
+        // Identity early-out: scale ≈ 1 on every axis AND centres aligned →
+        // hand-built mesh, return the source untouched (preserves exact
+        // positions / winding precision; the overwhelmingly common path).
+        let scaleId = abs(scale.x - 1) < 1e-5 && abs(scale.y - 1) < 1e-5 && abs(scale.z - 1) < 1e-5
+        let centreId = simd_length(bbCenter - vertCenter) < 1e-5 * max(1, simd_length(bbSize))
+        if scaleId && centreId { return positions }
+
+        return positions.map { bbCenter + ($0 - vertCenter) * scale }
     }
 
     // ── SCNGeometrySource → [SIMD3<Float>] / [SIMD2<Float>] ──────────────────
@@ -668,9 +734,13 @@ public final class IlluminatoramaMesh {
         guard elementIndex < geometry.elements.count else { return nil }
         let element = geometry.elements[elementIndex]
         guard element.primitiveType == .triangles,
-              let positions = floatTriples(from: geometry.sources(for: .vertex).first),
-              !positions.isEmpty, element.primitiveCount > 0,
+              let rawPositions = floatTriples(from: geometry.sources(for: .vertex).first),
+              !rawPositions.isEmpty, element.primitiveCount > 0,
               let idx = readIndexData(element: element) else { return nil }
+        // Same unit-primitive correction as `from(scnGeometry:)` — the RT soup
+        // must agree with the deferred G-buffer mesh or a box's raster draw and
+        // its ray-traced twin would be different sizes.
+        let positions = normaliseToBoundingBox(rawPositions, geometry: geometry)
         var indices = [UInt32](); indices.reserveCapacity(idx.count)
         idx.data.withUnsafeBytes { raw in
             switch idx.type {
