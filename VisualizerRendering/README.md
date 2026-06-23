@@ -44,6 +44,19 @@ something a third party could drop into their own SceneKit app.
 | `FluidParticleRenderer` | MLS-MPM particles → SceneKit `.point` geometry.          |
 | `FoamRenderer`          | Foam particles → billboard sprites with a foam shader.   |
 
+### Illuminatorama (deferred PBR + hardware-RT renderer)
+
+`IlluminatoramaRenderer` is the full deferred renderer — PBR materials, IBL, ray-traced
+GI/shadows/glass, area lights, ACES + post. Drive it from a SceneKit graph via
+`IlluminatoramaSceneExtractor`, or build a scene **directly** from your own geometry +
+materials (instances, meshes, atlas, lights, camera).
+
+> 📖 **[docs/ILLUMINATORAMA_SCENE_SETUP.md](docs/ILLUMINATORAMA_SCENE_SETUP.md)** — how to
+> set up a scene directly: the minimal end-to-end example, materials/atlas, lighting, and
+> the three gotchas that cost an afternoon (retain mesh handles · double-sided winding ·
+> `equirectSky` or you get a magenta frame). Working references:
+> `IlluminatoramaRoom`/`IlluminatoramaHouse` in the Visualizer app.
+
 ### Ray-traced compositors
 
 | Type                    | Notes                                                    |
