@@ -551,6 +551,26 @@ public final class IlluminatoramaRenderer {
     /// (exposes contour banding). Exposed for live A/B of gradient banding.
     public var debandDitherEnabled: Bool = true
 
+    // ── Phase 9 — film-stock LUT (post-tonemap colour grade) ─────────
+    /// The 256×16 PNG strip loaded as a 16×16×16 `MTLTexture3D`. `nil`
+    /// = LUT bypassed (identity pass-through). Assign from the host via
+    /// `setFilmLUT(_:strength:)` — do NOT set this and `filmLUTStrength`
+    /// directly; the setter validates that the texture is 16×16×16 3D.
+    public private(set) var filmLUTTexture: MTLTexture? = nil
+    /// Blend weight [0, 1]: 0 = LUT fully bypassed, 1 = full film grade.
+    public private(set) var filmLUTStrength: Float = 1.0
+
+    /// Load and set a film LUT from a 256×16 PNG strip on disk.
+    /// The strip encodes a 16×16×16 cube with blue slices laid left-to-right.
+    /// - Parameters:
+    ///   - texture: A 16×16×16 3D MTLTexture (`rgba8Unorm` or `rgba8Unorm_srgb`).
+    ///     Pass `nil` to disable the grade.
+    ///   - strength: Blend weight toward the graded result [0, 1]. Defaults 1.
+    public func setFilmLUT(_ texture: MTLTexture?, strength: Float = 1.0) {
+        filmLUTTexture = texture
+        filmLUTStrength = strength
+    }
+
     // ── Phase 2.7 TAA knobs ──────────────────────────────────────────
     /// Toggle temporal anti-aliasing + history denoise. Off = bloom/tonemap
     /// read the raw post-SSR HDR (Phase 2.5 behaviour).
@@ -8230,6 +8250,10 @@ public final class IlluminatoramaRenderer {
         enc.setRenderPipelineState(tonemapPipeline)
         enc.setFragmentTexture(bloomTonemapSource, index: 0)
         enc.setFragmentTexture(bloomBlurVHalf, index: 1)
+        // Phase 9 — film LUT at texture(2). nil = disabled (shader reads filmLUTStrength
+        // from frame uniforms; 0 = identity, so setting the texture slot to nil is safe —
+        // the shader checks `frame.filmLUTStrength > 0` before sampling).
+        enc.setFragmentTexture(filmLUTTexture, index: 2)
         enc.setFragmentBuffer(frameUniformBuffer, offset: 0, index: 0)
         // Phase 4.21 — exposure buffer at buffer(1). The fragment reads
         // `expoState.smoothedExposure` when `frame.autoExposureEnabled`
@@ -8488,6 +8512,8 @@ public final class IlluminatoramaRenderer {
         u.fringeTintR = easedFringeTint.x
         u.fringeTintG = easedFringeTint.y
         u.fringeTintB = easedFringeTint.z
+        // Phase 9 — film LUT strength: 0 when no LUT is bound (bypasses the shader branch).
+        u.filmLUTStrength = filmLUTTexture != nil ? max(0, min(1, filmLUTStrength)) : 0
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
 

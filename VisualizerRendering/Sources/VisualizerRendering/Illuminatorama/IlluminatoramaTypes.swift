@@ -256,6 +256,13 @@ public struct IlluminatoramaFrameUniforms {
     public var fringeTintR: Float = 0.62
     public var fringeTintG: Float = 0.12
     public var fringeTintB: Float = 0.92
+    // Phase 9 — film-stock LUT colour grade. Blends the 3D-LUT-graded result with
+    // the ACES-tonemapped result. 0 = LUT fully bypassed (identity), 1 = full grade.
+    // NEW 16-byte cluster (stride 1008 → 1024). Three float pads fill the cluster.
+    public var filmLUTStrength: Float = 0
+    public var _padFilmLUT0: Float = 0
+    public var _padFilmLUT1: Float = 0
+    public var _padFilmLUT2: Float = 0
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20

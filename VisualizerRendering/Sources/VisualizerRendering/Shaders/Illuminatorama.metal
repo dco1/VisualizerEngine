@@ -186,6 +186,12 @@ struct FrameUniforms {
     float    fringeTintR;
     float    fringeTintG;
     float    fringeTintB;
+    // Phase 9 — film-stock LUT blend strength. 0 = bypass, 1 = full grade.
+    // NEW 16-byte cluster (stride 1008 → 1024). Three float pads fill.
+    float    filmLUTStrength;
+    float    _padFilmLUT0;
+    float    _padFilmLUT1;
+    float    _padFilmLUT2;
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift
@@ -4676,10 +4682,13 @@ vertex TonemapVSOut illumi_tonemap_vs(uint vid [[vertex_id]]) {
 }
 
 fragment float4 illumi_tonemap_fs(
-    TonemapVSOut                    in       [[stage_in]],
-    texture2d<half, access::sample> inHDR    [[texture(0)]],
-    texture2d<half, access::sample> inBloom  [[texture(1)]],
-    constant FrameUniforms&         frame    [[buffer(0)]],
+    TonemapVSOut                    in        [[stage_in]],
+    texture2d<half, access::sample> inHDR     [[texture(0)]],
+    texture2d<half, access::sample> inBloom   [[texture(1)]],
+    // Phase 9 — film-stock LUT: 16×16×16 3D texture (B slices left-to-right in
+    // the 256×16 PNG strip). Bound when filmLUTStrength > 0; nil-checked below.
+    texture3d<float, access::sample> filmLUT  [[texture(2)]],
+    constant FrameUniforms&         frame     [[buffer(0)]],
     // Phase 4.21 — auto-exposure read (see below).
     const device ExposureState&     expoState [[buffer(1)]]
 ) {
@@ -4848,6 +4857,23 @@ fragment float4 illumi_tonemap_fs(
         float tpdf = (n0 + n1) - 1.0;                    // ∈ [-1, 1], triangular
         srgb += tpdf * (1.0 / 255.0);                    // ±1 LSB at 8-bit
         mapped = pow(saturate(srgb), float3(2.2));       // decode back to linear
+    }
+
+    // Phase 9 — film-stock LUT colour grade. Samples a 16×16×16 3D LUT
+    // (stored as a 256×16 PNG strip: 16 blue slices, each 16×16, laid left
+    // to right; the Swift host unpacks this into a proper MTLTexture3D).
+    // The LUT expects Cineon log input but we apply it post-ACES-tonemapper
+    // for a film-inspired grade (not technically accurate emulation — per spec).
+    // `filmLUTStrength` blends between ungraded and graded result.
+    if (frame.filmLUTStrength > 0.001) {
+        constexpr sampler lutSampler(filter::linear, address::clamp_to_edge);
+        // Remap `mapped` from [0,1] linear into LUT normalised coords. A 16-cell
+        // LUT needs a half-texel inset so the sample lands at the cell centre:
+        // coord = (mapped * (N-1) + 0.5) / N  where N = 16.
+        float3 uvw = (mapped * 15.0 + 0.5) / 16.0;
+        float3 graded = filmLUT.sample(lutSampler, uvw).rgb;
+        mapped = mix(mapped, graded, frame.filmLUTStrength);
+        mapped = saturate(mapped);
     }
 
     // Write LINEAR. The output attachment is `.bgra8Unorm_srgb`, so the GPU
