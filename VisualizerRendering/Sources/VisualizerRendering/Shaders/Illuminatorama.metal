@@ -631,8 +631,13 @@ fragment GBufferOut illumi_fs(
         length_squared(in.worldTangent.xyz) > 1e-4) {
         float3 T = normalize(in.worldTangent.xyz);
         float3 B = cross(n, T) * in.worldTangent.w;
-        float4 nmSample = sampleAtlasAspect(nonColorAtlas, texSampler, in.uv,
-                                            uint(inst.normalTextureSlice), nonColorUVScale);
+        // Hex-stochastic normal map — eliminates the regular tiling pattern
+        // on large flat surfaces (walls, floors) by blending three stochastically-
+        // offset lattice samples. The blend is linear in encoded space (before
+        // decode), which slightly overshoots tangent-space magnitude at boundaries
+        // but gives correct appearance after renormalize below.
+        float4 nmSample = sampleAtlasHex(nonColorAtlas, texSampler, in.uv,
+                                         uint(inst.normalTextureSlice), nonColorUVScale);
         float3 tangentN = normalize(nmSample.xyz * 2.0 - 1.0);
         // Phase 7 detail normal — blended on top of the macro normal at
         // higher UV frequency (pores, weave, grain). Uses overlay-normal
@@ -682,12 +687,10 @@ fragment GBufferOut illumi_fs(
 
     float roughness = inst.roughness;
     if (inst.roughnessTextureSlice >= 0) {
-        float4 tx = sampleAtlasAspect(nonColorAtlas, texSampler, in.uv,
-                                      uint(inst.roughnessTextureSlice), nonColorUVScale);
-        // Roughness uses the G channel by default for packed maps; the
-        // host can also point a single-channel roughness texture at the
-        // same slot — single-channel uploads replicate to RGB so G works
-        // for that case too.
+        // Hex-stochastic roughness — same three-cell blend as albedo so
+        // roughness variation doesn't lag the albedo tile seam.
+        float4 tx = sampleAtlasHex(nonColorAtlas, texSampler, in.uv,
+                                    uint(inst.roughnessTextureSlice), nonColorUVScale);
         roughness = tx.g;
     }
 
