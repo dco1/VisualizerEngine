@@ -262,9 +262,16 @@ struct Instance {
     int      emissionTextureSlice;
     // Phase 4.27b — multiplier on the emission TEXTURE sample so a texture-
     // driven glow (Pizza's heat coils) renders at its tuned HDR intensity.
-    // Repurposes the former `_padSlice0` slot; stride stays 208.
+    // Repurposes the former `_padSlice0` slot.
     float    emissionIntensity;
+    // Former trailing pad — still unused GPU-side (RT exclusion is host-only).
     int      _padSlice1;
+    // Phase 7 — detail-normal path. Stride grows from 208 → 224 (next 16-byte
+    // boundary) to preserve float4x4 natural alignment.
+    int      detailNormalTextureSlice;  // < 0 = disabled
+    float    detailNormalUVScale;       // tile frequency relative to macro UV
+    float    _padDetail0;
+    float    _padDetail1;
 };
 
 struct Vertex {
@@ -627,6 +634,16 @@ fragment GBufferOut illumi_fs(
         float4 nmSample = sampleAtlasAspect(nonColorAtlas, texSampler, in.uv,
                                             uint(inst.normalTextureSlice), nonColorUVScale);
         float3 tangentN = normalize(nmSample.xyz * 2.0 - 1.0);
+        // Phase 7 detail normal — blended on top of the macro normal at
+        // higher UV frequency (pores, weave, grain). Uses overlay-normal
+        // blend: partial-derivative add in tangent space, then renormalize.
+        if (inst.detailNormalTextureSlice >= 0) {
+            float2 detailUV = in.uv * inst.detailNormalUVScale;
+            float4 dnSample = sampleAtlasAspect(nonColorAtlas, texSampler, detailUV,
+                                                uint(inst.detailNormalTextureSlice), nonColorUVScale);
+            float3 dn = dnSample.xyz * 2.0 - 1.0;
+            tangentN = normalize(float3(tangentN.xy + dn.xy, tangentN.z));
+        }
         // World normal = T*x + B*y + N*z. Equivalent to a TBN matrix
         // multiply but cheaper to spell out as a single dot per axis.
         n = normalize(T * tangentN.x + B * tangentN.y + n * tangentN.z);

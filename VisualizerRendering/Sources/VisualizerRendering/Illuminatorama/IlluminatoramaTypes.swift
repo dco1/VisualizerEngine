@@ -408,10 +408,20 @@ public struct IlluminatoramaInstance {
     /// Former trailing pad, repurposed (#60 item 7): non-zero ⇒ this instance
     /// is raster-only (its TLAS instance gets mask 0, so RT rays never
     /// intersect it; the RT representation comes from elsewhere — e.g. a
-    /// registered `IlluminatoramaCurveSet` twin). Same 4 bytes, stride stays
-    /// 208; the Metal `Instance` mirrors keep the slot named `_padSlice1`
-    /// (never read GPU-side — the mask gating happens host-side at AS rebuild).
+    /// registered `IlluminatoramaCurveSet` twin). Same 4 bytes.
     public var rtExclude: Int32 = 0
+    // Phase 7 — detail-normal path for close-range pores/weave/grain.
+    // Sampled at `detailNormalUVScale × in.uv` and blended into the
+    // macro normal map result. Stride grows from 208 → 224 (next 16-byte
+    // boundary) to maintain float4x4 natural alignment.
+    /// Slice index for the detail normal map in the non-colour atlas.
+    /// `< 0` = no detail normal (pass-through). Default -1.
+    public var detailNormalTextureSlice: Int32 = -1
+    /// Tile frequency of the detail normal relative to the macro UV.
+    /// 8 = eight tiles per macro tile = fine grain/pore detail.
+    public var detailNormalUVScale: Float = 8.0
+    public var _padDetail0: Float = 0
+    public var _padDetail1: Float = 0
 
     public init(
         modelMatrix: simd_float4x4,
@@ -444,6 +454,11 @@ public struct IlluminatoramaInstance {
         self.modelMatrix = m
         self.normalMatrix = Self.normalMatrix(from: m)
     }
+
+    /// Compile-time guard: Swift and Metal structs must agree on 224 bytes.
+    /// If this fires, either a Swift field was added without the matching Metal
+    /// field (or vice versa), or alignment changed unexpectedly.
+    static let _assertStride224: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 224, "IlluminatoramaInstance stride must be 224") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //
