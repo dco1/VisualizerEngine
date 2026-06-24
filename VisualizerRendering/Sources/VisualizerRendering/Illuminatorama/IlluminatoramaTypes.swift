@@ -373,6 +373,13 @@ public struct IlluminatoramaInstance {
     public var normalMatrix: simd_float4x4   // upper-3x3 inverse-transpose, padded
     public var albedo: SIMD3<Float>
     public var metallic: Float
+    // Phase 7 — clearcoat: a second GGX lobe for polished/lacquered surfaces
+    // (terrazzo, marble, glazed tile, lacquered wood). Sits in the 12-byte
+    // padding gap between `metallic` and `emission` (offsets 148-159); stride
+    // stays 208. Default 0 = no clearcoat (no change to existing materials).
+    public var clearcoat: Float = 0          // lobe strength [0, 1]
+    public var clearcoatRoughness: Float = 0.10  // GGX alpha^2 for clearcoat
+    public var _padClearcoat: Float = 0      // fill the gap, keep emission at 160
     public var emission: SIMD3<Float>
     public var roughness: Float
     /// Phase 4.0 — slice index into the diffuse albedo atlas. `< 0` means

@@ -236,6 +236,12 @@ struct Instance {
     float4x4 normalMatrix;
     float3   albedo;
     float    metallic;
+    // Phase 7 — clearcoat lobe (polished/lacquered surfaces). Occupies the
+    // 12-byte padding gap between metallic (offset 144) and emission (offset 160);
+    // stride stays 208. Default 0 = off (no change to existing materials).
+    float    clearcoat;              // [0,1] lobe strength
+    float    clearcoatRoughness;     // GGX roughness for the clearcoat layer
+    float    _padClearcoat;          // align emission to offset 160
     float3   emission;
     float    roughness;
     // Phase 4.0/4.1 — slice indices into the per-material texture atlases
@@ -1177,7 +1183,10 @@ fragment GBufferOut illumi_fs(
         // HDR brightness (Pizza's heat coils were flat at intensity 1).
         emission += tx.rgb * inst.emissionIntensity;
     }
-    o.emission        = half4(half3(emission), 1.0h);
+    // Phase 7 — pack clearcoat strength into emission.alpha (was always 1.0,
+    // unused in the lighting pass). 0 = no clearcoat (default for all existing
+    // materials); > 0 = polished/lacquered second GGX lobe in the lighting pass.
+    o.emission        = half4(half3(emission), half(inst.clearcoat));
     // Screen-space motion vector. NDC.y is up, UV.y is down → Y is flipped.
     // The result is (currentUV - previousUV), so history reprojection in the
     // TAA kernel is `historyUV = currentUV - velocity`.
@@ -1397,7 +1406,7 @@ fragment SQImpostorFSOut illumi_superquadric_impostor_fs(
     o.albedoMetallic  = half4(half3(inst.albedo), half(inst.metallic));
     float2 oct = octEncode(wN);
     o.normalRoughness = half4(half(oct.x), half(oct.y), half(inst.roughness), 1.0h);
-    o.emission        = half4(half3(inst.emission), 1.0h);
+    o.emission        = half4(half3(inst.emission), half(inst.clearcoat));
     o.velocity        = half2(velUV);
     o.depth           = curClip.z / curClip.w;   // Metal NDC z ∈ [0,1]
     return o;
@@ -2656,20 +2665,15 @@ kernel void illumi_lighting(
         dbgAmbient = amb * ao;
     }
 
-    // ── Sausage-casing clearcoat (HotdogDropUltra) ──────────────────────────
-    // Casing pixels carry 0.75 in normalRoughness.w (foliage = 0, opaque = 1).
-    // HotdogDrop+'s frank is a SATIN base (roughness mottle mean ≈ 0.48) under
-    // a thin wet-glaze clearcoat (SCNMaterial clearCoat 0.55, ccRoughness 0.18)
-    // — the glaze is what carries the tight "just off the grill" glint. A
-    // single GGX lobe can't be both satin and glinting (rounds 30↔31 oscillated
-    // between silicone and foam-rubber trying), so this is a real second lobe:
-    // fixed-F0 dielectric GGX on the sun + a tight prefiltered-IBL sample,
-    // weighted by Drop+'s 0.55 coat strength. No-op for every other scene.
+    // ── Phase 7 — per-material clearcoat (terrazzo/marble/lacquered wood) ──────
+    // Clearcoat strength is packed into emission.alpha in the G-buffer (default 0).
+    // A second dielectric GGX lobe (F0=0.04, roughness=0.08) is added for
+    // polished surfaces. Strength 0 → no cost (branch exits immediately).
     float3 clearcoat = float3(0.0);
-    if (nrH.a > 0.6h && nrH.a < 0.9h) {
-        const float ccRough    = 0.18;
-        const float ccF0       = 0.04;
-        const float ccStrength = 0.55;
+    float houseCC = float(emH.a);
+    if (houseCC > 0.001f) {
+        const float ccRough = 0.08;    // tight polish (terrazzo/marble)
+        const float ccF0    = 0.04;    // dielectric IOR 1.5
         float ccNdotV = saturate(dot(N, V));
         if (NdotL_sun > 0.0) {
             float3 Hcc = normalize(V + Ld);
@@ -2688,7 +2692,46 @@ kernel void illumi_lighting(
             float  Fcc  = ccF0 + (1.0 - ccF0) * pow(1.0 - ccNdotV, 5.0);
             clearcoat += env * Fcc * frame.iblIntensity * ao;
         }
-        clearcoat *= ccStrength;
+        clearcoat *= houseCC;
+        // Energy conservation: clearcoat layer attenuates the base for grazing V.
+        float baseAtten = 1.0 - houseCC * (ccF0 + (1.0 - ccF0) * pow(1.0 - saturate(dot(N, V)), 5.0));
+        directSun    *= baseAtten;
+        indirect     *= baseAtten;
+    }
+
+    // ── Sausage-casing clearcoat (HotdogDropUltra) ──────────────────────────
+    // Casing pixels carry 0.75 in normalRoughness.w (foliage = 0, opaque = 1).
+    // HotdogDrop+'s frank is a SATIN base (roughness mottle mean ≈ 0.48) under
+    // a thin wet-glaze clearcoat (SCNMaterial clearCoat 0.55, ccRoughness 0.18)
+    // — the glaze is what carries the tight "just off the grill" glint. A
+    // single GGX lobe can't be both satin and glinting (rounds 30↔31 oscillated
+    // between silicone and foam-rubber trying), so this is a real second lobe:
+    // fixed-F0 dielectric GGX on the sun + a tight prefiltered-IBL sample,
+    // weighted by Drop+'s 0.55 coat strength. No-op for every other scene.
+    float3 hotdogCC = float3(0.0);
+    if (nrH.a > 0.6h && nrH.a < 0.9h) {
+        const float ccRough    = 0.18;
+        const float ccF0       = 0.04;
+        const float ccStrength = 0.55;
+        float ccNdotV = saturate(dot(N, V));
+        if (NdotL_sun > 0.0) {
+            float3 Hcc = normalize(V + Ld);
+            float  Dcc = distributionGGX(saturate(dot(N, Hcc)), ccRough);
+            float  Gcc = geometrySmith(ccNdotV, NdotL_sun, ccRough);
+            float  Fcc = ccF0 + (1.0 - ccF0) * pow(1.0 - saturate(dot(Hcc, V)), 5.0);
+            float  spec = (Dcc * Gcc * Fcc) / max(4.0 * ccNdotV * NdotL_sun, 1e-4);
+            hotdogCC += frame.directionalLightColor * spec * NdotL_sun * visibility;
+        }
+        if (kLightingIBLEnabled) {
+            constexpr sampler ccSampler(filter::linear, mip_filter::linear);
+            float3 Rcc  = reflect(-V, N);
+            float  mips = float(max(frame.iblPrefilteredMipCount, 1u));
+            float3 env  = float3(prefilteredCube.sample(ccSampler, Rcc,
+                                                        level(ccRough * (mips - 1.0))).rgb);
+            float  Fcc  = ccF0 + (1.0 - ccF0) * pow(1.0 - ccNdotV, 5.0);
+            hotdogCC += env * Fcc * frame.iblIntensity * ao;
+        }
+        hotdogCC *= ccStrength;
     }
 
     // ── Plush fur sheen rim (Teddy Bear Press) ───────────────────────────────
@@ -2706,7 +2749,7 @@ kernel void illumi_lighting(
         plushSheenTerm = sheenTint * fres * frame.plushSheen * (sunSheen + ambSheen);
     }
 
-    float3 color = directSun + transmission + dirFillSum + pointSum + spotSum + areaSum + indirect + emission + clearcoat + plushSheenTerm;
+    float3 color = directSun + transmission + dirFillSum + pointSum + spotSum + areaSum + indirect + emission + clearcoat + hotdogCC + plushSheenTerm;
 
     // Per-term split-render: isolate ONE contribution so a flooded/flat scene
     // can be decomposed. Surfaces only — sky already returned above.
