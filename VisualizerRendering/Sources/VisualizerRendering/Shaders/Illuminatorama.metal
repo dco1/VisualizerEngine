@@ -519,6 +519,67 @@ static inline float4 sampleAtlasAspect(texture2d_array<float, access::sample> at
     return atlas.sample(s, st, slice);
 }
 
+// Phase 7 — hex-stochastic atlas sample. Breaks repeating tiling on large planar
+// surfaces (floors, walls) by blending three stochastically-offset samples whose
+// cell borders align on a triangular lattice. GPU port of DaydreamCore's
+// MaterialChannels.sampleAlbedoHex / hexHash (CPU reference in MaterialChannels.swift).
+//
+// `uv` — the same UV that sampleAtlasAspect would use (world-metres ÷ tile-metres,
+//        so one UV unit = one texture tile). The hex cells and offset vectors are
+//        expressed in that same space — the offset shifts into a different region of
+//        the infinitely-tiling texture, so it's aspect-safe and letterbox-safe.
+static inline float2 hexHash2D(float2 p) {
+    // Integer bit-mixing hash — no sin/cos. Same constants as the CPU reference.
+    // p is in skewed-lattice coordinates (integer-valued at cell vertices).
+    float px = p.x * 73856093.0f + p.y * 19349663.0f;
+    float py = p.x * 83492791.0f + p.y * 23994923.0f;
+    int ix = int(px); int iy = int(py);
+    ix ^= ix >> 11; ix *= 0x45d9f3b; ix ^= ix >> 16;
+    iy ^= iy >> 11; iy *= 0x45d9f3b; iy ^= iy >> 16;
+    return float2(float(ix & 0xFF) / 128.0f - 1.0f,
+                  float(iy & 0xFF) / 128.0f - 1.0f);
+}
+
+static inline float4 sampleAtlasHex(texture2d_array<float, access::sample> atlas,
+                                     sampler s, float2 uv, uint slice,
+                                     const device float2* uvScale) {
+    const float sq3over2 = 0.8660254f;         // sqrt(3)/2
+    // Skew UV to triangular lattice: (u, v) → (u + v*0.5, v*sqrt(3)/2)
+    float su = uv.x + uv.y * 0.5f;
+    float sv = uv.y * sq3over2;
+    float si = floor(su), sj = floor(sv);
+    float fu = su - si, fv = sv - sj;
+
+    // Barycentric weights and cell-vertex integer coords in skewed space.
+    // Lower triangle: verts at (si,sj), (si+1,sj), (si,sj+1)
+    // Upper triangle: verts at (si+1,sj+1), (si,sj+1), (si+1,sj)
+    float2 sk0, sk1, sk2;
+    float  w0, w1, w2;
+    if (fu + fv < 1.0f) {
+        sk0 = float2(si,       sj);
+        sk1 = float2(si + 1.0f, sj);
+        sk2 = float2(si,       sj + 1.0f);
+        w0 = 1.0f - fu - fv; w1 = fu; w2 = fv;
+    } else {
+        sk0 = float2(si + 1.0f, sj + 1.0f);
+        sk1 = float2(si,        sj + 1.0f);
+        sk2 = float2(si + 1.0f, sj);
+        w0 = fu + fv - 1.0f; w1 = 1.0f - fu; w2 = 1.0f - fv;
+    }
+
+    // Hash each vertex (in skewed-lattice integer space) to a UV offset.
+    float2 h0 = hexHash2D(sk0), h1 = hexHash2D(sk1), h2 = hexHash2D(sk2);
+
+    // Cubic blend weight (w^3 normalised) — smooth at cell boundaries.
+    float p0 = w0 * w0 * w0, p1 = w1 * w1 * w1, p2 = w2 * w2 * w2;
+    float pSum = max(p0 + p1 + p2, 1e-6f);
+
+    float4 c0 = sampleAtlasAspect(atlas, s, uv + h0, slice, uvScale);
+    float4 c1 = sampleAtlasAspect(atlas, s, uv + h1, slice, uvScale);
+    float4 c2 = sampleAtlasAspect(atlas, s, uv + h2, slice, uvScale);
+    return (c0 * p0 + c1 * p1 + c2 * p2) / pSum;
+}
+
 fragment GBufferOut illumi_fs(
     VSOut                                       in              [[stage_in]],
     bool                                        frontFacing     [[front_facing]],
@@ -573,8 +634,14 @@ fragment GBufferOut illumi_fs(
 
     float3 albedo = inst.albedo;
     if (inst.albedoTextureSlice >= 0) {
-        float4 tx = sampleAtlasAspect(albedoAtlas, texSampler, in.uv,
-                                      uint(inst.albedoTextureSlice), albedoUVScale);
+        // Phase 7 hex-stochastic anti-tiling: floor/wall surfaces tile seamlessly but
+        // don't repeat visibly — three blended samples from stochastically-offset
+        // lattice cells. `in.uv` is already in tile-space (world ÷ uvMetres), so
+        // the hex cell size equals one texture tile. sampleAtlasAspect handles
+        // letterbox padding per-slice; the offset just shifts into a neighbouring
+        // infinitely-tiling region, so aspect is preserved.
+        float4 tx = sampleAtlasHex(albedoAtlas, texSampler, in.uv,
+                                    uint(inst.albedoTextureSlice), albedoUVScale);
         albedo = tx.rgb;
     }
     // Phase 4.17 — modulate albedo by per-vertex color (default white,
