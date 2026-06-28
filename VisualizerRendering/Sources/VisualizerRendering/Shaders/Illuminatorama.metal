@@ -1897,6 +1897,7 @@ static inline float sunVisibility(
     sampler                              shadowSampler,
     constant FrameUniforms&              frame,
     float3 worldPos,
+    float3 N,
     float  NdotL
 ) {
     if (!kLightingShadowEnabled) return 1.0;  // function_constant(1) — see decls above
@@ -1906,7 +1907,7 @@ static inline float sunVisibility(
     float viewDist = -vp.z;
     uint cascade = pickCascade(viewDist, frame.cascadeSplitsView.xyz);
 
-    // Slope-scaled bias — surfaces nearly parallel to the light direction
+    // Slope-scaled depth bias — surfaces nearly parallel to the light direction
     // need more bias to avoid acne, but biasing too much causes peter-panning.
     float slope = clamp(1.0 - NdotL, 0.0, 1.0);
     float bias = frame.shadowBias + frame.shadowSlopeBias * slope;
@@ -1919,7 +1920,22 @@ static inline float sunVisibility(
     else if (cascade == 1u) cascadeVP = frame.shadowVP1;
     else                    cascadeVP = frame.shadowVP2;
 
-    return sampleCascade(shadowMap, shadowSampler, worldPos,
+    // Normal-offset bias. Depth bias along the light ray peter-pans grazing
+    // surfaces (it scales with 1-NdotL, so walls detach from their contact
+    // line — the classic offset artifact). Instead push the *receiver sample*
+    // out along its own surface normal by ~1 shadow texel of WORLD size, so a
+    // flat top no longer samples its own occluder (kills self-shadow acne)
+    // while the in-plane shift barely moves the shadow edge. Texel world size
+    // is derived from the cascade's ortho extent: the first matrix row's linear
+    // length is 1/radius, and the map spans 2·radius across `width` texels.
+    float3 row0 = float3(cascadeVP[0][0], cascadeVP[1][0], cascadeVP[2][0]);
+    float  radius = 1.0 / max(length(row0), 1e-6);
+    float  texelWorld = 2.0 * radius / float(shadowMap.get_width());
+    // Widen mildly on grazing incidence (where acne is worst) but stay bounded
+    // — 1–3 texels, never the runaway depth bias produced.
+    float3 biasedPos = worldPos + N * texelWorld * (1.0 + 2.0 * slope);
+
+    return sampleCascade(shadowMap, shadowSampler, biasedPos,
                          cascadeVP, cascade, bias, frame.shadowPcfRadius);
 }
 
@@ -2456,7 +2472,7 @@ kernel void illumi_lighting(
     float3 Ld = normalize(frame.directionalLightDir);
     float NdotL_sun = saturate(dot(N, Ld));
     float visibility = sunVisibility(shadowMap, shadowSampler, frame,
-                                     worldPos, NdotL_sun);
+                                     worldPos, N, NdotL_sun);
     // Terms kept separate so the per-term split-render (frame.debugTerm) can
     // isolate any one of them; the normal path just sums them at the end.
     float3 directSun = brdf(N, V, Ld, albedo, metallic, roughness,
