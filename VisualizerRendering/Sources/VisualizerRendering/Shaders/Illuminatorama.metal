@@ -192,6 +192,19 @@ struct FrameUniforms {
     float    _padFilmLUT0;
     float    _padFilmLUT1;
     float    _padFilmLUT2;
+    // Tonemap colour-grade (white-balance / tint pre-tonemap; contrast / shadows
+    // / highlights as a post-tonemap curve). TWO new 16-byte clusters (stride
+    // 1024 → 1056). Defaults are neutral: whiteBalanceK 6500 → gain (1,1,1),
+    // tint 0, shadows/highlights/contrast 1.0 → the whole grade is a no-op.
+    // Mirrors IlluminatoramaFrameUniforms.{whiteBalanceK,tint,shadows,highlights,contrast}.
+    float    whiteBalanceK;
+    float    tint;
+    float    shadows;
+    float    highlights;
+    float    contrast;
+    float    _padGrade0;
+    float    _padGrade1;
+    float    _padGrade2;
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift
@@ -4707,6 +4720,57 @@ static inline float3 aces(float3 x) {
     return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
 }
 
+// ── Color-grade: white-balance gain from a Kelvin temperature ───────────────
+// Maps a correlated colour temperature (~2000–10000 K) to a normalized linear
+// RGB channel gain that, when MULTIPLIED into a neutral scene, warms it (low K)
+// or cools it (high K). 6500 K → (1,1,1) exactly (no-op default). We use a
+// cheap polynomial approximation of the daylight locus' channel response
+// rather than a full Planckian/CIE conversion — it only has to read tasteful
+// across the slider, not be colorimetrically exact. Normalized so the green
+// channel (and the luma) stays ≈1, i.e. the grade tints rather than dims.
+static inline float3 whiteBalanceGain(float kelvin) {
+    // Reference is 6500 K (D65). Below → push red, pull blue (warm); above →
+    // push blue, pull red (cool). A smooth, monotonic curve in 1000s-of-K.
+    float t = (kelvin - 6500.0) / 6500.0;        // 0 at D65; ~-0.69 at 2000 K; ~+0.54 at 10000 K
+    float r = 1.0 - 0.45 * t;                    // warmer (low K) → more red
+    float b = 1.0 + 0.55 * t;                    // warmer (low K) → less blue
+    float g = 1.0 - 0.04 * t * t;                // slight green dip away from D65
+    float3 gain = float3(max(r, 0.0), max(g, 0.0), max(b, 0.0));
+    // Renormalize to unit luma so the white-balance only shifts hue, not exposure.
+    float lum = dot(gain, float3(0.2126, 0.7152, 0.0722));
+    return (lum > 1e-4) ? gain / lum : float3(1.0);
+}
+
+// Green↔magenta tint on the [-1, 1] axis. tint > 0 pushes magenta (boost R+B,
+// cut G); tint < 0 pushes green. Luma-preserving by construction (the green
+// move is twice the magenta half-move). 0 = no-op.
+static inline float3 tintGain(float tint) {
+    float g = 1.0 - 0.20 * tint;                 // magenta (tint>0) cuts green
+    float rb = 1.0 + 0.10 * tint;                // ...and lifts red+blue
+    return float3(rb, g, rb);
+}
+
+// Tonemapped-domain tone curve. Operates on a 0..1 LDR colour:
+//   • contrast pivots around mid-grey 0.18 (1.0 = no-op)
+//   • shadows lifts (>1) / crushes (<1) the low-luma end (1.0 = no-op)
+//   • highlights lifts/rolls the high-luma end (1.0 = no-op)
+// Shadows/highlights are luma-weighted so mid-tones stay put and the two ends
+// move independently. All three default to 1.0 → an exact no-op.
+static inline float3 toneCurve(float3 c, float contrast, float shadows, float highlights) {
+    // Contrast around mid-grey pivot.
+    const float pivot = 0.18;
+    c = (c - pivot) * contrast + pivot;
+    c = max(c, 0.0);
+    // Per-pixel luma drives the shadow/highlight weights.
+    float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
+    // Smooth low/high masks: shadowW ≈ 1 in blacks → 0 by mid; highW the inverse.
+    float shadowW = 1.0 - smoothstep(0.0, 0.5, lum);
+    float highW   = smoothstep(0.5, 1.0, lum);
+    // Multiplicative lift/crush — keeps hue, scales magnitude per region.
+    float scale = mix(1.0, shadows, shadowW) * mix(1.0, highlights, highW);
+    return max(c * scale, 0.0);
+}
+
 // SSAA downsample. The HDR + bloom textures are sized to the INTERNAL
 // resolution (output × `internalRenderScale`); this kernel dispatches over
 // the OUTPUT resolution and runs a 4-tap bilinear-hardware downsample per
@@ -4855,7 +4919,12 @@ fragment float4 illumi_tonemap_fs(
                      ? expoState.smoothedExposure
                      : 1.0;
     float exposure = autoBase * frame.exposure;
-    float3 mapped = aces(mixed * exposure);
+    // ── Color-grade: white-balance + tint on LINEAR HDR, pre-tonemap ──────────
+    // Channel-multiply gains are most physical in linear light (they model a
+    // sensor/illuminant shift), so they go in before exposure + ACES. Defaults
+    // (whiteBalanceK = 6500, tint = 0) make both gains exactly (1,1,1) → no-op.
+    float3 graded = mixed * whiteBalanceGain(frame.whiteBalanceK) * tintGain(frame.tint);
+    float3 mapped = aces(graded * exposure);
     // Phase 4.15 — post-tonemap saturation boost. Narkowicz's fitted ACES
     // famously compresses midtone chroma harder than SCN's HDR chain, so
     // the deferred pipeline reads consistently flatter than the SCN
@@ -4870,6 +4939,11 @@ fragment float4 illumi_tonemap_fs(
     // negative on near-greys, and `pow(negative, 1/2.2)` returns NaN that
     // then propagates through any subsequent composite.
     mapped = saturate(mapped);
+    // ── Color-grade: contrast / shadows / highlights tone curve ───────────────
+    // Applied in the tonemapped (0..1) domain so the pivot, lift and roll-off
+    // act on display-referred values. Defaults (contrast = shadows = highlights
+    // = 1.0) make this an exact no-op.
+    mapped = saturate(toneCurve(mapped, frame.contrast, frame.shadows, frame.highlights));
 
     // ── Axial chromatic aberration ("purple fringing") ────────────────────────
     // Longitudinal CA: a real lens focuses wavelengths at slightly different

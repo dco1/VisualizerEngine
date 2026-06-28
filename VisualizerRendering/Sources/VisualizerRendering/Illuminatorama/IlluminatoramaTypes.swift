@@ -263,6 +263,22 @@ public struct IlluminatoramaFrameUniforms {
     public var _padFilmLUT0: Float = 0
     public var _padFilmLUT1: Float = 0
     public var _padFilmLUT2: Float = 0
+    // ── Tonemap colour-grade ─────────────────────────────────────────
+    // White-balance + tint are channel gains applied to LINEAR HDR before
+    // exposure/ACES; contrast/shadows/highlights are a tone curve in the
+    // tonemapped (0..1) domain. TWO new 16-byte clusters (stride 1024 →
+    // 1056) — five scalars + three pads. Defaults are neutral so existing
+    // renders are byte-for-byte unchanged: whiteBalanceK 6500 → gain
+    // (1,1,1), tint 0, shadows/highlights/contrast 1.0 → exact no-op.
+    // Field-for-field mirror of the Metal `FrameUniforms`.
+    public var whiteBalanceK: Float = 6500
+    public var tint: Float = 0
+    public var shadows: Float = 1.0
+    public var highlights: Float = 1.0
+    public var contrast: Float = 1.0
+    public var _padGrade0: Float = 0
+    public var _padGrade1: Float = 0
+    public var _padGrade2: Float = 0
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20

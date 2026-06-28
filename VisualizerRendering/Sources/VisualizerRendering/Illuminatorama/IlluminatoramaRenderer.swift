@@ -534,6 +534,21 @@ public final class IlluminatoramaRenderer {
     /// compression to compensate, so 1.10 is enough. 1.0 = no change. Tunable
     /// per-scene if a scene's intentional pastel palette doesn't want the boost.
     public var tonemapSaturation: Float = 1.10
+    // ── Tonemap colour-grade (white-balance / tint / contrast / shadows / highlights) ──
+    /// White-balance colour temperature in Kelvin (~2000–10000). 6500 = neutral
+    /// (channel gain (1,1,1) → exact no-op). Lower = warmer, higher = cooler.
+    /// Applied as a linear-HDR channel multiply BEFORE exposure + ACES.
+    public var whiteBalanceK: Float = 6500
+    /// Green↔magenta tint on [-1, 1]. 0 = no-op; >0 magenta, <0 green. Luma-
+    /// preserving channel gain applied pre-tonemap alongside white-balance.
+    public var tint: Float = 0
+    /// Shadow lift/crush, ~0.5–1.5. 1.0 = no-op; >1 lifts blacks, <1 crushes.
+    /// Luma-weighted tone-curve term in the tonemapped (0..1) domain.
+    public var shadows: Float = 1.0
+    /// Highlight lift/roll-off, ~0.5–1.5. 1.0 = no-op. Luma-weighted, post-tonemap.
+    public var highlights: Float = 1.0
+    /// Contrast about mid-grey 0.18, ~0.7–1.3. 1.0 = no-op. Post-tonemap curve.
+    public var contrast: Float = 1.0
     /// Saturation boost on the IBL diffuse term in the lighting kernel.
     /// Procedural-gradient backdrops (HotdogDrop+'s peach→tan, every
     /// `+`-tier sky) integrate to a near-grey irradiance, and the
@@ -8698,6 +8713,13 @@ public final class IlluminatoramaRenderer {
         u.fringeTintB = easedFringeTint.z
         // Phase 9 — film LUT strength: 0 when no LUT is bound (bypasses the shader branch).
         u.filmLUTStrength = filmLUTTexture != nil ? max(0, min(1, filmLUTStrength)) : 0
+        // Tonemap colour-grade. Neutral defaults (6500/0/1/1/1) are exact no-ops in
+        // the shader, so scenes that never touch these are byte-for-byte unchanged.
+        u.whiteBalanceK = whiteBalanceK
+        u.tint = tint
+        u.shadows = shadows
+        u.highlights = highlights
+        u.contrast = contrast
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
 
