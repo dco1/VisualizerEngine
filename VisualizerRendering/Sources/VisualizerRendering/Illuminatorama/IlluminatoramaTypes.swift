@@ -446,7 +446,9 @@ public struct IlluminatoramaInstance {
     /// Tile frequency of the detail normal relative to the macro UV.
     /// 8 = eight tiles per macro tile = fine grain/pore detail.
     public var detailNormalUVScale: Float = 8.0
-    public var _padDetail0: Float = 0
+    /// Phase 7c — anisotropy [0,1] (was `_padDetail0`, same offset/stride). Stretches the specular
+    /// highlight along the surface grain; packed as (1 + anisotropy) into normalRoughness.w.
+    public var anisotropy: Float = 0
     /// Highlight mode for the screen-space halo pass: 0 none · 1 selected (blue
     /// halo) · 2 hover (yellow halo). Only honoured on bounding-box proxies fed
     /// through `highlightMaskInstances`; the detailed scene meshes never set it.

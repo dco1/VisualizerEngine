@@ -289,7 +289,7 @@ struct Instance {
     // boundary) to preserve float4x4 natural alignment.
     int      detailNormalTextureSlice;  // < 0 = disabled
     float    detailNormalUVScale;       // tile frequency relative to macro UV
-    float    _padDetail0;
+    float    anisotropy;                // Phase 7c — grain highlight stretch [0,1] (was _padDetail0)
     int      highlight;   // 0 none · 1 selected (blue halo) · 2 hover (yellow halo)
     // Drag/impact sway — generic vertex-shader secondary motion (see applySway).
     // New 16-byte cluster (offsets 224-239): stride grows 224 → 240.
@@ -1560,7 +1560,9 @@ fragment SQImpostorFSOut illumi_superquadric_impostor_fs(
     SQImpostorFSOut o;
     o.albedoMetallic  = half4(half3(inst.albedo), half(inst.metallic));
     float2 oct = octEncode(wN);
-    o.normalRoughness = half4(half(oct.x), half(oct.y), half(inst.roughness), 1.0h);
+    // .w tag: 1.0 = opaque (default); 1.0 + anisotropy (>1) carries the grain-highlight stretch
+    // for the deferred pass (all existing tag tests are < 1.0, so this reads as opaque to them).
+    o.normalRoughness = half4(half(oct.x), half(oct.y), half(inst.roughness), 1.0h + half(inst.anisotropy));
     o.emission        = half4(half3(inst.emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -inst.sheen));
     o.velocity        = half2(velUV);
     o.depth           = curClip.z / curClip.w;   // Metal NDC z ∈ [0,1]
@@ -2002,7 +2004,8 @@ static inline float sunVisibility(
 }
 
 static inline float3 brdf(
-    float3 N, float3 V, float3 L, float3 albedo, float metallic, float roughness, float3 lightColor
+    float3 N, float3 V, float3 L, float3 albedo, float metallic, float roughness, float3 lightColor,
+    float anisotropy = 0.0, float3 grainT = float3(0.0)
 ) {
     float3 H = normalize(V + L);
     float NdotL = saturate(dot(N, L));
@@ -2013,8 +2016,22 @@ static inline float3 brdf(
 
     float3 F0 = mix(float3(0.04), albedo, metallic);
     float3 F  = fresnelSchlick(HdotV, F0);
-    float  D  = distributionGGX(NdotH, roughness);
     float  G  = geometrySmith(NdotV, NdotL, roughness);
+    float  D;
+    if (anisotropy > 0.001 && dot(grainT, grainT) > 0.25) {
+        // Anisotropic GGX (Burley): stretch the lobe along the in-plane grain tangent, compress
+        // across it — a wood floor / brushed steel reads as a streaked highlight, not a round one.
+        float3 B  = normalize(cross(N, grainT));
+        float3 T  = normalize(cross(B, N));                 // re-orthogonalize into the plane
+        float  a  = max(roughness * roughness, 1e-3);
+        float  at = max(a * (1.0 + anisotropy), 1e-3);      // along grain (stretched)
+        float  ab = max(a * (1.0 - 0.7 * anisotropy), 1e-3); // across grain (tight)
+        float  ToH = dot(T, H), BoH = dot(B, H);
+        float  d  = ToH * ToH / (at * at) + BoH * BoH / (ab * ab) + NdotH * NdotH;
+        D = 1.0 / (M_PI_F * at * ab * d * d);
+    } else {
+        D = distributionGGX(NdotH, roughness);
+    }
 
     float3 spec = (D * G * F) / (4.0 * NdotV * NdotL + 1e-7);
     float3 kd = (1.0 - F) * (1.0 - metallic);
@@ -2537,8 +2554,19 @@ kernel void illumi_lighting(
                                      worldPos, N, NdotL_sun);
     // Terms kept separate so the per-term split-render (frame.debugTerm) can
     // isolate any one of them; the normal path just sums them at the end.
+    // Phase 7c — grain anisotropy: normalRoughness.w carries (1 + aniso) for wood/brushed-metal
+    // pixels (opaque is exactly 1.0). Reconstruct an in-plane grain tangent from a world reference
+    // (plan-X for floors/ceilings, horizontal for walls) — approximate (per-instance, not per-
+    // plank), but it's the highlight STRETCH that kills the plastic look, not the exact grain angle.
+    float aniso = (nrH.a > 1.001h) ? float(nrH.a - 1.0h) : 0.0;
+    float3 grainT = float3(0.0);
+    if (aniso > 0.001) {
+        float3 up = float3(0.0, 1.0, 0.0);
+        grainT = (abs(dot(N, up)) > 0.95) ? normalize(float3(1.0, 0.0, 0.0) - N * N.x)
+                                          : normalize(cross(N, up));
+    }
     float3 directSun = brdf(N, V, Ld, albedo, metallic, roughness,
-                            frame.directionalLightColor) * visibility;
+                            frame.directionalLightColor, aniso, grainT) * visibility;
 
     // ── Leaf thin-sheet transmission (issue #58 / #20 item 2) ───────────────
     // Leaves are flagged in normalRoughness.w (0 = foliage; opaque geometry is
