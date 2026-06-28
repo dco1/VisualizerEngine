@@ -260,7 +260,7 @@ struct Instance {
     // stride stays 208. Default 0 = off (no change to existing materials).
     float    clearcoat;              // [0,1] lobe strength
     float    clearcoatRoughness;     // GGX roughness for the clearcoat layer
-    float    _padClearcoat;          // align emission to offset 160
+    float    sheen;                  // Phase 7b — cloth sheen strength [0,1] (was _padClearcoat)
     float3   emission;
     float    roughness;
     // Phase 4.0/4.1 — slice indices into the per-material texture atlases
@@ -1338,10 +1338,10 @@ fragment GBufferOut illumi_fs(
         // HDR brightness (Pizza's heat coils were flat at intensity 1).
         emission += tx.rgb * inst.emissionIntensity;
     }
-    // Phase 7 — pack clearcoat strength into emission.alpha (was always 1.0,
-    // unused in the lighting pass). 0 = no clearcoat (default for all existing
-    // materials); > 0 = polished/lacquered second GGX lobe in the lighting pass.
-    o.emission        = half4(half3(emission), half(inst.clearcoat));
+    // Phase 7 — pack clearcoat (≥0) OR cloth sheen (<0) into emission.alpha (was always 1.0,
+    // unused). A surface is polished OR cloth, never both, so one channel carries either: > 0 =
+    // polished/lacquered second GGX lobe; < 0 = velvet/wool grazing-Fresnel sheen (strength = -a).
+    o.emission        = half4(half3(emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -inst.sheen));
     // Screen-space motion vector. NDC.y is up, UV.y is down → Y is flipped.
     // The result is (currentUV - previousUV), so history reprojection in the
     // TAA kernel is `historyUV = currentUV - velocity`.
@@ -1561,7 +1561,7 @@ fragment SQImpostorFSOut illumi_superquadric_impostor_fs(
     o.albedoMetallic  = half4(half3(inst.albedo), half(inst.metallic));
     float2 oct = octEncode(wN);
     o.normalRoughness = half4(half(oct.x), half(oct.y), half(inst.roughness), 1.0h);
-    o.emission        = half4(half3(inst.emission), half(inst.clearcoat));
+    o.emission        = half4(half3(inst.emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -inst.sheen));
     o.velocity        = half2(velUV);
     o.depth           = curClip.z / curClip.w;   // Metal NDC z ∈ [0,1]
     return o;
@@ -2920,7 +2920,22 @@ kernel void illumi_lighting(
         plushSheenTerm = sheenTint * fres * frame.plushSheen * (sunSheen + ambSheen);
     }
 
-    float3 color = directSun + transmission + dirFillSum + pointSum + spotSum + areaSum + indirect + emission + clearcoat + hotdogCC + plushSheenTerm;
+    // ── Phase 7b — per-material cloth sheen (velvet/wool/linen) ───────────────
+    // Fabric packs its sheen strength as a NEGATIVE emission.alpha (reuses the clearcoat
+    // channel; a surface is polished OR cloth, never both). A soft grazing-Fresnel
+    // retroreflective rim — the velvety glow real cloth catches, which a single GGX lobe
+    // can't give. Strength = -emission.alpha. No-op for every non-cloth surface (a ≥ 0).
+    float3 clothSheen = float3(0.0);
+    float sheenStrength = float(-emH.a);
+    if (sheenStrength > 0.001f) {
+        float  fres = pow(1.0 - saturate(dot(N, V)), 2.5);    // grazing-angle edge
+        float3 sheenTint = albedo * 0.4 + float3(0.6);        // fibre-tip warm white
+        float3 sunSheen = frame.directionalLightColor * (NdotL_sun * visibility);
+        float3 ambSheen = desaturateFill(frame.ambientColor, frame.iblDiffuseDesaturation) * ao;
+        clothSheen = sheenTint * fres * sheenStrength * (sunSheen + ambSheen);
+    }
+
+    float3 color = directSun + transmission + dirFillSum + pointSum + spotSum + areaSum + indirect + emission + clearcoat + hotdogCC + plushSheenTerm + clothSheen;
 
     // Per-term split-render: isolate ONE contribution so a flooded/flat scene
     // can be decomposed. Surfaces only — sky already returned above.

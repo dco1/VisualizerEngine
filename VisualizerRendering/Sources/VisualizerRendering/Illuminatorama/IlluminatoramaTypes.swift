@@ -402,7 +402,10 @@ public struct IlluminatoramaInstance {
     // stays 208. Default 0 = no clearcoat (no change to existing materials).
     public var clearcoat: Float = 0          // lobe strength [0, 1]
     public var clearcoatRoughness: Float = 0.10  // GGX alpha^2 for clearcoat
-    public var _padClearcoat: Float = 0      // fill the gap, keep emission at 160
+    // Phase 7b — cloth sheen lobe strength [0,1] (velvet/wool/linen). Repurposes the former
+    // `_padClearcoat` slot (same offset 156, stride stays 208). Packed as a NEGATIVE
+    // emission.alpha in the G-buffer (a surface is polished OR cloth, never both).
+    public var sheen: Float = 0
     public var emission: SIMD3<Float>
     public var roughness: Float
     /// Phase 4.0 — slice index into the diffuse albedo atlas. `< 0` means
