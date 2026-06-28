@@ -242,6 +242,26 @@ public final class IlluminatoramaRenderer {
     public var treeWindStrength: Float = 0
     public var treeWindHeading: Float = 0
 
+    // ── Highlight outline (feathered halo around selected / hovered objects) ──
+    /// When true, every box in `highlightMaskInstances` receives a feathered halo
+    /// glow traced around its screen-space silhouette (mask → separable dilation →
+    /// HDR composite before bloom). Two modes composite in separate passes:
+    /// `highlight == 1` in `selectionOutlineColor`, `highlight == 2` in
+    /// `hoverOutlineColor`.
+    public var selectionOutlineEnabled: Bool = false
+    /// RGB color of the *selected* halo in linear HDR space (pre-intensity).
+    public var selectionOutlineColor: SIMD3<Float> = SIMD3(0.0, 0.7, 1.0)
+    /// RGB color of the *hover* halo in linear HDR space (pre-intensity).
+    public var hoverOutlineColor: SIMD3<Float> = SIMD3(1.0, 0.78, 0.12)
+    /// Dilation radius in pixels. Controls halo thickness.
+    public var selectionOutlineWidth: Int = 6
+    /// Bounding-box proxies drawn only in the halo mask pass (never the G-buffer),
+    /// so highlighted elements keep their real material while gaining a halo. One
+    /// solid box per selected/hovered element, its `highlight` set to 1 or 2.
+    /// Boxes (not detailed meshes) guarantee a hole-free mask → a clean outer ring.
+    /// The bridge clears and re-fills this each frame before `render()`.
+    public var highlightMaskInstances: [IlluminatoramaInstance] = []
+
     // ── Hardware ray tracing (soft sun shadows + 1-bounce GI) ────────
     //
     // When `rtEnabled` is true AND a static RT geometry has been supplied via
@@ -1304,6 +1324,24 @@ public final class IlluminatoramaRenderer {
     /// `nil` when the shaders are absent from the library — streak draws are
     /// silently skipped in that case (logged once at init).
     private var streakPipeline: MTLRenderPipelineState?
+
+    // ── Highlight outline pipeline state ─────────────────────────────
+    private var selectionBoxMaskPipeline: MTLRenderPipelineState?   // mask boxes, filtered by wantMode
+    private var selectionDilateHPipeline: MTLComputePipelineState?  // horizontal max-filter
+    private var selectionDilateVPipeline: MTLComputePipelineState?  // vertical max-filter
+    private var selectionCompositePipeline: MTLComputePipelineState? // ring → HDR additive composite
+    private var selectionMaskTexture: MTLTexture?      // 0/1 per pixel (mask boxes rendered here)
+    private var selectionDilateHTexture: MTLTexture?   // horizontal-dilated intermediate
+    private var selectionDilatedTexture: MTLTexture?   // fully dilated result
+    private var selectionMaskInstanceBuffer: MTLBuffer? // GPU copy of `highlightMaskInstances`
+    private var selectionDepthState: MTLDepthStencilState?
+
+    /// Swift mirror of the Metal `SelectionOutlineParams` struct (must match byte-for-byte).
+    private struct SelectionOutlineParams {
+        var colorIntensity: SIMD4<Float>
+        var width: Int32; var height: Int32
+        var _pad0: Int32 = 0; var _pad1: Int32 = 0
+    }
 
     /// Matches the Metal `ExtParticleParams` struct byte-for-byte.
     /// Set via `setVertexBytes` per emitter draw.
@@ -2479,6 +2517,24 @@ public final class IlluminatoramaRenderer {
             throw IlluminatoramaError.pipelineCreationFailed("particleDepthState")
         }
         self.particleDepthState = pds
+
+        // ── Highlight outline pipelines (optional — silently no-ops if shaders absent) ──
+        if let vs = library.makeFunction(name: "illumi_selection_box_vs"),
+           let fs = library.makeFunction(name: "illumi_selection_mask_fs") {
+            let d = MTLRenderPipelineDescriptor()
+            d.label = "Illuminatorama.selectionBoxMask"
+            d.vertexFunction = vs; d.fragmentFunction = fs
+            d.colorAttachments[0].pixelFormat = .r8Unorm
+            d.depthAttachmentPixelFormat = .depth32Float
+            self.selectionBoxMaskPipeline = try? device.makeRenderPipelineState(descriptor: d) // gpu-ok: optional
+        }
+        self.selectionDilateHPipeline = cache.pipelineState(name: "illumi_selection_dilate_h", device: device)
+        self.selectionDilateVPipeline = cache.pipelineState(name: "illumi_selection_dilate_v", device: device)
+        self.selectionCompositePipeline = cache.pipelineState(name: "illumi_selection_composite", device: device)
+        let selDepthDesc = MTLDepthStencilDescriptor()
+        selDepthDesc.depthCompareFunction = .lessEqual
+        selDepthDesc.isDepthWriteEnabled = false
+        self.selectionDepthState = device.makeDepthStencilState(descriptor: selDepthDesc)
 
         // ── Phase 3 cubemaps + dummy sky ────────────────────────────────
         let (irrCube, preCube, preViews) = try Self.makeIBLCubes(device: device)
@@ -6273,6 +6329,9 @@ public final class IlluminatoramaRenderer {
         // Depth of field on the resolved HDR before bloom, so out-of-focus
         // bright dust motes bloom into soft bokeh. No-op unless enabled.
         encodeDOFPass(cb)
+        // Feathered halo glow around selected objects. After DOF (outline stays
+        // sharp even on out-of-focus geometry) and before bloom (halo blooms soft).
+        encodeSelectionOutlinePass(cb)
         encodeBloomPasses(cb)
         encodeTonemapPass(cb)
 
@@ -8154,6 +8213,131 @@ public final class IlluminatoramaRenderer {
 
     private var currentHistoryTexture: MTLTexture { historyToggle ? historyB : historyA }
     private var previousHistoryTexture: MTLTexture { historyToggle ? historyA : historyB }
+
+    /// Feathered halo glow around selected / hovered objects. Runs after DOF so
+    /// the outline stays sharp even when the object is out of focus; before bloom
+    /// so the halo edge blooms into a soft glow.
+    ///
+    /// Each highlighted element supplies a SOLID bounding-box proxy via
+    /// `highlightMaskInstances`, tagged `highlight == 1` (selected) or `2` (hover).
+    /// The pass runs once per mode: rasterize the matching boxes into a 1-channel
+    /// R8 mask, separable max-filter dilate, then composite `dilated − original`
+    /// (a clean outer ring) additively into the HDR source bloom reads — in the
+    /// selected colour, then the hover colour. Boxes (never the detailed meshes)
+    /// keep the mask hole-free, so the ring traces the outline without internal
+    /// edges or fill. Cull `.none` so a box's winding can never sparsen the mask.
+    private func encodeSelectionOutlinePass(_ cb: MTLCommandBuffer) {
+        guard selectionOutlineEnabled else { return }
+        guard let boxPipeline     = selectionBoxMaskPipeline,
+              let dilateHPipeline = selectionDilateHPipeline,
+              let dilateVPipeline = selectionDilateVPipeline,
+              let compPipeline    = selectionCompositePipeline,
+              let depthSt         = selectionDepthState,
+              let boxMesh         = meshes[.box] else { return }
+        guard !highlightMaskInstances.isEmpty else { return }
+
+        // Lazily allocate / resize mask textures at the internal render resolution.
+        let w = depthTexture.width, h = depthTexture.height
+        if selectionMaskTexture == nil || selectionMaskTexture!.width != w || selectionMaskTexture!.height != h {
+            let td = MTLTextureDescriptor()
+            td.textureType = .type2D
+            td.pixelFormat = .r8Unorm
+            td.width = max(1, w); td.height = max(1, h)
+            td.usage = [.shaderRead, .shaderWrite, .renderTarget]
+            td.storageMode = .private
+            selectionMaskTexture   = device.makeTexture(descriptor: td)
+            selectionDilateHTexture = device.makeTexture(descriptor: td)
+            selectionDilatedTexture = device.makeTexture(descriptor: td)
+            selectionMaskTexture?.label    = "Illuminatorama.selectionMask"
+            selectionDilateHTexture?.label = "Illuminatorama.selectionDilateH"
+            selectionDilatedTexture?.label = "Illuminatorama.selectionDilated"
+        }
+        guard let maskTex = selectionMaskTexture,
+              let dilHTex = selectionDilateHTexture,
+              let dilTex  = selectionDilatedTexture else { return }
+
+        // Upload the mask boxes once; both mode passes index the same buffer and
+        // the VS clips boxes whose `highlight` tag ≠ the mode being drawn.
+        let instStride = MemoryLayout<IlluminatoramaInstance>.stride
+        let needed = instStride * highlightMaskInstances.count
+        if selectionMaskInstanceBuffer == nil || selectionMaskInstanceBuffer!.length < needed {
+            selectionMaskInstanceBuffer = device.makeBuffer(
+                length: max(needed, instStride * 64), options: .storageModeShared)
+            selectionMaskInstanceBuffer?.label = "Illuminatorama.highlightMaskInstances"
+        }
+        guard let instBuf = selectionMaskInstanceBuffer else { return }
+        instBuf.contents().copyMemory(from: highlightMaskInstances, byteCount: needed)
+        let boxCount = highlightMaskInstances.count
+
+        // Mode 1 = selected (blue); mode 2 = hover (yellow). Skip a mode with no
+        // boxes so we don't pay for an all-clear composite.
+        let modes: [(mode: Int32, color: SIMD3<Float>)] = [
+            (1, selectionOutlineColor),
+            (2, hoverOutlineColor),
+        ]
+        var radius = Int32(max(1, selectionOutlineWidth))
+
+        for m in modes {
+            guard highlightMaskInstances.contains(where: { $0.highlight == m.mode }) else { continue }
+
+            // ── Render pass: rasterize this mode's boxes into the mask ─────────
+            let rp = MTLRenderPassDescriptor()
+            rp.colorAttachments[0].texture      = maskTex
+            rp.colorAttachments[0].loadAction   = .clear
+            rp.colorAttachments[0].storeAction  = .store
+            rp.colorAttachments[0].clearColor   = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+            rp.depthAttachment.texture          = depthTexture
+            rp.depthAttachment.loadAction       = .load    // G-buffer depth → occlusion
+            rp.depthAttachment.storeAction      = .dontCare // read-only, don't modify
+
+            guard let enc = cb.makeRenderCommandEncoder(descriptor: rp) else { return }
+            enc.label = "Illuminatorama.highlightMask.\(m.mode)"
+            enc.setDepthStencilState(depthSt)
+            enc.setCullMode(.none)   // a box is convex; depth test alone resolves the silhouette
+            enc.setRenderPipelineState(boxPipeline)
+            var wantMode = m.mode
+            enc.setVertexBuffer(boxMesh.vertexBuffer, offset: 0, index: 0)
+            enc.setVertexBuffer(frameUniformBuffer,   offset: 0, index: 1)
+            enc.setVertexBuffer(instBuf,              offset: 0, index: 2)
+            enc.setVertexBytes(&wantMode, length: MemoryLayout<Int32>.stride, index: 3)
+            enc.drawIndexedPrimitives(
+                type: .triangle, indexCount: boxMesh.indexCount, indexType: boxMesh.indexType,
+                indexBuffer: boxMesh.indexBuffer, indexBufferOffset: 0,
+                instanceCount: boxCount, baseVertex: 0, baseInstance: 0)
+            enc.endEncoding()
+
+            // ── Compute: separable max-filter dilation → ring composite ───────
+            guard let comp = cb.makeComputeCommandEncoder() else { return }
+            comp.label = "Illuminatorama.highlightOutline.\(m.mode)"
+
+            comp.setComputePipelineState(dilateHPipeline)
+            comp.setTexture(maskTex, index: 0)
+            comp.setTexture(dilHTex, index: 1)
+            comp.setBytes(&radius, length: MemoryLayout<Int32>.stride, index: 0)
+            dispatch(comp, pipeline: dilateHPipeline, width: w, height: h)
+
+            comp.setComputePipelineState(dilateVPipeline)
+            comp.setTexture(dilHTex, index: 0)
+            comp.setTexture(dilTex,  index: 1)
+            comp.setBytes(&radius, length: MemoryLayout<Int32>.stride, index: 0)
+            dispatch(comp, pipeline: dilateVPipeline, width: w, height: h)
+
+            // Ring → additive composite. `bloomTonemapSource` is dofOutputTexture
+            // (if DOF ran) or displaySource. 7× pushes the ring past the bloom
+            // threshold so it blooms into a soft feathered halo.
+            var params = SelectionOutlineParams(
+                colorIntensity: SIMD4(m.color.x, m.color.y, m.color.z, 7.0),
+                width: Int32(w), height: Int32(h))
+            comp.setComputePipelineState(compPipeline)
+            comp.setTexture(maskTex,            index: 0)
+            comp.setTexture(dilTex,             index: 1)
+            comp.setTexture(bloomTonemapSource, index: 2)
+            comp.setBytes(&params, length: MemoryLayout<SelectionOutlineParams>.stride, index: 0)
+            dispatch(comp, pipeline: compPipeline, width: w, height: h)
+
+            comp.endEncoding()
+        }
+    }
 
     /// Phase 4.21 — estimate the scene's log-luminance once per frame and
     /// EMA-smooth into `exposureBuffer.smoothedExposure`. Lives between

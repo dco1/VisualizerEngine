@@ -277,7 +277,13 @@ struct Instance {
     int      detailNormalTextureSlice;  // < 0 = disabled
     float    detailNormalUVScale;       // tile frequency relative to macro UV
     float    _padDetail0;
-    float    _padDetail1;
+    int      highlight;   // 0 none · 1 selected (blue halo) · 2 hover (yellow halo)
+    // Drag/impact sway — generic vertex-shader secondary motion (see applySway).
+    // New 16-byte cluster (offsets 224-239): stride grows 224 → 240.
+    int      swayMode;    // 0 none · 1 bottom-pivot lean
+    float    swayLean;    // lean angle (radians) about the object's local-Z, pivoting at base
+    float    swayJostle;  // vertical pop (metres), applied in world space
+    float    _padSway0;
 };
 
 struct Vertex {
@@ -360,6 +366,34 @@ static inline float3 applyTreeWind(float3 wp, float4 windAttr, float time,
     return wp;
 }
 
+// ── Drag/impact sway (generic rigid secondary motion) ────────────────────────
+// The non-foliage sibling of applyTreeWind: a placed object the host is dragging
+// (or that just knocked into something) leans + hops, driven entirely by the
+// per-instance swayMode/swayLean/swayJostle the host's DragSwayTracker fills.
+//
+// Applied in WORLD space about the instance's bottom-pivot so it composes cleanly
+// with the per-instance non-uniform scale already baked into modelMatrix (rotating
+// unit-box object space then scaling would shear). Pivot = base centre of the
+// box; lean axis = the object's local +Z in world (modelMatrix column 2). swayMode
+// 0 ⇒ identity, so every non-swaying instance is an exact no-op.
+//
+// Returns the rotated world position; `worldN`/`worldT` are rotated in place by the
+// same rigid rotation so lighting/normal-mapping track the lean.
+static inline float3 applySway(float3 wp, float4x4 model, int mode,
+                               float lean, float jostle,
+                               thread float3& worldN, thread float3& worldT) {
+    if (mode == 0) return wp;
+    float3 pivot = (model * float4(0.0, -0.5, 0.0, 1.0)).xyz;   // box base centre (object y=-0.5)
+    float3 axis  = normalize((model * float4(0.0, 0.0, 1.0, 0.0)).xyz);  // local +Z in world
+    float  c = cos(lean), s = sin(lean);
+    // Rodrigues rotation of (wp - pivot) about `axis`, then restore pivot.
+    float3 r = wp - pivot;
+    float3 rot = r * c + cross(axis, r) * s + axis * dot(axis, r) * (1.0 - c);
+    worldN = worldN * c + cross(axis, worldN) * s + axis * dot(axis, worldN) * (1.0 - c);
+    worldT = worldT * c + cross(axis, worldT) * s + axis * dot(axis, worldT) * (1.0 - c);
+    return pivot + rot + float3(0.0, jostle, 0.0);
+}
+
 vertex VSOut illumi_vs(
     uint                       vid           [[vertex_id]],
     uint                       iid           [[instance_id]],
@@ -393,6 +427,16 @@ vertex VSOut illumi_vs(
     // surface — it should track non-uniform scale linearly, unlike a
     // normal. Handedness in .w rides along unchanged.
     float3 worldT = (inst.modelMatrix * float4(v.tangent.xyz, 0.0)).xyz;
+
+    // Drag/impact sway — rigid lean+hop driven by the host DragSwayTracker, no-op
+    // unless swayMode != 0. worldN/worldT rotate with it so lighting + normal maps
+    // track the lean. The previous frame gets LAST frame's sway (prevInst) so the
+    // motion vector captures the swing (TAA/motion-blur correctness).
+    worldP.xyz = applySway(worldP.xyz, inst.modelMatrix, inst.swayMode,
+                           inst.swayLean, inst.swayJostle, worldN, worldT);
+    float3 prevN = worldN, prevT = worldT;   // throwaway: prev normal/tangent unused
+    prevWorldP.xyz = applySway(prevWorldP.xyz, prevInst.modelMatrix, prevInst.swayMode,
+                               prevInst.swayLean, prevInst.swayJostle, prevN, prevT);
 
     VSOut o;
     o.clipPos      = frame.viewProjection * worldP;
@@ -433,6 +477,11 @@ vertex float4 illumi_shadow_vs(
     Vertex v = verts[vid];
     Instance inst = instances[iid];
     float4 worldP = inst.modelMatrix * float4(v.position, 1.0);
+    // Match the visible pose: a swaying object casts its leaned shadow (no-op unless
+    // swayMode != 0). Position-only — the depth pass needs no normal/tangent.
+    float3 nDummy = float3(0.0), tDummy = float3(0.0);
+    worldP.xyz = applySway(worldP.xyz, inst.modelMatrix, inst.swayMode,
+                           inst.swayLean, inst.swayJostle, nDummy, tDummy);
     return lightVP * worldP;
 }
 
@@ -5519,4 +5568,106 @@ kernel void bulbs_write_pointlights(
     pl.color    = c * U.gain;
     pl._pad     = 0.0;
     outLights[U.lightOffset + slot] = pl;
+}
+
+// ── Highlight outline mask pass ───────────────────────────────────────────────
+//
+// One render pipeline feeds a separable max-filter dilation + composite. Every
+// highlighted element (selected OR hovered) supplies a SOLID bounding-box proxy
+// to the mask buffer — never its detailed mesh. A box is a closed solid, so its
+// screen-space mask has no internal holes; dilate − original then yields a clean
+// outer ring with no internal edges and no fill. (Rasterizing the real mesh —
+// open sofa frames, see-through bookshelf bays — produced internal rings and,
+// once the small gaps merged under dilation, a full-object wash.)
+//
+//   illumi_selection_box_vs/fs   — draws boxes whose inst.highlight == wantMode.
+//
+// Then two compute passes:
+//   illumi_selection_dilate_h/v  — separable max-filter dilation by `radius` px.
+//   illumi_selection_composite   — ring = dilated − original; additive HDR blend.
+//
+// The pass runs once per mode: wantMode 1 (selected, blue) then 2 (hover, yellow).
+
+struct SelMaskVSOut {
+    float4 position [[position]];
+};
+
+// Mask boxes, filtered to the mode being composited this invocation: an instance
+// whose highlight tag differs from wantMode is clipped (NDC z > 1 → zero fragments).
+vertex SelMaskVSOut illumi_selection_box_vs(
+    uint                       vid       [[vertex_id]],
+    uint                       iid       [[instance_id]],
+    const device Vertex*       verts     [[buffer(0)]],
+    constant FrameUniforms&    frame     [[buffer(1)]],
+    const device Instance*     instances [[buffer(2)]],
+    constant int&              wantMode  [[buffer(3)]]
+) {
+    if (instances[iid].highlight != wantMode) {
+        return { float4(2, 2, 2, 1) };   // outside clip → zero fragments
+    }
+    float4 worldP = instances[iid].modelMatrix * float4(verts[vid].position, 1.0);
+    return { frame.viewProjection * worldP };
+}
+
+fragment float illumi_selection_mask_fs(SelMaskVSOut in [[stage_in]]) {
+    return 1.0;
+}
+
+// Horizontal max-filter dilation pass (reads selectionMask, writes dilateH).
+kernel void illumi_selection_dilate_h(
+    texture2d<float, access::read>  inTex  [[texture(0)]],
+    texture2d<float, access::write> outTex [[texture(1)]],
+    constant int&                   radius [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int w = int(inTex.get_width()), h = int(inTex.get_height());
+    if (int(gid.x) >= w || int(gid.y) >= h) return;
+    float v = 0;
+    for (int dx = -radius; dx <= radius; dx++) {
+        int px = clamp(int(gid.x) + dx, 0, w - 1);
+        v = max(v, inTex.read(uint2(px, gid.y)).r);
+    }
+    outTex.write(float4(v, 0, 0, 0), gid);
+}
+
+// Vertical max-filter dilation pass (reads dilateH, writes dilatedFinal).
+kernel void illumi_selection_dilate_v(
+    texture2d<float, access::read>  inTex  [[texture(0)]],
+    texture2d<float, access::write> outTex [[texture(1)]],
+    constant int&                   radius [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int w = int(inTex.get_width()), h = int(inTex.get_height());
+    if (int(gid.x) >= w || int(gid.y) >= h) return;
+    float v = 0;
+    for (int dy = -radius; dy <= radius; dy++) {
+        int py = clamp(int(gid.y) + dy, 0, h - 1);
+        v = max(v, inTex.read(uint2(gid.x, py)).r);
+    }
+    outTex.write(float4(v, 0, 0, 0), gid);
+}
+
+// Composites ring = (dilated − original) additively into the HDR texture.
+struct SelectionOutlineParams {
+    float4 colorIntensity;   // xyz = glow color, w = intensity (push past bloom threshold)
+    int    width;
+    int    height;
+    int    _pad0;
+    int    _pad1;
+};
+
+kernel void illumi_selection_composite(
+    texture2d<float, access::read>       maskTex    [[texture(0)]],
+    texture2d<float, access::read>       dilatedTex [[texture(1)]],
+    texture2d<float, access::read_write> hdrTex     [[texture(2)]],
+    constant SelectionOutlineParams&     p          [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (int(gid.x) >= p.width || int(gid.y) >= p.height) return;
+    float orig   = maskTex.read(gid).r;
+    float dilated = dilatedTex.read(gid).r;
+    float ring   = saturate(dilated - orig);
+    float4 hdr   = hdrTex.read(gid);
+    float3 glow  = ring * p.colorIntensity.xyz * p.colorIntensity.w;
+    hdrTex.write(float4(hdr.rgb + glow, hdr.a), gid);
 }

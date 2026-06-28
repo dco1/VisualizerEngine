@@ -428,7 +428,24 @@ public struct IlluminatoramaInstance {
     /// 8 = eight tiles per macro tile = fine grain/pore detail.
     public var detailNormalUVScale: Float = 8.0
     public var _padDetail0: Float = 0
-    public var _padDetail1: Float = 0
+    /// Highlight mode for the screen-space halo pass: 0 none · 1 selected (blue
+    /// halo) · 2 hover (yellow halo). Only honoured on bounding-box proxies fed
+    /// through `highlightMaskInstances`; the detailed scene meshes never set it.
+    public var highlight: Int32 = 0
+    // ── Drag/impact sway (vertex-shader secondary motion) ─────────────────────
+    // A generic, GPU-side rigid bend driven by the host `DragSwayTracker`: the
+    // sibling of `applyTreeWind` for non-foliage objects. The shader rotates the
+    // vertex about the instance's world bottom-pivot + local-Z axis (both read off
+    // `modelMatrix`, so no extra per-instance pivot data), then lifts it by jostle.
+    // `swayMode 0` is a hard no-op, so every instance that doesn't opt in is
+    // untouched. New 16-byte cluster (offsets 224-239): stride 224 → 240.
+    /// Sway kind: 0 none · 1 bottom-pivot lean (books, upright shelf contents).
+    public var swayMode: Int32 = 0
+    /// Lean angle (radians) about the object's local-Z, pivoting at its base.
+    public var swayLean: Float = 0
+    /// Vertical pop (metres) added in world space — a knock hops the object up.
+    public var swayJostle: Float = 0
+    public var _padSway0: Float = 0
 
     public init(
         modelMatrix: simd_float4x4,
@@ -462,10 +479,10 @@ public struct IlluminatoramaInstance {
         self.normalMatrix = Self.normalMatrix(from: m)
     }
 
-    /// Compile-time guard: Swift and Metal structs must agree on 224 bytes.
+    /// Compile-time guard: Swift and Metal structs must agree on 240 bytes.
     /// If this fires, either a Swift field was added without the matching Metal
     /// field (or vice versa), or alignment changed unexpectedly.
-    static let _assertStride224: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 224, "IlluminatoramaInstance stride must be 224") }()
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 240, "IlluminatoramaInstance stride must be 240") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //
