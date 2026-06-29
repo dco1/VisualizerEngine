@@ -481,6 +481,16 @@ public final class IlluminatoramaRenderer {
     /// Toggle the cascaded-shadow pass + sampling. Off = direct sun lights
     /// every pixel, regardless of occlusion (Phase 2 behaviour).
     public var shadowsEnabled: Bool = true
+
+    /// Mesh kinds excluded from the DIRECTIONAL (cascade/sun) shadow pass: their
+    /// geometry is not drawn as a sun-shadow occluder, so it casts no shadow from
+    /// the sun. Empty by default → no behaviour change. The host opts a kind in
+    /// when a self-illuminated object shouldn't blot its own light pool with a
+    /// hard sun shadow (e.g. a lamp: its body casting a crisp shadow across the
+    /// circular pool it throws reads as a lopsided pool). Spot-cone shadows
+    /// (`encodeSpotShadowPasses`) are unaffected — the object still traps its own
+    /// light; only the sun stops shadowing it.
+    public var directionalShadowExcludedKinds: Set<MeshKind> = []
     // DEFAULTS LESSON (PR #33 fix): the initial Phase 2.5 defaults were
     // shadowBias = 0.0008 and shadowSlopeBias = 0.005 — both too aggressive.
     // The shadow pass uses front-face culling, which already shifts stored
@@ -6526,6 +6536,7 @@ public final class IlluminatoramaRenderer {
             // per spot.
             let instStride = MemoryLayout<IlluminatoramaInstance>.stride
             for group in meshGroups {
+                if directionalShadowExcludedKinds.contains(group.kind) { continue }  // e.g. lamps — no sun shadow
                 guard let mesh = meshes[group.kind] else { continue }
                 let off = instStride * group.start
                 enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
