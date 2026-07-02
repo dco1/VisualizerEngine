@@ -209,7 +209,9 @@ struct FrameUniforms {
     // `_padGrade0` slot — same 4 bytes, stride unchanged. Mirrors
     // IlluminatoramaFrameUniforms.antiTilingStrength.
     float    antiTilingStrength;
-    float    _padGrade1;
+    // Point-light cubemap shadow depth bias (was `_padGrade1`). Read only for point
+    // lights with shadowCubeIndex >= 0; 0 ⇒ no point shadows ⇒ no behaviour change.
+    float    pointShadowBias;
     float    _padGrade2;
 };
 
@@ -230,6 +232,14 @@ struct PointLight {
     // fragment (byte-identical to the pre-mask behaviour). Reinterpreted from the
     // former float pad, so the struct stride is unchanged.
     uint   layerMask;
+    // ── Point-light cubemap shadows (opt-in) ──────────────────────────────────
+    // castsShadow: 1 ⇒ sample the depth cube at shadowCubeIndex for this light.
+    // Default 0 ⇒ the shadow branch is skipped entirely (byte-identical). shadowCubeIndex
+    // < 0 ⇒ no page this frame (treat as fully visible). Mirrors the Swift struct.
+    uint   castsShadow;
+    int    shadowCubeIndex;
+    int    _padPointShadow0;
+    int    _padPointShadow1;
 };
 
 // Rectangular area light (#60 task 5). Mirror of Swift IlluminatoramaAreaLight.
@@ -2592,12 +2602,17 @@ kernel void illumi_lighting(
     // (light.layerMask & fragLayer) != 0. When the host leaves every instance and
     // light at the default 0xFFFFFFFF the mask is always non-zero ⇒ no change.
     texture2d<uint,  access::read>          gLayer          [[texture(18)]],
+    // Point-light cube depth atlas: 6 slices per shadowed light (slice = cube*6 + face).
+    // Bound to a same-type placeholder when point shadows are off; never sampled then.
+    depth2d_array<float, access::sample>    pointShadowAtlas [[texture(19)]],
     constant FrameUniforms&                 frame           [[buffer(0)]],
     const device PointLight*                pointLights     [[buffer(1)]],
     constant DDGIUniforms&                  ddgi            [[buffer(2)]],
     const device SpotLight*                 spotLights      [[buffer(3)]],
     const device AreaLight*                 areaLights      [[buffer(4)]],
     const device DirectionalLight*          extraDirectionals [[buffer(5)]],
+    // Per-face view-projection matrices for shadowed point lights (6 per cube).
+    const device float4x4*                  pointShadowFaces [[buffer(6)]],
     uint2                                   gid             [[thread_position_in_grid]]
 ) {
     uint w = outHDR.get_width();
@@ -2719,13 +2734,23 @@ kernel void illumi_lighting(
     float3 pointSum = float3(0.0);
     float3 spotSum  = float3(0.0);
 
+    // Point-light cube-shadow PCF sampler — hardware depth compare, same config as
+    // the spot path. Declared once outside the loop.
+    constexpr sampler pointShadowSampler(filter::linear,
+                                         compare_func::less_equal,
+                                         address::clamp_to_edge);
+
     // Point lights — inverse-square with smooth radius cutoff. (Includes the
     // synthesised emissive-as-light points from the extractor, Phase 4.27.)
     for (uint i = 0; i < frame.pointLightCount; ++i) {
         PointLight pl = pointLights[i];
         // Light-layer mask: skip lights that don't share a bit with this fragment's
         // layer. Default 0xFFFFFFFF on both sides ⇒ always passes (no change).
-        if ((pl.layerMask & fragLayer) == 0u) continue;
+        // A SHADOWED light (castsShadow) ignores the mask entirely: the depth cube
+        // is the real, geometry-correct occluder (blocks walls AND passes doorways),
+        // so applying the coarse position-based room mask on top would double-darken
+        // and re-introduce the doorway over-block the shadow exists to fix.
+        if (pl.castsShadow == 0u && (pl.layerMask & fragLayer) == 0u) continue;
         float3 toLight = pl.position - worldPos;
         float  dist    = length(toLight);
         if (dist > pl.radius) continue;
@@ -2733,7 +2758,50 @@ kernel void illumi_lighting(
         float atten = 1.0 / max(dist * dist, 1e-4);
         float window = saturate(1.0 - pow(dist / pl.radius, 4.0));
         atten *= window * window;
-        pointSum += brdf(N, V, L, albedo, metallic, roughness, pl.color * atten);
+
+        // Cubemap shadow visibility. Only when this light opted in AND was assigned
+        // a cube page this frame. Pick the cube face from the dominant axis of the
+        // light→fragment direction (−L, pointing away from the bulb), project the
+        // fragment through that face's VP, and PCF-compare — identical machinery to
+        // the spot path, just with a face select in front.
+        float visibility = 1.0;
+        if (pl.castsShadow != 0u && pl.shadowCubeIndex >= 0) {
+            float3 d = -L;                     // bulb → fragment
+            float3 ad = abs(d);
+            uint face;
+            if (ad.x >= ad.y && ad.x >= ad.z)      face = (d.x > 0.0) ? 0u : 1u;  // ±X
+            else if (ad.y >= ad.z)                 face = (d.y > 0.0) ? 2u : 3u;  // ±Y
+            else                                   face = (d.z > 0.0) ? 4u : 5u;  // ±Z
+            uint slice = uint(pl.shadowCubeIndex) * 6u + face;
+            float4x4 faceVP = pointShadowFaces[slice];
+            float4 lsPos = faceVP * float4(worldPos, 1.0);
+            if (lsPos.w > 0.0) {
+                float2 lsNDC = lsPos.xy / lsPos.w;
+                float  lsZ   = lsPos.z  / lsPos.w;
+                float2 shadowUV = float2(lsNDC.x * 0.5 + 0.5,
+                                         -lsNDC.y * 0.5 + 0.5);
+                bool inFrustum = lsZ > 0.0 && lsZ < 1.0
+                              && shadowUV.x >= 0.0 && shadowUV.x <= 1.0
+                              && shadowUV.y >= 0.0 && shadowUV.y <= 1.0;
+                if (inFrustum) {
+                    float ref = lsZ - frame.pointShadowBias;
+                    float texel = 1.0 / 512.0;
+                    float sum = 0.0;
+                    for (int oy = -1; oy <= 1; ++oy) {
+                        for (int ox = -1; ox <= 1; ++ox) {
+                            sum += pointShadowAtlas.sample_compare(
+                                pointShadowSampler,
+                                shadowUV + float2(float(ox), float(oy)) * texel,
+                                slice,
+                                ref);
+                        }
+                    }
+                    visibility = sum * (1.0 / 9.0);
+                }
+            }
+        }
+        if (visibility <= 0.0) continue;
+        pointSum += brdf(N, V, L, albedo, metallic, roughness, pl.color * atten * visibility);
     }
 
     // Spot lights — same distance attenuation as point lights, multiplied

@@ -534,6 +534,32 @@ public final class IlluminatoramaRenderer {
     /// beyond this index render as direct-only (no shadow modulation).
     public var spotShadowMaxCount: Int { spotShadowAtlasCapacity }
 
+    // ── Point-light cubemap shadows (opt-in, additive) ────────────────
+    /// Master enable for the point-light depth-cubemap shadow pass. Default
+    /// OFF — no shadow textures are allocated, no depth is rendered, and the
+    /// lighting kernel takes the exact pre-change point-light path, so every
+    /// scene that never flips this (Visualizer) is byte-identical. Turn on
+    /// per-scene (Daydream) and additionally set `castsShadow` on the point
+    /// lights you want shadowed (default off per light too).
+    ///
+    /// Mechanism: for each shadow-casting point light the renderer renders SIX
+    /// 90°-perspective depth maps (the faces of a cube centred on the bulb) into
+    /// a shared depth atlas, then the deferred lighting kernel projects each
+    /// fragment through the dominant cube face and PCF-compares — so the bulb is
+    /// blocked by geometry, PASSES through openings (doorways), and casts
+    /// intra-room object shadows. Because it's a REAL depth occlusion, a shadowed
+    /// light no longer needs (and must not use) the cheap position-based room
+    /// layer mask — see `pointShadowSupersedesLayerMask`.
+    public var pointShadowsEnabled: Bool = false
+    /// Constant depth bias subtracted from the point light-space depth before the
+    /// PCF compare (same role as `spotShadowBias`). Combats acne on lit surfaces.
+    public var pointShadowBias: Float = 0.0006
+    /// Up to this many shadow-casting point lights get a depth cube each frame
+    /// (the N nearest to the camera; the rest fall back to unshadowed). Bounded by
+    /// the cube atlas capacity. 4 cubes × 6 faces × 512² × 4 B ≈ 24 MB (allocated
+    /// lazily only when `pointShadowsEnabled` first turns on).
+    public var pointShadowMaxCount: Int { pointShadowCubeCapacity }
+
     // ── Phase 4.15: Tonemap + IBL saturation parity ──────────────────
     /// Post-tonemap saturation multiplier. Narkowicz's fitted ACES curve
     /// compresses midtone chroma a little harder than SCN's HDR chain, so a
@@ -1067,6 +1093,21 @@ public final class IlluminatoramaRenderer {
     private let spotShadowAtlasCapacity: Int = 8
     private let spotShadowMapResolution: Int = 512
     private var cascadeSplitsView: SIMD4<Float> = .zero
+
+    // ── Point-light cubemap shadows (lazy — allocated on first enable) ─────────
+    // A single depth 2D-array texture holds every shadowed point light's cube as
+    // 6 consecutive slices (light c, face f → slice c*6 + f). Reusing a 2D-array
+    // (not a native cube) lets the depth PASS reuse the exact spot-shadow slice
+    // mechanism, and the SAMPLE reuse the exact matrix-projection + PCF path
+    // (per-face perspective VP, dominant-axis face select). Nil until the first
+    // frame `pointShadowsEnabled` is true → Visualizer never allocates it.
+    private var pointShadowAtlas: MTLTexture?
+    /// The 6 face view-projection matrices per shadow-casting light, uploaded to
+    /// the GPU so the kernel can project a fragment into the chosen face. Layout:
+    /// `[cube0.face0 … cube0.face5, cube1.face0 …]`. Grown with the atlas.
+    private var pointShadowFaceBuffer: MTLBuffer?
+    private let pointShadowCubeCapacity: Int = 4      // N nearest shadow-casting lights
+    private let pointShadowMapResolution: Int = 512
 
     // Phase 2.7 — motion vectors + TAA.
     // Velocity is the 4th G-buffer color attachment; we ping-pong two HDR
@@ -6242,6 +6283,10 @@ public final class IlluminatoramaRenderer {
         // disabled (cheap CPU math); the shadow PASS gates on
         // `spotShadowsEnabled` to skip the expensive depth render.
         updateSpotShadows()
+        // Point-light cube shadows: assign cube pages + compute the 6 face VPs.
+        // No-op (clears indices to -1) when the feature is off, so the uploaded
+        // buffer never carries a stale page. Cheap CPU math; the depth PASS gates.
+        updatePointShadows()
         uploadFrameUniforms()
         uploadInstances()
         uploadPointLights()
@@ -6300,6 +6345,7 @@ public final class IlluminatoramaRenderer {
 
         encodeShadowPasses(cb)
         encodeSpotShadowPasses(cb)
+        encodePointShadowPasses(cb)
         encodeGBufferPass(cb)
         encodeIBLBakeIfNeeded(cb)
         encodeDDGIFrame(cb)
@@ -6805,6 +6851,164 @@ public final class IlluminatoramaRenderer {
                 )
             }
             enc.endEncoding()
+        }
+    }
+
+    // ── Point-light cubemap shadows ───────────────────────────────────────────
+    //
+    // The point-light analogue of `updateSpotShadows` + `encodeSpotShadowPasses`.
+    // A point light is omnidirectional, so one perspective shadow map can't cover
+    // it — instead we render SIX 90°-FOV depth maps, one per cube face (+X −X +Y
+    // −Y +Z −Z), into 6 consecutive slices of a shared depth atlas. The lighting
+    // kernel then picks the dominant-axis face from the light→fragment direction,
+    // projects the fragment through that face's VP, and PCF-compares — the same
+    // matrix-projection + hardware-compare the spot path uses, just with a face
+    // pick in front. Result: the bulb is occluded by real geometry (walls block,
+    // furniture casts shadows) yet light still POURS through an open doorway,
+    // because the doorway is a genuine gap the depth map records as "far".
+
+    /// The 6 cube-face look directions and their stable up vectors (RH). The up
+    /// for ±Y avoids the look-at degeneracy where forward ∥ up.
+    private static let cubeFaceDirs: [(fwd: SIMD3<Float>, up: SIMD3<Float>)] = [
+        (SIMD3( 1, 0, 0), SIMD3(0, 1, 0)),   // +X
+        (SIMD3(-1, 0, 0), SIMD3(0, 1, 0)),   // -X
+        (SIMD3( 0, 1, 0), SIMD3(0, 0, 1)),   // +Y
+        (SIMD3( 0,-1, 0), SIMD3(0, 0,-1)),   // -Y
+        (SIMD3( 0, 0, 1), SIMD3(0, 1, 0)),   // +Z
+        (SIMD3( 0, 0,-1), SIMD3(0, 1, 0)),   // -Z
+    ]
+
+    /// CPU step (mirrors `updateSpotShadows`): choose which point lights get a cube
+    /// (the N nearest the camera, capped at `pointShadowCubeCapacity`), stamp each
+    /// chosen light's `shadowCubeIndex`, and compute its 6 face view-projection
+    /// matrices into `pointShadowFaceBuffer`. Lights not chosen get `shadowCubeIndex
+    /// = -1` (kernel treats them as fully visible). A no-op that clears every index
+    /// to -1 when the feature is off, so a stale buffer is never sampled.
+    private func updatePointShadows() {
+        // Feature off (or no lazy resources yet) → force every light unshadowed.
+        guard pointShadowsEnabled else {
+            for i in pointLights.indices { pointLights[i].shadowCubeIndex = -1 }
+            return
+        }
+        ensurePointShadowResources()
+        guard let faceBuffer = pointShadowFaceBuffer else {
+            for i in pointLights.indices { pointLights[i].shadowCubeIndex = -1 }
+            return
+        }
+
+        // Rank the shadow-casting lights by camera distance and keep the nearest N.
+        let cam = camera.position
+        let casters = pointLights.indices
+            .filter { pointLights[$0].castsShadow != 0 }
+            .sorted { simd_distance(pointLights[$0].position, cam)
+                    < simd_distance(pointLights[$1].position, cam) }
+        let chosen = Array(casters.prefix(pointShadowCubeCapacity))
+
+        // Everyone starts unshadowed; chosen lights claim a cube page below.
+        for i in pointLights.indices { pointLights[i].shadowCubeIndex = -1 }
+
+        let faces = faceBuffer.contents().bindMemory(
+            to: simd_float4x4.self, capacity: pointShadowCubeCapacity * 6)
+        let near: Float = 0.05
+        for (cube, lightIdx) in chosen.enumerated() {
+            pointLights[lightIdx].shadowCubeIndex = Int32(cube)
+            let pos = pointLights[lightIdx].position
+            let far = max(0.5, pointLights[lightIdx].radius)
+            // 90° per face so the six frusta tile the full sphere with no gaps.
+            let proj = Self.perspectiveRH(fovY: .pi / 2, aspect: 1.0, near: near, far: far)
+            for f in 0..<6 {
+                let face = Self.cubeFaceDirs[f]
+                let view = Self.lookAtRH(eye: pos, target: pos + face.fwd, up: face.up)
+                faces[cube * 6 + f] = proj * view
+            }
+        }
+    }
+
+    /// Depth-only pass: render the scene from each chosen point light into its 6
+    /// cube-face slices. Reuses `shadowPipeline` + the exact instanced-draw loop
+    /// the spot path uses. Skips entirely when the feature is off, when nothing
+    /// claimed a cube, or when there are no occluders.
+    private func encodePointShadowPasses(_ cb: MTLCommandBuffer) {
+        guard pointShadowsEnabled, !instances.isEmpty,
+              let atlas = pointShadowAtlas, let faceBuffer = pointShadowFaceBuffer
+        else { return }
+        let cubeCount = pointLights.reduce(0) { $0 + (($1.shadowCubeIndex >= 0) ? 1 : 0) }
+        guard cubeCount > 0 else { return }
+
+        let faces = faceBuffer.contents().bindMemory(
+            to: simd_float4x4.self, capacity: pointShadowCubeCapacity * 6)
+        let instStride = MemoryLayout<IlluminatoramaInstance>.stride
+        for pl in pointLights where pl.shadowCubeIndex >= 0 {
+            let cube = Int(pl.shadowCubeIndex)
+            for f in 0..<6 {
+                let slice = cube * 6 + f
+                let pass = MTLRenderPassDescriptor()
+                pass.depthAttachment.texture = atlas
+                pass.depthAttachment.slice = slice
+                pass.depthAttachment.loadAction = .clear
+                pass.depthAttachment.storeAction = .store
+                pass.depthAttachment.clearDepth = 1.0
+
+                guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { continue }
+                enc.label = "Illuminatorama.pointShadow.c\(cube).f\(f)"
+                enc.setRenderPipelineState(shadowPipeline)
+                enc.setDepthStencilState(depthState)
+                // Back-face cast, same acne mitigation as the sun / spot maps.
+                enc.setCullMode(.front)
+                enc.setFrontFacing(.counterClockwise)
+
+                var lightVP = faces[slice]
+                enc.setVertexBytes(&lightVP, length: MemoryLayout<simd_float4x4>.stride, index: 3)
+                var shadowTime = time
+                enc.setVertexBytes(&shadowTime, length: MemoryLayout<Float>.stride, index: 4)
+
+                for group in meshGroups {
+                    guard let mesh = meshes[group.kind] else { continue }
+                    let off = instStride * group.start
+                    enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
+                    enc.setVertexBuffer(currentInstanceBuffer, offset: off, index: 2)
+                    enc.drawIndexedPrimitives(
+                        type: .triangle,
+                        indexCount: mesh.indexCount,
+                        indexType: mesh.indexType,
+                        indexBuffer: mesh.indexBuffer,
+                        indexBufferOffset: 0,
+                        instanceCount: group.count,
+                        baseVertex: 0,
+                        baseInstance: 0
+                    )
+                }
+                enc.endEncoding()
+            }
+        }
+    }
+
+    /// Lazily allocate the point-shadow depth atlas (6 slices per cube) + the
+    /// per-face matrix buffer the first time the feature is enabled. A no-op once
+    /// allocated. Never called on a Visualizer frame (feature stays off), so the
+    /// memory is only paid where the app opts in.
+    private func ensurePointShadowResources() {
+        if pointShadowAtlas == nil {
+            let d = MTLTextureDescriptor()
+            d.textureType = .type2DArray
+            d.pixelFormat = .depth32Float
+            d.width = pointShadowMapResolution
+            d.height = pointShadowMapResolution
+            d.arrayLength = pointShadowCubeCapacity * 6
+            d.usage = [.renderTarget, .shaderRead]
+            d.storageMode = .private
+            if let t = device.makeTexture(descriptor: d) {
+                t.label = "Illuminatorama.pointShadowAtlas"
+                pointShadowAtlas = t
+            }
+        }
+        if pointShadowFaceBuffer == nil {
+            if let b = device.makeBuffer(
+                length: MemoryLayout<simd_float4x4>.stride * pointShadowCubeCapacity * 6,
+                options: .storageModeShared) {
+                b.label = "Illuminatorama.pointShadowFaces"
+                pointShadowFaceBuffer = b
+            }
         }
     }
 
@@ -7820,6 +8024,11 @@ public final class IlluminatoramaRenderer {
         // `updateSpotShadows` only when `spotShadowsEnabled` is on AND
         // the spot is within atlas capacity).
         enc.setTexture(spotShadowAtlas, index: 13)
+        // Point-light cube depth atlas (6 slices/light). When the feature is off
+        // its `pointShadowAtlas` is nil → bind the always-allocated spot atlas as a
+        // same-type (depth2d_array) placeholder; the kernel never samples it because
+        // every point light's `shadowCubeIndex` is -1. When on, real cube depth.
+        enc.setTexture(pointShadowAtlas ?? spotShadowAtlas, index: 19)
         // Phase 3.4 — irradiance EMA cache. Previous = read, current = write.
         // When cache is disabled the kernel still writes current (fresh lookup),
         // so the toggle and bind are always active regardless of the flag.
@@ -7837,6 +8046,11 @@ public final class IlluminatoramaRenderer {
         enc.setBuffer(spotLightBuffer, offset: 0, index: 3)
         enc.setBuffer(areaLightBuffer, offset: 0, index: 4)
         enc.setBuffer(extraDirectionalBuffer, offset: 0, index: 5)
+        // Point-light cube-face view-projection matrices (6 per shadowed light).
+        // Placeholder-bound to `pointLightBuffer` when the feature is off / not yet
+        // allocated — never read, because the kernel only indexes it for lights with
+        // `shadowCubeIndex >= 0`, and those exist only when the feature is on.
+        enc.setBuffer(pointShadowFaceBuffer ?? pointLightBuffer, offset: 0, index: 6)
         dispatch(enc, pipeline: pipe, width: width, height: height)
         enc.endEncoding()
     }
@@ -8821,6 +9035,8 @@ public final class IlluminatoramaRenderer {
         // Phase 7 — opt-in anti-tiling. Clamp to [0,1]; 0 (default) makes the shader
         // take the plain single-sample path, so opted-out scenes are unchanged.
         u.antiTilingStrength = max(0, min(1, antiTilingStrength))
+        // Point-light cube shadow bias (0 when the feature is off ⇒ no behaviour change).
+        u.pointShadowBias = pointShadowsEnabled ? pointShadowBias : 0
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
 

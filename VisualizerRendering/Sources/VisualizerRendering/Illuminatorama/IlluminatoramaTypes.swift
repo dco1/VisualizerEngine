@@ -281,7 +281,12 @@ public struct IlluminatoramaFrameUniforms {
     // texture read, so opted-out scenes are byte-for-byte unchanged. Repurposes the
     // former `_padGrade0` slot (same 4 bytes, stride unchanged).
     public var antiTilingStrength: Float = 0
-    public var _padGrade1: Float = 0
+    // Point-light cubemap shadow depth bias (repurposes the former `_padGrade1`
+    // slot — same 4 bytes, stride unchanged). Only read by the lighting kernel for
+    // point lights with `shadowCubeIndex >= 0`; 0 for every scene that never enables
+    // point shadows, so the byte layout AND behaviour stay identical. Mirrors the
+    // Metal `FrameUniforms.pointShadowBias`.
+    public var pointShadowBias: Float = 0.0006
     public var _padGrade2: Float = 0
 }
 
@@ -344,13 +349,33 @@ public struct IlluminatoramaPointLight {
     /// Default `0xFFFFFFFF` ⇒ affects every fragment (byte-identical to the prior
     /// behaviour, so scenes that never touch it — Visualizer — are unchanged).
     public var layerMask: UInt32 = 0xFFFF_FFFF
+    // ── Point-light cubemap shadows (opt-in) ──────────────────────────────────
+    /// 1 ⇒ this point light casts a real depth-cubemap shadow (blocks at geometry,
+    /// passes through openings, casts intra-room object shadows). Default 0 ⇒ NO
+    /// shadow map rendered and the lighting kernel takes the exact pre-change path,
+    /// so every scene that never sets this (Visualizer) is byte-identical. Was the
+    /// former `_padPointShadow0` trailing slot; reinterpreted, so the struct stride
+    /// is unchanged. Mirrors the Metal `PointLight.castsShadow`.
+    public var castsShadow: UInt32 = 0
+    /// Cube-array index (set by the renderer each frame in `updatePointShadows`).
+    /// `< 0` ⇒ no cube page for this light this frame — the kernel treats it as fully
+    /// visible. The renderer assigns the first `pointShadowCubeCapacity` shadow-casting
+    /// lights a page; the rest fall back to unshadowed. Mirrors the Metal
+    /// `PointLight.shadowCubeIndex`. Default `-1`.
+    public var shadowCubeIndex: Int32 = -1
+    /// Two explicit pads so the struct closes on a 16-byte boundary (stride 48 → 48;
+    /// the base struct was 32 B + the layerMask cluster). Mirror the Metal padding.
+    public var _padPointShadow0: Int32 = 0
+    public var _padPointShadow1: Int32 = 0
 
     public init(position: SIMD3<Float>, radius: Float, color: SIMD3<Float>,
-                layerMask: UInt32 = 0xFFFF_FFFF) {
+                layerMask: UInt32 = 0xFFFF_FFFF,
+                castsShadow: Bool = false) {
         self.position = position
         self.radius = radius
         self.color = color
         self.layerMask = layerMask
+        self.castsShadow = castsShadow ? 1 : 0
     }
 }
 
