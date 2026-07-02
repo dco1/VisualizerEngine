@@ -276,7 +276,11 @@ public struct IlluminatoramaFrameUniforms {
     public var shadows: Float = 1.0
     public var highlights: Float = 1.0
     public var contrast: Float = 1.0
-    public var _padGrade0: Float = 0
+    // Phase 7 — opt-in hex-stochastic anti-tiling strength [0,1]. 0 = OFF (default):
+    // the G-buffer shader short-circuits every `sampleAtlasHex` to a single plain
+    // texture read, so opted-out scenes are byte-for-byte unchanged. Repurposes the
+    // former `_padGrade0` slot (same 4 bytes, stride unchanged).
+    public var antiTilingStrength: Float = 0
     public var _padGrade1: Float = 0
     public var _padGrade2: Float = 0
 }

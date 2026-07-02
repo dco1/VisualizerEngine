@@ -202,7 +202,13 @@ struct FrameUniforms {
     float    shadows;
     float    highlights;
     float    contrast;
-    float    _padGrade0;
+    // Phase 7 — opt-in hex-stochastic anti-tiling strength [0,1]. 0 = OFF (the
+    // DEFAULT): every `sampleAtlasHex` short-circuits to a single plain texture
+    // read, so the G-buffer is byte-for-byte identical to the pre-anti-tiling
+    // shader. >0 mixes in the 3-tap de-repeat blend. Repurposes the former
+    // `_padGrade0` slot — same 4 bytes, stride unchanged. Mirrors
+    // IlluminatoramaFrameUniforms.antiTilingStrength.
+    float    antiTilingStrength;
     float    _padGrade1;
     float    _padGrade2;
 };
@@ -615,9 +621,19 @@ static inline float2 hexHash2D(float2 p) {
                   float(iy & 0xFF) / 128.0f - 1.0f);
 }
 
+// `strength` gates the whole effect. When strength <= 0 (the DEFAULT for every
+// scene that never opts in) this returns EXACTLY `sampleAtlasAspect(atlas, s, uv,
+// slice, uvScale)` — the identical single texture read the pre-anti-tiling shader
+// did — so opted-out scenes (Visualizer) are byte-for-byte unchanged. For
+// strength in (0,1] the three-tap hex blend is mixed in by `strength`, so the
+// caller can dial the de-repetition from subtle to full.
 static inline float4 sampleAtlasHex(texture2d_array<float, access::sample> atlas,
                                      sampler s, float2 uv, uint slice,
-                                     const device float2* uvScale) {
+                                     const device float2* uvScale,
+                                     float strength) {
+    // Exact single-sample fast path — identical to sampleAtlasAspect, no extra taps.
+    float4 single = sampleAtlasAspect(atlas, s, uv, slice, uvScale);
+    if (strength <= 0.0f) { return single; }
     const float sq3over2 = 0.8660254f;         // sqrt(3)/2
     // Skew UV to triangular lattice: (u, v) → (u + v*0.5, v*sqrt(3)/2)
     float su = uv.x + uv.y * 0.5f;
@@ -652,13 +668,22 @@ static inline float4 sampleAtlasHex(texture2d_array<float, access::sample> atlas
     float4 c0 = sampleAtlasAspect(atlas, s, uv + h0, slice, uvScale);
     float4 c1 = sampleAtlasAspect(atlas, s, uv + h1, slice, uvScale);
     float4 c2 = sampleAtlasAspect(atlas, s, uv + h2, slice, uvScale);
-    return (c0 * p0 + c1 * p1 + c2 * p2) / pSum;
+    float4 hex = (c0 * p0 + c1 * p1 + c2 * p2) / pSum;
+    // Blend the de-repeated hex result toward the plain single sample by strength.
+    // strength==1 → full hex, strength==0 handled by the early-out above.
+    return mix(single, hex, saturate(strength));
 }
 
 fragment GBufferOut illumi_fs(
     VSOut                                       in              [[stage_in]],
     bool                                        frontFacing     [[front_facing]],
     const device Instance*                      instances       [[buffer(2)]],
+    // Phase 7 — per-frame uniforms, bound to the fragment stage so the G-buffer
+    // shader can read `antiTilingStrength` (the opt-in hex-stochastic de-repeat
+    // knob). Same buffer the vertex stage reads at buffer(1); default strength 0
+    // makes every hex sample fall through to the plain single texture read, so
+    // scenes that never opt in are byte-for-byte unchanged.
+    constant FrameUniforms&                     frame           [[buffer(1)]],
     // Phase 4.25 — per-slice UV scale for the two atlases (letterbox fill
     // fraction; (1,1) = square). Indexed by the instance's slice id; drives
     // `sampleAtlasAspect`. `float2` (8-byte stride) matches the host's
@@ -705,7 +730,8 @@ fragment GBufferOut illumi_fs(
         // decode), which slightly overshoots tangent-space magnitude at boundaries
         // but gives correct appearance after renormalize below.
         float4 nmSample = sampleAtlasHex(nonColorAtlas, texSampler, in.uv,
-                                         uint(inst.normalTextureSlice), nonColorUVScale);
+                                         uint(inst.normalTextureSlice), nonColorUVScale,
+                                         frame.antiTilingStrength);
         float3 tangentN = normalize(nmSample.xyz * 2.0 - 1.0);
         // Phase 7 detail normal — blended on top of the macro normal at
         // higher UV frequency (pores, weave, grain). Uses overlay-normal
@@ -731,7 +757,8 @@ fragment GBufferOut illumi_fs(
         // letterbox padding per-slice; the offset just shifts into a neighbouring
         // infinitely-tiling region, so aspect is preserved.
         float4 tx = sampleAtlasHex(albedoAtlas, texSampler, in.uv,
-                                    uint(inst.albedoTextureSlice), albedoUVScale);
+                                    uint(inst.albedoTextureSlice), albedoUVScale,
+                                    frame.antiTilingStrength);
         albedo = tx.rgb;
     }
     // Phase 4.17 — modulate albedo by per-vertex color (default white,
@@ -758,7 +785,8 @@ fragment GBufferOut illumi_fs(
         // Hex-stochastic roughness — same three-cell blend as albedo so
         // roughness variation doesn't lag the albedo tile seam.
         float4 tx = sampleAtlasHex(nonColorAtlas, texSampler, in.uv,
-                                    uint(inst.roughnessTextureSlice), nonColorUVScale);
+                                    uint(inst.roughnessTextureSlice), nonColorUVScale,
+                                    frame.antiTilingStrength);
         roughness = tx.g;
     }
 

@@ -559,6 +559,15 @@ public final class IlluminatoramaRenderer {
     public var highlights: Float = 1.0
     /// Contrast about mid-grey 0.18, ~0.7–1.3. 1.0 = no-op. Post-tonemap curve.
     public var contrast: Float = 1.0
+    /// Opt-in hex-stochastic anti-tiling strength [0,1]. **Default 0 = OFF**, which
+    /// is a hard no-op: the G-buffer shader short-circuits every textured sample to a
+    /// single plain read, so scenes that leave this at 0 render byte-for-byte
+    /// identical to the pre-anti-tiling engine. Raise it (e.g. Daydream Home's large
+    /// tiled floors/walls) to break the visible tile-repeat on big planar surfaces —
+    /// three stochastically-offset lattice taps blended with variance-preserving
+    /// cubic weights, applied consistently across albedo / roughness / normal so the
+    /// channels stay registered. 1.0 = full de-repeat; intermediate values crossfade.
+    public var antiTilingStrength: Float = 0
     /// Saturation boost on the IBL diffuse term in the lighting kernel.
     /// Procedural-gradient backdrops (HotdogDrop+'s peach→tan, every
     /// `+`-tier sky) integrate to a near-grey irradiance, and the
@@ -7239,6 +7248,10 @@ public final class IlluminatoramaRenderer {
         // `illumi_fs`'s signature.
         enc.setFragmentBuffer(albedoAtlas.uvScaleBuffer, offset: 0, index: 3)
         enc.setFragmentBuffer(nonColorAtlas.uvScaleBuffer, offset: 0, index: 5)
+        // Phase 7 — bind the per-frame uniforms to the FRAGMENT stage too (they were
+        // already bound to vertex at buffer(1)) so `illumi_fs` can read
+        // `antiTilingStrength`. Pass-wide (constant across the draw loop).
+        enc.setFragmentBuffer(frameUniformBuffer, offset: 0, index: 1)
         // Phase 4.12 — instanced draws via the recipe built in
         // `uploadInstances`. One draw call per mesh kind, with the
         // current/previous instance buffer offsets pointed at the start
@@ -8778,6 +8791,9 @@ public final class IlluminatoramaRenderer {
         u.shadows = shadows
         u.highlights = highlights
         u.contrast = contrast
+        // Phase 7 — opt-in anti-tiling. Clamp to [0,1]; 0 (default) makes the shader
+        // take the plain single-sample path, so opted-out scenes are unchanged.
+        u.antiTilingStrength = max(0, min(1, antiTilingStrength))
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
 
