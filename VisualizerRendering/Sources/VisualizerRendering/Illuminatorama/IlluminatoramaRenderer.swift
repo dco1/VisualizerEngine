@@ -6086,6 +6086,53 @@ public final class IlluminatoramaRenderer {
         }
     }
 
+    /// Test / determinism hook — force every temporal accumulator and the
+    /// auto-exposure EMA back to a cold-start state on the **next** frame,
+    /// exactly as a fresh renderer would begin.
+    ///
+    /// Why this exists: `IlluminatoramaRenderer(engine: .shared)` is a
+    /// process-global engine. Its TAA history, SSAO/SSR/RT-GI temporal
+    /// accumulators, post-FX easing state, and auto-exposure EMA all persist
+    /// across renderer instances, so absolute-threshold GPU tests that build a
+    /// fresh bridge can flake by suite position (the previous test's converged
+    /// history bleeds into the next test's first frame). Calling this between
+    /// tests makes each test start from the same cold history, restoring
+    /// determinism.
+    ///
+    /// It is **purely additive**: it does nothing to normal per-frame rendering
+    /// unless explicitly invoked, so production callers (e.g. Visualizer) are
+    /// unaffected. Under the hood it composes the *same* reset paths the engine
+    /// already runs on a resize (the four `…NeedsFirstFrame` flags, which make
+    /// the next frame reproject against nothing), re-seeds the GPU
+    /// `ExposureState` buffer to its constructor cold-start values, and clears
+    /// the host-side post-FX easing / exposure-tick timers so the next frame
+    /// snaps to targets rather than gliding from stale ones.
+    public func resetTemporalHistory() {
+        // Temporal reprojection passes: reproject against nothing next frame,
+        // identical to the post-resize reset above.
+        taaNeedsFirstFrame  = true
+        aoNeedsFirstFrame   = true
+        ssrNeedsFirstFrame  = true
+        rtGINeedsFirstFrame = true
+
+        // Auto-exposure EMA — re-seed the GPU ExposureState buffer to the exact
+        // cold-start values written once in the constructor:
+        //   [prevTargetLogLum = -2.0, smoothedExposure = 1.0,
+        //    newTargetLogLum = -2.0, deltaTime = 1/60].
+        let initialExposureState: [Float] = [-2.0, 1.0, -2.0, 1.0 / 60.0]
+        memcpy(exposureBuffer.contents(), initialExposureState,
+               MemoryLayout<Float>.stride * initialExposureState.count)
+
+        // Host-side post-FX easing: clear the tick timer so the next
+        // `advancePostFXEasing` sees dt == 0 → k == 1 and snaps every eased
+        // value to its current target (no startup glide from stale eased state).
+        lastPostFXEaseTime   = 0
+        // Re-seed the self-timed exposure/particle tick clocks to now so the
+        // first post-reset frame reports a sane dt rather than a huge gap.
+        lastExposureTickTime = CACurrentMediaTime()
+        lastParticleTickTime = CACurrentMediaTime()
+    }
+
     /// Map an output size + scale to the internal render-target size,
     /// rounding to multiples of 2 so the half-res bloom / AO textures
     /// don't end up off-by-one on odd output dimensions.
