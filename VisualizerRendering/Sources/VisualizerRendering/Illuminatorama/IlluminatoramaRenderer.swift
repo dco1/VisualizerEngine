@@ -1947,6 +1947,16 @@ public final class IlluminatoramaRenderer {
     private static let rtMaxInstancesForLiveRT: Int = 2048
     private static let rtMaxMeshGroupsForLiveRT: Int = 128
     private static let rtMaxTrianglesForLiveRT: Int = 150_000
+    /// Triangle cap for the GLASS-ONLY TLAS (AAA glass opted in, but full-scene RT
+    /// lighting is OFF). The strict 150k cap above is sized so a per-pixel RT
+    /// lighting/GI pass stays sub-frame — but a glass-only TLAS is traced by ONLY
+    /// the handful of glass fragments in frame, so the same opaque geometry is far
+    /// cheaper to carry. An architectural interior (walls/floor/ceiling/furniture +
+    /// a lawn's worth of ground triangles) routinely lands in the 150k–600k range;
+    /// this higher ceiling lets its windows refract the real room without tripping
+    /// the hang-guard. Still bounded so a pathological scene auto-disables rather
+    /// than stalling the first BLAS build. Only consulted on the glass-only path.
+    private static let rtMaxTrianglesForGlassOnlyRT: Int = 1_200_000
 
     /// Surface-cache (P1c) caps for the TLAS path. The cache allocates one
     /// per-triangle micro-card over the INSTANCE-EXPANDED soup (count =
@@ -4885,16 +4895,22 @@ public final class IlluminatoramaRenderer {
             glassInstCount += insts.count
             if let m = meshes[kind] { estTriangles += m.indexCount / 3 }
         }
+        // A glass-only TLAS (glass opted in, full-scene RT lighting off) traces from
+        // only the glass fragments, so it carries a much higher triangle ceiling than
+        // the per-pixel RT-lighting path — an interior with a lawn otherwise trips the
+        // strict cap and its windows silently drop to the flat fallback.
+        let triCap = extractedRT ? Self.rtMaxTrianglesForLiveRT
+                                 : Self.rtMaxTrianglesForGlassOnlyRT
         if instances.count + glassInstCount > Self.rtMaxInstancesForLiveRT
             || meshGroups.count > Self.rtMaxMeshGroupsForLiveRT
-            || estTriangles > Self.rtMaxTrianglesForLiveRT {
+            || estTriangles > triCap {
             rtAutoDisabled = true
             rtTLASActive = false
             Self.log.warning("""
                 Illuminatorama RT auto-disabled — scene too heavy for live-loop \
                 RT (\(self.instances.count) instances, \(self.meshGroups.count) mesh \
                 groups, ~\(estTriangles) tris; caps \
-                \(Self.rtMaxInstancesForLiveRT)/\(Self.rtMaxMeshGroupsForLiveRT)/\(Self.rtMaxTrianglesForLiveRT)). \
+                \(Self.rtMaxInstancesForLiveRT)/\(Self.rtMaxMeshGroupsForLiveRT)/\(triCap)). \
                 Falling back to non-RT.
                 """)
             return
