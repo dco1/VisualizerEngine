@@ -464,9 +464,14 @@ public struct IlluminatoramaInstance {
     // `modelMatrix`, so no extra per-instance pivot data), then lifts it by jostle.
     // `swayMode 0` is a hard no-op, so every instance that doesn't opt in is
     // untouched. New 16-byte cluster (offsets 224-239): stride 224 → 240.
-    /// Sway kind: 0 none · 1 bottom-pivot lean (books, upright shelf contents).
+    /// Sway kind: 0 none · 1 bottom-pivot lean (books, upright shelf contents) ·
+    /// 2 top-pivot pendulum (a hanging pendant: rigid rotation about the model origin —
+    /// the ceiling anchor — self-oscillating from the frame time; see `applySway` in
+    /// Illuminatorama.metal).
     public var swayMode: Int32 = 0
-    /// Lean angle (radians) about the object's local-Z, pivoting at its base.
+    /// Mode 1: static lean angle (radians) about local-Z, pivoting at the base.
+    /// Mode 2: pendulum AMPLITUDE (max swing, radians) — the shader animates the swing
+    /// from the frame time, so the host sets this once (no per-frame drive).
     public var swayLean: Float = 0
     /// Vertical pop (metres) added in world space — a knock hops the object up.
     public var swayJostle: Float = 0

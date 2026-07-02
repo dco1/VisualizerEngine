@@ -6585,6 +6585,10 @@ public final class IlluminatoramaRenderer {
             enc.setVertexBytes(&lightVP,
                                length: MemoryLayout<simd_float4x4>.stride,
                                index: 3)
+            // Self-oscillating sway (swayMode 2) reads time so a swinging pendant casts
+            // its swung shadow in phase with the visible mesh; no-op for modes 0/1.
+            var shadowTime = time
+            enc.setVertexBytes(&shadowTime, length: MemoryLayout<Float>.stride, index: 4)
 
             // Phase 4.12 — instanced draw per mesh kind via the recipe
             // built in `uploadInstances`. Same win as the G-buffer pass:
@@ -6767,6 +6771,10 @@ public final class IlluminatoramaRenderer {
             enc.setVertexBytes(&lightVP,
                                length: MemoryLayout<simd_float4x4>.stride,
                                index: 3)
+            // Self-oscillating sway (swayMode 2) reads time so a swinging pendant casts
+            // its swung shadow in phase with the visible mesh; no-op for modes 0/1.
+            var shadowTime = time
+            enc.setVertexBytes(&shadowTime, length: MemoryLayout<Float>.stride, index: 4)
 
             // Phase 4.12 — instanced draw per mesh kind via the recipe
             // built in `uploadInstances`. Same win as the G-buffer pass:

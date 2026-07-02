@@ -299,8 +299,8 @@ struct Instance {
     int      highlight;   // 0 none · 1 selected (blue halo) · 2 hover (yellow halo)
     // Drag/impact sway — generic vertex-shader secondary motion (see applySway).
     // New 16-byte cluster (offsets 224-239): stride grows 224 → 240.
-    int      swayMode;    // 0 none · 1 bottom-pivot lean
-    float    swayLean;    // lean angle (radians) about the object's local-Z, pivoting at base
+    int      swayMode;    // 0 none · 1 bottom-pivot lean · 2 top-pivot pendulum (hanging)
+    float    swayLean;    // mode 1: static lean angle (rad); mode 2: pendulum amplitude (rad)
     float    swayJostle;  // vertical pop (metres), applied in world space
     float    _padSway0;
 };
@@ -396,15 +396,45 @@ static inline float3 applyTreeWind(float3 wp, float4 windAttr, float time,
 // box; lean axis = the object's local +Z in world (modelMatrix column 2). swayMode
 // 0 ⇒ identity, so every non-swaying instance is an exact no-op.
 //
+// swayMode reference:
+//   0 · none                — hard no-op (all vegetation instances that don't opt in).
+//   1 · bottom-pivot lean   — rigid rotation about the box BASE (object y=-0.5) by the
+//                             host-supplied static `lean` angle (books, upright shelf
+//                             contents, dragged/knocked props). `lean` IS the angle.
+//   2 · top-pivot pendulum  — rigid rotation about the model ORIGIN (object y=0), for a
+//                             HANGING object (ceiling pendant). The pendant mesh is
+//                             authored with its ceiling anchor at object y=0 and its body
+//                             hanging DOWN into −Y, and it's placed by an unscaled matrix,
+//                             so object y=0 is exactly the ceiling attach point — the
+//                             pivot. Self-oscillates in the shader: angle = `lean` *
+//                             sin(time·ω + phase), so `lean` here is the AMPLITUDE (max
+//                             swing, radians) and the host sets it ONCE (static
+//                             per-instance) — no per-frame drive. Phase is derived from
+//                             the pivot's world XZ so neighbouring pendants swing out of
+//                             step. Displacement is 0 at the top anchor and grows toward
+//                             the hanging bottom (pivot about the top) — the inverse of
+//                             mode 1 (which pivots at the box base y=-0.5).
+//
 // Returns the rotated world position; `worldN`/`worldT` are rotated in place by the
 // same rigid rotation so lighting/normal-mapping track the lean.
 static inline float3 applySway(float3 wp, float4x4 model, int mode,
-                               float lean, float jostle,
+                               float lean, float jostle, float time,
                                thread float3& worldN, thread float3& worldT) {
     if (mode == 0) return wp;
-    float3 pivot = (model * float4(0.0, -0.5, 0.0, 1.0)).xyz;   // box base centre (object y=-0.5)
-    float3 axis  = normalize((model * float4(0.0, 0.0, 1.0, 0.0)).xyz);  // local +Z in world
-    float  c = cos(lean), s = sin(lean);
+    // Mode 1 pivots at the box base (y=-0.5) and applies `lean` directly. Mode 2 pivots
+    // at the model origin (y=0) — the hanging pendant's ceiling anchor — and
+    // self-oscillates `lean` (as amplitude) from `time`.
+    float  pivotY = (mode == 2) ? 0.0 : -0.5;
+    float3 pivot  = (model * float4(0.0, pivotY, 0.0, 1.0)).xyz;
+    float3 axis   = normalize((model * float4(0.0, 0.0, 1.0, 0.0)).xyz);  // local +Z in world
+    float  angle  = lean;
+    if (mode == 2) {
+        // Gentle pendulum ~0.42 Hz (ω ≈ 2.65 rad/s); per-instance phase from the top
+        // anchor's world XZ so a row of pendants doesn't swing in lock-step.
+        float phase = pivot.x * 1.7 + pivot.z * 2.3;
+        angle = lean * sin(time * 2.65 + phase);
+    }
+    float  c = cos(angle), s = sin(angle);
     // Rodrigues rotation of (wp - pivot) about `axis`, then restore pivot.
     float3 r = wp - pivot;
     float3 rot = r * c + cross(axis, r) * s + axis * dot(axis, r) * (1.0 - c);
@@ -452,10 +482,13 @@ vertex VSOut illumi_vs(
     // track the lean. The previous frame gets LAST frame's sway (prevInst) so the
     // motion vector captures the swing (TAA/motion-blur correctness).
     worldP.xyz = applySway(worldP.xyz, inst.modelMatrix, inst.swayMode,
-                           inst.swayLean, inst.swayJostle, worldN, worldT);
+                           inst.swayLean, inst.swayJostle, frame.time, worldN, worldT);
     float3 prevN = worldN, prevT = worldT;   // throwaway: prev normal/tangent unused
+    // Prev frame uses the same `frame.time` as current (matching applyTreeWind above):
+    // during a settled headless capture time is frozen (static pose, no TAA smear); in
+    // the live app the per-frame swing delta is tiny, so the motion vector stays clean.
     prevWorldP.xyz = applySway(prevWorldP.xyz, prevInst.modelMatrix, prevInst.swayMode,
-                               prevInst.swayLean, prevInst.swayJostle, prevN, prevT);
+                               prevInst.swayLean, prevInst.swayJostle, frame.time, prevN, prevT);
 
     VSOut o;
     o.clipPos      = frame.viewProjection * worldP;
@@ -491,16 +524,19 @@ vertex float4 illumi_shadow_vs(
     uint                        iid       [[instance_id]],
     const device Vertex*        verts     [[buffer(0)]],
     const device Instance*      instances [[buffer(2)]],
-    constant float4x4&          lightVP   [[buffer(3)]]
+    constant float4x4&          lightVP   [[buffer(3)]],
+    constant float&             shadowTime [[buffer(4)]]
 ) {
     Vertex v = verts[vid];
     Instance inst = instances[iid];
     float4 worldP = inst.modelMatrix * float4(v.position, 1.0);
     // Match the visible pose: a swaying object casts its leaned shadow (no-op unless
     // swayMode != 0). Position-only — the depth pass needs no normal/tangent.
+    // `shadowTime` mirrors frame.time so a self-oscillating pendulum (swayMode 2) casts
+    // its swung shadow in phase with the visible mesh.
     float3 nDummy = float3(0.0), tDummy = float3(0.0);
     worldP.xyz = applySway(worldP.xyz, inst.modelMatrix, inst.swayMode,
-                           inst.swayLean, inst.swayJostle, nDummy, tDummy);
+                           inst.swayLean, inst.swayJostle, shadowTime, nDummy, tDummy);
     return lightVP * worldP;
 }
 
