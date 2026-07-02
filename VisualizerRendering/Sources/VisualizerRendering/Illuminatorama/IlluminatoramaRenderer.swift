@@ -1073,6 +1073,8 @@ public final class IlluminatoramaRenderer {
     // history textures so the TAA pass can read from one and write the
     // resolved current frame into the other.
     private var velocityTexture: MTLTexture
+    /// Light-layer G-buffer target (R32Uint) — see `Targets.layer`.
+    private var gbufferLayer: MTLTexture
     private var historyA: MTLTexture
     private var historyB: MTLTexture
     /// When true, historyA holds the previous frame's TAA output and we
@@ -2059,6 +2061,8 @@ public final class IlluminatoramaRenderer {
         pdesc.colorAttachments[2].pixelFormat = .rgba16Float
         // Phase 2.7 — velocity attachment (screen-space motion in UV space).
         pdesc.colorAttachments[3].pixelFormat = .rg16Float
+        // Light-layer attachment (R32Uint) — carries the per-fragment layer bitfield.
+        pdesc.colorAttachments[4].pixelFormat = .r32Uint
         pdesc.depthAttachmentPixelFormat = .depth32Float
         // No vertex descriptor — the shader reads from a device-buffer of
         // Vertex via [[vertex_id]]. Simpler than wiring a vertex descriptor
@@ -2080,6 +2084,7 @@ public final class IlluminatoramaRenderer {
             sqdesc.colorAttachments[1].pixelFormat = .rgba16Float
             sqdesc.colorAttachments[2].pixelFormat = .rgba16Float
             sqdesc.colorAttachments[3].pixelFormat = .rg16Float
+            sqdesc.colorAttachments[4].pixelFormat = .r32Uint
             sqdesc.depthAttachmentPixelFormat = .depth32Float
             self.superquadricImpostorPipeline =
                 try? device.makeRenderPipelineState(descriptor: sqdesc)
@@ -2693,6 +2698,7 @@ public final class IlluminatoramaRenderer {
         self.hdrCompositeTexture = t.hdrComposite
         self.rtDiffuseTexture    = t.rtDiffuse
         self.velocityTexture     = t.velocity
+        self.gbufferLayer        = t.layer
         self.historyA            = t.historyA
         self.historyB            = t.historyB
         self.bloomBrightHalf     = t.bloomBright
@@ -6034,6 +6040,7 @@ public final class IlluminatoramaRenderer {
             self.hdrCompositeTexture = t.hdrComposite
             self.rtDiffuseTexture    = t.rtDiffuse
             self.velocityTexture     = t.velocity
+            self.gbufferLayer        = t.layer
             self.historyA            = t.historyA
             self.historyB            = t.historyB
             self.bloomBrightHalf     = t.bloomBright
@@ -7229,6 +7236,14 @@ public final class IlluminatoramaRenderer {
         pass.colorAttachments[3].loadAction = .clear
         pass.colorAttachments[3].storeAction = .store
         pass.colorAttachments[3].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        // Light-layer target. Cleared to the ALL-BITS default (0xFFFFFFFF) so every
+        // sky / no-geometry pixel — and every instance that never sets a layer — is
+        // lit by every light exactly as before. The R32Uint clear reads its integer
+        // from clearColor.red.
+        pass.colorAttachments[4].texture = gbufferLayer
+        pass.colorAttachments[4].loadAction = .clear
+        pass.colorAttachments[4].storeAction = .store
+        pass.colorAttachments[4].clearColor = MTLClearColor(red: Double(UInt32.max), green: 0, blue: 0, alpha: 0)
         pass.depthAttachment.texture = depthTexture
         pass.depthAttachment.loadAction = .clear
         pass.depthAttachment.storeAction = .store
@@ -7812,6 +7827,10 @@ public final class IlluminatoramaRenderer {
         enc.setTexture(irrCacheCurrent,  index: 15)
         enc.setTexture(ltcMatTexture, index: 16)
         enc.setTexture(ltcMagTexture, index: 17)
+        // Light-layer G-buffer target — per-fragment layer bitfield the kernel
+        // masks each light against. When no scene sets layers this reads all-bits
+        // everywhere, so every light passes the mask (no behaviour change).
+        enc.setTexture(gbufferLayer, index: 18)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
         enc.setBuffer(pointLightBuffer, offset: 0, index: 1)
         enc.setBuffer(ddgiUniformBuffer, offset: 0, index: 2)
@@ -8955,6 +8974,11 @@ public final class IlluminatoramaRenderer {
         var rtDiffuse: MTLTexture    // full-res RT diffuse (shadow+GI) pre-denoise
         // Phase 2.7
         var velocity: MTLTexture
+        // Light-layer G-buffer target (R32Uint). Carries each fragment's `layer`
+        // bitfield so the deferred lighting kernel can mask per-room lights. Cleared
+        // to 0xFFFFFFFF (sky/no-geometry) — the all-bits default means no scene that
+        // leaves layers/masks untouched sees any change.
+        var layer: MTLTexture
         var historyA: MTLTexture
         var historyB: MTLTexture
         var bloomBright: MTLTexture
@@ -9307,6 +9331,12 @@ public final class IlluminatoramaRenderer {
         let velocity = try make(label: "Illuminatorama.velocity",
                                 format: .rg16Float, w: internalW, h: internalH,
                                 usage: [.renderTarget, .shaderRead])
+        // Light-layer target — R32Uint so the full 32-bit bitfield round-trips
+        // exactly (no half-float rounding). Written by the G-buffer fragment
+        // shaders, read by the lighting kernel at [[texture(18)]].
+        let layer = try make(label: "Illuminatorama.gbuffer.layer",
+                             format: .r32Uint, w: internalW, h: internalH,
+                             usage: [.renderTarget, .shaderRead])
         let historyA = try make(label: "Illuminatorama.historyA",
                                 format: .rgba16Float, w: internalW, h: internalH,
                                 usage: [.shaderRead, .shaderWrite])
@@ -9401,7 +9431,7 @@ public final class IlluminatoramaRenderer {
         return Targets(
             albedoMet: am, normalRgh: nr, emission: em, depth: depth,
             hdr: hdr, ao: ao, hdrComposite: hdrComposite, rtDiffuse: rtDiffuse,
-            velocity: velocity, historyA: historyA, historyB: historyB,
+            velocity: velocity, layer: layer, historyA: historyA, historyB: historyB,
             bloomBright: bb, bloomBlurH: bh, bloomBlurV: bv,
             ldr: ldr,
             aoFiltered: aoFiltered, aoHistoryA: aoHistA, aoHistoryB: aoHistB,

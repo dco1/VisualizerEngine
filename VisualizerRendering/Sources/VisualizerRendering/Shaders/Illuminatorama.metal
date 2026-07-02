@@ -225,7 +225,11 @@ struct PointLight {
     float3 position;
     float  radius;
     float3 color;
-    float  _pad;
+    // Light-layer mask (was `_pad`). A light contributes to a fragment only when
+    // (light.layerMask & fragment.layer) != 0. Default 0xFFFFFFFF ⇒ affects every
+    // fragment (byte-identical to the pre-mask behaviour). Reinterpreted from the
+    // former float pad, so the struct stride is unchanged.
+    uint   layerMask;
 };
 
 // Rectangular area light (#60 task 5). Mirror of Swift IlluminatoramaAreaLight.
@@ -251,7 +255,10 @@ struct SpotLight {
     // spot contributes as fully visible.
     float4x4 shadowMatrix;
     int      shadowSliceIndex;
-    int      _padSpot0;
+    // Light-layer mask (was `_padSpot0`). Same masking rule as PointLight; default
+    // 0xFFFFFFFF ⇒ affects every fragment. Reinterpreted from a former int pad, so
+    // the struct stride is unchanged.
+    uint     layerMask;
     int      _padSpot1;
     int      _padSpot2;
 };
@@ -302,7 +309,12 @@ struct Instance {
     int      swayMode;    // 0 none · 1 bottom-pivot lean · 2 top-pivot pendulum (hanging)
     float    swayLean;    // mode 1: static lean angle (rad); mode 2: pendulum amplitude (rad)
     float    swayJostle;  // vertical pop (metres), applied in world space
-    float    _padSway0;
+    // Light-layer bitfield (was `_padSway0`). Written into the gLayer G-buffer
+    // target by the fragment shader; the deferred lighting kernel masks each light
+    // by (light.layerMask & fragment.layer). Default 0xFFFFFFFF ⇒ every light
+    // affects this instance (byte-identical to pre-mask behaviour). Reinterpreted
+    // from the former float pad, so the struct stride stays 240.
+    uint     layer;
 };
 
 struct Vertex {
@@ -331,6 +343,9 @@ struct VSOut {
     float3 worldNormal;
     float2 uv;
     uint   instanceID   [[flat]];
+    // Light-layer bitfield, forwarded flat from the instance so the G-buffer
+    // fragment can write it into the gLayer target. Default 0xFFFFFFFF.
+    uint   layer        [[flat]];
     // Phase 2.7 — clip-space positions for motion-vector reconstruction.
     // We pass both the current and previous clip-space positions explicitly
     // (rather than reading [[position]] in the fragment, which is post-divide
@@ -496,6 +511,7 @@ vertex VSOut illumi_vs(
     o.worldNormal  = worldN;
     o.uv           = v.uv;
     o.instanceID   = iid;
+    o.layer        = inst.layer;
     o.currentClip  = o.clipPos;
     o.previousClip = frame.previousViewProjection * prevWorldP;
     o.worldTangent = float4(worldT, v.tangent.w);
@@ -510,6 +526,11 @@ struct GBufferOut {
     // Phase 2.7 — screen-space motion vector (current_uv - previous_uv), in
     // UV units (range typically ±0.5). RG16Float gives plenty of precision.
     half2 velocity         [[color(3)]];
+    // Light-layer bitfield (R32Uint target). Read by the deferred lighting kernel
+    // to mask per-room lights. Cleared to 0xFFFFFFFF for sky/no-geometry pixels, so
+    // a scene that never sets a layer (all instances default 0xFFFFFFFF) writes
+    // 0xFFFFFFFF everywhere ⇒ every light passes the mask ⇒ byte-identical.
+    uint  layer            [[color(4)]];
 };
 
 // ── Shadow depth pass (Phase 2.5) ────────────────────────────────────────────
@@ -1413,6 +1434,7 @@ fragment GBufferOut illumi_fs(
     float2 prevNDC = in.previousClip.xy / in.previousClip.w;
     float2 velocityUV = (currNDC - prevNDC) * float2(0.5, -0.5);
     o.velocity        = half2(velocityUV);
+    o.layer           = in.layer;   // light-layer bitfield (default 0xFFFFFFFF)
     return o;
 }
 
@@ -1577,6 +1599,7 @@ struct SQImpostorFSOut {
     half4 normalRoughness  [[color(1)]];
     half4 emission         [[color(2)]];
     half2 velocity         [[color(3)]];
+    uint  layer            [[color(4)]];   // light-layer bitfield (default 0xFFFFFFFF)
     float depth            [[depth(less)]];
 };
 
@@ -1629,6 +1652,7 @@ fragment SQImpostorFSOut illumi_superquadric_impostor_fs(
     o.normalRoughness = half4(half(oct.x), half(oct.y), half(inst.roughness), 1.0h + half(inst.anisotropy));
     o.emission        = half4(half3(inst.emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -inst.sheen));
     o.velocity        = half2(velUV);
+    o.layer           = inst.layer;   // light-layer bitfield (default 0xFFFFFFFF)
     o.depth           = curClip.z / curClip.w;   // Metal NDC z ∈ [0,1]
     return o;
 }
@@ -2563,6 +2587,11 @@ kernel void illumi_lighting(
     // #60 task 5 increment 2 — LTC area-light specular LUTs (Minv + magnitude).
     texture2d<float, access::sample>        ltcMat          [[texture(16)]],
     texture2d<float, access::sample>        ltcMag          [[texture(17)]],
+    // Light-layer G-buffer target (R32Uint). Cleared to 0xFFFFFFFF for sky pixels;
+    // each instance writes its `layer` bitfield here. A light contributes only when
+    // (light.layerMask & fragLayer) != 0. When the host leaves every instance and
+    // light at the default 0xFFFFFFFF the mask is always non-zero ⇒ no change.
+    texture2d<uint,  access::read>          gLayer          [[texture(18)]],
     constant FrameUniforms&                 frame           [[buffer(0)]],
     const device PointLight*                pointLights     [[buffer(1)]],
     constant DDGIUniforms&                  ddgi            [[buffer(2)]],
@@ -2601,6 +2630,10 @@ kernel void illumi_lighting(
     float3 N         = octDecode(float2(nrH.rg));
     float  roughness = max(0.045, float(nrH.b));
     float3 emission  = float3(emH.rgb);
+    // Light-layer bitfield for this fragment. Default (host never set a layer)
+    // reads 0xFFFFFFFF, so (light.layerMask & fragLayer) is always non-zero below
+    // ⇒ every light contributes exactly as before.
+    uint   fragLayer = gLayer.read(gid).r;
 
     float3 worldPos = worldPosFromDepth(ndc, depth, frame.invViewProjection);
     float3 V = normalize(frame.cameraWorldPos - worldPos);
@@ -2690,6 +2723,9 @@ kernel void illumi_lighting(
     // synthesised emissive-as-light points from the extractor, Phase 4.27.)
     for (uint i = 0; i < frame.pointLightCount; ++i) {
         PointLight pl = pointLights[i];
+        // Light-layer mask: skip lights that don't share a bit with this fragment's
+        // layer. Default 0xFFFFFFFF on both sides ⇒ always passes (no change).
+        if ((pl.layerMask & fragLayer) == 0u) continue;
         float3 toLight = pl.position - worldPos;
         float  dist    = length(toLight);
         if (dist > pl.radius) continue;
@@ -2711,6 +2747,8 @@ kernel void illumi_lighting(
                                         address::clamp_to_edge);
     for (uint i = 0; i < frame.spotLightCount; ++i) {
         SpotLight sl = spotLights[i];
+        // Light-layer mask (same rule as point lights). Default all-bits ⇒ passes.
+        if ((sl.layerMask & fragLayer) == 0u) continue;
         float3 toLight = sl.position - worldPos;
         float  dist    = length(toLight);
         if (dist > sl.radius) continue;
@@ -5747,7 +5785,7 @@ kernel void bulbs_write_pointlights(
     pl.position = bulbPos[i].xyz;
     pl.radius   = U.lightRadius;
     pl.color    = c * U.gain;
-    pl._pad     = 0.0;
+    pl.layerMask = 0xFFFFFFFFu;   // all-bits: GPU-synthesised bulb lights affect every layer
     outLights[U.lightOffset + slot] = pl;
 }
 

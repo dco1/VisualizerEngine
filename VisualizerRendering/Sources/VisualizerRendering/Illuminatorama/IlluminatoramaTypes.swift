@@ -339,12 +339,18 @@ public struct IlluminatoramaPointLight {
     public var position: SIMD3<Float>
     public var radius: Float
     public var color: SIMD3<Float>           // pre-multiplied intensity
-    public var _pad: Float = 0
+    /// Light-layer mask (mirrors the Metal `PointLight.layerMask`, was `_pad`). A
+    /// light contributes to a fragment only when `(layerMask & instance.layer) != 0`.
+    /// Default `0xFFFFFFFF` ⇒ affects every fragment (byte-identical to the prior
+    /// behaviour, so scenes that never touch it — Visualizer — are unchanged).
+    public var layerMask: UInt32 = 0xFFFF_FFFF
 
-    public init(position: SIMD3<Float>, radius: Float, color: SIMD3<Float>) {
+    public init(position: SIMD3<Float>, radius: Float, color: SIMD3<Float>,
+                layerMask: UInt32 = 0xFFFF_FFFF) {
         self.position = position
         self.radius = radius
         self.color = color
+        self.layerMask = layerMask
     }
 }
 
@@ -375,21 +381,26 @@ public struct IlluminatoramaSpotLight {
     /// the renderer based on the spot's position in the array and
     /// `spotShadowAtlasCapacity`.
     public var shadowSliceIndex: Int32 = -1
-    /// Three explicit pads so the struct closes on a 16-byte boundary.
+    /// Light-layer mask (mirrors the Metal `SpotLight.layerMask`, was `_padSpot0`).
+    /// Same masking rule as `IlluminatoramaPointLight`. Default `0xFFFFFFFF` ⇒ affects
+    /// every fragment (byte-identical to prior behaviour).
+    public var layerMask: UInt32 = 0xFFFF_FFFF
+    /// Two explicit pads so the struct closes on a 16-byte boundary.
     /// Stride bumps from 96 → 176.
-    public var _padSpot0: Int32 = 0
     public var _padSpot1: Int32 = 0
     public var _padSpot2: Int32 = 0
 
     public init(position: SIMD3<Float>, direction: SIMD3<Float>,
                 innerCone: Float, outerCone: Float,
-                color: SIMD3<Float>, radius: Float) {
+                color: SIMD3<Float>, radius: Float,
+                layerMask: UInt32 = 0xFFFF_FFFF) {
         self.position = position
         self.direction = direction
         self.innerCone = innerCone
         self.outerCone = outerCone
         self.color = color
         self.radius = radius
+        self.layerMask = layerMask
     }
 }
 
@@ -475,7 +486,12 @@ public struct IlluminatoramaInstance {
     public var swayLean: Float = 0
     /// Vertical pop (metres) added in world space — a knock hops the object up.
     public var swayJostle: Float = 0
-    public var _padSway0: Float = 0
+    /// Light-layer bitfield (mirrors the Metal `Instance.layer`, was `_padSway0`).
+    /// Written into the `gLayer` G-buffer target; the deferred lighting kernel keeps
+    /// a light only when `(light.layerMask & layer) != 0`. Default `0xFFFFFFFF` ⇒
+    /// every light affects this instance (byte-identical to prior behaviour). Same
+    /// 4 bytes as the former float pad, so the stride stays 240.
+    public var layer: UInt32 = 0xFFFF_FFFF
 
     public init(
         modelMatrix: simd_float4x4,
