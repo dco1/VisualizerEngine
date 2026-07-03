@@ -7441,6 +7441,11 @@ public final class IlluminatoramaRenderer {
             enc.setFragmentBuffer(cacheOn ? surfCardRectBuffer : dummy, offset: 0, index: 10)
             enc.setFragmentBuffer(cacheOn ? surfCardBuffer : (surfCardDummyBuffer ?? dummy), offset: 0, index: 11)
             enc.setFragmentTexture(cacheOn ? surfConsumerAtlas : (equirectSky ?? dummySkyTexture), index: 1)
+            // Through-glass world parity: re-shaded opaque hits sample the SAME
+            // cosine-convolved irradiance cube the deferred lighting pass uses for
+            // its diffuse IBL, so transmitted scenery gets the sky fill (not just
+            // the flat ambient supplement) and matches the world beside the pane.
+            enc.setFragmentTexture(irradianceCube, index: 3)
             // The TLAS references the BLASes which reference mesh buffers — all
             // must be resident for the fragment-stage intersector.
             for blas in rtBLASList { enc.useResource(blas, usage: .read) }
