@@ -288,6 +288,18 @@ public struct IlluminatoramaFrameUniforms {
     // Metal `FrameUniforms.pointShadowBias`.
     public var pointShadowBias: Float = 0.0006
     public var _padGrade2: Float = 0
+    // ── Interior day-light separation (opt-in; pairs with light-layer masking) ──
+    // `interiorMask` = OR of every layer bit the host stamped on INTERIOR rooms; a
+    // fragment whose gLayer is a real room stamp (≠ 0xFFFFFFFF) AND intersects the
+    // mask gets its sky-IBL indirect scaled by mix(interiorIBLSide, interiorIBLUp,
+    // saturate(N.y)) and its ambient supplement scaled by `interiorAmbient`. The
+    // default `interiorMask == 0` disables the block — both factors stay exactly 1.0
+    // in the kernel, so every scene that never opts in is byte-for-byte unchanged.
+    // NEW 16-byte cluster (stride 1056 → 1072); mirror of the Metal `FrameUniforms`.
+    public var interiorMask: UInt32 = 0
+    public var interiorIBLUp: Float = 1
+    public var interiorIBLSide: Float = 1
+    public var interiorAmbient: Float = 1
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20

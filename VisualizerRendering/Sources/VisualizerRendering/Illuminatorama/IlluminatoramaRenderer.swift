@@ -491,6 +491,30 @@ public final class IlluminatoramaRenderer {
     /// (`encodeSpotShadowPasses`) are unaffected — the object still traps its own
     /// light; only the sun stops shadowing it.
     public var directionalShadowExcludedKinds: Set<MeshKind> = []
+
+    /// Mesh kinds drawn ONLY into the shadow maps (sun cascades, spot atlas, point
+    /// cubes) and the RT TLAS — never the G-buffer. Empty by default → no behaviour
+    /// change. A "lighting-only" occluder: the host registers geometry that must
+    /// BLOCK light without being visible — e.g. a dollhouse ceiling that keeps the
+    /// noon sun out of interior rooms while the camera still looks freely down into
+    /// them. The instances are uploaded normally (they need slots in the instance
+    /// buffer for the shadow passes); only the G-buffer raster skips them, so they
+    /// write no albedo/depth/velocity/layer and are invisible + unpickable on screen.
+    public var shadowOnlyMeshKinds: Set<MeshKind> = []
+
+    /// Interior day-light separation (opt-in; pairs with light-layer masking).
+    /// `interiorLayerMask` = OR of every instance-layer bit the host stamped on
+    /// INTERIOR rooms; 0 (default) disables the feature entirely (byte-identical).
+    /// Fragments carrying an intersecting room stamp get their sky-IBL indirect
+    /// scaled by mix(`interiorIBLSide`, `interiorIBLUp`, saturate(N.y)) — up-facing
+    /// floors lose the open-top skylight hardest — and their ambient supplement
+    /// scaled by `interiorAmbient` (>1 = a warm indoor fill). Rationale: an open-top
+    /// dollhouse room is otherwise lit like a patio (full sky irradiance), several
+    /// stops over a believable interior.
+    public var interiorLayerMask: UInt32 = 0
+    public var interiorIBLUp: Float = 1
+    public var interiorIBLSide: Float = 1
+    public var interiorAmbient: Float = 1
     // DEFAULTS LESSON (PR #33 fix): the initial Phase 2.5 defaults were
     // shadowBias = 0.0008 and shadowSlopeBias = 0.005 — both too aggressive.
     // The shadow pass uses front-face culling, which already shifts stored
@@ -7505,9 +7529,11 @@ public final class IlluminatoramaRenderer {
         let instStride = MemoryLayout<IlluminatoramaInstance>.stride
         for group in meshGroups {
             // Superquadric impostor box kinds are drawn by the impostor pipeline
-            // below; RT-proxy kinds exist only in the TLAS. Both are skipped here.
+            // below; RT-proxy kinds exist only in the TLAS; shadow-only kinds are
+            // lighting occluders that draw solely into the shadow maps. All skipped here.
             if impostorMeshKinds.contains(group.kind) ||
-               rtProxyMeshKinds.contains(group.kind) { continue }
+               rtProxyMeshKinds.contains(group.kind) ||
+               shadowOnlyMeshKinds.contains(group.kind) { continue }
             guard let mesh = meshes[group.kind] else { continue }
             // Two-sided meshes (open / dynamic MC fluid surfaces) render cull
             // `.none` so they don't go hollow when their back side faces the
@@ -9053,6 +9079,12 @@ public final class IlluminatoramaRenderer {
         u.antiTilingStrength = max(0, min(1, antiTilingStrength))
         // Point-light cube shadow bias (0 when the feature is off ⇒ no behaviour change).
         u.pointShadowBias = pointShadowsEnabled ? pointShadowBias : 0
+        // Interior day-light separation. Mask 0 (default) ⇒ the kernel's factors stay
+        // exactly 1.0 ⇒ byte-identical for every scene that never opts in.
+        u.interiorMask = interiorLayerMask
+        u.interiorIBLUp = max(0, interiorIBLUp)
+        u.interiorIBLSide = max(0, interiorIBLSide)
+        u.interiorAmbient = max(0, interiorAmbient)
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
 

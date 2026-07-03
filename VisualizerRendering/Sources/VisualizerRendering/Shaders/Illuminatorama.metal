@@ -213,6 +213,20 @@ struct FrameUniforms {
     // lights with shadowCubeIndex >= 0; 0 ⇒ no point shadows ⇒ no behaviour change.
     float    pointShadowBias;
     float    _padGrade2;
+    // ── Interior day-light separation (opt-in; pairs with light-layer masking) ──
+    // A host that stamps per-room layer bits (gLayer) can declare those bits INTERIOR
+    // via `interiorMask` (OR of every interior room bit). A fragment whose layer is a
+    // real room stamp (≠ the 0xFFFFFFFF default) AND intersects the mask then has its
+    // sky-IBL indirect scaled by mix(interiorIBLSide, interiorIBLUp, saturate(N.y)) —
+    // up-facing floors lose the open-top skylight hardest — and its ambient supplement
+    // scaled by `interiorAmbient` (a warm indoor fill can exceed 1). `interiorMask == 0`
+    // (the default) skips the whole block: both factors stay exactly 1.0 and ×1.0 is an
+    // IEEE no-op, so every scene that never opts in renders byte-identically.
+    // NEW 16-byte cluster (stride 1056 → 1072). Mirrors IlluminatoramaFrameUniforms.
+    uint     interiorMask;
+    float    interiorIBLUp;
+    float    interiorIBLSide;
+    float    interiorAmbient;
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift
@@ -2900,6 +2914,18 @@ kernel void illumi_lighting(
     uint2 aoCoord = min(gid / 2, uint2(aoW - 1, aoH - 1));
     float ao = float(aoTex.read(aoCoord).r);
 
+    // ── Interior day-light separation (FrameUniforms.interiorMask) ──────────
+    // Both factors stay exactly 1.0 unless the host opted in AND this fragment
+    // carries a stamped interior room bit, so the multiplies below are exact
+    // no-ops (×1.0) for every scene that never sets `interiorMask`.
+    float interiorIBLK = 1.0;
+    float interiorAmbK = 1.0;
+    if (frame.interiorMask != 0u && fragLayer != 0xFFFFFFFFu &&
+        (fragLayer & frame.interiorMask) != 0u) {
+        interiorIBLK = mix(frame.interiorIBLSide, frame.interiorIBLUp, saturate(N.y));
+        interiorAmbK = frame.interiorAmbient;
+    }
+
     // ── Indirect (IBL + optional DDGI for diffuse) ──────────────────
     float3 indirect;
     // Debug accumulators (frame.debugTerm split-render) — populated below.
@@ -3011,9 +3037,9 @@ kernel void illumi_lighting(
             specularIBL = specEnv * F;
         }
 
-        indirect = (diffuseIBL + specularIBL) * frame.iblIntensity * ao;
-        dbgDiffuseIBL = diffuseIBL * frame.iblIntensity * ao;
-        dbgSpecularIBL = specularIBL * frame.iblIntensity * ao;
+        indirect = (diffuseIBL + specularIBL) * frame.iblIntensity * ao * interiorIBLK;
+        dbgDiffuseIBL = diffuseIBL * frame.iblIntensity * ao * interiorIBLK;
+        dbgSpecularIBL = specularIBL * frame.iblIntensity * ao * interiorIBLK;
         // `ambientColor` is now a TRUE ambient term — only SCN `.ambient`
         // lights (uniform, no NdotL) feed it. As of #60 task 5 the secondary
         // SCN directionals (fill, back) are NO LONGER folded in here; they
@@ -3023,15 +3049,15 @@ kernel void illumi_lighting(
         float upness = saturate(N.y * 0.5 + 0.5);
         float3 ambCol = desaturateFill(frame.ambientColor, frame.iblDiffuseDesaturation);
         float3 ambSupp = mix(ambCol * 0.4, ambCol, upness) * albedo;
-        indirect += ambSupp * ao;
-        dbgAmbient = ambSupp * ao;
+        indirect += ambSupp * ao * interiorAmbK;
+        dbgAmbient = ambSupp * ao * interiorAmbK;
     } else {
         // Legacy hemispheric ambient — only the diffuse term, no spec.
         float upness = saturate(N.y * 0.5 + 0.5);
         float3 ambCol = desaturateFill(frame.ambientColor, frame.iblDiffuseDesaturation);
         float3 amb = mix(ambCol * 0.4, ambCol, upness) * albedo;
-        indirect = amb * ao;
-        dbgAmbient = amb * ao;
+        indirect = amb * ao * interiorAmbK;
+        dbgAmbient = amb * ao * interiorAmbK;
     }
 
     // ── Phase 7 — per-material clearcoat (terrazzo/marble/lacquered wood) ──────
@@ -3059,7 +3085,10 @@ kernel void illumi_lighting(
             float3 env  = float3(prefilteredCube.sample(ccSampler, Rcc,
                                                         level(ccRough * (mips - 1.0))).rgb);
             float  Fcc  = ccF0 + (1.0 - ccF0) * pow(1.0 - ccNdotV, 5.0);
-            clearcoat += env * Fcc * frame.iblIntensity * ao;
+            // Interior separation: a lacquered interior floor's clearcoat environment
+            // reflection is the same open-top skylight the diffuse IBL is — dim it by
+            // the same factor (×1.0 no-op when the feature is off).
+            clearcoat += env * Fcc * frame.iblIntensity * ao * interiorIBLK;
         }
         clearcoat *= houseCC;
         // Energy conservation: clearcoat layer attenuates the base for grazing V.
