@@ -848,3 +848,14 @@ public struct IlluminatoramaCamera {
         )
     }
 }
+
+// ── Equatable (scene-content stability gate) ────────────────────────────────
+//
+// The renderer keeps last frame's `instances` / flattened glass and compares
+// per frame to detect a static scene (camera-only motion): when nothing
+// changed it skips the instance-buffer regroup/rewrite, the RT TLAS refit,
+// and (when light params also held) the spot/point shadow re-renders. Both
+// structs are plain SIMD/scalar bags, so the synthesized memberwise `==`
+// compiles to tight vector compares — cheap enough to run on every frame.
+extension IlluminatoramaInstance: Equatable {}
+extension IlluminatoramaGlassInstance: Equatable {}

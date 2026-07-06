@@ -101,7 +101,7 @@ public final class IlluminatoramaRenderer {
         }
     }
 
-    public struct InstanceRef {
+    public struct InstanceRef: Equatable {
         public var meshKind: MeshKind
         public var data: IlluminatoramaInstance
         /// CPU-only: effective emissive radiance used by the extractor's
@@ -132,6 +132,73 @@ public final class IlluminatoramaRenderer {
     // ── Inputs the host updates each frame ────────────────────────────────────
 
     public var instances: [InstanceRef] = []
+
+    // ── Scene-content stability gate (perf) ──────────────────────────────────
+    //
+    // The single biggest per-frame waste in a host like Daydream Home is that a
+    // CAMERA-ONLY frame (orbit/pan — by far the common case) still paid every
+    // scene-content cost: the instance buffer was regrouped + rewritten, the RT
+    // TLAS descriptors rewritten + refit, and every spot/point shadow map
+    // re-rasterised the whole scene — all producing byte-identical results.
+    // These counters detect "content unchanged since last frame" by comparing
+    // the host-set `instances` (and flattened glass) against last frame's; the
+    // consumers each gate on the stability they need:
+    //   • `uploadInstances`   skips at ≥2 stable frames (both ping-pong buffers
+    //     then already hold this exact content — motion vectors stay correct).
+    //   • `updateRTAccel`     skips the refit at ≥1 stable frame (the TLAS was
+    //     refit from this same content last frame; world-space, camera-free).
+    //   • spot/point shadows  skip at ≥1 stable frame IF their light matrices
+    //     also held and no GPU-fed geometry is live (see `sceneStaticForShadows`).
+    // `lastUploadedInstances` holds a COW reference to the host's array — when
+    // the host assigns a fresh array the compare is elementwise (SIMD-tight,
+    // sub-ms for thousands); when it mutates in place, COW gives the mutated
+    // array new storage so the compare still sees the change.
+    /// Dev A/B override: VIZ_ILLUMI_NO_STATIC_SKIP=1 disables every static-scene
+    /// skip (instance upload, TLAS refit, spot/point shadow reuse) so the
+    /// with/without cost is directly measurable and any suspected staleness
+    /// artifact can be ruled in/out in one run. Default: skips on.
+    private static let staticSkipDisabled =
+        ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_STATIC_SKIP"] == "1"
+    /// Test-observable skip census — hosts gate perf DETERMINISTICALLY on these
+    /// (N static frames must skip N-k uploads), not on wall-clock timings. Note
+    /// any per-frame-animated instance (e.g. a flickering TV screen's emission)
+    /// keeps the whole array unstable, so these staying 0 in such a scene is
+    /// expected, not a bug.
+    public struct StaticSkipStats: Equatable, Sendable {
+        public var uploadsSkipped = 0
+        public var tlasRefitsSkipped = 0
+        public var spotShadowPassesSkipped = 0
+        public var pointShadowPassesSkipped = 0
+    }
+    public private(set) var staticSkipStats = StaticSkipStats()
+    private var lastUploadedInstances: [InstanceRef] = []
+    private var instanceStableFrames: Int = 0
+    private var lastGlassFlat: [(kind: MeshKind, insts: [IlluminatoramaGlassInstance])] = []
+    private var glassStableFrames: Int = 0
+    /// True when any current instance self-oscillates in the vertex shader
+    /// (swayMode == 2, the top-pivot pendulum): its silhouette animates with
+    /// `time` even though the CPU data is static, so the shadow-skip must not
+    /// engage. Modes 0/1 are static functions of per-instance data (a mode-1
+    /// lean/jostle change rewrites the instance → resets stability anyway), so
+    /// they don't block the skip — sofas with mode-1 cushions still benefit.
+    /// Recomputed only when content changes.
+    private var contentHasSway = false
+    /// Spot-shadow skip signature: the atlas slices currently hold depth maps
+    /// rendered with exactly these light matrices (and the stable content).
+    private var lastSpotShadowMats: [simd_float4x4] = []
+    /// Point-shadow skip signature: (position, radius) per cube-holding light in
+    /// enumeration order + the cube-page assignment vector. Any ranking change,
+    /// light move, or radius change breaks equality → re-render.
+    private var lastPointShadowSig: [SIMD4<Float>] = []
+    private var lastPointCubeAssign: [Int32] = []
+    /// Shadow maps may be reused from last frame only when the scene content is
+    /// provably identical AND fully CPU-visible: no vertex-shader sway (time-
+    /// animated silhouettes), no compute-fed geometry (`gpuRepackTasks` — e.g.
+    /// the grass field), and no GPU-written instance slots (`onEncodeGPUInstances`).
+    private var sceneStaticForShadows: Bool {
+        instanceStableFrames >= 1 && !contentHasSway
+            && gpuRepackTasks.isEmpty && onEncodeGPUInstances == nil
+    }
 
     /// Opt-in GPU-resident instance hook (additive — nil for every scene that
     /// doesn't set it, so behaviour is byte-for-byte unchanged elsewhere).
@@ -1254,6 +1321,9 @@ public final class IlluminatoramaRenderer {
     private var ssrHistoryA: MTLTexture          // full-res, rgba16Float ping-pong
     private var ssrHistoryB: MTLTexture
     private var ssrHistoryToggle: Bool = false
+    /// Tracks `ssrIntensity > 0` transitions so a re-enable re-primes the SSR
+    /// history (the whole SSR chain is skipped while intensity is 0).
+    private var previousSSRIntensityActive: Bool = false
     private var ssrNeedsFirstFrame: Bool = true
     private var previousSsrEnabled: Bool = false
 
@@ -4960,6 +5030,19 @@ public final class IlluminatoramaRenderer {
             rtTLASTopologyHash = topo
         } else {
             rtConsecutiveRebuilds = 0   // stable topology this frame → reset
+            // PERF (static-scene skip): the TLAS is world-space — a camera-only
+            // frame refit it into a byte-identical AS while rewriting every
+            // instance descriptor on the CPU first. When the opaque instances
+            // AND glass held since last frame, the TLAS already encodes exactly
+            // this content, so skip both the descriptor rewrite and the refit
+            // encode. Conservative outs: any curve sets (wind-swayed control
+            // points) or deforming BLASes (GPU-fed vertices the CPU compare
+            // can't see) force the refit every frame, as before.
+            if instanceStableFrames >= 1, glassStableFrames >= 1,
+               rtCurveSets.isEmpty, rtBLASRefitDesc.isEmpty, rtTLASActive {
+                staticSkipStats.tlasRefitsSkipped += 1
+                return
+            }
             // Phase B — re-fit deforming BLASes from this frame's live vertices
             // BEFORE the TLAS refit so the RT passes trace current geometry.
             refitDeformingBLAS(cb)
@@ -6299,6 +6382,11 @@ public final class IlluminatoramaRenderer {
         previousSsaoEnabled = ssaoDenoiseEnabled
         if ssrDenoiseEnabled  && !previousSsrEnabled  { ssrNeedsFirstFrame = true }
         previousSsrEnabled  = ssrDenoiseEnabled
+        // SSR is skipped entirely while `ssrIntensity <= 0` (see the gather/temporal/
+        // composite gate below), so its temporal history goes stale during the off
+        // period — re-prime it when intensity comes back.
+        if ssrIntensity > 0 && !previousSSRIntensityActive { ssrNeedsFirstFrame = true }
+        previousSSRIntensityActive = ssrIntensity > 0
         if rtGITemporalEnabled && !previousRTGITemporalEnabled { rtGINeedsFirstFrame = true }
         previousRTGITemporalEnabled = rtGITemporalEnabled
         // ── Panel is the single source of truth for lens aberration too ─────
@@ -6316,6 +6404,31 @@ public final class IlluminatoramaRenderer {
         // previousInstanceBuffer now points to last frame's data.
         useBufferA.toggle()
         ensureBufferCapacity()  // may set taaNeedsFirstFrame on growth
+        // ── Scene-content stability update (perf gate — see the state block) ──
+        // Runs once per RENDERED frame (after the in-flight guard, before the
+        // uploads), so a stable count of N means N consecutive uploads saw this
+        // exact content. Glass is flattened once here and memoised for the frame
+        // (rtTopologyHash / refit / glass pass / caustics all reuse it instead of
+        // re-flattening 4–5×).
+        glassFlatMemo = nil
+        let glassNow = flattenGlass()
+        if instances == lastUploadedInstances {
+            instanceStableFrames += 1
+        } else {
+            instanceStableFrames = 0
+            lastUploadedInstances = instances   // COW reference, no deep copy
+            contentHasSway = instances.contains { $0.data.swayMode == 2 }
+        }
+        if glassNow.count == lastGlassFlat.count,
+           zip(glassNow, lastGlassFlat).allSatisfy({ $0.kind == $1.kind && $0.insts == $1.insts }) {
+            glassStableFrames += 1
+        } else {
+            glassStableFrames = 0
+            lastGlassFlat = glassNow
+        }
+        // Kill-switch: zeroing the counters here disables every downstream skip
+        // (upload / TLAS refit / shadow reuse) in one place.
+        if Self.staticSkipDisabled { instanceStableFrames = 0; glassStableFrames = 0 }
         updateCascades()
         // Phase 4.10 — compute per-spot shadow matrices + slice indices
         // BEFORE `uploadSpotLights` so the GPU buffer sees the current
@@ -6403,9 +6516,20 @@ public final class IlluminatoramaRenderer {
         // the SSR/RT reflection chain (they reflected in nearby metals). For
         // dust/sparks that's an acceptable loss; trail-free wins.
         // Phase 4.39: SSR gather → temporal → composite into hdrComposite.
-        encodeSSRGather(cb)
-        encodeSSRTemporalPass(cb)
-        encodeSSRComposite(cb)
+        // PERF: with SSR off (`ssrIntensity <= 0` — Daydream's default config, and
+        // the documented setting for RT-reflection hosts) the ray-march gather, the
+        // temporal denoise, and the full-res composite are all pure waste — the
+        // shader would early-out per pixel but the dispatches, depth reads, and the
+        // hdr→hdrComposite copy still ran. Skip all three and seed `hdrComposite`
+        // with one blit instead (downstream additive passes — RT sun/GI, glass
+        // backdrop, bloom/tonemap, TAA input — all read `hdrCompositeTexture`).
+        if ssrIntensity > 0 {
+            encodeSSRGather(cb)
+            encodeSSRTemporalPass(cb)
+            encodeSSRComposite(cb)
+        } else {
+            encodeSSRBypassCopy(cb)
+        }
         // Incremental invalidation (default-on): re-frame moved instances' cards
         // in place + flag them dirty so the update below re-lights only them,
         // preserving stationary cards' accumulation. Rigid movers AND deforming
@@ -6560,7 +6684,10 @@ public final class IlluminatoramaRenderer {
             aoNeedsFirstFrame = false
             aoHistoryToggle.toggle()
         }
-        if ssrDenoiseEnabled {
+        // Only when SSR actually RAN this frame (intensity > 0): while it's
+        // skipped, the history must neither toggle nor clear its first-frame
+        // flag, so a later re-enable re-primes from a clean slate.
+        if ssrDenoiseEnabled && ssrIntensity > 0 {
             ssrNeedsFirstFrame = false
             ssrHistoryToggle.toggle()
         }
@@ -6844,6 +6971,17 @@ public final class IlluminatoramaRenderer {
     private func encodeSpotShadowPasses(_ cb: MTLCommandBuffer) {
         guard spotShadowsEnabled, !spotLights.isEmpty, !instances.isEmpty else { return }
         let count = min(spotLights.count, spotShadowAtlasCapacity)
+        // PERF (static-scene skip): spot shadow maps are LIGHT-space — a camera
+        // orbit re-rendered every slice (up to 8 full scene depth passes) into
+        // byte-identical maps every frame. When the scene content held (see
+        // `sceneStaticForShadows`) and every slice's light matrix is unchanged,
+        // the atlas already contains exactly these maps — reuse them.
+        let mats = (0..<count).map { spotLights[$0].shadowMatrix }
+        if sceneStaticForShadows && mats == lastSpotShadowMats {
+            staticSkipStats.spotShadowPassesSkipped += count
+            return
+        }
+        lastSpotShadowMats = mats
         for slice in 0..<count {
             let pass = MTLRenderPassDescriptor()
             pass.depthAttachment.texture = spotShadowAtlas
@@ -6974,6 +7112,25 @@ public final class IlluminatoramaRenderer {
         else { return }
         let cubeCount = pointLights.reduce(0) { $0 + (($1.shadowCubeIndex >= 0) ? 1 : 0) }
         guard cubeCount > 0 else { return }
+
+        // PERF (static-scene skip): a point cube is 6 full scene depth passes,
+        // and its face matrices depend only on the light's position + radius
+        // (the ranking that ASSIGNS cubes is camera-driven, so orbit can still
+        // reshuffle pages — that breaks the assignment vector and re-renders).
+        // With stable content, identical (pos, radius) per cube-holder, and an
+        // identical page assignment, the atlas already holds these cubes.
+        var sig: [SIMD4<Float>] = []
+        var assigns: [Int32] = []
+        for pl in pointLights where pl.shadowCubeIndex >= 0 {
+            sig.append(SIMD4(pl.position, pl.radius))
+            assigns.append(pl.shadowCubeIndex)
+        }
+        if sceneStaticForShadows && sig == lastPointShadowSig && assigns == lastPointCubeAssign {
+            staticSkipStats.pointShadowPassesSkipped += cubeCount * 6
+            return
+        }
+        lastPointShadowSig = sig
+        lastPointCubeAssign = assigns
 
         let faces = faceBuffer.contents().bindMemory(
             to: simd_float4x4.self, capacity: pointShadowCubeCapacity * 6)
@@ -7301,13 +7458,26 @@ public final class IlluminatoramaRenderer {
     /// order) matches what the raster fragment drew. Precedence: multi-mesh
     /// groups → single-mesh array → single pane.
     func flattenGlass() -> [(kind: MeshKind, insts: [IlluminatoramaGlassInstance])] {
+        // Memoised per frame (invalidated at the top of `render()`): the topology
+        // hash, TLAS refit, glass pass, and caustics AABB all call this in one
+        // frame, and hosts only mutate glass between frames.
+        if let memo = glassFlatMemo { return memo }
+        let flat: [(kind: MeshKind, insts: [IlluminatoramaGlassInstance])]
         if !glassMeshGroups.isEmpty {
-            return glassMeshGroups.compactMap { $0.instances.isEmpty ? nil : ($0.kind, $0.instances) }
+            flat = glassMeshGroups.compactMap { $0.instances.isEmpty ? nil : ($0.kind, $0.instances) }
+        } else if let kind = glassPaneKind, !glassInstances.isEmpty {
+            flat = [(kind, glassInstances)]
+        } else if let kind = glassPaneKind, let single = glassPaneInstance {
+            flat = [(kind, [single])]
+        } else {
+            flat = []
         }
-        if let kind = glassPaneKind, !glassInstances.isEmpty { return [(kind, glassInstances)] }
-        if let kind = glassPaneKind, let single = glassPaneInstance { return [(kind, [single])] }
-        return []
+        glassFlatMemo = flat
+        return flat
     }
+
+    /// Per-frame memo for `flattenGlass()` — nil = not yet flattened this frame.
+    private var glassFlatMemo: [(kind: MeshKind, insts: [IlluminatoramaGlassInstance])]?
 
     private func encodeGlassPass(_ cb: MTLCommandBuffer) {
         guard let glassDepth = glassDepthState else { return }
@@ -8133,6 +8303,17 @@ public final class IlluminatoramaRenderer {
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
         dispatch(enc, pipeline: ssrTemporalPipeline, width: width, height: height)
         enc.endEncoding()
+    }
+
+    /// SSR-off fast path: seed `hdrCompositeTexture` from the lit frame with one
+    /// blit (DMA copy — same size/format) in place of the three full-res SSR
+    /// dispatches. Everything downstream keeps reading `hdrCompositeTexture`
+    /// exactly as before.
+    private func encodeSSRBypassCopy(_ cb: MTLCommandBuffer) {
+        guard let blit = cb.makeBlitCommandEncoder() else { return }
+        blit.label = "Illuminatorama.ssr.bypass"
+        blit.copy(from: hdrTexture, to: hdrCompositeTexture)
+        blit.endEncoding()
     }
 
     private func encodeSSRComposite(_ cb: MTLCommandBuffer) {
@@ -9108,6 +9289,15 @@ public final class IlluminatoramaRenderer {
     }
 
     private func uploadInstances() {
+        // PERF (static-scene skip): at ≥2 stable frames BOTH ping-pong buffers
+        // already hold exactly this content (each change is written twice, once
+        // per buffer), `meshGroups` is the grouping of that same content, and
+        // prev==current means zero motion vectors — which is precisely correct
+        // for content that didn't move. Skipping avoids the per-frame regroup
+        // dictionary, the full buffer rewrite, and the superquadric inverse
+        // recomputes. Capacity growth can't be missed: growth implies the count
+        // changed, which resets `instanceStableFrames`.
+        if instanceStableFrames >= 2 { staticSkipStats.uploadsSkipped += 1; return }
         // After the ping-pong toggle at the top of render(), the buffer that
         // WAS previous last frame is now "current" — we overwrite it with
         // this frame's data. The other buffer (now "previous") still holds
