@@ -227,6 +227,20 @@ struct FrameUniforms {
     float    interiorIBLUp;
     float    interiorIBLSide;
     float    interiorAmbient;
+    // ── Analytic night sky (stars + moon at SCREEN resolution) ──────────────
+    // The host disables the dome's baked celestials (VolumetricCloudRenderer
+    // Params.celestialsInDome = false) and sets these; the lighting kernel then
+    // evaluates nightStarField/nightMoonDisk per SKY PIXEL — pixel-sharp stars,
+    // a crisp phase-correct moon — instead of sampling their bilinearly-
+    // magnified dome bakes. All-zero (the default) ⇒ the sky branch adds
+    // exactly nothing, so every non-opting scene renders byte-identically.
+    // nightSkyParams: x = starBrightness × nightBlend, y = moonIntensity ×
+    // nightBlend, z = moon angular radius (radians), w reserved.
+    // THREE new 16-byte clusters (stride 1072 → 1120); field-for-field mirror
+    // of IlluminatoramaFrameUniforms.
+    float4   nightSkyParams;
+    float4   nightMoonDir;   // xyz = unit vector toward the moon
+    float4   nightSunDir;    // xyz = unit vector toward the TRUE sun (terminator)
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift
@@ -1820,6 +1834,141 @@ static inline float3 sampleSkyEquirect(texture2d<float, access::sample> sky,
     return sky.sample(s, dirToEquirectUV(normalize(dir))).rgb;
 }
 
+// ── Analytic night sky — stars + moon at SCREEN resolution ──────────────────
+//
+// The equirect sky dome (VolumetricCloudRenderer, 2048×1024) is far coarser than
+// the frame: one dome texel covers several screen pixels, so anything baked into
+// it — a star, the moon's limb — is bilinearly magnified into a soft blob. The
+// host can therefore ask the DOME to skip its celestials
+// (`Params.celestialsInDome = false`) and have this pass evaluate them
+// analytically per SKY PIXEL instead: pixel-sharp stars, a crisp moon disk with
+// a geometrically-correct terminator. Gated on `frame.nightSkyParams` being
+// non-zero — every scene that never sets it renders byte-identically.
+//
+// The star grid (cell layout, fill rate, magnitude/colour hashing) mirrors
+// `starField` in VolumetricSky.metal so the two paths agree on WHERE the stars
+// are — only the point-spread differs (dome texel there, screen pixel here).
+
+static inline uint nightHash3(int3 p) {
+    uint h = uint(p.x * 374761393 + p.y * 668265263 + p.z * 1274126177);
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    return h ^ (h >> 16u);
+}
+
+// 2D Worley (cellular) distance for the moon's maria/crater shading — the
+// disk-local sibling of VolumetricSky.metal's worley3.
+static inline float nightWorley2(float2 p) {
+    int2 ip = int2(floor(p));
+    float2 fp = p - float2(ip);
+    float minD2 = 1e9f;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int2 cell = ip + int2(dx, dy);
+            uint h = nightHash3(int3(cell.x, cell.y, 91));
+            float2 jitter = float2(float(h & 0xFFu), float((h >> 8u) & 0xFFu)) * (1.0f / 255.0f);
+            float2 d = (float2(dx, dy) + jitter) - fp;
+            minD2 = min(minD2, dot(d, d));
+        }
+    }
+    return clamp(sqrt(minD2), 0.0f, 1.0f);
+}
+
+// Procedural star field, evaluated at screen resolution. `pixAngle` is the
+// angular size of one output pixel (radians); each star is a gaussian point
+// ~1.5 px wide, so under TAA it resolves as a crisp spark instead of the
+// dome-bake's magnified blob. Same hash → same sky as the dome version.
+static inline float3 nightStarField(float3 rayDir, float brightness, float pixAngle) {
+    if (brightness <= 0.0f) return float3(0.0f);
+
+    float az = atan2(rayDir.z, rayDir.x);
+    float el = asin(clamp(rayDir.y, -1.0f, 1.0f));
+    const float cellsPerTurn = 450.0f;             // 0.8° cells (matches the dome grid)
+    float2 uv = float2((az + M_PI_F) * (cellsPerTurn / (2.0f * M_PI_F)),
+                       (el + M_PI_F * 0.5f) * (cellsPerTurn * 0.5f / M_PI_F));
+    int2 ip = int2(floor(uv));
+    float2 fp = uv - float2(ip);
+
+    // One screen pixel in cell units (elevation cells are constant on the sphere).
+    float cellAngle = (2.0f * M_PI_F) / cellsPerTurn;
+    float pixCell = max(pixAngle / cellAngle, 1e-4f);
+    // Point-spread: σ ≈ 0.75 px — a star's core lands on 1–2 pixels. The peak is
+    // resolution-independent (a star is "a bright point", not a patch of sky).
+    float sigma = 0.75f * pixCell;
+    float invS2 = 1.0f / (2.0f * sigma * sigma);
+
+    float3 result = float3(0.0f);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int2 cell = ip + int2(dx, dy);
+            uint h = nightHash3(int3(cell.x, cell.y, 17));
+            // ~4% of cells hold a star (matches the dome field).
+            if ((h & 0xFFu) < 10u) {
+                float2 starPos = float2(
+                    float((h >> 8u)  & 0xFFu) / 255.0f,
+                    float((h >> 16u) & 0xFFu) / 255.0f
+                );
+                float2 d  = fp - (float2(dx, dy) + starPos);
+                float  d2 = dot(d, d);
+                float  lum = exp(-d2 * invS2);
+                // Magnitude: 4 bits → 0..1; brighter is rarer. Dim stars fade
+                // fast so the field reads as sparkle over black, not noise.
+                float  mag = 1.0f - float((h >> 28u) & 0xFu) / 15.0f;
+                float3 col = mix(float3(1.0f, 0.92f, 0.72f),
+                                 float3(0.78f, 0.87f, 1.0f), mag * mag);
+                result += col * lum * (0.10f + 0.90f * mag * mag);
+            }
+        }
+    }
+    return result * brightness * 2.2f;
+}
+
+// Moon disk with a geometrically-correct phase terminator. Each disk pixel
+// reconstructs the sphere normal at that point and lights it with the TRUE sun
+// direction — so the phase (crescent → gibbous → full) and its orientation come
+// straight from the real ephemeris, not a hand-tuned phase scalar. `angRadius`
+// is the disk's angular radius in radians (real moon ≈ 0.0047; the default is
+// modestly enlarged for a photographic read). `toSun` points from the scene
+// toward the sun (below the horizon at night — exactly why the lit limb faces
+// the sunset). Faint earthshine keeps the dark limb readable on a new-ish moon.
+static inline float3 nightMoonDisk(float3 rayDir, float3 moonDir, float3 toSun,
+                                   float angRadius, float intensity, float pixAngle) {
+    if (intensity <= 0.0f || angRadius <= 0.0f) return float3(0.0f);
+    float cosT = dot(rayDir, moonDir);
+    if (cosT <= 0.0f) return float3(0.0f);
+
+    // Disk-local frame + position in units of the angular radius.
+    float3 upRef = fabs(moonDir.y) < 0.98f ? float3(0, 1, 0) : float3(1, 0, 0);
+    float3 T = normalize(cross(upRef, moonDir));
+    float3 B = cross(moonDir, T);
+    float  sinR = sin(angRadius);
+    float2 q = float2(dot(rayDir, T), dot(rayDir, B)) / sinR;
+    float  r2 = dot(q, q);
+    float  r  = sqrt(r2);
+
+    // Anti-aliased edge: one-pixel soft limb.
+    float aaW = max(pixAngle / angRadius, 1e-3f);
+    float disk = 1.0f - smoothstep(1.0f - aaW, 1.0f + aaW, r);
+    if (disk <= 0.0f) return float3(0.0f);
+
+    // Sphere normal at the visible point (the hemisphere facing the viewer).
+    float nz = sqrt(max(0.0f, 1.0f - min(r2, 1.0f)));
+    float3 n = q.x * T + q.y * B - nz * moonDir;
+
+    // Geometric terminator (sun at infinity — parallax is negligible), softened a
+    // touch: the regolith limb is not a hard lambert edge at this scale.
+    float lit = max(0.0f, dot(n, normalize(toSun)));
+    float shade = pow(lit, 0.75f);
+    float earthshine = 0.03f;
+
+    // Maria + crater speckle in DISK-LOCAL coords, so the moon always shows the
+    // same face and the pattern doesn't swim as it crosses the sky.
+    float mare   = 1.0f - 0.18f * nightWorley2(q * 2.5f + float2(3.7f, 1.3f));
+    float crater = 1.0f - 0.08f * nightWorley2(q * 8.0f + float2(9.1f, 4.6f));
+
+    float3 col = float3(0.92f, 0.93f, 1.0f) * (shade + earthshine) * mare * crater;
+    return col * intensity * disk;
+}
+
 // ── IBL bake — diffuse irradiance ────────────────────────────────────────────
 //
 // For each output texel (face, x, y) we compute the cosine-weighted hemisphere
@@ -2647,6 +2796,19 @@ kernel void illumi_lighting(
         float4 farWorld = frame.invViewProjection * farClip;
         float3 dir = normalize(farWorld.xyz / farWorld.w - frame.cameraWorldPos);
         float3 sky = sampleSkyEquirect(skyEquirect, dir);
+        // Analytic night sky (opt-in): pixel-sharp stars + a phase-correct moon
+        // composited over the (celestial-free) dome. Zero params ⇒ exact no-op.
+        // TAA's jittered projection supersamples the sub-pixel star cores.
+        if ((frame.nightSkyParams.x > 0.0f || frame.nightSkyParams.y > 0.0f)
+            && dir.y > -0.05f) {
+            // Angular size of one pixel from the projection: tan(fovY/2) = 1/P[1][1].
+            float pixAngle = (2.0f / frame.projection[1][1]) / float(h);
+            sky += nightStarField(dir, frame.nightSkyParams.x, pixAngle);
+            sky += nightMoonDisk(dir, normalize(frame.nightMoonDir.xyz),
+                                 frame.nightSunDir.xyz,
+                                 frame.nightSkyParams.z,
+                                 frame.nightSkyParams.y, pixAngle);
+        }
         outHDR.write(half4(half3(sky), 1.0h), gid);
         return;
     }

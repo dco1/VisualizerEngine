@@ -300,6 +300,19 @@ public struct IlluminatoramaFrameUniforms {
     public var interiorIBLUp: Float = 1
     public var interiorIBLSide: Float = 1
     public var interiorAmbient: Float = 1
+    // ── Analytic night sky (stars + moon at SCREEN resolution) ──────────────
+    // Set alongside `VolumetricCloudRenderer.Params.celestialsInDome = false`:
+    // the lighting kernel then evaluates the star field + phase-correct moon
+    // disk per SKY PIXEL instead of sampling their bilinearly-magnified dome
+    // bakes (the "stars are gaussian blobs" artifact). All-zero defaults ⇒ the
+    // kernel's sky branch adds exactly nothing — every non-opting scene renders
+    // byte-identically. nightSkyParams: x = starBrightness × nightBlend,
+    // y = moonIntensity × nightBlend, z = moon angular radius (radians),
+    // w reserved. THREE new 16-byte clusters (stride 1072 → 1120); mirror of
+    // the Metal `FrameUniforms`.
+    public var nightSkyParams: SIMD4<Float> = .zero
+    public var nightMoonDir: SIMD4<Float> = .zero
+    public var nightSunDir: SIMD4<Float> = .zero
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20

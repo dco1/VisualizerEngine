@@ -218,6 +218,14 @@ public final class VolumetricCloudRenderer {
         /// 1 = clear dark-sky star field. The kernel multiplies by `nightBlend`
         /// so stars always fade in as the sun sets regardless of this value.
         public var starBrightness: Float = 0.0
+        /// Whether the star field + moon disk are baked INTO this equirect dome
+        /// (the default — right for SceneKit-dome hosts). A host whose lighting
+        /// pass composites the analytic screen-resolution night sky instead
+        /// (IlluminatoramaRenderer's `nightSky*` properties) sets this false so
+        /// the dome doesn't double-draw a blurry low-res copy underneath: at
+        /// 2048×1024 one dome texel spans several screen pixels, which is
+        /// exactly the "stars are gaussian blobs" artifact.
+        public var celestialsInDome: Bool = true
 
         // ── Atmosphere model ───────────────────────────────────────────
         /// Which atmosphere to bake under the clouds.
@@ -414,6 +422,17 @@ public final class VolumetricCloudRenderer {
         if pipeline == nil {
             Self.log.error("volSkyRender pipeline missing — check Shaders/VolumetricSky.metal compiles")
         }
+    }
+
+    /// The night-sky fade the kernel applies to stars/moon, derived from the sun
+    /// direction (`Params.sunDir` — the direction sunlight TRAVELS, so `.y > 0`
+    /// means the sun is below the horizon). Ramps 0 at the horizon → 1 at ~15°
+    /// below. Exposed so a host driving the ANALYTIC screen-resolution night sky
+    /// (IlluminatoramaRenderer's `nightSky*` properties) fades its stars/moon on
+    /// the exact same ramp the dome uses — single source, no drift.
+    public nonisolated static func nightBlend(sunDir: SIMD3<Float>) -> Float {
+        let sun = sunDir == .zero ? SIMD3<Float>(0, -1, 0) : simd_normalize(sunDir)
+        return min(max(sun.y * 4.0, 0.0), 1.0)
     }
 
     /// Encode one render. Two dispatches:
@@ -657,8 +676,11 @@ public final class VolumetricCloudRenderer {
     private let iblSem = DispatchSemaphore(value: 2)
 
     /// Time-based throttle for the DOME dispatch only. IBL is dispatched
-    /// every `render(params:)` call.
-    private let minRenderInterval: CFTimeInterval
+    /// every `render(params:)` call. Mutable so a host can adapt the dome
+    /// cadence live (e.g. drop to 0 for deterministic offscreen captures —
+    /// a wall-clock throttle otherwise leaves a STALE dome under a fast
+    /// warm re-render, the classic suite-position flake in GPU tests).
+    public var minRenderInterval: CFTimeInterval
     private var lastDomeRenderTime: CFTimeInterval = 0
 
     private static func makeTexture(device: MTLDevice,
@@ -738,10 +760,10 @@ private struct SkyUniforms {
 
         // Night sky: auto-derive nightBlend from sun elevation so stars
         // and moon always fade in as the sun crosses the horizon without
-        // requiring callers to compute it explicitly.
-        // sunDir.y > 0 means the light is traveling upward → sun is below
-        // the horizon. We ramp from 0 at the horizon to 1 at ~15° below.
-        let nightBlend = min(max(sun.y * 4.0, 0.0), 1.0)
+        // requiring callers to compute it explicitly (single source:
+        // `VolumetricCloudRenderer.nightBlend(sunDir:)` — hosts that drive the
+        // analytic screen-res night sky use the same ramp).
+        let nightBlend = VolumetricCloudRenderer.nightBlend(sunDir: sun)
         let moonN = params.moonDir == .zero
                     ? SIMD3<Float>(0.4, 0.6, -0.7)
                     : simd_normalize(params.moonDir)
@@ -770,7 +792,10 @@ private struct SkyUniforms {
                                        max(0, params.curlScale),
                                        max(0, min(1, params.moundMix)),
                                        max(0, params.moundRatio))
-        // cloudExtra2.x = multiple-scattering strength.
-        self.cloudExtra2 = SIMD4<Float>(max(0, params.multiScatter), 0, 0, 0)
+        // cloudExtra2.x = multiple-scattering strength; .y = celestials-in-dome
+        // flag (0 = the host composites the analytic screen-res night sky, so
+        // the dome must not bake its own blurry stars/moon).
+        self.cloudExtra2 = SIMD4<Float>(max(0, params.multiScatter),
+                                        params.celestialsInDome ? 1 : 0, 0, 0)
     }
 }

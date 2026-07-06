@@ -599,6 +599,31 @@ public final class IlluminatoramaRenderer {
     public var interiorIBLUp: Float = 1
     public var interiorIBLSide: Float = 1
     public var interiorAmbient: Float = 1
+
+    /// ── Analytic night sky (stars + moon at SCREEN resolution) ──────────────
+    /// The 2048×1024 equirect dome is far coarser than the frame, so celestials
+    /// baked into it (VolumetricCloudRenderer's star field / moon) reach the
+    /// screen bilinearly magnified into soft blobs. A host that wants pixel-sharp
+    /// stars and a crisp, phase-correct moon sets the dome's
+    /// `Params.celestialsInDome = false` and drives these instead — the lighting
+    /// kernel evaluates them analytically per sky pixel (TAA supersamples the
+    /// sub-pixel cores). All zeros (defaults) = feature off, byte-identical.
+    ///
+    /// Fade both brightness values with `VolumetricCloudRenderer.nightBlend(sunDir:)`
+    /// so the analytic sky and the dome share ONE day/night ramp.
+    public var nightSkyStarBrightness: Float = 0
+    /// Moon disk brightness (HDR). 0 = no moon. ~1.5–3 reads as a luminous moon
+    /// that blooms gently at night exposure.
+    public var nightSkyMoonIntensity: Float = 0
+    /// Unit vector from the scene toward the moon (e.g. a real ephemeris).
+    public var nightSkyMoonDirection: SIMD3<Float> = SIMD3(0, 1, 0)
+    /// Unit vector from the scene toward the TRUE sun — below the horizon at
+    /// night. Lights the moon sphere per-pixel, so the phase (crescent→gibbous→
+    /// full) and its orientation come straight from the geometry.
+    public var nightSkySunDirection: SIMD3<Float> = SIMD3(0, -1, 0)
+    /// Moon angular RADIUS in radians. The real moon is ≈0.0047 (0.27°); the
+    /// default is ~2× that for a photographic read. Taste knob.
+    public var nightSkyMoonAngularRadius: Float = 0.0095
     // DEFAULTS LESSON (PR #33 fix): the initial Phase 2.5 defaults were
     // shadowBias = 0.0008 and shadowSlopeBias = 0.005 — both too aggressive.
     // The shadow pass uses front-face culling, which already shifts stored
@@ -9409,6 +9434,17 @@ public final class IlluminatoramaRenderer {
         u.interiorIBLUp = max(0, interiorIBLUp)
         u.interiorIBLSide = max(0, interiorIBLSide)
         u.interiorAmbient = max(0, interiorAmbient)
+        // Analytic night sky. All-zero defaults keep the kernel's sky branch an
+        // exact no-op; hosts fade the brightnesses with nightBlend themselves.
+        u.nightSkyParams = SIMD4(max(0, nightSkyStarBrightness),
+                                 max(0, nightSkyMoonIntensity),
+                                 max(0, nightSkyMoonAngularRadius), 0)
+        let moonDirSafe = nightSkyMoonDirection == .zero
+            ? SIMD3<Float>(0, 1, 0) : simd_normalize(nightSkyMoonDirection)
+        let sunDirSafe = nightSkySunDirection == .zero
+            ? SIMD3<Float>(0, -1, 0) : simd_normalize(nightSkySunDirection)
+        u.nightMoonDir = SIMD4(moonDirSafe, 0)
+        u.nightSunDir = SIMD4(sunDirSafe, 0)
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
 
