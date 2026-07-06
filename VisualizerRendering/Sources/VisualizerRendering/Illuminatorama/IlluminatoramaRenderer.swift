@@ -973,6 +973,16 @@ public final class IlluminatoramaRenderer {
     nonisolated static let maxFramesInFlight = 2
     private let inFlightSemaphore = DispatchSemaphore(value: IlluminatoramaRenderer.maxFramesInFlight)
 
+    deinit {
+        // Balance the in-flight semaphore before it can be deallocated: the
+        // adaptive latency guard may be HOLDING a permit (depth 2→1 on heavy
+        // frames), and a DispatchSemaphore deallocated below its creation value
+        // traps ("Semaphore object deallocated while in use") — a crash that
+        // surfaces at a random later point in the host process. See
+        // `IlluminatoramaPresentSync.retire`.
+        presentSync.retire(semaphore: inFlightSemaphore)
+    }
+
     public let device: MTLDevice
     public let commandQueue: MTLCommandQueue
 
@@ -9955,6 +9965,9 @@ private final class IlluminatoramaPresentSync: @unchecked Sendable {
     /// Permits currently held back (0 ⇒ depth 2, 1 ⇒ depth 1). Never exceeds
     /// `maxFramesInFlight - 1`, so at least one permit always circulates (no deadlock).
     private var heldPermits: Int = 0
+    /// Set by `retire(semaphore:)` when the owning renderer tears down — no
+    /// further permits may be held after that (see the deinit-balance contract).
+    private var retired = false
     /// Current effective depth target, with hysteresis so it doesn't flap.
     private var depth: Int = IlluminatoramaRenderer.maxFramesInFlight
     /// Hysteresis band (~2 ticks): pipeline only while the GPU frame is light.
@@ -9977,7 +9990,7 @@ private final class IlluminatoramaPresentSync: @unchecked Sendable {
             if gpuMsEMA < Self.pipelineEnterMs { depth = IlluminatoramaRenderer.maxFramesInFlight }
         }
         let targetHeld = max(0, IlluminatoramaRenderer.maxFramesInFlight - depth)
-        if heldPermits < targetHeld {
+        if heldPermits < targetHeld, !retired {
             heldPermits += 1            // hold this frame's permit (shrink capacity)
             lock.unlock()
         } else if heldPermits > targetHeld {
@@ -9989,6 +10002,26 @@ private final class IlluminatoramaPresentSync: @unchecked Sendable {
             lock.unlock()
             semaphore.signal()          // normal release
         }
+    }
+
+    /// The owning renderer is tearing down: release every HELD permit and refuse to
+    /// hold any more, so `inFlightSemaphore` can never be deallocated under-valued.
+    /// A `DispatchSemaphore` whose value at dealloc is below its creation value hits
+    /// the libdispatch trap "Semaphore object deallocated while in use" — which is
+    /// exactly what happened when a heavy-frame scene (RT glass) ended with the
+    /// adaptive guard holding a permit: the renderer + semaphore died one frame
+    /// later and the SIGTRAP detonated in whatever unrelated code ran next (it
+    /// presented as heap-corruption-looking crashes in the NEXT test's mesh build).
+    /// The lock serializes against a completion handler mid-decision: either it
+    /// holds first (drained here) or it sees `retired` and signals normally.
+    /// Over-signalling past the creation value is safe — only UNDER-value traps.
+    func retire(semaphore: DispatchSemaphore) {
+        lock.lock()
+        retired = true
+        let toRelease = heldPermits
+        heldPermits = 0
+        lock.unlock()
+        for _ in 0..<toRelease { semaphore.signal() }
     }
 
     /// Record (from the main thread, at commit) that pool buffer `idx` is now in flight.
