@@ -171,8 +171,18 @@ public final class IlluminatoramaRenderer {
         public var pointShadowPassesSkipped = 0
     }
     public private(set) var staticSkipStats = StaticSkipStats()
+    /// Debug window for tests/instruments: the current stability streak lengths
+    /// (frames since full-content / shape-only / glass content last changed).
+    public var stabilityDebug: (full: Int, shape: Int, glass: Int) {
+        (instanceStableFrames, instanceShapeStableFrames, glassStableFrames)
+    }
     private var lastUploadedInstances: [InstanceRef] = []
     private var instanceStableFrames: Int = 0
+    /// Frames since any instance's SHAPE (meshKind / modelMatrix / sway fields)
+    /// changed — a weaker invariant than full stability that the shadow passes
+    /// can gate on, because they never read materials or emission. Always ≥
+    /// `instanceStableFrames`.
+    private var instanceShapeStableFrames: Int = 0
     private var lastGlassFlat: [(kind: MeshKind, insts: [IlluminatoramaGlassInstance])] = []
     private var glassStableFrames: Int = 0
     /// True when any current instance self-oscillates in the vertex shader
@@ -191,12 +201,19 @@ public final class IlluminatoramaRenderer {
     /// light move, or radius change breaks equality → re-render.
     private var lastPointShadowSig: [SIMD4<Float>] = []
     private var lastPointCubeAssign: [Int32] = []
+    /// Cached per-slice shadow pass descriptors + labels (spot atlas slices and
+    /// point cube-face slices) — built once, reused every re-render; the encode
+    /// loops used to allocate ~35 descriptors + label strings per frame.
+    private var spotShadowPassDescs: [MTLRenderPassDescriptor] = []
+    private var spotShadowPassLabels: [String] = []
+    private var pointShadowPassDescs: [MTLRenderPassDescriptor] = []
+    private var pointShadowPassLabels: [String] = []
     /// Shadow maps may be reused from last frame only when the scene content is
     /// provably identical AND fully CPU-visible: no vertex-shader sway (time-
     /// animated silhouettes), no compute-fed geometry (`gpuRepackTasks` — e.g.
     /// the grass field), and no GPU-written instance slots (`onEncodeGPUInstances`).
     private var sceneStaticForShadows: Bool {
-        instanceStableFrames >= 1 && !contentHasSway
+        instanceShapeStableFrames >= 1 && !contentHasSway
             && gpuRepackTasks.isEmpty && onEncodeGPUInstances == nil
     }
 
@@ -1206,7 +1223,14 @@ public final class IlluminatoramaRenderer {
     /// The 6 face view-projection matrices per shadow-casting light, uploaded to
     /// the GPU so the kernel can project a fragment into the chosen face. Layout:
     /// `[cube0.face0 … cube0.face5, cube1.face0 …]`. Grown with the atlas.
-    private var pointShadowFaceBuffer: MTLBuffer?
+    // A/B ring pair (see the MFIF ring block) — `updatePointShadows` rewrites the
+    // face matrices on the CPU every frame, so the slot must alternate with the
+    // frame parity or the in-flight frame's kernel reads mid-write matrices.
+    private var pointShadowFaceBufferA: MTLBuffer?
+    private var pointShadowFaceBufferB: MTLBuffer?
+    private var pointShadowFaceBuffer: MTLBuffer? {
+        useBufferA ? pointShadowFaceBufferA : pointShadowFaceBufferB
+    }
     private let pointShadowCubeCapacity: Int = 4      // N nearest shadow-casting lights
     private let pointShadowMapResolution: Int = 512
 
@@ -1287,6 +1311,9 @@ public final class IlluminatoramaRenderer {
     }
     private var ddgiRayBuffer: MTLBuffer?
     private var ddgiInstanceDataBuffer: MTLBuffer?
+    /// Instance count last packed into `ddgiInstanceDataBuffer` (−1 = never) —
+    /// with stable content the pack loop (a 4×4 inverse per instance) is skipped.
+    private var ddgiPackedInstanceCount = -1
     private var ddgiInstanceDataCapacity: Int = 0
     private var ddgiEmitterBuffer: MTLBuffer?
     private var ddgiEmitterCapacity: Int = 0
@@ -2153,15 +2180,40 @@ public final class IlluminatoramaRenderer {
     private var instanceBufferB: MTLBuffer
     private var instanceCapacity: Int
     private var useBufferA: Bool = true
-    private var pointLightBuffer: MTLBuffer
+    // ── MFIF ring (audit fix, 2026-07-05) ─────────────────────────────────
+    // Every per-frame CPU-written shared buffer is an A/B pair selected by the
+    // SAME `useBufferA` parity the instance ping-pong toggles each rendered
+    // frame. With `maxFramesInFlight = 2` exactly one earlier frame can still
+    // be executing when the CPU writes the next frame's data — single-buffered
+    // uniforms/lights let frame N's GPU passes read frame N+1's fresh memcpy
+    // mid-flight (one-frame TAA/motion/light glitches). A 2-slot ring closes
+    // that race: by the time a parity repeats, the semaphore guarantees the
+    // frame that used that slot has fully completed. All use sites read the
+    // single-name computed property, which resolves to the CURRENT slot.
+    private var pointLightBufferA: MTLBuffer
+    private var pointLightBufferB: MTLBuffer
     private var pointLightCapacity: Int
-    private var spotLightBuffer: MTLBuffer
+    private var spotLightBufferA: MTLBuffer
+    private var spotLightBufferB: MTLBuffer
     private var spotLightCapacity: Int
-    private var areaLightBuffer: MTLBuffer
+    private var areaLightBufferA: MTLBuffer
+    private var areaLightBufferB: MTLBuffer
     private var areaLightCapacity: Int
-    private var extraDirectionalBuffer: MTLBuffer
+    private var extraDirectionalBufferA: MTLBuffer
+    private var extraDirectionalBufferB: MTLBuffer
     private var extraDirectionalCapacity: Int
-    private var frameUniformBuffer: MTLBuffer
+    private var frameUniformBufferA: MTLBuffer
+    private var frameUniformBufferB: MTLBuffer
+
+    private var pointLightBuffer: MTLBuffer { useBufferA ? pointLightBufferA : pointLightBufferB }
+    private var spotLightBuffer: MTLBuffer { useBufferA ? spotLightBufferA : spotLightBufferB }
+    private var areaLightBuffer: MTLBuffer { useBufferA ? areaLightBufferA : areaLightBufferB }
+    private var extraDirectionalBuffer: MTLBuffer {
+        useBufferA ? extraDirectionalBufferA : extraDirectionalBufferB
+    }
+    private var frameUniformBuffer: MTLBuffer {
+        useBufferA ? frameUniformBufferA : frameUniformBufferB
+    }
 
     private var currentInstanceBuffer: MTLBuffer { useBufferA ? instanceBufferA : instanceBufferB }
     private var previousInstanceBuffer: MTLBuffer { useBufferA ? instanceBufferB : instanceBufferA }
@@ -2921,51 +2973,78 @@ public final class IlluminatoramaRenderer {
         self.superquadricParamBuffer = spb
         self.superquadricParamCapacity = initInstCap
 
-        guard let pb = device.makeBuffer(
+        // Each per-frame CPU-written buffer is an A/B ring pair (see the MFIF
+        // ring block at the declarations) — allocate both slots of each.
+        guard let pbA = device.makeBuffer(
+            length: MemoryLayout<IlluminatoramaPointLight>.stride * initLightCap,
+            options: .storageModeShared
+        ), let pbB = device.makeBuffer(
             length: MemoryLayout<IlluminatoramaPointLight>.stride * initLightCap,
             options: .storageModeShared
         ) else { throw IlluminatoramaError.bufferAllocationFailed("pointLights") }
-        pb.label = "Illuminatorama.pointLights"
-        self.pointLightBuffer = pb
+        pbA.label = "Illuminatorama.pointLightsA"
+        pbB.label = "Illuminatorama.pointLightsB"
+        self.pointLightBufferA = pbA
+        self.pointLightBufferB = pbB
         self.pointLightCapacity = initLightCap
 
         // Spot lights are bound at lighting kernel buffer(3). Same default
         // capacity as point lights — Eggs's rail-spotlight layout pushes
         // into the 20+ range so grow-on-demand will kick in early there.
-        guard let sb = device.makeBuffer(
+        guard let sbA = device.makeBuffer(
+            length: MemoryLayout<IlluminatoramaSpotLight>.stride * initLightCap,
+            options: .storageModeShared
+        ), let sbB = device.makeBuffer(
             length: MemoryLayout<IlluminatoramaSpotLight>.stride * initLightCap,
             options: .storageModeShared
         ) else { throw IlluminatoramaError.bufferAllocationFailed("spotLights") }
-        sb.label = "Illuminatorama.spotLights"
-        self.spotLightBuffer = sb
+        sbA.label = "Illuminatorama.spotLightsA"
+        sbB.label = "Illuminatorama.spotLightsB"
+        self.spotLightBufferA = sbA
+        self.spotLightBufferB = sbB
         self.spotLightCapacity = initLightCap
 
         // Area lights are bound at lighting kernel buffer(4). Few per scene
         // (one softbox / window pane is typical); grow-on-demand covers more.
-        guard let ab = device.makeBuffer(
+        guard let abA = device.makeBuffer(
+            length: MemoryLayout<IlluminatoramaAreaLight>.stride * initLightCap,
+            options: .storageModeShared
+        ), let abB = device.makeBuffer(
             length: MemoryLayout<IlluminatoramaAreaLight>.stride * initLightCap,
             options: .storageModeShared
         ) else { throw IlluminatoramaError.bufferAllocationFailed("areaLights") }
-        ab.label = "Illuminatorama.areaLights"
-        self.areaLightBuffer = ab
+        abA.label = "Illuminatorama.areaLightsA"
+        abB.label = "Illuminatorama.areaLightsB"
+        self.areaLightBufferA = abA
+        self.areaLightBufferB = abB
         self.areaLightCapacity = initLightCap
 
         // Secondary directional fills are bound at lighting kernel buffer(5).
         // A SCN 3-point rig ships 1–2 (fill + back); grow-on-demand covers more.
-        guard let db = device.makeBuffer(
+        guard let dbA = device.makeBuffer(
+            length: MemoryLayout<IlluminatoramaDirectionalLight>.stride * initLightCap,
+            options: .storageModeShared
+        ), let dbB = device.makeBuffer(
             length: MemoryLayout<IlluminatoramaDirectionalLight>.stride * initLightCap,
             options: .storageModeShared
         ) else { throw IlluminatoramaError.bufferAllocationFailed("extraDirectionals") }
-        db.label = "Illuminatorama.extraDirectionals"
-        self.extraDirectionalBuffer = db
+        dbA.label = "Illuminatorama.extraDirectionalsA"
+        dbB.label = "Illuminatorama.extraDirectionalsB"
+        self.extraDirectionalBufferA = dbA
+        self.extraDirectionalBufferB = dbB
         self.extraDirectionalCapacity = initLightCap
 
-        guard let fb = device.makeBuffer(
+        guard let fbA = device.makeBuffer(
+            length: MemoryLayout<IlluminatoramaFrameUniforms>.stride,
+            options: .storageModeShared
+        ), let fbB = device.makeBuffer(
             length: MemoryLayout<IlluminatoramaFrameUniforms>.stride,
             options: .storageModeShared
         ) else { throw IlluminatoramaError.bufferAllocationFailed("frameUniforms") }
-        fb.label = "Illuminatorama.frame"
-        self.frameUniformBuffer = fb
+        fbA.label = "Illuminatorama.frameA"
+        fbB.label = "Illuminatorama.frameB"
+        self.frameUniformBufferA = fbA
+        self.frameUniformBufferB = fbB
 
         // Phase 1 ships three procedural primitives. Hosts can also call
         // `setMesh(_:_:)` to swap in their own.
@@ -6424,7 +6503,24 @@ public final class IlluminatoramaRenderer {
         let glassNow = flattenGlass()
         if instances == lastUploadedInstances {
             instanceStableFrames += 1
+            instanceShapeStableFrames += 1
         } else {
+            // Full content changed. Distinguish "geometry moved" from "only a
+            // material/emission animated" (the canonical case: a powered-on TV's
+            // screen flicker rewrites emission+albedo every frame). The shadow
+            // depth passes read ONLY meshKind + modelMatrix + the sway fields,
+            // so SHAPE stability keeps the up-to-32-pass shadow reuse alive
+            // under animated materials. Compared per-field only on full-compare
+            // misses, so the static-scene fast path never pays for it.
+            let shapeHeld = instances.count == lastUploadedInstances.count
+                && zip(instances, lastUploadedInstances).allSatisfy {
+                    $0.meshKind == $1.meshKind
+                        && $0.data.modelMatrix == $1.data.modelMatrix
+                        && $0.data.swayMode == $1.data.swayMode
+                        && $0.data.swayLean == $1.data.swayLean
+                        && $0.data.swayJostle == $1.data.swayJostle
+                }
+            instanceShapeStableFrames = shapeHeld ? instanceShapeStableFrames + 1 : 0
             instanceStableFrames = 0
             lastUploadedInstances = instances   // COW reference, no deep copy
             contentHasSway = instances.contains { $0.data.swayMode == 2 }
@@ -6438,7 +6534,11 @@ public final class IlluminatoramaRenderer {
         }
         // Kill-switch: zeroing the counters here disables every downstream skip
         // (upload / TLAS refit / shadow reuse) in one place.
-        if Self.staticSkipDisabled { instanceStableFrames = 0; glassStableFrames = 0 }
+        if Self.staticSkipDisabled {
+            instanceStableFrames = 0
+            instanceShapeStableFrames = 0
+            glassStableFrames = 0
+        }
         updateCascades()
         // Phase 4.10 — compute per-spot shadow matrices + slice indices
         // BEFORE `uploadSpotLights` so the GPU buffer sees the current
@@ -6481,11 +6581,8 @@ public final class IlluminatoramaRenderer {
         // overwrite its group's slots with GPU-computed data. No-op (closure nil)
         // for every scene that doesn't set the hook.
         if let hook = onEncodeGPUInstances {
-            let groups = meshGroups
-            hook(cb, currentInstanceBuffer) { kind in
-                guard let g = groups.first(where: { $0.kind == kind }) else { return nil }
-                return g.start ..< (g.start + g.count)
-            }
+            let ranges = meshGroupRange
+            hook(cb, currentInstanceBuffer) { kind in ranges[kind] }
         }
         // GPU-resident point lights (additive — see `onEncodeGPUPointLights`).
         // `uploadPointLights()` above packed the CPU placeholders into the buffer;
@@ -6856,12 +6953,15 @@ public final class IlluminatoramaRenderer {
         let lambda: Float = 0.5
 
         // PSSM split distances (in view-space positive distance) — log + uniform.
-        var splitsPos: [Float] = [near]
+        // Fixed SIMD storage (count + 1 ≤ 8): this ran every frame and used to
+        // heap-allocate three small arrays (splits + the two corner lists below).
+        var splitsPos = SIMD8<Float>()
+        splitsPos[0] = near
         for i in 1...count {
             let f = Float(i) / Float(count)
             let logSplit = near * pow(far / near, f)
             let uniSplit = near + (far - near) * f
-            splitsPos.append(lambda * logSplit + (1 - lambda) * uniSplit)
+            splitsPos[i] = lambda * logSplit + (1 - lambda) * uniSplit
         }
         // Expose far-Z of each cascade to the lighting kernel.
         cascadeSplitsView = SIMD4(splitsPos[1], splitsPos[2], splitsPos[3], 0)
@@ -6878,28 +6978,29 @@ public final class IlluminatoramaRenderer {
             let f = splitsPos[c + 1]
             let hHN = n * tanHalfFovY, hWN = hHN * aspect
             let hHF = f * tanHalfFovY, hWF = hHF * aspect
-            // View-space corners (Metal/right-handed: looking down -Z).
-            let viewCorners: [SIMD4<Float>] = [
-                SIMD4(-hWN, -hHN, -n, 1), SIMD4( hWN, -hHN, -n, 1),
-                SIMD4(-hWN,  hHN, -n, 1), SIMD4( hWN,  hHN, -n, 1),
-                SIMD4(-hWF, -hHF, -f, 1), SIMD4( hWF, -hHF, -f, 1),
-                SIMD4(-hWF,  hHF, -f, 1), SIMD4( hWF,  hHF, -f, 1),
-            ]
-            var worldCorners: [SIMD3<Float>] = []
-            worldCorners.reserveCapacity(8)
-            for v in viewCorners {
+            // View-space corners (Metal/right-handed: looking down -Z), generated
+            // procedurally from the index bits (b0 = ±x, b1 = ±y, b2 = near/far)
+            // — same 8 corners the old literal arrays held, no allocation.
+            func worldCorner(_ i: Int) -> SIMD3<Float> {
+                let isFar = (i & 4) != 0
+                let d: Float = isFar ? f : n
+                let hH = isFar ? hHF : hHN, hW = isFar ? hWF : hWN
+                let v = SIMD4<Float>((i & 1) == 0 ? -hW : hW,
+                                     (i & 2) == 0 ? -hH : hH, -d, 1)
                 let w = invView * v
-                worldCorners.append(SIMD3(w.x, w.y, w.z))
+                return SIMD3(w.x, w.y, w.z)
             }
 
             // Bounding sphere of the sub-frustum — rotation-invariant, so
-            // the cascade extents don't pulse as the camera spins.
+            // the cascade extents don't pulse as the camera spins. Two passes
+            // (centre, then radius) recompute the corners — 16 mat-vec mults,
+            // cheaper than materialising two heap arrays per cascade per frame.
             var center = SIMD3<Float>.zero
-            for p in worldCorners { center += p }
+            for i in 0..<8 { center += worldCorner(i) }
             center /= 8
             var radius: Float = 0
-            for p in worldCorners {
-                radius = max(radius, simd_length(p - center))
+            for i in 0..<8 {
+                radius = max(radius, simd_length(worldCorner(i) - center))
             }
             // Round the radius up slightly so PCF taps near the sphere edge
             // still find geometry.
@@ -6992,16 +7093,23 @@ public final class IlluminatoramaRenderer {
             return
         }
         lastSpotShadowMats = mats
-        for slice in 0..<count {
+        // Pass descriptors + labels are cached per slice (they never change after
+        // the atlas exists) — this loop used to allocate a fresh descriptor and
+        // interpolate a fresh label string per slice per frame.
+        while spotShadowPassDescs.count < count {
+            let slice = spotShadowPassDescs.count
             let pass = MTLRenderPassDescriptor()
             pass.depthAttachment.texture = spotShadowAtlas
             pass.depthAttachment.slice = slice
             pass.depthAttachment.loadAction = .clear
             pass.depthAttachment.storeAction = .store
             pass.depthAttachment.clearDepth = 1.0
-
-            guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { continue }
-            enc.label = "Illuminatorama.spotShadow.s\(slice)"
+            spotShadowPassDescs.append(pass)
+            spotShadowPassLabels.append("Illuminatorama.spotShadow.s\(slice)")
+        }
+        for slice in 0..<count {
+            guard let enc = cb.makeRenderCommandEncoder(descriptor: spotShadowPassDescs[slice]) else { continue }
+            enc.label = spotShadowPassLabels[slice]
             enc.setRenderPipelineState(shadowPipeline)
             enc.setDepthStencilState(depthState)
             // Same back-face-cast trick as the cascaded path.
@@ -7145,19 +7253,24 @@ public final class IlluminatoramaRenderer {
         let faces = faceBuffer.contents().bindMemory(
             to: simd_float4x4.self, capacity: pointShadowCubeCapacity * 6)
         let instStride = MemoryLayout<IlluminatoramaInstance>.stride
+        // Pass descriptors + labels cached per cube-face slice (fixed atlas).
+        while pointShadowPassDescs.count < pointShadowCubeCapacity * 6 {
+            let slice = pointShadowPassDescs.count
+            let pass = MTLRenderPassDescriptor()
+            pass.depthAttachment.texture = atlas
+            pass.depthAttachment.slice = slice
+            pass.depthAttachment.loadAction = .clear
+            pass.depthAttachment.storeAction = .store
+            pass.depthAttachment.clearDepth = 1.0
+            pointShadowPassDescs.append(pass)
+            pointShadowPassLabels.append("Illuminatorama.pointShadow.c\(slice / 6).f\(slice % 6)")
+        }
         for pl in pointLights where pl.shadowCubeIndex >= 0 {
             let cube = Int(pl.shadowCubeIndex)
             for f in 0..<6 {
                 let slice = cube * 6 + f
-                let pass = MTLRenderPassDescriptor()
-                pass.depthAttachment.texture = atlas
-                pass.depthAttachment.slice = slice
-                pass.depthAttachment.loadAction = .clear
-                pass.depthAttachment.storeAction = .store
-                pass.depthAttachment.clearDepth = 1.0
-
-                guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { continue }
-                enc.label = "Illuminatorama.pointShadow.c\(cube).f\(f)"
+                guard let enc = cb.makeRenderCommandEncoder(descriptor: pointShadowPassDescs[slice]) else { continue }
+                enc.label = pointShadowPassLabels[slice]
                 enc.setRenderPipelineState(shadowPipeline)
                 enc.setDepthStencilState(depthState)
                 // Back-face cast, same acne mitigation as the sun / spot maps.
@@ -7209,12 +7322,14 @@ public final class IlluminatoramaRenderer {
                 pointShadowAtlas = t
             }
         }
-        if pointShadowFaceBuffer == nil {
-            if let b = device.makeBuffer(
-                length: MemoryLayout<simd_float4x4>.stride * pointShadowCubeCapacity * 6,
-                options: .storageModeShared) {
-                b.label = "Illuminatorama.pointShadowFaces"
-                pointShadowFaceBuffer = b
+        if pointShadowFaceBufferA == nil || pointShadowFaceBufferB == nil {
+            let len = MemoryLayout<simd_float4x4>.stride * pointShadowCubeCapacity * 6
+            if let a = device.makeBuffer(length: len, options: .storageModeShared),
+               let b = device.makeBuffer(length: len, options: .storageModeShared) {
+                a.label = "Illuminatorama.pointShadowFacesA"
+                b.label = "Illuminatorama.pointShadowFacesB"
+                pointShadowFaceBufferA = a
+                pointShadowFaceBufferB = b
             }
         }
     }
@@ -8034,23 +8149,29 @@ public final class IlluminatoramaRenderer {
         }
 
         // Build per-instance DDGI data (invModelMatrix + material) for the trace kernel.
+        // PERF (static-scene skip): this loop pays a general 4×4 inverse per instance
+        // per frame — with stable content the packed buffer already holds exactly this
+        // data, so repack only when the content generation moved (or on first use).
         ensureDDGIInstanceDataBuffer(count: instances.count)
         guard let instBuf = ddgiInstanceDataBuffer else { return }
-        let instPtr = instBuf.contents().bindMemory(
-            to: DDGIGPUInstanceData.self, capacity: instances.count)
-        for (i, ref) in instances.enumerated() {
-            // Phase 2.6 — meshKind=3 is "custom mesh, no analytic intersection";
-            // the trace kernel skips intersection on anything not in {0,1,2}.
-            let kind: UInt32 = ref.meshKind.gpuMeshKind
-            instPtr[i] = DDGIGPUInstanceData(
-                invModelMatrix: ref.data.modelMatrix.inverse,
-                normalMatrix:   ref.data.normalMatrix,
-                albedo:         ref.data.albedo,
-                metallic:       ref.data.metallic,
-                emission:       ref.data.emission,
-                roughness:      ref.data.roughness,
-                meshKind:       kind
-            )
+        if instanceStableFrames == 0 || ddgiPackedInstanceCount != instances.count {
+            let instPtr = instBuf.contents().bindMemory(
+                to: DDGIGPUInstanceData.self, capacity: instances.count)
+            for (i, ref) in instances.enumerated() {
+                // Phase 2.6 — meshKind=3 is "custom mesh, no analytic intersection";
+                // the trace kernel skips intersection on anything not in {0,1,2}.
+                let kind: UInt32 = ref.meshKind.gpuMeshKind
+                instPtr[i] = DDGIGPUInstanceData(
+                    invModelMatrix: ref.data.modelMatrix.inverse,
+                    normalMatrix:   ref.data.normalMatrix,
+                    albedo:         ref.data.albedo,
+                    metallic:       ref.data.metallic,
+                    emission:       ref.data.emission,
+                    roughness:      ref.data.roughness,
+                    meshKind:       kind
+                )
+            }
+            ddgiPackedInstanceCount = instances.count
         }
 
         let probeCount   = ddgiGridDims.x * ddgiGridDims.y * ddgiGridDims.z
@@ -9084,47 +9205,54 @@ public final class IlluminatoramaRenderer {
                 superquadricParamCapacity = newCap
             }
         }
+        // Light-buffer growth replaces BOTH ring slots in lockstep (the retiring
+        // slot may still be bound by the in-flight frame — Metal retains it via
+        // the command buffer, so dropping our reference is safe).
         if pointLights.count > pointLightCapacity {
             let newCap = max(pointLights.count, pointLightCapacity * 2)
-            if let nb = device.makeBuffer(
-                length: MemoryLayout<IlluminatoramaPointLight>.stride * newCap,
-                options: .storageModeShared
-            ) {
-                nb.label = "Illuminatorama.pointLights"
-                pointLightBuffer = nb
+            let len = MemoryLayout<IlluminatoramaPointLight>.stride * newCap
+            if let a = device.makeBuffer(length: len, options: .storageModeShared),
+               let b = device.makeBuffer(length: len, options: .storageModeShared) {
+                a.label = "Illuminatorama.pointLightsA"
+                b.label = "Illuminatorama.pointLightsB"
+                pointLightBufferA = a
+                pointLightBufferB = b
                 pointLightCapacity = newCap
             }
         }
         if spotLights.count > spotLightCapacity {
             let newCap = max(spotLights.count, spotLightCapacity * 2)
-            if let nb = device.makeBuffer(
-                length: MemoryLayout<IlluminatoramaSpotLight>.stride * newCap,
-                options: .storageModeShared
-            ) {
-                nb.label = "Illuminatorama.spotLights"
-                spotLightBuffer = nb
+            let len = MemoryLayout<IlluminatoramaSpotLight>.stride * newCap
+            if let a = device.makeBuffer(length: len, options: .storageModeShared),
+               let b = device.makeBuffer(length: len, options: .storageModeShared) {
+                a.label = "Illuminatorama.spotLightsA"
+                b.label = "Illuminatorama.spotLightsB"
+                spotLightBufferA = a
+                spotLightBufferB = b
                 spotLightCapacity = newCap
             }
         }
         if areaLights.count > areaLightCapacity {
             let newCap = max(areaLights.count, areaLightCapacity * 2)
-            if let nb = device.makeBuffer(
-                length: MemoryLayout<IlluminatoramaAreaLight>.stride * newCap,
-                options: .storageModeShared
-            ) {
-                nb.label = "Illuminatorama.areaLights"
-                areaLightBuffer = nb
+            let len = MemoryLayout<IlluminatoramaAreaLight>.stride * newCap
+            if let a = device.makeBuffer(length: len, options: .storageModeShared),
+               let b = device.makeBuffer(length: len, options: .storageModeShared) {
+                a.label = "Illuminatorama.areaLightsA"
+                b.label = "Illuminatorama.areaLightsB"
+                areaLightBufferA = a
+                areaLightBufferB = b
                 areaLightCapacity = newCap
             }
         }
         if extraDirectionals.count > extraDirectionalCapacity {
             let newCap = max(extraDirectionals.count, extraDirectionalCapacity * 2)
-            if let nb = device.makeBuffer(
-                length: MemoryLayout<IlluminatoramaDirectionalLight>.stride * newCap,
-                options: .storageModeShared
-            ) {
-                nb.label = "Illuminatorama.extraDirectionals"
-                extraDirectionalBuffer = nb
+            let len = MemoryLayout<IlluminatoramaDirectionalLight>.stride * newCap
+            if let a = device.makeBuffer(length: len, options: .storageModeShared),
+               let b = device.makeBuffer(length: len, options: .storageModeShared) {
+                a.label = "Illuminatorama.extraDirectionalsA"
+                b.label = "Illuminatorama.extraDirectionalsB"
+                extraDirectionalBufferA = a
+                extraDirectionalBufferB = b
                 extraDirectionalCapacity = newCap
             }
         }
@@ -9332,6 +9460,7 @@ public final class IlluminatoramaRenderer {
         // instance as `instances[iid]` because both buffers used the
         // same grouping last → this frame.
         meshGroups.removeAll(keepingCapacity: true)
+        meshGroupRange.removeAll(keepingCapacity: true)
         guard !instances.isEmpty else { return }
 
         // First pass — bucket by mesh kind, preserving first-seen order
@@ -9379,8 +9508,16 @@ public final class IlluminatoramaRenderer {
             }
             meshGroups.append(MeshDrawGroup(
                 kind: kind, start: groupStart, count: srcIndices.count))
+            meshGroupRange[kind] = groupStart ..< (groupStart + srcIndices.count)
         }
     }
+
+    /// `MeshKind` → its contiguous `[start, end)` slot range in the grouped
+    /// instance buffer. Built alongside `meshGroups` in `uploadInstances` (and
+    /// preserved across static-skip frames, whose grouping is identical) so the
+    /// per-frame `onEncodeGPUInstances` lookup is a hash probe, not a linear
+    /// scan of `meshGroups`.
+    private var meshGroupRange: [MeshKind: Range<Int>] = [:]
 
     private func uploadPointLights() {
         guard !pointLights.isEmpty else { return }

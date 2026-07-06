@@ -106,8 +106,21 @@ public struct DragSwayTracker {
         } else {
             s.leanX  *= 0.91   // ~530 ms settle at 60 fps
             s.jostle *= 0.88
+            // Snap to TRUE rest below visibility. Exponential decay alone never
+            // reaches zero, so a once-jostled object kept mutating its per-instance
+            // sway fields by sub-visible amounts (≲0.06° lean / ≲0.1 mm hop) every
+            // frame for hundreds of frames — which defeated the renderer's shape-
+            // stability gate (shadow-map reuse) long after the motion stopped
+            // reading. The impact spring already retires via `atRest`; this is the
+            // eased channel's equivalent.
+            if abs(s.leanX) < 1e-3 { s.leanX = 0 }
+            if s.jostle < 1e-4 { s.jostle = 0 }
         }
-        states[id] = s
+        if !moving, s.leanX == 0, s.jostle == 0, impacts[id] == nil {
+            states[id] = nil   // fully at rest — retire the entry (bounded map)
+        } else {
+            states[id] = s
+        }
 
         // Add the collision recoil on top, then advance / retire its spring.
         var out = s
