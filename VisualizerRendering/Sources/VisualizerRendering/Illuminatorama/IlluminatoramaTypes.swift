@@ -542,6 +542,18 @@ public struct IlluminatoramaInstance {
     /// every light affects this instance (byte-identical to prior behaviour). Same
     /// 4 bytes as the former float pad, so the stride stays 240.
     public var layer: UInt32 = 0xFFFF_FFFF
+    // ── Anti-tiling suitability (per instance) ────────────────────────────────
+    // Multiplier on the frame's global `antiTilingStrength` for THIS instance's
+    // hex-stochastic samples. The de-repeat blend is only valid for STOCHASTIC
+    // textures — on a coherent pattern it superimposes misaligned copies: a tile
+    // grid double-prints its grout lines and directional wood grain dices into a
+    // patchwork quilt (both Danny-reported). Hosts set 0 for regular/directional
+    // materials (tile, wallpaper, wood planks, brick) and leave 1 elsewhere.
+    // NEW 16-byte cluster (offsets 240-255): stride 240 → 256; three float pads.
+    public var antiTilingScale: Float = 1
+    public var _padAntiTiling0: Float = 0
+    public var _padAntiTiling1: Float = 0
+    public var _padAntiTiling2: Float = 0
 
     public init(
         modelMatrix: simd_float4x4,
@@ -575,10 +587,10 @@ public struct IlluminatoramaInstance {
         self.normalMatrix = Self.normalMatrix(from: m)
     }
 
-    /// Compile-time guard: Swift and Metal structs must agree on 240 bytes.
+    /// Compile-time guard: Swift and Metal structs must agree on 256 bytes.
     /// If this fires, either a Swift field was added without the matching Metal
     /// field (or vice versa), or alignment changed unexpectedly.
-    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 240, "IlluminatoramaInstance stride must be 240") }()
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 256, "IlluminatoramaInstance stride must be 256") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //

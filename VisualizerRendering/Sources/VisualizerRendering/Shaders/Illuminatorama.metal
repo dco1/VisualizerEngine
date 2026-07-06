@@ -353,6 +353,14 @@ struct Instance {
     // affects this instance (byte-identical to pre-mask behaviour). Reinterpreted
     // from the former float pad, so the struct stride stays 240.
     uint     layer;
+    // Per-instance multiplier on frame.antiTilingStrength. The hex-stochastic
+    // de-repeat is only valid for STOCHASTIC textures — hosts set 0 for coherent
+    // patterns (tile grids, wallpaper, directional wood) whose offset samples
+    // would double-print/dice the pattern. NEW 16-byte cluster: stride 240 → 256.
+    float    antiTilingScale;
+    float    _padAntiTiling0;
+    float    _padAntiTiling1;
+    float    _padAntiTiling2;
 };
 
 struct Vertex {
@@ -826,7 +834,7 @@ fragment GBufferOut illumi_fs(
         // but gives correct appearance after renormalize below.
         float4 nmSample = sampleAtlasHex(nonColorAtlas, texSampler, in.uv,
                                          uint(inst.normalTextureSlice), nonColorUVScale,
-                                         frame.antiTilingStrength);
+                                         frame.antiTilingStrength * inst.antiTilingScale);
         float3 tangentN = normalize(nmSample.xyz * 2.0 - 1.0);
         // Phase 7 detail normal — blended on top of the macro normal at
         // higher UV frequency (pores, weave, grain). Uses overlay-normal
@@ -853,7 +861,7 @@ fragment GBufferOut illumi_fs(
         // infinitely-tiling region, so aspect is preserved.
         float4 tx = sampleAtlasHex(albedoAtlas, texSampler, in.uv,
                                     uint(inst.albedoTextureSlice), albedoUVScale,
-                                    frame.antiTilingStrength);
+                                    frame.antiTilingStrength * inst.antiTilingScale);
         albedo = tx.rgb;
     }
     // Phase 4.17 — modulate albedo by per-vertex color (default white,
@@ -881,7 +889,7 @@ fragment GBufferOut illumi_fs(
         // roughness variation doesn't lag the albedo tile seam.
         float4 tx = sampleAtlasHex(nonColorAtlas, texSampler, in.uv,
                                     uint(inst.roughnessTextureSlice), nonColorUVScale,
-                                    frame.antiTilingStrength);
+                                    frame.antiTilingStrength * inst.antiTilingScale);
         roughness = tx.g;
     }
 
