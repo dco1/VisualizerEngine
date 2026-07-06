@@ -1260,7 +1260,12 @@ kernel void volSkyRender(
     // a row of distant buildings on the equator. |yCos| so the fade is
     // symmetric: downward rays from an above-deck camera get the same
     // grazing-angle treatment as upward rays from below.
-    float horizonFade = smoothstep(0.02f, 0.22f, abs(yCos));
+    // Fade window host-tunable via cloudExtra2.zw (0 = the legacy 0.02/0.22).
+    // A ground-level architectural camera sees sky ONLY near the horizon —
+    // the legacy window (full clouds above ~13°) erased the whole deck there.
+    float fadeLo = u.cloudExtra2.z > 0.0f ? u.cloudExtra2.z : 0.02f;
+    float fadeHi = u.cloudExtra2.w > 0.0f ? u.cloudExtra2.w : 0.22f;
+    float horizonFade = smoothstep(fadeLo, fadeHi, abs(yCos));
     float blend = mix(0.0f, 1.0f, horizonFade);
     float effTrans = mix(1.0f, trans, blend);
     float3 col = sky * effTrans + lum * blend;
@@ -1472,7 +1477,12 @@ kernel void illumi_cloud_inview(
         if (pos.y > topY + 0.5f || pos.y < baseY - 0.5f) break;
     }
 
-    float horizonFade = smoothstep(0.02f, 0.22f, abs(yCos));
+    // Fade window host-tunable via cloudExtra2.zw (0 = the legacy 0.02/0.22).
+    // A ground-level architectural camera sees sky ONLY near the horizon —
+    // the legacy window (full clouds above ~13°) erased the whole deck there.
+    float fadeLo = u.cloudExtra2.z > 0.0f ? u.cloudExtra2.z : 0.02f;
+    float fadeHi = u.cloudExtra2.w > 0.0f ? u.cloudExtra2.w : 0.22f;
+    float horizonFade = smoothstep(fadeLo, fadeHi, abs(yCos));
     float blend = mix(0.0f, 1.0f, horizonFade);
     float effTrans = mix(1.0f, trans, blend);
     float3 col = sky * effTrans + lum * blend;

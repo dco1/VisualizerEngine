@@ -218,6 +218,16 @@ public final class VolumetricCloudRenderer {
         /// 1 = clear dark-sky star field. The kernel multiplies by `nightBlend`
         /// so stars always fade in as the sun sets regardless of this value.
         public var starBrightness: Float = 0.0
+        /// Horizon fade window for the cloud composite, in |rayDir.y| units. The
+        /// deck fades to nothing below `cloudHorizonFadeStart` and reaches full
+        /// strength above `cloudHorizonFadeEnd` — the guard against grazing-ray
+        /// over-integration reading as a building band on the equator. 0/0 (the
+        /// defaults) keep the legacy 0.02/0.22 window, byte-identical for every
+        /// non-opting scene. A ground-level architectural camera (house scenes)
+        /// sees sky ONLY near the horizon, so it needs a much tighter window
+        /// (e.g. 0.005/0.06) or the whole deck is invisible in typical frames.
+        public var cloudHorizonFadeStart: Float = 0
+        public var cloudHorizonFadeEnd: Float = 0
         /// Whether the star field + moon disk are baked INTO this equirect dome
         /// (the default — right for SceneKit-dome hosts). A host whose lighting
         /// pass composites the analytic screen-resolution night sky instead
@@ -794,8 +804,11 @@ private struct SkyUniforms {
                                        max(0, params.moundRatio))
         // cloudExtra2.x = multiple-scattering strength; .y = celestials-in-dome
         // flag (0 = the host composites the analytic screen-res night sky, so
-        // the dome must not bake its own blurry stars/moon).
+        // the dome must not bake its own blurry stars/moon); .zw = horizon fade
+        // window (0 = legacy 0.02/0.22).
         self.cloudExtra2 = SIMD4<Float>(max(0, params.multiScatter),
-                                        params.celestialsInDome ? 1 : 0, 0, 0)
+                                        params.celestialsInDome ? 1 : 0,
+                                        max(0, params.cloudHorizonFadeStart),
+                                        max(0, params.cloudHorizonFadeEnd))
     }
 }
