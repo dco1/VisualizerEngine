@@ -289,6 +289,15 @@ public final class IlluminatoramaRenderer {
     public var exposure: Float = 1.0
     public var bloomThreshold: Float = 1.0
     public var bloomIntensity: Float = 0.6
+    /// Screen-space SUN lens flare strength in the tonemap pass (ghost train +
+    /// halo + anamorphic streak, optically occluded by sampling the HDR frame at
+    /// the sun's screen position). 0 = OFF (the default for every scene) → an
+    /// exact shader no-op. 1.0 is the intended "on" look; values between scale it.
+    public var lensFlareIntensity: Float = 0
+    /// TEST-OBSERVABLE: the lens-flare uniform cluster as computed for the last frame
+    /// (x = strength, yz = sun screen uv, w = on-screen weight). Lets a host's GPU test
+    /// verify the sun projection without reading the uniform buffer back.
+    public private(set) var lastLensFlareParams: SIMD4<Float> = .zero
     /// Lens-style transverse chromatic aberration strength in the tonemap pass.
     /// 0 = OFF (the default for every scene) → an exact shader no-op. Maps into
     /// the trailing `_padPlush0` slot of `IlluminatoramaFrameUniforms`, so the
@@ -9445,6 +9454,23 @@ public final class IlluminatoramaRenderer {
             ? SIMD3<Float>(0, -1, 0) : simd_normalize(nightSkySunDirection)
         u.nightMoonDir = SIMD4(moonDirSafe, 0)
         u.nightSunDir = SIMD4(sunDirSafe, 0)
+        // Lens flare: project the primary sun's direction to screen uv. w carries the
+        // on-screen weight — a smooth fade as the sun leaves the frame, hard 0 behind
+        // the camera (clip.w ≤ 0). Strength 0 (default) leaves the whole cluster zero,
+        // an exact shader no-op.
+        u.lensFlareParams = .zero
+        if lensFlareIntensity > 0 {
+            let toSun = simd_normalize(u.directionalLightDir)
+            let clip = u.viewProjection * SIMD4<Float>(u.cameraWorldPos + toSun * 500, 1)
+            if clip.w > 0 {
+                let ndc = SIMD2<Float>(clip.x / clip.w, clip.y / clip.w)
+                let uv = SIMD2<Float>(ndc.x * 0.5 + 0.5, 1 - (ndc.y * 0.5 + 0.5))
+                let edge = max(abs(ndc.x), abs(ndc.y))
+                let weight = max(0, min(1, (1.25 - edge) / 0.35))
+                u.lensFlareParams = SIMD4(max(0, lensFlareIntensity), uv.x, uv.y, weight)
+            }
+        }
+        lastLensFlareParams = u.lensFlareParams
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
 

@@ -313,6 +313,12 @@ public struct IlluminatoramaFrameUniforms {
     public var nightSkyParams: SIMD4<Float> = .zero
     public var nightMoonDir: SIMD4<Float> = .zero
     public var nightSunDir: SIMD4<Float> = .zero
+    // ── Lens flare (sun) ─────────────────────────────────────────────────────
+    // x = strength (0 = OFF, default — the tonemap branch is gated on it so every
+    // non-opting scene renders byte-identically), yz = the sun's screen-space uv,
+    // w = on-screen weight (fades at the frame edge, 0 behind the camera). ONE
+    // new 16-byte cluster (stride 1120 → 1136); mirror of the Metal FrameUniforms.
+    public var lensFlareParams: SIMD4<Float> = .zero
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20

@@ -241,6 +241,13 @@ struct FrameUniforms {
     float4   nightSkyParams;
     float4   nightMoonDir;   // xyz = unit vector toward the moon
     float4   nightSunDir;    // xyz = unit vector toward the TRUE sun (terminator)
+    // ── Lens flare (sun) ─────────────────────────────────────────────────────
+    // x = strength (0 = OFF, the default — the tonemap branch is gated on it so
+    // non-opting scenes are byte-for-byte unchanged), yz = the sun's screen-space
+    // uv, w = on-screen weight (fades at the frame edge, 0 behind the camera).
+    // ONE new 16-byte cluster (stride 1120 → 1136); mirror of
+    // IlluminatoramaFrameUniforms.lensFlareParams.
+    float4   lensFlareParams;
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift
@@ -5315,6 +5322,58 @@ fragment float4 illumi_tonemap_fs(
     float3 bloom = float3(inBloom.sample(downSampler, in.uv).rgb);
 
     float3 mixed = hdr + bloom * frame.bloomIntensity;
+
+    // ── Lens flare (sun) ───────────────────────────────────────────────────────
+    // Screen-space anamorphic streak + ghost train + halo, driven by the sun's
+    // projected screen position (frame.lensFlareParams: x = strength, yz = sun uv,
+    // w = on-screen weight). Occlusion is OPTICAL, not geometric: the HDR source is
+    // sampled at the sun's uv — when a wall hides the sun those taps are stops
+    // dimmer than open sky and the flare fades out, exactly like a real camera.
+    // Added in the HDR domain so exposure/ACES/grade shape it naturally. Strength 0
+    // (the default) skips the branch — non-opting scenes are byte-for-byte unchanged.
+    if (frame.lensFlareParams.x > 0.0 && frame.lensFlareParams.w > 0.0) {
+        float2 sunUV = frame.lensFlareParams.yz;
+        float3 sunTap = float3(inHDR.sample(downSampler, sunUV).rgb);
+        float2 tapR = 4.0 * invInSize;
+        sunTap += float3(inHDR.sample(downSampler, sunUV + float2( tapR.x, 0)).rgb);
+        sunTap += float3(inHDR.sample(downSampler, sunUV + float2(-tapR.x, 0)).rgb);
+        sunTap += float3(inHDR.sample(downSampler, sunUV + float2(0,  tapR.y)).rgb);
+        sunTap += float3(inHDR.sample(downSampler, sunUV + float2(0, -tapR.y)).rgb);
+        float sunLuma = dot(sunTap * 0.2, float3(0.2126, 0.7152, 0.0722));
+        float vis = smoothstep(0.35, 1.6, sunLuma) * frame.lensFlareParams.w;
+        if (vis > 0.001) {
+            float gain = frame.lensFlareParams.x * vis;
+            float aspect = inSize.x / inSize.y;
+            float2 asp = float2(aspect, 1.0);
+            float2 toC = float2(0.5, 0.5) - sunUV;             // sun → frame centre
+            float3 flare = float3(0.0);
+            // Ghost train: tinted discs strung along the sun–centre axis (the
+            // classic multi-element internal-reflection pattern).
+            const float  gT[5]    = { 0.45, 0.85, 1.30, 1.70, 2.10 };
+            const float  gR[5]    = { 0.020, 0.045, 0.032, 0.065, 0.028 };
+            const float3 gTint[5] = { float3(1.00, 0.85, 0.60), float3(0.55, 0.75, 1.00),
+                                      float3(1.00, 0.65, 0.45), float3(0.60, 0.90, 1.00),
+                                      float3(0.95, 0.80, 1.00) };
+            for (int g = 0; g < 5; ++g) {
+                float2 pos = sunUV + toC * gT[g];
+                float d = length((in.uv - pos) * asp);
+                float disc = smoothstep(gR[g], gR[g] * 0.25, d);
+                flare += gTint[g] * disc * (0.14 / (1.0 + gT[g]));
+            }
+            // Halo ring about the frame centre at the sun's mirrored radius.
+            float haloR = clamp(length(toC * asp) * 0.8, 0.15, 0.45);
+            float dC = length((in.uv - 0.5) * asp);
+            float halo = exp(-pow((dC - haloR) * 18.0, 2.0));
+            flare += float3(0.55, 0.75, 1.0) * halo * 0.065;
+            // Anamorphic streak through the sun — tight vertically, long horizontally.
+            float2 dS = (in.uv - sunUV) * asp;
+            float streak = exp(-fabs(dS.y) * 90.0) * exp(-fabs(dS.x) * 4.5);
+            flare += float3(0.65, 0.80, 1.0) * streak * 1.1;
+            // Veiling glare around the sun itself.
+            flare += float3(1.0, 0.92, 0.78) * exp(-length(dS) * 7.0) * 0.55;
+            mixed += flare * gain;
+        }
+    }
     // Phase 4.21 — read the GPU-computed smoothed exposure from the
     // auto-exposure buffer when the host has the feature on; otherwise
     // fall back to the static scalar in FrameUniforms. The estimator
