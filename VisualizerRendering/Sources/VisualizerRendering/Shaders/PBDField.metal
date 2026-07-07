@@ -153,10 +153,11 @@ kernel void pbdFieldForces(
 // to handle the back of a curled-over blade (where this normal would be
 // pointing away from the camera).
 kernel void pbdGrassExpand(
-    device const PBDParticle*           particles [[ buffer(0) ]],
-    device       packed_float3*         verts     [[ buffer(1) ]],
-    constant     GrassExpandUniforms&   u         [[ buffer(2) ]],
-    device       packed_float3*         normals   [[ buffer(3) ]],
+    device const PBDParticle*           particles   [[ buffer(0) ]],
+    device       packed_float3*         verts       [[ buffer(1) ]],
+    constant     GrassExpandUniforms&   u           [[ buffer(2) ]],
+    device       packed_float3*         normals     [[ buffer(3) ]],
+    device const float*                 widthScales [[ buffer(4) ]],  // one per blade (host fills 1.0 when uniform)
     uint id [[ thread_position_in_grid ]]
 ) {
     uint total = u.bladeCount * u.particlesPerBlade;
@@ -206,9 +207,10 @@ kernel void pbdGrassExpand(
     }
     perp /= pLen;
 
-    // Linear taper from base (t=0) to tip (t=1).
+    // Linear taper from base (t=0) to tip (t=1), scaled per blade (flower
+    // heads / reeds can run wider than the field's grass blades).
     float t = float(localIdx) / max(1.0f, float(u.particlesPerBlade - 1u));
-    float halfWidth = u.baseHalfWidth *
+    float halfWidth = u.baseHalfWidth * widthScales[blade] *
         mix(1.0f, max(u.tipHalfWidthFrac, 0.0f), t);
 
     // Normal points "toward the camera" — orthogonal to both the blade

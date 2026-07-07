@@ -63,6 +63,11 @@ public final class GrassRibbonRenderer {
     /// per-tick before encoding.
     public var cameraPosition: SIMD3<Float> = SIMD3(0, 1, 5)
 
+    /// Per-blade width multiplier (×`baseHalfWidth`, same root→tip taper).
+    /// Defaults to 1.0 for every blade; hosts can widen a subset so flower
+    /// heads / reeds stand out from the grass without a second field.
+    private let widthScaleBuffer: MTLBuffer
+
     // ── Init ───────────────────────────────────────────────────────────
 
     public init?(solver: PBDFieldSolver,
@@ -131,6 +136,18 @@ public final class GrassRibbonRenderer {
         }
         idxBuf.label = "Grass.indices"
 
+        // Per-blade width scales, all 1.0 until a host overrides a subset.
+        let ones = [Float](repeating: 1, count: blades)
+        guard let wsBuf = ones.withUnsafeBufferPointer({ ptr -> MTLBuffer? in
+            device.makeBuffer(bytes: ptr.baseAddress!,
+                              length: MemoryLayout<Float>.stride * blades,
+                              options: .storageModeShared)
+        }) else {
+            Self.log.error("Grass width-scale buffer alloc failed")
+            return nil
+        }
+        wsBuf.label = "Grass.widthScales"
+
         let stride12 = MemoryLayout<Float>.stride * 3  // packed_float3
         let posSource = SCNGeometrySource(
             buffer: posBuf.buffer,
@@ -169,6 +186,7 @@ public final class GrassRibbonRenderer {
         self.positionBuffer = posBuf
         self.normalBuffer   = normBuf
         self.indexBuffer    = idxBuf
+        self.widthScaleBuffer = wsBuf
         self.indexCount     = indices.count
         self.vertexCount    = verts
         self.bladeCount     = blades
@@ -204,6 +222,19 @@ public final class GrassRibbonRenderer {
             doubleSided: true)
     }
 
+    /// Override the per-blade width multipliers (blade order = solver chain
+    /// order, the same order `configureChains` received). Counts beyond
+    /// `bladeCount` are ignored; missing entries keep their previous scale.
+    /// A scale multiplies `baseHalfWidth` with the same root→tip taper —
+    /// use it to widen flower-head / reed blades within one field.
+    public func setBladeWidthScales(_ scales: [Float]) {
+        let n = min(scales.count, bladeCount)
+        guard n > 0 else { return }
+        widthScaleBuffer.contents()
+            .bindMemory(to: Float.self, capacity: bladeCount)
+            .update(from: scales, count: n)
+    }
+
     /// The renderer-order vertex layout this geometry uses, so a caller can build
     /// a matching per-vertex `colorBuffer`: vertex index = (blade·M + particle)·2
     /// + side, with `f = particle / (M-1)` the root→tip fraction (0 at root).
@@ -232,6 +263,7 @@ public final class GrassRibbonRenderer {
         enc.setBuffer(positionBuffer.buffer,         offset: 0, index: 1)
         enc.setBuffer(uniformBuffer,                  offset: 0, index: 2)
         enc.setBuffer(normalBuffer.buffer,            offset: 0, index: 3)
+        enc.setBuffer(widthScaleBuffer,               offset: 0, index: 4)
 
         let w = min(total, expandPipeline.maxTotalThreadsPerThreadgroup)
         enc.dispatchThreads(MTLSize(width: total, height: 1, depth: 1),
