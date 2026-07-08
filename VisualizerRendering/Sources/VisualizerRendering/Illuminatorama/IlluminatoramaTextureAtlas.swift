@@ -162,6 +162,22 @@ public final class IlluminatoramaTextureAtlas {
     public func reset() {
         nextSlice = 0
         sliceForObject.removeAll(keepingCapacity: true)
+        freeSlices.removeAll(keepingCapacity: true)
+    }
+
+    /// Slots explicitly RETURNED by the host — e.g. a slider-customized material whose
+    /// params changed, leaving the old bake unreachable. `register` reuses these before
+    /// consuming a fresh slot, so churned custom materials stop growing the atlas
+    /// unboundedly (the terrazzo-slider issue). Any content-cache entry pointing at the
+    /// freed slot is dropped (releasing its retained image).
+    private var freeSlices: [Int32] = []
+    /// TEST-OBSERVABLE: how many freed slots are currently awaiting reuse.
+    public var freeSliceCount: Int { freeSlices.count }
+
+    public func freeSlice(_ slice: Int32) {
+        guard slice >= 0, Int(slice) < nextSlice, !freeSlices.contains(slice) else { return }
+        sliceForObject = sliceForObject.filter { $0.value.slice != slice }
+        freeSlices.append(slice)
     }
 
     /// Try to surface a slice index for the supplied SCNMaterialProperty
@@ -208,22 +224,30 @@ public final class IlluminatoramaTextureAtlas {
         // is invisible from outside. Bounded by Metal's per-device limit
         // (typically 2048 array layers); we hard-cap below to keep VRAM
         // sane on small machines.
-        if nextSlice >= capacity {
-            let maxCap = 1024
-            guard capacity < maxCap, grow(to: min(capacity * 2, maxCap)) else {
-                Self.log.warning("Atlas exhausted at capacity=\(self.capacity, privacy: .public); falling back to average colour")
-                sliceForObject[key] = SliceCacheEntry(retained: keyObject, slice: nil)
-                return nil
+        // Reuse an explicitly-freed slot before consuming a fresh one (see `freeSlice`).
+        let slice: Int32
+        let reusedFreeSlot: Bool
+        if let reused = freeSlices.popLast() {
+            slice = reused; reusedFreeSlot = true
+        } else {
+            if nextSlice >= capacity {
+                let maxCap = 1024
+                guard capacity < maxCap, grow(to: min(capacity * 2, maxCap)) else {
+                    Self.log.warning("Atlas exhausted at capacity=\(self.capacity, privacy: .public); falling back to average colour")
+                    sliceForObject[key] = SliceCacheEntry(retained: keyObject, slice: nil)
+                    return nil
+                }
             }
+            slice = Int32(nextSlice)
+            nextSlice += 1
+            reusedFreeSlot = false
         }
-        let slice = Int32(nextSlice)
-        nextSlice += 1
         if upload(cgImage: cg, to: Int(slice)) {
             sliceForObject[key] = SliceCacheEntry(retained: keyObject, slice: slice)
             return slice
         } else {
-            // Failed upload — drop the slot and remember the failure.
-            nextSlice -= 1
+            // Failed upload — return the slot and remember the failure.
+            if reusedFreeSlot { freeSlices.append(slice) } else { nextSlice -= 1 }
             sliceForObject[key] = SliceCacheEntry(retained: keyObject, slice: nil)
             return nil
         }
