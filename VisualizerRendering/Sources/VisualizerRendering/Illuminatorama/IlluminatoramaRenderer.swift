@@ -313,6 +313,34 @@ public final class IlluminatoramaRenderer {
     /// 0 = OFF (default) → exact shader no-op. Maps into the former
     /// `_padPlush1` slot of `IlluminatoramaFrameUniforms` (stride unchanged).
     public var sphericalAberration: Float = 0
+    /// Film **halation**: the wide, warm halo real film wears around blown highlights.
+    /// Light punches through the emulsion, reflects off the back of the base and
+    /// re-exposes it from behind; the anti-halation backing lets red survive that
+    /// round trip best, hence the tint. A separate quarter-res threshold → wide
+    /// gaussian chain from bloom (they key off different thresholds and want radii an
+    /// order of magnitude apart). 0 = OFF (the default for every scene): the halation
+    /// passes are not even encoded and the tonemap branch is skipped, so non-opting
+    /// scenes are byte-for-byte unchanged. ~0.4 is a tasteful film amount; 1.0 is strong.
+    public var halationIntensity: Float = 0
+    /// HDR luminance above which a highlight scatters into the halation halo. Only
+    /// the excess above this threshold contributes, so the halo grows continuously
+    /// out of the highlight rather than popping in.
+    ///
+    /// Deliberately LOWER than the usual `bloomThreshold` of 1.0. Exposure and the ACES
+    /// curve are applied after this, and they put the visual "blown" point of a normally-
+    /// exposed frame near HDR 0.6 — keying halation at 1.0 confines it to pixels that are
+    /// already clipping, where adding a red halo only pushes them to white and the effect
+    /// reads as a neutral second bloom. Measured on the Daydream fixture house: at 1.0 the
+    /// tint barely survives (mean R−B moves +0.10 while luma moves +4.6); at 0.6 it reads
+    /// as halation (R−B +1.56, and the added light lands in a ΔR:ΔG:ΔB ≈ 1 : 0.23 : 0.27
+    /// ratio that matches `halationTint`).
+    public var halationThreshold: Float = 0.6
+    /// Halation halo radius in INTERNAL-resolution texels (≈2σ of the quarter-res
+    /// gaussian). Wide by design — this is what separates halation from bloom.
+    public var halationRadius: Float = 64
+    /// Halation halo tint (linear RGB). The default is the classic orange-red of an
+    /// anti-halation-backed colour negative.
+    public var halationTint: SIMD3<Float> = SIMD3(1.0, 0.32, 0.12)
     /// Post-FX easing time constant (seconds) from the panel's "Easing" picker.
     /// The post-FX knobs above (exposure, bloom, chromatic aberration, fringe) are
     /// treated as TARGETS; each frame `uploadFrameUniforms` eases an internal
@@ -326,6 +354,10 @@ public final class IlluminatoramaRenderer {
     private var easedFringe: Float = 0
     private var easedFringeTint: SIMD3<Float> = SIMD3(0.62, 0.12, 0.92)
     private var easedSphericalAberration: Float = 0
+    private var easedHalationIntensity: Float = 0
+    private var easedHalationThreshold: Float = 0.6
+    private var easedHalationRadius: Float = 64
+    private var easedHalationTint: SIMD3<Float> = SIMD3(1.0, 0.32, 0.12)
     private var lastPostFXEaseTime: CFTimeInterval = 0
     public var time: Float = 0
     /// Vertex-shader tree-wind knobs (#58 #1). `treeWindStrength` is the max
@@ -1194,6 +1226,11 @@ public final class IlluminatoramaRenderer {
     private var bloomBrightHalf: MTLTexture
     private var bloomBlurHHalf: MTLTexture
     private var bloomBlurVHalf: MTLTexture
+    // Halation runs at a QUARTER of the internal resolution — a wide diffuse halo has
+    // no high-frequency detail to lose, and the coarse grid buys radius for free.
+    private var halationBrightQuarter: MTLTexture
+    private var halationBlurHQuarter: MTLTexture
+    private var halationBlurVQuarter: MTLTexture
 
     // Phase 3 — sky-probe IBL. The irradiance + prefiltered cubes are baked
     // from `equirectSky` each frame (or whenever the sky texture changes).
@@ -1475,6 +1512,9 @@ public final class IlluminatoramaRenderer {
     private let bloomThresholdPipeline: MTLComputePipelineState
     private let bloomBlurHPipeline: MTLComputePipelineState
     private let bloomBlurVPipeline: MTLComputePipelineState
+    private let halationThresholdPipeline: MTLComputePipelineState
+    private let halationBlurHPipeline: MTLComputePipelineState
+    private let halationBlurVPipeline: MTLComputePipelineState
     // Phase 4.28 — tonemap is now a fullscreen RENDER pass (vertex+fragment)
     // rather than a compute kernel, so its write to `outputTexture` is visible
     // to SceneKit's cross-queue background sample without a CPU wait. See the
@@ -2403,7 +2443,9 @@ public final class IlluminatoramaRenderer {
         cache.precompile([
             "illumi_bloom_blur_h", "illumi_bloom_blur_v", "illumi_bloom_threshold",
             "illumi_ddgi_trace", "illumi_ddgi_update_depth", "illumi_ddgi_update_irradiance",
-            "illumi_dfg_bake", "illumi_exposure_estimate", "illumi_irradiance_bake",
+            "illumi_dfg_bake", "illumi_exposure_estimate",
+            "illumi_halation_blur_h", "illumi_halation_blur_v", "illumi_halation_threshold",
+            "illumi_irradiance_bake",
             "illumi_mesh_build_adjacency", "illumi_mesh_synth", "illumi_particles_step",
             "illumi_prefilter_bake", "illumi_repack_pos_norm", "illumi_rt_denoise",
             "illumi_rt_gi_temporal", "illumi_ssao", "illumi_ssao_spatial",
@@ -2473,6 +2515,18 @@ public final class IlluminatoramaRenderer {
         guard let blurV = cache.pipelineState(name: "illumi_bloom_blur_v", device: device) else {
             throw IlluminatoramaError.pipelineCreationFailed("illumi_bloom_blur_v")
         }
+        // Film halation — its own threshold + wide gaussian, quarter-res. The pipelines
+        // are always built (cheap, and it keeps `let` initialisation simple); the passes
+        // are only ENCODED when halationIntensity > 0.
+        guard let halThreshold = cache.pipelineState(name: "illumi_halation_threshold", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_halation_threshold")
+        }
+        guard let halBlurH = cache.pipelineState(name: "illumi_halation_blur_h", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_halation_blur_h")
+        }
+        guard let halBlurV = cache.pipelineState(name: "illumi_halation_blur_v", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_halation_blur_v")
+        }
         // Phase 4.28 — tonemap render pipeline (fullscreen triangle → fragment).
         // Outputs into the bgra8Unorm `outputTexture` via a render pass so the
         // write is visible to SceneKit's cross-queue background sample.
@@ -2514,6 +2568,9 @@ public final class IlluminatoramaRenderer {
         self.bloomThresholdPipeline = threshold
         self.bloomBlurHPipeline = blurH
         self.bloomBlurVPipeline = blurV
+        self.halationThresholdPipeline = halThreshold
+        self.halationBlurHPipeline = halBlurH
+        self.halationBlurVPipeline = halBlurV
         self.tonemapPipeline = tonemap
         self.exposureEstimatePipeline = expoEst
 
@@ -2945,6 +3002,9 @@ public final class IlluminatoramaRenderer {
         self.bloomBrightHalf     = t.bloomBright
         self.bloomBlurHHalf      = t.bloomBlurH
         self.bloomBlurVHalf      = t.bloomBlurV
+        self.halationBrightQuarter = t.halationBright
+        self.halationBlurHQuarter  = t.halationBlurH
+        self.halationBlurVQuarter  = t.halationBlurV
         self.outputTexture       = t.ldr
         self.tonemapWriteTarget  = t.ldr
         // Phase 4.39 denoiser textures
@@ -6333,6 +6393,9 @@ public final class IlluminatoramaRenderer {
             self.bloomBrightHalf     = t.bloomBright
             self.bloomBlurHHalf      = t.bloomBlurH
             self.bloomBlurVHalf      = t.bloomBlurV
+            self.halationBrightQuarter = t.halationBright
+            self.halationBlurHQuarter  = t.halationBlurH
+            self.halationBlurVQuarter  = t.halationBlurV
             self.aoFilteredTexture   = t.aoFiltered
             self.aoHistoryA          = t.aoHistoryA
             self.aoHistoryB          = t.aoHistoryB
@@ -6772,6 +6835,10 @@ public final class IlluminatoramaRenderer {
         // sharp even on out-of-focus geometry) and before bloom (halo blooms soft).
         encodeSelectionOutlinePass(cb)
         encodeBloomPasses(cb)
+        // Film halation reads the same HDR source bloom does (post-TAA, post-DOF), so
+        // a blown out-of-focus highlight halates as softly as it blooms. No-op — not
+        // even encoded — unless halationIntensity > 0.
+        encodeHalationPasses(cb)
         encodeTonemapPass(cb)
 
         // Signal — on GPU completion (background thread) — that this pool
@@ -9138,6 +9205,36 @@ public final class IlluminatoramaRenderer {
         enc.endEncoding()
     }
 
+    /// Film halation: quarter-res threshold → wide separable gaussian, tinted and
+    /// added back by the tonemap fragment. Encoded ONLY when the eased intensity is
+    /// non-zero — and that's the SAME value the shader's branch reads, so "passes ran"
+    /// and "tonemap consumes the halo" can never disagree. A scene that never opts in
+    /// pays no dispatches and renders byte-identically.
+    private func encodeHalationPasses(_ cb: MTLCommandBuffer) {
+        guard easedHalationIntensity > 0 else { return }
+        let quarterW = max(1, width / 4)
+        let quarterH = max(1, height / 4)
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.label = "Illuminatorama.halation"
+
+        enc.setComputePipelineState(halationThresholdPipeline)
+        enc.setTexture(bloomTonemapSource, index: 0)
+        enc.setTexture(halationBrightQuarter, index: 1)
+        enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
+        dispatch(enc, pipeline: halationThresholdPipeline, width: quarterW, height: quarterH)
+
+        enc.setComputePipelineState(halationBlurHPipeline)
+        enc.setTexture(halationBrightQuarter, index: 0)
+        enc.setTexture(halationBlurHQuarter, index: 1)
+        dispatch(enc, pipeline: halationBlurHPipeline, width: quarterW, height: quarterH)
+
+        enc.setComputePipelineState(halationBlurVPipeline)
+        enc.setTexture(halationBlurHQuarter, index: 0)
+        enc.setTexture(halationBlurVQuarter, index: 1)
+        dispatch(enc, pipeline: halationBlurVPipeline, width: quarterW, height: quarterH)
+        enc.endEncoding()
+    }
+
     private func encodeTonemapPass(_ cb: MTLCommandBuffer) {
         // Phase 4.28 — RENDER pass (not compute). Draws a fullscreen triangle
         // into `tonemapWriteTarget`; the end-of-pass `.store` is what makes the
@@ -9158,6 +9255,10 @@ public final class IlluminatoramaRenderer {
         // from frame uniforms; 0 = identity, so setting the texture slot to nil is safe —
         // the shader checks `frame.filmLUTStrength > 0` before sampling).
         enc.setFragmentTexture(filmLUTTexture, index: 2)
+        // Halation halo. Always bound (the texture is allocated unconditionally); its
+        // contents are stale when halationIntensity == 0, and the shader's branch is
+        // gated on the same uniform, so it isn't read then.
+        enc.setFragmentTexture(halationBlurVQuarter, index: 3)
         enc.setFragmentBuffer(frameUniformBuffer, offset: 0, index: 0)
         // Phase 4.21 — exposure buffer at buffer(1). The fragment reads
         // `expoState.smoothedExposure` when `frame.autoExposureEnabled`
@@ -9310,6 +9411,15 @@ public final class IlluminatoramaRenderer {
         easedFringe            += (max(0, fringe)        - easedFringe)            * kf
         easedFringeTint        += (fringeTint            - easedFringeTint)        * kf
         easedSphericalAberration += (max(0, sphericalAberration) - easedSphericalAberration) * kf
+        easedHalationIntensity += (max(0, halationIntensity) - easedHalationIntensity) * kf
+        easedHalationThreshold += (halationThreshold        - easedHalationThreshold) * kf
+        easedHalationRadius    += (max(0, halationRadius)   - easedHalationRadius)    * kf
+        easedHalationTint      += (halationTint             - easedHalationTint)      * kf
+        // Exponential easing approaches 0 asymptotically, so a scene that turns halation
+        // OFF would keep encoding three dispatches forever on a residue of ~1e-9. Snap
+        // the last sliver: `encodeHalationPasses` and the shader branch both key off
+        // this value, so the effect switches off exactly when the passes stop.
+        if halationIntensity <= 0 && easedHalationIntensity < 1e-3 { easedHalationIntensity = 0 }
     }
 
     private func uploadFrameUniforms() {
@@ -9423,6 +9533,15 @@ public final class IlluminatoramaRenderer {
         u.fringeTintR = easedFringeTint.x
         u.fringeTintG = easedFringeTint.y
         u.fringeTintB = easedFringeTint.z
+        // Film halation: intensity / threshold / halo radius + tint. Intensity 0 (the
+        // default) → the tonemap branch is skipped AND `encodeHalationPasses` doesn't
+        // dispatch, so a non-opting scene is byte-identical. The radius floor of 1
+        // keeps the shader's tap spacing from collapsing if a host sets radius 0.
+        u.halationParams = SIMD4(max(0, easedHalationIntensity),
+                                 easedHalationThreshold,
+                                 max(1, easedHalationRadius),
+                                 0)
+        u.halationTint = SIMD4(easedHalationTint.x, easedHalationTint.y, easedHalationTint.z, 0)
         // Phase 9 — film LUT strength: 0 when no LUT is bound (bypasses the shader branch).
         u.filmLUTStrength = filmLUTTexture != nil ? max(0, min(1, filmLUTStrength)) : 0
         // Tonemap colour-grade. Neutral defaults (6500/0/1/1/1) are exact no-ops in
@@ -9652,6 +9771,10 @@ public final class IlluminatoramaRenderer {
         var bloomBright: MTLTexture
         var bloomBlurH: MTLTexture
         var bloomBlurV: MTLTexture
+        // Film halation — quarter-res (see `halationBrightQuarter`).
+        var halationBright: MTLTexture
+        var halationBlurH: MTLTexture
+        var halationBlurV: MTLTexture
         var ldr: MTLTexture
         // Phase 4.39 denoiser
         var aoFiltered: MTLTexture   // half-res, after bilateral
@@ -10080,6 +10203,22 @@ public final class IlluminatoramaRenderer {
         let bv = try make(label: "Illuminatorama.bloom.blurV",
                           format: .rgba16Float, w: halfW, h: halfH,
                           usage: [.shaderRead, .shaderWrite])
+        // Film halation at QUARTER res — a wide diffuse halo carries no detail worth
+        // preserving, and the coarse grid is what makes a 9-tap gaussian reach ~64
+        // full-res texels. Allocated unconditionally so the tonemap always has a
+        // texture to bind at fragment slot 3; the passes that fill it are skipped
+        // when halationIntensity == 0.
+        let quarterW = max(1, internalW / 4)
+        let quarterH = max(1, internalH / 4)
+        let hb = try make(label: "Illuminatorama.halation.bright",
+                          format: .rgba16Float, w: quarterW, h: quarterH,
+                          usage: [.shaderRead, .shaderWrite])
+        let hbh = try make(label: "Illuminatorama.halation.blurH",
+                           format: .rgba16Float, w: quarterW, h: quarterH,
+                           usage: [.shaderRead, .shaderWrite])
+        let hbv = try make(label: "Illuminatorama.halation.blurV",
+                           format: .rgba16Float, w: quarterW, h: quarterH,
+                           usage: [.shaderRead, .shaderWrite])
         // Final LDR output at OUTPUT resolution — the only texture sized to
         // what the SCNView shows. Tonemap kernel downsamples from internal
         // HDR + bloom into this each frame.
@@ -10101,6 +10240,7 @@ public final class IlluminatoramaRenderer {
             hdr: hdr, ao: ao, hdrComposite: hdrComposite, rtDiffuse: rtDiffuse,
             velocity: velocity, layer: layer, historyA: historyA, historyB: historyB,
             bloomBright: bb, bloomBlurH: bh, bloomBlurV: bv,
+            halationBright: hb, halationBlurH: hbh, halationBlurV: hbv,
             ldr: ldr,
             aoFiltered: aoFiltered, aoHistoryA: aoHistA, aoHistoryB: aoHistB,
             ssrRaw: ssrRaw, ssrHistoryA: ssrHistA, ssrHistoryB: ssrHistB,

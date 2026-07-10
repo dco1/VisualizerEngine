@@ -319,6 +319,18 @@ public struct IlluminatoramaFrameUniforms {
     // w = on-screen weight (fades at the frame edge, 0 behind the camera). ONE
     // new 16-byte cluster (stride 1120 → 1136); mirror of the Metal FrameUniforms.
     public var lensFlareParams: SIMD4<Float> = .zero
+    // ── Halation (film) ──────────────────────────────────────────────────────
+    // The wide warm halo film wears around blown highlights: light punches through
+    // the emulsion, reflects off the back of the base and re-exposes it, and the
+    // anti-halation backing lets red survive that round trip best.
+    // `halationParams`: x = intensity (0 = OFF, the default — the renderer skips the
+    // halation passes AND the tonemap branch is gated on it, so every non-opting
+    // scene renders byte-identically), y = HDR luminance threshold, z = halo radius
+    // in INTERNAL-resolution texels, w reserved. `halationTint`: xyz = halo tint
+    // (linear RGB), w reserved. TWO new 16-byte clusters (stride 1136 → 1168);
+    // mirror of the Metal FrameUniforms.
+    public var halationParams: SIMD4<Float> = .zero
+    public var halationTint: SIMD4<Float> = .zero
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20

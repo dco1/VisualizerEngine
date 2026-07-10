@@ -248,6 +248,16 @@ struct FrameUniforms {
     // ONE new 16-byte cluster (stride 1120 → 1136); mirror of
     // IlluminatoramaFrameUniforms.lensFlareParams.
     float4   lensFlareParams;
+    // ── Halation (film) ──────────────────────────────────────────────────────
+    // halationParams: x = intensity (0 = OFF, the default — the host skips the
+    // halation passes entirely and the tonemap branch is gated on it, so non-opting
+    // scenes are byte-for-byte unchanged), y = HDR luminance threshold above which a
+    // highlight scatters, z = halo radius in INTERNAL-resolution texels, w reserved.
+    // halationTint: xyz = halo tint (linear RGB), w reserved.
+    // TWO new 16-byte clusters (stride 1136 → 1168); mirror of
+    // IlluminatoramaFrameUniforms.halationParams/halationTint.
+    float4   halationParams;
+    float4   halationTint;
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift
@@ -5125,6 +5135,107 @@ kernel void illumi_bloom_blur_v(
     outTex.write(half4(half3(acc), 1.0h), gid);
 }
 
+// ── Halation (film) ──────────────────────────────────────────────────────────
+//
+// On real film, light from a blown highlight passes THROUGH the emulsion, scatters
+// off the back of the acetate base, and re-exposes the emulsion from behind — a
+// wide, diffuse second exposure around the highlight. The anti-halation backing
+// absorbs short wavelengths best, so what survives that round trip is predominantly
+// RED, which is why blown highlights on film wear a warm orange halo far wider and
+// softer than any lens bloom.
+//
+// Modelled as its own threshold → wide separable gaussian → tinted add, run at a
+// QUARTER of the internal resolution. Quarter-res is both the cost win and the
+// point: it buys a wide, soft halo out of a 9-tap kernel, and halation carries no
+// high-frequency detail worth preserving. It is a SEPARATE chain from bloom rather
+// than a re-tint of the bloom texture because the two key off different thresholds
+// (only genuinely blown highlights halate) and want radii an order of magnitude
+// apart.
+//
+// `halationParams.x == 0` (the default) ⇒ the host does not encode these passes at
+// all AND the tonemap branch is skipped ⇒ non-opting scenes are byte-identical.
+
+kernel void illumi_halation_threshold(
+    texture2d<half, access::read>  inHDR     [[texture(0)]],
+    texture2d<half, access::write> outBright [[texture(1)]],
+    constant FrameUniforms&        frame     [[buffer(0)]],
+    uint2                          gid       [[thread_position_in_grid]]
+) {
+    uint w = outBright.get_width();
+    uint h = outBright.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    // 4×4 box downsample of the full-res HDR → quarter res.
+    uint2 maxC = uint2(inHDR.get_width() - 1, inHDR.get_height() - 1);
+    uint2 src  = gid * 4;
+    float3 avg = float3(0.0);
+    for (uint j = 0; j < 4; ++j) {
+        for (uint i = 0; i < 4; ++i) {
+            avg += float3(inHDR.read(min(src + uint2(i, j), maxC)).rgb);
+        }
+    }
+    avg *= (1.0 / 16.0);
+    // Only the EXCESS over the threshold scatters — the same linear knee bloom uses,
+    // so the halo grows continuously out of the highlight instead of popping in.
+    float lum = dot(avg, float3(0.2126, 0.7152, 0.0722));
+    float t = max(0.0, lum - frame.halationParams.y);
+    float3 bright = avg * (t / max(lum, 1e-4));
+    outBright.write(half4(half3(bright), 1.0h), gid);
+}
+
+// Tap spacing (in QUARTER-res texels) for the 9-tap gaussian below. The kernel's
+// sigma is 2 taps, and a halo reads as radius ≈ 2σ, so a requested radius R in
+// INTERNAL-resolution texels — R/4 quarter-texels — wants a spacing of R/16.
+// Clamped to ≥1 so the kernel never collapses to a 9× re-read of one texel.
+static inline float halationTapStep(constant FrameUniforms& frame) {
+    return max(1.0, frame.halationParams.z * (1.0 / 16.0));
+}
+
+kernel void illumi_halation_blur_h(
+    texture2d<half, access::sample> inTex  [[texture(0)]],
+    texture2d<half, access::write>  outTex [[texture(1)]],
+    constant FrameUniforms&         frame  [[buffer(0)]],
+    uint2                           gid    [[thread_position_in_grid]]
+) {
+    uint w = outTex.get_width();
+    uint h = outTex.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    constexpr sampler smp(filter::linear, address::clamp_to_edge, coord::normalized);
+    const float weights[5] = { 0.227027, 0.194595, 0.121622, 0.054054, 0.016216 };
+    float2 invSize = 1.0 / float2(w, h);
+    float2 uv = (float2(gid) + 0.5) * invSize;
+    float  tap = halationTapStep(frame);
+    float3 acc = float3(inTex.sample(smp, uv).rgb) * weights[0];
+    for (int i = 1; i < 5; ++i) {
+        float o = float(i) * tap * invSize.x;
+        acc += float3(inTex.sample(smp, uv + float2(o, 0.0)).rgb) * weights[i];
+        acc += float3(inTex.sample(smp, uv - float2(o, 0.0)).rgb) * weights[i];
+    }
+    outTex.write(half4(half3(acc), 1.0h), gid);
+}
+
+kernel void illumi_halation_blur_v(
+    texture2d<half, access::sample> inTex  [[texture(0)]],
+    texture2d<half, access::write>  outTex [[texture(1)]],
+    constant FrameUniforms&         frame  [[buffer(0)]],
+    uint2                           gid    [[thread_position_in_grid]]
+) {
+    uint w = outTex.get_width();
+    uint h = outTex.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    constexpr sampler smp(filter::linear, address::clamp_to_edge, coord::normalized);
+    const float weights[5] = { 0.227027, 0.194595, 0.121622, 0.054054, 0.016216 };
+    float2 invSize = 1.0 / float2(w, h);
+    float2 uv = (float2(gid) + 0.5) * invSize;
+    float  tap = halationTapStep(frame);
+    float3 acc = float3(inTex.sample(smp, uv).rgb) * weights[0];
+    for (int i = 1; i < 5; ++i) {
+        float o = float(i) * tap * invSize.y;
+        acc += float3(inTex.sample(smp, uv + float2(0.0, o)).rgb) * weights[i];
+        acc += float3(inTex.sample(smp, uv - float2(0.0, o)).rgb) * weights[i];
+    }
+    outTex.write(half4(half3(acc), 1.0h), gid);
+}
+
 // ── Tonemap + composite ──────────────────────────────────────────────────────
 //
 // ACES filmic curve (Krzysztof Narkowicz's approximation). Reads HDR + bloom,
@@ -5236,6 +5347,9 @@ fragment float4 illumi_tonemap_fs(
     // Phase 9 — film-stock LUT: 16×16×16 3D texture (B slices left-to-right in
     // the 256×16 PNG strip). Bound when filmLUTStrength > 0; nil-checked below.
     texture3d<float, access::sample> filmLUT  [[texture(2)]],
+    // Quarter-res halation halo. Always bound (the texture exists); its contents are
+    // stale when halationParams.x == 0, and the branch below never reads it then.
+    texture2d<half, access::sample> inHalation [[texture(3)]],
     constant FrameUniforms&         frame     [[buffer(0)]],
     // Phase 4.21 — auto-exposure read (see below).
     const device ExposureState&     expoState [[buffer(1)]]
@@ -5322,6 +5436,28 @@ fragment float4 illumi_tonemap_fs(
     float3 bloom = float3(inBloom.sample(downSampler, in.uv).rgb);
 
     float3 mixed = hdr + bloom * frame.bloomIntensity;
+
+    // ── Halation (film) ────────────────────────────────────────────────────────
+    // The wide warm halo film wears around blown highlights (see the halation
+    // kernels above). Added in the HDR domain, like bloom, so exposure + ACES shape
+    // it. The halo is driven mostly by LUMINANCE and takes its colour from
+    // `halationTint` — real halation is red because red is what survives the round
+    // trip through the anti-halation backing, whatever colour the highlight was —
+    // with a quarter of the source hue left in so a strongly coloured highlight
+    // still tints its own halo. Intensity 0 (the default) skips the branch.
+    if (frame.halationParams.x > 0.0) {
+        // Artistic normalisation. The threshold keeps only the EXCESS radiance above the
+        // blown point, and the wide gaussian then averages that excess down by the fraction
+        // of the kernel a highlight covers — so the raw halo is a small fraction of scene
+        // radiance and a 0…1 dial would spend its whole range on "barely visible". This gain
+        // makes `halationIntensity = 1.0` the intended full-strength look (the same
+        // convention `lensFlareIntensity` uses); it is a constant, not a per-scene tuning.
+        constexpr float kHalationGain = 3.0;
+        float3 halo    = float3(inHalation.sample(downSampler, in.uv).rgb);
+        float  haloLum = dot(halo, float3(0.2126, 0.7152, 0.0722));
+        halo = mix(float3(haloLum), halo, 0.25) * frame.halationTint.rgb;
+        mixed += halo * (frame.halationParams.x * kHalationGain);
+    }
 
     // ── Lens flare (sun) ───────────────────────────────────────────────────────
     // Screen-space anamorphic streak + ghost train + halo, driven by the sun's
