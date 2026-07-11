@@ -2308,10 +2308,18 @@ public final class IlluminatoramaRenderer {
 
     // ── Init ──────────────────────────────────────────────────────────────────
 
-    public init(engine: SimEngine, width: Int, height: Int, camera: IlluminatoramaCamera) throws {
+    /// - Parameter shadowMapResolution: Side length (px) of each directional
+    ///   (sun) cascade shadow map. Default `2048` (behaviour-preserving for
+    ///   existing hosts). Doubling to `4096` halves the outer-cascade ground
+    ///   texel — finer, less-aliased sun-shadow edges — at 4× shadow-map memory
+    ///   per doubling. Safe for PCF: the lighting shader reads its texel size
+    ///   from `shadowMap.get_width()`, so no shader change is needed.
+    public init(engine: SimEngine, width: Int, height: Int, camera: IlluminatoramaCamera,
+                shadowMapResolution: Int = 2048) throws {
         self.engine = engine
         self.device = engine.device
         self.commandQueue = engine.commandQueue
+        self.shadowMapResolution = shadowMapResolution
         // `width` / `height` are the OUTPUT (host-visible) target size; the
         // internal pipeline runs at `output × initialScale`. The init scale
         // mirrors the default `internalRenderScale` field above — we can't
@@ -2957,7 +2965,7 @@ public final class IlluminatoramaRenderer {
         self.ddgiDummyDepthAtlas = ddd
 
         // ── Phase 2.5 shadow map array ──────────────────────────────────
-        self.shadowMap = try Self.makeShadowMap(device: device)
+        self.shadowMap = try Self.makeShadowMap(device: device, resolution: shadowMapResolution)
         self.spotShadowAtlas = try Self.makeSpotShadowAtlas(
             device: device,
             resolution: spotShadowMapResolution,
@@ -9802,7 +9810,13 @@ public final class IlluminatoramaRenderer {
     // scale. 2048² per cascade matches what UE / Frostbite use for their inner
     // cascade and gives clean PCF at 3×3.
     private static let cascadeCount: Int = 3
-    private static let shadowMapResolution: Int = 2048
+    /// Side length (px) of each directional (sun) cascade shadow map, set once at
+    /// init (see `IlluminatoramaRenderer.init`). Default 2048 — a larger value
+    /// halves the outer-cascade ground texel per doubling (finer, less-aliased sun
+    /// shadow edges) at 4× shadow-map memory. The lighting shader derives its PCF
+    /// texel size from `shadowMap.get_width()`, so this scales safely with no
+    /// shader change.
+    private let shadowMapResolution: Int
 
     // ── Phase 3 IBL cube resolutions ──────────────────────────────────────────
     // 16² per face → tiny, since diffuse irradiance is a very low-frequency
@@ -9898,12 +9912,12 @@ public final class IlluminatoramaRenderer {
     /// of precision for the comparison test; `.shaderRead` is required so the
     /// lighting kernel can sample it, and `.renderTarget` lets us write into
     /// each slice via a render pass.
-    private static func makeShadowMap(device: MTLDevice) throws -> MTLTexture {
+    private static func makeShadowMap(device: MTLDevice, resolution: Int) throws -> MTLTexture {
         let d = MTLTextureDescriptor()
         d.textureType = .type2DArray
         d.pixelFormat = .depth32Float
-        d.width = shadowMapResolution
-        d.height = shadowMapResolution
+        d.width = resolution
+        d.height = resolution
         d.arrayLength = cascadeCount
         d.usage = [.renderTarget, .shaderRead]
         d.storageMode = .private
