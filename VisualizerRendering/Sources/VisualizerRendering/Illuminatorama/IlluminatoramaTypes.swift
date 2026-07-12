@@ -287,7 +287,14 @@ public struct IlluminatoramaFrameUniforms {
     // point shadows, so the byte layout AND behaviour stay identical. Mirrors the
     // Metal `FrameUniforms.pointShadowBias`.
     public var pointShadowBias: Float = 0.0006
-    public var _padGrade2: Float = 0
+    /// Scotopic (Purkinje) desaturation strength. Pulls the DIMMEST tonemapped
+    /// pixels toward their own luminance so dark night surfaces read neutral-
+    /// moonlit, not green (the grass-albedo × dim-neutral-light green cast). 0 =
+    /// OFF (default) → the tonemap branch is an EXACT no-op, so day frames and
+    /// every non-opting scene (Visualizer) are byte-identical. Repurposes the
+    /// former `_padGrade2` slot — same 4 bytes, stride unchanged. Mirrors the
+    /// Metal `FrameUniforms.scotopicDesaturation`.
+    public var scotopicDesaturation: Float = 0
     // ── Interior day-light separation (opt-in; pairs with light-layer masking) ──
     // `interiorMask` = OR of every layer bit the host stamped on INTERIOR rooms; a
     // fragment whose gLayer is a real room stamp (≠ 0xFFFFFFFF) AND intersects the

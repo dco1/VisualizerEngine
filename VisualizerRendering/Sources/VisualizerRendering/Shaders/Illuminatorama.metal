@@ -212,7 +212,12 @@ struct FrameUniforms {
     // Point-light cubemap shadow depth bias (was `_padGrade1`). Read only for point
     // lights with shadowCubeIndex >= 0; 0 ⇒ no point shadows ⇒ no behaviour change.
     float    pointShadowBias;
-    float    _padGrade2;
+    // Scotopic (Purkinje) desaturation strength (was `_padGrade2` — same 4 bytes,
+    // stride unchanged). Pulls the DIMMEST tonemapped pixels toward their own
+    // luminance so moonlit surfaces read neutral-dark, not (green-albedo) tinted.
+    // 0 (DEFAULT) ⇒ the tonemap branch never runs ⇒ byte-identical. Mirrors
+    // IlluminatoramaFrameUniforms.scotopicDesaturation.
+    float    scotopicDesaturation;
     // ── Interior day-light separation (opt-in; pairs with light-layer masking) ──
     // A host that stamps per-room layer bits (gLayer) can declare those bits INTERIOR
     // via `interiorMask` (OR of every interior room bit). A fragment whose layer is a
@@ -5542,6 +5547,19 @@ fragment float4 illumi_tonemap_fs(
     // restoring tint. Rec.709 luminance weights are the standard choice.
     float lum = dot(mapped, float3(0.2126, 0.7152, 0.0722));
     mapped = max(mix(float3(lum), mapped, frame.tonemapSaturation), 0.0);
+    // ── Scotopic (Purkinje) desaturation ──────────────────────────────────────
+    // Human rods are colour-blind, so in dim light real vision loses chroma: a
+    // moonlit lawn reads neutral-dark, not green — but the green ALBEDO × dim
+    // near-neutral night light keeps our render green. Pull ONLY the dimmest
+    // tonemapped pixels toward their own luminance, keyed to the display luma;
+    // lamps/moon/stars stay bright enough (lum ≳ 0.08) to keep full colour. 0
+    // (DEFAULT) ⇒ the branch never runs ⇒ day frames + every non-opting scene are
+    // byte-identical. Hosts fade the strength with nightBlend themselves.
+    if (frame.scotopicDesaturation > 0.0) {
+        float scotLum = dot(mapped, float3(0.2126, 0.7152, 0.0722));
+        float scot = frame.scotopicDesaturation * (1.0 - smoothstep(0.0, 0.08, scotLum));
+        mapped = max(mix(mapped, float3(scotLum), scot), 0.0);   // 0 → exact no-op
+    }
     // Clamp after the saturation push — boosting past 1.0 can take channels
     // negative on near-greys, and `pow(negative, 1/2.2)` returns NaN that
     // then propagates through any subsequent composite.

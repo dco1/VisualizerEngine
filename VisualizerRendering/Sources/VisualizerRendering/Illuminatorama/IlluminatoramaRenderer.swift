@@ -786,6 +786,14 @@ public final class IlluminatoramaRenderer {
     /// lever the #46 magnitude knobs (intensity/exposure) couldn't move.
     public var iblDiffuseDesaturation: Float = 0
 
+    /// Scotopic (Purkinje) desaturation strength, applied in the tonemap. Pulls
+    /// only the DIMMEST tonemapped pixels toward their own luminance so dark night
+    /// surfaces read neutral moonlit-dark instead of holding their (green grass)
+    /// albedo tint; bright pixels (lamps/moon/stars) keep full colour. 0 = OFF
+    /// (default) → an exact no-op (Visualizer byte-identical). Hosts typically
+    /// fade this in with their night blend.
+    public var scotopicDesaturation: Float = 0
+
     // ── Phase 4.39 spatiotemporal denoiser knobs ────────────────────
     /// Enable the SSAO bilateral spatial filter + temporal accumulation.
     /// When on, AO converges from 16 samples to hundreds over time;
@@ -9564,6 +9572,9 @@ public final class IlluminatoramaRenderer {
         u.antiTilingStrength = max(0, min(1, antiTilingStrength))
         // Point-light cube shadow bias (0 when the feature is off ⇒ no behaviour change).
         u.pointShadowBias = pointShadowsEnabled ? pointShadowBias : 0
+        // Scotopic (Purkinje) night desaturation. 0 (default) ⇒ the tonemap branch
+        // never runs ⇒ byte-identical; hosts fade it in with their night blend.
+        u.scotopicDesaturation = max(0, scotopicDesaturation)
         // Interior day-light separation. Mask 0 (default) ⇒ the kernel's factors stay
         // exactly 1.0 ⇒ byte-identical for every scene that never opts in.
         u.interiorMask = interiorLayerMask
