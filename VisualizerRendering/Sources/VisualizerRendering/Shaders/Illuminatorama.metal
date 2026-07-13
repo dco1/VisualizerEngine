@@ -2288,7 +2288,11 @@ static inline float sunVisibility(
     float  texelWorld = 2.0 * radius / float(shadowMap.get_width());
     // Widen mildly on grazing incidence (where acne is worst) but stay bounded
     // — 1–3 texels, never the runaway depth bias produced.
-    float3 biasedPos = worldPos + N * texelWorld * (1.0 + 2.0 * slope);
+    // Reduced from (1.0 + 2.0*slope) — front-face culling (second-depth) is the primary acne
+    // defence, so a smaller normal offset keeps acne away while the contact shadow stays tight
+    // (the larger offset peter-panned shadows off object bases). Also capped so an outer-cascade
+    // texel can't produce a runaway world push.
+    float3 biasedPos = worldPos + N * min(texelWorld * (0.4 + 0.8 * slope), 0.006);
 
     return sampleCascade(shadowMap, shadowSampler, biasedPos,
                          cascadeVP, cascade, bias, frame.shadowPcfRadius);
