@@ -168,6 +168,17 @@ public struct CoinContact {
     public var aux:  SIMD4<Float>    // x=pre-solve approach vn₀ (restitution target), w=captured flag
 }
 
+// One generic joint (constraint path). 80 bytes (5 × {u,f}16). Mirrors `CoinJoint`
+// in CoinDEM.metal exactly. Built via the addBallJoint / addHingeJoint /
+// addDistanceJoint APIs — not constructed by hand.
+public struct CoinJoint {
+    public var meta:    SIMD4<UInt32>  // x=type(0 ball,1 hinge,2 distance), y=A, z=B(0xFFFFFFFF=world), w=enabled
+    public var anchorA: SIMD4<Float>   // xyz=A-local anchor, w=rest length (distance)
+    public var anchorB: SIMD4<Float>   // xyz=B-local anchor (WORLD if z==world)
+    public var axisA:   SIMD4<Float>   // xyz=A-local hinge axis, w=limit lo (rad)
+    public var axisB:   SIMD4<Float>   // xyz=B-local hinge axis (WORLD if world), w=limit hi
+}
+
 // Per-substep uniforms. Scalars only (no float3) — alignment-safe. 132 bytes (33 × 4).
 struct CoinUniforms {
     var dt: Float = 1.0 / 240.0
@@ -246,6 +257,8 @@ public final class CoinDEMSolver: PenetrationProbing {
     private let sleepMarkPipeline:  MTLComputePipelineState
     private let gjkEPAPipeline:     MTLComputePipelineState
     private let writeSolveArgsPipeline: MTLComputePipelineState
+    private let jointSolveCSPipeline: MTLComputePipelineState
+    private let islandUnionJointsPipeline: MTLComputePipelineState
     private let solveArgsBuffer: MTLBuffer         // MTLDispatchThreadgroupsIndirectArguments (3×UInt32)
     private let solveTGSizeBuffer: MTLBuffer       // 1×UInt32 (threadgroup size for the indirect sizing)
     private static let solveTGSize = 64
@@ -308,6 +321,26 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// Capacity of `contactBuffer`. A dense mixed pile emits up to ~tens of contacts
     /// per body (box manifolds + statics), so size generously (maxCoins × 64).
     public let maxContacts: Int
+
+    // ── Generic joints (constraint path) ──────────────────────────────────────
+    /// Joint slots (CoinJoint each; meta.w == 0 = disabled/free). Solved serially
+    /// (true Gauss-Seidel) once per velocity iteration, interleaved with the
+    /// contact colours; joint edges union into the sleep islands so an articulated
+    /// assembly sleeps and wakes as one.
+    public let jointBuffer: MTLBuffer
+    public static let maxJoints = 1024
+    private var freeJointSlots: [Int] = []
+    private var jointHighWater: Int = 0
+    /// Number of joint slots the solve loops over (disabled slots are skipped
+    /// in-kernel). For tests / instrumentation.
+    public var jointCount: Int { jointHighWater }
+    /// Active (enabled) joints.
+    public var activeJointCount: Int {
+        let j = jointBuffer.contents().bindMemory(to: CoinJoint.self, capacity: Self.maxJoints)
+        var n = 0
+        for i in 0..<jointHighWater where j[i].meta.w != 0 { n += 1 }
+        return n
+    }
 
     public let maxCoins: Int
 
@@ -451,6 +484,7 @@ public final class CoinDEMSolver: PenetrationProbing {
         let sleepTick, islandMinReduce, sleepMark: MTLComputePipelineState
         let gjkEPA: MTLComputePipelineState                                        // GJK/EPA probe
         let writeSolveArgs: MTLComputePipelineState                                // indirect-dispatch sizing
+        let jointSolveCS, islandUnionJoints: MTLComputePipelineState               // generic joints
     }
 
     /// Resolve the kernels through an arbitrary lookup (engine cache in production; a
@@ -488,7 +522,9 @@ public final class CoinDEMSolver: PenetrationProbing {
             let p28 = resolve("coinIslandMinReduce"),
             let p29 = resolve("coinSleepMark"),
             let p30 = resolve("coinGJKEPAProbe"),
-            let p31 = resolve("coinWriteSolveArgs")
+            let p31 = resolve("coinWriteSolveArgs"),
+            let p32 = resolve("coinJointSolveCS"),
+            let p33 = resolve("coinIslandUnionJoints")
         else { return nil }
         return Pipelines(integrate: p0, cellClear: p1, cellCount: p2, scan: p3, scatter: p4,
                          contact: p5, apply: p6, finalize: p7, orient: p8, transform: p9, joint: p10,
@@ -497,7 +533,7 @@ public final class CoinDEMSolver: PenetrationProbing {
                          clearHash: p20, snapshot: p21, warmMatch: p22, warmApply: p23,
                          islandInit: p24, islandUnion: p25, islandJump: p26,
                          sleepTick: p27, islandMinReduce: p28, sleepMark: p29, gjkEPA: p30,
-                         writeSolveArgs: p31)
+                         writeSolveArgs: p31, jointSolveCS: p32, islandUnionJoints: p33)
     }
 
     /// Production init: pipelines come from the engine's memoised cache (the
@@ -553,6 +589,7 @@ public final class CoinDEMSolver: PenetrationProbing {
         let p24 = pipelines.islandInit, p25 = pipelines.islandUnion, p26 = pipelines.islandJump
         let p27 = pipelines.sleepTick, p28 = pipelines.islandMinReduce, p29 = pipelines.sleepMark
         let p30 = pipelines.gjkEPA, p31 = pipelines.writeSolveArgs
+        let p32 = pipelines.jointSolveCS, p33 = pipelines.islandUnionJoints
 
         // Grid: one cell ≈ one contact diameter so a 3×3×3 scan covers every
         // possible body–body contact and box contacts. For a MIXED pile the cell
@@ -620,7 +657,9 @@ public final class CoinDEMSolver: PenetrationProbing {
             let sleepTimer = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * maxCoins, options: .storageModeShared),
             let asleep = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * maxCoins, options: .storageModeShared),
             let solveArgs = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * 4, options: .storageModePrivate),
-            let solveTG = dev.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared)
+            let solveTG = dev.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared),
+            let jointsBuf = dev.makeBuffer(length: MemoryLayout<CoinJoint>.stride * CoinDEMSolver.maxJoints,
+                                           options: .storageModeShared)
         else {
             Self.log.error("Coin buffer allocation failed (cells=\(cellCount))")
             return nil
@@ -667,6 +706,8 @@ public final class CoinDEMSolver: PenetrationProbing {
         self.sleepMarkPipeline = p29
         self.gjkEPAPipeline = p30
         self.writeSolveArgsPipeline = p31
+        self.jointSolveCSPipeline = p32
+        self.islandUnionJointsPipeline = p33
         self.coinBuffer = coins
         self.transformBuffer = xform
         self.bodyTypeBuffer = btype
@@ -710,6 +751,8 @@ public final class CoinDEMSolver: PenetrationProbing {
         solveArgs.label = "Coin.solveArgs"
         self.solveArgsBuffer = solveArgs
         self.solveTGSizeBuffer = solveTG
+        jointsBuf.label = "Coin.joints"
+        self.jointBuffer = jointsBuf
         solveTG.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = UInt32(CoinDEMSolver.solveTGSize)
         // Persistent + read-during-substep buffers start cleared (all awake, no slow frames).
         sleepTimer.contents().bindMemory(to: UInt32.self, capacity: maxCoins).update(repeating: 0, count: maxCoins)
@@ -954,6 +997,108 @@ public final class CoinDEMSolver: PenetrationProbing {
         return slot
     }
 
+    // ── Generic joints (constraint path) ──────────────────────────────────────
+
+    private func claimJointSlot() -> Int? {
+        if let reused = freeJointSlots.popLast() { return reused }
+        guard jointHighWater < Self.maxJoints else { return nil }
+        defer { jointHighWater += 1 }
+        return jointHighWater
+    }
+
+    private func writeJoint(_ slot: Int, _ joint: CoinJoint) {
+        jointBuffer.contents().bindMemory(to: CoinJoint.self, capacity: Self.maxJoints)[slot] = joint
+        wakeAll()   // constraint topology changed — sleeping islands must re-evaluate
+    }
+
+    /// A-local coordinates of a world point (for anchor construction).
+    private func toLocal(_ slot: Int, _ world: SIMD3<Float>) -> SIMD3<Float> {
+        let b = coinBuffer.buffer.contents().bindMemory(to: CoinBody.self, capacity: maxCoins)[slot]
+        let q = simd_quatf(ix: b.orient.x, iy: b.orient.y, iz: b.orient.z, r: b.orient.w)
+        return simd_act(q.inverse, world - SIMD3(b.posInvMass.x, b.posInvMass.y, b.posInvMass.z))
+    }
+
+    private func toLocalDir(_ slot: Int, _ worldDir: SIMD3<Float>) -> SIMD3<Float> {
+        let b = coinBuffer.buffer.contents().bindMemory(to: CoinBody.self, capacity: maxCoins)[slot]
+        let q = simd_quatf(ix: b.orient.x, iy: b.orient.y, iz: b.orient.z, r: b.orient.w)
+        return simd_act(q.inverse, worldDir)
+    }
+
+    /// BALL joint: the world point `worldAnchor` on body A coincides with the same
+    /// point on body B (or with that fixed world point when `bodyB` is nil).
+    /// Anchors are captured from the bodies' CURRENT poses. Returns a handle for
+    /// `removeJoint`, or nil when the joint table is full. Constraint path only.
+    @discardableResult
+    public func addBallJoint(bodyA: Int, bodyB: Int?, worldAnchor: SIMD3<Float>) -> Int? {
+        guard let slot = claimJointSlot() else { return nil }
+        let world = bodyB == nil
+        writeJoint(slot, CoinJoint(
+            meta: SIMD4(0, UInt32(bodyA), world ? 0xFFFF_FFFF : UInt32(bodyB!), 1),
+            anchorA: SIMD4(toLocal(bodyA, worldAnchor), 0),
+            anchorB: SIMD4(world ? worldAnchor : toLocal(bodyB!, worldAnchor), 0),
+            axisA: SIMD4(0, 1, 0, 0), axisB: SIMD4(0, 1, 0, 0)))
+        return slot
+    }
+
+    /// HINGE joint: ball at `worldAnchor` + the bodies may only rotate relative to
+    /// each other about `worldAxis`. `limits` (radians, lo < hi, measured from the
+    /// CURRENT relative pose = 0) adds angle stops; nil = free spin.
+    @discardableResult
+    public func addHingeJoint(bodyA: Int, bodyB: Int?, worldAnchor: SIMD3<Float>,
+                              worldAxis: SIMD3<Float>,
+                              limits: ClosedRange<Float>? = nil) -> Int? {
+        guard let slot = claimJointSlot() else { return nil }
+        let world = bodyB == nil
+        let axis = simd_normalize(worldAxis)
+        // lo == hi disables the limit branch in-kernel.
+        let lo = limits?.lowerBound ?? 0, hi = limits?.upperBound ?? 0
+        writeJoint(slot, CoinJoint(
+            meta: SIMD4(1, UInt32(bodyA), world ? 0xFFFF_FFFF : UInt32(bodyB!), 1),
+            anchorA: SIMD4(toLocal(bodyA, worldAnchor), 0),
+            anchorB: SIMD4(world ? worldAnchor : toLocal(bodyB!, worldAnchor), 0),
+            axisA: SIMD4(toLocalDir(bodyA, axis), lo),
+            axisB: SIMD4(world ? axis : toLocalDir(bodyB!, axis), hi)))
+        return slot
+    }
+
+    /// DISTANCE joint: the two world anchor points keep their CURRENT separation
+    /// (or `restLength` when given) — a rigid tether/rod, free to swing.
+    @discardableResult
+    public func addDistanceJoint(bodyA: Int, bodyB: Int?,
+                                 worldAnchorA: SIMD3<Float>, worldAnchorB: SIMD3<Float>,
+                                 restLength: Float? = nil) -> Int? {
+        guard let slot = claimJointSlot() else { return nil }
+        let world = bodyB == nil
+        let rest = restLength ?? simd_length(worldAnchorB - worldAnchorA)
+        writeJoint(slot, CoinJoint(
+            meta: SIMD4(2, UInt32(bodyA), world ? 0xFFFF_FFFF : UInt32(bodyB!), 1),
+            anchorA: SIMD4(toLocal(bodyA, worldAnchorA), rest),
+            anchorB: SIMD4(world ? worldAnchorB : toLocal(bodyB!, worldAnchorB), 0),
+            axisA: SIMD4(0, 1, 0, 0), axisB: SIMD4(0, 1, 0, 0)))
+        return slot
+    }
+
+    /// Remove (disable + recycle) a joint created by the add*Joint APIs.
+    public func removeJoint(_ handle: Int) {
+        guard handle >= 0, handle < jointHighWater else { return }
+        let j = jointBuffer.contents().bindMemory(to: CoinJoint.self, capacity: Self.maxJoints)
+        guard j[handle].meta.w != 0 else { return }   // already free
+        j[handle].meta.w = 0
+        freeJointSlots.append(handle)
+        wakeAll()
+    }
+
+    /// Disable every joint that references `slot` (called when the body despawns —
+    /// a recycled slot must never inherit a stale constraint).
+    private func removeJoints(referencing slot: Int) {
+        let j = jointBuffer.contents().bindMemory(to: CoinJoint.self, capacity: Self.maxJoints)
+        let s = UInt32(slot)
+        for i in 0..<jointHighWater where j[i].meta.w != 0 && (j[i].meta.y == s || j[i].meta.z == s) {
+            j[i].meta.w = 0
+            freeJointSlots.append(i)
+        }
+    }
+
     /// Recycle a coin slot (e.g. it left through the trough or a side gap).
     public func despawn(_ slot: Int) {
         guard slot >= 0, slot < maxCoins else { return }
@@ -961,6 +1106,7 @@ public final class CoinDEMSolver: PenetrationProbing {
         guard ptr[slot].posInvMass.w != 0 else { return }   // already free
         let lptr = linkBuffer.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)
         clearLink(slot, lptr)
+        removeJoints(referencing: slot)
         ptr[slot] = .inactive
         freeSlots.append(slot)
     }
@@ -977,6 +1123,7 @@ public final class CoinDEMSolver: PenetrationProbing {
         for slot in 0..<highWater where ptr[slot].posInvMass.w != 0 {
             if ptr[slot].posInvMass.y < y {
                 clearLink(slot, lptr)
+                removeJoints(referencing: slot)
                 ptr[slot] = .inactive
                 freeSlots.append(slot)
                 n += 1
@@ -1001,6 +1148,11 @@ public final class CoinDEMSolver: PenetrationProbing {
         freeSlots.removeAll(keepingCapacity: true)
         nextSlot = 0
         highWater = 0
+        // Joints reference the cleared bodies — drop them all with the field.
+        let j = jointBuffer.contents().bindMemory(to: CoinJoint.self, capacity: Self.maxJoints)
+        for i in 0..<jointHighWater { j[i].meta.w = 0 }
+        freeJointSlots.removeAll(keepingCapacity: true)
+        jointHighWater = 0
     }
 
     /// Read-only snapshot of an active coin's COM (safe after the frame's command
@@ -1270,6 +1422,21 @@ public final class CoinDEMSolver: PenetrationProbing {
                     enc.setBuffer(self.materialBuffer, offset: 0, index: 7)
                 }
             }
+            // Generic joints: one serial Gauss-Seidel pass over all joints per
+            // velocity iteration, interleaved with the contact colours so joints
+            // and contacts converge together (a jointed body pressed by a pile
+            // both holds its anchor AND de-penetrates in the same substep).
+            if jointHighWater > 0 {
+                var jc = UInt32(jointHighWater)
+                dispatch(cb, jointSolveCSPipeline, threads: 1, label: "Coin.cs.joints") { enc in
+                    enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
+                    enc.setBuffer(self.biasBuffer, offset: 0, index: 1)
+                    enc.setBuffer(self.jointBuffer, offset: 0, index: 2)
+                    enc.setBytes(&jc, length: MemoryLayout<UInt32>.size, index: 3)
+                    enc.setBuffer(self.uniformBuffer, offset: 0, index: 4)
+                    enc.setBuffer(self.asleepBuffer, offset: 0, index: 5)
+                }
+            }
         }
         // Snapshot the solved contacts + rebuild the pair hash for next substep.
         if warmStart {
@@ -1311,6 +1478,16 @@ public final class CoinDEMSolver: PenetrationProbing {
                 enc.setBuffer(self.islandLabelBuffer, offset: 0, index: 0)
                 enc.setBuffer(self.contactBuffer, offset: 0, index: 1)
                 enc.setBuffer(self.contactCountBuffer, offset: 0, index: 2)
+            }
+            // Joint edges join the same islands, so an articulated assembly
+            // sleeps and wakes as one body.
+            if jointHighWater > 0 {
+                var jc = UInt32(jointHighWater)
+                dispatch(cb, islandUnionJointsPipeline, threads: jointHighWater, label: "Coin.cs.islandUnionJoints") { enc in
+                    enc.setBuffer(self.islandLabelBuffer, offset: 0, index: 0)
+                    enc.setBuffer(self.jointBuffer, offset: 0, index: 1)
+                    enc.setBytes(&jc, length: MemoryLayout<UInt32>.size, index: 2)
+                }
             }
             dispatch(cb, islandJumpPipeline, threads: coinCount, label: "Coin.cs.islandJump") { enc in
                 enc.setBuffer(self.islandLabelBuffer, offset: 0, index: 0)

@@ -136,6 +136,80 @@ final class CoinDEMGenericEngineTests: XCTestCase {
         solver.position(of: slot)
     }
 
+    // ── Joints: distance (pendulum on a tether) ───────────────────────────────
+    // A sphere tethered to a world anchor swings under gravity; the tether length
+    // must hold through the whole swing and the bob must end up BELOW the anchor.
+    func testDistanceJointPendulumHoldsLength() throws {
+        let (solver, queue) = try makeSolver(radius: 0.05, maxDim: 0.05)
+        let anchor = SIMD3<Float>(0, 1.0, 0)
+        let start  = SIMD3<Float>(0.5, 1.0, 0)          // horizontal release
+        let bob = solver.spawnSphere(at: start, radius: 0.05)!
+        let j = solver.addDistanceJoint(bodyA: bob, bodyB: nil,
+                                        worldAnchorA: start, worldAnchorB: anchor)
+        XCTAssertNotNil(j)
+        var worstStretch: Float = 0
+        step(solver, queue, frames: 300) { _ in
+            guard let p = solver.position(of: bob) else { return }
+            worstStretch = max(worstStretch, abs(simd_length(p - anchor) - 0.5))
+        }
+        let p = solver.position(of: bob)!
+        print("JOINT_DISTANCE worstStretch=\(worstStretch) final=\(p)")
+        XCTAssertLessThan(worstStretch, 0.05, "tether length held through the swing (≤10% drift)")
+        XCTAssertLessThan(p.y, 0.95, "bob swung below the anchor")
+        XCTAssertFalse(p.x.isNaN)
+    }
+
+    // ── Joints: ball (point pendulum holds its anchor) ────────────────────────
+    func testBallJointHoldsAnchor() throws {
+        let (solver, queue) = try makeSolver(radius: 0.06, maxDim: 0.06)
+        let anchor = SIMD3<Float>(0, 0.9, 0)
+        let box = solver.spawnBox(at: SIMD3(0.1, 0.8, 0), halfExtents: SIMD3(0.04, 0.04, 0.04))!
+        XCTAssertNotNil(solver.addBallJoint(bodyA: box, bodyB: nil, worldAnchor: anchor))
+        let localR = simd_length(SIMD3<Float>(0.1, 0.8, 0) - anchor)
+        var worstAnchorErr: Float = 0
+        step(solver, queue, frames: 300) { _ in
+            guard let p = solver.position(of: box) else { return }
+            // The COM must stay on the sphere of radius |localAnchor| around the pin.
+            let dist = simd_length(p - anchor)
+            worstAnchorErr = max(worstAnchorErr, abs(dist - localR))
+        }
+        let p = solver.position(of: box)!
+        print("JOINT_BALL worstErr=\(worstAnchorErr) final=\(p)")
+        XCTAssertLessThan(worstAnchorErr, 0.03, "COM stayed on the sphere around the ball anchor")
+        XCTAssertLessThan(p.y, 0.9, "body hangs below the anchor")
+    }
+
+    // ── Joints: hinge limits ──────────────────────────────────────────────────
+    // Two identical flaps hinged to the world about Z at their edge; gravity
+    // swings them down. The limited one must stop at its stop; the free one
+    // swings far past it — proving the limit (not friction) is what held.
+    func testHingeLimitStopsTheFlap() throws {
+        let (solver, queue) = try makeSolver(radius: 0.16, maxDim: 0.16)
+        let he = SIMD3<Float>(0.12, 0.015, 0.05)
+        func flap(z: Float, limits: ClosedRange<Float>?) -> Int {
+            let com = SIMD3<Float>(0.12, 1.0, z)         // extends +X from the hinge edge
+            let b = solver.spawnBox(at: com, halfExtents: he)!
+            _ = solver.addHingeJoint(bodyA: b, bodyB: nil,
+                                     worldAnchor: SIMD3(0, 1.0, z),
+                                     worldAxis: SIMD3(0, 0, 1),
+                                     limits: limits)
+            return b
+        }
+        let limited = flap(z: -0.4, limits: -0.25...0.25)
+        let free    = flap(z:  0.4, limits: nil)
+        var freeDropped: Float = 0
+        step(solver, queue, frames: 300) { _ in
+            if let q = solver.orientation(of: free) {
+                freeDropped = max(freeDropped, abs(simd_act(q, SIMD3<Float>(1, 0, 0)).y))
+            }
+        }
+        let qL = solver.orientation(of: limited)!
+        let tiltLimited = abs(simd_act(qL, SIMD3<Float>(1, 0, 0)).y)   // sin(swing angle)
+        print("JOINT_HINGE tiltLimited=\(tiltLimited) freeDroppedMax=\(freeDropped)")
+        XCTAssertLessThan(tiltLimited, 0.35, "limited flap held near its ±0.25 rad stop")
+        XCTAssertGreaterThan(freeDropped, 0.6, "free flap swung far past the stop")
+    }
+
     // ── Per-body restitution ──────────────────────────────────────────────────
     // Two identical spheres, same drop, different per-body restitution: the
     // bouncy one must rebound visibly higher. Globals stay at their defaults —

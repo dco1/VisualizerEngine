@@ -2427,6 +2427,227 @@ kernel void coinFinalizeCS(
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
+// CONSTRAINT SOLVER — Stage 7: generic joints (ball / hinge / distance)
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// Bilateral constraints between two dynamic bodies (or a body and the WORLD),
+// solved at velocity level exactly like contacts — real velocity toward the
+// constraint manifold, position drift recovered through the SAME split-impulse
+// bias velocities (never mixed into real velocity, so a settled articulated
+// assembly carries zero restoring energy). One thread solves all joints
+// serially (true Gauss-Seidel): joint counts are tens-to-hundreds, not the
+// thousands contacts reach, so a serial loop is cheaper and simpler than
+// colouring them, and it is exactly race-free.
+//
+// Types (meta.x): 0 = BALL (anchors coincide, 3-DOF point constraint),
+//                 1 = HINGE (ball + axis alignment + optional angle limits),
+//                 2 = DISTANCE (anchor separation = rest length, 1-DOF).
+
+struct CoinJoint {
+    uint4  meta;     // x = type, y = bodyA, z = bodyB (CD_STATIC = world), w = enabled
+    float4 anchorA;  // xyz = anchor in A-local frame;               w = rest length (distance)
+    float4 anchorB;  // xyz = anchor in B-local frame (WORLD if z==CD_STATIC)
+    float4 axisA;    // xyz = hinge axis in A-local frame;           w = limit lo (rad)
+    float4 axisB;    // xyz = hinge axis in B-local (WORLD if world); w = limit hi (rad)
+};
+
+// Invert a symmetric positive-definite 3×3 (cofactor expansion).
+static float3x3 cdInvert3x3(float3x3 m) {
+    float3 c0 = cross(m[1], m[2]);
+    float3 c1 = cross(m[2], m[0]);
+    float3 c2 = cross(m[0], m[1]);
+    float det = dot(m[0], c0);
+    if (abs(det) < 1e-12) return float3x3(0.0);
+    float inv = 1.0 / det;
+    // rows of the inverse are the cofactor columns / det (m is symmetric here).
+    return float3x3(c0 * inv, c1 * inv, c2 * inv);
+}
+
+kernel void coinJointSolveCS(
+    device CoinBody*        coins      [[ buffer(0) ]],
+    device float4*          bias       [[ buffer(1) ]],
+    device const CoinJoint* joints     [[ buffer(2) ]],
+    constant uint&          jointCount [[ buffer(3) ]],
+    constant CoinUniforms&  u          [[ buffer(4) ]],
+    device const uint*      asleep     [[ buffer(5) ]],
+    uint tid [[ thread_position_in_grid ]])
+{
+    if (tid != 0) return;                    // serial Gauss-Seidel over all joints
+    for (uint k = 0; k < jointCount; ++k) {
+        CoinJoint jn = joints[k];
+        if (jn.meta.w == 0u) continue;       // disabled slot
+        uint A = jn.meta.y, B = jn.meta.z;
+        bool bWorld = (B == CD_STATIC);
+        CoinBody a = coins[A];
+        if (a.posInvMass.w == 0.0) continue;
+        bool aSleep = (asleep[A] != 0u);
+        bool bSleep = bWorld || (asleep[B] != 0u);
+        if (aSleep && bSleep) continue;
+
+        float invMa = aSleep ? 0.0 : a.posInvMass.w;
+        float3 invIa = aSleep ? float3(0.0) : cdBodyInvInertia(a, a.posInvMass.w);
+        float4 qa = a.orient;
+        float3 vA = a.vel.xyz, wA = a.angVel.xyz;
+        float3 bvA = bias[2*A].xyz, bwA = bias[2*A+1].xyz;
+
+        CoinBody b;
+        float invMb = 0.0; float3 invIb = float3(0.0); float4 qb = float4(0,0,0,1);
+        float3 vB = float3(0.0), wB = float3(0.0), bvB = float3(0.0), bwB = float3(0.0);
+        float3 xb = float3(0.0);
+        if (!bWorld) {
+            b = coins[B];
+            if (b.posInvMass.w == 0.0) continue;
+            invMb = bSleep ? 0.0 : b.posInvMass.w;
+            invIb = bSleep ? float3(0.0) : cdBodyInvInertia(b, b.posInvMass.w);
+            qb = b.orient;
+            vB = b.vel.xyz; wB = b.angVel.xyz;
+            bvB = bias[2*B].xyz; bwB = bias[2*B+1].xyz;
+            xb = b.posInvMass.xyz;
+        }
+
+        // World anchors + lever arms. For a world joint, anchorB IS world space.
+        float3 pA = a.posInvMass.xyz + cdQuatRotate(qa, jn.anchorA.xyz);
+        float3 pB = bWorld ? jn.anchorB.xyz : (xb + cdQuatRotate(qb, jn.anchorB.xyz));
+        float3 rA = pA - a.posInvMass.xyz;
+        float3 rB = bWorld ? float3(0.0) : (pB - xb);
+        uint type = jn.meta.x;
+
+        if (type == 2u) {
+            // ── DISTANCE: |pA − pB| = rest, 1-DOF along the anchor axis ────────
+            float3 d = pA - pB;
+            float len = length(d);
+            if (len < 1e-6) continue;
+            float3 n = d / len;
+            float C = len - jn.anchorA.w;                 // signed stretch
+            float3 raXn = cross(rA, n), rbXn = cross(rB, n);
+            float kJ = invMa + invMb
+                     + dot(raXn, cdApplyInvInertiaWorld(qa, invIa, raXn))
+                     + (bWorld ? 0.0 : dot(rbXn, cdApplyInvInertiaWorld(qb, invIb, rbXn)));
+            if (kJ < 1e-9) continue;
+            // Real velocity along n → 0 (bilateral, unclamped).
+            float vn = dot((vA + cross(wA, rA)) - (vB + cross(wB, rB)), n);
+            float jI = -vn / kJ;
+            float3 P = jI * n;
+            vA += invMa * P; wA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, P));
+            if (!bWorld) { vB -= invMb * P; wB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, P)); }
+            // Bias velocity recovers the stretch (split-impulse; never real energy).
+            float bvn = dot((bvA + cross(bwA, rA)) - (bvB + cross(bwB, rB)), n);
+            float jB = (-u.baumgarteBeta * C / max(u.dt, 1e-6) - bvn) / kJ;
+            float3 Pb = jB * n;
+            bvA += invMa * Pb; bwA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, Pb));
+            if (!bWorld) { bvB -= invMb * Pb; bwB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, Pb)); }
+        } else {
+            // ── BALL core (types 0 and 1): anchors coincide, 3-DOF ─────────────
+            // K built by columns: K = (ΣinvM)·I − [rA]× IA⁻¹ [rA]× − [rB]× IB⁻¹ [rB]×.
+            float3x3 K;
+            for (int j = 0; j < 3; ++j) {
+                float3 e = float3(j == 0 ? 1.0 : 0.0, j == 1 ? 1.0 : 0.0, j == 2 ? 1.0 : 0.0);
+                float3 col = (invMa + invMb) * e;
+                col -= cross(rA, cdApplyInvInertiaWorld(qa, invIa, cross(rA, e)));
+                if (!bWorld) col -= cross(rB, cdApplyInvInertiaWorld(qb, invIb, cross(rB, e)));
+                K[j] = col;
+            }
+            float3x3 Kinv = cdInvert3x3(K);
+            // Real: relative anchor velocity → 0.
+            float3 vrel = (vA + cross(wA, rA)) - (vB + cross(wB, rB));
+            float3 P = Kinv * (-vrel);
+            vA += invMa * P; wA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, P));
+            if (!bWorld) { vB -= invMb * P; wB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, P)); }
+            // Bias: recover the anchor gap C = pA − pB.
+            float3 C = pA - pB;
+            float3 bvrel = (bvA + cross(bwA, rA)) - (bvB + cross(bwB, rB));
+            float3 Pb = Kinv * (-u.baumgarteBeta * C / max(u.dt, 1e-6) - bvrel);
+            bvA += invMa * Pb; bwA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, Pb));
+            if (!bWorld) { bvB -= invMb * Pb; bwB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, Pb)); }
+
+            if (type == 1u) {
+                // ── HINGE: kill relative rotation ⟂ the axis + align the axes ──
+                float3 aW = normalize(cdQuatRotate(qa, jn.axisA.xyz));
+                float3 bW = bWorld ? normalize(jn.axisB.xyz) : normalize(cdQuatRotate(qb, jn.axisB.xyz));
+                // Two directions spanning ⟂ aW.
+                float3 b1 = (abs(aW.x) > 0.7) ? normalize(float3(-aW.y, aW.x, 0.0))
+                                              : normalize(float3(0.0, -aW.z, aW.y));
+                float3 b2 = cross(aW, b1);
+                float3 axisErr = cross(aW, bW);           // sin-scaled misalignment
+                for (int t = 0; t < 2; ++t) {
+                    float3 dir = (t == 0) ? b1 : b2;
+                    float kA = dot(dir, cdApplyInvInertiaWorld(qa, invIa, dir))
+                             + (bWorld ? 0.0 : dot(dir, cdApplyInvInertiaWorld(qb, invIb, dir)));
+                    if (kA < 1e-9) continue;
+                    // Real: relative angular velocity ⟂ axis → 0.
+                    float wrel = dot(wA - wB, dir);
+                    float jA = -wrel / kA;
+                    wA += cdApplyInvInertiaWorld(qa, invIa, jA * dir);
+                    if (!bWorld) wB -= cdApplyInvInertiaWorld(qb, invIb, jA * dir);
+                    // Bias: rotate the axes back into alignment.
+                    float bwrel = dot(bwA - bwB, dir);
+                    float errT = dot(axisErr, dir);
+                    float jAb = (-u.baumgarteBeta * errT / max(u.dt, 1e-6) - bwrel) / kA;
+                    bwA += cdApplyInvInertiaWorld(qa, invIa, jAb * dir);
+                    if (!bWorld) bwB -= cdApplyInvInertiaWorld(qb, invIb, jAb * dir);
+                }
+                // Angle limits about the hinge axis (lo < hi enables them).
+                float lo = jn.axisA.w, hi = jn.axisB.w;
+                if (lo < hi) {
+                    // Twist of B relative to A about the WORLD hinge axis
+                    // (swing-twist projection of the relative quaternion).
+                    float4 qrel = bWorld ? cdQuatConj(qa) : cdQuatMul(qb, cdQuatConj(qa));
+                    float twist = 2.0 * atan2(dot(qrel.xyz, aW), qrel.w);
+                    float overLo = twist - lo;             // < 0 ⇒ below the low stop
+                    float overHi = twist - hi;             // > 0 ⇒ past the high stop
+                    float kT = dot(aW, cdApplyInvInertiaWorld(qa, invIa, aW))
+                             + (bWorld ? 0.0 : dot(aW, cdApplyInvInertiaWorld(qb, invIb, aW)));
+                    if (kT > 1e-9 && (overLo < 0.0 || overHi > 0.0)) {
+                        float err = (overLo < 0.0) ? overLo : overHi;
+                        // Real: stop the twist velocity heading further past the stop.
+                        float wt = dot(wB - wA, aW);        // d(twist)/dt
+                        if ((err < 0.0 && wt < 0.0) || (err > 0.0 && wt > 0.0)) {
+                            float jT = -wt / kT;
+                            wA -= cdApplyInvInertiaWorld(qa, invIa, jT * aW);
+                            if (!bWorld) wB += cdApplyInvInertiaWorld(qb, invIb, jT * aW);
+                        }
+                        // Bias: rotate back inside the limit.
+                        float bwt = dot(bwB - bwA, aW);
+                        float jTb = (-u.baumgarteBeta * err / max(u.dt, 1e-6) - bwt) / kT;
+                        bwA -= cdApplyInvInertiaWorld(qa, invIa, jTb * aW);
+                        if (!bWorld) bwB += cdApplyInvInertiaWorld(qb, invIb, jTb * aW);
+                    }
+                }
+            }
+        }
+
+        // Write back (a sleeping/world end carried no impulse — leave it be).
+        if (!aSleep) {
+            coins[A].vel.xyz = vA; coins[A].angVel.xyz = wA;
+            bias[2*A] = float4(bvA, 0.0); bias[2*A+1] = float4(bwA, 0.0);
+        }
+        if (!bWorld && !bSleep) {
+            coins[B].vel.xyz = vB; coins[B].angVel.xyz = wB;
+            bias[2*B] = float4(bvB, 0.0); bias[2*B+1] = float4(bwB, 0.0);
+        }
+    }
+}
+
+// Union the two bodies of each ENABLED joint into one island, so an articulated
+// assembly sleeps and wakes as a unit (mirror of coinIslandUnion over contacts).
+kernel void coinIslandUnionJoints(
+    device atomic_uint*     label      [[ buffer(0) ]],
+    device const CoinJoint* joints     [[ buffer(1) ]],
+    constant uint&          jointCount [[ buffer(2) ]],
+    uint k [[ thread_position_in_grid ]])
+{
+    if (k >= jointCount) return;
+    CoinJoint jn = joints[k];
+    if (jn.meta.w == 0u || jn.meta.z == CD_STATIC) return;
+    uint a = jn.meta.y, b = jn.meta.z;
+    uint la = atomic_load_explicit(&label[a], memory_order_relaxed);
+    uint lb = atomic_load_explicit(&label[b], memory_order_relaxed);
+    uint lo = min(la, lb);
+    atomic_fetch_min_explicit(&label[a], lo, memory_order_relaxed);
+    atomic_fetch_min_explicit(&label[b], lo, memory_order_relaxed);
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
 // CONSTRAINT SOLVER — Stage 5: island detection + sleeping
 // ══════════════════════════════════════════════════════════════════════════════
 //
