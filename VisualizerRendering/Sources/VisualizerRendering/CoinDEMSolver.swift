@@ -214,6 +214,7 @@ struct CoinUniforms {
     var restitutionMinE: Float = 0.0        // floor for the velocity-faded COR
     var quadraticDrag: Float = 0.0          // ∝v² aerodynamic drag (accel = −k·|v|·v); 0 = off
     var dragRefRadius: Float = 0.0          // radius where quadraticDrag is calibrated; drag ∝1/r per body. 0 = flat k
+    var speculativeMargin: Float = 0.0      // emit near-contacts within this gap (anti-tunneling); 0 = off
 }
 
 @MainActor
@@ -418,6 +419,13 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// drags LESS and flies further, a smaller one drags MORE. 0 (default) ⇒ flat k
     /// for every body (no size scaling).
     public var dragRefRadius: Float = 0.0
+    /// Speculative-contact margin (metres, constraint path, default 0 = off).
+    /// When > 0, sphere/capsule pairs and plane/cylinder statics also emit
+    /// NEAR-contacts within this gap (negative depth); the normal constraint then
+    /// only limits the approach speed to gap/dt — the standard anti-tunneling
+    /// scheme for small fast bodies. Keep ≤ the broadphase cell size (pairs
+    /// beyond one cell are never even found).
+    public var speculativeMargin: Float = 0.0
     /// Colour passes per velocity iteration. The colouring uses ≤ this many colours in
     /// practice (≈8 for a dense pile); contacts in higher colours wait a substep.
     public var solveColors: Int = 16
@@ -1733,7 +1741,8 @@ public final class CoinDEMSolver: PenetrationProbing {
             maxHSpeed: maxHSpeed, maxSpeed: maxSpeed, maxOmega: maxOmega,
             contactSlop: contactSlop, baumgarteBeta: baumgarteBeta, restThreshold: restThreshold,
             restitutionVelFalloff: restitutionVelFalloff, restitutionMinE: restitutionMinE,
-            quadraticDrag: quadraticDrag, dragRefRadius: dragRefRadius)
+            quadraticDrag: quadraticDrag, dragRefRadius: dragRefRadius,
+            speculativeMargin: speculativeMargin)
         uniformBuffer.contents().bindMemory(to: CoinUniforms.self, capacity: 1).pointee = u
     }
 

@@ -124,6 +124,7 @@ struct CoinUniforms {
     float restitutionMinE;       // floor for the velocity-faded COR
     float quadraticDrag;         // ∝v² aerodynamic drag k (accel = −k·|v|·v); 0 = off
     float dragRefRadius;         // radius where quadraticDrag is calibrated; drag scales ∝1/r per body. 0 = flat k (no size scaling)
+    float speculativeMargin;     // emit near-contacts within this gap (anti-tunneling); 0 = off
 };
 
 // Per-body drag coefficient. Real aerodynamic drag-per-mass A/m ∝ r²/r³ = 1/r, so
@@ -1593,7 +1594,9 @@ static void cdEmitContact(device CoinContact* contacts,
                           device atomic_uint* contactCount, uint maxContacts,
                           uint a, uint b, uint feature, uint colliderIdx,
                           float3 nBtoA, float3 cp, float3 xa, float3 xb, float depth) {
-    if (depth <= 0.0) return;
+    // Depth may be NEGATIVE (a speculative near-contact within the margin) — each
+    // call site owns its own `pen > -margin` gate; this only rejects garbage.
+    if (isnan(depth)) return;
     uint slot = atomic_fetch_add_explicit(contactCount, 1u, memory_order_relaxed);
     if (slot >= maxContacts) return;                 // buffer full — drop (logged host-side)
     float3 n = normalize(nBtoA);
@@ -1625,6 +1628,7 @@ kernel void coinGenerateContacts(
     CoinBody ci = coins[id];
     if (ci.posInvMass.w == 0.0) return;
     int jointPartner = links[id].x;
+    float spec = u.speculativeMargin;   // >0 ⇒ also emit near-contacts (anti-tunneling)
 
     float3 xi = ci.posInvMass.xyz;
     float4 qi = ci.orient;
@@ -1656,13 +1660,15 @@ kernel void coinGenerateContacts(
             float4 qj = cj.orient;
             float  Rj = cdRadiusOf(cj), hj = cdHalfThickOf(cj);
             float3 D  = xi - xj;
-            float reach = sqrt(Ri*Ri + hi*hi) + sqrt(Rj*Rj + hj*hj);
+            // Bounding reject — widened by the speculative margin, or near-contacts
+            // within the margin would be culled before their branch ever runs.
+            float reach = sqrt(Ri*Ri + hi*hi) + sqrt(Rj*Rj + hj*hj) + spec;
             if (dot(D, D) > reach * reach) continue;
 
             // Sphere-involved.
             if (cdIsSphere(ci) && cdIsSphere(cj)) {
                 float dl = length(D), pen = (Ri + Rj) - dl;
-                if (pen > 0.0 && dl > 1e-6) {
+                if (pen > -spec && dl > 1e-6) {
                     float3 n = D / dl;
                     float3 cp = 0.5 * ((xi - n * Ri) + (xj + n * Rj));
                     cdEmitContact(contacts, contactCount, maxContacts, id, j, 0u, 0u, n, cp, xi, xj, pen);
@@ -1688,7 +1694,7 @@ kernel void coinGenerateContacts(
                 }
                 float3 deltaLocal = lp - closestLocal;
                 float dist = length(deltaLocal), pen = rs + extraR - dist;
-                if (pen > 0.0 && dist > 1e-6) {
+                if (pen > -spec && dist > 1e-6) {
                     float3 nOut = cdQuatRotate(qo, deltaLocal / dist);   // out of shape toward sphere
                     float3 cp   = co + cdQuatRotate(qo, closestLocal) + extraR * nOut;
                     float3 nBtoA = iSphere ? nOut : -nOut;               // from j(B) toward i(A)
@@ -1718,7 +1724,7 @@ kernel void coinGenerateContacts(
                         float3 dS = cps[k] - cqs[k];
                         float dl = length(dS);
                         float pen = rI + rJ - dl;
-                        if (pen > 0.0 && dl > 1e-6) {
+                        if (pen > -spec && dl > 1e-6) {
                             float3 n = dS / dl;                            // out of j, toward i
                             float3 cp = 0.5 * ((cps[k] - n * rI) + (cqs[k] + n * rJ));
                             cdEmitContact(contacts, contactCount, maxContacts, id, j, uint(k), 0u, n, cp, xi, xj, pen);
@@ -1741,7 +1747,7 @@ kernel void coinGenerateContacts(
                     float3 nOut, cp; float pen;
                     if (dl > 1e-6) {
                         pen = rc - dl;
-                        if (pen <= 0.0) continue;
+                        if (pen <= -spec) continue;
                         nOut = cdQuatRotate(qo, dL / dl);            // out of O, toward the probe
                         cp = co + cdQuatRotate(qo, cl);
                     } else {
@@ -1831,18 +1837,18 @@ kernel void coinGenerateContacts(
             float3 n = col.a.xyz; float d = col.b.w;
             if (cdIsSphere(ci)) {
                 float pen = (d + Ri) - dot(n, xi);
-                if (pen > 0.0) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, 0u, k, n, xi - Ri*n, xi, xi, pen);
+                if (pen > -spec) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, 0u, k, n, xi - Ri*n, xi, xi, pen);
             } else if (iCapsule) {
                 // Both END probes (skip mid: coplanar with the ends, adds nothing) —
                 // the 2-point manifold that holds a side-lying capsule level.
                 for (int p = 0; p < 3; p += 2) {
                     float pen = (d + capR) - dot(n, capP[p]);
-                    if (pen > 0.0) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, capP[p] - capR*n, xi, xi, pen);
+                    if (pen > -spec) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, capP[p] - capR*n, xi, xi, pen);
                 }
             } else {
                 for (int p = 0; p < CD_NPTS; ++p) {
                     float pen = d - dot(n, fp[p]);
-                    if (pen > 0.0) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, fp[p], xi, xi, pen);
+                    if (pen > -spec) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, fp[p], xi, xi, pen);
                 }
             }
         } else if (kind == 1u) {                         // axis-aligned box
@@ -1942,17 +1948,20 @@ kernel void coinGenerateContacts(
                     cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, fp[p], xi, xi, push);
                 }
             }
-        } else if (kind == 4u && (cdIsSphere(ci) || iCapsule)) {   // cylinder segment (pipe / half-pipe)
+        } else if (kind == 4u) {                         // cylinder segment (pipe / half-pipe)
             // a.xyz = axis centre, b.xyz = axis dir (unit), b.w = radius R,
             // vel.xyz = "up" dir, vel.w = half-length, meta.x bit0 = lower-half only.
-            // A sphere is one probe (its centre); a capsule is its 3 segment probes.
+            // A sphere is one probe (its centre, radius Ri); a capsule its 3 segment
+            // probes (radius capR); a disc/box its surface FEATURE POINTS (radius 0)
+            // — so every shape rides the pipe, not just marbles.
             float3 ctr = col.a.xyz, ax = col.b.xyz, up = col.vel.xyz;
             float R = col.b.w, halfLen = col.vel.w;
             bool lowerOnly = (col.meta.x & 1u) != 0u;
-            int nProbes = iCapsule ? 3 : 1;
+            bool sphereLike = cdIsSphere(ci) || iCapsule;
+            int nProbes = iCapsule ? 3 : (cdIsSphere(ci) ? 1 : CD_NPTS);
             for (int p = 0; p < nProbes; ++p) {
-                float3 s  = iCapsule ? capP[p] : xi;
-                float  rs = iCapsule ? capR    : Ri;
+                float3 s  = sphereLike ? (iCapsule ? capP[p] : xi) : fp[p];
+                float  rs = sphereLike ? (iCapsule ? capR    : Ri) : 0.0;
                 float3 d = s - ctr;
                 float along = dot(d, ax);
                 if (along < -halfLen || along > halfLen) continue;   // outside this segment's length
@@ -1962,14 +1971,46 @@ kernel void coinGenerateContacts(
                 float3 rn = radial / dr;                    // outward from axis
                 bool active = !lowerOnly || dot(rn, up) < 0.05;   // half-pipe: lower hemisphere
                 float pen = (dr + rs) - R;                  // surface vs inner wall (>0 ⇒ touching)
-                if (active && pen > 0.0) {
+                if (active && pen > -spec) {
                     float3 n = -rn;                         // push toward the axis
                     cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, s + rn * rs, xi, xi, pen);
                 }
             }
+        } else if (kind == 2u) {
+            // ── Reciprocating pusher plate (constraint-path parity) ────────────
+            // Legacy semantics preserved: a body the plate has overtaken is pushed
+            // to just in front of its +Z face, at most plateSpeed·dt per substep —
+            // the depth clamp means the split-impulse recovery can never move a
+            // body faster than the plate itself (no launching). Probes: sphere =
+            // its centre (radius Ri), capsule = 3 segment probes (radius capR),
+            // disc/box = feature points with the legacy (Ri, hi) margins.
+            float3 cc2 = col.a.xyz, he2 = col.b.xyz;
+            float frontZ = cc2.z + he2.z;
+            float backZ  = cc2.z - he2.z;
+            float maxPush = max(0.0, col.vel.z) * u.dt;
+            if (maxPush <= 0.0) continue;
+            // The shove arrives through the split-impulse bias, which recovers
+            // β·(depth − slop)/dt — so cap the DEPTH such that the recovery speed
+            // caps at the plate speed (depth ≤ push/β + slop), not the raw push
+            // (which β·slop would eat: the plate would ghost through the pile).
+            float maxDepth = maxPush / max(u.baumgarteBeta, 0.05) + u.contactSlop;
+            bool sphereLike = cdIsSphere(ci) || iCapsule;
+            int nProbes = iCapsule ? 3 : (cdIsSphere(ci) ? 1 : CD_NPTS);
+            for (int p = 0; p < nProbes; ++p) {
+                float3 s  = sphereLike ? (iCapsule ? capP[p] : xi) : fp[p];
+                float  rs = sphereLike ? (iCapsule ? capR    : Ri) : Ri;
+                float  ry = sphereLike ? rs : hi;
+                if (abs(s.x - cc2.x) < he2.x + rs &&
+                    s.y > cc2.y - (he2.y + ry) && s.y < cc2.y + (he2.y + ry) &&
+                    s.z < frontZ + rs && s.z > backZ - rs) {
+                    float depth = clamp((frontZ + rs) - s.z, 0.0, maxDepth);
+                    if (depth > 0.0) {
+                        cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k,
+                                      float3(0, 0, 1), s, xi, xi, depth);
+                    }
+                }
+            }
         }
-        // kind == 2 (pusher) is a kinematic position shove handled by the legacy path
-        // only; the constraint path is opt-in for piles without a pusher (Pile of Mess).
     }
 }
 
@@ -2217,8 +2258,12 @@ kernel void coinSolveVelocityColor(
     if (c.aux.w < 0.5) { c.aux.x = vn; c.aux.w = 1.0; }
     float vn0 = c.aux.x;
     float restE = (vn0 < -u.restThreshold) ? cdEffectiveCORBase(u, eC, -vn0) : 0.0;
+    // SPECULATIVE near-contact (depth < 0): don't stop the body at the current
+    // gap — only cap its approach so it can close AT MOST the gap this substep
+    // (vn ≥ depth/dt). A real contact (depth ≥ 0) keeps the plain vn → −e·vn₀.
+    float allowedVn = min(depth, 0.0) / max(u.dt, 1e-6);
     float jnOld = c.rA.w;
-    float dJn = -(vn + restE * vn0) / kN;          // drive vn → −e·vn₀
+    float dJn = -(vn - allowedVn + restE * vn0) / kN;   // drive vn → allowedVn − e·vn₀
     float jnNew = max(jnOld + dJn, 0.0);           // accumulated, non-adhesive
     dJn = jnNew - jnOld;
     float3 Pn = dJn * n;
@@ -2262,6 +2307,30 @@ kernel void coinSolveVelocityColor(
         vA += invMa * Pt2; wA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, Pt2));
         if (!bStatic) { vB -= invMb * Pt2; wB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, Pt2)); }
         c.tan1.w = jt2New;
+    }
+
+    // ── Rolling resistance (constraint path): a physical angular constraint ────
+    // Opposes the RELATIVE rolling spin (ω ⟂ n) with an angular impulse bounded
+    // by μᵣ · jₙ · r (coefficient × normal impulse × contact lever) — so a ball
+    // rolls out and STOPS on a level floor instead of coasting forever, and the
+    // stopping torque scales with how hard the contact is loaded, exactly like
+    // real rolling friction. Twist ABOUT n is friction's job, not this.
+    if (u.rollingResistance > 0.0 && c.rA.w > 0.0) {
+        float3 wrel = wA - wB;
+        float3 wRoll = wrel - dot(wrel, n) * n;
+        float wl = length(wRoll);
+        if (wl > 1e-5) {
+            float3 axis = wRoll / wl;
+            float kR = dot(axis, cdApplyInvInertiaWorld(qa, invIa, axis))
+                     + (bStatic ? 0.0 : dot(axis, cdApplyInvInertiaWorld(qb, invIb, axis)));
+            if (kR > 1e-9) {
+                float lever = max(length(rA), 1e-4);
+                float jR = min(wl / kR, u.rollingResistance * c.rA.w * lever);
+                float3 T = -jR * axis;
+                wA += cdApplyInvInertiaWorld(qa, invIa, T);
+                if (!bStatic) wB -= cdApplyInvInertiaWorld(qb, invIb, T);
+            }
+        }
     }
 
     // Write back (an inert/asleep end carried no impulse, so leave it untouched).

@@ -136,6 +136,85 @@ final class CoinDEMGenericEngineTests: XCTestCase {
         solver.position(of: slot)
     }
 
+    // ── Speculative contacts (anti-tunneling) ─────────────────────────────────
+    // A small sphere fired at 120 m/s crosses a same-size target's whole overlap
+    // window between substeps (0.5 m/substep vs a 0.14 m window, phased to miss),
+    // so WITHOUT the margin it sails straight through. With a speculative margin
+    // the near-contact caps its approach to gap/dt and it lands ON the target.
+    func testSpeculativeMarginStopsTunneling() throws {
+        func fire(margin: Float) throws -> (projectileX: Float, targetX: Float) {
+            let (solver, queue) = try makeSolver(radius: 0.07, maxDim: 0.2,
+                                                 boundsMin: SIMD3(-4, -0.5, -1),
+                                                 boundsMax: SIMD3(4, 1, 1))
+            solver.maxSpeed = 200
+            solver.restitution = 0
+            solver.speculativeMargin = margin
+            let target = solver.spawnSphere(at: SIMD3(0, 0.05, 0), radius: 0.05)!
+            // 120 m/s → 0.5 m/substep; start phased so sampled gaps skip the window.
+            let proj = solver.spawnSphere(at: SIMD3(-2.27, 0.05, 0), radius: 0.02,
+                                          velocity: SIMD3(120, 0, 0))!
+            step(solver, queue, frames: 30)
+            return (solver.position(of: proj)!.x, solver.position(of: target)!.x)
+        }
+        let without = try fire(margin: 0)
+        let with    = try fire(margin: 0.3)
+        print("SPECULATIVE without=\(without) with=\(with)")
+        XCTAssertGreaterThan(without.projectileX, 1.0,
+                             "control: at 120 m/s the projectile tunnels straight through")
+        XCTAssertLessThan(abs(without.targetX), 0.05, "control: target untouched")
+        XCTAssertGreaterThan(with.targetX, 0.1,
+                             "speculative: the target was actually HIT and carried forward")
+    }
+
+    // ── Rolling resistance (constraint path) ──────────────────────────────────
+    // Two identical balls rolled with the same send-off; the solver with rolling
+    // resistance must stop its ball far shorter than the free-rolling control.
+    func testRollingResistanceStopsTheBall() throws {
+        func roll(muR: Float) throws -> Float {
+            let (solver, queue) = try makeSolver(radius: 0.05, maxDim: 0.05,
+                                                 boundsMin: SIMD3(-1, -0.5, -1),
+                                                 boundsMax: SIMD3(14, 1, 1))
+            solver.frictionCoeff = 0.6          // grip so it truly ROLLS
+            solver.rollingResistance = muR
+            let ball = solver.spawnSphere(at: SIMD3(0, 0.05, 0), radius: 0.05,
+                                          velocity: SIMD3(3, 0, 0))!
+            step(solver, queue, frames: 420)    // 7 s
+            return solver.position(of: ball)!.x
+        }
+        let free    = try roll(muR: 0)
+        let resisted = try roll(muR: 0.4)
+        print("ROLLING free=\(free) resisted=\(resisted)")
+        XCTAssertGreaterThan(free, resisted + 0.5,
+                             "rolling resistance stops the ball well short of the free roller")
+    }
+
+    // ── Pusher plate on the constraint path ──────────────────────────────────
+    // The kinematic pusher now exists for constraint-mode scenes: a coin sitting
+    // in front of an advancing plate is carried forward, and the depth clamp
+    // keeps the shove at plate speed (no launching).
+    func testConstraintPusherShovesWithoutLaunching() throws {
+        let (solver, queue) = try makeSolver(radius: 0.05, maxDim: 0.05,
+                                             boundsMin: SIMD3(-1, -0.5, -1),
+                                             boundsMax: SIMD3(1, 1, 2))
+        let coin = solver.spawn(at: SIMD3(0, 0.006, 0.1), radius: 0.05, halfThickness: 0.0037)!
+        let plateSpeed: Float = 0.5
+        var plateZ: Float = -0.06
+        var maxVz: Float = 0
+        step(solver, queue, frames: 180) { _ in
+            plateZ += plateSpeed / 60
+            solver.setColliders([
+                .plane(normal: SIMD3(0, 1, 0), offset: 0),
+                .pusherPlate(center: SIMD3(0, 0.05, plateZ), halfExtents: SIMD3(0.3, 0.05, 0.05),
+                             velocity: SIMD3(0, 0, plateSpeed)),
+            ])
+            if let v = solver.velocity(of: coin) { maxVz = max(maxVz, v.z) }
+        }
+        let p = solver.position(of: coin)!
+        print("CS_PUSHER finalZ=\(p.z) maxVz=\(maxVz)")
+        XCTAssertGreaterThan(p.z, 0.6, "coin was carried forward by the plate")
+        XCTAssertLessThan(maxVz, plateSpeed * 2.5, "shove never launched the coin")
+    }
+
     // ── Joints: distance (pendulum on a tether) ───────────────────────────────
     // A sphere tethered to a world anchor swings under gravity; the tether length
     // must hold through the whole swing and the bob must end up BELOW the anchor.
