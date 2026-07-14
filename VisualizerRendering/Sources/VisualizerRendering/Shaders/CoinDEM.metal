@@ -144,6 +144,27 @@ inline float cdEffectiveCOR(constant CoinUniforms& u, float impactSpeed) {
     return clamp(e, min(u.restitutionMinE, u.restitution), u.restitution);
 }
 
+// Per-body-material variant: same velocity falloff, but around a per-CONTACT base
+// COR (the combined material restitution) instead of the global uniform.
+inline float cdEffectiveCORBase(constant CoinUniforms& u, float baseE, float impactSpeed) {
+    float e = baseE - u.restitutionVelFalloff * impactSpeed;
+    return clamp(e, min(u.restitutionMinE, baseE), baseE);
+}
+
+// ── Per-body material (constraint path) ──────────────────────────────────────
+// material[slot] = (μ, e); a NEGATIVE lane means "inherit the global uniform"
+// (u.frictionCoeff / u.restitution) — the default for every body, so a scene
+// that never sets materials is byte-identical. Combine rules are the standard
+// production ones: friction = √(μA·μB) (geometric mean), restitution = max.
+inline float cdBodyMu(device const float2* material, uint slot, constant CoinUniforms& u) {
+    float m = material[slot].x;
+    return m >= 0.0 ? m : u.frictionCoeff;
+}
+inline float cdBodyE(device const float2* material, uint slot, constant CoinUniforms& u) {
+    float e = material[slot].y;
+    return e >= 0.0 ? e : u.restitution;
+}
+
 struct CoinTransform {
     float4 col0;  // basis column 0 (xyz, 0)
     float4 col1;
@@ -167,6 +188,12 @@ struct CoinContact {
     float4 rB;     // xyz = contact point − comB,  w = accumulated TANGENT-1 impulse
     float4 tan1;   // xyz = tangent dir 1 (world), w = accumulated TANGENT-2 impulse
     float4 tan2;   // xyz = tangent dir 2 (world), w = assigned colour (−1 until coloured)
+    // x = pre-solve approach speed vn₀ along n, captured ONCE by the first solve
+    // pass (w = captured flag). The restitution target is −e·vn₀ — recomputing it
+    // from the CURRENT vn each iteration let iteration 2 see the already-reflected
+    // velocity, gate restitution off, and unwind the bounce via the accumulated-
+    // impulse clamp (a resting-stack feature, a bounce killer). yz reserved.
+    float4 aux;
 };
 
 // ── Quaternion helpers (mirror EggMotion.metal) ───────────────────────────────
@@ -236,15 +263,40 @@ static float3 cdBoxInvInertia(float3 he, float invMass) {
     return float3(invMass / Ixx_k, invMass / Iyy_k, invMass / Izz_k);
 }
 
-// Shape tags ride shapeExtents.w: 0 = disc/capped-cylinder, 1 = box, 2 = sphere.
-// (cdIsBox MUST be a half-open band — a sphere's tag of 2 would slip past a bare
-// `> 0.5` and be mis-collided as a box everywhere.)
-static bool cdIsBox(CoinBody c)    { return c.shapeExtents.w > 0.5 && c.shapeExtents.w < 1.5; }
-static bool cdIsSphere(CoinBody c) { return c.shapeExtents.w > 1.5; }
+// Shape tags ride shapeExtents.w: 0 = disc/capped-cylinder, 1 = box, 2 = sphere,
+// 3 = capsule, 4 = convex hull. (Every predicate MUST be a half-open band — a
+// bare `> 0.5` box test would mis-collide every later tag as a box.)
+static bool cdIsBox(CoinBody c)     { return c.shapeExtents.w > 0.5 && c.shapeExtents.w < 1.5; }
+static bool cdIsSphere(CoinBody c)  { return c.shapeExtents.w > 1.5 && c.shapeExtents.w < 2.5; }
+static bool cdIsCapsule(CoinBody c) { return c.shapeExtents.w > 2.5 && c.shapeExtents.w < 3.5; }
+static bool cdIsHull(CoinBody c)    { return c.shapeExtents.w > 3.5; }
+
+// Capsule lanes: prevPos.w = cross-section RADIUS r (like a disc), vel.w = the
+// FULL half-height hl + r (so the legacy capped-cylinder path sees the correct
+// bounds), shapeExtents.x = the true SEGMENT half-length hl for exact contacts.
+static float cdCapsuleR(CoinBody c)  { return c.prevPos.w > 1e-4 ? c.prevPos.w : 0.02; }
+static float cdCapsuleHL(CoinBody c) { return max(c.shapeExtents.x, 0.0); }
+
+// Solid capsule inverse inertia (axis = local +Y). Standard cylinder+hemisphere
+// aggregation: mass splits by volume; hemispheres carry parallel-axis terms.
+static float3 cdCapsuleInvInertia(float r, float hl, float invMass) {
+    float L  = 2.0 * hl;                       // cylinder full length
+    float Vc = M_PI_F * r * r * L;             // cylinder volume
+    float Vs = (4.0 / 3.0) * M_PI_F * r * r * r;   // both hemispheres = one sphere
+    float V  = max(Vc + Vs, 1e-12);
+    float mc = Vc / V, ms = Vs / V;            // mass fractions (per unit mass)
+    float Iyy_k = mc * 0.5 * r * r + ms * 0.4 * r * r;
+    float Ixx_k = mc * (L * L / 12.0 + 0.25 * r * r)
+                + ms * (0.4 * r * r + 0.25 * L * L + 0.375 * L * r);
+    return float3(invMass / max(Ixx_k, 1e-10),
+                  invMass / max(Iyy_k, 1e-10),
+                  invMass / max(Ixx_k, 1e-10));
+}
 
 // Shape-aware inverse inertia for a body.
 static float3 cdBodyInvInertia(CoinBody c, float invMass) {
     if (cdIsBox(c)) return cdBoxInvInertia(c.shapeExtents.xyz, invMass);
+    if (cdIsCapsule(c)) return cdCapsuleInvInertia(cdCapsuleR(c), cdCapsuleHL(c), invMass);
     if (cdIsSphere(c)) {
         // Solid sphere: I = (2/5) m R², isotropic ⇒ I⁻¹ = invMass / (0.4 R²) on every axis.
         float R = c.prevPos.w > 1e-4 ? c.prevPos.w : 0.12;
@@ -277,6 +329,65 @@ static float cdScaleOf(CoinBody c) { return c.prevPos.w > 0.01 ? c.prevPos.w : 1
 // a body was spawned before the dims were set.
 static float cdRadiusOf(CoinBody c)    { return c.prevPos.w > 1e-4 ? c.prevPos.w : 0.12; }
 static float cdHalfThickOf(CoinBody c) { return c.vel.w     > 1e-5 ? c.vel.w     : 0.009; }
+
+// ── Segment / closest-point helpers (capsule narrowphase) ─────────────────────
+
+// Closest point on segment [a,b] to point p.
+static float3 cdClosestOnSegment(float3 a, float3 b, float3 p) {
+    float3 ab = b - a;
+    float t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-12), 0.0, 1.0);
+    return a + t * ab;
+}
+
+// Closest points between segments [p1,q1] / [p2,q2] (Ericson, RTCD §5.1.9).
+static void cdClosestSegSeg(float3 p1, float3 q1, float3 p2, float3 q2,
+                            thread float3& c1, thread float3& c2) {
+    float3 d1 = q1 - p1, d2 = q2 - p2, r = p1 - p2;
+    float a = dot(d1, d1), e = dot(d2, d2), f = dot(d2, r);
+    float s = 0.0, t = 0.0;
+    if (a <= 1e-12 && e <= 1e-12) { c1 = p1; c2 = p2; return; }
+    if (a <= 1e-12) {
+        t = clamp(f / e, 0.0, 1.0);
+    } else {
+        float c = dot(d1, r);
+        if (e <= 1e-12) {
+            s = clamp(-c / a, 0.0, 1.0);
+        } else {
+            float b = dot(d1, d2);
+            float denom = a * e - b * b;
+            s = (denom > 1e-12) ? clamp((b * f - c * e) / denom, 0.0, 1.0) : 0.0;
+            t = (b * s + f) / e;
+            if (t < 0.0)      { t = 0.0; s = clamp(-c / a, 0.0, 1.0); }
+            else if (t > 1.0) { t = 1.0; s = clamp((b - c) / a, 0.0, 1.0); }
+        }
+    }
+    c1 = p1 + d1 * s;
+    c2 = p2 + d2 * t;
+}
+
+// Closest point ON-or-inside shape O's solid volume to the O-local point `lp`
+// (box: AABB clamp; disc: radial+axial clamp on the capped cylinder). The shared
+// core of every "sphere-probe vs shape" contact (sphere bodies, capsule probe
+// centres). For a point INSIDE the shape this returns `lp` itself — callers
+// needing an interior push-out use the SDF/box-push routines instead.
+static float3 cdClosestInShapeLocal(CoinBody O, float3 lp) {
+    if (cdIsBox(O)) {
+        float3 heO = O.shapeExtents.xyz;
+        return clamp(lp, -heO, heO);
+    }
+    float Ro = cdRadiusOf(O), hO = cdHalfThickOf(O);
+    float radial = length(lp.xz);
+    float2 rd = radial > 1e-6 ? lp.xz / radial : float2(1, 0);
+    return float3(rd.x * min(radial, Ro), clamp(lp.y, -hO, hO), rd.y * min(radial, Ro));
+}
+
+// A capsule's world-space segment endpoints (axis = local +Y, half-length hl).
+static void cdCapsuleSegment(CoinBody c, thread float3& a, thread float3& b) {
+    float3 ax = cdQuatRotate(c.orient, float3(0, cdCapsuleHL(c), 0));
+    a = c.posInvMass.xyz - ax;
+    b = c.posInvMass.xyz + ax;
+}
+
 
 // ── KERNEL: integrate (predict COM + advance orientation) ─────────────────────
 
@@ -1360,10 +1471,10 @@ kernel void coinMeasurePenetration(
                 // Sphere-involved pair: the EXACT contact the constraint-path
                 // narrowphase (coinGenerateContacts) de-penetrates with — sphere↔sphere
                 // is centre distance; sphere↔box clamps the centre to the box, sphere↔disc
-                // clamps to the capped cylinder. (The old code used the box's *bounding
-                // sphere* here, which matched only the legacy Jacobi solver and grossly
-                // over-reported a sphere resting beside a box — a false positive for any
-                // constraint-path scene.)
+                // clamps to the capped cylinder, sphere↔capsule clamps to the segment.
+                // (The old code used the box's *bounding sphere* here, which matched only
+                // the legacy Jacobi solver and grossly over-reported a sphere resting
+                // beside a box — a false positive for any constraint-path scene.)
                 bool iSphere = cdIsSphere(ci);
                 float3 cs = iSphere ? xi : xj;  float rs = iSphere ? Ri : Rj;
                 float3 co = iSphere ? xj : xi;  float4 qo = iSphere ? qj : qi;
@@ -1373,15 +1484,52 @@ kernel void coinMeasurePenetration(
                 } else {
                     float3 lp = cdQuatRotateInv(qo, cs - co);
                     float3 closestLocal;
-                    if (cdIsBox(O)) {
-                        closestLocal = clamp(lp, -cdBodyHalfExtents(O), cdBodyHalfExtents(O));
+                    float extraR = 0.0;
+                    if (cdIsCapsule(O)) {
+                        float hlO = cdCapsuleHL(O);
+                        closestLocal = float3(0.0, clamp(lp.y, -hlO, hlO), 0.0);
+                        extraR = cdCapsuleR(O);
                     } else {
-                        float Ro = cdRadiusOf(O), hO = cdHalfThickOf(O);
-                        float radial = length(lp.xz);
-                        float2 rd = radial > 1e-6 ? lp.xz / radial : float2(1, 0);
-                        closestLocal = float3(rd.x * min(radial, Ro), clamp(lp.y, -hO, hO), rd.y * min(radial, Ro));
+                        closestLocal = cdClosestInShapeLocal(O, lp);
                     }
-                    minDepth = rs - length(lp - closestLocal);
+                    minDepth = rs + extraR - length(lp - closestLocal);
+                }
+                if (minDepth <= 0.0) separated = true;
+            } else if (cdIsCapsule(ci) || cdIsCapsule(cj)) {
+                // Capsule-involved pair — the same probe math the constraint
+                // narrowphase de-penetrates with (bounding-cylinder SAT here would
+                // over-report a capsule resting beside anything: a false positive).
+                if (cdIsCapsule(ci) && cdIsCapsule(cj)) {
+                    float3 a0, a1, b0, b1;
+                    cdCapsuleSegment(ci, a0, a1);
+                    cdCapsuleSegment(cj, b0, b1);
+                    float3 c1, c2; cdClosestSegSeg(a0, a1, b0, b1, c1, c2);
+                    minDepth = (cdCapsuleR(ci) + cdCapsuleR(cj)) - length(c1 - c2);
+                } else {
+                    bool iCap = cdIsCapsule(ci);
+                    CoinBody C = iCap ? ci : cj;
+                    CoinBody O = iCap ? cj : ci;
+                    float rc = cdCapsuleR(C);
+                    float3 s0, s1; cdCapsuleSegment(C, s0, s1);
+                    float3 co2 = O.posInvMass.xyz; float4 qo2 = O.orient;
+                    minDepth = -1e30;
+                    for (int p = 0; p < 3; ++p) {
+                        float3 s = mix(s0, s1, float(p) * 0.5);
+                        float3 lp = cdQuatRotateInv(qo2, s - co2);
+                        float3 cl = cdClosestInShapeLocal(O, lp);
+                        float dl = length(lp - cl);
+                        float pen;
+                        if (dl > 1e-6) {
+                            pen = rc - dl;
+                        } else if (cdIsBox(O)) {
+                            float3 dd = cdBodyHalfExtents(O) - abs(lp);
+                            pen = min(dd.x, min(dd.y, dd.z)) + rc;
+                        } else {
+                            float3 nL;
+                            pen = -cdCappedCylSDF(lp, cdRadiusOf(O), cdHalfThickOf(O), nL) + rc;
+                        }
+                        minDepth = max(minDepth, pen);
+                    }
                 }
                 if (minDepth <= 0.0) separated = true;
             } else if (cdIsBox(ci) || cdIsBox(cj)) {
@@ -1457,6 +1605,7 @@ static void cdEmitContact(device CoinContact* contacts,
     c.rB   = float4((b == CD_STATIC) ? float3(0.0) : (cp - xb), 0.0);
     c.tan1 = float4(t1, 0.0);
     c.tan2 = float4(t2, -1.0);                       // colour = −1 (uncoloured)
+    c.aux  = float4(0.0);                            // vn₀ captured by the first solve pass
     contacts[slot] = c;
 }
 
@@ -1527,21 +1676,90 @@ kernel void coinGenerateContacts(
                 CoinBody O = iSphere ? cj : ci;
                 float3 lp = cdQuatRotateInv(qo, cs - co);
                 float3 closestLocal;
-                if (cdIsBox(O)) {
-                    closestLocal = clamp(lp, -cdBodyHalfExtents(O), cdBodyHalfExtents(O));
+                float extraR = 0.0;      // the other shape's own surface radius (capsule)
+                if (cdIsCapsule(O)) {
+                    // Sphere ↔ capsule: closest point on the capsule's SEGMENT, then
+                    // the capsule's radius joins the sphere's in the gap test.
+                    float hlO = cdCapsuleHL(O);
+                    closestLocal = float3(0.0, clamp(lp.y, -hlO, hlO), 0.0);
+                    extraR = cdCapsuleR(O);
                 } else {
-                    float Ro = cdRadiusOf(O), hO = cdHalfThickOf(O);
-                    float radial = length(lp.xz);
-                    float2 rd = radial > 1e-6 ? lp.xz / radial : float2(1, 0);
-                    closestLocal = float3(rd.x * min(radial, Ro), clamp(lp.y, -hO, hO), rd.y * min(radial, Ro));
+                    closestLocal = cdClosestInShapeLocal(O, lp);
                 }
                 float3 deltaLocal = lp - closestLocal;
-                float dist = length(deltaLocal), pen = rs - dist;
+                float dist = length(deltaLocal), pen = rs + extraR - dist;
                 if (pen > 0.0 && dist > 1e-6) {
                     float3 nOut = cdQuatRotate(qo, deltaLocal / dist);   // out of shape toward sphere
-                    float3 cp   = co + cdQuatRotate(qo, closestLocal);
+                    float3 cp   = co + cdQuatRotate(qo, closestLocal) + extraR * nOut;
                     float3 nBtoA = iSphere ? nOut : -nOut;               // from j(B) toward i(A)
                     cdEmitContact(contacts, contactCount, maxContacts, id, j, 0u, 0u, nBtoA, cp, xi, xj, pen);
+                }
+                continue;
+            }
+
+            // ── Capsule-involved pair (constraint path gets the EXACT capsule) ──
+            // A capsule is a segment + radius, so every contact reduces to sphere
+            // probes: the true seg-seg closest pair plus the two END probes for the
+            // parallel-rest manifold (capsule↔capsule), or 3 probe centres along
+            // the segment vs the other shape's closest-point map (capsule↔box/disc).
+            if (cdIsCapsule(ci) || cdIsCapsule(cj)) {
+                if (cdIsCapsule(ci) && cdIsCapsule(cj)) {
+                    float rI = cdCapsuleR(ci), rJ = cdCapsuleR(cj);
+                    float3 a0, a1, b0, b1;
+                    cdCapsuleSegment(ci, a0, a1);
+                    cdCapsuleSegment(cj, b0, b1);
+                    float3 cps[3]; float3 cqs[3];
+                    float3 c1, c2; cdClosestSegSeg(a0, a1, b0, b1, c1, c2);
+                    cps[0] = c1; cqs[0] = c2;                              // true closest pair
+                    cps[1] = a0; cqs[1] = cdClosestOnSegment(b0, b1, a0);  // end probes: the
+                    cps[2] = a1; cqs[2] = cdClosestOnSegment(b0, b1, a1);  // parallel-rest manifold
+                    for (int k = 0; k < 3; ++k) {
+                        if (k > 0 && length(cps[k] - cps[0]) < 0.5 * rI) continue;   // dedupe vs main
+                        float3 dS = cps[k] - cqs[k];
+                        float dl = length(dS);
+                        float pen = rI + rJ - dl;
+                        if (pen > 0.0 && dl > 1e-6) {
+                            float3 n = dS / dl;                            // out of j, toward i
+                            float3 cp = 0.5 * ((cps[k] - n * rI) + (cqs[k] + n * rJ));
+                            cdEmitContact(contacts, contactCount, maxContacts, id, j, uint(k), 0u, n, cp, xi, xj, pen);
+                        }
+                    }
+                    continue;
+                }
+                bool iCap = cdIsCapsule(ci);
+                CoinBody C = iCap ? ci : cj;      // the capsule
+                CoinBody O = iCap ? cj : ci;      // the box / disc
+                float rc = cdCapsuleR(C);
+                float3 s0, s1; cdCapsuleSegment(C, s0, s1);
+                float3 co = O.posInvMass.xyz; float4 qo = O.orient;
+                for (int k = 0; k < 3; ++k) {
+                    float3 s = mix(s0, s1, float(k) * 0.5);          // end, mid, end
+                    float3 lp = cdQuatRotateInv(qo, s - co);
+                    float3 cl = cdClosestInShapeLocal(O, lp);
+                    float3 dL = lp - cl;
+                    float dl = length(dL);
+                    float3 nOut, cp; float pen;
+                    if (dl > 1e-6) {
+                        pen = rc - dl;
+                        if (pen <= 0.0) continue;
+                        nOut = cdQuatRotate(qo, dL / dl);            // out of O, toward the probe
+                        cp = co + cdQuatRotate(qo, cl);
+                    } else {
+                        // Probe centre INSIDE the shape: push out along the nearest
+                        // face (box) / SDF gradient (disc); the depth gains rc.
+                        float d2; float3 n2;
+                        if (cdIsBox(O)) {
+                            if (!cdOrientedBoxPush(s, co, qo, O.shapeExtents.xyz, n2, d2)) continue;
+                        } else {
+                            float3 nL;
+                            float sd = cdCappedCylSDF(lp, cdRadiusOf(O), cdHalfThickOf(O), nL);
+                            if (sd >= 0.0) continue;
+                            n2 = cdQuatRotate(qo, nL); d2 = -sd;
+                        }
+                        nOut = n2; pen = d2 + rc; cp = s;
+                    }
+                    float3 nBtoA = iCap ? nOut : -nOut;              // toward A (thread's body i)
+                    cdEmitContact(contacts, contactCount, maxContacts, id, j, uint(k), 0u, nBtoA, cp, xi, xj, pen);
                 }
                 continue;
             }
@@ -1595,6 +1813,17 @@ kernel void coinGenerateContacts(
     }
 
     // ── Static / kinematic colliders (planes, boxes, pusher) ──────────────────
+    // A CAPSULE resolves against every static as sphere probes at 3 segment
+    // stations (both ends + mid, radius r) — the exact round-cap surface, not the
+    // bounding cylinder's hard rim (which is what the generic feature-point path
+    // would test). Probes are precomputed once here.
+    bool iCapsule = cdIsCapsule(ci);
+    float capR = iCapsule ? cdCapsuleR(ci) : 0.0;
+    float3 capP[3];
+    if (iCapsule) {
+        float3 s0, s1; cdCapsuleSegment(ci, s0, s1);
+        capP[0] = s0; capP[1] = 0.5 * (s0 + s1); capP[2] = s1;
+    }
     for (uint k = 0u; k < u.colliderCount; ++k) {
         CoinStaticCollider col = colliders[k];
         uint kind = as_type<uint>(col.a.w);
@@ -1603,6 +1832,13 @@ kernel void coinGenerateContacts(
             if (cdIsSphere(ci)) {
                 float pen = (d + Ri) - dot(n, xi);
                 if (pen > 0.0) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, 0u, k, n, xi - Ri*n, xi, xi, pen);
+            } else if (iCapsule) {
+                // Both END probes (skip mid: coplanar with the ends, adds nothing) —
+                // the 2-point manifold that holds a side-lying capsule level.
+                for (int p = 0; p < 3; p += 2) {
+                    float pen = (d + capR) - dot(n, capP[p]);
+                    if (pen > 0.0) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, capP[p] - capR*n, xi, xi, pen);
+                }
             } else {
                 for (int p = 0; p < CD_NPTS; ++p) {
                     float pen = d - dot(n, fp[p]);
@@ -1612,6 +1848,29 @@ kernel void coinGenerateContacts(
         } else if (kind == 1u) {                         // axis-aligned box
             float3 ctr = col.a.xyz, he = col.b.xyz;
             bool oneWay = (col.meta.x & 1u) != 0u;
+            if (iCapsule) {
+                for (int p = 0; p < 3; ++p) {
+                    float3 lp = capP[p] - ctr;
+                    float3 cl = clamp(lp, -he, he);
+                    float3 dL = lp - cl;
+                    float dl = length(dL);
+                    float3 n; float pen; float3 cp;
+                    if (dl > 1e-6) {
+                        pen = capR - dl;
+                        if (pen <= 0.0) continue;
+                        n = dL / dl; cp = ctr + cl;
+                    } else {                              // probe centre inside the box
+                        float3 dist = he - abs(lp); float push;
+                        if (dist.x < dist.y && dist.x < dist.z) { n = float3(sign(lp.x),0,0); push = dist.x; }
+                        else if (dist.y < dist.z)               { n = float3(0,sign(lp.y),0); push = dist.y; }
+                        else                                    { n = float3(0,0,sign(lp.z)); push = dist.z; }
+                        pen = push + capR; cp = capP[p];
+                    }
+                    if (oneWay && n.y < 0.5) continue;
+                    cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, cp, xi, xi, pen);
+                }
+                continue;
+            }
             for (int p = 0; p < CD_NPTS; ++p) {
                 float3 pw = fp[p], dd = pw - ctr;
                 if (abs(dd.x) >= he.x || abs(dd.y) >= he.y || abs(dd.z) >= he.z) continue;
@@ -1648,6 +1907,28 @@ kernel void coinGenerateContacts(
                     float3 n = cdQuatRotate(q, nL);
                     cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, 0u, k, n, xi - Ri*n, xi, xi, pen);
                 }
+            } else if (iCapsule) {
+                // Capsule vs OBB: the 3 segment probes in the box's local frame.
+                for (int p = 0; p < 3; ++p) {
+                    float3 lp = cdQuatRotateInv(q, capP[p] - ctr);
+                    float3 cl = clamp(lp, -he, he);
+                    float3 dL = lp - cl;
+                    float dl = length(dL);
+                    float3 nL; float pen; float3 cp;
+                    if (dl > 1e-6) {
+                        pen = capR - dl;
+                        if (pen <= 0.0) continue;
+                        nL = dL / dl; cp = ctr + cdQuatRotate(q, cl);
+                    } else {
+                        float3 dd = he - abs(lp); float push;
+                        if (dd.x < dd.y && dd.x < dd.z) { nL = float3(sign(lp.x),0,0); push = dd.x; }
+                        else if (dd.y < dd.z)           { nL = float3(0,sign(lp.y),0); push = dd.y; }
+                        else                            { nL = float3(0,0,sign(lp.z)); push = dd.z; }
+                        pen = push + capR; cp = capP[p];
+                    }
+                    float3 n = cdQuatRotate(q, nL);
+                    cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, cp, xi, xi, pen);
+                }
             } else {
                 for (int p = 0; p < CD_NPTS; ++p) {
                     float3 lp = cdQuatRotateInv(q, fp[p] - ctr);
@@ -1661,25 +1942,29 @@ kernel void coinGenerateContacts(
                     cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, fp[p], xi, xi, push);
                 }
             }
-        } else if (kind == 4u && cdIsSphere(ci)) {       // cylinder segment (pipe / half-pipe)
+        } else if (kind == 4u && (cdIsSphere(ci) || iCapsule)) {   // cylinder segment (pipe / half-pipe)
             // a.xyz = axis centre, b.xyz = axis dir (unit), b.w = radius R,
             // vel.xyz = "up" dir, vel.w = half-length, meta.x bit0 = lower-half only.
+            // A sphere is one probe (its centre); a capsule is its 3 segment probes.
             float3 ctr = col.a.xyz, ax = col.b.xyz, up = col.vel.xyz;
             float R = col.b.w, halfLen = col.vel.w;
             bool lowerOnly = (col.meta.x & 1u) != 0u;
-            float3 d = xi - ctr;
-            float along = dot(d, ax);
-            if (along >= -halfLen && along <= halfLen) {   // within this segment's length
+            int nProbes = iCapsule ? 3 : 1;
+            for (int p = 0; p < nProbes; ++p) {
+                float3 s  = iCapsule ? capP[p] : xi;
+                float  rs = iCapsule ? capR    : Ri;
+                float3 d = s - ctr;
+                float along = dot(d, ax);
+                if (along < -halfLen || along > halfLen) continue;   // outside this segment's length
                 float3 radial = d - ax * along;
                 float dr = length(radial);
-                if (dr > 1e-5 && dr < R) {                 // ONLY when the centre is INSIDE the tube
-                    float3 rn = radial / dr;                // outward from axis
-                    bool active = !lowerOnly || dot(rn, up) < 0.05;   // half-pipe: lower hemisphere
-                    float pen = (dr + Ri) - R;             // marble surface vs inner wall (>0 ⇒ touching)
-                    if (active && pen > 0.0) {
-                        float3 n = -rn;                     // push toward the axis
-                        cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, 0u, k, n, xi + rn * Ri, xi, xi, pen);
-                    }
+                if (dr <= 1e-5 || dr >= R) continue;       // ONLY when the centre is INSIDE the tube
+                float3 rn = radial / dr;                    // outward from axis
+                bool active = !lowerOnly || dot(rn, up) < 0.05;   // half-pipe: lower hemisphere
+                float pen = (dr + rs) - R;                  // surface vs inner wall (>0 ⇒ touching)
+                if (active && pen > 0.0) {
+                    float3 n = -rn;                         // push toward the axis
+                    cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, s + rn * rs, xi, xi, pen);
                 }
             }
         }
@@ -1862,6 +2147,7 @@ kernel void coinSolveVelocityColor(
     constant CoinUniforms&    u            [[ buffer(4) ]],
     constant uint&            currentColor [[ buffer(5) ]],
     device const uint*        asleep       [[ buffer(6) ]],
+    device const float2*      material     [[ buffer(7) ]],   // per-body (μ, e); <0 = inherit
     uint cid [[ thread_position_in_grid ]])
 {
     uint ncon = atomic_load_explicit(&contactCount, memory_order_relaxed);
@@ -1912,10 +2198,27 @@ kernel void coinSolveVelocityColor(
     float3 vrel = vpA - vpB;
     float vn = dot(vrel, n);                       // <0 = closing along the normal
 
+    // ── Per-contact material: combine the two bodies' (μ, e). A static side
+    // MIRRORS the body's own material (colliders carry none), so a per-body μ/e
+    // override behaves the same against the floor as against a like neighbour —
+    // and the all-defaults case still reduces exactly to the global uniforms.
+    float muA = cdBodyMu(material, A, u);
+    float eA  = cdBodyE(material, A, u);
+    float muB = bStatic ? muA : cdBodyMu(material, B, u);
+    float eB  = bStatic ? eA  : cdBodyE(material, B, u);
+    float muC = sqrt(max(muA * muB, 0.0));      // geometric mean (Box2D convention)
+    float eC  = max(eA, eB);                    // bounciest material wins
+
     // ── REAL normal impulse (restitution only above the threshold) ────────────
-    float restE = (vn < -u.restThreshold) ? cdEffectiveCOR(u, -vn) : 0.0;
+    // The restitution target is anchored to the PRE-SOLVE approach speed vn₀,
+    // captured once on this contact's first solve pass — every later iteration
+    // then drives toward the same −e·vn₀ instead of re-deriving it from the
+    // already-reflected current velocity (which zeroed the bounce).
+    if (c.aux.w < 0.5) { c.aux.x = vn; c.aux.w = 1.0; }
+    float vn0 = c.aux.x;
+    float restE = (vn0 < -u.restThreshold) ? cdEffectiveCORBase(u, eC, -vn0) : 0.0;
     float jnOld = c.rA.w;
-    float dJn = -(vn + restE * vn) / kN;           // drive vn → −e·vn
+    float dJn = -(vn + restE * vn0) / kN;          // drive vn → −e·vn₀
     float jnNew = max(jnOld + dJn, 0.0);           // accumulated, non-adhesive
     dJn = jnNew - jnOld;
     float3 Pn = dJn * n;
@@ -1936,7 +2239,7 @@ kernel void coinSolveVelocityColor(
     if (!bStatic) { bvB -= invMb * Pb; bwB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, Pb)); }
 
     // ── Two-axis Coulomb friction (accumulated jt1→rB.w, jt2→tan1.w; |jt|≤μ·jn) ─
-    float mu = u.frictionCoeff;
+    float mu = muC;
     if (mu > 0.0) {
         float kT1 = invMa + invMb + dot(raXn1, cdApplyInvInertiaWorld(qa, invIa, raXn1))
                   + (bStatic ? 0.0 : dot(rbXn1, cdApplyInvInertiaWorld(qb, invIb, rbXn1)));
@@ -2099,9 +2402,15 @@ kernel void coinFinalizeCS(
     if (asleep[id] != 0u) { coins[id].vel.xyz = float3(0.0); coins[id].angVel.xyz = float3(0.0); return; }
     float3 v = c.vel.xyz, w = c.angVel.xyz;
 
-    // Hard safety floor (a fast body that outran a substep).
+    // Hard safety floor (a fast body that outran a substep). Half the min extent
+    // for EVERY shape — deliberately BELOW rest height. The constraint path
+    // generates contacts from the PREVIOUS substep's end state, so a backstop AT
+    // rest height (the old sphere special case, floorY + R) dead-stopped a falling
+    // sphere before a floor contact could ever exist: the plane contact — and with
+    // it restitution — never fired, and every ball landed dead. At half-extent the
+    // backstop only catches true tunnelers; the contact solve owns the landing.
     float floorH = min(cdRadiusOf(c), cdHalfThickOf(c));
-    float restY = cdIsSphere(c) ? cdRadiusOf(c) : floorH * 0.5;
+    float restY = floorH * 0.5;
     float3 x = c.posInvMass.xyz;
     if (x.y < u.floorY + restY) { x.y = u.floorY + restY; if (v.y < 0.0) v.y = 0.0; }
     coins[id].posInvMass.xyz = x;
@@ -2234,6 +2543,12 @@ static float3 cdSupport(CoinBody c, float3 d) {
     float4 q = c.orient;
     float3 dl = cdQuatRotateInv(q, d);     // direction in body-local frame
     float3 pl;
+    if (cdIsCapsule(c)) {
+        // Segment end nearest the direction, plus the radius along d.
+        float hl = cdCapsuleHL(c), r = cdCapsuleR(c);
+        return ctr + cdQuatRotate(q, float3(0.0, dl.y >= 0.0 ? hl : -hl, 0.0))
+                   + r * normalize(d);
+    }
     if (cdIsBox(c)) {
         float3 he = cdBodyHalfExtents(c);
         pl = float3(dl.x >= 0.0 ? he.x : -he.x, dl.y >= 0.0 ? he.y : -he.y, dl.z >= 0.0 ? he.z : -he.z);

@@ -157,7 +157,7 @@ public struct CoinTransform {
 }
 
 // One contact-constraint (a manifold point) — the constraint solver's currency.
-// 96 bytes (6 × {u,f}16). Mirrors `CoinContact` in CoinDEM.metal exactly.
+// 112 bytes (7 × {u,f}16). Mirrors `CoinContact` in CoinDEM.metal exactly.
 public struct CoinContact {
     public var meta: SIMD4<UInt32>   // x=A, y=B (0xFFFFFFFF=static), z=collider|feature, w=pairKey
     public var nrm:  SIMD4<Float>    // xyz=normal (B→A), w=depth
@@ -165,6 +165,7 @@ public struct CoinContact {
     public var rB:   SIMD4<Float>    // xyz=cp−comB, w=tangent1Impulse
     public var tan1: SIMD4<Float>    // xyz=tangent1, w=tangent2Impulse
     public var tan2: SIMD4<Float>    // xyz=tangent2, w=colour
+    public var aux:  SIMD4<Float>    // x=pre-solve approach vn₀ (restitution target), w=captured flag
 }
 
 // Per-substep uniforms. Scalars only (no float3) — alignment-safe. 132 bytes (33 × 4).
@@ -260,6 +261,12 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// none), y = which of this body's ends joins (±1 → ±Y). Drives `coinJointSolve`
     /// so a frankfurter's two segments bend at their joint. Default (−1, 0).
     private let linkBuffer: MTLBuffer
+    /// Per-body material (SIMD2<Float> per slot): x = Coulomb friction μ, y =
+    /// restitution e. A NEGATIVE lane means "inherit the global uniform"
+    /// (`frictionCoeff` / `restitution`) — the default, so untouched scenes are
+    /// unchanged. Constraint path only; combined per contact as μ=√(μA·μB),
+    /// e=max(eA,eB). Set at spawn (`friction:`/`restitution:`) or via `setMaterial`.
+    public let materialBuffer: MTLBuffer
     private let colliderBuffer: SimBuffer<CoinStaticCollider>
     private let coinDeltaBuffer: MTLBuffer         // private — per-coin Jacobi delta
     private let cellCounts: MTLBuffer              // private
@@ -583,6 +590,8 @@ public final class CoinDEMSolver: PenetrationProbing {
                                        options: .storageModeShared),
             let linkB = dev.makeBuffer(length: MemoryLayout<SIMD2<Int32>>.stride * maxCoins,
                                        options: .storageModeShared),
+            let matB = dev.makeBuffer(length: MemoryLayout<SIMD2<Float>>.stride * maxCoins,
+                                      options: .storageModeShared),
             let uni = dev.makeBuffer(length: MemoryLayout<CoinUniforms>.stride,
                                      options: .storageModeShared),
             let penResult = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * 2,
@@ -662,6 +671,8 @@ public final class CoinDEMSolver: PenetrationProbing {
         self.transformBuffer = xform
         self.bodyTypeBuffer = btype
         self.linkBuffer = linkB
+        matB.label = "Coin.material"
+        self.materialBuffer = matB
         self.colliderBuffer = cols
         self.coinDeltaBuffer = delta
         self.cellCounts = counts
@@ -714,9 +725,20 @@ public final class CoinDEMSolver: PenetrationProbing {
 
         // Park every slot off-screen so unused instances are invisible from frame 0,
         // and clear every articulation link (no joints until a frank is spawned).
+        // Materials start at (−1, −1) = inherit the global friction/restitution.
         let ptr = coins.buffer.contents().bindMemory(to: CoinBody.self, capacity: maxCoins)
         let lptr = linkB.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)
-        for i in 0..<maxCoins { ptr[i] = .inactive; lptr[i] = SIMD2(-1, 0) }
+        let mptr = matB.contents().bindMemory(to: SIMD2<Float>.self, capacity: maxCoins)
+        for i in 0..<maxCoins { ptr[i] = .inactive; lptr[i] = SIMD2(-1, 0); mptr[i] = SIMD2(-1, -1) }
+    }
+
+    /// Set (or clear) a body's material override. A negative component inherits the
+    /// solver-wide `frictionCoeff` / `restitution`. Constraint path only; combined
+    /// per contact as μ=√(μA·μB), e=max(eA,eB).
+    public func setMaterial(_ slot: Int, friction: Float?, restitution: Float?) {
+        guard slot >= 0, slot < maxCoins else { return }
+        let m = materialBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: maxCoins)
+        m[slot] = SIMD2(friction ?? -1, restitution ?? -1)
     }
 
     /// Articulate two slots: `slot`'s `mySign` end (±1 → ±Y) joins its partner's
@@ -757,6 +779,8 @@ public final class CoinDEMSolver: PenetrationProbing {
                       radius: Float? = nil,
                       halfThickness: Float? = nil,
                       mass: Float = 1,
+                      friction: Float? = nil,
+                      restitution: Float? = nil,
                       type: UInt32 = 0) -> Int? {
         // `spin` is folded into the initial angular velocity about the body's own
         // axis; `tumble` is the world-frame initial angular velocity.
@@ -782,6 +806,7 @@ public final class CoinDEMSolver: PenetrationProbing {
         // Per-body collision dimensions: radius → prevPos.w, halfThickness → vel.w.
         ptr[slot].prevPos.w = radius ?? coinRadius
         ptr[slot].vel.w     = halfThickness ?? self.halfThickness
+        setMaterial(slot, friction: friction, restitution: restitution)
         bodyTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = type
         // A freshly-spawned body has no joint until setLink wires one (it may be
         // reusing a slot whose previous link wasn't cleared).
@@ -807,6 +832,8 @@ public final class CoinDEMSolver: PenetrationProbing {
                          orient: SIMD4<Float> = SIMD4(0, 0, 0, 1),
                          tumble: SIMD3<Float> = .zero,
                          mass: Float = 1,
+                         friction: Float? = nil,
+                         restitution: Float? = nil,
                          type: UInt32 = 0) -> Int? {
         let slot: Int
         if let reused = freeSlots.popLast() {
@@ -825,6 +852,7 @@ public final class CoinDEMSolver: PenetrationProbing {
         // rides vel.w (the floor-safety / per-apply-clamp scale, like a disc's halfThick).
         ptr[slot].prevPos.w = simd_length(halfExtents)
         ptr[slot].vel.w     = min(halfExtents.x, min(halfExtents.y, halfExtents.z))
+        setMaterial(slot, friction: friction, restitution: restitution)
         bodyTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = type
         linkBuffer.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)[slot] = SIMD2(-1, 0)
         // A reused slot must not inherit the previous body's sleep state, or a fresh
@@ -848,6 +876,8 @@ public final class CoinDEMSolver: PenetrationProbing {
                             orient: SIMD4<Float> = SIMD4(0, 0, 0, 1),
                             tumble: SIMD3<Float> = .zero,
                             mass: Float = 1,
+                            friction: Float? = nil,
+                            restitution: Float? = nil,
                             type: UInt32 = 0) -> Int? {
         let slot: Int
         if let reused = freeSlots.popLast() {
@@ -866,10 +896,58 @@ public final class CoinDEMSolver: PenetrationProbing {
         // (the per-apply / floor-safety min-extent), so a sphere reads R uniformly.
         ptr[slot].prevPos.w = radius
         ptr[slot].vel.w     = radius
+        setMaterial(slot, friction: friction, restitution: restitution)
         bodyTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = type
         linkBuffer.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)[slot] = SIMD2(-1, 0)
         // A reused slot must not inherit the previous body's sleep state, or a fresh
         // body could spawn frozen mid-air while the rest of the pile is asleep.
+        asleepBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
+        sleepTimerBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
+        highWater = max(highWater, slot + 1)
+        return slot
+    }
+
+    /// Activate a CAPSULE body (cross-section `radius`, segment half-length
+    /// `halfLength` — cap centres at ±halfLength along local +Y, so the full
+    /// height is 2·(halfLength + radius)). On the constraint path a capsule
+    /// collides EXACTLY (segment + radius probes: smooth round caps, a 2-point
+    /// manifold when lying on its side); on the legacy path it degrades to its
+    /// bounding capped cylinder (the historical frank approximation). The
+    /// broadphase cell is sized off the solver's construction dims, so construct
+    /// with `halfThickness ≥ halfLength + radius` when spawning capsules.
+    @discardableResult
+    public func spawnCapsule(at position: SIMD3<Float>,
+                             radius: Float,
+                             halfLength: Float,
+                             velocity: SIMD3<Float> = .zero,
+                             orient: SIMD4<Float> = SIMD4(0, 0, 0, 1),
+                             tumble: SIMD3<Float> = .zero,
+                             mass: Float = 1,
+                             friction: Float? = nil,
+                             restitution: Float? = nil,
+                             type: UInt32 = 0) -> Int? {
+        let slot: Int
+        if let reused = freeSlots.popLast() {
+            slot = reused
+        } else if nextSlot < maxCoins {
+            slot = nextSlot; nextSlot += 1
+        } else {
+            return nil
+        }
+        let ptr = coinBuffer.buffer.contents().bindMemory(to: CoinBody.self, capacity: maxCoins)
+        let invMass: Float = mass > 1e-6 ? 1.0 / mass : 1.0
+        ptr[slot] = CoinBody(position: position, invMass: invMass, velocity: velocity,
+                             orient: orient, angVel: tumble,
+                             shapeExtents: SIMD4(halfLength, 0, 0, 3))   // w = 3 → capsule
+        // Disc-compatible lanes: cross-section radius rides prevPos.w, the FULL
+        // half-height (hl + r) rides vel.w — so the legacy capped-cylinder path,
+        // the broadphase reach, and the floor backstop all see the true bounds.
+        ptr[slot].prevPos.w = radius
+        ptr[slot].vel.w     = halfLength + radius
+        setMaterial(slot, friction: friction, restitution: restitution)
+        bodyTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = type
+        linkBuffer.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)[slot] = SIMD2(-1, 0)
+        // A reused slot must not inherit the previous body's sleep state.
         asleepBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
         sleepTimerBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
         highWater = max(highWater, slot + 1)
@@ -1189,6 +1267,7 @@ public final class CoinDEMSolver: PenetrationProbing {
                     enc.setBuffer(self.uniformBuffer, offset: 0, index: 4)
                     enc.setBytes(&cc, length: MemoryLayout<UInt32>.size, index: 5)
                     enc.setBuffer(self.asleepBuffer, offset: 0, index: 6)
+                    enc.setBuffer(self.materialBuffer, offset: 0, index: 7)
                 }
             }
         }
