@@ -39,18 +39,24 @@ public struct CoinBody {
     public var orient:     SIMD4<Float>   // physical orientation quaternion (x,y,z,w)
     public var prevOrient: SIMD4<Float>   // orientation at substep start (for deriving ω)
     public var angVel:     SIMD4<Float>   // xyz = angular velocity (world, rad/s), w = support flag
-    // Shape: w = tag (0 = disc / capped cylinder, the default; 1 = box; 2 = sphere).
-    // For a box, xyz = the three half-extents; for a sphere, x = radius. Appended
-    // last so every existing field keeps its offset — existing kernels and CPU
-    // readbacks are byte-identical for discs.
+    // Shape: w = tag (0 = disc / capped cylinder, the default; 1 = box; 2 =
+    // sphere; 3 = capsule; 4 = convex hull). For a box, xyz = the three
+    // half-extents; sphere, x = radius; capsule, x = segment half-length.
+    // Appended so every existing field keeps its offset — existing kernels and
+    // CPU readbacks are byte-identical for discs.
     public var shapeExtents: SIMD4<Float>
+    // Convex hull only (tag 4): x = registered hull index (as float), yzw = the
+    // per-unit-mass INVERSE inertia diagonal in the hull's principal frame
+    // (I⁻¹ = invMass · yzw). Zero for every other shape.
+    public var hullRef: SIMD4<Float>
 
     public init(position: SIMD3<Float>,
                 invMass: Float = 1.0,
                 velocity: SIMD3<Float> = .zero,
                 orient: SIMD4<Float> = SIMD4(0, 0, 0, 1),
                 angVel: SIMD3<Float> = .zero,
-                shapeExtents: SIMD4<Float> = SIMD4(0, 0, 0, 0)) {
+                shapeExtents: SIMD4<Float> = SIMD4(0, 0, 0, 0),
+                hullRef: SIMD4<Float> = SIMD4(0, 0, 0, 0)) {
         self.posInvMass = SIMD4(position, invMass)
         self.prevPos    = SIMD4(position, 0)
         self.vel        = SIMD4(velocity, 0)
@@ -58,6 +64,7 @@ public struct CoinBody {
         self.prevOrient = orient
         self.angVel     = SIMD4(angVel, 0)
         self.shapeExtents = shapeExtents
+        self.hullRef = hullRef
     }
 
     public static var inactive: CoinBody {
@@ -322,6 +329,26 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// Capacity of `contactBuffer`. A dense mixed pile emits up to ~tens of contacts
     /// per body (box manifolds + statics), so size generously (maxCoins × 64).
     public let maxContacts: Int
+
+    // ── Convex hulls (constraint path) ────────────────────────────────────────
+    /// Registered hull vertices (principal frame, COM at origin), all hulls
+    /// packed into one buffer; per-hull (offset, count) ranges beside it.
+    public let hullVertexBuffer: MTLBuffer      // SIMD4<Float> × maxHullVertices
+    public let hullRangeBuffer: MTLBuffer       // SIMD2<UInt32> × maxHulls
+    public static let maxHulls = 64
+    public static let maxHullVertices = 4096
+    private var registeredHulls: [CoinHullMath.Prepared] = []
+    private var hullVertexCursor = 0
+    /// Frame change applied at registration, returned so callers can express
+    /// their render mesh in the same (principal, COM-origin) frame the solver
+    /// simulates in: stored = principalRotation⁻¹ · (input − comOffset).
+    public struct HullHandle {
+        public let index: Int
+        public let vertices: [SIMD3<Float>]          // the stored principal-frame hull
+        public let comOffset: SIMD3<Float>
+        public let principalRotation: simd_quatf
+        public let boundingRadius: Float
+    }
 
     // ── Generic joints (constraint path) ──────────────────────────────────────
     /// Joint slots (CoinJoint each; meta.w == 0 = disabled/free). Solved serially
@@ -667,7 +694,11 @@ public final class CoinDEMSolver: PenetrationProbing {
             let solveArgs = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * 4, options: .storageModePrivate),
             let solveTG = dev.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared),
             let jointsBuf = dev.makeBuffer(length: MemoryLayout<CoinJoint>.stride * CoinDEMSolver.maxJoints,
-                                           options: .storageModeShared)
+                                           options: .storageModeShared),
+            let hullV = dev.makeBuffer(length: MemoryLayout<SIMD4<Float>>.stride * CoinDEMSolver.maxHullVertices,
+                                       options: .storageModeShared),
+            let hullR = dev.makeBuffer(length: MemoryLayout<SIMD2<UInt32>>.stride * CoinDEMSolver.maxHulls,
+                                       options: .storageModeShared)
         else {
             Self.log.error("Coin buffer allocation failed (cells=\(cellCount))")
             return nil
@@ -761,6 +792,10 @@ public final class CoinDEMSolver: PenetrationProbing {
         self.solveTGSizeBuffer = solveTG
         jointsBuf.label = "Coin.joints"
         self.jointBuffer = jointsBuf
+        hullV.label = "Coin.hullVertices"
+        hullR.label = "Coin.hullRanges"
+        self.hullVertexBuffer = hullV
+        self.hullRangeBuffer = hullR
         solveTG.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = UInt32(CoinDEMSolver.solveTGSize)
         // Persistent + read-during-substep buffers start cleared (all awake, no slow frames).
         sleepTimer.contents().bindMemory(to: UInt32.self, capacity: maxCoins).update(repeating: 0, count: maxCoins)
@@ -999,6 +1034,77 @@ public final class CoinDEMSolver: PenetrationProbing {
         bodyTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = type
         linkBuffer.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)[slot] = SIMD2(-1, 0)
         // A reused slot must not inherit the previous body's sleep state.
+        asleepBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
+        sleepTimerBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
+        highWater = max(highWater, slot + 1)
+        return slot
+    }
+
+    // ── Convex hulls (constraint path) ────────────────────────────────────────
+
+    /// Register a convex shape from a point cloud. Interior points are dropped
+    /// (a real incremental convex hull runs on the CPU, once); the EXACT solid
+    /// COM + inertia are integrated over the hull's boundary, diagonalized, and
+    /// the vertices re-expressed in the principal frame — the returned handle
+    /// carries that frame change so the render mesh can match. nil when the
+    /// input is degenerate or the hull tables are full.
+    public func registerHull(vertices: [SIMD3<Float>]) -> HullHandle? {
+        guard registeredHulls.count < Self.maxHulls,
+              let prep = CoinHullMath.prepare(vertices),
+              prep.vertices.count >= 4,
+              hullVertexCursor + prep.vertices.count <= Self.maxHullVertices else { return nil }
+        let index = registeredHulls.count
+        let vp = hullVertexBuffer.contents().bindMemory(to: SIMD4<Float>.self,
+                                                        capacity: Self.maxHullVertices)
+        for (i, v) in prep.vertices.enumerated() { vp[hullVertexCursor + i] = SIMD4(v, 0) }
+        hullRangeBuffer.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: Self.maxHulls)[index] =
+            SIMD2(UInt32(hullVertexCursor), UInt32(prep.vertices.count))
+        hullVertexCursor += prep.vertices.count
+        registeredHulls.append(prep)
+        return HullHandle(index: index, vertices: prep.vertices,
+                          comOffset: prep.comOffset,
+                          principalRotation: prep.principalRotation,
+                          boundingRadius: prep.boundingRadius)
+    }
+
+    /// Activate a CONVEX HULL body (a shape registered with `registerHull`).
+    /// Constraint path only: hull pairs resolve through live GJK+EPA with a
+    /// clipped support-polygon manifold; statics via the true hull vertices.
+    /// (On the legacy path a hull degrades to a coarse bounding disc — assert.)
+    @discardableResult
+    public func spawnHull(at position: SIMD3<Float>,
+                          hull: HullHandle,
+                          velocity: SIMD3<Float> = .zero,
+                          orient: SIMD4<Float> = SIMD4(0, 0, 0, 1),
+                          tumble: SIMD3<Float> = .zero,
+                          mass: Float = 1,
+                          friction: Float? = nil,
+                          restitution: Float? = nil,
+                          type: UInt32 = 0) -> Int? {
+        assert(solverMode == .constraint,
+               "spawnHull requires solverMode == .constraint (legacy has no hull narrowphase)")
+        guard hull.index >= 0, hull.index < registeredHulls.count else { return nil }
+        let prep = registeredHulls[hull.index]
+        let slot: Int
+        if let reused = freeSlots.popLast() {
+            slot = reused
+        } else if nextSlot < maxCoins {
+            slot = nextSlot; nextSlot += 1
+        } else {
+            return nil
+        }
+        let ptr = coinBuffer.buffer.contents().bindMemory(to: CoinBody.self, capacity: maxCoins)
+        let invMass: Float = mass > 1e-6 ? 1.0 / mass : 1.0
+        ptr[slot] = CoinBody(position: position, invMass: invMass, velocity: velocity,
+                             orient: orient, angVel: tumble,
+                             shapeExtents: SIMD4(0, 0, 0, 4),   // w = 4 → hull
+                             hullRef: SIMD4(Float(hull.index),
+                                            prep.invInertiaK.x, prep.invInertiaK.y, prep.invInertiaK.z))
+        ptr[slot].prevPos.w = prep.boundingRadius
+        ptr[slot].vel.w     = prep.minHalfExtent
+        setMaterial(slot, friction: friction, restitution: restitution)
+        bodyTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = type
+        linkBuffer.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)[slot] = SIMD2(-1, 0)
         asleepBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
         sleepTimerBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
         highWater = max(highWater, slot + 1)
@@ -1599,6 +1705,8 @@ public final class CoinDEMSolver: PenetrationProbing {
             enc.setBuffer(self.linkBuffer, offset: 0, index: 4)
             enc.setBuffer(self.penetrationResult, offset: 0, index: 5)
             enc.setBuffer(self.penetrationThreshold, offset: 0, index: 6)
+            enc.setBuffer(self.hullVertexBuffer, offset: 0, index: 7)
+            enc.setBuffer(self.hullRangeBuffer, offset: 0, index: 8)
         }
         cb.commit()
         cb.waitUntilCompleted()   // gpu-ok: one-shot diagnostic readback, not the per-frame render loop
@@ -1654,6 +1762,8 @@ public final class CoinDEMSolver: PenetrationProbing {
             enc.setBuffer(self.contactBuffer, offset: 0, index: 6)
             enc.setBuffer(self.contactCountBuffer, offset: 0, index: 7)
             enc.setBuffer(self.maxContactsBuffer, offset: 0, index: 8)
+            enc.setBuffer(self.hullVertexBuffer, offset: 0, index: 9)
+            enc.setBuffer(self.hullRangeBuffer, offset: 0, index: 10)
         }
     }
 
@@ -1669,6 +1779,8 @@ public final class CoinDEMSolver: PenetrationProbing {
             enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
             enc.setBytes(&pair, length: MemoryLayout<SIMD2<UInt32>>.size, index: 1)
             enc.setBuffer(res, offset: 0, index: 2)
+            enc.setBuffer(self.hullVertexBuffer, offset: 0, index: 3)
+            enc.setBuffer(self.hullRangeBuffer, offset: 0, index: 4)
         }
         cb.commit(); cb.waitUntilCompleted()  // gpu-ok: one-shot diagnostic probe
         let p = res.contents().bindMemory(to: SIMD4<Float>.self, capacity: 2)

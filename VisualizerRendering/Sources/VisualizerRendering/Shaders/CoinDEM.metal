@@ -69,7 +69,8 @@ struct CoinBody {
     float4 orient;      // current visual+physical orientation quaternion (x,y,z,w)
     float4 prevOrient;  // orientation at substep start (x,y,z,w) — for deriving ω
     float4 angVel;      // xyz = angular velocity (world frame, rad/s),  w = support/rest flag
-    float4 shapeExtents;// w = shape tag (0 = disc/cylinder, 1 = box, 2 = sphere); box: xyz = half-extents, sphere: x = radius
+    float4 shapeExtents;// w = shape tag (0 disc/cylinder, 1 box, 2 sphere, 3 capsule, 4 hull); box: xyz = half-extents, sphere: x = radius, capsule: x = seg half-length
+    float4 hullRef;     // hull only: x = hull index (float), yzw = per-unit-mass INVERSE inertia diag (principal frame)
 };
 
 // Plane:    a.xyz = unit normal, a.w = type tag(0);  b.w = plane offset d  (n·x = d)
@@ -298,6 +299,9 @@ static float3 cdCapsuleInvInertia(float r, float hl, float invMass) {
 static float3 cdBodyInvInertia(CoinBody c, float invMass) {
     if (cdIsBox(c)) return cdBoxInvInertia(c.shapeExtents.xyz, invMass);
     if (cdIsCapsule(c)) return cdCapsuleInvInertia(cdCapsuleR(c), cdCapsuleHL(c), invMass);
+    // Hull: the exact per-unit-mass inverse inertia diag (principal frame) was
+    // integrated over the solid hull at registration and rides hullRef.yzw.
+    if (cdIsHull(c)) return invMass * c.hullRef.yzw;
     if (cdIsSphere(c)) {
         // Solid sphere: I = (2/5) m R², isotropic ⇒ I⁻¹ = invMass / (0.4 R²) on every axis.
         float R = c.prevPos.w > 1e-4 ? c.prevPos.w : 0.12;
@@ -1406,6 +1410,233 @@ kernel void coin_expand_instances(
     outNrm[outIdx] = packed_float3(nWorld);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// CONSTRAINT SOLVER — Stage 6: GJK + EPA general convex narrowphase
+// ══════════════════════════════════════════════════════════════════════════════
+//
+// The general path: any convex pair → GJK (is the Minkowski difference's origin
+// enclosed? = overlap) → EPA (expand the polytope to the origin's closest face =
+// penetration normal + depth). Works for ANY shape with a support function, so it
+// generalizes past the analytic disc/box/sphere routines (e.g. a future arbitrary
+// convex hull). Delivered + verified as the primitive; the analytic manifold path
+// stays the live narrowphase (one GJK/EPA point per pair can't hold a box stack
+// without face-clipping, which is a separate, larger addition).
+
+// Farthest surface point of body `c` along world direction `d` (the support map).
+static float3 cdSupport(CoinBody c, float3 d,
+                        device const float4* hullVerts, device const uint2* hullRanges) {
+    float3 ctr = c.posInvMass.xyz;
+    if (cdIsSphere(c)) return ctr + cdRadiusOf(c) * normalize(d);
+    float4 q = c.orient;
+    float3 dl = cdQuatRotateInv(q, d);     // direction in body-local frame
+    if (cdIsHull(c)) {
+        // Scan the registered principal-frame vertices (≤64; interior points were
+        // dropped at registration, so every scan hit is a true hull vertex).
+        uint2 rng = hullRanges[uint(c.hullRef.x + 0.5)];
+        float best = -1e30; float3 bp = float3(0.0);
+        for (uint i = 0; i < rng.y; ++i) {
+            float3 v = float3(hullVerts[rng.x + i].xyz);
+            float pr = dot(v, dl);
+            if (pr > best) { best = pr; bp = v; }
+        }
+        return ctr + cdQuatRotate(q, bp);
+    }
+    float3 pl;
+    if (cdIsCapsule(c)) {
+        // Segment end nearest the direction, plus the radius along d.
+        float hl = cdCapsuleHL(c), r = cdCapsuleR(c);
+        return ctr + cdQuatRotate(q, float3(0.0, dl.y >= 0.0 ? hl : -hl, 0.0))
+                   + r * normalize(d);
+    }
+    if (cdIsBox(c)) {
+        float3 he = cdBodyHalfExtents(c);
+        pl = float3(dl.x >= 0.0 ? he.x : -he.x, dl.y >= 0.0 ? he.y : -he.y, dl.z >= 0.0 ? he.z : -he.z);
+    } else {                               // capped cylinder, axis +Y
+        float R = cdRadiusOf(c), h = cdHalfThickOf(c);
+        float2 rad = float2(dl.x, dl.z); float rl = length(rad);
+        float2 rdir = rl > 1e-6 ? rad / rl : float2(1.0, 0.0);
+        pl = float3(rdir.x * R, dl.y >= 0.0 ? h : -h, rdir.y * R);
+    }
+    return ctr + cdQuatRotate(q, pl);
+}
+
+// Support point of the Minkowski difference A⊖B along d (and the witness on A).
+static float4 cdCSO(CoinBody ci, CoinBody cj, float3 d,
+                    device const float4* hullVerts, device const uint2* hullRanges) {
+    float3 a = cdSupport(ci, d, hullVerts, hullRanges);
+    return float4(a - cdSupport(cj, -d, hullVerts, hullRanges), 0.0);   // .xyz = CSO point
+}
+
+// Triple product (a×b)×c.
+static float3 cdTriple(float3 a, float3 b, float3 c) { return cross(cross(a, b), c); }
+
+// EXACT penetration depth along unit direction d (defined as: translating body A
+// by depth·d just separates the pair). Two support calls; used to (a) resolve the
+// degenerate-GJK flat/face-face terminations EPA can't seed from, and (b) cross-
+// check EPA's answer against the bodies' own face axes.
+static float cdDepthAlong(CoinBody ci, CoinBody cj, float3 d,
+                          device const float4* hullVerts, device const uint2* hullRanges) {
+    float3 sm = cdCSO(ci, cj, -d, hullVerts, hullRanges).xyz;   // CSO min along d
+    return dot(sm, -d);
+}
+
+// Directional-sampling narrowphase: minimum exact depth over the two bodies'
+// local frame axes + the centre line. For flat face-face contacts (where the GJK
+// simplex degenerates and EPA has nothing to seed from) one of these axes IS the
+// true separating direction, so the result is exact — and it can only ever
+// report a deeper-or-equal depth than the true minimum elsewhere (safe).
+static bool cdAxisProbe(CoinBody ci, CoinBody cj,
+                        device const float4* hullVerts, device const uint2* hullRanges,
+                        thread float3& outN, thread float& outDepth) {
+    float3 cand[14];
+    int nc = 0;
+    for (int a = 0; a < 3; ++a) {
+        float3 e = float3(a == 0 ? 1.0 : 0.0, a == 1 ? 1.0 : 0.0, a == 2 ? 1.0 : 0.0);
+        float3 wa = cdQuatRotate(ci.orient, e);
+        float3 wb = cdQuatRotate(cj.orient, e);
+        cand[nc++] = wa; cand[nc++] = -wa;
+        cand[nc++] = wb; cand[nc++] = -wb;
+    }
+    float3 D = ci.posInvMass.xyz - cj.posInvMass.xyz;
+    float dl = length(D);
+    cand[nc++] = dl > 1e-6 ? D / dl : float3(0, 1, 0);
+    cand[nc++] = float3(0, 1, 0);
+    float best = 1e30; float3 bestN = float3(0, 1, 0);
+    for (int i = 0; i < nc; ++i) {
+        float pd = cdDepthAlong(ci, cj, cand[i], hullVerts, hullRanges);
+        if (pd < best) { best = pd; bestN = cand[i]; }
+    }
+    if (best <= 0.0) return false;   // a separating axis exists — no contact
+    outN = bestN;                    // pushing A along n separates ⇒ n points B→A
+    outDepth = best;
+    return true;
+}
+
+constant int CD_EPA_MAXV = 32;
+constant int CD_EPA_MAXF = 60;
+
+// GJK + EPA. Returns true if `ci`,`cj` overlap, with the penetration NORMAL (world,
+// points from B toward A) and DEPTH. Bounded thread-local polytope (no heap).
+static bool cdGJKEPA(CoinBody ci, CoinBody cj,
+                     device const float4* hullVerts, device const uint2* hullRanges,
+                     thread float3& outN, thread float& outDepth) {
+    // ── GJK: evolve a simplex toward the origin of the Minkowski difference ────
+    float3 sx[4]; int n = 0;
+    float3 dir = ci.posInvMass.xyz - cj.posInvMass.xyz;
+    if (dot(dir, dir) < 1e-12) dir = float3(1, 0, 0);
+    sx[0] = cdCSO(ci, cj, dir, hullVerts, hullRanges).xyz; n = 1;
+    dir = -sx[0];
+    bool overlap = false;
+    for (int iter = 0; iter < 32; ++iter) {
+        if (dot(dir, dir) < 1e-12) { overlap = true; break; }
+        float3 p = cdCSO(ci, cj, dir, hullVerts, hullRanges).xyz;
+        if (dot(p, dir) < 0.0) return false;            // no overlap (separating axis)
+        // add p, run do-simplex
+        for (int k = n; k > 0; --k) sx[k] = sx[k-1];
+        sx[0] = p; n++;
+        // Evolve simplex (point already handled; handle line/triangle/tetra).
+        if (n == 2) {
+            float3 a = sx[0], b = sx[1], ab = b - a, ao = -a;
+            dir = cdTriple(ab, ao, ab);
+            if (dot(dir, dir) < 1e-12) dir = cross(ab, float3(1,0,0)), dir = dot(dir,dir)<1e-12 ? cross(ab,float3(0,1,0)) : dir;
+        } else if (n == 3) {
+            float3 a = sx[0], b = sx[1], c = sx[2];
+            float3 ab = b - a, ac = c - a, ao = -a, abc = cross(ab, ac);
+            if (dot(cross(abc, ac), ao) > 0.0)      { sx[1] = c; n = 2; dir = cdTriple(ac, ao, ac); }
+            else if (dot(cross(ab, abc), ao) > 0.0) { n = 2; dir = cdTriple(ab, ao, ab); }
+            else { dir = dot(abc, ao) > 0.0 ? abc : -abc; }
+        } else { // n == 4: tetrahedron — does it contain the origin?
+            float3 a = sx[0], b = sx[1], c = sx[2], d = sx[3], ao = -a;
+            float3 abc = cross(b-a, c-a), acd = cross(c-a, d-a), adb = cross(d-a, b-a);
+            if (dot(abc, ao) > 0.0)      { sx[3] = c; sx[2] = b; sx[1] = a; n = 3; dir = abc; n = 3; sx[0]=a;sx[1]=b;sx[2]=c; n=3; }
+            else if (dot(acd, ao) > 0.0) { sx[1] = c; sx[2] = d; n = 3; }
+            else if (dot(adb, ao) > 0.0) { sx[1] = d; sx[2] = b; n = 3; }
+            else { overlap = true; break; }
+            // recompute dir from the kept triangle
+            float3 aa = sx[0], bb = sx[1], cc = sx[2];
+            float3 nn = cross(bb-aa, cc-aa); dir = dot(nn, -aa) > 0.0 ? nn : -nn;
+        }
+    }
+    if (!overlap) return false;
+
+    // GJK confirmed overlap but terminated on a DEGENERATE simplex (point / edge
+    // / triangle — the flat face-face case). EPA cannot be seeded from it: the
+    // old completion added coplanar supports (or left seed vertices
+    // uninitialized), and the garbage face normals it produced read as LATERAL
+    // contact normals that pumped resting hull stacks apart. The exact
+    // directional probe over both bodies' face axes IS the right answer for
+    // precisely these flat contacts.
+    if (n < 4) return cdAxisProbe(ci, cj, hullVerts, hullRanges, outN, outDepth);
+
+    // ── EPA: expand the simplex's polytope to the origin's closest face ───────
+    float3 V[CD_EPA_MAXV]; int VN = 0;
+    int F[CD_EPA_MAXF][3]; float3 FN[CD_EPA_MAXF]; float FD[CD_EPA_MAXF]; int FNn = 0;
+    // Seed with the GJK tetrahedron (n == 4: it encloses the origin).
+    for (int i = 0; i < 4; ++i) { V[i] = sx[i]; }
+    VN = 4;
+    // faces of the tetra (winding outward)
+    int tet[4][3] = {{0,1,2},{0,2,3},{0,3,1},{1,3,2}};
+    for (int i = 0; i < 4; ++i) {
+        int i0=tet[i][0], i1=tet[i][1], i2=tet[i][2];
+        float3 fn = cross(V[i1]-V[i0], V[i2]-V[i0]);
+        float fl = length(fn); if (fl < 1e-12) continue; fn /= fl;
+        if (dot(fn, V[i0]) < 0.0) { int t=i1; i1=i2; i2=t; fn = -fn; }   // outward
+        F[FNn][0]=i0; F[FNn][1]=i1; F[FNn][2]=i2; FN[FNn]=fn; FD[FNn]=dot(fn,V[i0]); FNn++;
+    }
+    float3 bestN = float3(0,1,0); float bestD = 1e30;
+    for (int iter = 0; iter < 24; ++iter) {
+        // closest face to origin
+        int ci2 = -1; float cd = 1e30;
+        for (int f = 0; f < FNn; ++f) if (FD[f] < cd) { cd = FD[f]; ci2 = f; }
+        if (ci2 < 0) break;
+        bestN = FN[ci2]; bestD = cd;
+        float3 sp = cdCSO(ci, cj, FN[ci2], hullVerts, hullRanges).xyz;
+        float spd = dot(FN[ci2], sp);
+        if (spd - cd < 1e-4 || VN >= CD_EPA_MAXV || FNn + 6 >= CD_EPA_MAXF) break;   // converged
+        // Remove all faces the new point can "see", collect the horizon, re-fan.
+        int newV = VN; V[VN++] = sp;
+        // mark visible faces, build a fresh face list
+        int keepF[CD_EPA_MAXF][3]; float3 keepN[CD_EPA_MAXF]; float keepD[CD_EPA_MAXF]; int keepN_n = 0;
+        // horizon edges (store as pairs)
+        int edges[CD_EPA_MAXF*2][2]; int en = 0;
+        for (int f = 0; f < FNn; ++f) {
+            bool visible = dot(FN[f], sp) - FD[f] > 1e-6;
+            if (!visible) { keepF[keepN_n][0]=F[f][0];keepF[keepN_n][1]=F[f][1];keepF[keepN_n][2]=F[f][2];keepN[keepN_n]=FN[f];keepD[keepN_n]=FD[f];keepN_n++; continue; }
+            // add its 3 edges to the horizon (cancel shared)
+            for (int e = 0; e < 3; ++e) {
+                int a = F[f][e], b = F[f][(e+1)%3];
+                bool found = false;
+                for (int q = 0; q < en; ++q) if (edges[q][0]==b && edges[q][1]==a) { edges[q][0]=edges[en-1][0]; edges[q][1]=edges[en-1][1]; en--; found=true; break; }
+                if (!found && en < CD_EPA_MAXF*2) { edges[en][0]=a; edges[en][1]=b; en++; }
+            }
+        }
+        // rebuild faces = kept + a fan from newV over the horizon
+        FNn = 0;
+        for (int f = 0; f < keepN_n; ++f) { F[FNn][0]=keepF[f][0];F[FNn][1]=keepF[f][1];F[FNn][2]=keepF[f][2];FN[FNn]=keepN[f];FD[FNn]=keepD[f];FNn++; }
+        for (int e = 0; e < en && FNn < CD_EPA_MAXF; ++e) {
+            int a = edges[e][0], b = edges[e][1];
+            float3 fn = cross(V[b]-V[a], V[newV]-V[a]); float fl = length(fn);
+            if (fl < 1e-12) continue; fn /= fl;
+            if (dot(fn, V[a]) < 0.0) fn = -fn;          // keep outward
+            F[FNn][0]=a; F[FNn][1]=b; F[FNn][2]=newV; FN[FNn]=fn; FD[FNn]=max(dot(fn,V[a]),0.0); FNn++;
+        }
+    }
+    // EPA's outward face normal of the A⊖B polytope points A→B; the rest of the solver
+    // uses "out of B toward A" (see cdAccumContact), so negate to match the convention.
+    outN = -bestN;
+    outDepth = bestD;
+    // Cross-check EPA against the exact face-axis probe: near-flat contacts sit at
+    // EPA's numerical edge, and a shallower true axis means EPA's normal is off.
+    float3 pn; float pdepth;
+    if (cdAxisProbe(ci, cj, hullVerts, hullRanges, pn, pdepth) && pdepth < bestD * 0.9) {
+        outN = pn;
+        outDepth = pdepth;
+    }
+    return true;
+}
+
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // coinMeasurePenetration — DIAGNOSTIC pass (no resolution).
 //
@@ -1429,6 +1660,8 @@ kernel void coinMeasurePenetration(
     device const int2*      links         [[ buffer(4) ]],
     device atomic_uint*     result        [[ buffer(5) ]],   // [0]=maxDepth µm, [1]=pairCount
     constant float&         threshold     [[ buffer(6) ]],
+    device const float4*    hullVerts     [[ buffer(7) ]],
+    device const uint2*     hullRanges    [[ buffer(8) ]],
     uint id [[ thread_position_in_grid ]])
 {
     if (id >= u.coinCount) { return; }
@@ -1468,7 +1701,11 @@ kernel void coinMeasurePenetration(
 
             float minDepth = 1e30;
             bool  separated = false;
-            if (cdIsSphere(ci) || cdIsSphere(cj)) {
+            if (cdIsHull(ci) || cdIsHull(cj)) {
+                // Hull-involved pair: the same GJK/EPA depth the solver resolves with.
+                float3 nH;
+                if (!cdGJKEPA(ci, cj, hullVerts, hullRanges, nH, minDepth)) separated = true;
+            } else if (cdIsSphere(ci) || cdIsSphere(cj)) {
                 // Sphere-involved pair: the EXACT contact the constraint-path
                 // narrowphase (coinGenerateContacts) de-penetrates with — sphere↔sphere
                 // is centre distance; sphere↔box clamps the centre to the box, sphere↔disc
@@ -1612,6 +1849,117 @@ static void cdEmitContact(device CoinContact* contacts,
     contacts[slot] = c;
 }
 
+
+// ── Hull manifold: support sets + polygon clipping ────────────────────────────
+//
+// One EPA contact per pair can't hold a stack (the doc's "GJK/EPA not wired in"
+// caveat) — a resting box needs its support FOOTPRINT. Given the EPA normal we
+// gather each body's support set (the vertices within an eps band of its support
+// plane along ∓n), project both onto the contact plane, clip one convex polygon
+// by the other (Sutherland–Hodgman), and reduce to ≤4 spread points. Both sets
+// live in eps-thin slabs ⟂ n, so the EPA depth is valid for every manifold point
+// to within ~eps — the standard production approximation.
+
+constant int CD_MSET = 8;
+
+// Support set of body `c` along world direction `dirW` (toward its contact
+// face). Returns ≤CD_MSET world-space points. Hull: banded vertex scan;
+// box: banded corners; disc: 8 rim samples of the support-side face circle.
+static int cdSupportSet(CoinBody c, float3 dirW,
+                        device const float4* hullVerts, device const uint2* hullRanges,
+                        thread float3* out) {
+    float4 q = c.orient;
+    float3 ctr = c.posInvMass.xyz;
+    float3 dl = normalize(cdQuatRotateInv(q, dirW));
+    float eps = 1e-3 + 0.02 * cdRadiusOf(c);
+    int n = 0;
+    if (cdIsHull(c)) {
+        uint2 rng = hullRanges[uint(c.hullRef.x + 0.5)];
+        float best = -1e30;
+        for (uint i = 0; i < rng.y; ++i) best = max(best, dot(float3(hullVerts[rng.x + i].xyz), dl));
+        for (uint i = 0; i < rng.y && n < CD_MSET; ++i) {
+            float3 v = float3(hullVerts[rng.x + i].xyz);
+            if (best - dot(v, dl) < eps) out[n++] = ctr + cdQuatRotate(q, v);
+        }
+        return n;
+    }
+    if (cdIsBox(c)) {
+        float3 he = c.shapeExtents.xyz;
+        float best = -1e30;
+        for (int i = 0; i < 8; ++i) {
+            float3 v = float3((i & 1) ? he.x : -he.x, (i & 2) ? he.y : -he.y, (i & 4) ? he.z : -he.z);
+            best = max(best, dot(v, dl));
+        }
+        for (int i = 0; i < 8 && n < CD_MSET; ++i) {
+            float3 v = float3((i & 1) ? he.x : -he.x, (i & 2) ? he.y : -he.y, (i & 4) ? he.z : -he.z);
+            if (best - dot(v, dl) < eps) out[n++] = ctr + cdQuatRotate(q, v);
+        }
+        return n;
+    }
+    // Disc (capped cylinder): sample the rim circle on the support-side face; the
+    // eps band keeps all 8 for a face-on contact and 1–2 for an edge-on one.
+    {
+        float R = cdRadiusOf(c), h = cdHalfThickOf(c);
+        float sy = dl.y >= 0.0 ? h : -h;
+        float best = -1e30;
+        for (int i = 0; i < 8; ++i) {
+            float a = float(i) * 0.7853982;
+            float3 v = float3(R * cos(a), sy, R * sin(a));
+            best = max(best, dot(v, dl));
+        }
+        for (int i = 0; i < 8 && n < CD_MSET; ++i) {
+            float a = float(i) * 0.7853982;
+            float3 v = float3(R * cos(a), sy, R * sin(a));
+            if (best - dot(v, dl) < eps) out[n++] = ctr + cdQuatRotate(q, v);
+        }
+        return n;
+    }
+}
+
+// Order ≤CD_MSET 2D points CCW about their centroid (insertion sort by angle).
+static int cdOrderConvex2D(thread float2* pts, int n) {
+    if (n < 3) return n;
+    float2 cen = float2(0.0);
+    for (int i = 0; i < n; ++i) cen += pts[i];
+    cen /= float(n);
+    float ang[CD_MSET];
+    for (int i = 0; i < n; ++i) ang[i] = atan2(pts[i].y - cen.y, pts[i].x - cen.x);
+    for (int i = 1; i < n; ++i) {
+        float2 pv = pts[i]; float av = ang[i]; int j = i - 1;
+        while (j >= 0 && ang[j] > av) { pts[j+1] = pts[j]; ang[j+1] = ang[j]; j--; }
+        pts[j+1] = pv; ang[j+1] = av;
+    }
+    return n;
+}
+
+// Sutherland–Hodgman: clip convex polygon A (CCW) by convex polygon B (CCW).
+// Returns the clipped vertex count (≤ 2·CD_MSET).
+static int cdClipConvex2D(thread float2* A, int nA, thread const float2* B, int nB,
+                          thread float2* out) {
+    float2 cur[CD_MSET * 2]; int nc = min(nA, CD_MSET);
+    for (int i = 0; i < nc; ++i) cur[i] = A[i];
+    float2 nxt[CD_MSET * 2];
+    for (int e = 0; e < nB; ++e) {
+        float2 p0 = B[e], p1 = B[(e + 1) % nB];
+        float2 en = float2(-(p1.y - p0.y), p1.x - p0.x);   // inward normal of a CCW edge
+        int nn = 0;
+        for (int i = 0; i < nc; ++i) {
+            float2 a = cur[i], b = cur[(i + 1) % nc];
+            float da = dot(a - p0, en), db = dot(b - p0, en);
+            if (da >= 0.0 && nn < CD_MSET * 2) nxt[nn++] = a;
+            if (da * db < 0.0 && nn < CD_MSET * 2) {
+                float t = da / (da - db);
+                nxt[nn++] = a + t * (b - a);
+            }
+        }
+        nc = nn;
+        for (int i = 0; i < nc; ++i) cur[i] = nxt[i];
+        if (nc == 0) break;
+    }
+    for (int i = 0; i < nc; ++i) out[i] = cur[i];
+    return nc;
+}
+
 kernel void coinGenerateContacts(
     device const CoinBody*           coins         [[ buffer(0) ]],
     device const uint*               sortedIndices [[ buffer(1) ]],
@@ -1622,6 +1970,8 @@ kernel void coinGenerateContacts(
     device CoinContact*              contacts      [[ buffer(6) ]],
     device atomic_uint*              contactCount  [[ buffer(7) ]],
     constant uint&                   maxContacts   [[ buffer(8) ]],
+    device const float4*             hullVerts     [[ buffer(9) ]],
+    device const uint2*              hullRanges    [[ buffer(10) ]],
     uint id [[ thread_position_in_grid ]])
 {
     if (id >= u.coinCount) return;
@@ -1664,6 +2014,63 @@ kernel void coinGenerateContacts(
             // within the margin would be culled before their branch ever runs.
             float reach = sqrt(Ri*Ri + hi*hi) + sqrt(Rj*Rj + hj*hj) + spec;
             if (dot(D, D) > reach * reach) continue;
+
+            // ── Hull-involved pair: LIVE GJK + EPA + clipped manifold ──────
+            // (This is the "wire GJK/EPA into the solver" step the constraint-
+            // solver doc lists as missing: the EPA contact gets a real support-
+            // polygon manifold, so hull stacks rest on a footprint.)
+            if (cdIsHull(ci) || cdIsHull(cj)) {
+                float3 n; float depth;
+                if (!cdGJKEPA(ci, cj, hullVerts, hullRanges, n, depth)) continue;
+                if (depth <= 0.0) continue;
+                // n points from j(B) toward i(A) — cdEmitContact's convention.
+                bool otherRound = cdIsSphere(ci) || cdIsSphere(cj) ||
+                                  cdIsCapsule(ci) || cdIsCapsule(cj);
+                if (!otherRound) {
+                    float3 setA[CD_MSET], setB[CD_MSET];
+                    int nA = cdSupportSet(ci, -n, hullVerts, hullRanges, setA);
+                    int nB = cdSupportSet(cj,  n, hullVerts, hullRanges, setB);
+                    if (nA >= 3 && nB >= 3) {
+                        // Project both support polygons onto the contact plane,
+                        // clip, reduce to ≤4 spread points.
+                        float3 t1, t2; cdContactTangents(n, t1, t2);
+                        float3 origin = 0.5 * (xi + xj);
+                        float2 A2[CD_MSET], B2[CD_MSET];
+                        for (int m = 0; m < nA; ++m) A2[m] = float2(dot(setA[m] - origin, t1), dot(setA[m] - origin, t2));
+                        for (int m = 0; m < nB; ++m) B2[m] = float2(dot(setB[m] - origin, t1), dot(setB[m] - origin, t2));
+                        nA = cdOrderConvex2D(A2, nA);
+                        nB = cdOrderConvex2D(B2, nB);
+                        float2 clipped[CD_MSET * 2];
+                        int nC = cdClipConvex2D(A2, nA, B2, nB, clipped);
+                        if (nC > 0) {
+                            // Reduce: extremes along ±t1 / ±t2 (≤4 spread points).
+                            int pick[4]; int nP = 0;
+                            for (int axm = 0; axm < 4 && nP < min(nC, 4); ++axm) {
+                                float bestv = -1e30; int bi = 0;
+                                for (int m = 0; m < nC; ++m) {
+                                    float v2 = (axm == 0) ? clipped[m].x : (axm == 1) ? -clipped[m].x
+                                             : (axm == 2) ? clipped[m].y : -clipped[m].y;
+                                    if (v2 > bestv) { bestv = v2; bi = m; }
+                                }
+                                bool dup = false;
+                                for (int m = 0; m < nP; ++m) if (pick[m] == bi) dup = true;
+                                if (!dup) pick[nP++] = bi;
+                            }
+                            for (int m = 0; m < nP; ++m) {
+                                float2 c2 = clipped[pick[m]];
+                                float3 cp = origin + c2.x * t1 + c2.y * t2;
+                                cdEmitContact(contacts, contactCount, maxContacts, id, j, uint(m), 0u, n, cp, xi, xj, depth);
+                            }
+                            continue;
+                        }
+                    }
+                }
+                // Round partner / degenerate clip → the single EPA contact.
+                float3 sa = cdSupport(ci, -n, hullVerts, hullRanges);
+                float3 sb = cdSupport(cj,  n, hullVerts, hullRanges);
+                cdEmitContact(contacts, contactCount, maxContacts, id, j, 0u, 0u, n, 0.5 * (sa + sb), xi, xj, depth);
+                continue;
+            }
 
             // Sphere-involved.
             if (cdIsSphere(ci) && cdIsSphere(cj)) {
@@ -1830,6 +2237,13 @@ kernel void coinGenerateContacts(
         float3 s0, s1; cdCapsuleSegment(ci, s0, s1);
         capP[0] = s0; capP[1] = 0.5 * (s0 + s1); capP[2] = s1;
     }
+    // A HULL body probes statics with its true vertices (≤32), radius 0 — the
+    // same point logic as the disc/box feature points, but on the real shape.
+    bool iHull = cdIsHull(ci);
+    uint2 hRange = uint2(0, 0);
+    if (iHull) hRange = hullRanges[uint(ci.hullRef.x + 0.5)];
+    int nFP = iHull ? int(min(hRange.y, 32u)) : CD_NPTS;
+#define CD_PROBE(pp) (iHull ? (xi + cdQuatRotate(qi, float3(hullVerts[hRange.x + uint(pp)].xyz))) : fp[pp])
     for (uint k = 0u; k < u.colliderCount; ++k) {
         CoinStaticCollider col = colliders[k];
         uint kind = as_type<uint>(col.a.w);
@@ -1846,9 +2260,10 @@ kernel void coinGenerateContacts(
                     if (pen > -spec) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, capP[p] - capR*n, xi, xi, pen);
                 }
             } else {
-                for (int p = 0; p < CD_NPTS; ++p) {
-                    float pen = d - dot(n, fp[p]);
-                    if (pen > -spec) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, fp[p], xi, xi, pen);
+                for (int p = 0; p < nFP; ++p) {
+                    float3 pw = CD_PROBE(p);
+                    float pen = d - dot(n, pw);
+                    if (pen > -spec) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, pw, xi, xi, pen);
                 }
             }
         } else if (kind == 1u) {                         // axis-aligned box
@@ -1877,8 +2292,8 @@ kernel void coinGenerateContacts(
                 }
                 continue;
             }
-            for (int p = 0; p < CD_NPTS; ++p) {
-                float3 pw = fp[p], dd = pw - ctr;
+            for (int p = 0; p < nFP; ++p) {
+                float3 pw = CD_PROBE(p), dd = pw - ctr;
                 if (abs(dd.x) >= he.x || abs(dd.y) >= he.y || abs(dd.z) >= he.z) continue;
                 float3 dist = he - abs(dd); float3 n; float push;
                 if (dist.x < dist.y && dist.x < dist.z) { n = float3(sign(dd.x),0,0); push = dist.x; }
@@ -1936,8 +2351,9 @@ kernel void coinGenerateContacts(
                     cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, cp, xi, xi, pen);
                 }
             } else {
-                for (int p = 0; p < CD_NPTS; ++p) {
-                    float3 lp = cdQuatRotateInv(q, fp[p] - ctr);
+                for (int p = 0; p < nFP; ++p) {
+                    float3 pw = CD_PROBE(p);
+                    float3 lp = cdQuatRotateInv(q, pw - ctr);
                     if (abs(lp.x) >= he.x || abs(lp.y) >= he.y || abs(lp.z) >= he.z) continue;
                     float3 d = he - abs(lp);
                     float3 nL; float push;
@@ -1945,7 +2361,7 @@ kernel void coinGenerateContacts(
                     else if (d.y < d.z)         { nL = float3(0,sign(lp.y),0); push = d.y; }
                     else                        { nL = float3(0,0,sign(lp.z)); push = d.z; }
                     float3 n = cdQuatRotate(q, nL);
-                    cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, fp[p], xi, xi, push);
+                    cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, pw, xi, xi, push);
                 }
             }
         } else if (kind == 4u) {                         // cylinder segment (pipe / half-pipe)
@@ -1958,9 +2374,9 @@ kernel void coinGenerateContacts(
             float R = col.b.w, halfLen = col.vel.w;
             bool lowerOnly = (col.meta.x & 1u) != 0u;
             bool sphereLike = cdIsSphere(ci) || iCapsule;
-            int nProbes = iCapsule ? 3 : (cdIsSphere(ci) ? 1 : CD_NPTS);
+            int nProbes = iCapsule ? 3 : (cdIsSphere(ci) ? 1 : nFP);
             for (int p = 0; p < nProbes; ++p) {
-                float3 s  = sphereLike ? (iCapsule ? capP[p] : xi) : fp[p];
+                float3 s  = sphereLike ? (iCapsule ? capP[p] : xi) : CD_PROBE(p);
                 float  rs = sphereLike ? (iCapsule ? capR    : Ri) : 0.0;
                 float3 d = s - ctr;
                 float along = dot(d, ax);
@@ -1995,11 +2411,11 @@ kernel void coinGenerateContacts(
             // (which β·slop would eat: the plate would ghost through the pile).
             float maxDepth = maxPush / max(u.baumgarteBeta, 0.05) + u.contactSlop;
             bool sphereLike = cdIsSphere(ci) || iCapsule;
-            int nProbes = iCapsule ? 3 : (cdIsSphere(ci) ? 1 : CD_NPTS);
+            int nProbes = iCapsule ? 3 : (cdIsSphere(ci) ? 1 : nFP);
             for (int p = 0; p < nProbes; ++p) {
-                float3 s  = sphereLike ? (iCapsule ? capP[p] : xi) : fp[p];
-                float  rs = sphereLike ? (iCapsule ? capR    : Ri) : Ri;
-                float  ry = sphereLike ? rs : hi;
+                float3 s  = sphereLike ? (iCapsule ? capP[p] : xi) : CD_PROBE(p);
+                float  rs = sphereLike ? (iCapsule ? capR    : Ri) : (iHull ? 0.0 : Ri);
+                float  ry = sphereLike ? rs : (iHull ? 0.0 : hi);
                 if (abs(s.x - cc2.x) < he2.x + rs &&
                     s.y > cc2.y - (he2.y + ry) && s.y < cc2.y + (he2.y + ry) &&
                     s.z < frontZ + rs && s.z > backZ - rs) {
@@ -2012,6 +2428,7 @@ kernel void coinGenerateContacts(
             }
         }
     }
+#undef CD_PROBE
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2814,175 +3231,18 @@ kernel void coinSleepMark(
     asleep[id] = (islandMin[label[id]] >= sleepFrames) ? 1u : 0u;
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// CONSTRAINT SOLVER — Stage 6: GJK + EPA general convex narrowphase
-// ══════════════════════════════════════════════════════════════════════════════
-//
-// The general path: any convex pair → GJK (is the Minkowski difference's origin
-// enclosed? = overlap) → EPA (expand the polytope to the origin's closest face =
-// penetration normal + depth). Works for ANY shape with a support function, so it
-// generalizes past the analytic disc/box/sphere routines (e.g. a future arbitrary
-// convex hull). Delivered + verified as the primitive; the analytic manifold path
-// stays the live narrowphase (one GJK/EPA point per pair can't hold a box stack
-// without face-clipping, which is a separate, larger addition).
-
-// Farthest surface point of body `c` along world direction `d` (the support map).
-static float3 cdSupport(CoinBody c, float3 d) {
-    float3 ctr = c.posInvMass.xyz;
-    if (cdIsSphere(c)) return ctr + cdRadiusOf(c) * normalize(d);
-    float4 q = c.orient;
-    float3 dl = cdQuatRotateInv(q, d);     // direction in body-local frame
-    float3 pl;
-    if (cdIsCapsule(c)) {
-        // Segment end nearest the direction, plus the radius along d.
-        float hl = cdCapsuleHL(c), r = cdCapsuleR(c);
-        return ctr + cdQuatRotate(q, float3(0.0, dl.y >= 0.0 ? hl : -hl, 0.0))
-                   + r * normalize(d);
-    }
-    if (cdIsBox(c)) {
-        float3 he = cdBodyHalfExtents(c);
-        pl = float3(dl.x >= 0.0 ? he.x : -he.x, dl.y >= 0.0 ? he.y : -he.y, dl.z >= 0.0 ? he.z : -he.z);
-    } else {                               // capped cylinder, axis +Y
-        float R = cdRadiusOf(c), h = cdHalfThickOf(c);
-        float2 rad = float2(dl.x, dl.z); float rl = length(rad);
-        float2 rdir = rl > 1e-6 ? rad / rl : float2(1.0, 0.0);
-        pl = float3(rdir.x * R, dl.y >= 0.0 ? h : -h, rdir.y * R);
-    }
-    return ctr + cdQuatRotate(q, pl);
-}
-
-// Support point of the Minkowski difference A⊖B along d (and the witness on A).
-static float4 cdCSO(CoinBody ci, CoinBody cj, float3 d) {
-    float3 a = cdSupport(ci, d);
-    return float4(a - cdSupport(cj, -d), 0.0);   // .xyz = CSO point
-}
-
-// Triple product (a×b)×c.
-static float3 cdTriple(float3 a, float3 b, float3 c) { return cross(cross(a, b), c); }
-
-constant int CD_EPA_MAXV = 32;
-constant int CD_EPA_MAXF = 60;
-
-// GJK + EPA. Returns true if `ci`,`cj` overlap, with the penetration NORMAL (world,
-// points from B toward A) and DEPTH. Bounded thread-local polytope (no heap).
-static bool cdGJKEPA(CoinBody ci, CoinBody cj, thread float3& outN, thread float& outDepth) {
-    // ── GJK: evolve a simplex toward the origin of the Minkowski difference ────
-    float3 sx[4]; int n = 0;
-    float3 dir = ci.posInvMass.xyz - cj.posInvMass.xyz;
-    if (dot(dir, dir) < 1e-12) dir = float3(1, 0, 0);
-    sx[0] = cdCSO(ci, cj, dir).xyz; n = 1;
-    dir = -sx[0];
-    bool overlap = false;
-    for (int iter = 0; iter < 32; ++iter) {
-        if (dot(dir, dir) < 1e-12) { overlap = true; break; }
-        float3 p = cdCSO(ci, cj, dir).xyz;
-        if (dot(p, dir) < 0.0) return false;            // no overlap (separating axis)
-        // add p, run do-simplex
-        for (int k = n; k > 0; --k) sx[k] = sx[k-1];
-        sx[0] = p; n++;
-        // Evolve simplex (point already handled; handle line/triangle/tetra).
-        if (n == 2) {
-            float3 a = sx[0], b = sx[1], ab = b - a, ao = -a;
-            dir = cdTriple(ab, ao, ab);
-            if (dot(dir, dir) < 1e-12) dir = cross(ab, float3(1,0,0)), dir = dot(dir,dir)<1e-12 ? cross(ab,float3(0,1,0)) : dir;
-        } else if (n == 3) {
-            float3 a = sx[0], b = sx[1], c = sx[2];
-            float3 ab = b - a, ac = c - a, ao = -a, abc = cross(ab, ac);
-            if (dot(cross(abc, ac), ao) > 0.0)      { sx[1] = c; n = 2; dir = cdTriple(ac, ao, ac); }
-            else if (dot(cross(ab, abc), ao) > 0.0) { n = 2; dir = cdTriple(ab, ao, ab); }
-            else { dir = dot(abc, ao) > 0.0 ? abc : -abc; }
-        } else { // n == 4: tetrahedron — does it contain the origin?
-            float3 a = sx[0], b = sx[1], c = sx[2], d = sx[3], ao = -a;
-            float3 abc = cross(b-a, c-a), acd = cross(c-a, d-a), adb = cross(d-a, b-a);
-            if (dot(abc, ao) > 0.0)      { sx[3] = c; sx[2] = b; sx[1] = a; n = 3; dir = abc; n = 3; sx[0]=a;sx[1]=b;sx[2]=c; n=3; }
-            else if (dot(acd, ao) > 0.0) { sx[1] = c; sx[2] = d; n = 3; }
-            else if (dot(adb, ao) > 0.0) { sx[1] = d; sx[2] = b; n = 3; }
-            else { overlap = true; break; }
-            // recompute dir from the kept triangle
-            float3 aa = sx[0], bb = sx[1], cc = sx[2];
-            float3 nn = cross(bb-aa, cc-aa); dir = dot(nn, -aa) > 0.0 ? nn : -nn;
-        }
-    }
-    if (!overlap) return false;
-
-    // ── EPA: expand the simplex's polytope to the origin's closest face ───────
-    float3 V[CD_EPA_MAXV]; int VN = 0;
-    int F[CD_EPA_MAXF][3]; float3 FN[CD_EPA_MAXF]; float FD[CD_EPA_MAXF]; int FNn = 0;
-    // Seed with the GJK tetrahedron (ensure we have 4 verts).
-    if (n < 4) {
-        // build a tetra: add a support along the current face normal
-        float3 aa = sx[0], bb = sx[n>1?1:0], cc = sx[n>2?2:0];
-        float3 nn = (n>=3) ? cross(bb-aa, cc-aa) : float3(0,1,0);
-        if (dot(nn,nn)<1e-12) nn = float3(0,1,0);
-        sx[n] = cdCSO(ci, cj, nn).xyz; n = min(n+1,4);
-        if (n < 4) { sx[n] = cdCSO(ci, cj, -nn).xyz; n = min(n+1,4); }
-    }
-    for (int i = 0; i < 4 && i < n; ++i) { V[i] = sx[i]; }
-    VN = 4;
-    // faces of the tetra (winding outward)
-    int tet[4][3] = {{0,1,2},{0,2,3},{0,3,1},{1,3,2}};
-    for (int i = 0; i < 4; ++i) {
-        int i0=tet[i][0], i1=tet[i][1], i2=tet[i][2];
-        float3 fn = cross(V[i1]-V[i0], V[i2]-V[i0]);
-        float fl = length(fn); if (fl < 1e-12) continue; fn /= fl;
-        if (dot(fn, V[i0]) < 0.0) { int t=i1; i1=i2; i2=t; fn = -fn; }   // outward
-        F[FNn][0]=i0; F[FNn][1]=i1; F[FNn][2]=i2; FN[FNn]=fn; FD[FNn]=dot(fn,V[i0]); FNn++;
-    }
-    float3 bestN = float3(0,1,0); float bestD = 1e30;
-    for (int iter = 0; iter < 24; ++iter) {
-        // closest face to origin
-        int ci2 = -1; float cd = 1e30;
-        for (int f = 0; f < FNn; ++f) if (FD[f] < cd) { cd = FD[f]; ci2 = f; }
-        if (ci2 < 0) break;
-        bestN = FN[ci2]; bestD = cd;
-        float3 sp = cdCSO(ci, cj, FN[ci2]).xyz;
-        float spd = dot(FN[ci2], sp);
-        if (spd - cd < 1e-4 || VN >= CD_EPA_MAXV || FNn + 6 >= CD_EPA_MAXF) break;   // converged
-        // Remove all faces the new point can "see", collect the horizon, re-fan.
-        int newV = VN; V[VN++] = sp;
-        // mark visible faces, build a fresh face list
-        int keepF[CD_EPA_MAXF][3]; float3 keepN[CD_EPA_MAXF]; float keepD[CD_EPA_MAXF]; int keepN_n = 0;
-        // horizon edges (store as pairs)
-        int edges[CD_EPA_MAXF*2][2]; int en = 0;
-        for (int f = 0; f < FNn; ++f) {
-            bool visible = dot(FN[f], sp) - FD[f] > 1e-6;
-            if (!visible) { keepF[keepN_n][0]=F[f][0];keepF[keepN_n][1]=F[f][1];keepF[keepN_n][2]=F[f][2];keepN[keepN_n]=FN[f];keepD[keepN_n]=FD[f];keepN_n++; continue; }
-            // add its 3 edges to the horizon (cancel shared)
-            for (int e = 0; e < 3; ++e) {
-                int a = F[f][e], b = F[f][(e+1)%3];
-                bool found = false;
-                for (int q = 0; q < en; ++q) if (edges[q][0]==b && edges[q][1]==a) { edges[q][0]=edges[en-1][0]; edges[q][1]=edges[en-1][1]; en--; found=true; break; }
-                if (!found && en < CD_EPA_MAXF*2) { edges[en][0]=a; edges[en][1]=b; en++; }
-            }
-        }
-        // rebuild faces = kept + a fan from newV over the horizon
-        FNn = 0;
-        for (int f = 0; f < keepN_n; ++f) { F[FNn][0]=keepF[f][0];F[FNn][1]=keepF[f][1];F[FNn][2]=keepF[f][2];FN[FNn]=keepN[f];FD[FNn]=keepD[f];FNn++; }
-        for (int e = 0; e < en && FNn < CD_EPA_MAXF; ++e) {
-            int a = edges[e][0], b = edges[e][1];
-            float3 fn = cross(V[b]-V[a], V[newV]-V[a]); float fl = length(fn);
-            if (fl < 1e-12) continue; fn /= fl;
-            if (dot(fn, V[a]) < 0.0) fn = -fn;          // keep outward
-            F[FNn][0]=a; F[FNn][1]=b; F[FNn][2]=newV; FN[FNn]=fn; FD[FNn]=max(dot(fn,V[a]),0.0); FNn++;
-        }
-    }
-    // EPA's outward face normal of the A⊖B polytope points A→B; the rest of the solver
-    // uses "out of B toward A" (see cdAccumContact), so negate to match the convention.
-    outN = -bestN;
-    outDepth = bestD;
-    return true;
-}
-
 // Diagnostic probe: run GJK+EPA on coins[a],coins[b]; write [overlap, depthµm, nx,ny,nz].
 kernel void coinGJKEPAProbe(
-    device const CoinBody* coins  [[ buffer(0) ]],
-    constant uint2&        pair   [[ buffer(1) ]],
-    device float4*         result [[ buffer(2) ]],
+    device const CoinBody* coins      [[ buffer(0) ]],
+    constant uint2&        pair       [[ buffer(1) ]],
+    device float4*         result     [[ buffer(2) ]],
+    device const float4*   hullVerts  [[ buffer(3) ]],
+    device const uint2*    hullRanges [[ buffer(4) ]],
     uint id [[ thread_position_in_grid ]])
 {
     if (id != 0) return;
     float3 nrm; float depth;
-    bool hit = cdGJKEPA(coins[pair.x], coins[pair.y], nrm, depth);
+    bool hit = cdGJKEPA(coins[pair.x], coins[pair.y], hullVerts, hullRanges, nrm, depth);
     result[0] = float4(hit ? 1.0 : 0.0, depth, 0.0, 0.0);
     result[1] = float4(nrm, 0.0);
 }

@@ -136,6 +136,115 @@ final class CoinDEMGenericEngineTests: XCTestCase {
         solver.position(of: slot)
     }
 
+    // ── Convex hulls ──────────────────────────────────────────────────────────
+    // Registration: interior points dropped, exact solid inertia diagonalized.
+    func testHullRegistrationDropsInteriorAndFindsInertia() throws {
+        let (solver, _) = try makeSolver()
+        let h: Float = 0.05
+        var pts: [SIMD3<Float>] = []
+        for i in 0..<8 {
+            pts.append(SIMD3((i & 1) != 0 ? h : -h, (i & 2) != 0 ? h : -h, (i & 4) != 0 ? h : -h))
+        }
+        pts.append(.zero)                                 // interior — must be dropped
+        pts.append(SIMD3(0.01, 0.0, -0.01))               // interior — must be dropped
+        guard let hull = solver.registerHull(vertices: pts) else {
+            return XCTFail("cube registration failed")
+        }
+        XCTAssertEqual(hull.vertices.count, 8, "interior points dropped, 8 corners kept")
+        XCTAssertEqual(hull.boundingRadius, h * sqrt(3), accuracy: 1e-4)
+        // Solid cube inertia per unit mass: I = (2/3)h² each axis → k = 1/I.
+        let expected = 1.0 / ((2.0 / 3.0) * h * h)
+        let prepK = 1.0 / hull.boundingRadius   // placeholder to keep tuple use simple
+        _ = prepK
+        // Reconstruct k from a spawned body's hullRef.
+        let slot = solver.spawnHull(at: SIMD3(0, 1, 0), hull: hull)!
+        let body = solver.coinBuffer.buffer.contents()
+            .bindMemory(to: CoinBody.self, capacity: solver.maxCoins)[slot]
+        for lane in [body.hullRef.y, body.hullRef.z, body.hullRef.w] {
+            XCTAssertEqual(lane, Float(expected), accuracy: Float(expected) * 0.02,
+                           "solid-cube inverse inertia (exact boundary integral)")
+        }
+    }
+
+    // A hull CUBE dropped tilted must land, tip flat onto a face, and rest at
+    // exactly its half-extent — behavioural parity with the analytic box path,
+    // but through GJK/EPA + the clipped manifold.
+    func testHullCubeRestsFlatLikeABox() throws {
+        let (solver, queue) = try makeSolver(radius: 0.09, maxDim: 0.09)
+        let h: Float = 0.05
+        var pts: [SIMD3<Float>] = []
+        for i in 0..<8 {
+            pts.append(SIMD3((i & 1) != 0 ? h : -h, (i & 2) != 0 ? h : -h, (i & 4) != 0 ? h : -h))
+        }
+        let hull = solver.registerHull(vertices: pts)!
+        let tilt = simd_quatf(angle: 0.35, axis: simd_normalize(SIMD3<Float>(1, 0, 0.4)))
+        let slot = solver.spawnHull(at: SIMD3(0, 0.4, 0), hull: hull,
+                                    orient: SIMD4(tilt.imag, tilt.real))!
+        step(solver, queue, frames: 360)
+
+        let p = solver.position(of: slot)!
+        let v = solver.velocity(of: slot)!
+        XCTAssertEqual(p.y, h, accuracy: h * 0.25, "hull cube rests at its half-extent")
+        XCTAssertLessThan(simd_length(v), 0.03, "hull cube at rest")
+        // Flat on a face: some local axis is within ~10° of world-up.
+        let q = solver.orientation(of: slot)!
+        let ax = [simd_act(q, SIMD3<Float>(1,0,0)), simd_act(q, SIMD3<Float>(0,1,0)), simd_act(q, SIMD3<Float>(0,0,1))]
+        let bestUp = ax.map { abs($0.y) }.max()!
+        XCTAssertGreaterThan(bestUp, 0.96, "tipped flat onto a face (a local axis ≈ world-up)")
+    }
+
+    // Two hull cubes stacked: without the clipped manifold a single EPA contact
+    // point can't resist tipping — the top cube would wobble off. It must stay.
+    func testHullCubesStack() throws {
+        let (solver, queue) = try makeSolver(radius: 0.09, maxDim: 0.09)
+        let h: Float = 0.05
+        var pts: [SIMD3<Float>] = []
+        for i in 0..<8 {
+            pts.append(SIMD3((i & 1) != 0 ? h : -h, (i & 2) != 0 ? h : -h, (i & 4) != 0 ? h : -h))
+        }
+        let hull = solver.registerHull(vertices: pts)!
+        solver.frictionCoeff = 0.6      // real cube-on-cube grip — frictionless cubes DON'T stack
+        let bottom = solver.spawnHull(at: SIMD3(0, 0.06, 0), hull: hull)!
+        let top    = solver.spawnHull(at: SIMD3(0.008, 0.25, 0), hull: hull)!
+        step(solver, queue, frames: 360)
+
+        let pb = solver.position(of: bottom)!
+        let pt = solver.position(of: top)!
+        print("HULL_STACK bottom=\(pb) top=\(pt)")
+        XCTAssertEqual(pb.y, h, accuracy: h * 0.3, "bottom cube on the floor")
+        XCTAssertEqual(pt.y, 3 * h, accuracy: h * 0.5, "top cube RESTS ON the bottom (COM ≈ 3h)")
+        XCTAssertLessThan(abs(pt.x - pb.x), h * 0.8, "top didn't slide/wobble off the stack")
+        let stats = solver.measurePenetration(threshold: h * 0.1)
+        XCTAssertLessThan(stats.maxPenetration, h * 0.4, "no deep hull↔hull overlap")
+    }
+
+    // An OCTAHEDRON (a hull nothing like a box) dropped point-down must tip onto
+    // a face and settle at the face's support height — real generic-shape physics.
+    func testHullOctahedronSettlesOnAFace() throws {
+        let (solver, queue) = try makeSolver(radius: 0.08, maxDim: 0.08)
+        let r: Float = 0.06
+        let pts: [SIMD3<Float>] = [
+            SIMD3( r, 0, 0), SIMD3(-r, 0, 0),
+            SIMD3(0,  r, 0), SIMD3(0, -r, 0),
+            SIMD3(0, 0,  r), SIMD3(0, 0, -r),
+        ]
+        let hull = solver.registerHull(vertices: pts)!
+        XCTAssertEqual(hull.vertices.count, 6)
+        let slot = solver.spawnHull(at: SIMD3(0, 0.3, 0), hull: hull,
+                                    tumble: SIMD3(0.4, 0, 0.2))!
+        step(solver, queue, frames: 420)
+
+        let p = solver.position(of: slot)!
+        let v = solver.velocity(of: slot)!
+        // Face-down rest height = distance from COM to a face plane = r/√3.
+        let faceH = r / sqrt(3)
+        print("HULL_OCTA rest y=\(p.y) faceH=\(faceH)")
+        XCTAssertLessThan(simd_length(v), 0.03, "octahedron settled")
+        XCTAssertEqual(p.y, faceH, accuracy: faceH * 0.35,
+                       "rests on a FACE (COM at ~r/√3), not balanced on a vertex (r)")
+    }
+
+
     // ── Speculative contacts (anti-tunneling) ─────────────────────────────────
     // A small sphere fired at 120 m/s crosses a same-size target's whole overlap
     // window between substeps (0.5 m/substep vs a 0.14 m window, phased to miss),
