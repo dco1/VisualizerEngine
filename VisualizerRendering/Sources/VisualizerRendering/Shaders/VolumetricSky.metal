@@ -161,7 +161,12 @@ struct SkyUniforms {
     //     only (byte-identical to the legacy path; every non-fireworks scene).
     //     >0 adds 2 softer octaves (less extinction, flatter phase) so thick
     //     banks self-glow from a bright internal/behind source instead of
-    //     reading as flat-lit shells. y,z,w reserved.
+    //     reading as flat-lit shells.
+    // y = celestialsInDome (>0.5 = stars/moon are baked into this equirect —
+    //     the default). A host whose lighting pass evaluates the analytic
+    //     night sky at SCREEN resolution (Illuminatorama's nightStarField /
+    //     nightMoonDisk) sets this to 0 so the dome doesn't double-draw a
+    //     blurry low-res copy underneath the crisp one. z,w reserved.
     float4 cloudExtra2;
 };
 
@@ -1000,8 +1005,11 @@ kernel void volSkyRender(
         sky += sunDisk(rayDir, u);
 
         // ── Night sky: stars + moon (additive, gated by nightBlend) ──
+        // Skipped when the host renders the analytic screen-res night sky
+        // instead (cloudExtra2.y = 0) — the dome-baked copies would only be
+        // magnified into blobs behind the crisp ones.
         float nightBlend = u.nightParams.w;
-        if (nightBlend > 0.0f && rayDir.y > -0.05f) {
+        if (nightBlend > 0.0f && rayDir.y > -0.05f && u.cloudExtra2.y > 0.5f) {
             sky += starField(rayDir, u.nightParams.x) * nightBlend;
             sky += moonDisk(rayDir, u) * nightBlend;
         }
@@ -1252,7 +1260,12 @@ kernel void volSkyRender(
     // a row of distant buildings on the equator. |yCos| so the fade is
     // symmetric: downward rays from an above-deck camera get the same
     // grazing-angle treatment as upward rays from below.
-    float horizonFade = smoothstep(0.02f, 0.22f, abs(yCos));
+    // Fade window host-tunable via cloudExtra2.zw (0 = the legacy 0.02/0.22).
+    // A ground-level architectural camera sees sky ONLY near the horizon —
+    // the legacy window (full clouds above ~13°) erased the whole deck there.
+    float fadeLo = u.cloudExtra2.z > 0.0f ? u.cloudExtra2.z : 0.02f;
+    float fadeHi = u.cloudExtra2.w > 0.0f ? u.cloudExtra2.w : 0.22f;
+    float horizonFade = smoothstep(fadeLo, fadeHi, abs(yCos));
     float blend = mix(0.0f, 1.0f, horizonFade);
     float effTrans = mix(1.0f, trans, blend);
     float3 col = sky * effTrans + lum * blend;
@@ -1320,8 +1333,9 @@ kernel void illumi_cloud_inview(
             ? nishitaAtmosphereColor(rayDir, u)
             : atmosphereColor(rayDir, u);
         sky += sunDisk(rayDir, u);
+        // Same analytic-night-sky skip as volSkyRender (cloudExtra2.y).
         float nightBlend = u.nightParams.w;
-        if (nightBlend > 0.0f && rayDir.y > -0.05f) {
+        if (nightBlend > 0.0f && rayDir.y > -0.05f && u.cloudExtra2.y > 0.5f) {
             sky += starField(rayDir, u.nightParams.x) * nightBlend;
             sky += moonDisk(rayDir, u) * nightBlend;
         }
@@ -1463,7 +1477,12 @@ kernel void illumi_cloud_inview(
         if (pos.y > topY + 0.5f || pos.y < baseY - 0.5f) break;
     }
 
-    float horizonFade = smoothstep(0.02f, 0.22f, abs(yCos));
+    // Fade window host-tunable via cloudExtra2.zw (0 = the legacy 0.02/0.22).
+    // A ground-level architectural camera sees sky ONLY near the horizon —
+    // the legacy window (full clouds above ~13°) erased the whole deck there.
+    float fadeLo = u.cloudExtra2.z > 0.0f ? u.cloudExtra2.z : 0.02f;
+    float fadeHi = u.cloudExtra2.w > 0.0f ? u.cloudExtra2.w : 0.22f;
+    float horizonFade = smoothstep(fadeLo, fadeHi, abs(yCos));
     float blend = mix(0.0f, 1.0f, horizonFade);
     float effTrans = mix(1.0f, trans, blend);
     float3 col = sky * effTrans + lum * blend;

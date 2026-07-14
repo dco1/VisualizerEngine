@@ -88,9 +88,21 @@ public final class IlluminatoramaTextureAtlas {
     private var nextSlice: Int = 0
     /// Cache keyed by the SCNMaterialProperty contents' identity, so a
     /// single shared `NSImage` referenced by many materials gets uploaded
-    /// once. Sentinel value `nil` means "we tried this content and it
-    /// failed to convert" — skip future attempts.
-    private var sliceForObject: [ObjectIdentifier: Int32?] = [:]
+    /// once. `slice == nil` means "we tried this content and it failed to
+    /// convert" — skip future attempts.
+    ///
+    /// The entry RETAINS the keyed object: `ObjectIdentifier` is just the
+    /// object's address, so caching it for a transient image (a procedural
+    /// bake's fresh `CGImage`, released right after registration) left a
+    /// stale key that a LATER image could collide with when the allocator
+    /// recycled the address — a false cache HIT returning the dead image's
+    /// slice. Symptom: a material randomly wearing another material's
+    /// texture, stable within a run but flipping across runs with allocator
+    /// state (Daydream's bistable washed-white lawn / "two stable exterior
+    /// regimes"). Retaining the object pins the address for the cache's
+    /// lifetime, so a live key can never alias. `reset()` releases them.
+    private struct SliceCacheEntry { let retained: AnyObject; let slice: Int32? }
+    private var sliceForObject: [ObjectIdentifier: SliceCacheEntry] = [:]
 
     /// Pixel format passed at init. Use `.bgra8Unorm_srgb` for colour
     /// (diffuse / albedo / emission) so the GPU sampler decodes sRGB → linear
@@ -150,6 +162,22 @@ public final class IlluminatoramaTextureAtlas {
     public func reset() {
         nextSlice = 0
         sliceForObject.removeAll(keepingCapacity: true)
+        freeSlices.removeAll(keepingCapacity: true)
+    }
+
+    /// Slots explicitly RETURNED by the host — e.g. a slider-customized material whose
+    /// params changed, leaving the old bake unreachable. `register` reuses these before
+    /// consuming a fresh slot, so churned custom materials stop growing the atlas
+    /// unboundedly (the terrazzo-slider issue). Any content-cache entry pointing at the
+    /// freed slot is dropped (releasing its retained image).
+    private var freeSlices: [Int32] = []
+    /// TEST-OBSERVABLE: how many freed slots are currently awaiting reuse.
+    public var freeSliceCount: Int { freeSlices.count }
+
+    public func freeSlice(_ slice: Int32) {
+        guard slice >= 0, Int(slice) < nextSlice, !freeSlices.contains(slice) else { return }
+        sliceForObject = sliceForObject.filter { $0.value.slice != slice }
+        freeSlices.append(slice)
     }
 
     /// Try to surface a slice index for the supplied SCNMaterialProperty
@@ -166,12 +194,14 @@ public final class IlluminatoramaTextureAtlas {
         //   • MTLTexture        — already on the GPU; not handled in 4.0
         //   • NSColor / CGColor — solid-colour material; not our path
         let key: ObjectIdentifier
+        let keyObject: AnyObject
         let cg: CGImage
         if let img = contents as? NSImage {
             key = ObjectIdentifier(img)
-            if let cached = sliceForObject[key] { return cached }
+            keyObject = img
+            if let cached = sliceForObject[key] { return cached.slice }
             guard let extracted = Self.cgImage(from: img) else {
-                sliceForObject[key] = .some(nil)
+                sliceForObject[key] = SliceCacheEntry(retained: keyObject, slice: nil)
                 return nil
             }
             cg = extracted
@@ -182,7 +212,8 @@ public final class IlluminatoramaTextureAtlas {
             // then force-cast once the type ID confirms we have a CGImage.
             let img = contents as! CGImage
             key = ObjectIdentifier(img as AnyObject)
-            if let cached = sliceForObject[key] { return cached }
+            keyObject = img as AnyObject
+            if let cached = sliceForObject[key] { return cached.slice }
             cg = img
         } else {
             return nil
@@ -193,23 +224,31 @@ public final class IlluminatoramaTextureAtlas {
         // is invisible from outside. Bounded by Metal's per-device limit
         // (typically 2048 array layers); we hard-cap below to keep VRAM
         // sane on small machines.
-        if nextSlice >= capacity {
-            let maxCap = 1024
-            guard capacity < maxCap, grow(to: min(capacity * 2, maxCap)) else {
-                Self.log.warning("Atlas exhausted at capacity=\(self.capacity, privacy: .public); falling back to average colour")
-                sliceForObject[key] = .some(nil)
-                return nil
+        // Reuse an explicitly-freed slot before consuming a fresh one (see `freeSlice`).
+        let slice: Int32
+        let reusedFreeSlot: Bool
+        if let reused = freeSlices.popLast() {
+            slice = reused; reusedFreeSlot = true
+        } else {
+            if nextSlice >= capacity {
+                let maxCap = 1024
+                guard capacity < maxCap, grow(to: min(capacity * 2, maxCap)) else {
+                    Self.log.warning("Atlas exhausted at capacity=\(self.capacity, privacy: .public); falling back to average colour")
+                    sliceForObject[key] = SliceCacheEntry(retained: keyObject, slice: nil)
+                    return nil
+                }
             }
+            slice = Int32(nextSlice)
+            nextSlice += 1
+            reusedFreeSlot = false
         }
-        let slice = Int32(nextSlice)
-        nextSlice += 1
         if upload(cgImage: cg, to: Int(slice)) {
-            sliceForObject[key] = .some(slice)
+            sliceForObject[key] = SliceCacheEntry(retained: keyObject, slice: slice)
             return slice
         } else {
-            // Failed upload — drop the slot and remember the failure.
-            nextSlice -= 1
-            sliceForObject[key] = .some(nil)
+            // Failed upload — return the slot and remember the failure.
+            if reusedFreeSlot { freeSlices.append(slice) } else { nextSlice -= 1 }
+            sliceForObject[key] = SliceCacheEntry(retained: keyObject, slice: nil)
             return nil
         }
     }

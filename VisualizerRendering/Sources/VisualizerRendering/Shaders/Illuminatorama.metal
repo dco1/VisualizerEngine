@@ -240,6 +240,83 @@ struct FrameUniforms {
     float    sssDebugForceAll;  // 1 = treat every opaque pixel as SSS (headless verify)
     float    _padSSS1;
     float    _padSSS2;
+    // Phase 9 — film-stock LUT blend strength. 0 = bypass, 1 = full grade.
+    // NEW 16-byte cluster (stride 1088 → 1104). Three float pads fill.
+    float    filmLUTStrength;
+    float    _padFilmLUT0;
+    float    _padFilmLUT1;
+    float    _padFilmLUT2;
+    // Tonemap colour-grade (white-balance / tint pre-tonemap; contrast / shadows
+    // / highlights as a post-tonemap curve). TWO new 16-byte clusters (stride
+    // 1104 → 1136). Defaults are neutral: whiteBalanceK 6500 → gain (1,1,1),
+    // tint 0, shadows/highlights/contrast 1.0 → the whole grade is a no-op.
+    // Mirrors IlluminatoramaFrameUniforms.{whiteBalanceK,tint,shadows,highlights,contrast}.
+    float    whiteBalanceK;
+    float    tint;
+    float    shadows;
+    float    highlights;
+    float    contrast;
+    // Phase 7 — opt-in hex-stochastic anti-tiling strength [0,1]. 0 = OFF (the
+    // DEFAULT): every `sampleAtlasHex` short-circuits to a single plain texture
+    // read, so the G-buffer is byte-for-byte identical to the pre-anti-tiling
+    // shader. >0 mixes in the 3-tap de-repeat blend. Repurposes the former
+    // `_padGrade0` slot — same 4 bytes, stride unchanged. Mirrors
+    // IlluminatoramaFrameUniforms.antiTilingStrength.
+    float    antiTilingStrength;
+    // Point-light cubemap shadow depth bias (was `_padGrade1`). Read only for point
+    // lights with shadowCubeIndex >= 0; 0 ⇒ no point shadows ⇒ no behaviour change.
+    float    pointShadowBias;
+    // Scotopic (Purkinje) desaturation strength (was `_padGrade2` — same 4 bytes,
+    // stride unchanged). Pulls the DIMMEST tonemapped pixels toward their own
+    // luminance so moonlit surfaces read neutral-dark, not (green-albedo) tinted.
+    // 0 (DEFAULT) ⇒ the tonemap branch never runs ⇒ byte-identical. Mirrors
+    // IlluminatoramaFrameUniforms.scotopicDesaturation.
+    float    scotopicDesaturation;
+    // ── Interior day-light separation (opt-in; pairs with light-layer masking) ──
+    // A host that stamps per-room layer bits (gLayer) can declare those bits INTERIOR
+    // via `interiorMask` (OR of every interior room bit). A fragment whose layer is a
+    // real room stamp (≠ the 0xFFFFFFFF default) AND intersects the mask then has its
+    // sky-IBL indirect scaled by mix(interiorIBLSide, interiorIBLUp, saturate(N.y)) —
+    // up-facing floors lose the open-top skylight hardest — and its ambient supplement
+    // scaled by `interiorAmbient` (a warm indoor fill can exceed 1). `interiorMask == 0`
+    // (the default) skips the whole block: both factors stay exactly 1.0 and ×1.0 is an
+    // IEEE no-op, so every scene that never opts in renders byte-identically.
+    // NEW 16-byte cluster (stride 1136 → 1152). Mirrors IlluminatoramaFrameUniforms.
+    uint     interiorMask;
+    float    interiorIBLUp;
+    float    interiorIBLSide;
+    float    interiorAmbient;
+    // ── Analytic night sky (stars + moon at SCREEN resolution) ──────────────
+    // The host disables the dome's baked celestials (VolumetricCloudRenderer
+    // Params.celestialsInDome = false) and sets these; the lighting kernel then
+    // evaluates nightStarField/nightMoonDisk per SKY PIXEL — pixel-sharp stars,
+    // a crisp phase-correct moon — instead of sampling their bilinearly-
+    // magnified dome bakes. All-zero (the default) ⇒ the sky branch adds
+    // exactly nothing, so every non-opting scene renders byte-identically.
+    // nightSkyParams: x = starBrightness × nightBlend, y = moonIntensity ×
+    // nightBlend, z = moon angular radius (radians), w reserved.
+    // THREE new 16-byte clusters (stride 1152 → 1200); field-for-field mirror
+    // of IlluminatoramaFrameUniforms.
+    float4   nightSkyParams;
+    float4   nightMoonDir;   // xyz = unit vector toward the moon
+    float4   nightSunDir;    // xyz = unit vector toward the TRUE sun (terminator)
+    // ── Lens flare (sun) ─────────────────────────────────────────────────────
+    // x = strength (0 = OFF, the default — the tonemap branch is gated on it so
+    // non-opting scenes are byte-for-byte unchanged), yz = the sun's screen-space
+    // uv, w = on-screen weight (fades at the frame edge, 0 behind the camera).
+    // ONE new 16-byte cluster (stride 1200 → 1216); mirror of
+    // IlluminatoramaFrameUniforms.lensFlareParams.
+    float4   lensFlareParams;
+    // ── Halation (film) ──────────────────────────────────────────────────────
+    // halationParams: x = intensity (0 = OFF, the default — the host skips the
+    // halation passes entirely and the tonemap branch is gated on it, so non-opting
+    // scenes are byte-for-byte unchanged), y = HDR luminance threshold above which a
+    // highlight scatters, z = halo radius in INTERNAL-resolution texels, w reserved.
+    // halationTint: xyz = halo tint (linear RGB), w reserved.
+    // TWO new 16-byte clusters (stride 1216 → 1248); mirror of
+    // IlluminatoramaFrameUniforms.halationParams/halationTint.
+    float4   halationParams;
+    float4   halationTint;
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift
@@ -254,7 +331,19 @@ struct PointLight {
     float3 position;
     float  radius;
     float3 color;
-    float  _pad;
+    // Light-layer mask (was `_pad`). A light contributes to a fragment only when
+    // (light.layerMask & fragment.layer) != 0. Default 0xFFFFFFFF ⇒ affects every
+    // fragment (byte-identical to the pre-mask behaviour). Reinterpreted from the
+    // former float pad, so the struct stride is unchanged.
+    uint   layerMask;
+    // ── Point-light cubemap shadows (opt-in) ──────────────────────────────────
+    // castsShadow: 1 ⇒ sample the depth cube at shadowCubeIndex for this light.
+    // Default 0 ⇒ the shadow branch is skipped entirely (byte-identical). shadowCubeIndex
+    // < 0 ⇒ no page this frame (treat as fully visible). Mirrors the Swift struct.
+    uint   castsShadow;
+    int    shadowCubeIndex;
+    int    _padPointShadow0;
+    int    _padPointShadow1;
 };
 
 // Rectangular area light (#60 task 5). Mirror of Swift IlluminatoramaAreaLight.
@@ -280,7 +369,10 @@ struct SpotLight {
     // spot contributes as fully visible.
     float4x4 shadowMatrix;
     int      shadowSliceIndex;
-    int      _padSpot0;
+    // Light-layer mask (was `_padSpot0`). Same masking rule as PointLight; default
+    // 0xFFFFFFFF ⇒ affects every fragment. Reinterpreted from a former int pad, so
+    // the struct stride is unchanged.
+    uint     layerMask;
     int      _padSpot1;
     int      _padSpot2;
 };
@@ -290,6 +382,12 @@ struct Instance {
     float4x4 normalMatrix;
     float3   albedo;
     float    metallic;
+    // Phase 7 — clearcoat lobe (polished/lacquered surfaces). Occupies the
+    // 12-byte padding gap between metallic (offset 144) and emission (offset 160);
+    // stride stays 208. Default 0 = off (no change to existing materials).
+    float    clearcoat;              // [0,1] lobe strength
+    float    clearcoatRoughness;     // GGX roughness for the clearcoat layer
+    float    sheen;                  // Phase 7b — cloth sheen strength [0,1] (was _padClearcoat)
     float3   emission;
     float    roughness;
     // Phase 4.0/4.1 — slice indices into the per-material texture atlases
@@ -310,9 +408,35 @@ struct Instance {
     int      emissionTextureSlice;
     // Phase 4.27b — multiplier on the emission TEXTURE sample so a texture-
     // driven glow (Pizza's heat coils) renders at its tuned HDR intensity.
-    // Repurposes the former `_padSlice0` slot; stride stays 208.
+    // Repurposes the former `_padSlice0` slot.
     float    emissionIntensity;
+    // Former trailing pad — still unused GPU-side (RT exclusion is host-only).
     int      _padSlice1;
+    // Phase 7 — detail-normal path. Stride grows from 208 → 224 (next 16-byte
+    // boundary) to preserve float4x4 natural alignment.
+    int      detailNormalTextureSlice;  // < 0 = disabled
+    float    detailNormalUVScale;       // tile frequency relative to macro UV
+    float    anisotropy;                // Phase 7c — grain highlight stretch [0,1] (was _padDetail0)
+    int      highlight;   // 0 none · 1 selected (blue halo) · 2 hover (yellow halo)
+    // Drag/impact sway — generic vertex-shader secondary motion (see applySway).
+    // New 16-byte cluster (offsets 224-239): stride grows 224 → 240.
+    int      swayMode;    // 0 none · 1 bottom-pivot lean · 2 top-pivot pendulum (hanging)
+    float    swayLean;    // mode 1: static lean angle (rad); mode 2: pendulum amplitude (rad)
+    float    swayJostle;  // vertical pop (metres), applied in world space
+    // Light-layer bitfield (was `_padSway0`). Written into the gLayer G-buffer
+    // target by the fragment shader; the deferred lighting kernel masks each light
+    // by (light.layerMask & fragment.layer). Default 0xFFFFFFFF ⇒ every light
+    // affects this instance (byte-identical to pre-mask behaviour). Reinterpreted
+    // from the former float pad, so the struct stride stays 240.
+    uint     layer;
+    // Per-instance multiplier on frame.antiTilingStrength. The hex-stochastic
+    // de-repeat is only valid for STOCHASTIC textures — hosts set 0 for coherent
+    // patterns (tile grids, wallpaper, directional wood) whose offset samples
+    // would double-print/dice the pattern. NEW 16-byte cluster: stride 240 → 256.
+    float    antiTilingScale;
+    float    _padAntiTiling0;
+    float    _padAntiTiling1;
+    float    _padAntiTiling2;
 };
 
 struct Vertex {
@@ -341,6 +465,9 @@ struct VSOut {
     float3 worldNormal;
     float2 uv;
     uint   instanceID   [[flat]];
+    // Light-layer bitfield, forwarded flat from the instance so the G-buffer
+    // fragment can write it into the gLayer target. Default 0xFFFFFFFF.
+    uint   layer        [[flat]];
     // Phase 2.7 — clip-space positions for motion-vector reconstruction.
     // We pass both the current and previous clip-space positions explicitly
     // (rather than reading [[position]] in the fragment, which is post-divide
@@ -408,6 +535,64 @@ static inline float3 applyTreeWind(float3 wp, float4 windAttr, float time,
 // to the matrix delta, exactly as before.
 constant bool kUsePrevVerts [[function_constant(10)]];
 
+// ── Drag/impact sway (generic rigid secondary motion) ────────────────────────
+// The non-foliage sibling of applyTreeWind: a placed object the host is dragging
+// (or that just knocked into something) leans + hops, driven entirely by the
+// per-instance swayMode/swayLean/swayJostle the host's DragSwayTracker fills.
+//
+// Applied in WORLD space about the instance's bottom-pivot so it composes cleanly
+// with the per-instance non-uniform scale already baked into modelMatrix (rotating
+// unit-box object space then scaling would shear). Pivot = base centre of the
+// box; lean axis = the object's local +Z in world (modelMatrix column 2). swayMode
+// 0 ⇒ identity, so every non-swaying instance is an exact no-op.
+//
+// swayMode reference:
+//   0 · none                — hard no-op (all vegetation instances that don't opt in).
+//   1 · bottom-pivot lean   — rigid rotation about the box BASE (object y=-0.5) by the
+//                             host-supplied static `lean` angle (books, upright shelf
+//                             contents, dragged/knocked props). `lean` IS the angle.
+//   2 · top-pivot pendulum  — rigid rotation about the model ORIGIN (object y=0), for a
+//                             HANGING object (ceiling pendant). The pendant mesh is
+//                             authored with its ceiling anchor at object y=0 and its body
+//                             hanging DOWN into −Y, and it's placed by an unscaled matrix,
+//                             so object y=0 is exactly the ceiling attach point — the
+//                             pivot. Self-oscillates in the shader: angle = `lean` *
+//                             sin(time·ω + phase), so `lean` here is the AMPLITUDE (max
+//                             swing, radians) and the host sets it ONCE (static
+//                             per-instance) — no per-frame drive. Phase is derived from
+//                             the pivot's world XZ so neighbouring pendants swing out of
+//                             step. Displacement is 0 at the top anchor and grows toward
+//                             the hanging bottom (pivot about the top) — the inverse of
+//                             mode 1 (which pivots at the box base y=-0.5).
+//
+// Returns the rotated world position; `worldN`/`worldT` are rotated in place by the
+// same rigid rotation so lighting/normal-mapping track the lean.
+static inline float3 applySway(float3 wp, float4x4 model, int mode,
+                               float lean, float jostle, float time,
+                               thread float3& worldN, thread float3& worldT) {
+    if (mode == 0) return wp;
+    // Mode 1 pivots at the box base (y=-0.5) and applies `lean` directly. Mode 2 pivots
+    // at the model origin (y=0) — the hanging pendant's ceiling anchor — and
+    // self-oscillates `lean` (as amplitude) from `time`.
+    float  pivotY = (mode == 2) ? 0.0 : -0.5;
+    float3 pivot  = (model * float4(0.0, pivotY, 0.0, 1.0)).xyz;
+    float3 axis   = normalize((model * float4(0.0, 0.0, 1.0, 0.0)).xyz);  // local +Z in world
+    float  angle  = lean;
+    if (mode == 2) {
+        // Gentle pendulum ~0.42 Hz (ω ≈ 2.65 rad/s); per-instance phase from the top
+        // anchor's world XZ so a row of pendants doesn't swing in lock-step.
+        float phase = pivot.x * 1.7 + pivot.z * 2.3;
+        angle = lean * sin(time * 2.65 + phase);
+    }
+    float  c = cos(angle), s = sin(angle);
+    // Rodrigues rotation of (wp - pivot) about `axis`, then restore pivot.
+    float3 r = wp - pivot;
+    float3 rot = r * c + cross(axis, r) * s + axis * dot(axis, r) * (1.0 - c);
+    worldN = worldN * c + cross(axis, worldN) * s + axis * dot(axis, worldN) * (1.0 - c);
+    worldT = worldT * c + cross(axis, worldT) * s + axis * dot(axis, worldT) * (1.0 - c);
+    return pivot + rot + float3(0.0, jostle, 0.0);
+}
+
 vertex VSOut illumi_vs(
     uint                       vid           [[vertex_id]],
     uint                       iid           [[instance_id]],
@@ -453,12 +638,26 @@ vertex VSOut illumi_vs(
     // normal. Handedness in .w rides along unchanged.
     float3 worldT = (inst.modelMatrix * float4(v.tangent.xyz, 0.0)).xyz;
 
+    // Drag/impact sway — rigid lean+hop driven by the host DragSwayTracker, no-op
+    // unless swayMode != 0. worldN/worldT rotate with it so lighting + normal maps
+    // track the lean. The previous frame gets LAST frame's sway (prevInst) so the
+    // motion vector captures the swing (TAA/motion-blur correctness).
+    worldP.xyz = applySway(worldP.xyz, inst.modelMatrix, inst.swayMode,
+                           inst.swayLean, inst.swayJostle, frame.time, worldN, worldT);
+    float3 prevN = worldN, prevT = worldT;   // throwaway: prev normal/tangent unused
+    // Prev frame uses the same `frame.time` as current (matching applyTreeWind above):
+    // during a settled headless capture time is frozen (static pose, no TAA smear); in
+    // the live app the per-frame swing delta is tiny, so the motion vector stays clean.
+    prevWorldP.xyz = applySway(prevWorldP.xyz, prevInst.modelMatrix, prevInst.swayMode,
+                               prevInst.swayLean, prevInst.swayJostle, frame.time, prevN, prevT);
+
     VSOut o;
     o.clipPos      = frame.viewProjection * worldP;
     o.worldPos     = worldP.xyz;
     o.worldNormal  = worldN;
     o.uv           = v.uv;
     o.instanceID   = iid;
+    o.layer        = inst.layer;
     o.currentClip  = o.clipPos;
     o.previousClip = frame.previousViewProjection * prevWorldP;
     o.worldTangent = float4(worldT, v.tangent.w);
@@ -473,6 +672,11 @@ struct GBufferOut {
     // Phase 2.7 — screen-space motion vector (current_uv - previous_uv), in
     // UV units (range typically ±0.5). RG16Float gives plenty of precision.
     half2 velocity         [[color(3)]];
+    // Light-layer bitfield (R32Uint target). Read by the deferred lighting kernel
+    // to mask per-room lights. Cleared to 0xFFFFFFFF for sky/no-geometry pixels, so
+    // a scene that never sets a layer (all instances default 0xFFFFFFFF) writes
+    // 0xFFFFFFFF everywhere ⇒ every light passes the mask ⇒ byte-identical.
+    uint  layer            [[color(4)]];
 };
 
 // ── Shadow depth pass (Phase 2.5) ────────────────────────────────────────────
@@ -487,11 +691,19 @@ vertex float4 illumi_shadow_vs(
     uint                        iid       [[instance_id]],
     const device Vertex*        verts     [[buffer(0)]],
     const device Instance*      instances [[buffer(2)]],
-    constant float4x4&          lightVP   [[buffer(3)]]
+    constant float4x4&          lightVP   [[buffer(3)]],
+    constant float&             shadowTime [[buffer(4)]]
 ) {
     Vertex v = verts[vid];
     Instance inst = instances[iid];
     float4 worldP = inst.modelMatrix * float4(v.position, 1.0);
+    // Match the visible pose: a swaying object casts its leaned shadow (no-op unless
+    // swayMode != 0). Position-only — the depth pass needs no normal/tangent.
+    // `shadowTime` mirrors frame.time so a self-oscillating pendulum (swayMode 2) casts
+    // its swung shadow in phase with the visible mesh.
+    float3 nDummy = float3(0.0), tDummy = float3(0.0);
+    worldP.xyz = applySway(worldP.xyz, inst.modelMatrix, inst.swayMode,
+                           inst.swayLean, inst.swayJostle, shadowTime, nDummy, tDummy);
     return lightVP * worldP;
 }
 
@@ -591,10 +803,90 @@ static inline float4 sampleAtlasAspect(texture2d_array<float, access::sample> at
     return atlas.sample(s, st, slice);
 }
 
+// Phase 7 — hex-stochastic atlas sample. Breaks repeating tiling on large planar
+// surfaces (floors, walls) by blending three stochastically-offset samples whose
+// cell borders align on a triangular lattice. GPU port of DaydreamCore's
+// MaterialChannels.sampleAlbedoHex / hexHash (CPU reference in MaterialChannels.swift).
+//
+// `uv` — the same UV that sampleAtlasAspect would use (world-metres ÷ tile-metres,
+//        so one UV unit = one texture tile). The hex cells and offset vectors are
+//        expressed in that same space — the offset shifts into a different region of
+//        the infinitely-tiling texture, so it's aspect-safe and letterbox-safe.
+static inline float2 hexHash2D(float2 p) {
+    // Integer bit-mixing hash — no sin/cos. Same constants as the CPU reference.
+    // p is in skewed-lattice coordinates (integer-valued at cell vertices).
+    float px = p.x * 73856093.0f + p.y * 19349663.0f;
+    float py = p.x * 83492791.0f + p.y * 23994923.0f;
+    int ix = int(px); int iy = int(py);
+    ix ^= ix >> 11; ix *= 0x45d9f3b; ix ^= ix >> 16;
+    iy ^= iy >> 11; iy *= 0x45d9f3b; iy ^= iy >> 16;
+    return float2(float(ix & 0xFF) / 128.0f - 1.0f,
+                  float(iy & 0xFF) / 128.0f - 1.0f);
+}
+
+// `strength` gates the whole effect. When strength <= 0 (the DEFAULT for every
+// scene that never opts in) this returns EXACTLY `sampleAtlasAspect(atlas, s, uv,
+// slice, uvScale)` — the identical single texture read the pre-anti-tiling shader
+// did — so opted-out scenes (Visualizer) are byte-for-byte unchanged. For
+// strength in (0,1] the three-tap hex blend is mixed in by `strength`, so the
+// caller can dial the de-repetition from subtle to full.
+static inline float4 sampleAtlasHex(texture2d_array<float, access::sample> atlas,
+                                     sampler s, float2 uv, uint slice,
+                                     const device float2* uvScale,
+                                     float strength) {
+    // Exact single-sample fast path — identical to sampleAtlasAspect, no extra taps.
+    float4 single = sampleAtlasAspect(atlas, s, uv, slice, uvScale);
+    if (strength <= 0.0f) { return single; }
+    const float sq3over2 = 0.8660254f;         // sqrt(3)/2
+    // Skew UV to triangular lattice: (u, v) → (u + v*0.5, v*sqrt(3)/2)
+    float su = uv.x + uv.y * 0.5f;
+    float sv = uv.y * sq3over2;
+    float si = floor(su), sj = floor(sv);
+    float fu = su - si, fv = sv - sj;
+
+    // Barycentric weights and cell-vertex integer coords in skewed space.
+    // Lower triangle: verts at (si,sj), (si+1,sj), (si,sj+1)
+    // Upper triangle: verts at (si+1,sj+1), (si,sj+1), (si+1,sj)
+    float2 sk0, sk1, sk2;
+    float  w0, w1, w2;
+    if (fu + fv < 1.0f) {
+        sk0 = float2(si,       sj);
+        sk1 = float2(si + 1.0f, sj);
+        sk2 = float2(si,       sj + 1.0f);
+        w0 = 1.0f - fu - fv; w1 = fu; w2 = fv;
+    } else {
+        sk0 = float2(si + 1.0f, sj + 1.0f);
+        sk1 = float2(si,        sj + 1.0f);
+        sk2 = float2(si + 1.0f, sj);
+        w0 = fu + fv - 1.0f; w1 = 1.0f - fu; w2 = 1.0f - fv;
+    }
+
+    // Hash each vertex (in skewed-lattice integer space) to a UV offset.
+    float2 h0 = hexHash2D(sk0), h1 = hexHash2D(sk1), h2 = hexHash2D(sk2);
+
+    // Cubic blend weight (w^3 normalised) — smooth at cell boundaries.
+    float p0 = w0 * w0 * w0, p1 = w1 * w1 * w1, p2 = w2 * w2 * w2;
+    float pSum = max(p0 + p1 + p2, 1e-6f);
+
+    float4 c0 = sampleAtlasAspect(atlas, s, uv + h0, slice, uvScale);
+    float4 c1 = sampleAtlasAspect(atlas, s, uv + h1, slice, uvScale);
+    float4 c2 = sampleAtlasAspect(atlas, s, uv + h2, slice, uvScale);
+    float4 hex = (c0 * p0 + c1 * p1 + c2 * p2) / pSum;
+    // Blend the de-repeated hex result toward the plain single sample by strength.
+    // strength==1 → full hex, strength==0 handled by the early-out above.
+    return mix(single, hex, saturate(strength));
+}
+
 fragment GBufferOut illumi_fs(
     VSOut                                       in              [[stage_in]],
     bool                                        frontFacing     [[front_facing]],
     const device Instance*                      instances       [[buffer(2)]],
+    // Phase 7 — per-frame uniforms, bound to the fragment stage so the G-buffer
+    // shader can read `antiTilingStrength` (the opt-in hex-stochastic de-repeat
+    // knob). Same buffer the vertex stage reads at buffer(1); default strength 0
+    // makes every hex sample fall through to the plain single texture read, so
+    // scenes that never opt in are byte-for-byte unchanged.
+    constant FrameUniforms&                     frame           [[buffer(1)]],
     // Phase 4.25 — per-slice UV scale for the two atlases (letterbox fill
     // fraction; (1,1) = square). Indexed by the instance's slice id; drives
     // `sampleAtlasAspect`. `float2` (8-byte stride) matches the host's
@@ -635,9 +927,25 @@ fragment GBufferOut illumi_fs(
         length_squared(in.worldTangent.xyz) > 1e-4) {
         float3 T = normalize(in.worldTangent.xyz);
         float3 B = cross(n, T) * in.worldTangent.w;
-        float4 nmSample = sampleAtlasAspect(nonColorAtlas, texSampler, in.uv,
-                                            uint(inst.normalTextureSlice), nonColorUVScale);
+        // Hex-stochastic normal map — eliminates the regular tiling pattern
+        // on large flat surfaces (walls, floors) by blending three stochastically-
+        // offset lattice samples. The blend is linear in encoded space (before
+        // decode), which slightly overshoots tangent-space magnitude at boundaries
+        // but gives correct appearance after renormalize below.
+        float4 nmSample = sampleAtlasHex(nonColorAtlas, texSampler, in.uv,
+                                         uint(inst.normalTextureSlice), nonColorUVScale,
+                                         frame.antiTilingStrength * inst.antiTilingScale);
         float3 tangentN = normalize(nmSample.xyz * 2.0 - 1.0);
+        // Phase 7 detail normal — blended on top of the macro normal at
+        // higher UV frequency (pores, weave, grain). Uses overlay-normal
+        // blend: partial-derivative add in tangent space, then renormalize.
+        if (inst.detailNormalTextureSlice >= 0) {
+            float2 detailUV = in.uv * inst.detailNormalUVScale;
+            float4 dnSample = sampleAtlasAspect(nonColorAtlas, texSampler, detailUV,
+                                                uint(inst.detailNormalTextureSlice), nonColorUVScale);
+            float3 dn = dnSample.xyz * 2.0 - 1.0;
+            tangentN = normalize(float3(tangentN.xy + dn.xy, tangentN.z));
+        }
         // World normal = T*x + B*y + N*z. Equivalent to a TBN matrix
         // multiply but cheaper to spell out as a single dot per axis.
         n = normalize(T * tangentN.x + B * tangentN.y + n * tangentN.z);
@@ -645,8 +953,15 @@ fragment GBufferOut illumi_fs(
 
     float3 albedo = inst.albedo;
     if (inst.albedoTextureSlice >= 0) {
-        float4 tx = sampleAtlasAspect(albedoAtlas, texSampler, in.uv,
-                                      uint(inst.albedoTextureSlice), albedoUVScale);
+        // Phase 7 hex-stochastic anti-tiling: floor/wall surfaces tile seamlessly but
+        // don't repeat visibly — three blended samples from stochastically-offset
+        // lattice cells. `in.uv` is already in tile-space (world ÷ uvMetres), so
+        // the hex cell size equals one texture tile. sampleAtlasAspect handles
+        // letterbox padding per-slice; the offset just shifts into a neighbouring
+        // infinitely-tiling region, so aspect is preserved.
+        float4 tx = sampleAtlasHex(albedoAtlas, texSampler, in.uv,
+                                    uint(inst.albedoTextureSlice), albedoUVScale,
+                                    frame.antiTilingStrength * inst.antiTilingScale);
         albedo = tx.rgb;
     }
     // Phase 4.17 — modulate albedo by per-vertex color (default white,
@@ -670,12 +985,11 @@ fragment GBufferOut illumi_fs(
 
     float roughness = inst.roughness;
     if (inst.roughnessTextureSlice >= 0) {
-        float4 tx = sampleAtlasAspect(nonColorAtlas, texSampler, in.uv,
-                                      uint(inst.roughnessTextureSlice), nonColorUVScale);
-        // Roughness uses the G channel by default for packed maps; the
-        // host can also point a single-channel roughness texture at the
-        // same slot — single-channel uploads replicate to RGB so G works
-        // for that case too.
+        // Hex-stochastic roughness — same three-cell blend as albedo so
+        // roughness variation doesn't lag the albedo tile seam.
+        float4 tx = sampleAtlasHex(nonColorAtlas, texSampler, in.uv,
+                                    uint(inst.roughnessTextureSlice), nonColorUVScale,
+                                    frame.antiTilingStrength * inst.antiTilingScale);
         roughness = tx.g;
     }
 
@@ -1255,7 +1569,10 @@ fragment GBufferOut illumi_fs(
         // HDR brightness (Pizza's heat coils were flat at intensity 1).
         emission += tx.rgb * inst.emissionIntensity;
     }
-    o.emission        = half4(half3(emission), 1.0h);
+    // Phase 7 — pack clearcoat (≥0) OR cloth sheen (<0) into emission.alpha (was always 1.0,
+    // unused). A surface is polished OR cloth, never both, so one channel carries either: > 0 =
+    // polished/lacquered second GGX lobe; < 0 = velvet/wool grazing-Fresnel sheen (strength = -a).
+    o.emission        = half4(half3(emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -inst.sheen));
     // Screen-space motion vector. NDC.y is up, UV.y is down → Y is flipped.
     // The result is (currentUV - previousUV), so history reprojection in the
     // TAA kernel is `historyUV = currentUV - velocity`.
@@ -1263,6 +1580,7 @@ fragment GBufferOut illumi_fs(
     float2 prevNDC = in.previousClip.xy / in.previousClip.w;
     float2 velocityUV = (currNDC - prevNDC) * float2(0.5, -0.5);
     o.velocity        = half2(velocityUV);
+    o.layer           = in.layer;   // light-layer bitfield (default 0xFFFFFFFF)
     return o;
 }
 
@@ -1427,6 +1745,7 @@ struct SQImpostorFSOut {
     half4 normalRoughness  [[color(1)]];
     half4 emission         [[color(2)]];
     half2 velocity         [[color(3)]];
+    uint  layer            [[color(4)]];   // light-layer bitfield (default 0xFFFFFFFF)
     float depth            [[depth(less)]];
 };
 
@@ -1474,9 +1793,12 @@ fragment SQImpostorFSOut illumi_superquadric_impostor_fs(
     SQImpostorFSOut o;
     o.albedoMetallic  = half4(half3(inst.albedo), half(inst.metallic));
     float2 oct = octEncode(wN);
-    o.normalRoughness = half4(half(oct.x), half(oct.y), half(inst.roughness), 1.0h);
-    o.emission        = half4(half3(inst.emission), 1.0h);
+    // .w tag: 1.0 = opaque (default); 1.0 + anisotropy (>1) carries the grain-highlight stretch
+    // for the deferred pass (all existing tag tests are < 1.0, so this reads as opaque to them).
+    o.normalRoughness = half4(half(oct.x), half(oct.y), half(inst.roughness), 1.0h + half(inst.anisotropy));
+    o.emission        = half4(half3(inst.emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -inst.sheen));
     o.velocity        = half2(velUV);
+    o.layer           = inst.layer;   // light-layer bitfield (default 0xFFFFFFFF)
     o.depth           = curClip.z / curClip.w;   // Metal NDC z ∈ [0,1]
     return o;
 }
@@ -1618,6 +1940,141 @@ static inline float3 sampleSkyEquirect(texture2d<float, access::sample> sky,
                         s_address::repeat,
                         t_address::clamp_to_edge);
     return sky.sample(s, dirToEquirectUV(normalize(dir))).rgb;
+}
+
+// ── Analytic night sky — stars + moon at SCREEN resolution ──────────────────
+//
+// The equirect sky dome (VolumetricCloudRenderer, 2048×1024) is far coarser than
+// the frame: one dome texel covers several screen pixels, so anything baked into
+// it — a star, the moon's limb — is bilinearly magnified into a soft blob. The
+// host can therefore ask the DOME to skip its celestials
+// (`Params.celestialsInDome = false`) and have this pass evaluate them
+// analytically per SKY PIXEL instead: pixel-sharp stars, a crisp moon disk with
+// a geometrically-correct terminator. Gated on `frame.nightSkyParams` being
+// non-zero — every scene that never sets it renders byte-identically.
+//
+// The star grid (cell layout, fill rate, magnitude/colour hashing) mirrors
+// `starField` in VolumetricSky.metal so the two paths agree on WHERE the stars
+// are — only the point-spread differs (dome texel there, screen pixel here).
+
+static inline uint nightHash3(int3 p) {
+    uint h = uint(p.x * 374761393 + p.y * 668265263 + p.z * 1274126177);
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    return h ^ (h >> 16u);
+}
+
+// 2D Worley (cellular) distance for the moon's maria/crater shading — the
+// disk-local sibling of VolumetricSky.metal's worley3.
+static inline float nightWorley2(float2 p) {
+    int2 ip = int2(floor(p));
+    float2 fp = p - float2(ip);
+    float minD2 = 1e9f;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int2 cell = ip + int2(dx, dy);
+            uint h = nightHash3(int3(cell.x, cell.y, 91));
+            float2 jitter = float2(float(h & 0xFFu), float((h >> 8u) & 0xFFu)) * (1.0f / 255.0f);
+            float2 d = (float2(dx, dy) + jitter) - fp;
+            minD2 = min(minD2, dot(d, d));
+        }
+    }
+    return clamp(sqrt(minD2), 0.0f, 1.0f);
+}
+
+// Procedural star field, evaluated at screen resolution. `pixAngle` is the
+// angular size of one output pixel (radians); each star is a gaussian point
+// ~1.5 px wide, so under TAA it resolves as a crisp spark instead of the
+// dome-bake's magnified blob. Same hash → same sky as the dome version.
+static inline float3 nightStarField(float3 rayDir, float brightness, float pixAngle) {
+    if (brightness <= 0.0f) return float3(0.0f);
+
+    float az = atan2(rayDir.z, rayDir.x);
+    float el = asin(clamp(rayDir.y, -1.0f, 1.0f));
+    const float cellsPerTurn = 450.0f;             // 0.8° cells (matches the dome grid)
+    float2 uv = float2((az + M_PI_F) * (cellsPerTurn / (2.0f * M_PI_F)),
+                       (el + M_PI_F * 0.5f) * (cellsPerTurn * 0.5f / M_PI_F));
+    int2 ip = int2(floor(uv));
+    float2 fp = uv - float2(ip);
+
+    // One screen pixel in cell units (elevation cells are constant on the sphere).
+    float cellAngle = (2.0f * M_PI_F) / cellsPerTurn;
+    float pixCell = max(pixAngle / cellAngle, 1e-4f);
+    // Point-spread: σ ≈ 0.75 px — a star's core lands on 1–2 pixels. The peak is
+    // resolution-independent (a star is "a bright point", not a patch of sky).
+    float sigma = 0.75f * pixCell;
+    float invS2 = 1.0f / (2.0f * sigma * sigma);
+
+    float3 result = float3(0.0f);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int2 cell = ip + int2(dx, dy);
+            uint h = nightHash3(int3(cell.x, cell.y, 17));
+            // ~4% of cells hold a star (matches the dome field).
+            if ((h & 0xFFu) < 10u) {
+                float2 starPos = float2(
+                    float((h >> 8u)  & 0xFFu) / 255.0f,
+                    float((h >> 16u) & 0xFFu) / 255.0f
+                );
+                float2 d  = fp - (float2(dx, dy) + starPos);
+                float  d2 = dot(d, d);
+                float  lum = exp(-d2 * invS2);
+                // Magnitude: 4 bits → 0..1; brighter is rarer. Dim stars fade
+                // fast so the field reads as sparkle over black, not noise.
+                float  mag = 1.0f - float((h >> 28u) & 0xFu) / 15.0f;
+                float3 col = mix(float3(1.0f, 0.92f, 0.72f),
+                                 float3(0.78f, 0.87f, 1.0f), mag * mag);
+                result += col * lum * (0.10f + 0.90f * mag * mag);
+            }
+        }
+    }
+    return result * brightness * 2.2f;
+}
+
+// Moon disk with a geometrically-correct phase terminator. Each disk pixel
+// reconstructs the sphere normal at that point and lights it with the TRUE sun
+// direction — so the phase (crescent → gibbous → full) and its orientation come
+// straight from the real ephemeris, not a hand-tuned phase scalar. `angRadius`
+// is the disk's angular radius in radians (real moon ≈ 0.0047; the default is
+// modestly enlarged for a photographic read). `toSun` points from the scene
+// toward the sun (below the horizon at night — exactly why the lit limb faces
+// the sunset). Faint earthshine keeps the dark limb readable on a new-ish moon.
+static inline float3 nightMoonDisk(float3 rayDir, float3 moonDir, float3 toSun,
+                                   float angRadius, float intensity, float pixAngle) {
+    if (intensity <= 0.0f || angRadius <= 0.0f) return float3(0.0f);
+    float cosT = dot(rayDir, moonDir);
+    if (cosT <= 0.0f) return float3(0.0f);
+
+    // Disk-local frame + position in units of the angular radius.
+    float3 upRef = fabs(moonDir.y) < 0.98f ? float3(0, 1, 0) : float3(1, 0, 0);
+    float3 T = normalize(cross(upRef, moonDir));
+    float3 B = cross(moonDir, T);
+    float  sinR = sin(angRadius);
+    float2 q = float2(dot(rayDir, T), dot(rayDir, B)) / sinR;
+    float  r2 = dot(q, q);
+    float  r  = sqrt(r2);
+
+    // Anti-aliased edge: one-pixel soft limb.
+    float aaW = max(pixAngle / angRadius, 1e-3f);
+    float disk = 1.0f - smoothstep(1.0f - aaW, 1.0f + aaW, r);
+    if (disk <= 0.0f) return float3(0.0f);
+
+    // Sphere normal at the visible point (the hemisphere facing the viewer).
+    float nz = sqrt(max(0.0f, 1.0f - min(r2, 1.0f)));
+    float3 n = q.x * T + q.y * B - nz * moonDir;
+
+    // Geometric terminator (sun at infinity — parallax is negligible), softened a
+    // touch: the regolith limb is not a hard lambert edge at this scale.
+    float lit = max(0.0f, dot(n, normalize(toSun)));
+    float shade = pow(lit, 0.75f);
+    float earthshine = 0.03f;
+
+    // Maria + crater speckle in DISK-LOCAL coords, so the moon always shows the
+    // same face and the pattern doesn't swim as it crosses the sky.
+    float mare   = 1.0f - 0.18f * nightWorley2(q * 2.5f + float2(3.7f, 1.3f));
+    float crater = 1.0f - 0.08f * nightWorley2(q * 8.0f + float2(9.1f, 4.6f));
+
+    float3 col = float3(0.92f, 0.93f, 1.0f) * (shade + earthshine) * mare * crater;
+    return col * intensity * disk;
 }
 
 // ── IBL bake — diffuse irradiance ────────────────────────────────────────────
@@ -1873,6 +2330,7 @@ static inline float sunVisibility(
     sampler                              shadowSampler,
     constant FrameUniforms&              frame,
     float3 worldPos,
+    float3 N,
     float  NdotL
 ) {
     if (!kLightingShadowEnabled) return 1.0;  // function_constant(1) — see decls above
@@ -1882,7 +2340,7 @@ static inline float sunVisibility(
     float viewDist = -vp.z;
     uint cascade = pickCascade(viewDist, frame.cascadeSplitsView.xyz);
 
-    // Slope-scaled bias — surfaces nearly parallel to the light direction
+    // Slope-scaled depth bias — surfaces nearly parallel to the light direction
     // need more bias to avoid acne, but biasing too much causes peter-panning.
     float slope = clamp(1.0 - NdotL, 0.0, 1.0);
     float bias = frame.shadowBias + frame.shadowSlopeBias * slope;
@@ -1895,12 +2353,32 @@ static inline float sunVisibility(
     else if (cascade == 1u) cascadeVP = frame.shadowVP1;
     else                    cascadeVP = frame.shadowVP2;
 
-    return sampleCascade(shadowMap, shadowSampler, worldPos,
+    // Normal-offset bias. Depth bias along the light ray peter-pans grazing
+    // surfaces (it scales with 1-NdotL, so walls detach from their contact
+    // line — the classic offset artifact). Instead push the *receiver sample*
+    // out along its own surface normal by ~1 shadow texel of WORLD size, so a
+    // flat top no longer samples its own occluder (kills self-shadow acne)
+    // while the in-plane shift barely moves the shadow edge. Texel world size
+    // is derived from the cascade's ortho extent: the first matrix row's linear
+    // length is 1/radius, and the map spans 2·radius across `width` texels.
+    float3 row0 = float3(cascadeVP[0][0], cascadeVP[1][0], cascadeVP[2][0]);
+    float  radius = 1.0 / max(length(row0), 1e-6);
+    float  texelWorld = 2.0 * radius / float(shadowMap.get_width());
+    // Widen mildly on grazing incidence (where acne is worst) but stay bounded
+    // — 1–3 texels, never the runaway depth bias produced.
+    // Reduced from (1.0 + 2.0*slope) — front-face culling (second-depth) is the primary acne
+    // defence, so a smaller normal offset keeps acne away while the contact shadow stays tight
+    // (the larger offset peter-panned shadows off object bases). Also capped so an outer-cascade
+    // texel can't produce a runaway world push.
+    float3 biasedPos = worldPos + N * min(texelWorld * (0.4 + 0.8 * slope), 0.006);
+
+    return sampleCascade(shadowMap, shadowSampler, biasedPos,
                          cascadeVP, cascade, bias, frame.shadowPcfRadius);
 }
 
 static inline float3 brdf(
-    float3 N, float3 V, float3 L, float3 albedo, float metallic, float roughness, float3 lightColor
+    float3 N, float3 V, float3 L, float3 albedo, float metallic, float roughness, float3 lightColor,
+    float anisotropy = 0.0, float3 grainT = float3(0.0)
 ) {
     float3 H = normalize(V + L);
     float NdotL = saturate(dot(N, L));
@@ -1911,8 +2389,22 @@ static inline float3 brdf(
 
     float3 F0 = mix(float3(0.04), albedo, metallic);
     float3 F  = fresnelSchlick(HdotV, F0);
-    float  D  = distributionGGX(NdotH, roughness);
     float  G  = geometrySmith(NdotV, NdotL, roughness);
+    float  D;
+    if (anisotropy > 0.001 && dot(grainT, grainT) > 0.25) {
+        // Anisotropic GGX (Burley): stretch the lobe along the in-plane grain tangent, compress
+        // across it — a wood floor / brushed steel reads as a streaked highlight, not a round one.
+        float3 B  = normalize(cross(N, grainT));
+        float3 T  = normalize(cross(B, N));                 // re-orthogonalize into the plane
+        float  a  = max(roughness * roughness, 1e-3);
+        float  at = max(a * (1.0 + anisotropy), 1e-3);      // along grain (stretched)
+        float  ab = max(a * (1.0 - 0.7 * anisotropy), 1e-3); // across grain (tight)
+        float  ToH = dot(T, H), BoH = dot(B, H);
+        float  d  = ToH * ToH / (at * at) + BoH * BoH / (ab * ab) + NdotH * NdotH;
+        D = 1.0 / (M_PI_F * at * ab * d * d);
+    } else {
+        D = distributionGGX(NdotH, roughness);
+    }
 
     float3 spec = (D * G * F) / (4.0 * NdotV * NdotL + 1e-7);
     float3 kd = (1.0 - F) * (1.0 - metallic);
@@ -2459,17 +2951,28 @@ kernel void illumi_lighting(
     // #60 task 5 increment 2 — LTC area-light specular LUTs (Minv + magnitude).
     texture2d<float, access::sample>        ltcMat          [[texture(16)]],
     texture2d<float, access::sample>        ltcMag          [[texture(17)]],
+    // Light-layer G-buffer target (R32Uint). Cleared to 0xFFFFFFFF for sky pixels;
+    // each instance writes its `layer` bitfield here. A light contributes only when
+    // (light.layerMask & fragLayer) != 0. When the host leaves every instance and
+    // light at the default 0xFFFFFFFF the mask is always non-zero ⇒ no change.
+    texture2d<uint,  access::read>          gLayer          [[texture(18)]],
+    // Point-light cube depth atlas: 6 slices per shadowed light (slice = cube*6 + face).
+    // Bound to a same-type placeholder when point shadows are off; never sampled then.
+    depth2d_array<float, access::sample>    pointShadowAtlas [[texture(19)]],
     // Issue #65 — screen-space SSS diffuse side buffer. rgb = the diffuse-lit
     // irradiance of an SSS-flagged pixel; a = the SSS mask (1 = blur this pixel,
     // 0 = leave it). Written ONLY when frame.sssStrength > 0 (else the binding is
     // an unread dummy and the write is skipped, so non-SSS scenes pay nothing).
-    texture2d<half,  access::write>         sssOut          [[texture(18)]],
+    // (texture(20): 18/19 were taken by gLayer/pointShadowAtlas in the merge.)
+    texture2d<half,  access::write>         sssOut          [[texture(20)]],
     constant FrameUniforms&                 frame           [[buffer(0)]],
     const device PointLight*                pointLights     [[buffer(1)]],
     constant DDGIUniforms&                  ddgi            [[buffer(2)]],
     const device SpotLight*                 spotLights      [[buffer(3)]],
     const device AreaLight*                 areaLights      [[buffer(4)]],
     const device DirectionalLight*          extraDirectionals [[buffer(5)]],
+    // Per-face view-projection matrices for shadowed point lights (6 per cube).
+    const device float4x4*                  pointShadowFaces [[buffer(6)]],
     uint2                                   gid             [[thread_position_in_grid]]
 ) {
     uint w = outHDR.get_width();
@@ -2490,6 +2993,19 @@ kernel void illumi_lighting(
         float4 farWorld = frame.invViewProjection * farClip;
         float3 dir = normalize(farWorld.xyz / farWorld.w - frame.cameraWorldPos);
         float3 sky = sampleSkyEquirect(skyEquirect, dir);
+        // Analytic night sky (opt-in): pixel-sharp stars + a phase-correct moon
+        // composited over the (celestial-free) dome. Zero params ⇒ exact no-op.
+        // TAA's jittered projection supersamples the sub-pixel star cores.
+        if ((frame.nightSkyParams.x > 0.0f || frame.nightSkyParams.y > 0.0f)
+            && dir.y > -0.05f) {
+            // Angular size of one pixel from the projection: tan(fovY/2) = 1/P[1][1].
+            float pixAngle = (2.0f / frame.projection[1][1]) / float(h);
+            sky += nightStarField(dir, frame.nightSkyParams.x, pixAngle);
+            sky += nightMoonDisk(dir, normalize(frame.nightMoonDir.xyz),
+                                 frame.nightSunDir.xyz,
+                                 frame.nightSkyParams.z,
+                                 frame.nightSkyParams.y, pixAngle);
+        }
         outHDR.write(half4(half3(sky), 1.0h), gid);
         // Issue #65 — sky is never SSS; clear its mask so the composite skips it.
         if (frame.sssStrength > 0.0) sssOut.write(half4(0.0h), gid);
@@ -2504,6 +3020,10 @@ kernel void illumi_lighting(
     float3 N         = octDecode(float2(nrH.rg));
     float  roughness = max(0.045, float(nrH.b));
     float3 emission  = float3(emH.rgb);
+    // Light-layer bitfield for this fragment. Default (host never set a layer)
+    // reads 0xFFFFFFFF, so (light.layerMask & fragLayer) is always non-zero below
+    // ⇒ every light contributes exactly as before.
+    uint   fragLayer = gLayer.read(gid).r;
 
     float3 worldPos = worldPosFromDepth(ndc, depth, frame.invViewProjection);
     float3 V = normalize(frame.cameraWorldPos - worldPos);
@@ -2530,7 +3050,7 @@ kernel void illumi_lighting(
     float3 Ld = normalize(frame.directionalLightDir);
     float NdotL_sun = saturate(dot(N, Ld));
     float visibility = sunVisibility(shadowMap, shadowSampler, frame,
-                                     worldPos, NdotL_sun);
+                                     worldPos, N, NdotL_sun);
     // ── Screen-space contact shadows (issue #65) ────────────────────────────
     // Fold a short screen-space ray-march occlusion into the sun visibility so
     // EVERY sun-driven term below (direct BRDF, leaf/plush transmission, the
@@ -2549,8 +3069,19 @@ kernel void illumi_lighting(
     }
     // Terms kept separate so the per-term split-render (frame.debugTerm) can
     // isolate any one of them; the normal path just sums them at the end.
+    // Phase 7c — grain anisotropy: normalRoughness.w carries (1 + aniso) for wood/brushed-metal
+    // pixels (opaque is exactly 1.0). Reconstruct an in-plane grain tangent from a world reference
+    // (plan-X for floors/ceilings, horizontal for walls) — approximate (per-instance, not per-
+    // plank), but it's the highlight STRETCH that kills the plastic look, not the exact grain angle.
+    float aniso = (nrH.a > 1.001h) ? float(nrH.a - 1.0h) : 0.0;
+    float3 grainT = float3(0.0);
+    if (aniso > 0.001) {
+        float3 up = float3(0.0, 1.0, 0.0);
+        grainT = (abs(dot(N, up)) > 0.95) ? normalize(float3(1.0, 0.0, 0.0) - N * N.x)
+                                          : normalize(cross(N, up));
+    }
     float3 directSun = brdf(N, V, Ld, albedo, metallic, roughness,
-                            frame.directionalLightColor) * visibility;
+                            frame.directionalLightColor, aniso, grainT) * visibility;
     if (isSSS) sssDiffuse += brdfDiffuse(N, V, Ld, albedo, metallic,
                                          frame.directionalLightColor) * visibility;
 
@@ -2608,10 +3139,23 @@ kernel void illumi_lighting(
     float3 pointSum = float3(0.0);
     float3 spotSum  = float3(0.0);
 
+    // Point-light cube-shadow PCF sampler — hardware depth compare, same config as
+    // the spot path. Declared once outside the loop.
+    constexpr sampler pointShadowSampler(filter::linear,
+                                         compare_func::less_equal,
+                                         address::clamp_to_edge);
+
     // Point lights — inverse-square with smooth radius cutoff. (Includes the
     // synthesised emissive-as-light points from the extractor, Phase 4.27.)
     for (uint i = 0; i < frame.pointLightCount; ++i) {
         PointLight pl = pointLights[i];
+        // Light-layer mask: skip lights that don't share a bit with this fragment's
+        // layer. Default 0xFFFFFFFF on both sides ⇒ always passes (no change).
+        // A SHADOWED light (castsShadow) ignores the mask entirely: the depth cube
+        // is the real, geometry-correct occluder (blocks walls AND passes doorways),
+        // so applying the coarse position-based room mask on top would double-darken
+        // and re-introduce the doorway over-block the shadow exists to fix.
+        if (pl.castsShadow == 0u && (pl.layerMask & fragLayer) == 0u) continue;
         float3 toLight = pl.position - worldPos;
         float  dist    = length(toLight);
         if (dist > pl.radius) continue;
@@ -2619,8 +3163,52 @@ kernel void illumi_lighting(
         float atten = 1.0 / max(dist * dist, 1e-4);
         float window = saturate(1.0 - pow(dist / pl.radius, 4.0));
         atten *= window * window;
-        pointSum += brdf(N, V, L, albedo, metallic, roughness, pl.color * atten);
-        if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic, pl.color * atten);
+
+        // Cubemap shadow visibility. Only when this light opted in AND was assigned
+        // a cube page this frame. Pick the cube face from the dominant axis of the
+        // light→fragment direction (−L, pointing away from the bulb), project the
+        // fragment through that face's VP, and PCF-compare — identical machinery to
+        // the spot path, just with a face select in front.
+        float visibility = 1.0;
+        if (pl.castsShadow != 0u && pl.shadowCubeIndex >= 0) {
+            float3 d = -L;                     // bulb → fragment
+            float3 ad = abs(d);
+            uint face;
+            if (ad.x >= ad.y && ad.x >= ad.z)      face = (d.x > 0.0) ? 0u : 1u;  // ±X
+            else if (ad.y >= ad.z)                 face = (d.y > 0.0) ? 2u : 3u;  // ±Y
+            else                                   face = (d.z > 0.0) ? 4u : 5u;  // ±Z
+            uint slice = uint(pl.shadowCubeIndex) * 6u + face;
+            float4x4 faceVP = pointShadowFaces[slice];
+            float4 lsPos = faceVP * float4(worldPos, 1.0);
+            if (lsPos.w > 0.0) {
+                float2 lsNDC = lsPos.xy / lsPos.w;
+                float  lsZ   = lsPos.z  / lsPos.w;
+                float2 shadowUV = float2(lsNDC.x * 0.5 + 0.5,
+                                         -lsNDC.y * 0.5 + 0.5);
+                bool inFrustum = lsZ > 0.0 && lsZ < 1.0
+                              && shadowUV.x >= 0.0 && shadowUV.x <= 1.0
+                              && shadowUV.y >= 0.0 && shadowUV.y <= 1.0;
+                if (inFrustum) {
+                    float ref = lsZ - frame.pointShadowBias;
+                    float texel = 1.0 / 512.0;
+                    float sum = 0.0;
+                    for (int oy = -1; oy <= 1; ++oy) {
+                        for (int ox = -1; ox <= 1; ++ox) {
+                            sum += pointShadowAtlas.sample_compare(
+                                pointShadowSampler,
+                                shadowUV + float2(float(ox), float(oy)) * texel,
+                                slice,
+                                ref);
+                        }
+                    }
+                    visibility = sum * (1.0 / 9.0);
+                }
+            }
+        }
+        if (visibility <= 0.0) continue;
+        pointSum += brdf(N, V, L, albedo, metallic, roughness, pl.color * atten * visibility);
+        if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic,
+                                             pl.color * atten * visibility);
     }
 
     // Spot lights — same distance attenuation as point lights, multiplied
@@ -2634,6 +3222,8 @@ kernel void illumi_lighting(
                                         address::clamp_to_edge);
     for (uint i = 0; i < frame.spotLightCount; ++i) {
         SpotLight sl = spotLights[i];
+        // Light-layer mask (same rule as point lights). Default all-bits ⇒ passes.
+        if ((sl.layerMask & fragLayer) == 0u) continue;
         float3 toLight = sl.position - worldPos;
         float  dist    = length(toLight);
         if (dist > sl.radius) continue;
@@ -2719,6 +3309,18 @@ kernel void illumi_lighting(
     uint aoH = aoTex.get_height();
     uint2 aoCoord = min(gid / 2, uint2(aoW - 1, aoH - 1));
     float ao = float(aoTex.read(aoCoord).r);
+
+    // ── Interior day-light separation (FrameUniforms.interiorMask) ──────────
+    // Both factors stay exactly 1.0 unless the host opted in AND this fragment
+    // carries a stamped interior room bit, so the multiplies below are exact
+    // no-ops (×1.0) for every scene that never sets `interiorMask`.
+    float interiorIBLK = 1.0;
+    float interiorAmbK = 1.0;
+    if (frame.interiorMask != 0u && fragLayer != 0xFFFFFFFFu &&
+        (fragLayer & frame.interiorMask) != 0u) {
+        interiorIBLK = mix(frame.interiorIBLSide, frame.interiorIBLUp, saturate(N.y));
+        interiorAmbK = frame.interiorAmbient;
+    }
 
     // ── Indirect (IBL + optional DDGI for diffuse) ──────────────────
     float3 indirect;
@@ -2831,9 +3433,9 @@ kernel void illumi_lighting(
             specularIBL = specEnv * F;
         }
 
-        indirect = (diffuseIBL + specularIBL) * frame.iblIntensity * ao;
-        dbgDiffuseIBL = diffuseIBL * frame.iblIntensity * ao;
-        dbgSpecularIBL = specularIBL * frame.iblIntensity * ao;
+        indirect = (diffuseIBL + specularIBL) * frame.iblIntensity * ao * interiorIBLK;
+        dbgDiffuseIBL = diffuseIBL * frame.iblIntensity * ao * interiorIBLK;
+        dbgSpecularIBL = specularIBL * frame.iblIntensity * ao * interiorIBLK;
         // `ambientColor` is now a TRUE ambient term — only SCN `.ambient`
         // lights (uniform, no NdotL) feed it. As of #60 task 5 the secondary
         // SCN directionals (fill, back) are NO LONGER folded in here; they
@@ -2843,15 +3445,15 @@ kernel void illumi_lighting(
         float upness = saturate(N.y * 0.5 + 0.5);
         float3 ambCol = desaturateFill(frame.ambientColor, frame.iblDiffuseDesaturation);
         float3 ambSupp = mix(ambCol * 0.4, ambCol, upness) * albedo;
-        indirect += ambSupp * ao;
-        dbgAmbient = ambSupp * ao;
+        indirect += ambSupp * ao * interiorAmbK;
+        dbgAmbient = ambSupp * ao * interiorAmbK;
     } else {
         // Legacy hemispheric ambient — only the diffuse term, no spec.
         float upness = saturate(N.y * 0.5 + 0.5);
         float3 ambCol = desaturateFill(frame.ambientColor, frame.iblDiffuseDesaturation);
         float3 amb = mix(ambCol * 0.4, ambCol, upness) * albedo;
-        indirect = amb * ao;
-        dbgAmbient = amb * ao;
+        indirect = amb * ao * interiorAmbK;
+        dbgAmbient = amb * ao * interiorAmbK;
     }
 
     // Issue #65 — fold the indirect DIFFUSE (diffuse-IBL irradiance + ambient
@@ -2860,20 +3462,15 @@ kernel void illumi_lighting(
     // dbgDiffuseIBL is 0 and dbgAmbient carries the hemispheric diffuse.)
     if (isSSS) sssDiffuse += dbgDiffuseIBL + dbgAmbient;
 
-    // ── Sausage-casing clearcoat (HotdogDropUltra) ──────────────────────────
-    // Casing pixels carry 0.75 in normalRoughness.w (foliage = 0, opaque = 1).
-    // HotdogDrop+'s frank is a SATIN base (roughness mottle mean ≈ 0.48) under
-    // a thin wet-glaze clearcoat (SCNMaterial clearCoat 0.55, ccRoughness 0.18)
-    // — the glaze is what carries the tight "just off the grill" glint. A
-    // single GGX lobe can't be both satin and glinting (rounds 30↔31 oscillated
-    // between silicone and foam-rubber trying), so this is a real second lobe:
-    // fixed-F0 dielectric GGX on the sun + a tight prefiltered-IBL sample,
-    // weighted by Drop+'s 0.55 coat strength. No-op for every other scene.
+    // ── Phase 7 — per-material clearcoat (terrazzo/marble/lacquered wood) ──────
+    // Clearcoat strength is packed into emission.alpha in the G-buffer (default 0).
+    // A second dielectric GGX lobe (F0=0.04, roughness=0.08) is added for
+    // polished surfaces. Strength 0 → no cost (branch exits immediately).
     float3 clearcoat = float3(0.0);
-    if (nrH.a > 0.6h && nrH.a < 0.9h) {
-        const float ccRough    = 0.18;
-        const float ccF0       = 0.04;
-        const float ccStrength = 0.55;
+    float houseCC = float(emH.a);
+    if (houseCC > 0.001f) {
+        const float ccRough = 0.08;    // tight polish (terrazzo/marble)
+        const float ccF0    = 0.04;    // dielectric IOR 1.5
         float ccNdotV = saturate(dot(N, V));
         if (NdotL_sun > 0.0) {
             float3 Hcc = normalize(V + Ld);
@@ -2890,9 +3487,51 @@ kernel void illumi_lighting(
             float3 env  = float3(prefilteredCube.sample(ccSampler, Rcc,
                                                         level(ccRough * (mips - 1.0))).rgb);
             float  Fcc  = ccF0 + (1.0 - ccF0) * pow(1.0 - ccNdotV, 5.0);
-            clearcoat += env * Fcc * frame.iblIntensity * ao;
+            // Interior separation: a lacquered interior floor's clearcoat environment
+            // reflection is the same open-top skylight the diffuse IBL is — dim it by
+            // the same factor (×1.0 no-op when the feature is off).
+            clearcoat += env * Fcc * frame.iblIntensity * ao * interiorIBLK;
         }
-        clearcoat *= ccStrength;
+        clearcoat *= houseCC;
+        // Energy conservation: clearcoat layer attenuates the base for grazing V.
+        float baseAtten = 1.0 - houseCC * (ccF0 + (1.0 - ccF0) * pow(1.0 - saturate(dot(N, V)), 5.0));
+        directSun    *= baseAtten;
+        indirect     *= baseAtten;
+    }
+
+    // ── Sausage-casing clearcoat (HotdogDropUltra) ──────────────────────────
+    // Casing pixels carry 0.75 in normalRoughness.w (foliage = 0, opaque = 1).
+    // HotdogDrop+'s frank is a SATIN base (roughness mottle mean ≈ 0.48) under
+    // a thin wet-glaze clearcoat (SCNMaterial clearCoat 0.55, ccRoughness 0.18)
+    // — the glaze is what carries the tight "just off the grill" glint. A
+    // single GGX lobe can't be both satin and glinting (rounds 30↔31 oscillated
+    // between silicone and foam-rubber trying), so this is a real second lobe:
+    // fixed-F0 dielectric GGX on the sun + a tight prefiltered-IBL sample,
+    // weighted by Drop+'s 0.55 coat strength. No-op for every other scene.
+    float3 hotdogCC = float3(0.0);
+    if (nrH.a > 0.6h && nrH.a < 0.9h) {
+        const float ccRough    = 0.18;
+        const float ccF0       = 0.04;
+        const float ccStrength = 0.55;
+        float ccNdotV = saturate(dot(N, V));
+        if (NdotL_sun > 0.0) {
+            float3 Hcc = normalize(V + Ld);
+            float  Dcc = distributionGGX(saturate(dot(N, Hcc)), ccRough);
+            float  Gcc = geometrySmith(ccNdotV, NdotL_sun, ccRough);
+            float  Fcc = ccF0 + (1.0 - ccF0) * pow(1.0 - saturate(dot(Hcc, V)), 5.0);
+            float  spec = (Dcc * Gcc * Fcc) / max(4.0 * ccNdotV * NdotL_sun, 1e-4);
+            hotdogCC += frame.directionalLightColor * spec * NdotL_sun * visibility;
+        }
+        if (kLightingIBLEnabled) {
+            constexpr sampler ccSampler(filter::linear, mip_filter::linear);
+            float3 Rcc  = reflect(-V, N);
+            float  mips = float(max(frame.iblPrefilteredMipCount, 1u));
+            float3 env  = float3(prefilteredCube.sample(ccSampler, Rcc,
+                                                        level(ccRough * (mips - 1.0))).rgb);
+            float  Fcc  = ccF0 + (1.0 - ccF0) * pow(1.0 - ccNdotV, 5.0);
+            hotdogCC += env * Fcc * frame.iblIntensity * ao;
+        }
+        hotdogCC *= ccStrength;
     }
 
     // ── Plush fur sheen rim (Teddy Bear Press) ───────────────────────────────
@@ -2910,7 +3549,22 @@ kernel void illumi_lighting(
         plushSheenTerm = sheenTint * fres * frame.plushSheen * (sunSheen + ambSheen);
     }
 
-    float3 color = directSun + transmission + dirFillSum + pointSum + spotSum + areaSum + indirect + emission + clearcoat + plushSheenTerm;
+    // ── Phase 7b — per-material cloth sheen (velvet/wool/linen) ───────────────
+    // Fabric packs its sheen strength as a NEGATIVE emission.alpha (reuses the clearcoat
+    // channel; a surface is polished OR cloth, never both). A soft grazing-Fresnel
+    // retroreflective rim — the velvety glow real cloth catches, which a single GGX lobe
+    // can't give. Strength = -emission.alpha. No-op for every non-cloth surface (a ≥ 0).
+    float3 clothSheen = float3(0.0);
+    float sheenStrength = float(-emH.a);
+    if (sheenStrength > 0.001f) {
+        float  fres = pow(1.0 - saturate(dot(N, V)), 2.5);    // grazing-angle edge
+        float3 sheenTint = albedo * 0.4 + float3(0.6);        // fibre-tip warm white
+        float3 sunSheen = frame.directionalLightColor * (NdotL_sun * visibility);
+        float3 ambSheen = desaturateFill(frame.ambientColor, frame.iblDiffuseDesaturation) * ao;
+        clothSheen = sheenTint * fres * sheenStrength * (sunSheen + ambSheen);
+    }
+
+    float3 color = directSun + transmission + dirFillSum + pointSum + spotSum + areaSum + indirect + emission + clearcoat + hotdogCC + plushSheenTerm + clothSheen;
 
     // Per-term split-render: isolate ONE contribution so a flooded/flat scene
     // can be decomposed. Surfaces only — sky already returned above.
@@ -4889,6 +5543,107 @@ kernel void illumi_bloom_blur_v(
     outTex.write(half4(half3(acc), 1.0h), gid);
 }
 
+// ── Halation (film) ──────────────────────────────────────────────────────────
+//
+// On real film, light from a blown highlight passes THROUGH the emulsion, scatters
+// off the back of the acetate base, and re-exposes the emulsion from behind — a
+// wide, diffuse second exposure around the highlight. The anti-halation backing
+// absorbs short wavelengths best, so what survives that round trip is predominantly
+// RED, which is why blown highlights on film wear a warm orange halo far wider and
+// softer than any lens bloom.
+//
+// Modelled as its own threshold → wide separable gaussian → tinted add, run at a
+// QUARTER of the internal resolution. Quarter-res is both the cost win and the
+// point: it buys a wide, soft halo out of a 9-tap kernel, and halation carries no
+// high-frequency detail worth preserving. It is a SEPARATE chain from bloom rather
+// than a re-tint of the bloom texture because the two key off different thresholds
+// (only genuinely blown highlights halate) and want radii an order of magnitude
+// apart.
+//
+// `halationParams.x == 0` (the default) ⇒ the host does not encode these passes at
+// all AND the tonemap branch is skipped ⇒ non-opting scenes are byte-identical.
+
+kernel void illumi_halation_threshold(
+    texture2d<half, access::read>  inHDR     [[texture(0)]],
+    texture2d<half, access::write> outBright [[texture(1)]],
+    constant FrameUniforms&        frame     [[buffer(0)]],
+    uint2                          gid       [[thread_position_in_grid]]
+) {
+    uint w = outBright.get_width();
+    uint h = outBright.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    // 4×4 box downsample of the full-res HDR → quarter res.
+    uint2 maxC = uint2(inHDR.get_width() - 1, inHDR.get_height() - 1);
+    uint2 src  = gid * 4;
+    float3 avg = float3(0.0);
+    for (uint j = 0; j < 4; ++j) {
+        for (uint i = 0; i < 4; ++i) {
+            avg += float3(inHDR.read(min(src + uint2(i, j), maxC)).rgb);
+        }
+    }
+    avg *= (1.0 / 16.0);
+    // Only the EXCESS over the threshold scatters — the same linear knee bloom uses,
+    // so the halo grows continuously out of the highlight instead of popping in.
+    float lum = dot(avg, float3(0.2126, 0.7152, 0.0722));
+    float t = max(0.0, lum - frame.halationParams.y);
+    float3 bright = avg * (t / max(lum, 1e-4));
+    outBright.write(half4(half3(bright), 1.0h), gid);
+}
+
+// Tap spacing (in QUARTER-res texels) for the 9-tap gaussian below. The kernel's
+// sigma is 2 taps, and a halo reads as radius ≈ 2σ, so a requested radius R in
+// INTERNAL-resolution texels — R/4 quarter-texels — wants a spacing of R/16.
+// Clamped to ≥1 so the kernel never collapses to a 9× re-read of one texel.
+static inline float halationTapStep(constant FrameUniforms& frame) {
+    return max(1.0, frame.halationParams.z * (1.0 / 16.0));
+}
+
+kernel void illumi_halation_blur_h(
+    texture2d<half, access::sample> inTex  [[texture(0)]],
+    texture2d<half, access::write>  outTex [[texture(1)]],
+    constant FrameUniforms&         frame  [[buffer(0)]],
+    uint2                           gid    [[thread_position_in_grid]]
+) {
+    uint w = outTex.get_width();
+    uint h = outTex.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    constexpr sampler smp(filter::linear, address::clamp_to_edge, coord::normalized);
+    const float weights[5] = { 0.227027, 0.194595, 0.121622, 0.054054, 0.016216 };
+    float2 invSize = 1.0 / float2(w, h);
+    float2 uv = (float2(gid) + 0.5) * invSize;
+    float  tap = halationTapStep(frame);
+    float3 acc = float3(inTex.sample(smp, uv).rgb) * weights[0];
+    for (int i = 1; i < 5; ++i) {
+        float o = float(i) * tap * invSize.x;
+        acc += float3(inTex.sample(smp, uv + float2(o, 0.0)).rgb) * weights[i];
+        acc += float3(inTex.sample(smp, uv - float2(o, 0.0)).rgb) * weights[i];
+    }
+    outTex.write(half4(half3(acc), 1.0h), gid);
+}
+
+kernel void illumi_halation_blur_v(
+    texture2d<half, access::sample> inTex  [[texture(0)]],
+    texture2d<half, access::write>  outTex [[texture(1)]],
+    constant FrameUniforms&         frame  [[buffer(0)]],
+    uint2                           gid    [[thread_position_in_grid]]
+) {
+    uint w = outTex.get_width();
+    uint h = outTex.get_height();
+    if (gid.x >= w || gid.y >= h) return;
+    constexpr sampler smp(filter::linear, address::clamp_to_edge, coord::normalized);
+    const float weights[5] = { 0.227027, 0.194595, 0.121622, 0.054054, 0.016216 };
+    float2 invSize = 1.0 / float2(w, h);
+    float2 uv = (float2(gid) + 0.5) * invSize;
+    float  tap = halationTapStep(frame);
+    float3 acc = float3(inTex.sample(smp, uv).rgb) * weights[0];
+    for (int i = 1; i < 5; ++i) {
+        float o = float(i) * tap * invSize.y;
+        acc += float3(inTex.sample(smp, uv + float2(0.0, o)).rgb) * weights[i];
+        acc += float3(inTex.sample(smp, uv - float2(0.0, o)).rgb) * weights[i];
+    }
+    outTex.write(half4(half3(acc), 1.0h), gid);
+}
+
 // ── Tonemap + composite ──────────────────────────────────────────────────────
 //
 // ACES filmic curve (Krzysztof Narkowicz's approximation). Reads HDR + bloom,
@@ -4901,6 +5656,57 @@ static inline float3 aces(float3 x) {
     const float d = 0.59;
     const float e = 0.14;
     return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+}
+
+// ── Color-grade: white-balance gain from a Kelvin temperature ───────────────
+// Maps a correlated colour temperature (~2000–10000 K) to a normalized linear
+// RGB channel gain that, when MULTIPLIED into a neutral scene, warms it (low K)
+// or cools it (high K). 6500 K → (1,1,1) exactly (no-op default). We use a
+// cheap polynomial approximation of the daylight locus' channel response
+// rather than a full Planckian/CIE conversion — it only has to read tasteful
+// across the slider, not be colorimetrically exact. Normalized so the green
+// channel (and the luma) stays ≈1, i.e. the grade tints rather than dims.
+static inline float3 whiteBalanceGain(float kelvin) {
+    // Reference is 6500 K (D65). Below → push red, pull blue (warm); above →
+    // push blue, pull red (cool). A smooth, monotonic curve in 1000s-of-K.
+    float t = (kelvin - 6500.0) / 6500.0;        // 0 at D65; ~-0.69 at 2000 K; ~+0.54 at 10000 K
+    float r = 1.0 - 0.45 * t;                    // warmer (low K) → more red
+    float b = 1.0 + 0.55 * t;                    // warmer (low K) → less blue
+    float g = 1.0 - 0.04 * t * t;                // slight green dip away from D65
+    float3 gain = float3(max(r, 0.0), max(g, 0.0), max(b, 0.0));
+    // Renormalize to unit luma so the white-balance only shifts hue, not exposure.
+    float lum = dot(gain, float3(0.2126, 0.7152, 0.0722));
+    return (lum > 1e-4) ? gain / lum : float3(1.0);
+}
+
+// Green↔magenta tint on the [-1, 1] axis. tint > 0 pushes magenta (boost R+B,
+// cut G); tint < 0 pushes green. Luma-preserving by construction (the green
+// move is twice the magenta half-move). 0 = no-op.
+static inline float3 tintGain(float tint) {
+    float g = 1.0 - 0.20 * tint;                 // magenta (tint>0) cuts green
+    float rb = 1.0 + 0.10 * tint;                // ...and lifts red+blue
+    return float3(rb, g, rb);
+}
+
+// Tonemapped-domain tone curve. Operates on a 0..1 LDR colour:
+//   • contrast pivots around mid-grey 0.18 (1.0 = no-op)
+//   • shadows lifts (>1) / crushes (<1) the low-luma end (1.0 = no-op)
+//   • highlights lifts/rolls the high-luma end (1.0 = no-op)
+// Shadows/highlights are luma-weighted so mid-tones stay put and the two ends
+// move independently. All three default to 1.0 → an exact no-op.
+static inline float3 toneCurve(float3 c, float contrast, float shadows, float highlights) {
+    // Contrast around mid-grey pivot.
+    const float pivot = 0.18;
+    c = (c - pivot) * contrast + pivot;
+    c = max(c, 0.0);
+    // Per-pixel luma drives the shadow/highlight weights.
+    float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
+    // Smooth low/high masks: shadowW ≈ 1 in blacks → 0 by mid; highW the inverse.
+    float shadowW = 1.0 - smoothstep(0.0, 0.5, lum);
+    float highW   = smoothstep(0.5, 1.0, lum);
+    // Multiplicative lift/crush — keeps hue, scales magnitude per region.
+    float scale = mix(1.0, shadows, shadowW) * mix(1.0, highlights, highW);
+    return max(c * scale, 0.0);
 }
 
 // SSAA downsample. The HDR + bloom textures are sized to the INTERNAL
@@ -4954,6 +5760,13 @@ fragment float4 illumi_tonemap_fs(
     texture2d<half,  access::read>  gAlbedoMet [[texture(4)]], // .rgb albedo, .a metalness
     texture2d<half,  access::read>  gNormalRgh [[texture(5)]], // .xy oct-normal, .z roughness
     depth2d<float,   access::read>  gDepth     [[texture(6)]],
+    // Phase 9 — film-stock LUT: 16×16×16 3D texture (B slices left-to-right in
+    // the 256×16 PNG strip). Bound when filmLUTStrength > 0; nil-checked below.
+    // (texture(7): 2..6 were taken by colorLUT/inVel/G-buffer in the merge.)
+    texture3d<float, access::sample> filmLUT  [[texture(7)]],
+    // Quarter-res halation halo. Always bound (the texture exists); its contents are
+    // stale when halationParams.x == 0, and the branch below never reads it then.
+    texture2d<half, access::sample> inHalation [[texture(8)]],
     constant FrameUniforms&         frame    [[buffer(0)]],
     // Phase 4.21 — auto-exposure read (see below).
     const device ExposureState&     expoState [[buffer(1)]]
@@ -5124,6 +5937,80 @@ fragment float4 illumi_tonemap_fs(
     float3 bloom = float3(inBloom.sample(downSampler, in.uv).rgb);
 
     float3 mixed = hdr + bloom * frame.bloomIntensity;
+
+    // ── Halation (film) ────────────────────────────────────────────────────────
+    // The wide warm halo film wears around blown highlights (see the halation
+    // kernels above). Added in the HDR domain, like bloom, so exposure + ACES shape
+    // it. The halo is driven mostly by LUMINANCE and takes its colour from
+    // `halationTint` — real halation is red because red is what survives the round
+    // trip through the anti-halation backing, whatever colour the highlight was —
+    // with a quarter of the source hue left in so a strongly coloured highlight
+    // still tints its own halo. Intensity 0 (the default) skips the branch.
+    if (frame.halationParams.x > 0.0) {
+        // Artistic normalisation. The threshold keeps only the EXCESS radiance above the
+        // blown point, and the wide gaussian then averages that excess down by the fraction
+        // of the kernel a highlight covers — so the raw halo is a small fraction of scene
+        // radiance and a 0…1 dial would spend its whole range on "barely visible". This gain
+        // makes `halationIntensity = 1.0` the intended full-strength look (the same
+        // convention `lensFlareIntensity` uses); it is a constant, not a per-scene tuning.
+        constexpr float kHalationGain = 3.0;
+        float3 halo    = float3(inHalation.sample(downSampler, in.uv).rgb);
+        float  haloLum = dot(halo, float3(0.2126, 0.7152, 0.0722));
+        halo = mix(float3(haloLum), halo, 0.25) * frame.halationTint.rgb;
+        mixed += halo * (frame.halationParams.x * kHalationGain);
+    }
+
+    // ── Lens flare (sun) ───────────────────────────────────────────────────────
+    // Screen-space anamorphic streak + ghost train + halo, driven by the sun's
+    // projected screen position (frame.lensFlareParams: x = strength, yz = sun uv,
+    // w = on-screen weight). Occlusion is OPTICAL, not geometric: the HDR source is
+    // sampled at the sun's uv — when a wall hides the sun those taps are stops
+    // dimmer than open sky and the flare fades out, exactly like a real camera.
+    // Added in the HDR domain so exposure/ACES/grade shape it naturally. Strength 0
+    // (the default) skips the branch — non-opting scenes are byte-for-byte unchanged.
+    if (frame.lensFlareParams.x > 0.0 && frame.lensFlareParams.w > 0.0) {
+        float2 sunUV = frame.lensFlareParams.yz;
+        float3 sunTap = float3(inHDR.sample(downSampler, sunUV).rgb);
+        float2 tapR = 4.0 * invInSize;
+        sunTap += float3(inHDR.sample(downSampler, sunUV + float2( tapR.x, 0)).rgb);
+        sunTap += float3(inHDR.sample(downSampler, sunUV + float2(-tapR.x, 0)).rgb);
+        sunTap += float3(inHDR.sample(downSampler, sunUV + float2(0,  tapR.y)).rgb);
+        sunTap += float3(inHDR.sample(downSampler, sunUV + float2(0, -tapR.y)).rgb);
+        float sunLuma = dot(sunTap * 0.2, float3(0.2126, 0.7152, 0.0722));
+        float vis = smoothstep(0.35, 1.6, sunLuma) * frame.lensFlareParams.w;
+        if (vis > 0.001) {
+            float gain = frame.lensFlareParams.x * vis;
+            float aspect = inSize.x / inSize.y;
+            float2 asp = float2(aspect, 1.0);
+            float2 toC = float2(0.5, 0.5) - sunUV;             // sun → frame centre
+            float3 flare = float3(0.0);
+            // Ghost train: tinted discs strung along the sun–centre axis (the
+            // classic multi-element internal-reflection pattern).
+            const float  gT[5]    = { 0.45, 0.85, 1.30, 1.70, 2.10 };
+            const float  gR[5]    = { 0.020, 0.045, 0.032, 0.065, 0.028 };
+            const float3 gTint[5] = { float3(1.00, 0.85, 0.60), float3(0.55, 0.75, 1.00),
+                                      float3(1.00, 0.65, 0.45), float3(0.60, 0.90, 1.00),
+                                      float3(0.95, 0.80, 1.00) };
+            for (int g = 0; g < 5; ++g) {
+                float2 pos = sunUV + toC * gT[g];
+                float d = length((in.uv - pos) * asp);
+                float disc = smoothstep(gR[g], gR[g] * 0.25, d);
+                flare += gTint[g] * disc * (0.14 / (1.0 + gT[g]));
+            }
+            // Halo ring about the frame centre at the sun's mirrored radius.
+            float haloR = clamp(length(toC * asp) * 0.8, 0.15, 0.45);
+            float dC = length((in.uv - 0.5) * asp);
+            float halo = exp(-pow((dC - haloR) * 18.0, 2.0));
+            flare += float3(0.55, 0.75, 1.0) * halo * 0.065;
+            // Anamorphic streak through the sun — tight vertically, long horizontally.
+            float2 dS = (in.uv - sunUV) * asp;
+            float streak = exp(-fabs(dS.y) * 90.0) * exp(-fabs(dS.x) * 4.5);
+            flare += float3(0.65, 0.80, 1.0) * streak * 1.1;
+            // Veiling glare around the sun itself.
+            flare += float3(1.0, 0.92, 0.78) * exp(-length(dS) * 7.0) * 0.55;
+            mixed += flare * gain;
+        }
+    }
     // Phase 4.21 — read the GPU-computed smoothed exposure from the
     // auto-exposure buffer when the host has the feature on; otherwise
     // fall back to the static scalar in FrameUniforms. The estimator
@@ -5140,7 +6027,12 @@ fragment float4 illumi_tonemap_fs(
                      ? expoState.smoothedExposure
                      : 1.0;
     float exposure = autoBase * frame.exposure;
-    float3 mapped = aces(mixed * exposure);
+    // ── Color-grade: white-balance + tint on LINEAR HDR, pre-tonemap ──────────
+    // Channel-multiply gains are most physical in linear light (they model a
+    // sensor/illuminant shift), so they go in before exposure + ACES. Defaults
+    // (whiteBalanceK = 6500, tint = 0) make both gains exactly (1,1,1) → no-op.
+    float3 graded = mixed * whiteBalanceGain(frame.whiteBalanceK) * tintGain(frame.tint);
+    float3 mapped = aces(graded * exposure);
     // Phase 4.15 — post-tonemap saturation boost. Narkowicz's fitted ACES
     // famously compresses midtone chroma harder than SCN's HDR chain, so
     // the deferred pipeline reads consistently flatter than the SCN
@@ -5151,10 +6043,28 @@ fragment float4 illumi_tonemap_fs(
     // restoring tint. Rec.709 luminance weights are the standard choice.
     float lum = dot(mapped, float3(0.2126, 0.7152, 0.0722));
     mapped = max(mix(float3(lum), mapped, frame.tonemapSaturation), 0.0);
+    // ── Scotopic (Purkinje) desaturation ──────────────────────────────────────
+    // Human rods are colour-blind, so in dim light real vision loses chroma: a
+    // moonlit lawn reads neutral-dark, not green — but the green ALBEDO × dim
+    // near-neutral night light keeps our render green. Pull ONLY the dimmest
+    // tonemapped pixels toward their own luminance, keyed to the display luma;
+    // lamps/moon/stars stay bright enough (lum ≳ 0.08) to keep full colour. 0
+    // (DEFAULT) ⇒ the branch never runs ⇒ day frames + every non-opting scene are
+    // byte-identical. Hosts fade the strength with nightBlend themselves.
+    if (frame.scotopicDesaturation > 0.0) {
+        float scotLum = dot(mapped, float3(0.2126, 0.7152, 0.0722));
+        float scot = frame.scotopicDesaturation * (1.0 - smoothstep(0.0, 0.08, scotLum));
+        mapped = max(mix(mapped, float3(scotLum), scot), 0.0);   // 0 → exact no-op
+    }
     // Clamp after the saturation push — boosting past 1.0 can take channels
     // negative on near-greys, and `pow(negative, 1/2.2)` returns NaN that
     // then propagates through any subsequent composite.
     mapped = saturate(mapped);
+    // ── Color-grade: contrast / shadows / highlights tone curve ───────────────
+    // Applied in the tonemapped (0..1) domain so the pivot, lift and roll-off
+    // act on display-referred values. Defaults (contrast = shadows = highlights
+    // = 1.0) make this an exact no-op.
+    mapped = saturate(toneCurve(mapped, frame.contrast, frame.shadows, frame.highlights));
 
     // ── Axial chromatic aberration ("purple fringing") ────────────────────────
     // Longitudinal CA: a real lens focuses wavelengths at slightly different
@@ -5254,6 +6164,23 @@ fragment float4 illumi_tonemap_fs(
         float tpdf = (n0 + n1) - 1.0;                    // ∈ [-1, 1], triangular
         srgb += tpdf * (1.0 / 255.0);                    // ±1 LSB at 8-bit
         mapped = pow(saturate(srgb), float3(2.2));       // decode back to linear
+    }
+
+    // Phase 9 — film-stock LUT colour grade. Samples a 16×16×16 3D LUT
+    // (stored as a 256×16 PNG strip: 16 blue slices, each 16×16, laid left
+    // to right; the Swift host unpacks this into a proper MTLTexture3D).
+    // The LUT expects Cineon log input but we apply it post-ACES-tonemapper
+    // for a film-inspired grade (not technically accurate emulation — per spec).
+    // `filmLUTStrength` blends between ungraded and graded result.
+    if (frame.filmLUTStrength > 0.001) {
+        constexpr sampler lutSampler(filter::linear, address::clamp_to_edge);
+        // Remap `mapped` from [0,1] linear into LUT normalised coords. A 16-cell
+        // LUT needs a half-texel inset so the sample lands at the cell centre:
+        // coord = (mapped * (N-1) + 0.5) / N  where N = 16.
+        float3 uvw = (mapped * 15.0 + 0.5) / 16.0;
+        float3 graded = filmLUT.sample(lutSampler, uvw).rgb;
+        mapped = mix(mapped, graded, frame.filmLUTStrength);
+        mapped = saturate(mapped);
     }
 
     // Write LINEAR. The output attachment is `.bgra8Unorm_srgb`, so the GPU
@@ -5881,6 +6808,108 @@ kernel void bulbs_write_pointlights(
     pl.position = bulbPos[i].xyz;
     pl.radius   = U.lightRadius;
     pl.color    = c * U.gain;
-    pl._pad     = 0.0;
+    pl.layerMask = 0xFFFFFFFFu;   // all-bits: GPU-synthesised bulb lights affect every layer
     outLights[U.lightOffset + slot] = pl;
+}
+
+// ── Highlight outline mask pass ───────────────────────────────────────────────
+//
+// One render pipeline feeds a separable max-filter dilation + composite. Every
+// highlighted element (selected OR hovered) supplies a SOLID bounding-box proxy
+// to the mask buffer — never its detailed mesh. A box is a closed solid, so its
+// screen-space mask has no internal holes; dilate − original then yields a clean
+// outer ring with no internal edges and no fill. (Rasterizing the real mesh —
+// open sofa frames, see-through bookshelf bays — produced internal rings and,
+// once the small gaps merged under dilation, a full-object wash.)
+//
+//   illumi_selection_box_vs/fs   — draws boxes whose inst.highlight == wantMode.
+//
+// Then two compute passes:
+//   illumi_selection_dilate_h/v  — separable max-filter dilation by `radius` px.
+//   illumi_selection_composite   — ring = dilated − original; additive HDR blend.
+//
+// The pass runs once per mode: wantMode 1 (selected, blue) then 2 (hover, yellow).
+
+struct SelMaskVSOut {
+    float4 position [[position]];
+};
+
+// Mask boxes, filtered to the mode being composited this invocation: an instance
+// whose highlight tag differs from wantMode is clipped (NDC z > 1 → zero fragments).
+vertex SelMaskVSOut illumi_selection_box_vs(
+    uint                       vid       [[vertex_id]],
+    uint                       iid       [[instance_id]],
+    const device Vertex*       verts     [[buffer(0)]],
+    constant FrameUniforms&    frame     [[buffer(1)]],
+    const device Instance*     instances [[buffer(2)]],
+    constant int&              wantMode  [[buffer(3)]]
+) {
+    if (instances[iid].highlight != wantMode) {
+        return { float4(2, 2, 2, 1) };   // outside clip → zero fragments
+    }
+    float4 worldP = instances[iid].modelMatrix * float4(verts[vid].position, 1.0);
+    return { frame.viewProjection * worldP };
+}
+
+fragment float illumi_selection_mask_fs(SelMaskVSOut in [[stage_in]]) {
+    return 1.0;
+}
+
+// Horizontal max-filter dilation pass (reads selectionMask, writes dilateH).
+kernel void illumi_selection_dilate_h(
+    texture2d<float, access::read>  inTex  [[texture(0)]],
+    texture2d<float, access::write> outTex [[texture(1)]],
+    constant int&                   radius [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int w = int(inTex.get_width()), h = int(inTex.get_height());
+    if (int(gid.x) >= w || int(gid.y) >= h) return;
+    float v = 0;
+    for (int dx = -radius; dx <= radius; dx++) {
+        int px = clamp(int(gid.x) + dx, 0, w - 1);
+        v = max(v, inTex.read(uint2(px, gid.y)).r);
+    }
+    outTex.write(float4(v, 0, 0, 0), gid);
+}
+
+// Vertical max-filter dilation pass (reads dilateH, writes dilatedFinal).
+kernel void illumi_selection_dilate_v(
+    texture2d<float, access::read>  inTex  [[texture(0)]],
+    texture2d<float, access::write> outTex [[texture(1)]],
+    constant int&                   radius [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    int w = int(inTex.get_width()), h = int(inTex.get_height());
+    if (int(gid.x) >= w || int(gid.y) >= h) return;
+    float v = 0;
+    for (int dy = -radius; dy <= radius; dy++) {
+        int py = clamp(int(gid.y) + dy, 0, h - 1);
+        v = max(v, inTex.read(uint2(gid.x, py)).r);
+    }
+    outTex.write(float4(v, 0, 0, 0), gid);
+}
+
+// Composites ring = (dilated − original) additively into the HDR texture.
+struct SelectionOutlineParams {
+    float4 colorIntensity;   // xyz = glow color, w = intensity (push past bloom threshold)
+    int    width;
+    int    height;
+    int    _pad0;
+    int    _pad1;
+};
+
+kernel void illumi_selection_composite(
+    texture2d<float, access::read>       maskTex    [[texture(0)]],
+    texture2d<float, access::read>       dilatedTex [[texture(1)]],
+    texture2d<float, access::read_write> hdrTex     [[texture(2)]],
+    constant SelectionOutlineParams&     p          [[buffer(0)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    if (int(gid.x) >= p.width || int(gid.y) >= p.height) return;
+    float orig   = maskTex.read(gid).r;
+    float dilated = dilatedTex.read(gid).r;
+    float ring   = saturate(dilated - orig);
+    float4 hdr   = hdrTex.read(gid);
+    float3 glow  = ring * p.colorIntensity.xyz * p.colorIntensity.w;
+    hdrTex.write(float4(hdr.rgb + glow, hdr.a), gid);
 }

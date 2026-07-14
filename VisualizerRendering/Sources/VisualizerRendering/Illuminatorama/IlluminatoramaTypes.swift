@@ -320,6 +320,88 @@ public struct IlluminatoramaFrameUniforms {
     public var sssDebugForceAll: Float = 0
     public var _padSSS1: Float = 0
     public var _padSSS2: Float = 0
+    // Phase 9 — film-stock LUT colour grade. Blends the 3D-LUT-graded result with
+    // the ACES-tonemapped result. 0 = LUT fully bypassed (identity), 1 = full grade.
+    // NEW 16-byte cluster (stride 1088 → 1104). Three float pads fill the cluster.
+    public var filmLUTStrength: Float = 0
+    public var _padFilmLUT0: Float = 0
+    public var _padFilmLUT1: Float = 0
+    public var _padFilmLUT2: Float = 0
+    // ── Tonemap colour-grade ─────────────────────────────────────────
+    // White-balance + tint are channel gains applied to LINEAR HDR before
+    // exposure/ACES; contrast/shadows/highlights are a tone curve in the
+    // tonemapped (0..1) domain. TWO new 16-byte clusters (stride 1104 →
+    // 1136) — five scalars + three pads. Defaults are neutral so existing
+    // renders are byte-for-byte unchanged: whiteBalanceK 6500 → gain
+    // (1,1,1), tint 0, shadows/highlights/contrast 1.0 → exact no-op.
+    // Field-for-field mirror of the Metal `FrameUniforms`.
+    public var whiteBalanceK: Float = 6500
+    public var tint: Float = 0
+    public var shadows: Float = 1.0
+    public var highlights: Float = 1.0
+    public var contrast: Float = 1.0
+    // Phase 7 — opt-in hex-stochastic anti-tiling strength [0,1]. 0 = OFF (default):
+    // the G-buffer shader short-circuits every `sampleAtlasHex` to a single plain
+    // texture read, so opted-out scenes are byte-for-byte unchanged. Repurposes the
+    // former `_padGrade0` slot (same 4 bytes, stride unchanged).
+    public var antiTilingStrength: Float = 0
+    // Point-light cubemap shadow depth bias (repurposes the former `_padGrade1`
+    // slot — same 4 bytes, stride unchanged). Only read by the lighting kernel for
+    // point lights with `shadowCubeIndex >= 0`; 0 for every scene that never enables
+    // point shadows, so the byte layout AND behaviour stay identical. Mirrors the
+    // Metal `FrameUniforms.pointShadowBias`.
+    public var pointShadowBias: Float = 0.0006
+    /// Scotopic (Purkinje) desaturation strength. Pulls the DIMMEST tonemapped
+    /// pixels toward their own luminance so dark night surfaces read neutral-
+    /// moonlit, not green (the grass-albedo × dim-neutral-light green cast). 0 =
+    /// OFF (default) → the tonemap branch is an EXACT no-op, so day frames and
+    /// every non-opting scene (Visualizer) are byte-identical. Repurposes the
+    /// former `_padGrade2` slot — same 4 bytes, stride unchanged. Mirrors the
+    /// Metal `FrameUniforms.scotopicDesaturation`.
+    public var scotopicDesaturation: Float = 0
+    // ── Interior day-light separation (opt-in; pairs with light-layer masking) ──
+    // `interiorMask` = OR of every layer bit the host stamped on INTERIOR rooms; a
+    // fragment whose gLayer is a real room stamp (≠ 0xFFFFFFFF) AND intersects the
+    // mask gets its sky-IBL indirect scaled by mix(interiorIBLSide, interiorIBLUp,
+    // saturate(N.y)) and its ambient supplement scaled by `interiorAmbient`. The
+    // default `interiorMask == 0` disables the block — both factors stay exactly 1.0
+    // in the kernel, so every scene that never opts in is byte-for-byte unchanged.
+    // NEW 16-byte cluster (stride 1136 → 1152); mirror of the Metal `FrameUniforms`.
+    public var interiorMask: UInt32 = 0
+    public var interiorIBLUp: Float = 1
+    public var interiorIBLSide: Float = 1
+    public var interiorAmbient: Float = 1
+    // ── Analytic night sky (stars + moon at SCREEN resolution) ──────────────
+    // Set alongside `VolumetricCloudRenderer.Params.celestialsInDome = false`:
+    // the lighting kernel then evaluates the star field + phase-correct moon
+    // disk per SKY PIXEL instead of sampling their bilinearly-magnified dome
+    // bakes (the "stars are gaussian blobs" artifact). All-zero defaults ⇒ the
+    // kernel's sky branch adds exactly nothing — every non-opting scene renders
+    // byte-identically. nightSkyParams: x = starBrightness × nightBlend,
+    // y = moonIntensity × nightBlend, z = moon angular radius (radians),
+    // w reserved. THREE new 16-byte clusters (stride 1152 → 1200); mirror of
+    // the Metal `FrameUniforms`.
+    public var nightSkyParams: SIMD4<Float> = .zero
+    public var nightMoonDir: SIMD4<Float> = .zero
+    public var nightSunDir: SIMD4<Float> = .zero
+    // ── Lens flare (sun) ─────────────────────────────────────────────────────
+    // x = strength (0 = OFF, default — the tonemap branch is gated on it so every
+    // non-opting scene renders byte-identically), yz = the sun's screen-space uv,
+    // w = on-screen weight (fades at the frame edge, 0 behind the camera). ONE
+    // new 16-byte cluster (stride 1200 → 1216); mirror of the Metal FrameUniforms.
+    public var lensFlareParams: SIMD4<Float> = .zero
+    // ── Halation (film) ──────────────────────────────────────────────────────
+    // The wide warm halo film wears around blown highlights: light punches through
+    // the emulsion, reflects off the back of the base and re-exposes it, and the
+    // anti-halation backing lets red survive that round trip best.
+    // `halationParams`: x = intensity (0 = OFF, the default — the renderer skips the
+    // halation passes AND the tonemap branch is gated on it, so every non-opting
+    // scene renders byte-identically), y = HDR luminance threshold, z = halo radius
+    // in INTERNAL-resolution texels, w reserved. `halationTint`: xyz = halo tint
+    // (linear RGB), w reserved. TWO new 16-byte clusters (stride 1216 → 1248);
+    // mirror of the Metal FrameUniforms.
+    public var halationParams: SIMD4<Float> = .zero
+    public var halationTint: SIMD4<Float> = .zero
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20
@@ -376,12 +458,38 @@ public struct IlluminatoramaPointLight {
     public var position: SIMD3<Float>
     public var radius: Float
     public var color: SIMD3<Float>           // pre-multiplied intensity
-    public var _pad: Float = 0
+    /// Light-layer mask (mirrors the Metal `PointLight.layerMask`, was `_pad`). A
+    /// light contributes to a fragment only when `(layerMask & instance.layer) != 0`.
+    /// Default `0xFFFFFFFF` ⇒ affects every fragment (byte-identical to the prior
+    /// behaviour, so scenes that never touch it — Visualizer — are unchanged).
+    public var layerMask: UInt32 = 0xFFFF_FFFF
+    // ── Point-light cubemap shadows (opt-in) ──────────────────────────────────
+    /// 1 ⇒ this point light casts a real depth-cubemap shadow (blocks at geometry,
+    /// passes through openings, casts intra-room object shadows). Default 0 ⇒ NO
+    /// shadow map rendered and the lighting kernel takes the exact pre-change path,
+    /// so every scene that never sets this (Visualizer) is byte-identical. Was the
+    /// former `_padPointShadow0` trailing slot; reinterpreted, so the struct stride
+    /// is unchanged. Mirrors the Metal `PointLight.castsShadow`.
+    public var castsShadow: UInt32 = 0
+    /// Cube-array index (set by the renderer each frame in `updatePointShadows`).
+    /// `< 0` ⇒ no cube page for this light this frame — the kernel treats it as fully
+    /// visible. The renderer assigns the first `pointShadowCubeCapacity` shadow-casting
+    /// lights a page; the rest fall back to unshadowed. Mirrors the Metal
+    /// `PointLight.shadowCubeIndex`. Default `-1`.
+    public var shadowCubeIndex: Int32 = -1
+    /// Two explicit pads so the struct closes on a 16-byte boundary (stride 48 → 48;
+    /// the base struct was 32 B + the layerMask cluster). Mirror the Metal padding.
+    public var _padPointShadow0: Int32 = 0
+    public var _padPointShadow1: Int32 = 0
 
-    public init(position: SIMD3<Float>, radius: Float, color: SIMD3<Float>) {
+    public init(position: SIMD3<Float>, radius: Float, color: SIMD3<Float>,
+                layerMask: UInt32 = 0xFFFF_FFFF,
+                castsShadow: Bool = false) {
         self.position = position
         self.radius = radius
         self.color = color
+        self.layerMask = layerMask
+        self.castsShadow = castsShadow ? 1 : 0
     }
 }
 
@@ -412,21 +520,26 @@ public struct IlluminatoramaSpotLight {
     /// the renderer based on the spot's position in the array and
     /// `spotShadowAtlasCapacity`.
     public var shadowSliceIndex: Int32 = -1
-    /// Three explicit pads so the struct closes on a 16-byte boundary.
+    /// Light-layer mask (mirrors the Metal `SpotLight.layerMask`, was `_padSpot0`).
+    /// Same masking rule as `IlluminatoramaPointLight`. Default `0xFFFFFFFF` ⇒ affects
+    /// every fragment (byte-identical to prior behaviour).
+    public var layerMask: UInt32 = 0xFFFF_FFFF
+    /// Two explicit pads so the struct closes on a 16-byte boundary.
     /// Stride bumps from 96 → 176.
-    public var _padSpot0: Int32 = 0
     public var _padSpot1: Int32 = 0
     public var _padSpot2: Int32 = 0
 
     public init(position: SIMD3<Float>, direction: SIMD3<Float>,
                 innerCone: Float, outerCone: Float,
-                color: SIMD3<Float>, radius: Float) {
+                color: SIMD3<Float>, radius: Float,
+                layerMask: UInt32 = 0xFFFF_FFFF) {
         self.position = position
         self.direction = direction
         self.innerCone = innerCone
         self.outerCone = outerCone
         self.color = color
         self.radius = radius
+        self.layerMask = layerMask
     }
 }
 
@@ -437,6 +550,16 @@ public struct IlluminatoramaInstance {
     public var normalMatrix: simd_float4x4   // upper-3x3 inverse-transpose, padded
     public var albedo: SIMD3<Float>
     public var metallic: Float
+    // Phase 7 — clearcoat: a second GGX lobe for polished/lacquered surfaces
+    // (terrazzo, marble, glazed tile, lacquered wood). Sits in the 12-byte
+    // padding gap between `metallic` and `emission` (offsets 148-159); stride
+    // stays 208. Default 0 = no clearcoat (no change to existing materials).
+    public var clearcoat: Float = 0          // lobe strength [0, 1]
+    public var clearcoatRoughness: Float = 0.10  // GGX alpha^2 for clearcoat
+    // Phase 7b — cloth sheen lobe strength [0,1] (velvet/wool/linen). Repurposes the former
+    // `_padClearcoat` slot (same offset 156, stride stays 208). Packed as a NEGATIVE
+    // emission.alpha in the G-buffer (a surface is polished OR cloth, never both).
+    public var sheen: Float = 0
     public var emission: SIMD3<Float>
     public var roughness: Float
     /// Phase 4.0 — slice index into the diffuse albedo atlas. `< 0` means
@@ -465,10 +588,61 @@ public struct IlluminatoramaInstance {
     /// Former trailing pad, repurposed (#60 item 7): non-zero ⇒ this instance
     /// is raster-only (its TLAS instance gets mask 0, so RT rays never
     /// intersect it; the RT representation comes from elsewhere — e.g. a
-    /// registered `IlluminatoramaCurveSet` twin). Same 4 bytes, stride stays
-    /// 208; the Metal `Instance` mirrors keep the slot named `_padSlice1`
-    /// (never read GPU-side — the mask gating happens host-side at AS rebuild).
+    /// registered `IlluminatoramaCurveSet` twin). Same 4 bytes.
     public var rtExclude: Int32 = 0
+    // Phase 7 — detail-normal path for close-range pores/weave/grain.
+    // Sampled at `detailNormalUVScale × in.uv` and blended into the
+    // macro normal map result. Stride grows from 208 → 224 (next 16-byte
+    // boundary) to maintain float4x4 natural alignment.
+    /// Slice index for the detail normal map in the non-colour atlas.
+    /// `< 0` = no detail normal (pass-through). Default -1.
+    public var detailNormalTextureSlice: Int32 = -1
+    /// Tile frequency of the detail normal relative to the macro UV.
+    /// 8 = eight tiles per macro tile = fine grain/pore detail.
+    public var detailNormalUVScale: Float = 8.0
+    /// Phase 7c — anisotropy [0,1] (was `_padDetail0`, same offset/stride). Stretches the specular
+    /// highlight along the surface grain; packed as (1 + anisotropy) into normalRoughness.w.
+    public var anisotropy: Float = 0
+    /// Highlight mode for the screen-space halo pass: 0 none · 1 selected (blue
+    /// halo) · 2 hover (yellow halo). Only honoured on bounding-box proxies fed
+    /// through `highlightMaskInstances`; the detailed scene meshes never set it.
+    public var highlight: Int32 = 0
+    // ── Drag/impact sway (vertex-shader secondary motion) ─────────────────────
+    // A generic, GPU-side rigid bend driven by the host `DragSwayTracker`: the
+    // sibling of `applyTreeWind` for non-foliage objects. The shader rotates the
+    // vertex about the instance's world bottom-pivot + local-Z axis (both read off
+    // `modelMatrix`, so no extra per-instance pivot data), then lifts it by jostle.
+    // `swayMode 0` is a hard no-op, so every instance that doesn't opt in is
+    // untouched. New 16-byte cluster (offsets 224-239): stride 224 → 240.
+    /// Sway kind: 0 none · 1 bottom-pivot lean (books, upright shelf contents) ·
+    /// 2 top-pivot pendulum (a hanging pendant: rigid rotation about the model origin —
+    /// the ceiling anchor — self-oscillating from the frame time; see `applySway` in
+    /// Illuminatorama.metal).
+    public var swayMode: Int32 = 0
+    /// Mode 1: static lean angle (radians) about local-Z, pivoting at the base.
+    /// Mode 2: pendulum AMPLITUDE (max swing, radians) — the shader animates the swing
+    /// from the frame time, so the host sets this once (no per-frame drive).
+    public var swayLean: Float = 0
+    /// Vertical pop (metres) added in world space — a knock hops the object up.
+    public var swayJostle: Float = 0
+    /// Light-layer bitfield (mirrors the Metal `Instance.layer`, was `_padSway0`).
+    /// Written into the `gLayer` G-buffer target; the deferred lighting kernel keeps
+    /// a light only when `(light.layerMask & layer) != 0`. Default `0xFFFFFFFF` ⇒
+    /// every light affects this instance (byte-identical to prior behaviour). Same
+    /// 4 bytes as the former float pad, so the stride stays 240.
+    public var layer: UInt32 = 0xFFFF_FFFF
+    // ── Anti-tiling suitability (per instance) ────────────────────────────────
+    // Multiplier on the frame's global `antiTilingStrength` for THIS instance's
+    // hex-stochastic samples. The de-repeat blend is only valid for STOCHASTIC
+    // textures — on a coherent pattern it superimposes misaligned copies: a tile
+    // grid double-prints its grout lines and directional wood grain dices into a
+    // patchwork quilt (both Danny-reported). Hosts set 0 for regular/directional
+    // materials (tile, wallpaper, wood planks, brick) and leave 1 elsewhere.
+    // NEW 16-byte cluster (offsets 240-255): stride 240 → 256; three float pads.
+    public var antiTilingScale: Float = 1
+    public var _padAntiTiling0: Float = 0
+    public var _padAntiTiling1: Float = 0
+    public var _padAntiTiling2: Float = 0
 
     public init(
         modelMatrix: simd_float4x4,
@@ -501,6 +675,11 @@ public struct IlluminatoramaInstance {
         self.modelMatrix = m
         self.normalMatrix = Self.normalMatrix(from: m)
     }
+
+    /// Compile-time guard: Swift and Metal structs must agree on 256 bytes.
+    /// If this fires, either a Swift field was added without the matching Metal
+    /// field (or vice versa), or alignment changed unexpectedly.
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 256, "IlluminatoramaInstance stride must be 256") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //
@@ -801,3 +980,14 @@ public struct IlluminatoramaCamera {
         )
     }
 }
+
+// ── Equatable (scene-content stability gate) ────────────────────────────────
+//
+// The renderer keeps last frame's `instances` / flattened glass and compares
+// per frame to detect a static scene (camera-only motion): when nothing
+// changed it skips the instance-buffer regroup/rewrite, the RT TLAS refit,
+// and (when light params also held) the spot/point shadow re-renders. Both
+// structs are plain SIMD/scalar bags, so the synthesized memberwise `==`
+// compiles to tight vector compares — cheap enough to run on every frame.
+extension IlluminatoramaInstance: Equatable {}
+extension IlluminatoramaGlassInstance: Equatable {}

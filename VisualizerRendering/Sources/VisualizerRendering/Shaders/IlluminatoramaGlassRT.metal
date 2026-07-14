@@ -360,6 +360,25 @@ struct GlassRTState {
     const device SurfCard*       surfCards;
 };
 
+// Indirect (sky + ambient) fill for a re-shaded hit — the SAME terms the deferred
+// lighting pass applies, so the world seen THROUGH glass matches the world beside it
+// (PHOTOREALISM #4: the old flat `albedo * skyAmbient` fill skipped the sky-IBL
+// irradiance entirely, so transmitted scenery lost the sky's cool fill and read
+// hotter + more saturated than the deferred render of the same surface):
+//   • diffuse IBL — the renderer's cosine-convolved `irradianceCube` sampled along
+//     the hit normal, × `iblIntensity` (mirrors `diffuseIBL * frame.iblIntensity`;
+//     kD ≈ 1 for the rough dielectrics a refracted ray typically lands on).
+//   • ambient supplement — upness-weighted 40 % → 100 %, exactly the deferred
+//     `mix(ambCol * 0.4, ambCol, upness)` shaping of `frame.ambientColor`.
+static inline float3 indirectFill(float3 hitN, constant GlassRTUniforms& u,
+                                  texturecube<float, access::sample> irrCube)
+{
+    constexpr sampler cubeSmp(filter::linear);
+    float3 irr = irrCube.sample(cubeSmp, hitN).rgb * max(0.0, u.skyIntensity);
+    float upness = saturate(hitN.y * 0.5 + 0.5);
+    return irr + mix(u.skyAmbient * 0.4, u.skyAmbient, upness);
+}
+
 // Re-shade or cache-read an OPAQUE triangle hit's outgoing radiance.
 static float3 shadeOpaqueHit(thread intersector<triangle_data, instancing>& isect,
                              instance_acceleration_structure accel,
@@ -368,6 +387,7 @@ static float3 shadeOpaqueHit(thread intersector<triangle_data, instancing>& isec
                              GlassRTState st,
                              texture2d<float, access::sample> sky,
                              texture2d<float, access::sample> surfAtlas,
+                             texturecube<float, access::sample> irrCube,
                              thread uint& seed,
                              intersection_result<triangle_data, instancing> res)
 {
@@ -383,14 +403,17 @@ static float3 shadeOpaqueHit(thread intersector<triangle_data, instancing>& isec
         }
         if (hitCard != 0xFFFFFFFFu) {
             SurfCard sc = st.surfCards[hitCard];
-            return sc.emission.xyz + sc.albedo.xyz * u.skyAmbient;
+            float3 scN = hitWorldNormal(iid, prim, st.insts, st.objNormal);
+            if (dot(scN, rd) > 0.0) scN = -scN;
+            return sc.emission.xyz + sc.albedo.xyz * indirectFill(scN, u, irrCube);
         }
     }
-    // Re-shade: ambient + direct sun (shadow ray), matching the TLAS reflection path.
+    // Re-shade: indirect (sky IBL + ambient) + direct sun (shadow ray) — the same
+    // terms, at the same strengths, the deferred lighting pass applies.
     float3 hitN = hitWorldNormal(iid, prim, st.insts, st.objNormal);
     if (dot(hitN, rd) > 0.0) hitN = -hitN;             // face the incoming ray
     float3 hitA = st.insts[iid].albedoTriBase.xyz;
-    float3 rad = hitA * u.skyAmbient;
+    float3 rad = hitA * indirectFill(hitN, u, irrCube);
     float3 Ld = normalize(u.sunDir);
     float hN = saturate(dot(hitN, Ld));
     if (hN > 0.0 && u.shadowRays > 0) {
@@ -428,6 +451,7 @@ static float3 traceRefractionPath(
     float roughness, constant GlassRTUniforms& u, GlassRTState st,
     texture2d<float, access::sample> sky,
     texture2d<float, access::sample> surfAtlas,
+    texturecube<float, access::sample> irrCube,
     thread uint& seed)
 {
     float eps = max(u.rayTMin, 1e-3);
@@ -485,7 +509,7 @@ static float3 traceRefractionPath(
         // Opaque surface: shade it and stop.
         float3 rad = shadeOpaqueHit(isect, accel, iid, res.primitive_id,
                                     res.triangle_barycentric_coord, hitP, r.direction,
-                                    u, st, sky, surfAtlas, seed, res);
+                                    u, st, sky, surfAtlas, irrCube, seed, res);
         return throughput * rad;
     }
     // Bounce budget exhausted — return the accumulated sky as a fallback.
@@ -501,6 +525,7 @@ static float3 traceReflection(
     constant GlassRTUniforms& u, GlassRTState st,
     texture2d<float, access::sample> sky,
     texture2d<float, access::sample> surfAtlas,
+    texturecube<float, access::sample> irrCube,
     thread uint& seed)
 {
     float eps = max(u.rayTMin, 1e-3);
@@ -524,7 +549,7 @@ static float3 traceReflection(
     float3 hitP = r.origin + r.direction * res.distance;
     return shadeOpaqueHit(isect, accel, res.instance_id, res.primitive_id,
                           res.triangle_barycentric_coord, hitP, r.direction,
-                          u, st, sky, surfAtlas, seed, res);
+                          u, st, sky, surfAtlas, irrCube, seed, res);
 }
 
 fragment float4 illumi_glass_rt_fs(
@@ -542,7 +567,8 @@ fragment float4 illumi_glass_rt_fs(
     const device float4*             surfCardRect[[buffer(10)]],
     const device SurfCard*           surfCards   [[buffer(11)]],
     texture2d<float, access::sample> sky         [[texture(0)]],
-    texture2d<float, access::sample> surfAtlas   [[texture(1)]])
+    texture2d<float, access::sample> surfAtlas   [[texture(1)]],
+    texturecube<float, access::sample> irrCube   [[texture(3)]])
 {
     GlassInstance gi = instances[in.instanceID];
     float ior        = max(1.0, gi.tintIor.w);
@@ -584,13 +610,13 @@ fragment float4 illumi_glass_rt_fs(
         float spread = dispersion * 0.04 * ior;         // ±IOR offset
         uint s0 = seed;
         float r = traceRefractionPath(isect, accel, P, V, N, ior - spread, tint, density,
-                                      roughness, u, st, sky, surfAtlas, seed).r;
+                                      roughness, u, st, sky, surfAtlas, irrCube, seed).r;
         seed = s0 ^ 0x1234u;
         float g = traceRefractionPath(isect, accel, P, V, N, ior, tint, density,
-                                      roughness, u, st, sky, surfAtlas, seed).g;
+                                      roughness, u, st, sky, surfAtlas, irrCube, seed).g;
         seed = s0 ^ 0x9abcu;
         float bb = traceRefractionPath(isect, accel, P, V, N, ior + spread, tint, density,
-                                       roughness, u, st, sky, surfAtlas, seed).b;
+                                       roughness, u, st, sky, surfAtlas, irrCube, seed).b;
         refr = float3(r, g, bb);
     } else {
         // Frosted glass jitters the refraction in a cone, so a single sample is
@@ -600,12 +626,12 @@ fragment float4 illumi_glass_rt_fs(
         uint nRefr = min(4u, 1u + uint(roughness * 3.0 + 0.5));
         if (nRefr <= 1u) {
             refr = traceRefractionPath(isect, accel, P, V, N, ior, tint, density,
-                                       roughness, u, st, sky, surfAtlas, seed);
+                                       roughness, u, st, sky, surfAtlas, irrCube, seed);
         } else {
             float3 acc = float3(0.0);
             for (uint s = 0u; s < nRefr; ++s) {
                 acc += traceRefractionPath(isect, accel, P, V, N, ior, tint, density,
-                                           roughness, u, st, sky, surfAtlas, seed);
+                                           roughness, u, st, sky, surfAtlas, irrCube, seed);
             }
             refr = acc / float(nRefr);
         }
@@ -619,7 +645,7 @@ fragment float4 illumi_glass_rt_fs(
         uint nRefl = min(3u, 1u + uint(roughness * 2.0 + 0.5));
         float3 acc = float3(0.0);
         for (uint s = 0u; s < nRefl; ++s) {
-            acc += traceReflection(isect, accel, P, N, R, roughness, u, st, sky, surfAtlas, seed);
+            acc += traceReflection(isect, accel, P, N, R, roughness, u, st, sky, surfAtlas, irrCube, seed);
         }
         refl = acc / float(nRefl);
     }
