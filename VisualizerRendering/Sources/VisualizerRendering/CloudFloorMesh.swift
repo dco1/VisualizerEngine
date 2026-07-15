@@ -1,4 +1,8 @@
+#if canImport(AppKit) && !targetEnvironment(macCatalyst)
 import AppKit
+#else
+import UIKit
+#endif
 import Foundation
 import Metal
 import OSLog
@@ -247,14 +251,14 @@ public final class CloudFloorMesh {
         let bodyGeom = SCNGeometry(sources: [posSource, nrmSource], elements: [element])
         let bodyMat = SCNMaterial()
         bodyMat.lightingModel = .physicallyBased
-        bodyMat.diffuse.contents = NSColor(calibratedWhite: 0.68, alpha: 1)
+        bodyMat.diffuse.contents = PlatformColor(calibratedWhite: 0.68, alpha: 1)
         bodyMat.metalness.contents = 0.0
         bodyMat.roughness.contents = 1.0
         bodyMat.isDoubleSided = true
         // Slight emission so the cloud is visible at night even with no
         // direct light — same role the ambient-tint had in the screen-
         // space overlay.
-        bodyMat.emission.contents = NSColor(calibratedRed: 0.10, green: 0.12, blue: 0.16, alpha: 1)
+        bodyMat.emission.contents = PlatformColor(calibratedRed: 0.10, green: 0.12, blue: 0.16, alpha: 1)
         bodyGeom.materials = [bodyMat]
 
         let bodyNode = SCNNode(geometry: bodyGeom)
@@ -276,7 +280,7 @@ public final class CloudFloorMesh {
         )
         let emissionMat = SCNMaterial()
         emissionMat.lightingModel = .constant
-        emissionMat.diffuse.contents = NSColor.white
+        emissionMat.diffuse.contents = PlatformColor.white
         emissionMat.blendMode = .add
         emissionMat.writesToDepthBuffer = false
         emissionMat.readsFromDepthBuffer = true

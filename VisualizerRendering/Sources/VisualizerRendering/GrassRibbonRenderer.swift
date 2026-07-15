@@ -172,7 +172,7 @@ public final class GrassRibbonRenderer {
         // fancier (vertex-colour gradient, etc.).
         let mat = SCNMaterial()
         mat.lightingModel = .physicallyBased
-        mat.diffuse.contents = NSColor(deviceRed: 0.30, green: 0.55, blue: 0.18, alpha: 1)
+        mat.diffuse.contents = PlatformColor(deviceRed: 0.30, green: 0.55, blue: 0.18, alpha: 1)
         mat.roughness.contents = 0.85
         mat.metalness.contents = 0.0
         mat.isDoubleSided = true

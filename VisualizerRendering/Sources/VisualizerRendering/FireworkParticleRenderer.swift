@@ -1,8 +1,13 @@
+#if canImport(AppKit) && !targetEnvironment(macCatalyst)
 import AppKit
+#else
+import UIKit
+#endif
 import Foundation
 import Metal
 import SceneKit
 import simd
+import VisualizerCore
 
 // ── FIREWORK PARTICLE RENDERER ──────────────────────────────────────────────
 //
@@ -221,9 +226,9 @@ public final class FireworkParticleRenderer {
     // Falloff lives in RGB because the material's `.add` blend mode ignores
     // alpha. Alpha is set to the same falloff so any future blend-mode swap
     // (e.g. premultiplied alpha) keeps working without a regen.
-    public static let sparkSprite: NSImage = makeSparkSprite()
+    public static let sparkSprite: PlatformImage = makeSparkSprite()
 
-    private static func makeSparkSprite() -> NSImage {
+    private static func makeSparkSprite() -> PlatformImage {
         let size = 128
         let bytesPerPixel = 4
         let bytesPerRow = size * bytesPerPixel
@@ -265,6 +270,6 @@ public final class FireworkParticleRenderer {
             shouldInterpolate: true,
             intent: .defaultIntent
         )!
-        return NSImage(cgImage: cg, size: NSSize(width: size, height: size))
+        return PlatformImage(cgImage: cg, size: CGSize(width: size, height: size))
     }
 }

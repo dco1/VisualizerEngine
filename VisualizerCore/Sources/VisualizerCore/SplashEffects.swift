@@ -1,3 +1,6 @@
+// AppKit-only utility — not compiled for Mac Catalyst (no NSScreen/NSPasteboard/
+// NSEvent/NSGraphicsContext there). Render-path code never references this file.
+#if canImport(AppKit) && !targetEnvironment(macCatalyst)
 import AppKit
 import SceneKit
 
@@ -336,3 +339,4 @@ public enum SplashEffects {
         return img
     }
 }
+#endif // canImport(AppKit)

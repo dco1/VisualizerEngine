@@ -1,8 +1,13 @@
+#if canImport(AppKit) && !targetEnvironment(macCatalyst)
 import AppKit
+#else
+import UIKit
+#endif
 import Foundation
 import Metal
 import SceneKit
 import simd
+import VisualizerCore
 
 // ── FOAM RENDERER ────────────────────────────────────────────────────────────
 //
@@ -139,7 +144,7 @@ public final class FoamRenderer {
         // real foam concentrates on splash crowns.
         let mat = SCNMaterial()
         mat.lightingModel = .constant
-        let col = NSColor(deviceRed: CGFloat(colour.x),
+        let col = PlatformColor(deviceRed: CGFloat(colour.x),
                           green:     CGFloat(colour.y),
                           blue:      CGFloat(colour.z),
                           alpha:     1)
@@ -222,7 +227,7 @@ public final class FoamRenderer {
     public func setColour(_ colour: SIMD3<Float>) {
         guard colour != currentColour else { return }
         currentColour = colour
-        let col = NSColor(deviceRed: CGFloat(colour.x),
+        let col = PlatformColor(deviceRed: CGFloat(colour.x),
                           green:     CGFloat(colour.y),
                           blue:      CGFloat(colour.z),
                           alpha:     1)

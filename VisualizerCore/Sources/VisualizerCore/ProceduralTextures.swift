@@ -1,4 +1,8 @@
+#if canImport(AppKit) && !targetEnvironment(macCatalyst)
 import AppKit
+#else
+import UIKit
+#endif
 
 /// Procedural texture helpers shared by all scene packages.
 ///
@@ -73,7 +77,7 @@ public enum ProceduralTextures {
     }
 
     /// Convert a height field to a tangent-space normal map.
-    public static func heightToNormalMap(_ height: [[Double]], strength: Double) -> NSImage {
+    public static func heightToNormalMap(_ height: [[Double]], strength: Double) -> PlatformImage {
         let h = height.count
         let w = height[0].count
         return makeImage(width: w, height: h) { x, y in
@@ -94,13 +98,14 @@ public enum ProceduralTextures {
         }
     }
 
-    /// Build an `NSImage` from a per-pixel render closure. The closure returns
-    /// 8-bit RGBA; the backing buffer is wrapped in a CGImage and handed to AppKit.
+    /// Build a platform image (`NSImage` on macOS, `UIImage` on Catalyst)
+    /// from a per-pixel render closure. The closure returns 8-bit RGBA; the
+    /// backing buffer is wrapped in a CGImage and handed to the platform kit.
     public static func makeImage(
         width: Int,
         height: Int,
         render: (Int, Int) -> (r: UInt8, g: UInt8, b: UInt8, a: UInt8)
-    ) -> NSImage {
+    ) -> PlatformImage {
         let bytesPerPixel = 4
         let bytesPerRow = width * bytesPerPixel
         var pixels = [UInt8](repeating: 0, count: width * height * bytesPerPixel)
@@ -127,6 +132,6 @@ public enum ProceduralTextures {
             decode: nil, shouldInterpolate: true,
             intent: .defaultIntent
         )!
-        return NSImage(cgImage: cg, size: NSSize(width: width, height: height))
+        return PlatformImage(cgImage: cg, size: CGSize(width: width, height: height))
     }
 }

@@ -1,6 +1,10 @@
 import Foundation
 import SceneKit
+#if canImport(AppKit) && !targetEnvironment(macCatalyst)
 import AppKit
+#else
+import UIKit
+#endif
 import simd
 import VisualizerCore
 
@@ -48,9 +52,9 @@ public final class NeonTube {
     /// - `lightSpacing`: emit one light every N path points.
     public init(path: [SIMD3<Float>],
                 radius: Float = 0.07,
-                color: NSColor = NSColor(srgbRed: 1.0, green: 0.12, blue: 0.6, alpha: 1),
+                color: PlatformColor = PlatformColor(srgbRed: 1.0, green: 0.12, blue: 0.6, alpha: 1),
                 emissionIntensity: CGFloat = 3.0,
-                lightColor: NSColor? = nil,
+                lightColor: PlatformColor? = nil,
                 lightIntensity: CGFloat = 600,
                 lightSpacing: Int = 4,
                 radialSegments: Int = 12,
@@ -66,14 +70,14 @@ public final class NeonTube {
         // ── Neon material: constant-lit black glass + HDR emission ────────────
         let m = SCNMaterial()
         m.lightingModel = .constant            // the tube IS a light, not lit by the scene
-        m.diffuse.contents = NSColor.black
+        m.diffuse.contents = PlatformColor.black
         m.emission.contents = color
         m.emission.intensity = emissionIntensity
         m.isDoubleSided = false
         m.writesToDepthBuffer = true
         // A faint fresnel-ish rim via multiply on the reflective slot keeps the
         // glass edge reading; cheap and modifier-free (modifiers are finicky here).
-        m.multiply.contents = NSColor(white: 1.0, alpha: 1)
+        m.multiply.contents = PlatformColor(white: 1.0, alpha: 1)
         geometry.firstMaterial = m
         self.material = m
 
@@ -83,7 +87,7 @@ public final class NeonTube {
 
         // ── Paired lights along the path ──────────────────────────────────────
         let lc = lightColor ?? color
-        let lcc = lc.usingColorSpace(.deviceRGB) ?? lc
+        let lcc = lc.srgbComponents ?? SIMD4(1, 1, 1, 1)
         var specs: [LightSpec] = []
         var i = 0
         while i < path.count {
@@ -101,7 +105,7 @@ public final class NeonTube {
             let scale = Float(lightIntensity) / 600.0
             specs.append(LightSpec(
                 position: path[i],
-                color: SIMD3(Float(lcc.redComponent), Float(lcc.greenComponent), Float(lcc.blueComponent)) * (5.0 * scale),
+                color: SIMD3(Float(lcc.x), Float(lcc.y), Float(lcc.z)) * (5.0 * scale),
                 radius: radius * 40))
             i += max(1, lightSpacing)
         }

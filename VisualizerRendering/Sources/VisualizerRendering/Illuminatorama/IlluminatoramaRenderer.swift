@@ -9780,8 +9780,30 @@ public final class IlluminatoramaRenderer {
     // ── Issue #65: colour-grading LUT ─────────────────────────────────────────
 
     /// IEEE-754 binary32 → binary16 (half) bit pattern for `rgba16Float` uploads.
+    /// Software conversion: Swift's `Float16` is unavailable under Mac Catalyst.
+    /// LUT values are finite and in [0, 1], so the round-to-nearest-even path is
+    /// all that matters; sub-normals/inf/NaN are handled for completeness.
     @inline(__always)
-    private static func float32to16(_ v: Float) -> UInt16 { Float16(v).bitPattern }
+    private static func float32to16(_ v: Float) -> UInt16 {
+        let bits = v.bitPattern
+        let sign = UInt16((bits >> 16) & 0x8000)
+        let expo = Int32((bits >> 23) & 0xFF) - 127 + 15
+        let mant = bits & 0x7F_FFFF
+        if expo >= 0x1F {                                   // overflow / inf / NaN
+            let isNaN = (bits & 0x7F80_0000) == 0x7F80_0000 && mant != 0
+            return sign | (isNaN ? 0x7E00 : 0x7C00)
+        }
+        if expo <= 0 {                                      // sub-normal / zero
+            guard expo > -11 else { return sign }
+            let m = (mant | 0x80_0000) >> UInt32(1 - expo + 13)
+            return sign | UInt16(m)
+        }
+        // Normal: round mantissa to 10 bits, nearest-even.
+        var half = UInt32(expo) << 10 | (mant >> 13)
+        let roundBits = mant & 0x1FFF
+        if roundBits > 0x1000 || (roundBits == 0x1000 && (half & 1) == 1) { half += 1 }
+        return sign | UInt16(truncatingIfNeeded: half)
+    }
 
     /// Build an identity 3D LUT (`rgba16Float`, `size³`) where the texel at
     /// (r,g,b) holds the colour (r,g,b)/(size-1). Sampling it with a colour in

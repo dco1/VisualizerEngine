@@ -1,4 +1,8 @@
+#if canImport(AppKit) && !targetEnvironment(macCatalyst)
 import AppKit
+#else
+import UIKit
+#endif
 import CoreGraphics
 import Foundation
 import Metal
@@ -196,7 +200,7 @@ public final class IlluminatoramaTextureAtlas {
         let key: ObjectIdentifier
         let keyObject: AnyObject
         let cg: CGImage
-        if let img = contents as? NSImage {
+        if let img = contents as? PlatformImage {
             key = ObjectIdentifier(img)
             keyObject = img
             if let cached = sliceForObject[key] { return cached.slice }
@@ -428,10 +432,7 @@ public final class IlluminatoramaTextureAtlas {
         return true
     }
 
-    private static func cgImage(from nsImage: NSImage) -> CGImage? {
-        var rect = CGRect(origin: .zero, size: nsImage.size)
-        return nsImage.cgImage(forProposedRect: &rect,
-                                context: nil,
-                                hints: nil)
+    private static func cgImage(from image: PlatformImage) -> CGImage? {
+        image.platformCGImage
     }
 }

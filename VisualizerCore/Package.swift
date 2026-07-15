@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "VisualizerCore",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS(.v15), .iOS(.v18)],
     products: [
         .library(name: "VisualizerCore", targets: ["VisualizerCore"])
     ],

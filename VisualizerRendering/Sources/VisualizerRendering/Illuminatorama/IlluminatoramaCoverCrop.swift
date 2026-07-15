@@ -34,8 +34,8 @@ public extension IlluminatoramaRenderer {
         guard viewportWidth > 0, viewportHeight > 0 else { return }
         let uv = coverUVRect(viewportWidth: viewportWidth, viewportHeight: viewportHeight)
         var t = SCNMatrix4Identity
-        t.m11 = CGFloat(uv.x); t.m22 = CGFloat(uv.y)
-        t.m41 = CGFloat(uv.z); t.m42 = CGFloat(uv.w)
+        t.m11 = SCNFloat(uv.x); t.m22 = SCNFloat(uv.y)
+        t.m41 = SCNFloat(uv.z); t.m42 = SCNFloat(uv.w)
         scene.background.contentsTransform = t
     }
 }

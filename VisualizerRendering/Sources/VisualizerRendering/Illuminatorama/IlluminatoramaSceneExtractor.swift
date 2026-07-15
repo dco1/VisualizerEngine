@@ -914,7 +914,7 @@ public final class IlluminatoramaSceneExtractor {
         let key = ObjectIdentifier(contents as AnyObject)
         if let cached = emissionAvgCache[key] { return cached }
         let cg: CGImage?
-        if let img = contents as? NSImage {
+        if let img = contents as? PlatformImage {
             cg = Self.cgImage(from: img)
         } else if CFGetTypeID(contents as CFTypeRef) == CGImage.typeID {
             cg = (contents as! CGImage)
@@ -1102,7 +1102,7 @@ public final class IlluminatoramaSceneExtractor {
         // material atlas.
         let key: ObjectIdentifier
         let cg: CGImage
-        if let img = contents as? NSImage {
+        if let img = contents as? PlatformImage {
             key = ObjectIdentifier(img)
             if let cached = equirectSkyCache[key] { return cached }
             guard let extracted = Self.cgImage(from: img) else {
@@ -1180,9 +1180,8 @@ public final class IlluminatoramaSceneExtractor {
         return tex
     }
 
-    private static func cgImage(from nsImage: NSImage) -> CGImage? {
-        var rect = CGRect(origin: .zero, size: nsImage.size)
-        return nsImage.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+    private static func cgImage(from image: PlatformImage) -> CGImage? {
+        image.platformCGImage
     }
 
     // ── Mesh registration ─────────────────────────────────────────────────────
@@ -1294,12 +1293,11 @@ public final class IlluminatoramaSceneExtractor {
 //        can be reused by IlluminatoramaMesh.from(scnGeometry:) too).
 
 @MainActor
-func scnColorToRGB(_ color: NSColor) -> SIMD3<Float> {
-    // Convert to a sRGB-ish device colourspace so the channel reads are
-    // consistent. `usingColorSpace(.sRGB)` returns nil for some non-RGB
-    // input colours (named, calibrated white, etc.); fall back to mid-grey
+func scnColorToRGB(_ color: PlatformColor) -> SIMD3<Float> {
+    // Convert to sRGB components; srgbComponents returns nil for some
+    // non-RGB input colours (named, pattern, etc.); fall back to mid-grey
     // rather than letting a force-unwrap crash on a content edge case.
-    let rgb = color.usingColorSpace(.sRGB) ?? .gray
+    let rgb = color.srgbComponents ?? SIMD4(0.5, 0.5, 0.5, 1)
     // sRGB-encoded components → LINEAR. Illuminatorama shades in linear and
     // tonemaps to sRGB on store; the texture-atlas, emission-average, and
     // environment paths all decode with `pow(x, 2.2)` (see
@@ -1307,20 +1305,20 @@ func scnColorToRGB(_ color: NSColor) -> SIMD3<Float> {
     // emission/light-colour used to skip this decode, so a SceneKit material's
     // sRGB diffuse was fed in as if linear — translated scenes washed out
     // (green felt → khaki). Decode here so colour matches the textured paths.
-    return SIMD3(pow(Float(rgb.redComponent),   2.2),
-                 pow(Float(rgb.greenComponent), 2.2),
-                 pow(Float(rgb.blueComponent),  2.2))
+    return SIMD3(pow(Float(rgb.x), 2.2),
+                 pow(Float(rgb.y), 2.2),
+                 pow(Float(rgb.z), 2.2))
 }
 
 @MainActor
 func scnContentsToRGB(_ contents: Any?) -> SIMD3<Float>? {
-    if let color = contents as? NSColor {
+    if let color = contents as? PlatformColor {
         return scnColorToRGB(color)
     }
     if let cf = contents, CFGetTypeID(cf as CFTypeRef) == CGColor.typeID {
         let cgColor = cf as! CGColor
-        if let ns = NSColor(cgColor: cgColor) {
-            return scnColorToRGB(ns)
+        if let platform = PlatformColor.fromCG(cgColor) {
+            return scnColorToRGB(platform)
         }
     }
     if let num = contents as? NSNumber {
@@ -1338,11 +1336,11 @@ func scnContentsToScalar(_ contents: Any?) -> Float? {
     if let num = contents as? NSNumber {
         return Float(truncating: num)
     }
-    if let color = contents as? NSColor {
+    if let color = contents as? PlatformColor {
         // Some scenes pack a single-channel value into a colour. Take the
         // red channel as the value.
-        let rgb = color.usingColorSpace(.sRGB) ?? .gray
-        return Float(rgb.redComponent)
+        let rgb = color.srgbComponents ?? SIMD4(0.5, 0.5, 0.5, 1)
+        return Float(rgb.x)
     }
     return nil
 }

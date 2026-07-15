@@ -1,4 +1,8 @@
+#if canImport(AppKit) && !targetEnvironment(macCatalyst)
 import AppKit
+#else
+import UIKit
+#endif
 import Foundation
 import Metal
 import OSLog
@@ -247,7 +251,7 @@ public final class OceanSurface {
         )
         let emissionMat = SCNMaterial()
         emissionMat.lightingModel = .constant
-        emissionMat.diffuse.contents = NSColor.white   // per-vertex color modulates
+        emissionMat.diffuse.contents = PlatformColor.white   // per-vertex color modulates
         emissionMat.blendMode = .add
         emissionMat.writesToDepthBuffer = false
         emissionMat.readsFromDepthBuffer = true
@@ -426,7 +430,7 @@ public final class OceanSurface {
         // Almost-black base — at night, the diffuse contribution is supposed
         // to be a sliver; the IBL specular off the wave normals is what
         // carries the surface.
-        m.diffuse.contents  = NSColor(calibratedRed: 0.005, green: 0.012, blue: 0.025, alpha: 1)
+        m.diffuse.contents  = PlatformColor(calibratedRed: 0.005, green: 0.012, blue: 0.025, alpha: 1)
         m.metalness.contents = 0.04
         m.roughness.contents = 0.06
         m.isDoubleSided      = false

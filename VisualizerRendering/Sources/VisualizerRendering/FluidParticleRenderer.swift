@@ -2,6 +2,7 @@ import Foundation
 import Metal
 import SceneKit
 import simd
+import VisualizerCore
 
 // ── FLUID PARTICLE RENDERER ──────────────────────────────────────────────────
 //
@@ -92,11 +93,11 @@ public final class FluidParticleRenderer {
         // when no environment IBL is set on the scene.
         let mat = SCNMaterial()
         mat.lightingModel = .constant
-        mat.diffuse.contents = NSColor(deviceRed: CGFloat(colour.x),
+        mat.diffuse.contents = PlatformColor(deviceRed: CGFloat(colour.x),
                                        green:     CGFloat(colour.y),
                                        blue:      CGFloat(colour.z),
                                        alpha:     1)
-        mat.emission.contents = NSColor(deviceRed: CGFloat(colour.x),
+        mat.emission.contents = PlatformColor(deviceRed: CGFloat(colour.x),
                                         green:     CGFloat(colour.y),
                                         blue:      CGFloat(colour.z),
                                         alpha:     1)

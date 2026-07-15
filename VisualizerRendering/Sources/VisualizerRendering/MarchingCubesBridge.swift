@@ -908,7 +908,7 @@ public final class MarchingCubesBridge {
         // shouldn't see through dense red liquid), visible where it
         // pokes above the surface (the water mass has been displaced).
         m.lightingModel = .constant
-        m.diffuse.contents = NSColor.black
+        m.diffuse.contents = PlatformColor.black
         m.transparency = 1.0
         m.transparencyMode = .singleLayer
         // CRITICAL — isDoubleSided = true so the body looks SOLID from
@@ -1079,7 +1079,7 @@ public final class MarchingCubesBridge {
         // toward white. Surface highlights can be re-added later via an
         // additive overlay plane (per shader_modifier_overlay_pattern).
         m.lightingModel = .constant
-        m.diffuse.contents  = NSColor(deviceRed: 0.04, green: 0.18, blue: 0.28, alpha: 1)
+        m.diffuse.contents  = PlatformColor(deviceRed: 0.04, green: 0.18, blue: 0.28, alpha: 1)
         m.metalness.contents = 0.0
         // 0.55 — diffuses the IBL spec into a soft glow instead of a
         // sharp mirror. At low roughness the cool sky reflection
@@ -1121,7 +1121,7 @@ public final class MarchingCubesBridge {
         // lifting it toward the lighter rim colour only near the silhouette.
         // The previous values were too light, making the whole surface read
         // as whitish foam at any non-head-on angle.
-        m.diffuse.contents  = NSColor(deviceRed: 0.04, green: 0.12, blue: 0.30, alpha: 1)
+        m.diffuse.contents  = PlatformColor(deviceRed: 0.04, green: 0.12, blue: 0.30, alpha: 1)
         m.metalness.contents = 0.0
         m.roughness.contents = 0.08
         // Set to 1 because the shader modifier writes the effective alpha
@@ -1222,7 +1222,7 @@ public final class MarchingCubesBridge {
         // Default tint = warm cheese yellow so a fresh material renders
         // sensibly before the host calls setWaterTint(). Overwritten by
         // applyTintToCurrentMaterials() on first push.
-        m.diffuse.contents = NSColor(deviceRed: 0.96, green: 0.74, blue: 0.26, alpha: 1)
+        m.diffuse.contents = PlatformColor(deviceRed: 0.96, green: 0.74, blue: 0.26, alpha: 1)
         m.metalness.contents = 0.0
         m.roughness.contents = 0.35
         m.transparency = 1.0
@@ -1333,8 +1333,8 @@ public final class MarchingCubesBridge {
         let m = SCNMaterial()
         m.lightingModel = .blinn
         m.diffuse.contents = front
-            ? NSColor(deviceRed: 0.25, green: 0.55, blue: 0.85, alpha: 1)   // light blue
-            : NSColor(deviceRed: 0.10, green: 0.25, blue: 0.50, alpha: 1)   // dark blue
+            ? PlatformColor(deviceRed: 0.25, green: 0.55, blue: 0.85, alpha: 1)   // light blue
+            : PlatformColor(deviceRed: 0.10, green: 0.25, blue: 0.50, alpha: 1)   // dark blue
         m.transparency = 1.0
         m.isDoubleSided = false
         m.cullMode = .back   // overridden per-element by the bridge
@@ -1348,8 +1348,8 @@ public final class MarchingCubesBridge {
         let m = SCNMaterial()
         m.lightingModel = .constant
         m.diffuse.contents = front
-            ? NSColor(deviceRed: 0.40, green: 0.80, blue: 1.0, alpha: 1)
-            : NSColor(deviceRed: 0.20, green: 0.45, blue: 0.65, alpha: 1)
+            ? PlatformColor(deviceRed: 0.40, green: 0.80, blue: 1.0, alpha: 1)
+            : PlatformColor(deviceRed: 0.20, green: 0.45, blue: 0.65, alpha: 1)
         m.transparency = 1.0
         m.isDoubleSided = false
         m.cullMode = .back
@@ -1373,8 +1373,8 @@ public final class MarchingCubesBridge {
         let m = SCNMaterial()
         m.lightingModel = .constant
         m.diffuse.contents = front
-            ? NSColor.red
-            : NSColor.green
+            ? PlatformColor.red
+            : PlatformColor.green
         m.transparency = 1.0
         m.transparencyMode = .singleLayer
         m.isDoubleSided = false
@@ -1410,8 +1410,8 @@ public final class MarchingCubesBridge {
         let m = SCNMaterial()
         m.lightingModel = .constant
         m.diffuse.contents = front
-            ? NSColor(deviceRed: 1.00, green: 0.10, blue: 0.10, alpha: 1)   // saturated red
-            : NSColor(deviceRed: 0.10, green: 1.00, blue: 0.10, alpha: 1)   // saturated green
+            ? PlatformColor(deviceRed: 1.00, green: 0.10, blue: 0.10, alpha: 1)   // saturated red
+            : PlatformColor(deviceRed: 0.10, green: 1.00, blue: 0.10, alpha: 1)   // saturated green
         m.transparency = 1.0
         m.transparencyMode = .singleLayer
         m.isDoubleSided = false

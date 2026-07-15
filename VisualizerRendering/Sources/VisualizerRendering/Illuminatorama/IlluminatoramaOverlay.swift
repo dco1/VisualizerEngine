@@ -350,8 +350,8 @@ public final class IlluminatoramaOverlay {
         if let size = viewportSizeProvider?(), size.x > 0, size.y > 0 {
             let uv = renderer.coverUVRect(viewportWidth: size.x, viewportHeight: size.y)
             var xform = SCNMatrix4Identity
-            xform.m11 = CGFloat(uv.x); xform.m22 = CGFloat(uv.y)
-            xform.m41 = CGFloat(uv.z); xform.m42 = CGFloat(uv.w)
+            xform.m11 = SCNFloat(uv.x); xform.m22 = SCNFloat(uv.y)
+            xform.m41 = SCNFloat(uv.z); xform.m42 = SCNFloat(uv.w)
             displayScene.background.contentsTransform = xform
         }
         // Tick the host scene's physics + actions + particle emitters

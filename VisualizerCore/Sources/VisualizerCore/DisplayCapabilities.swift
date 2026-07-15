@@ -1,3 +1,6 @@
+// AppKit-only utility — not compiled for Mac Catalyst (no NSScreen/NSPasteboard/
+// NSEvent/NSGraphicsContext there). Render-path code never references this file.
+#if canImport(AppKit) && !targetEnvironment(macCatalyst)
 import AppKit
 import OSLog
 
@@ -33,3 +36,4 @@ public enum DisplayCapabilities {
         log.notice("\(summary())")
     }
 }
+#endif // canImport(AppKit)

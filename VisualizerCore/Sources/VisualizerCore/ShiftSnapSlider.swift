@@ -1,5 +1,7 @@
 import SwiftUI
+#if canImport(AppKit) && !targetEnvironment(macCatalyst)
 import AppKit
+#endif
 
 // ──────────────────────────────────────────────────────────────────────────
 // Shift-to-snap slider bindings
@@ -17,6 +19,10 @@ import AppKit
 //     Slider(value: $value.shiftSnapped(format: format, in: range), in: range)
 //
 // Without Shift held, writes pass straight through unchanged.
+//
+// Mac Catalyst: there is no NSEvent to read live modifier flags from, so the
+// binding compiles but never snaps (a plain passthrough). Keeping the API
+// alive lets every shared SwiftUI settings section compile unchanged.
 // ──────────────────────────────────────────────────────────────────────────
 
 public extension Binding where Value == Double {
@@ -48,7 +54,11 @@ func applyShiftSnap(_ value: Double, format: String, in range: ClosedRange<Doubl
 /// `true` when the Shift key is currently held — read from the live modifier
 /// flags so it reflects the key state mid-drag.
 func shiftSnapIsActive() -> Bool {
+    #if canImport(AppKit) && !targetEnvironment(macCatalyst)
     NSEvent.modifierFlags.contains(.shift)
+    #else
+    false
+    #endif
 }
 
 /// The shift-snap increment for a printf-style float `format`: 5× the smallest

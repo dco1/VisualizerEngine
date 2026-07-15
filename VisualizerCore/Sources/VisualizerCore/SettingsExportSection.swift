@@ -1,3 +1,6 @@
+// AppKit-only utility — not compiled for Mac Catalyst (no NSScreen/NSPasteboard/
+// NSEvent/NSGraphicsContext there). Render-path code never references this file.
+#if canImport(AppKit) && !targetEnvironment(macCatalyst)
 import AppKit
 import SwiftUI
 
@@ -77,18 +80,4 @@ public struct SettingsExportSection: View {
     }
     #endif
 }
-
-@MainActor
-public enum SettingsExportFormat {
-    public static func fmt(_ d: Double) -> String {
-        String(format: "%.4f", d)
-    }
-
-    public static func color(_ c: Color) -> String {
-        let ns = NSColor(c).usingColorSpace(.sRGB) ?? .black
-        return String(
-            format: "(%.4f, %.4f, %.4f)",
-            ns.redComponent, ns.greenComponent, ns.blueComponent
-        )
-    }
-}
+#endif // canImport(AppKit)

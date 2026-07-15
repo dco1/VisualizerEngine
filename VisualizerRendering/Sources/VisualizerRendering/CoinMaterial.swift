@@ -1,7 +1,12 @@
 import Foundation
 import SceneKit
-import AppKit
 import CoreGraphics
+import VisualizerCore
+#if canImport(AppKit) && !targetEnvironment(macCatalyst)
+import AppKit
+#else
+import UIKit
+#endif
 
 // ── CoinMaterial ──────────────────────────────────────────────────────────────
 //
@@ -25,7 +30,7 @@ public enum CoinMaterial {
         m.lightingModel = .physicallyBased
         m.name = "CoinGold"
         // sRGB equivalent of linear gold F0 (1.0, 0.78, 0.34) ≈ #FFE29B.
-        m.diffuse.contents = NSColor(srgbRed: 1.0, green: 0.886, blue: 0.608, alpha: 1.0)
+        m.diffuse.contents = PlatformColor(srgbRed: 1.0, green: 0.886, blue: 0.608, alpha: 1.0)
         m.metalness.contents = 1.0
         m.roughness.contents = roughness
         m.normal.contents = normal
@@ -39,7 +44,7 @@ public enum CoinMaterial {
     /// Returns (normalMap, roughnessMap) for the coin face. The textured content
     /// lives in a central disk (radius ≈ 0.45 in UV, matching CoinMesh); the
     /// border is flat so the rim stays smooth.
-    static func faceMaps(text: String, size S: Int) -> (NSImage, NSImage) {
+    static func faceMaps(text: String, size S: Int) -> (PlatformImage, PlatformImage) {
         let height = heightField(text: text, size: S)
         return (normalMap(from: height, size: S, strength: 2.4),
                 roughnessMap(from: height, size: S))
@@ -88,6 +93,7 @@ public enum CoinMaterial {
         let top = parts.first ?? text
         let bottom = parts.count > 1 ? parts[1] : ""
 
+        #if canImport(AppKit) && !targetEnvironment(macCatalyst)
         let ns = NSGraphicsContext(cgContext: ctx, flipped: false)
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = ns
@@ -106,6 +112,30 @@ public enum CoinMaterial {
         draw(top, fontSize: f * 0.30, yCenterFrac: 0.60)
         draw(bottom, fontSize: f * 0.20, yCenterFrac: 0.34)
         NSGraphicsContext.restoreGraphicsState()
+        #else
+        // UIKit string drawing assumes a top-left-flipped context; flip, and
+        // mirror the y placement so the stamp lands identically to macOS.
+        ctx.saveGState()
+        ctx.translateBy(x: 0, y: f)
+        ctx.scaleBy(x: 1, y: -1)
+        UIGraphicsPushContext(ctx)
+        func draw(_ s: String, fontSize: CGFloat, yCenterFrac: CGFloat) {
+            guard !s.isEmpty else { return }
+            let font = UIFont.systemFont(ofSize: fontSize, weight: .heavy)
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: UIColor(white: 0.95, alpha: 1.0),
+                .kern: fontSize * 0.04,
+            ]
+            let str = NSAttributedString(string: s, attributes: attrs)
+            let sz = str.size()
+            str.draw(at: CGPoint(x: cx - sz.width/2, y: f * (1 - yCenterFrac) - sz.height/2))
+        }
+        draw(top, fontSize: f * 0.30, yCenterFrac: 0.60)
+        draw(bottom, fontSize: f * 0.20, yCenterFrac: 0.34)
+        UIGraphicsPopContext()
+        ctx.restoreGState()
+        #endif
 
         guard let data = ctx.data else { return [Float](repeating: 0, count: S * S) }
         let ptr = data.bindMemory(to: UInt8.self, capacity: S * S * 4)
@@ -148,7 +178,7 @@ public enum CoinMaterial {
         return out
     }
 
-    private static func normalMap(from h: [Float], size S: Int, strength: Float) -> NSImage {
+    private static func normalMap(from h: [Float], size S: Int, strength: Float) -> PlatformImage {
         var px = [UInt8](repeating: 0, count: S * S * 4)
         for y in 0..<S {
             for x in 0..<S {
@@ -168,7 +198,7 @@ public enum CoinMaterial {
         return image(from: px, size: S)
     }
 
-    private static func roughnessMap(from h: [Float], size S: Int) -> NSImage {
+    private static func roughnessMap(from h: [Float], size S: Int) -> PlatformImage {
         // Struck/raised areas are slightly more polished (rubbed); field is duller.
         var px = [UInt8](repeating: 0, count: S * S * 4)
         for i in 0..<(S * S) {
@@ -180,7 +210,7 @@ public enum CoinMaterial {
         return image(from: px, size: S)
     }
 
-    private static func image(from px: [UInt8], size S: Int) -> NSImage {
+    private static func image(from px: [UInt8], size S: Int) -> PlatformImage {
         let cs = CGColorSpaceCreateDeviceRGB()
         var data = px
         let img: CGImage? = data.withUnsafeMutableBytes { raw in
@@ -190,7 +220,11 @@ public enum CoinMaterial {
             else { return nil }
             return ctx.makeImage()
         }
+        #if canImport(AppKit) && !targetEnvironment(macCatalyst)
         guard let cg = img else { return NSImage(size: NSSize(width: S, height: S)) }
-        return NSImage(cgImage: cg, size: NSSize(width: S, height: S))
+        #else
+        guard let cg = img else { return UIImage() }
+        #endif
+        return PlatformImage(cgImage: cg, size: CGSize(width: S, height: S))
     }
 }

@@ -11,7 +11,7 @@ import PackageDescription
 // The two manifest forms are independent — nobody reads both at once.
 let package = Package(
     name: "VisualizerEngine",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS(.v15), .iOS(.v18)],
     products: [
         .library(name: "VisualizerCore", targets: ["VisualizerCore"]),
         .library(name: "VisualizerRendering", targets: ["VisualizerRendering"]),

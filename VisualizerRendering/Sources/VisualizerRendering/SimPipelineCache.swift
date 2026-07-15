@@ -124,7 +124,9 @@ public final class SimPipelineCache {
     /// so it never has to be kept perfectly in sync with the call sites.
     public func precompile(_ names: [String], device: MTLDevice) {
         guard let lib = library(for: device) else { return }
+        #if !targetEnvironment(macCatalyst)
         if #available(macOS 13.3, *) { device.shouldMaximizeConcurrentCompilation = true }
+        #endif
         final class Box: @unchecked Sendable {
             let lock = NSLock()
             var dict: [String: MTLComputePipelineState] = [:]
@@ -234,7 +236,9 @@ public final class SimPipelineCache {
         // per device.
         let devKey = ObjectIdentifier(device)
         if !maximizedDevices.contains(devKey) {
-            if #available(macOS 13.3, *) { device.shouldMaximizeConcurrentCompilation = true }
+            #if !targetEnvironment(macCatalyst)
+        if #available(macOS 13.3, *) { device.shouldMaximizeConcurrentCompilation = true }
+        #endif
             maximizedDevices.insert(devKey)
         }
 
