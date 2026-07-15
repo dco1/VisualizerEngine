@@ -550,6 +550,27 @@ public final class IlluminatoramaRenderer {
     /// when the camera looks toward the low sun through canopy gaps.
     public var volOutdoorMode: Bool = false
 
+    // ── Spot-light beam scattering (issue: CK5 concert beams) ───────
+    /// Single-scatter march of every `spotLights` cone through hazy air, so
+    /// spots read as BEAMS in the air, not just pools on surfaces. Runs after
+    /// the sun volumetric pass, independent of `volumetricEnabled` — a stage
+    /// scene wants haze-lit beams with no sun window. Per-ray cost is bounded
+    /// per spot by analytic range-sphere clipping, so dead air is ~free; keep
+    /// `spotLights.count` in the low tens. Beams are depth-terminated but not
+    /// shadow-traced inside the interval (geometry in front hides a beam;
+    /// geometry inside one doesn't carve it).
+    public var volSpotBeamsEnabled: Bool = false
+    /// Haze density for the beam march (separate from `volFogDensity` so the
+    /// sun shaft and stage haze are tunable independently).
+    public var volSpotBeamDensity: Float = 0.06
+    public var volSpotBeamStrength: Float = 1.0
+    /// Forward-scatter anisotropy: higher = beams flare when the camera looks
+    /// into the fixture, like real stage haze.
+    public var volSpotBeamAnisotropy: Float = 0.55
+    /// Jittered samples per spot interval (TAA accumulates the noise out).
+    public var volSpotBeamSteps: Int = 20
+    public var volSpotBeamMaxDistance: Float = 60.0
+
     // ── Phase 4.21 — auto-exposure ──────────────────────────────────
     /// Toggle the per-frame log-luminance estimator + EMA. When off,
     /// the tonemap falls back to the static `exposure` scalar above.
@@ -2465,6 +2486,17 @@ public final class IlluminatoramaRenderer {
     private let volUniformBuffer: MTLBuffer
     private var volFrameSeed: UInt32 = 0
 
+    // ── Spot-beam scattering state ───────────────────────────────────
+    // Mirror of the Metal `VolSpotUniforms` in IlluminatoramaVolumetric.metal.
+    private struct VolSpotUniforms {
+        var invViewProjection: simd_float4x4
+        var cameraWorldPos: SIMD3<Float>; var density: Float
+        var anisotropy: Float; var strength: Float; var spotCount: UInt32; var steps: UInt32
+        var maxDist: Float; var frameSeed: UInt32; var width: UInt32; var height: UInt32
+    }
+    private let volSpotPipeline: MTLComputePipelineState?
+    private let volSpotUniformBuffer: MTLBuffer
+
     // ── In-view (perspective) cloud pass — OPT-IN ────────────────────
     // Mirror of the Metal `CloudInViewUniforms`. The cloud density/lighting/
     // burst params ride in the cloud renderer's own SkyUniforms buffer
@@ -2999,6 +3031,19 @@ public final class IlluminatoramaRenderer {
         }
         volUB.label = "Illuminatorama.vol.uniforms"
         self.volUniformBuffer = volUB
+
+        // ── Spot-beam scattering pipeline ────────────────────────────
+        if let volSpotFn = library.makeFunction(name: "illumi_volumetric_spots") {
+            self.volSpotPipeline = try? device.makeComputePipelineState(function: volSpotFn) // gpu-ok: one-time init, optional spot-beam pipeline
+        } else {
+            self.volSpotPipeline = nil
+        }
+        guard let volSpotUB = device.makeBuffer(length: MemoryLayout<VolSpotUniforms>.stride,
+                                                options: .storageModeShared) else {
+            throw IlluminatoramaError.bufferAllocationFailed("volSpotUniforms")
+        }
+        volSpotUB.label = "Illuminatorama.volSpot.uniforms"
+        self.volSpotUniformBuffer = volSpotUB
 
         // ── In-view cloud pipeline (opt-in; nil-safe → pass no-ops) ──
         if let cloudFn = library.makeFunction(name: "illumi_cloud_inview") {
@@ -7176,6 +7221,7 @@ public final class IlluminatoramaRenderer {
         }
         // Volumetric god-ray shaft in the air. No-op unless enabled.
         encodeVolumetricPass(cb)
+        encodeSpotBeamPass(cb)
         // In-view perspective cloud composite (issue #61). No-op unless a scene
         // opted in. Lands before TAA (so clouds anti-alias) and before the
         // additive firework particles in encodePostResolveFX (so clouds sit
@@ -9330,6 +9376,34 @@ public final class IlluminatoramaRenderer {
         enc.setTexture(depthTexture, index: 0)
         enc.setTexture(hdrCompositeTexture, index: 1)
         enc.setBuffer(volUniformBuffer, offset: 0, index: 0)
+        dispatch(enc, pipeline: pipeline, width: width, height: height)
+        enc.endEncoding()
+    }
+
+    /// Spot-light beam scattering — every entry in `spotLights` marches as a
+    /// haze-lit cone. Runs after the sun volumetric pass so both add into the
+    /// same HDR composite; independent of `volumetricEnabled`.
+    private func encodeSpotBeamPass(_ cb: MTLCommandBuffer) {
+        guard volSpotBeamsEnabled, !spotLights.isEmpty,
+              let pipeline = volSpotPipeline else { return }
+        let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
+        volFrameSeed &+= 1
+        var u = VolSpotUniforms(
+            invViewProjection: fu.invViewProjection,
+            cameraWorldPos: fu.cameraWorldPos, density: max(0, volSpotBeamDensity),
+            anisotropy: volSpotBeamAnisotropy, strength: max(0, volSpotBeamStrength),
+            spotCount: UInt32(spotLights.count),
+            steps: UInt32(max(4, min(48, volSpotBeamSteps))),
+            maxDist: volSpotBeamMaxDistance, frameSeed: volFrameSeed,
+            width: UInt32(width), height: UInt32(height))
+        memcpy(volSpotUniformBuffer.contents(), &u, MemoryLayout<VolSpotUniforms>.stride)
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.label = "Illuminatorama.volumetricSpots"
+        enc.setComputePipelineState(pipeline)
+        enc.setTexture(depthTexture, index: 0)
+        enc.setTexture(hdrCompositeTexture, index: 1)
+        enc.setBuffer(volSpotUniformBuffer, offset: 0, index: 0)
+        enc.setBuffer(spotLightBuffer, offset: 0, index: 1)
         dispatch(enc, pipeline: pipeline, width: width, height: height)
         enc.endEncoding()
     }
