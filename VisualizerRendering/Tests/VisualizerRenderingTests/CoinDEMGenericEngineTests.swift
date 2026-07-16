@@ -266,6 +266,54 @@ final class CoinDEMGenericEngineTests: XCTestCase {
         XCTAssertLessThan(stats.maxPenetration, r * 0.5, "no deep capsule↔hull overlap")
     }
 
+    // ── Hull ↔ hull: per-point manifold depths (roadmap item 2) ────────────────
+    // A tilted hull box overlapping a flat hull box must produce a manifold whose
+    // contact points carry DIFFERENT depths — one edge digs in further than the
+    // other. Before per-point depths, every clipped point shared the single EPA
+    // witness depth, which is wrong (and a source of bias-recovery noise) on any
+    // contact that isn't perfectly face-parallel. This is a Stage-1-style direct
+    // contact-buffer probe (generateContactsNow), not a settle test.
+    func testHullHullManifoldHasPerPointDepths() throws {
+        let (solver, _) = try makeSolver(maxCoins: 8, radius: 0.3, maxDim: 0.3,
+                                         boundsMin: SIMD3(-1, -0.5, -1), boundsMax: SIMD3(1, 1, 1))
+        let bh: Float = 0.3   // bottom hull half-extent (flat "floor" slab)
+        var bottomPts: [SIMD3<Float>] = []
+        for i in 0..<8 {
+            bottomPts.append(SIMD3((i & 1) != 0 ? bh : -bh, (i & 2) != 0 ? 0.03 : -0.03, (i & 4) != 0 ? bh : -bh))
+        }
+        let bottomHull = solver.registerHull(vertices: bottomPts)!
+        let bottom = solver.spawnHull(at: SIMD3(0, 0.03, 0), hull: bottomHull)!
+
+        // Top hull tilted ~0.9° about Z — shallow enough that BOTH hulls' support
+        // sets still present ≥3 points each (a real face-face contact, not an
+        // edge-only one), but tilted enough that the near/far corners penetrate
+        // by clearly different amounts.
+        let th: Float = 0.1
+        var topPts: [SIMD3<Float>] = []
+        for i in 0..<8 {
+            topPts.append(SIMD3((i & 1) != 0 ? th : -th, (i & 2) != 0 ? th : -th, (i & 4) != 0 ? th : -th))
+        }
+        let topHull = solver.registerHull(vertices: topPts)!
+        let tilt = simd_quatf(angle: 0.016, axis: SIMD3(0, 0, 1))
+        let top = solver.spawnHull(at: SIMD3(0, 0.06 + th - 0.01, 0), hull: topHull,
+                                   orient: SIMD4(tilt.imag, tilt.real))!
+
+        let n = solver.generateContactsNow()
+        XCTAssertGreaterThan(n, 0, "tilted overlapping hulls must generate contacts")
+        let ptr = solver.contactBuffer.contents().bindMemory(to: CoinContact.self, capacity: max(1, n))
+        var depths: [Float] = []
+        let lo = min(bottom, top), hi = max(bottom, top)
+        for i in 0..<n {
+            let c = ptr[i]
+            if Int(c.meta.x) == lo && Int(c.meta.y) == hi { depths.append(c.nrm.w) }
+        }
+        print("HULLHULL_TILT depths=\(depths)")
+        XCTAssertGreaterThanOrEqual(depths.count, 2, "tilted face contact needs a real (not single-point) manifold")
+        let spread = (depths.max() ?? 0) - (depths.min() ?? 0)
+        XCTAssertGreaterThan(spread, 0.003,
+                             "manifold points on a tilted face must carry DIFFERENT depths, not one shared EPA value")
+    }
+
     // An OCTAHEDRON (a hull nothing like a box) dropped point-down must tip onto
     // a face and settle at the face's support height — real generic-shape physics.
     func testHullOctahedronSettlesOnAFace() throws {

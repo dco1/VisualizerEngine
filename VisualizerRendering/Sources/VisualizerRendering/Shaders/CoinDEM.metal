@@ -1932,6 +1932,43 @@ static int cdOrderConvex2D(thread float2* pts, int n) {
     return n;
 }
 
+// Order ≤CD_MSET 3D points CCW (as seen along the tangent basis t1/t2) about
+// their centroid — the winding cdFitFacePlane's Newell's-method normal needs
+// to come out stable and consistently signed.
+static void cdOrderConvex3D(thread float3* pts, int n, float3 t1, float3 t2) {
+    if (n < 3) return;
+    float3 cen = float3(0.0);
+    for (int i = 0; i < n; ++i) cen += pts[i];
+    cen /= float(n);
+    float ang[CD_MSET];
+    for (int i = 0; i < n; ++i) {
+        float3 d = pts[i] - cen;
+        ang[i] = atan2(dot(d, t2), dot(d, t1));
+    }
+    for (int i = 1; i < n; ++i) {
+        float3 pv = pts[i]; float av = ang[i]; int j = i - 1;
+        while (j >= 0 && ang[j] > av) { pts[j+1] = pts[j]; ang[j+1] = ang[j]; j--; }
+        pts[j+1] = pv; ang[j+1] = av;
+    }
+}
+
+// Fit a plane (dot(normal, x) == offset) through ≤CD_MSET CCW-ordered 3D
+// points via Newell's method. False on a degenerate (near-collinear) set —
+// callers must fall back rather than trust a near-zero-length normal.
+static bool cdFitFacePlane(thread const float3* pts, int n, thread float3& outNormal, thread float& outOffset) {
+    if (n < 3) return false;
+    float3 centroid = float3(0.0);
+    for (int i = 0; i < n; ++i) centroid += pts[i];
+    centroid /= float(n);
+    float3 nrm = float3(0.0);
+    for (int i = 0; i < n; ++i) nrm += cross(pts[i] - centroid, pts[(i + 1) % n] - centroid);
+    float len = length(nrm);
+    if (len < 1e-10) return false;
+    outNormal = nrm / len;
+    outOffset = dot(outNormal, centroid);
+    return true;
+}
+
 // Sutherland–Hodgman: clip convex polygon A (CCW) by convex polygon B (CCW).
 // Returns the clipped vertex count (≤ 2·CD_MSET).
 static int cdClipConvex2D(thread float2* A, int nA, thread const float2* B, int nB,
@@ -2087,10 +2124,58 @@ kernel void coinGenerateContacts(
                                 for (int m = 0; m < nP; ++m) if (pick[m] == bi) dup = true;
                                 if (!dup) pick[nP++] = bi;
                             }
+
+                            // Fit each shape's actual near-face plane (Newell's
+                            // method over its own CCW-ordered support set) so
+                            // manifold points get a TRUE per-point depth instead
+                            // of sharing the single EPA witness depth — the
+                            // shared value is only exact at the EPA witness
+                            // points; on a tilted face contact the other
+                            // manifold points are off by up to the eps-band
+                            // width, which reads back as bias-recovery noise.
+                            // Falls back to the shared depth wherever the fit
+                            // is degenerate or a face sits edge-on to n.
+                            float3 setA3[CD_MSET], setB3[CD_MSET];
+                            for (int m = 0; m < nA; ++m) setA3[m] = setA[m];
+                            for (int m = 0; m < nB; ++m) setB3[m] = setB[m];
+                            cdOrderConvex3D(setA3, nA, t1, t2);
+                            cdOrderConvex3D(setB3, nB, t1, t2);
+                            float3 planeNA, planeNB; float offA, offB;
+                            bool haveA = cdFitFacePlane(setA3, nA, planeNA, offA);
+                            bool haveB = cdFitFacePlane(setB3, nB, planeNB, offB);
+                            if (haveA && dot(planeNA, n) > 0.0) { planeNA = -planeNA; offA = -offA; }
+                            if (haveB && dot(planeNB, n) < 0.0) { planeNB = -planeNB; offB = -offB; }
+
+                            int emittedPts = 0;
                             for (int m = 0; m < nP; ++m) {
                                 float2 c2 = clipped[pick[m]];
                                 float3 cp = origin + c2.x * t1 + c2.y * t2;
-                                cdEmitContact(contacts, contactCount, maxContacts, id, j, uint(m), 0u, n, cp, xi, xj, depth);
+                                float pointDepth = depth;
+                                if (haveA && haveB) {
+                                    float denomA = dot(planeNA, n), denomB = dot(planeNB, n);
+                                    if (abs(denomA) > 0.2 && abs(denomB) > 0.2) {
+                                        float tA = (offA - dot(planeNA, cp)) / denomA;
+                                        float tB = (offB - dot(planeNB, cp)) / denomB;
+                                        // pointOnA = cp + tA*n, pointOnB = cp + tB*n; depth is
+                                        // how far B's surface has been pushed past A's along n
+                                        // (B sits "ahead" along n by convention: n points B→A).
+                                        pointDepth = tB - tA;
+                                    }
+                                }
+                                if (pointDepth > -spec) {
+                                    cdEmitContact(contacts, contactCount, maxContacts, id, j, uint(m), 0u, n, cp, xi, xj, pointDepth);
+                                    emittedPts++;
+                                }
+                            }
+                            if (emittedPts == 0) {
+                                // Every corner read non-penetrating under the
+                                // tilted-plane fit (a rare near-equilibrium
+                                // contact) — don't drop the pair to zero contacts.
+                                // EPA's depth>0 is the authoritative overlap test,
+                                // so it wins over the plane-fit approximation here;
+                                // `origin` (body-center midpoint) stands in for a
+                                // contact point since no per-corner one qualified.
+                                cdEmitContact(contacts, contactCount, maxContacts, id, j, 0u, 0u, n, origin, xi, xj, depth);
                             }
                             continue;
                         }
