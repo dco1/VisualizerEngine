@@ -218,6 +218,54 @@ final class CoinDEMGenericEngineTests: XCTestCase {
         XCTAssertLessThan(stats.maxPenetration, h * 0.4, "no deep hull↔hull overlap")
     }
 
+    // ── Capsule ↔ hull (roadmap: capsule↔hull 2-point manifold) ────────────────
+    // A capsule resting crosswise on a flat hull "table" must settle level with
+    // BOTH segment stations supported. Before the 2-point manifold, a hull pair
+    // involving a capsule collapsed to the single midpoint EPA contact, which
+    // can't resist the roll torque about that one point — the capsule teeters
+    // instead of coming to rest.
+    func testCapsuleRestsLevelOnHullTable() throws {
+        let (solver, queue) = try makeSolver(radius: 0.15, maxDim: 0.15,
+                                             boundsMin: SIMD3(-2, -0.5, -2),
+                                             boundsMax: SIMD3(2, 2, 2))
+        let th: Float = 0.03            // table half-thickness
+        let tw: Float = 0.15            // table half-width/depth
+        var tablePts: [SIMD3<Float>] = []
+        for i in 0..<8 {
+            tablePts.append(SIMD3((i & 1) != 0 ? tw : -tw, (i & 2) != 0 ? th : -th, (i & 4) != 0 ? tw : -tw))
+        }
+        let table = solver.registerHull(vertices: tablePts)!
+        let tableSlot = solver.spawnHull(at: SIMD3(0, th, 0), hull: table)!
+
+        let r: Float = 0.03, hl: Float = 0.10   // capsule spans most of the table, axis → X
+        let q = simd_quatf(angle: -.pi / 2, axis: SIMD3(0, 0, 1))
+        let cap = solver.spawnCapsule(at: SIMD3(0, 2 * th + r + 0.05, 0), radius: r, halfLength: hl,
+                                      orient: SIMD4(q.imag, q.real))!
+
+        var tailAxisY: [Float] = []
+        step(solver, queue, frames: 420) { f in
+            if f > 360, let o = solver.orientation(of: cap) {
+                tailAxisY.append(simd_act(o, SIMD3<Float>(0, 1, 0)).y)
+            }
+        }
+
+        let pTable = solver.position(of: tableSlot)!
+        let pCap = solver.position(of: cap)!
+        let vCap = solver.velocity(of: cap)!
+        let restY = pTable.y + th + r
+        XCTAssertEqual(pCap.y, restY, accuracy: r * 0.5,
+                       "capsule rests ON the table top (COM ≈ table top + r), no sink-through")
+        XCTAssertLessThan(simd_length(vCap), 0.03, "capsule at rest")
+        let axis = simd_act(solver.orientation(of: cap)!, SIMD3<Float>(0, 1, 0))
+        XCTAssertLessThan(abs(axis.y), 0.25, "capsule stayed level (didn't tip off the table)")
+        // No teeter: over the settled tail, the axis tilt barely moves — a
+        // single-point manifold rocks the capsule back and forth forever.
+        let tiltSpread = (tailAxisY.max() ?? 0) - (tailAxisY.min() ?? 0)
+        XCTAssertLessThan(tiltSpread, 0.03, "capsule didn't keep rocking on the hull (2-point manifold holds it still)")
+        let stats = solver.measurePenetration(threshold: r * 0.15)
+        XCTAssertLessThan(stats.maxPenetration, r * 0.5, "no deep capsule↔hull overlap")
+    }
+
     // An OCTAHEDRON (a hull nothing like a box) dropped point-down must tip onto
     // a face and settle at the face's support height — real generic-shape physics.
     func testHullOctahedronSettlesOnAFace() throws {

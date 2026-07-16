@@ -2024,9 +2024,40 @@ kernel void coinGenerateContacts(
                 if (!cdGJKEPA(ci, cj, hullVerts, hullRanges, n, depth)) continue;
                 if (depth <= 0.0) continue;
                 // n points from j(B) toward i(A) — cdEmitContact's convention.
-                bool otherRound = cdIsSphere(ci) || cdIsSphere(cj) ||
-                                  cdIsCapsule(ci) || cdIsCapsule(cj);
-                if (!otherRound) {
+                bool capsuleInvolved = cdIsCapsule(ci) || cdIsCapsule(cj);
+
+                // Capsule↔hull: 2-point manifold (both segment stations vs the
+                // hull's near-face support point along the EPA normal), so a
+                // capsule lying across a hull face/edge rests level instead of
+                // teetering on the single-point EPA contact.
+                if (capsuleInvolved) {
+                    bool idIsCapsule = cdIsCapsule(ci);
+                    CoinBody capBody = idIsCapsule ? ci : cj;
+                    float3 nCapWard = idIsCapsule ? n : -n;   // hull → capsule
+                    float capR = cdCapsuleR(capBody);
+                    float3 s0, s1; cdCapsuleSegment(capBody, s0, s1);
+                    CoinBody hullBody = idIsCapsule ? cj : ci;
+                    float3 hullSupport = cdSupport(hullBody, nCapWard, hullVerts, hullRanges);
+                    float planeOffset = dot(nCapWard, hullSupport);
+                    float3 stations[2] = { s0, s1 };
+                    int emitted = 0;
+                    for (int p = 0; p < 2; ++p) {
+                        float pen = (planeOffset + capR) - dot(nCapWard, stations[p]);
+                        if (pen > -spec) {
+                            float3 cp = stations[p] - capR * nCapWard;
+                            cdEmitContact(contacts, contactCount, maxContacts, id, j, uint(p), 0u, n, cp, xi, xj, pen);
+                            emitted++;
+                        }
+                    }
+                    if (emitted > 0) continue;
+                    // Neither station registered a plane-relative penetration
+                    // (e.g. the capsule tip is the true contact, not a side
+                    // rest) — fall back to the single EPA contact below.
+                    cdEmitContact(contacts, contactCount, maxContacts, id, j, 0u, 0u, n, 0.5 * (cdSupport(ci, -n, hullVerts, hullRanges) + cdSupport(cj, n, hullVerts, hullRanges)), xi, xj, depth);
+                    continue;
+                }
+
+                if (!cdIsSphere(ci) && !cdIsSphere(cj)) {
                     float3 setA[CD_MSET], setB[CD_MSET];
                     int nA = cdSupportSet(ci, -n, hullVerts, hullRanges, setA);
                     int nB = cdSupportSet(cj,  n, hullVerts, hullRanges, setB);
