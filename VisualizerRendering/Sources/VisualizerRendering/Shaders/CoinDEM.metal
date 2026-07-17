@@ -518,6 +518,12 @@ constant int   CD_FRING = 4;          // face-ring samples per face
 constant int   CD_EQ    = 4;          // equatorial samples
 constant int   CD_NPTS  = 2 + 2 * CD_FRING + CD_EQ;   // 14
 constant float CD_FACE_R = 0.6;       // face-ring radius fraction
+// Widest per-body probe count the static-collider loop's `nFP` ever reaches — a
+// hull's real vertex count, capped (`min(hRange.y, 32u)` at its computation
+// site). CD_NPTS (14, box/disc feature points) is narrower; any fixed-size
+// per-point cache in that loop must size to THIS, or a >14-vertex hull
+// overflows it.
+constant int   CD_MAX_STATIC_FP = 32;
 
 static float3 cdFeaturePoint(int i, float R, float h) {
     if (i == 0) return float3(0.0,  h, 0.0);   // top centre
@@ -682,6 +688,38 @@ static bool cdOrientedBoxPush(float3 pw, float3 cj, float4 qj, float3 heJ,
     else                        { nLocal = float3(0, 0, sign(lp.z)); push = d.z; }
     outN = cdQuatRotate(qj, nLocal);             // world normal, out of box j toward pw
     outDepth = push;
+    return true;
+}
+
+// Speculative-margin sibling of `cdOrientedBoxPush`: an inside-only test misses a
+// fast thin point that tunnels a thin wall between substeps (the point never
+// registers as "inside" at either sample). Inside behaves exactly like
+// `cdOrientedBoxPush` (positive outDepth, push-out normal). Outside, instead of
+// unconditionally returning false, it finds the TRUE exterior closest point
+// (clamp to the half-extents — same core as `cdClosestInShapeLocal`'s box case)
+// and reports a near-contact (negative outDepth = gap) when that gap is under
+// `spec`, using cdEmitContact's `pen > -spec` convention throughout. `spec <= 0`
+// degrades to the exact inside-only behaviour of `cdOrientedBoxPush`.
+static bool cdOrientedBoxPushSpeculative(float3 pw, float3 cj, float4 qj, float3 heJ, float spec,
+                                         thread float3& outN, thread float& outDepth) {
+    float3 lp = cdQuatRotateInv(qj, pw - cj);    // point in box-local frame
+    float3 d  = heJ - abs(lp);
+    if (d.x > 0.0 && d.y > 0.0 && d.z > 0.0) {    // inside: push out (unchanged)
+        float3 nLocal; float push;
+        if (d.x < d.y && d.x < d.z) { nLocal = float3(sign(lp.x), 0, 0); push = d.x; }
+        else if (d.y < d.z)         { nLocal = float3(0, sign(lp.y), 0); push = d.y; }
+        else                        { nLocal = float3(0, 0, sign(lp.z)); push = d.z; }
+        outN = cdQuatRotate(qj, nLocal);
+        outDepth = push;
+        return true;
+    }
+    if (spec <= 0.0) return false;                // no margin ⇒ exact cdOrientedBoxPush behaviour
+    float3 cl = clamp(lp, -heJ, heJ);
+    float3 dl3 = lp - cl;
+    float dist = length(dl3);
+    if (dist >= spec || dist < 1e-8) return false;
+    outN = cdQuatRotate(qj, dl3 / dist);          // world normal, out of box j toward pw
+    outDepth = -dist;                             // negative gap
     return true;
 }
 
@@ -2330,19 +2368,45 @@ kernel void coinGenerateContacts(
             }
 
             // Box-involved (box–box manifold, or disc–box with phantom-corner reject).
+            // Two-phase, shared-depth near-face manifold: any INSIDE corner emits
+            // the full manifold (unchanged); with none inside — a fast thin box
+            // can cross a thin box/disc between substeps without any corner ever
+            // landing "inside" the other — every corner within a tight tolerance
+            // of the CLOSEST corner's depth gets a near-contact, all sharing that
+            // one depth (item 5 in the constraint-solver doc's roadmap). Testing
+            // every corner independently, or using only the single nearest one,
+            // both fail a flush symmetric hit: independent depths mix the near
+            // face with the trailing one (over-constrained, inconsistent
+            // targets); a single off-center contact induces spurious SPIN instead
+            // of clean linear deceleration (part of the impulse goes into
+            // rotation to satisfy just that one point's relative velocity).
             if (iIsBox || cdIsBox(cj)) {
                 bool jIsDisc = !cdIsBox(cj);
                 float3 heJ = cdBodyHalfExtents(cj);
-                int added = 0;
+                float3 cPos[8]; float3 cN[8]; float cDepth[8]; int cFeat[8];
+                bool anyInside = false;
+                int nCand = 0;
+                float bestDepth = -1e30;
                 for (int p = 0; p < 8; ++p) {
                     float3 pw = fp[p]; float3 nB; float depthB;
-                    if (cdOrientedBoxPush(pw, xj, qj, heJ, nB, depthB)) {
-                        if (jIsDisc) { float3 lp = cdQuatRotateInv(qj, pw - xj); if (length(lp.xz) > Rj) continue; }
+                    if (!cdOrientedBoxPushSpeculative(pw, xj, qj, heJ, spec, nB, depthB)) continue;
+                    if (jIsDisc) { float3 lp = cdQuatRotateInv(qj, pw - xj); if (length(lp.xz) > Rj) continue; }
+                    if (depthB >= 0.0) {
+                        anyInside = true;
                         cdEmitContact(contacts, contactCount, maxContacts, id, j, uint(p), 0u, nB, pw, xi, xj, depthB);
-                        added++;
+                    } else {
+                        cPos[nCand] = pw; cN[nCand] = nB; cDepth[nCand] = depthB; cFeat[nCand] = p; nCand++;
+                        bestDepth = max(bestDepth, depthB);
                     }
                 }
-                if (added == 0) {
+                if (!anyInside && nCand > 0) {
+                    float tol = max(1e-6, min(abs(spec), min(Ri, hi)) * 0.05);
+                    for (int m = 0; m < nCand; ++m) {
+                        if (cDepth[m] < bestDepth - tol) continue;
+                        cdEmitContact(contacts, contactCount, maxContacts, id, j, uint(cFeat[m]), 0u, cN[m], cPos[m], xi, xj, bestDepth);
+                    }
+                }
+                if (!anyInside && nCand == 0) {
                     float minDepth; float3 nS, cpS;
                     if (cdBoxBoxSAT(xi, qi, cdBodyHalfExtents(ci), xj, qj, heJ, minDepth, nS, cpS))
                         cdEmitContact(contacts, contactCount, maxContacts, id, j, 14u, 0u, nS, cpS, xi, xj, minDepth);
@@ -2394,7 +2458,7 @@ kernel void coinGenerateContacts(
     bool iHull = cdIsHull(ci);
     uint2 hRange = uint2(0, 0);
     if (iHull) hRange = hullRanges[uint(ci.hullRef.x + 0.5)];
-    int nFP = iHull ? int(min(hRange.y, 32u)) : CD_NPTS;
+    int nFP = iHull ? int(min(hRange.y, uint(CD_MAX_STATIC_FP))) : CD_NPTS;
 #define CD_PROBE(pp) (iHull ? (xi + cdQuatRotate(qi, float3(hullVerts[hRange.x + uint(pp)].xyz))) : fp[pp])
     for (uint k = 0u; k < u.colliderCount; ++k) {
         CoinStaticCollider col = colliders[k];
@@ -2421,7 +2485,32 @@ kernel void coinGenerateContacts(
         } else if (kind == 1u) {                         // axis-aligned box
             float3 ctr = col.a.xyz, he = col.b.xyz;
             bool oneWay = (col.meta.x & 1u) != 0u;
-            if (iCapsule) {
+            if (cdIsSphere(ci)) {
+                // Sphere vs AABB: exact closest point. Previously a sphere fell
+                // into the generic feature-point loop below — that loop samples
+                // the DISC surrogate's 14 points (cdBodyFeaturePoint's fallback
+                // for a non-box shape), an approximation for a round body; this
+                // mirrors kind==3's OBB sphere branch (identity rotation).
+                float3 lp = xi - ctr;
+                float3 cl = clamp(lp, -he, he);
+                float3 dlt = lp - cl;
+                float dist2 = dot(dlt, dlt);
+                float3 n; float pen;
+                if (dist2 > 1e-10) {                      // centre outside the box
+                    float dist = sqrt(dist2);
+                    pen = Ri - dist;
+                    n = dlt / dist;
+                } else {                                  // centre inside: least-penetration axis
+                    float3 d = he - abs(lp);
+                    n = (d.x < d.y && d.x < d.z) ? float3(sign(lp.x),0,0)
+                      : (d.y < d.z)              ? float3(0,sign(lp.y),0)
+                      :                            float3(0,0,sign(lp.z));
+                    pen = min(d.x, min(d.y, d.z)) + Ri;
+                }
+                if (pen > -spec && !(oneWay && n.y < 0.5)) {
+                    cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, 0u, k, n, xi - Ri*n, xi, xi, pen);
+                }
+            } else if (iCapsule) {
                 for (int p = 0; p < 3; ++p) {
                     float3 lp = capP[p] - ctr;
                     float3 cl = clamp(lp, -he, he);
@@ -2430,7 +2519,7 @@ kernel void coinGenerateContacts(
                     float3 n; float pen; float3 cp;
                     if (dl > 1e-6) {
                         pen = capR - dl;
-                        if (pen <= 0.0) continue;
+                        if (pen <= -spec) continue;
                         n = dL / dl; cp = ctr + cl;
                     } else {                              // probe centre inside the box
                         float3 dist = he - abs(lp); float push;
@@ -2442,17 +2531,52 @@ kernel void coinGenerateContacts(
                     if (oneWay && n.y < 0.5) continue;
                     cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, cp, xi, xi, pen);
                 }
-                continue;
-            }
-            for (int p = 0; p < nFP; ++p) {
-                float3 pw = CD_PROBE(p), dd = pw - ctr;
-                if (abs(dd.x) >= he.x || abs(dd.y) >= he.y || abs(dd.z) >= he.z) continue;
-                float3 dist = he - abs(dd); float3 n; float push;
-                if (dist.x < dist.y && dist.x < dist.z) { n = float3(sign(dd.x),0,0); push = dist.x; }
-                else if (dist.y < dist.z)               { n = float3(0,sign(dd.y),0); push = dist.y; }
-                else                                    { n = float3(0,0,sign(dd.z)); push = dist.z; }
-                if (oneWay && n.y < 0.5) continue;
-                cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, pw, xi, xi, push);
+            } else {
+                // Box/disc feature points vs the wall. Two-phase: if any point is
+                // genuinely INSIDE, emit the full multi-point manifold (unchanged —
+                // needed for resting stability). Otherwise the body isn't touching
+                // yet — a fast thin box can still tunnel a thin wall between
+                // substeps without any corner ever landing "inside" (item 5 in the
+                // constraint-solver doc's roadmap). The near face's corners must
+                // share ONE target depth (the closest approach), not each their
+                // own: a lone off-center speculative contact induces spurious
+                // SPIN instead of clean linear deceleration for a flush hit (part
+                // of the correcting impulse goes into rotation to satisfy that one
+                // point's own relative velocity), and testing every point
+                // independently mixes the near face with the trailing one — an
+                // over-constrained, physically-inconsistent target set. So: find
+                // the overall closest point, then emit every OTHER point within a
+                // tight tolerance of that SAME depth (its own near face; a
+                // genuinely farther face differs by ~the body's size, far above
+                // the tolerance) using the SHARED depth + normal.
+                float4 qId = float4(0, 0, 0, 1);
+                float3 cPos[CD_MAX_STATIC_FP]; float3 cN[CD_MAX_STATIC_FP]; float cDepth[CD_MAX_STATIC_FP]; int cFeat[CD_MAX_STATIC_FP];
+                bool anyInside = false;
+                int nCand = 0;
+                float bestDepth = -1e30;
+                for (int p = 0; p < nFP; ++p) {
+                    float3 pw = CD_PROBE(p);
+                    float3 n; float push;
+                    if (!cdOrientedBoxPushSpeculative(pw, ctr, qId, he, spec, n, push)) continue;
+                    if (oneWay && n.y < 0.5) continue;
+                    if (push >= 0.0) {
+                        anyInside = true;
+                        cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, pw, xi, xi, push);
+                    } else if (nCand < CD_MAX_STATIC_FP) {
+                        cPos[nCand] = pw; cN[nCand] = n; cDepth[nCand] = push; cFeat[nCand] = p; nCand++;
+                        bestDepth = max(bestDepth, push);
+                    }
+                }
+                if (!anyInside) {
+                    // Bounded by both the margin AND the querying body's own
+                    // bounding scale, so a projectile THINNER than 5% of the
+                    // margin can't have its trailing face misread as "near" too.
+                    float tol = max(1e-6, min(abs(spec), min(Ri, hi)) * 0.05);
+                    for (int m = 0; m < nCand; ++m) {
+                        if (cDepth[m] < bestDepth - tol) continue;   // a farther face, not this near-contact
+                        cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(cFeat[m]), k, cN[m], cPos[m], xi, xi, bestDepth);
+                    }
+                }
             }
         } else if (kind == 3u) {                         // oriented box (plank / ramp)
             float3 ctr = col.a.xyz, he = col.b.xyz;
@@ -2467,7 +2591,7 @@ kernel void coinGenerateContacts(
                 if (dist2 > 1e-10) {                      // centre outside the box
                     float dist = sqrt(dist2);
                     float pen = Ri - dist;
-                    if (pen > 0.0) {
+                    if (pen > -spec) {
                         float3 n = cdQuatRotate(q, dlt / dist);
                         cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, 0u, k, n, xi - Ri*n, xi, xi, pen);
                     }
@@ -2490,7 +2614,7 @@ kernel void coinGenerateContacts(
                     float3 nL; float pen; float3 cp;
                     if (dl > 1e-6) {
                         pen = capR - dl;
-                        if (pen <= 0.0) continue;
+                        if (pen <= -spec) continue;
                         nL = dL / dl; cp = ctr + cdQuatRotate(q, cl);
                     } else {
                         float3 dd = he - abs(lp); float push;
@@ -2503,17 +2627,30 @@ kernel void coinGenerateContacts(
                     cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, cp, xi, xi, pen);
                 }
             } else {
+                // Two-phase, shared-depth near-face manifold — see the kind==1u
+                // generic loop's comment.
+                float3 cPos[CD_MAX_STATIC_FP]; float3 cN[CD_MAX_STATIC_FP]; float cDepth[CD_MAX_STATIC_FP]; int cFeat[CD_MAX_STATIC_FP];
+                bool anyInside = false;
+                int nCand = 0;
+                float bestDepth = -1e30;
                 for (int p = 0; p < nFP; ++p) {
                     float3 pw = CD_PROBE(p);
-                    float3 lp = cdQuatRotateInv(q, pw - ctr);
-                    if (abs(lp.x) >= he.x || abs(lp.y) >= he.y || abs(lp.z) >= he.z) continue;
-                    float3 d = he - abs(lp);
-                    float3 nL; float push;
-                    if (d.x < d.y && d.x < d.z) { nL = float3(sign(lp.x),0,0); push = d.x; }
-                    else if (d.y < d.z)         { nL = float3(0,sign(lp.y),0); push = d.y; }
-                    else                        { nL = float3(0,0,sign(lp.z)); push = d.z; }
-                    float3 n = cdQuatRotate(q, nL);
-                    cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, pw, xi, xi, push);
+                    float3 n; float push;
+                    if (!cdOrientedBoxPushSpeculative(pw, ctr, q, he, spec, n, push)) continue;
+                    if (push >= 0.0) {
+                        anyInside = true;
+                        cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, pw, xi, xi, push);
+                    } else if (nCand < CD_MAX_STATIC_FP) {
+                        cPos[nCand] = pw; cN[nCand] = n; cDepth[nCand] = push; cFeat[nCand] = p; nCand++;
+                        bestDepth = max(bestDepth, push);
+                    }
+                }
+                if (!anyInside) {
+                    float tol = max(1e-6, min(abs(spec), min(Ri, hi)) * 0.05);
+                    for (int m = 0; m < nCand; ++m) {
+                        if (cDepth[m] < bestDepth - tol) continue;
+                        cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(cFeat[m]), k, cN[m], cPos[m], xi, xi, bestDepth);
+                    }
                 }
             }
         } else if (kind == 4u) {                         // cylinder segment (pipe / half-pipe)

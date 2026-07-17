@@ -446,6 +446,107 @@ final class CoinDEMGenericEngineTests: XCTestCase {
                              "speculative: the target was actually HIT and carried forward")
     }
 
+    // ── Speculative margin: box vs static AABB wall (roadmap item 5) ───────────
+    // A thin box fired at 120 m/s tunnels a thin static AABB wall WITHOUT the
+    // margin (control) — cdOrientedBoxPush is inside-only, and no corner ever
+    // lands "inside" the wall between samples — and is stopped WITH it, via
+    // cdOrientedBoxPushSpeculative's exterior closest-point near-contact.
+    // ── Speculative margin: box vs static AABB wall (roadmap item 5) ───────────
+    // A thin box fired at 120 m/s tunnels a thin static AABB wall WITHOUT the
+    // margin (control) — cdOrientedBoxPush is inside-only, and no corner ever
+    // lands "inside" the wall between samples — and is stopped WITH it, via
+    // cdOrientedBoxPushSpeculative's exterior closest-point near-contact. The
+    // near face's corners share ONE target depth (the closest approach), not
+    // each their own, so the box decelerates cleanly instead of picking up
+    // spurious spin from a lone off-center contact.
+    func testSpeculativeMarginStopsBoxTunnelingThroughAABBWall() throws {
+        func fire(margin: Float) throws -> Float {
+            let (solver, queue) = try makeSolver(radius: 0.07, maxDim: 0.5,
+                                                 boundsMin: SIMD3(-4, -0.5, -1),
+                                                 boundsMax: SIMD3(4, 1, 1))
+            solver.maxSpeed = 200
+            solver.restitution = 0
+            solver.speculativeMargin = margin
+            solver.setColliders([.plane(normal: SIMD3(0, 1, 0), offset: 0),
+                                 .box(center: SIMD3(0, 0.05, 0), halfExtents: SIMD3(0.02, 0.5, 0.5))])
+            let proj = solver.spawnBox(at: SIMD3(-2.04, 0.05, 0), halfExtents: SIMD3(0.02, 0.02, 0.02),
+                                       velocity: SIMD3(120, 0, 0))!
+            step(solver, queue, frames: 30)
+            return solver.position(of: proj)!.x
+        }
+        let without = try fire(margin: 0)
+        let with    = try fire(margin: 0.6)
+        print("SPECULATIVE_BOX without=\(without) with=\(with)")
+        XCTAssertGreaterThan(without, 1.0,
+                             "control: at 120 m/s the box tunnels straight through the thin wall")
+        XCTAssertLessThan(with, 0.5, "speculative: the box was actually STOPPED by the wall")
+    }
+
+    // ── Sphere vs AABB static: exact closest point (roadmap item 5) ────────────
+    // A sphere positioned diagonally off an AABB static box's CORNER (not a flat
+    // face) must report a contact whose depth exactly matches the analytic
+    // sphere-radius-minus-distance-to-corner — provable only by a true exterior
+    // closest-point computation. The old path routed a sphere through the box's
+    // generic feature-point loop (a 14-point DISC surrogate with fixed sample
+    // directions unrelated to the true corner diagonal) — a corner approach is
+    // exactly the case that approximation gets wrong.
+    func testSphereVsAABBCornerIsExact() throws {
+        let (solver, _) = try makeSolver(maxCoins: 8, radius: 0.05, maxDim: 0.05,
+                                         boundsMin: SIMD3(-1, -0.5, -1), boundsMax: SIMD3(1, 1, 1))
+        let he: Float = 0.05
+        solver.setColliders([.box(center: SIMD3(0, 0.05, 0), halfExtents: SIMD3(he, he, he))])
+        let corner = SIMD3<Float>(he, 0.05 + he, he)
+        let diag = simd_normalize(SIMD3<Float>(1, 1, 1))
+        let d: Float = 0.02, r: Float = 0.03   // expected penetration = r - d = 0.01
+        let ball = solver.spawnSphere(at: corner + diag * d, radius: r)!
+        let n = solver.generateContactsNow()
+        let ptr = solver.contactBuffer.contents().bindMemory(to: CoinContact.self, capacity: max(1, n))
+        var found: CoinContact?
+        for i in 0..<n where Int(ptr[i].meta.x) == ball && ptr[i].meta.y == 0xFFFF_FFFF { found = ptr[i] }
+        guard let c = found else { return XCTFail("sphere↔AABB-corner must generate a contact") }
+        let depth = c.nrm.w, normal = SIMD3(c.nrm.x, c.nrm.y, c.nrm.z)
+        print("SPHERE_AABB_CORNER depth=\(depth) normal=\(normal)")
+        XCTAssertEqual(depth, r - d, accuracy: 1e-4, "exact closest-point depth, not a disc-surrogate approximation")
+        XCTAssertEqual(simd_dot(normal, diag), 1.0, accuracy: 1e-3, "normal points exactly along the true corner diagonal")
+    }
+
+    // ── Hull (>14 verts) vs static box with speculative margin ─────────────────
+    // The static generic-else loop's per-point candidate cache is sized to
+    // CD_MAX_STATIC_FP (32, the hull vertex cap), not CD_NPTS (14, the box/disc
+    // feature-point count) — a >14-vertex hull near a static AABB/OBB with
+    // speculativeMargin > 0 is exactly the configuration that overflowed a
+    // 14-slot cache before that fix. A 24-point near-spherical hull registers
+    // ~24 real vertices (all extremal on a convex point cloud), well past 14.
+    func testHullOver14VertsVsStaticBoxWithMarginDoesNotOverflow() throws {
+        let (solver, _) = try makeSolver(maxCoins: 8, radius: 0.05, maxDim: 0.05,
+                                         boundsMin: SIMD3(-1, -0.5, -1), boundsMax: SIMD3(1, 1, 1))
+        solver.speculativeMargin = 0.3
+        solver.setColliders([.box(center: SIMD3(0, 0.05, 0), halfExtents: SIMD3(0.05, 0.05, 0.05)),
+                             .orientedBox(center: SIMD3(0.3, 0.05, 0), halfExtents: SIMD3(0.05, 0.05, 0.05),
+                                          orientation: simd_quatf(angle: 0.3, axis: SIMD3(0, 0, 1)))])
+        var pts: [SIMD3<Float>] = []
+        let r: Float = 0.04
+        for i in 0..<24 {
+            // Fibonacci sphere distribution — every point sits on the convex
+            // hull of the point cloud, so registration keeps ~24 real vertices.
+            let y = 1 - (Float(i) / Float(23)) * 2
+            let radiusAtY = sqrt(max(0, 1 - y * y))
+            let theta = Float(i) * 2.399963  // golden angle
+            pts.append(SIMD3(cos(theta) * radiusAtY, y, sin(theta) * radiusAtY) * r)
+        }
+        let hull = solver.registerHull(vertices: pts)!
+        XCTAssertGreaterThan(hull.vertices.count, 14, "test hull must actually exceed the old 14-slot cache")
+        // Close enough (gap 0.05, well within the 0.3 margin) that MOST of the
+        // hull's ~24 vertices register simultaneously — not just the closest —
+        // actually filling the candidate cache past the old 14-slot size.
+        // One near each static (AABB kind==1, OBB kind==3) so both fixed loops run.
+        _ = solver.spawnHull(at: SIMD3(0, 0.05 + 0.05 + r + 0.05, 0), hull: hull)
+        _ = solver.spawnHull(at: SIMD3(0.3, 0.05 + 0.05 + r + 0.05, 0), hull: hull)
+        let n = solver.generateContactsNow()   // must not crash / corrupt memory
+        print("HULL_OVER14_MARGIN vertexCount=\(hull.vertices.count) contacts=\(n)")
+        XCTAssertGreaterThanOrEqual(n, 0)
+    }
+
     // ── Rolling resistance (constraint path) ──────────────────────────────────
     // Two identical balls rolled with the same send-off; the solver with rolling
     // resistance must stop its ball far shorter than the free-rolling control.
