@@ -340,6 +340,81 @@ final class CoinDEMGenericEngineTests: XCTestCase {
                        "rests on a FACE (COM at ~r/√3), not balanced on a vertex (r)")
     }
 
+    // ── Perf gate: dense hull + capsule pile (roadmap item 4) ───────────────────
+    // "Nobody has measured a 200-hull pile yet" — hull narrowphase is O(verts)
+    // per support call, and this is the first real measurement. 100 hull bodies
+    // (cubes + tetrahedra, sharing 2 registered hull shapes — maxHulls=64 caps
+    // distinct REGISTRATIONS, not instances) + 100 capsules dropped into a bin.
+    // Measures real GPU command-buffer time (gpuEndTime−gpuStartTime, the same
+    // signal IlluminatoramaRenderer uses) per frame — a fence, not a spec, per
+    // frame-time-gate.sh's own convention (numbers are machine-dependent).
+    func testDenseHullCapsulePilePerf() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
+        let engine = SimEngine(device: device)
+        let lib = try Self.makeLibrary(device)
+        guard let solver = CoinDEMSolver(engine: engine, library: lib, maxCoins: 200,
+                                         coinRadius: 0.06, halfThickness: 0.06,
+                                         boundsMin: SIMD3(-1.1, -0.5, -1.1), boundsMax: SIMD3(1.1, 2.6, 1.1)),
+              let queue = device.makeCommandQueue()  // gpu-ok: test harness queue
+        else { throw XCTSkip("solver/queue init failed") }
+        solver.floorY = 0
+        solver.setColliders(RigidPileField.bin(innerHalf: SIMD2(0.55, 0.55), floorY: 0))
+        solver.solverMode = .constraint
+        solver.frictionCoeff = 0.5
+
+        let h: Float = 0.045
+        var cubePts: [SIMD3<Float>] = []
+        for i in 0..<8 {
+            cubePts.append(SIMD3((i & 1) != 0 ? h : -h, (i & 2) != 0 ? h : -h, (i & 4) != 0 ? h : -h))
+        }
+        let cube = solver.registerHull(vertices: cubePts)!
+        let te: Float = 0.06
+        let tetraPts: [SIMD3<Float>] = [
+            SIMD3(te, te, te), SIMD3(te, -te, -te), SIMD3(-te, te, -te), SIMD3(-te, -te, te),
+        ]
+        let tetra = solver.registerHull(vertices: tetraPts)!
+
+        var seed: UInt64 = 0xC0FFEE
+        func rnd() -> Float { seed = seed &* 6364136223846793005 &+ 1; return Float(seed >> 40) / Float(1 << 24) }
+        for i in 0..<100 {
+            let p = SIMD3<Float>((rnd() - 0.5) * 0.9, 0.4 + rnd() * 1.8, (rnd() - 0.5) * 0.9)
+            let t = SIMD3<Float>((rnd() - 0.5) * 4, (rnd() - 0.5) * 4, (rnd() - 0.5) * 4)
+            _ = solver.spawnHull(at: p, hull: i % 2 == 0 ? cube : tetra, tumble: t)
+        }
+        for _ in 0..<100 {
+            let p = SIMD3<Float>((rnd() - 0.5) * 0.9, 0.4 + rnd() * 1.8, (rnd() - 0.5) * 0.9)
+            let t = SIMD3<Float>((rnd() - 0.5) * 4, (rnd() - 0.5) * 4, (rnd() - 0.5) * 4)
+            let q = simd_quatf(angle: rnd() * 2 * .pi, axis: simd_normalize(SIMD3<Float>(rnd(), rnd(), rnd()) + 0.01))
+            _ = solver.spawnCapsule(at: p, radius: 0.03, halfLength: 0.05,
+                                    orient: SIMD4(q.imag, q.real), tumble: t)
+        }
+
+        var frameMs: [Double] = []
+        for _ in 0..<420 {
+            guard let cb = queue.makeCommandBuffer() else { break }
+            solver.encode(to: cb, wallDt: 1.0 / 60.0)
+            cb.commit()
+            cb.waitUntilCompleted()  // gpu-ok: test harness must read results synchronously
+            frameMs.append((cb.gpuEndTime - cb.gpuStartTime) * 1000.0)
+        }
+        frameMs.sort()
+        let p50 = frameMs[frameMs.count / 2]
+        let p95 = frameMs[Int(Double(frameMs.count) * 0.95)]
+        let worst = frameMs.last ?? 0
+        let stats = solver.measurePenetration(threshold: 0.01)
+        print("HULLCAPSULE_PERF frames=\(frameMs.count) p50ms=\(p50) p95ms=\(p95) worstMs=\(worst) maxPen=\(stats.maxPenetration) awake=\(solver.activeCount - solver.asleepCount)")
+        // This is the FIRST measurement of this shape mix (see roadmap item 4)
+        // — there's no established SLA to gate against yet, so this is a
+        // regression FENCE against the current measured baseline (p95≈37ms,
+        // worst≈38ms — the ACTIVE/falling phase, well over a 16.67ms 60fps
+        // budget; the whole-pile-sleep skip makes the settled tail ~free,
+        // which is why p50 is near zero). Catches it getting WORSE; does not
+        // assert it's fast enough yet — that's color-compaction (per-colour
+        // contact dispatch, noted as the next lever in this doc's Verification
+        // section), tracked as its own follow-up, not silently baked in here.
+        XCTAssertLessThan(p95, 60.0, "dense hull+capsule pile p95 frame time regression fence")
+        XCTAssertLessThan(stats.maxPenetration, 0.03, "no runaway interpenetration under load")
+    }
 
     // ── Speculative contacts (anti-tunneling) ─────────────────────────────────
     // A small sphere fired at 120 m/s crosses a same-size target's whole overlap
