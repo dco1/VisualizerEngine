@@ -494,6 +494,38 @@ final class CoinDEMGenericEngineTests: XCTestCase {
         XCTAssertGreaterThan(freeDropped, 0.6, "free flap swung far past the stop")
     }
 
+    // ── Joints: collideConnected (roadmap item 3) ───────────────────────────────
+    // Two spheres (radius 0.05, combined resting separation 0.1) distance-jointed
+    // to a too-short rest length (0.04) — the joint FORCES an overlap that a
+    // contact would otherwise fight. This is a direct contact-buffer probe
+    // (generateContactsNow, no stepping) of the actual mechanism: collideConnected
+    // gates whether coinGenerateContacts's pair loop emits a contact for the
+    // joint's own bodyA/bodyB at all.
+    func testCollideConnectedGatesContactGeneration() throws {
+        func run(_ collideConnected: Bool) throws -> Int {
+            let (solver, _) = try makeSolver(maxCoins: 8, radius: 0.05, maxDim: 0.05,
+                                             boundsMin: SIMD3(-1, -0.5, -1), boundsMax: SIMD3(1, 3, 1))
+            let r: Float = 0.05
+            let posA = SIMD3<Float>(0, 2.0, 0)
+            let posB = SIMD3<Float>(0.04, 2.0, 0)   // forced overlap: 0.04 < combined radius 0.1
+            let a = solver.spawnSphere(at: posA, radius: r)!
+            let b = solver.spawnSphere(at: posB, radius: r)!
+            _ = solver.addDistanceJoint(bodyA: a, bodyB: b, worldAnchorA: posA, worldAnchorB: posB,
+                                        restLength: 0.04, collideConnected: collideConnected)
+            let n = solver.generateContactsNow()
+            let ptr = solver.contactBuffer.contents().bindMemory(to: CoinContact.self, capacity: max(1, n))
+            let lo = min(a, b), hi = max(a, b)
+            return (0..<n).filter { Int(ptr[$0].meta.x) == lo && Int(ptr[$0].meta.y) == hi }.count
+        }
+        let offContacts = try run(false)
+        let onContacts = try run(true)
+        print("JOINT_COLLIDECONNECTED off=\(offContacts) on=\(onContacts)")
+        XCTAssertEqual(offContacts, 0,
+                       "collideConnected=false: the jointed pair's own overlap must NOT generate a contact")
+        XCTAssertGreaterThan(onContacts, 0,
+                             "collideConnected=true: the pair still overlaps geometrically, so a contact must be generated")
+    }
+
     // ── Per-body restitution ──────────────────────────────────────────────────
     // Two identical spheres, same drop, different per-body restitution: the
     // bouncy one must rebound visibly higher. Globals stay at their defaults —

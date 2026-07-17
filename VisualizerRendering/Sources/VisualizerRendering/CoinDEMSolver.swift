@@ -179,7 +179,10 @@ public struct CoinContact {
 // in CoinDEM.metal exactly. Built via the addBallJoint / addHingeJoint /
 // addDistanceJoint APIs — not constructed by hand.
 public struct CoinJoint {
-    public var meta:    SIMD4<UInt32>  // x=type(0 ball,1 hinge,2 distance), y=A, z=B(0xFFFFFFFF=world), w=enabled
+    // w bit 0 = enabled, bit 1 = collideConnected (default off — the two jointed
+    // bodies don't generate contacts against each other; set to keep them
+    // colliding, e.g. a hinge whose bodies are meant to stay physically apart).
+    public var meta:    SIMD4<UInt32>  // x=type(0 ball,1 hinge,2 distance), y=A, z=B(0xFFFFFFFF=world), w=enabled|collideConnected bits
     public var anchorA: SIMD4<Float>   // xyz=A-local anchor, w=rest length (distance)
     public var anchorB: SIMD4<Float>   // xyz=B-local anchor (WORLD if z==world)
     public var axisA:   SIMD4<Float>   // xyz=A-local hinge axis, w=limit lo (rad)
@@ -1142,12 +1145,17 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// point on body B (or with that fixed world point when `bodyB` is nil).
     /// Anchors are captured from the bodies' CURRENT poses. Returns a handle for
     /// `removeJoint`, or nil when the joint table is full. Constraint path only.
+    /// `collideConnected`: false (default) suppresses contacts between the two
+    /// jointed bodies — otherwise a body pair that touches at the anchor fights
+    /// its own contact. Set true to keep them colliding (e.g. bodies meant to
+    /// stay physically apart despite the joint).
     @discardableResult
-    public func addBallJoint(bodyA: Int, bodyB: Int?, worldAnchor: SIMD3<Float>) -> Int? {
+    public func addBallJoint(bodyA: Int, bodyB: Int?, worldAnchor: SIMD3<Float>,
+                             collideConnected: Bool = false) -> Int? {
         guard let slot = claimJointSlot() else { return nil }
         let world = bodyB == nil
         writeJoint(slot, CoinJoint(
-            meta: SIMD4(0, UInt32(bodyA), world ? 0xFFFF_FFFF : UInt32(bodyB!), 1),
+            meta: SIMD4(0, UInt32(bodyA), world ? 0xFFFF_FFFF : UInt32(bodyB!), Self.jointMeta(collideConnected: collideConnected)),
             anchorA: SIMD4(toLocal(bodyA, worldAnchor), 0),
             anchorB: SIMD4(world ? worldAnchor : toLocal(bodyB!, worldAnchor), 0),
             axisA: SIMD4(0, 1, 0, 0), axisB: SIMD4(0, 1, 0, 0)))
@@ -1157,17 +1165,19 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// HINGE joint: ball at `worldAnchor` + the bodies may only rotate relative to
     /// each other about `worldAxis`. `limits` (radians, lo < hi, measured from the
     /// CURRENT relative pose = 0) adds angle stops; nil = free spin.
+    /// `collideConnected`: see `addBallJoint`.
     @discardableResult
     public func addHingeJoint(bodyA: Int, bodyB: Int?, worldAnchor: SIMD3<Float>,
                               worldAxis: SIMD3<Float>,
-                              limits: ClosedRange<Float>? = nil) -> Int? {
+                              limits: ClosedRange<Float>? = nil,
+                              collideConnected: Bool = false) -> Int? {
         guard let slot = claimJointSlot() else { return nil }
         let world = bodyB == nil
         let axis = simd_normalize(worldAxis)
         // lo == hi disables the limit branch in-kernel.
         let lo = limits?.lowerBound ?? 0, hi = limits?.upperBound ?? 0
         writeJoint(slot, CoinJoint(
-            meta: SIMD4(1, UInt32(bodyA), world ? 0xFFFF_FFFF : UInt32(bodyB!), 1),
+            meta: SIMD4(1, UInt32(bodyA), world ? 0xFFFF_FFFF : UInt32(bodyB!), Self.jointMeta(collideConnected: collideConnected)),
             anchorA: SIMD4(toLocal(bodyA, worldAnchor), 0),
             anchorB: SIMD4(world ? worldAnchor : toLocal(bodyB!, worldAnchor), 0),
             axisA: SIMD4(toLocalDir(bodyA, axis), lo),
@@ -1177,19 +1187,27 @@ public final class CoinDEMSolver: PenetrationProbing {
 
     /// DISTANCE joint: the two world anchor points keep their CURRENT separation
     /// (or `restLength` when given) — a rigid tether/rod, free to swing.
+    /// `collideConnected`: see `addBallJoint`.
     @discardableResult
     public func addDistanceJoint(bodyA: Int, bodyB: Int?,
                                  worldAnchorA: SIMD3<Float>, worldAnchorB: SIMD3<Float>,
-                                 restLength: Float? = nil) -> Int? {
+                                 restLength: Float? = nil,
+                                 collideConnected: Bool = false) -> Int? {
         guard let slot = claimJointSlot() else { return nil }
         let world = bodyB == nil
         let rest = restLength ?? simd_length(worldAnchorB - worldAnchorA)
         writeJoint(slot, CoinJoint(
-            meta: SIMD4(2, UInt32(bodyA), world ? 0xFFFF_FFFF : UInt32(bodyB!), 1),
+            meta: SIMD4(2, UInt32(bodyA), world ? 0xFFFF_FFFF : UInt32(bodyB!), Self.jointMeta(collideConnected: collideConnected)),
             anchorA: SIMD4(toLocal(bodyA, worldAnchorA), rest),
             anchorB: SIMD4(world ? worldAnchorB : toLocal(bodyB!, worldAnchorB), 0),
             axisA: SIMD4(0, 1, 0, 0), axisB: SIMD4(0, 1, 0, 0)))
         return slot
+    }
+
+    /// Packs the `CoinJoint.meta.w` bit flags: bit 0 = enabled (always set for a
+    /// live joint), bit 1 = collideConnected.
+    private static func jointMeta(collideConnected: Bool) -> UInt32 {
+        1 | (collideConnected ? 2 : 0)
     }
 
     /// Remove (disable + recycle) a joint created by the add*Joint APIs.
@@ -1752,6 +1770,7 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// all contacts from the broadphase (must already be built this command buffer).
     private func encodeGenerateContacts(_ cb: MTLCommandBuffer, coinCount: Int) {
         contactCountBuffer.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = 0
+        var jc = UInt32(jointHighWater)
         dispatch(cb, generatePipeline, threads: coinCount, label: "Coin.cs.generate") { enc in
             enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
             enc.setBuffer(self.sortedIndices, offset: 0, index: 1)
@@ -1764,6 +1783,8 @@ public final class CoinDEMSolver: PenetrationProbing {
             enc.setBuffer(self.maxContactsBuffer, offset: 0, index: 8)
             enc.setBuffer(self.hullVertexBuffer, offset: 0, index: 9)
             enc.setBuffer(self.hullRangeBuffer, offset: 0, index: 10)
+            enc.setBuffer(self.jointBuffer, offset: 0, index: 11)
+            enc.setBytes(&jc, length: MemoryLayout<UInt32>.size, index: 12)
         }
     }
 

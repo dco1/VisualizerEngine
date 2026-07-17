@@ -198,6 +198,22 @@ struct CoinContact {
     float4 aux;
 };
 
+// One generic constraint-path joint. Types (meta.x): 0 = BALL (anchors
+// coincide, 3-DOF point constraint), 1 = HINGE (ball + axis alignment +
+// optional angle limits), 2 = DISTANCE (anchor separation = rest length,
+// 1-DOF). meta.w bit 0 = enabled, bit 1 = collideConnected (contacts between
+// this joint's own bodyA/bodyB are suppressed in coinGenerateContacts unless
+// this bit is set — a hinge whose bodies touch at the anchor would otherwise
+// fight its own contact). Declared here (not by the joint-solve kernel below,
+// where it conceptually lives) so coinGenerateContacts can read it too.
+struct CoinJoint {
+    uint4  meta;     // x = type, y = bodyA, z = bodyB (CD_STATIC = world), w = enabled|collideConnected bits
+    float4 anchorA;  // xyz = anchor in A-local frame;               w = rest length (distance)
+    float4 anchorB;  // xyz = anchor in B-local frame (WORLD if z==CD_STATIC)
+    float4 axisA;    // xyz = hinge axis in A-local frame;           w = limit lo (rad)
+    float4 axisB;    // xyz = hinge axis in B-local (WORLD if world); w = limit hi (rad)
+};
+
 // ── Quaternion helpers (mirror EggMotion.metal) ───────────────────────────────
 
 static float3x3 cdQuatToMat3(float4 q) {
@@ -2009,6 +2025,8 @@ kernel void coinGenerateContacts(
     constant uint&                   maxContacts   [[ buffer(8) ]],
     device const float4*             hullVerts     [[ buffer(9) ]],
     device const uint2*              hullRanges    [[ buffer(10) ]],
+    device const CoinJoint*          joints        [[ buffer(11) ]],
+    constant uint&                   jointCount    [[ buffer(12) ]],
     uint id [[ thread_position_in_grid ]])
 {
     if (id >= u.coinCount) return;
@@ -2041,6 +2059,24 @@ kernel void coinGenerateContacts(
             uint j = sortedIndices[s];
             if (j <= id) continue;                       // pair once, lower index owns it
             if (int(j) == jointPartner) continue;
+            // Generic joints: skip contact generation for a pair that's the two
+            // bodies of a joint with collideConnected off (meta.w bit 1 unset,
+            // the default) — otherwise a hinge whose bodies touch at the anchor
+            // fights its own contact. Bounded scan: jointCount is tens-to-
+            // hundreds (see coinJointSolveCS), and only candidate pairs that
+            // already passed the broadphase cell + bounding-sphere reject above
+            // reach this line.
+            bool jointSkip = false;
+            for (uint k = 0; k < jointCount; ++k) {
+                CoinJoint jn = joints[k];
+                if ((jn.meta.w & 1u) == 0u) continue;        // disabled
+                if ((jn.meta.w & 2u) != 0u) continue;        // collideConnected → keep contact
+                if ((jn.meta.y == id && jn.meta.z == j) || (jn.meta.y == j && jn.meta.z == id)) {
+                    jointSkip = true;
+                    break;
+                }
+            }
+            if (jointSkip) continue;
             CoinBody cj = coins[j];
             if (cj.posInvMass.w == 0.0) continue;
             float3 xj = cj.posInvMass.xyz;
@@ -3044,14 +3080,8 @@ kernel void coinFinalizeCS(
 // Types (meta.x): 0 = BALL (anchors coincide, 3-DOF point constraint),
 //                 1 = HINGE (ball + axis alignment + optional angle limits),
 //                 2 = DISTANCE (anchor separation = rest length, 1-DOF).
-
-struct CoinJoint {
-    uint4  meta;     // x = type, y = bodyA, z = bodyB (CD_STATIC = world), w = enabled
-    float4 anchorA;  // xyz = anchor in A-local frame;               w = rest length (distance)
-    float4 anchorB;  // xyz = anchor in B-local frame (WORLD if z==CD_STATIC)
-    float4 axisA;    // xyz = hinge axis in A-local frame;           w = limit lo (rad)
-    float4 axisB;    // xyz = hinge axis in B-local (WORLD if world); w = limit hi (rad)
-};
+// (CoinJoint itself is declared earlier, alongside CoinContact, so
+// coinGenerateContacts can also read it for the collideConnected check.)
 
 // Invert a symmetric positive-definite 3×3 (cofactor expansion).
 static float3x3 cdInvert3x3(float3x3 m) {
