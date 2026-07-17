@@ -703,6 +703,87 @@ final class CoinDEMGenericEngineTests: XCTestCase {
                           "a torque-starved motor can't overcome gravity — maxTorque genuinely bounds it")
     }
 
+    // ── Joints: prismatic/slider (roadmap item 7) ───────────────────────────────
+    // A box hinged prismatically to the world, given an initial tumble and
+    // resting away from a horizontal slide axis under gravity, must: hold its
+    // perpendicular position (gravity pulls ⟂ the axis — the joint bears the
+    // load, doesn't let it fall), and go instantly and permanently non-
+    // rotating (the tumble is killed) — the two defining differences from a
+    // hinge (which only locks 2 of 3 rotational DOF and is built to bear no
+    // perpendicular load at all).
+    func testPrismaticLocksRotationAndPerpendicularTranslation() throws {
+        let (solver, queue) = try makeSolver(radius: 0.1, maxDim: 0.1,
+                                             boundsMin: SIMD3(-2, -2, -2), boundsMax: SIMD3(2, 2, 2))
+        let he = SIMD3<Float>(0.06, 0.06, 0.06)
+        let start = SIMD3<Float>(0.3, 1.0, 0.1)
+        let b = solver.spawnBox(at: start, halfExtents: he, tumble: SIMD3(2, 3, 1.5))!
+        _ = solver.addPrismaticJoint(bodyA: b, bodyB: nil, worldAnchor: start, worldAxis: SIMD3(1, 0, 0))
+        step(solver, queue, frames: 120)
+        let p = solver.position(of: b)!
+        let w = solver.angularVelocity(of: b)!
+        print("JOINT_PRISMATIC_LOCK pos=\(p) angVel=\(w)")
+        XCTAssertEqual(p.y, start.y, accuracy: 0.02, "perpendicular translation stays locked despite gravity")
+        XCTAssertEqual(p.z, start.z, accuracy: 0.02, "perpendicular translation stays locked (Z too)")
+        XCTAssertLessThan(simd_length(w), 0.05, "rotation lock kills the initial tumble and stays killed")
+    }
+
+    // ── Joints: prismatic limit ──────────────────────────────────────────────
+    // Two identical sliders launched along their (horizontal, gravity-free-
+    // along-axis) slide axis at the same speed — the limited one must stop at
+    // its travel stop; the free one slides far past it.
+    func testPrismaticLimitStopsTheSlide() throws {
+        let (solver, queue) = try makeSolver(radius: 0.1, maxDim: 0.1,
+                                             boundsMin: SIMD3(-3, -2, -2), boundsMax: SIMD3(3, 2, 2))
+        let he = SIMD3<Float>(0.06, 0.06, 0.06)
+        func slider(z: Float, limits: ClosedRange<Float>?) -> Int {
+            let start = SIMD3<Float>(0, 1.0, z)
+            let b = solver.spawnBox(at: start, halfExtents: he, velocity: SIMD3(2, 0, 0))!
+            _ = solver.addPrismaticJoint(bodyA: b, bodyB: nil, worldAnchor: start,
+                                         worldAxis: SIMD3(1, 0, 0), limits: limits)
+            return b
+        }
+        let limited = slider(z: -0.3, limits: -0.2...0.2)
+        let free    = slider(z:  0.3, limits: nil)
+        step(solver, queue, frames: 90)
+        let xLimited = solver.position(of: limited)!.x
+        let xFree    = solver.position(of: free)!.x
+        print("JOINT_PRISMATIC_LIMIT limited=\(xLimited) free=\(xFree)")
+        XCTAssertLessThan(xLimited, 0.35, "limited slider held near its 0.2 m stop")
+        XCTAssertGreaterThan(xFree, 0.8, "free slider travels far past that")
+    }
+
+    // ── Joints: prismatic motor ──────────────────────────────────────────────
+    // A vertical slider motored upward (opposing gravity) — a strong-force
+    // motor must reach its target linear velocity; a force-starved one falls
+    // well short (or loses to gravity outright), proving maxForce bounds it.
+    // ── Joints: prismatic motor ──────────────────────────────────────────────
+    // A vertical slider motored upward (opposing gravity) — a strong-force
+    // motor must reach its target linear velocity; a force-starved one falls
+    // well short (or loses to gravity outright), proving maxForce bounds it.
+    func testPrismaticMotorDrivesToTargetVelocity() throws {
+        let (solver, queue) = try makeSolver(radius: 0.1, maxDim: 0.1,
+                                             boundsMin: SIMD3(-2, -2, -2), boundsMax: SIMD3(2, 2, 2))
+        let he = SIMD3<Float>(0.06, 0.06, 0.06)
+        let axis = SIMD3<Float>(0, 1, 0)
+        let target: Float = 1.0
+        func slider(z: Float, maxForce: Float) -> Int {
+            let start = SIMD3<Float>(0, 1.0, z)
+            let b = solver.spawnBox(at: start, halfExtents: he)!
+            _ = solver.addPrismaticJoint(bodyA: b, bodyB: nil, worldAnchor: start, worldAxis: axis,
+                                         motor: (targetVelocity: target, maxForce: maxForce))
+            return b
+        }
+        let strong = slider(z: -0.3, maxForce: 50.0)
+        let weak   = slider(z:  0.3, maxForce: 0.05)
+        step(solver, queue, frames: 60)
+        let vStrong = simd_dot(solver.velocity(of: strong)!, axis)
+        let vWeak   = simd_dot(solver.velocity(of: weak)!, axis)
+        print("JOINT_PRISMATIC_MOTOR target=\(target) strong=\(vStrong) weak=\(vWeak)")
+        XCTAssertEqual(vStrong, target, accuracy: 0.3, "a strong-force motor reaches its target linear velocity")
+        XCTAssertLessThan(vWeak, target - 0.3,
+                          "a force-starved motor falls well short of (or reverses past) its target — gravity wins")
+    }
+
     // ── Joints: collideConnected (roadmap item 3) ───────────────────────────────
     // Two spheres (radius 0.05, combined resting separation 0.1) distance-jointed
     // to a too-short rest length (0.04) — the joint FORCES an overlap that a

@@ -1216,6 +1216,47 @@ public final class CoinDEMSolver: PenetrationProbing {
         return slot
     }
 
+    /// PRISMATIC/SLIDER joint: the bodies may only translate relative to each
+    /// other along `worldAxis`, through `worldAnchor` — rotation is fully
+    /// locked (unlike the hinge, which leaves rotation about its axis free).
+    /// `limits` (meters, lo < hi, measured from the CURRENT relative position
+    /// = 0) adds travel stops; nil = unbounded slide. `motor` drives toward
+    /// `targetVelocity` (m/s along the axis), bounded by `maxForce` (N) each
+    /// substep — a piston or elevator instead of a free/limited slide; nil =
+    /// no motor. `targetVelocity` is body A's own velocity along the axis for
+    /// BOTH a world joint and a two-body one (unlike `addHingeJoint`'s
+    /// `motor:`, which needs a world-case sign correction — the two kernels'
+    /// motor sub-constraints are written against opposite relative-velocity
+    /// conventions; verified by direct measurement for each, not assumed from
+    /// the other).
+    /// `collideConnected`: see `addBallJoint`.
+    @discardableResult
+    public func addPrismaticJoint(bodyA: Int, bodyB: Int?, worldAnchor: SIMD3<Float>,
+                                  worldAxis: SIMD3<Float>,
+                                  limits: ClosedRange<Float>? = nil,
+                                  motor: (targetVelocity: Float, maxForce: Float)? = nil,
+                                  collideConnected: Bool = false) -> Int? {
+        guard let slot = claimJointSlot() else { return nil }
+        let world = bodyB == nil
+        let axis = simd_normalize(worldAxis)
+        // lo == hi disables the limit branch in-kernel.
+        let lo = limits?.lowerBound ?? 0, hi = limits?.upperBound ?? 0
+        // maxForce <= 0 disables the motor branch in-kernel. UNLIKE the hinge
+        // motor, no world-case negation: the prismatic kernel's along-axis
+        // motor is written against vpA−vpB (A relative to B), so for a world
+        // joint (vpB=0) it already converges directly to A's own velocity —
+        // confirmed by a single-body trace, not assumed from the hinge's
+        // pattern (which uses the opposite wB−wA convention and DOES need it).
+        let motorTarget = motor?.targetVelocity ?? 0
+        writeJoint(slot, CoinJoint(
+            meta: SIMD4(3, UInt32(bodyA), world ? 0xFFFF_FFFF : UInt32(bodyB!), Self.jointMeta(collideConnected: collideConnected)),
+            anchorA: SIMD4(toLocal(bodyA, worldAnchor), motorTarget),
+            anchorB: SIMD4(world ? worldAnchor : toLocal(bodyB!, worldAnchor), motor?.maxForce ?? 0),
+            axisA: SIMD4(toLocalDir(bodyA, axis), lo),
+            axisB: SIMD4(world ? axis : toLocalDir(bodyB!, axis), hi)))
+        return slot
+    }
+
     /// DISTANCE joint: the two world anchor points keep their CURRENT separation
     /// (or `restLength` when given) — a rigid tether/rod, free to swing.
     /// `collideConnected`: see `addBallJoint`.

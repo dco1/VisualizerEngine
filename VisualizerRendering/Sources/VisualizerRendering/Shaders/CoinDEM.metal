@@ -222,23 +222,25 @@ struct CoinContact {
 // One generic constraint-path joint. Types (meta.x): 0 = BALL (anchors
 // coincide, 3-DOF point constraint), 1 = HINGE (ball + axis alignment +
 // optional angle limits + optional motor), 2 = DISTANCE (anchor separation =
-// rest length, 1-DOF). meta.w bit 0 = enabled, bit 1 = collideConnected
-// (contacts between this joint's own bodyA/bodyB are suppressed in
-// coinGenerateContacts unless this bit is set — a hinge whose bodies touch at
-// the anchor would otherwise fight its own contact). Declared here (not by
-// the joint-solve kernel below, where it conceptually lives) so
-// coinGenerateContacts can read it too.
+// rest length, 1-DOF), 3 = PRISMATIC (axis alignment + rotation fully locked
+// + optional linear limits + optional motor — 1-DOF translation only).
+// meta.w bit 0 = enabled, bit 1 = collideConnected (contacts between this
+// joint's own bodyA/bodyB are suppressed in coinGenerateContacts unless this
+// bit is set — a hinge whose bodies touch at the anchor would otherwise fight
+// its own contact). Declared here (not by the joint-solve kernel below, where
+// it conceptually lives) so coinGenerateContacts can read it too.
 struct CoinJoint {
     uint4  meta;     // x = type, y = bodyA, z = bodyB (CD_STATIC = world), w = enabled|collideConnected bits
-    // xyz = anchor in A-local frame. w: DISTANCE only, rest length; HINGE only,
-    // motor target angular velocity (rad/s) — otherwise dead weight (BALL has
-    // no use for it either).
+    // xyz = anchor in A-local frame. w: DISTANCE only, rest length; HINGE or
+    // PRISMATIC only, motor target velocity (rad/s or m/s) — otherwise dead
+    // weight (BALL has no use for it either).
     float4 anchorA;
-    // xyz = anchor in B-local frame (WORLD if z==CD_STATIC). w: HINGE only,
-    // motor max torque (>0 enables the motor) — otherwise dead weight.
+    // xyz = anchor in B-local frame (WORLD if z==CD_STATIC). w: HINGE or
+    // PRISMATIC only, motor max torque/force (>0 enables the motor) —
+    // otherwise dead weight.
     float4 anchorB;
-    float4 axisA;    // xyz = hinge axis in A-local frame;           w = limit lo (rad)
-    float4 axisB;    // xyz = hinge axis in B-local (WORLD if world); w = limit hi (rad)
+    float4 axisA;    // xyz = hinge/slide axis in A-local frame;      w = limit lo (rad or m)
+    float4 axisB;    // xyz = hinge/slide axis in B-local (WORLD if world); w = limit hi (rad or m)
 };
 
 // ── Quaternion helpers (mirror EggMotion.metal) ───────────────────────────────
@@ -3245,8 +3247,11 @@ kernel void coinFinalizeCS(
 // colouring them, and it is exactly race-free.
 //
 // Types (meta.x): 0 = BALL (anchors coincide, 3-DOF point constraint),
-//                 1 = HINGE (ball + axis alignment + optional angle limits),
-//                 2 = DISTANCE (anchor separation = rest length, 1-DOF).
+//                 1 = HINGE (ball + axis alignment + optional angle limits +
+//                 optional motor), 2 = DISTANCE (anchor separation = rest
+//                 length, 1-DOF), 3 = PRISMATIC (axis alignment + full
+//                 rotation lock + optional linear limits/motor, 1-DOF
+//                 translation).
 // (CoinJoint itself is declared earlier, alongside CoinContact, so
 // coinGenerateContacts can also read it for the collideConnected check.)
 
@@ -3335,6 +3340,131 @@ kernel void coinJointSolveCS(
             float3 Pb = jB * n;
             bvA += invMa * Pb; bwA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, Pb));
             if (!bWorld) { bvB -= invMb * Pb; bwB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, Pb)); }
+        } else if (type == 3u) {
+            // ── PRISMATIC/SLIDER: 1-DOF translation along axisA/axisB, full
+            // rotation lock (a real prismatic has ZERO rotational freedom,
+            // unlike the hinge's "aligned but free to spin about the axis") —
+            // its own top-level branch, not the ball-core, since it does NOT
+            // want anchors to coincide (that's what "free along the axis"
+            // means). Own free-lane packing (same 4 scalars the hinge motor +
+            // limit combo already established): anchorA.w/anchorB.w = motor
+            // target linear velocity (m/s) / max force (N); axisA.w/axisB.w =
+            // linear limit lo/hi (m). Rotation lock costs nothing extra to
+            // configure — a prismatic ALWAYS fully locks rotation, so the
+            // twist sub-constraint below targets 0 unconditionally rather than
+            // reading a stored bound (there's no free lane left for one).
+            float3 aW = normalize(cdQuatRotate(qa, jn.axisA.xyz));
+            float3 bW = bWorld ? normalize(jn.axisB.xyz) : normalize(cdQuatRotate(qb, jn.axisB.xyz));
+            float3 b1 = (abs(aW.x) > 0.7) ? normalize(float3(-aW.y, aW.x, 0.0))
+                                          : normalize(float3(0.0, -aW.z, aW.y));
+            float3 b2 = cross(aW, b1);
+            float3 axisErr = cross(aW, bW);
+
+            // (1) Axis alignment, 2-DOF: keep the two bodies' slide axes
+            // parallel — identical to the hinge's own axis-alignment loop.
+            for (int t = 0; t < 2; ++t) {
+                float3 dir = (t == 0) ? b1 : b2;
+                float kA2 = dot(dir, cdApplyInvInertiaWorld(qa, invIa, dir))
+                          + (bWorld ? 0.0 : dot(dir, cdApplyInvInertiaWorld(qb, invIb, dir)));
+                if (kA2 < 1e-9) continue;
+                float wrel = dot(wA - wB, dir);
+                float jA = -wrel / kA2;
+                wA += cdApplyInvInertiaWorld(qa, invIa, jA * dir);
+                if (!bWorld) wB -= cdApplyInvInertiaWorld(qb, invIb, jA * dir);
+                float bwrel = dot(bwA - bwB, dir);
+                float errT = dot(axisErr, dir);
+                float jAb = (-u.baumgarteBeta * errT / max(u.dt, 1e-6) - bwrel) / kA2;
+                bwA += cdApplyInvInertiaWorld(qa, invIa, jAb * dir);
+                if (!bWorld) bwB -= cdApplyInvInertiaWorld(qb, invIb, jAb * dir);
+            }
+
+            // (2) Twist lock, 1-DOF: rotation ABOUT the axis → 0 always (the
+            // 3rd rotational DOF the hinge deliberately leaves free; a
+            // prismatic doesn't). Same twist computation as the hinge's angle
+            // limit, but unconditional — no lo/hi, no sign-gated one-sided
+            // stop, just a rigid weld about this one remaining axis.
+            {
+                float4 qrel = bWorld ? cdQuatConj(qa) : cdQuatMul(qb, cdQuatConj(qa));
+                float twist = 2.0 * atan2(dot(qrel.xyz, aW), qrel.w);
+                float kTw = dot(aW, cdApplyInvInertiaWorld(qa, invIa, aW))
+                          + (bWorld ? 0.0 : dot(aW, cdApplyInvInertiaWorld(qb, invIb, aW)));
+                if (kTw > 1e-9) {
+                    float wt = dot(wB - wA, aW);
+                    float jT = -wt / kTw;
+                    wA -= cdApplyInvInertiaWorld(qa, invIa, jT * aW);
+                    if (!bWorld) wB += cdApplyInvInertiaWorld(qb, invIb, jT * aW);
+                    float bwt = dot(bwB - bwA, aW);
+                    float jTb = (-u.baumgarteBeta * twist / max(u.dt, 1e-6) - bwt) / kTw;
+                    bwA -= cdApplyInvInertiaWorld(qa, invIa, jTb * aW);
+                    if (!bWorld) bwB += cdApplyInvInertiaWorld(qb, invIb, jTb * aW);
+                }
+            }
+
+            // (3) Perpendicular translation lock, 2-DOF: the DISTANCE joint's
+            // linear + lever-arm Jacobian, run along each direction ⟂ the
+            // slide axis instead of along the anchor separation.
+            for (int t = 0; t < 2; ++t) {
+                float3 dir = (t == 0) ? b1 : b2;
+                float3 raXn = cross(rA, dir), rbXn = cross(rB, dir);
+                float kP = invMa + invMb
+                         + dot(raXn, cdApplyInvInertiaWorld(qa, invIa, raXn))
+                         + (bWorld ? 0.0 : dot(rbXn, cdApplyInvInertiaWorld(qb, invIb, rbXn)));
+                if (kP < 1e-9) continue;
+                float C = dot(pA - pB, dir);
+                float vn = dot((vA + cross(wA, rA)) - (vB + cross(wB, rB)), dir);
+                float jP = -vn / kP;
+                float3 P = jP * dir;
+                vA += invMa * P; wA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, P));
+                if (!bWorld) { vB -= invMb * P; wB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, P)); }
+                float bvn = dot((bvA + cross(bwA, rA)) - (bvB + cross(bwB, rB)), dir);
+                float jPb = (-u.baumgarteBeta * C / max(u.dt, 1e-6) - bvn) / kP;
+                float3 Pb = jPb * dir;
+                bvA += invMa * Pb; bwA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, Pb));
+                if (!bWorld) { bvB -= invMb * Pb; bwB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, Pb)); }
+            }
+
+            // Shared effective mass for the along-axis motor + limit (the
+            // DISTANCE joint's linear + lever-arm formula, evaluated along aW).
+            float3 raXa = cross(rA, aW), rbXa = cross(rB, aW);
+            float kAxis = invMa + invMb
+                        + dot(raXa, cdApplyInvInertiaWorld(qa, invIa, raXa))
+                        + (bWorld ? 0.0 : dot(rbXa, cdApplyInvInertiaWorld(qb, invIb, rbXa)));
+
+            // (4) Motor: drive linear velocity along the axis toward a target,
+            // bounded by a max force per substep — same clamped-single-impulse
+            // pattern as the hinge motor (see addPrismaticJoint), no bias term.
+            float targetVel = jn.anchorA.w, maxForce = jn.anchorB.w;
+            if (maxForce > 0.0 && kAxis > 1e-9) {
+                float vAlong = dot((vA + cross(wA, rA)) - (vB + cross(wB, rB)), aW);
+                float jM = clamp((targetVel - vAlong) / kAxis, -maxForce * u.dt, maxForce * u.dt);
+                float3 P = jM * aW;
+                vA += invMa * P; wA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, P));
+                if (!bWorld) { vB -= invMb * P; wB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, P)); }
+            }
+
+            // (5) Linear limits along the axis (lo < hi enables) — same
+            // sign-gated one-sided-stop pattern as the hinge's angle limit.
+            float lo = jn.axisA.w, hi = jn.axisB.w;
+            if (lo < hi && kAxis > 1e-9) {
+                float s = dot(pA - pB, aW);
+                float overLo = s - lo;
+                float overHi = s - hi;
+                if (overLo < 0.0 || overHi > 0.0) {
+                    float err = (overLo < 0.0) ? overLo : overHi;
+                    float vAlong2 = dot((vA + cross(wA, rA)) - (vB + cross(wB, rB)), aW);
+                    if ((err < 0.0 && vAlong2 < 0.0) || (err > 0.0 && vAlong2 > 0.0)) {
+                        float jL = -vAlong2 / kAxis;
+                        float3 P = jL * aW;
+                        vA += invMa * P; wA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, P));
+                        if (!bWorld) { vB -= invMb * P; wB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, P)); }
+                    }
+                    float bvAlong = dot((bvA + cross(bwA, rA)) - (bvB + cross(bwB, rB)), aW);
+                    float jLb = (-u.baumgarteBeta * err / max(u.dt, 1e-6) - bvAlong) / kAxis;
+                    float3 Pb = jLb * aW;
+                    bvA += invMa * Pb; bwA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, Pb));
+                    if (!bWorld) { bvB -= invMb * Pb; bwB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, Pb)); }
+                }
+            }
         } else {
             // ── BALL core (types 0 and 1): anchors coincide, 3-DOF ─────────────
             // K built by columns: K = (ΣinvM)·I − [rA]× IA⁻¹ [rA]× − [rB]× IB⁻¹ [rB]×.
