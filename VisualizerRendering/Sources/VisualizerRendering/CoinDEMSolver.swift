@@ -196,8 +196,8 @@ public struct CoinJoint {
     // bodies don't generate contacts against each other; set to keep them
     // colliding, e.g. a hinge whose bodies are meant to stay physically apart).
     public var meta:    SIMD4<UInt32>  // x=type(0 ball,1 hinge,2 distance), y=A, z=B(0xFFFFFFFF=world), w=enabled|collideConnected bits
-    public var anchorA: SIMD4<Float>   // xyz=A-local anchor, w=rest length (distance)
-    public var anchorB: SIMD4<Float>   // xyz=B-local anchor (WORLD if z==world)
+    public var anchorA: SIMD4<Float>   // xyz=A-local anchor; w=rest length (distance) or motor target ω rad/s (hinge)
+    public var anchorB: SIMD4<Float>   // xyz=B-local anchor (WORLD if z==world); w=motor max torque, >0 enables (hinge)
     public var axisA:   SIMD4<Float>   // xyz=A-local hinge axis, w=limit lo (rad)
     public var axisB:   SIMD4<Float>   // xyz=B-local hinge axis (WORLD if world), w=limit hi
 }
@@ -1177,22 +1177,40 @@ public final class CoinDEMSolver: PenetrationProbing {
 
     /// HINGE joint: ball at `worldAnchor` + the bodies may only rotate relative to
     /// each other about `worldAxis`. `limits` (radians, lo < hi, measured from the
-    /// CURRENT relative pose = 0) adds angle stops; nil = free spin.
+    /// CURRENT relative pose = 0) adds angle stops; nil = free spin. `motor`
+    /// drives toward `targetVelocity` (rad/s about `worldAxis`), bounded by
+    /// `maxTorque` (N·m) each substep — turns the hinge into a motorized wheel
+    /// or door; nil = no motor (the default free/limited-swing hinge). Combine
+    /// with `limits` for a motorized door that stops at an angle.
+    /// For a WORLD hinge (`bodyB == nil`, the common wheel/fan/door case),
+    /// `targetVelocity` is body A's own angular velocity — the intuitive
+    /// framing. The in-kernel constraint is actually on B's velocity relative
+    /// to A (the same convention the limit's twist angle already uses), which
+    /// for a world hinge — B is the velocity-less world — would otherwise
+    /// target `-A`'s own spin, so it's negated here to keep the public API
+    /// intuitive. For a real two-body hinge `targetVelocity` is the RELATIVE
+    /// spin of B about A (B's own spin plus this, roughly, when A is also
+    /// moving) — not independently A's own spin.
     /// `collideConnected`: see `addBallJoint`.
     @discardableResult
     public func addHingeJoint(bodyA: Int, bodyB: Int?, worldAnchor: SIMD3<Float>,
                               worldAxis: SIMD3<Float>,
                               limits: ClosedRange<Float>? = nil,
+                              motor: (targetVelocity: Float, maxTorque: Float)? = nil,
                               collideConnected: Bool = false) -> Int? {
         guard let slot = claimJointSlot() else { return nil }
         let world = bodyB == nil
         let axis = simd_normalize(worldAxis)
         // lo == hi disables the limit branch in-kernel.
         let lo = limits?.lowerBound ?? 0, hi = limits?.upperBound ?? 0
+        // maxTorque <= 0 disables the motor branch in-kernel. The kernel's
+        // constraint target is "B relative to A"; negate for a world hinge so
+        // targetVelocity means A's own spin (see doc comment above).
+        let motorTarget = (motor?.targetVelocity ?? 0) * (world ? -1 : 1)
         writeJoint(slot, CoinJoint(
             meta: SIMD4(1, UInt32(bodyA), world ? 0xFFFF_FFFF : UInt32(bodyB!), Self.jointMeta(collideConnected: collideConnected)),
-            anchorA: SIMD4(toLocal(bodyA, worldAnchor), 0),
-            anchorB: SIMD4(world ? worldAnchor : toLocal(bodyB!, worldAnchor), 0),
+            anchorA: SIMD4(toLocal(bodyA, worldAnchor), motorTarget),
+            anchorB: SIMD4(world ? worldAnchor : toLocal(bodyB!, worldAnchor), motor?.maxTorque ?? 0),
             axisA: SIMD4(toLocalDir(bodyA, axis), lo),
             axisB: SIMD4(world ? axis : toLocalDir(bodyB!, axis), hi)))
         return slot
@@ -1315,6 +1333,14 @@ public final class CoinDEMSolver: PenetrationProbing {
         let ptr = coinBuffer.buffer.contents().bindMemory(to: CoinBody.self, capacity: maxCoins)
         let b = ptr[slot]
         return b.posInvMass.w == 0 ? nil : SIMD3(b.vel.x, b.vel.y, b.vel.z)
+    }
+
+    /// Read-only snapshot of an active body's angular velocity (rad/s, world frame).
+    public func angularVelocity(of slot: Int) -> SIMD3<Float>? {
+        guard slot >= 0, slot < highWater else { return nil }
+        let ptr = coinBuffer.buffer.contents().bindMemory(to: CoinBody.self, capacity: maxCoins)
+        let b = ptr[slot]
+        return b.posInvMass.w == 0 ? nil : SIMD3(b.angVel.x, b.angVel.y, b.angVel.z)
     }
 
     /// Read-only snapshot of an active body's orientation quaternion.

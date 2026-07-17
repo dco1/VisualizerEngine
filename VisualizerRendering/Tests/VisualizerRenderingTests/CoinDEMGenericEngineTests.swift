@@ -670,6 +670,39 @@ final class CoinDEMGenericEngineTests: XCTestCase {
         XCTAssertGreaterThan(freeDropped, 0.6, "free flap swung far past the stop")
     }
 
+    // ── Joints: hinge motor (roadmap item 7 — "motors/springs") ────────────────
+    // Two identical flaps hinged to the world, each motored toward the SAME
+    // target angular velocity that opposes gravity's own swing direction (lifting
+    // the arm, not falling with it) — a strong motor must reach it; a torque-
+    // starved one must fall well short, proving maxTorque genuinely bounds the
+    // impulse rather than the target being applied unconditionally.
+    func testHingeMotorDrivesToTargetVelocity() throws {
+        let (solver, queue) = try makeSolver(radius: 0.16, maxDim: 0.16)
+        let he = SIMD3<Float>(0.12, 0.015, 0.05)
+        let axis = SIMD3<Float>(0, 0, 1)
+        let target: Float = 3.0
+        func flap(z: Float, maxTorque: Float) -> Int {
+            let com = SIMD3<Float>(0.12, 1.0, z)
+            let b = solver.spawnBox(at: com, halfExtents: he)!
+            _ = solver.addHingeJoint(bodyA: b, bodyB: nil,
+                                     worldAnchor: SIMD3(0, 1.0, z),
+                                     worldAxis: axis,
+                                     motor: (targetVelocity: target, maxTorque: maxTorque))
+            return b
+        }
+        let strong = flap(z: -0.4, maxTorque: 50.0)
+        let weak   = flap(z:  0.4, maxTorque: 0.02)
+        step(solver, queue, frames: 120)
+
+        let spinStrong = simd_dot(solver.angularVelocity(of: strong)!, axis)
+        let spinWeak   = simd_dot(solver.angularVelocity(of: weak)!, axis)
+        print("JOINT_HINGE_MOTOR target=\(target) strong=\(spinStrong) weak=\(spinWeak)")
+        XCTAssertEqual(spinStrong, target, accuracy: 0.5,
+                       "a strong-torque motor reaches its target angular velocity")
+        XCTAssertLessThan(abs(spinWeak), target * 0.3,
+                          "a torque-starved motor can't overcome gravity — maxTorque genuinely bounds it")
+    }
+
     // ── Joints: collideConnected (roadmap item 3) ───────────────────────────────
     // Two spheres (radius 0.05, combined resting separation 0.1) distance-jointed
     // to a too-short rest length (0.04) — the joint FORCES an overlap that a

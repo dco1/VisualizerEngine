@@ -221,16 +221,22 @@ struct CoinContact {
 
 // One generic constraint-path joint. Types (meta.x): 0 = BALL (anchors
 // coincide, 3-DOF point constraint), 1 = HINGE (ball + axis alignment +
-// optional angle limits), 2 = DISTANCE (anchor separation = rest length,
-// 1-DOF). meta.w bit 0 = enabled, bit 1 = collideConnected (contacts between
-// this joint's own bodyA/bodyB are suppressed in coinGenerateContacts unless
-// this bit is set — a hinge whose bodies touch at the anchor would otherwise
-// fight its own contact). Declared here (not by the joint-solve kernel below,
-// where it conceptually lives) so coinGenerateContacts can read it too.
+// optional angle limits + optional motor), 2 = DISTANCE (anchor separation =
+// rest length, 1-DOF). meta.w bit 0 = enabled, bit 1 = collideConnected
+// (contacts between this joint's own bodyA/bodyB are suppressed in
+// coinGenerateContacts unless this bit is set — a hinge whose bodies touch at
+// the anchor would otherwise fight its own contact). Declared here (not by
+// the joint-solve kernel below, where it conceptually lives) so
+// coinGenerateContacts can read it too.
 struct CoinJoint {
     uint4  meta;     // x = type, y = bodyA, z = bodyB (CD_STATIC = world), w = enabled|collideConnected bits
-    float4 anchorA;  // xyz = anchor in A-local frame;               w = rest length (distance)
-    float4 anchorB;  // xyz = anchor in B-local frame (WORLD if z==CD_STATIC)
+    // xyz = anchor in A-local frame. w: DISTANCE only, rest length; HINGE only,
+    // motor target angular velocity (rad/s) — otherwise dead weight (BALL has
+    // no use for it either).
+    float4 anchorA;
+    // xyz = anchor in B-local frame (WORLD if z==CD_STATIC). w: HINGE only,
+    // motor max torque (>0 enables the motor) — otherwise dead weight.
+    float4 anchorB;
     float4 axisA;    // xyz = hinge axis in A-local frame;           w = limit lo (rad)
     float4 axisB;    // xyz = hinge axis in B-local (WORLD if world); w = limit hi (rad)
 };
@@ -3378,6 +3384,25 @@ kernel void coinJointSolveCS(
                     float jAb = (-u.baumgarteBeta * errT / max(u.dt, 1e-6) - bwrel) / kA;
                     bwA += cdApplyInvInertiaWorld(qa, invIa, jAb * dir);
                     if (!bWorld) bwB -= cdApplyInvInertiaWorld(qb, invIb, jAb * dir);
+                }
+                // Motor: drive the relative angular velocity about the axis
+                // toward a target, bounded by a max torque (anchorA.w/anchorB.w
+                // — dead weight for a hinge otherwise; see addHingeJoint). A
+                // velocity target has no position error, so unlike the ball/axis/
+                // limit sub-constraints above there's no bias half — one direct
+                // impulse per substep (the joint solve is already single-pass,
+                // no warm-start/accumulator, so no clamp-against-history needed
+                // either; maxTorque bounds THIS substep's impulse directly).
+                float targetOmega = jn.anchorA.w, maxTorque = jn.anchorB.w;
+                if (maxTorque > 0.0) {
+                    float kM = dot(aW, cdApplyInvInertiaWorld(qa, invIa, aW))
+                             + (bWorld ? 0.0 : dot(aW, cdApplyInvInertiaWorld(qb, invIb, aW)));
+                    if (kM > 1e-9) {
+                        float wm = dot(wB - wA, aW);
+                        float jM = clamp((targetOmega - wm) / kM, -maxTorque * u.dt, maxTorque * u.dt);
+                        wA -= cdApplyInvInertiaWorld(qa, invIa, jM * aW);
+                        if (!bWorld) wB += cdApplyInvInertiaWorld(qb, invIb, jM * aW);
+                    }
                 }
                 // Angle limits about the hinge axis (lo < hi enables them).
                 float lo = jn.axisA.w, hi = jn.axisB.w;
