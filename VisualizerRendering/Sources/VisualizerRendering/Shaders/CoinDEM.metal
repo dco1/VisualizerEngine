@@ -80,8 +80,15 @@ struct CoinBody {
 struct CoinStaticCollider {
     float4 a;
     float4 b;
-    float4 vel;    // xyz = surface velocity (kinematic pusher), w = friction (reserved)
-    uint4  meta;   // x = flags (bit0 = one-way: push only when approaching from +normal), yzw reserved
+    // xyz = surface velocity (kinematic pusher); w = cylinder (kind 4) half-length
+    // ONLY — every other kind leaves it 0, but it's occupied there, so material
+    // lives in meta.yz instead (see below).
+    float4 vel;
+    // x = flags (bit0 = one-way: push only when approaching from +normal).
+    // y/z = per-collider (μ, e), bit-cast float via as_type<float>() — a NEGATIVE
+    // value means "inherit the global uniform", identical convention and combine
+    // rule (μ=√(μA·μB), e=max(eA,eB)) to per-body material. w reserved.
+    uint4  meta;
     float4 orient; // oriented-box (kind 3) rotation quaternion (x,y,z,w); identity for other kinds
 };
 // `cdQuatRotate` / `cdQuatRotateInv` are defined below (shared with the body solver).
@@ -164,6 +171,20 @@ inline float cdBodyMu(device const float2* material, uint slot, constant CoinUni
 }
 inline float cdBodyE(device const float2* material, uint slot, constant CoinUniforms& u) {
     float e = material[slot].y;
+    return e >= 0.0 ? e : u.restitution;
+}
+
+// ── Per-collider material (constraint path) ───────────────────────────────────
+// Mirrors cdBodyMu/cdBodyE exactly, reading CoinStaticCollider.meta.yz (bit-cast
+// float) instead of a per-body buffer slot. A static side used to just copy the
+// dynamic body's own material (an icy ramp read identical to a rubber floor);
+// this lets the collider carry its own (μ, e), combined the same way.
+inline float cdColliderMu(device const CoinStaticCollider* colliders, uint idx, constant CoinUniforms& u) {
+    float m = as_type<float>(colliders[idx].meta.y);
+    return m >= 0.0 ? m : u.frictionCoeff;
+}
+inline float cdColliderE(device const CoinStaticCollider* colliders, uint idx, constant CoinUniforms& u) {
+    float e = as_type<float>(colliders[idx].meta.z);
     return e >= 0.0 ? e : u.restitution;
 }
 
@@ -2895,6 +2916,7 @@ kernel void coinSolveVelocityColor(
     constant uint&            currentColor [[ buffer(5) ]],
     device const uint*        asleep       [[ buffer(6) ]],
     device const float2*      material     [[ buffer(7) ]],   // per-body (μ, e); <0 = inherit
+    device const CoinStaticCollider* colliders [[ buffer(8) ]],
     uint cid [[ thread_position_in_grid ]])
 {
     uint ncon = atomic_load_explicit(&contactCount, memory_order_relaxed);
@@ -2945,14 +2967,16 @@ kernel void coinSolveVelocityColor(
     float3 vrel = vpA - vpB;
     float vn = dot(vrel, n);                       // <0 = closing along the normal
 
-    // ── Per-contact material: combine the two bodies' (μ, e). A static side
-    // MIRRORS the body's own material (colliders carry none), so a per-body μ/e
-    // override behaves the same against the floor as against a like neighbour —
-    // and the all-defaults case still reduces exactly to the global uniforms.
+    // ── Per-contact material: combine the two sides' (μ, e). A static side
+    // reads the COLLIDER's own material (c.meta.z is the collider index for a
+    // static contact — see cdEmitContact/cdPairKey), not a mirror of A's — an
+    // icy ramp next to a rubber floor now actually differs. Same combine rule
+    // and "<0 = inherit the global uniform" convention as per-body material, so
+    // the all-defaults case still reduces exactly to the global uniforms.
     float muA = cdBodyMu(material, A, u);
     float eA  = cdBodyE(material, A, u);
-    float muB = bStatic ? muA : cdBodyMu(material, B, u);
-    float eB  = bStatic ? eA  : cdBodyE(material, B, u);
+    float muB = bStatic ? cdColliderMu(colliders, c.meta.z, u) : cdBodyMu(material, B, u);
+    float eB  = bStatic ? cdColliderE(colliders, c.meta.z, u) : cdBodyE(material, B, u);
     float muC = sqrt(max(muA * muB, 0.0));      // geometric mean (Box2D convention)
     float eC  = max(eA, eB);                    // bounciest material wins
 

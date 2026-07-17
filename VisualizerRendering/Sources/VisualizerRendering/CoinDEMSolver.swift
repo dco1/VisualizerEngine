@@ -76,13 +76,21 @@ public struct CoinBody {
 public struct CoinStaticCollider {
     public var a:      SIMD4<Float>   // plane: xyz=normal, w=tag(0) ; box: xyz=centre, w=tag(1)
     public var b:      SIMD4<Float>   // plane: w=offset d ; box: xyz=halfExtents
-    public var vel:    SIMD4<Float>   // xyz = kinematic surface velocity, w = friction (reserved)
-    public var meta:   SIMD4<UInt32>  // x = flags (bit0 = one-way ledge)
+    public var vel:    SIMD4<Float>   // xyz = kinematic surface velocity; w = cylinder (kind 4) half-length only
+    // x = flags (bit0 = one-way ledge). y/z = per-collider (μ, e), bit-cast float
+    // — negative = inherit the global uniform, same convention + combine rule
+    // (μ=√(μA·μB), e=max(eA,eB)) as per-body material (`friction:`/`restitution:`
+    // on every factory below). w reserved.
+    public var meta:   SIMD4<UInt32>
     public var orient: SIMD4<Float>   // oriented-box (kind 3) quaternion (x,y,z,w); identity otherwise
 
     enum Kind: UInt32 { case plane = 0, box = 1, pusherPlate = 2, orientedBox = 3, cylinder = 4 }
 
     private static let identityQuat = SIMD4<Float>(0, 0, 0, 1)
+
+    private static func matMeta(_ flags: UInt32, friction: Float?, restitution: Float?) -> SIMD4<UInt32> {
+        SIMD4(flags, (friction ?? -1).bitPattern, (restitution ?? -1).bitPattern, 0)
+    }
 
     /// A CYLINDER-interior segment — the marble is constrained INSIDE a cylinder of
     /// `radius` whose axis passes through `center` along `axis` for ±`halfLength`.
@@ -91,12 +99,13 @@ public struct CoinStaticCollider {
     /// Resolved on the constraint path's sphere case (CoinDEM.metal kind 4).
     public static func cylinder(center: SIMD3<Float>, axis: SIMD3<Float>, radius: Float,
                                 up: SIMD3<Float>, halfLength: Float,
-                                lowerHalfOnly: Bool) -> CoinStaticCollider {
+                                lowerHalfOnly: Bool,
+                                friction: Float? = nil, restitution: Float? = nil) -> CoinStaticCollider {
         CoinStaticCollider(
             a: SIMD4(center, Float(bitPattern: Kind.cylinder.rawValue)),
             b: SIMD4(simd_normalize(axis), radius),
             vel: SIMD4(simd_normalize(up), halfLength),
-            meta: SIMD4(lowerHalfOnly ? 1 : 0, 0, 0, 0),
+            meta: matMeta(lowerHalfOnly ? 1 : 0, friction: friction, restitution: restitution),
             orient: identityQuat)
     }
 
@@ -107,21 +116,23 @@ public struct CoinStaticCollider {
     /// just in front of its +Z face — but no faster than `velocity.z` (the plate's
     /// true forward speed), so the contact can't launch coins (see CoinDEM.metal).
     public static func pusherPlate(center: SIMD3<Float>, halfExtents: SIMD3<Float>,
-                                   velocity: SIMD3<Float> = .zero) -> CoinStaticCollider {
+                                   velocity: SIMD3<Float> = .zero,
+                                   friction: Float? = nil, restitution: Float? = nil) -> CoinStaticCollider {
         CoinStaticCollider(
             a: SIMD4(center, Float(bitPattern: Kind.pusherPlate.rawValue)),
             b: SIMD4(halfExtents, 0),
-            vel: SIMD4(velocity, 0), meta: SIMD4(0, 0, 0, 0),
+            vel: SIMD4(velocity, 0), meta: matMeta(0, friction: friction, restitution: restitution),
             orient: identityQuat)
     }
 
     /// Half-space `n · x ≥ d`. Coins are pushed back to the surface.
-    public static func plane(normal: SIMD3<Float>, offset: Float) -> CoinStaticCollider {
+    public static func plane(normal: SIMD3<Float>, offset: Float,
+                             friction: Float? = nil, restitution: Float? = nil) -> CoinStaticCollider {
         let n = simd_normalize(normal)
         return CoinStaticCollider(
             a: SIMD4(n, Float(bitPattern: Kind.plane.rawValue)),
             b: SIMD4(0, 0, 0, offset),
-            vel: .zero, meta: SIMD4(0, 0, 0, 0),
+            vel: .zero, meta: matMeta(0, friction: friction, restitution: restitution),
             orient: identityQuat)
     }
 
@@ -131,12 +142,13 @@ public struct CoinStaticCollider {
     /// box's per-frame advance (see CoinDEM.metal).
     public static func box(center: SIMD3<Float>, halfExtents: SIMD3<Float>,
                            oneWay: Bool = false,
-                           velocity: SIMD3<Float> = .zero) -> CoinStaticCollider {
+                           velocity: SIMD3<Float> = .zero,
+                           friction: Float? = nil, restitution: Float? = nil) -> CoinStaticCollider {
         CoinStaticCollider(
             a: SIMD4(center, Float(bitPattern: Kind.box.rawValue)),
             b: SIMD4(halfExtents, 0),
             vel: SIMD4(velocity, 0),
-            meta: SIMD4(oneWay ? 1 : 0, 0, 0, 0),
+            meta: matMeta(oneWay ? 1 : 0, friction: friction, restitution: restitution),
             orient: identityQuat)
     }
 
@@ -145,12 +157,13 @@ public struct CoinStaticCollider {
     /// path only (the path the ball/plank scenes use); proper sphere-vs-OBB
     /// contact for marbles rolling on a tilted plank. See CoinDEM.metal kind 3.
     public static func orientedBox(center: SIMD3<Float>, halfExtents: SIMD3<Float>,
-                                   orientation: simd_quatf) -> CoinStaticCollider {
+                                   orientation: simd_quatf,
+                                   friction: Float? = nil, restitution: Float? = nil) -> CoinStaticCollider {
         let q = orientation.normalized
         return CoinStaticCollider(
             a: SIMD4(center, Float(bitPattern: Kind.orientedBox.rawValue)),
             b: SIMD4(halfExtents, 0),
-            vel: .zero, meta: SIMD4(0, 0, 0, 0),
+            vel: .zero, meta: matMeta(0, friction: friction, restitution: restitution),
             orient: SIMD4(q.imag.x, q.imag.y, q.imag.z, q.real))
     }
 }
@@ -1552,6 +1565,7 @@ public final class CoinDEMSolver: PenetrationProbing {
                     enc.setBytes(&cc, length: MemoryLayout<UInt32>.size, index: 5)
                     enc.setBuffer(self.asleepBuffer, offset: 0, index: 6)
                     enc.setBuffer(self.materialBuffer, offset: 0, index: 7)
+                    enc.setBuffer(self.colliderBuffer.buffer, offset: 0, index: 8)
                 }
             }
             // Generic joints: one serial Gauss-Seidel pass over all joints per

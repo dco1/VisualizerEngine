@@ -737,6 +737,13 @@ final class CoinDEMGenericEngineTests: XCTestCase {
     // frictionCoeff stays 0 — vs statics a body's own material governs.
     func testPerBodyFrictionControlsSlide() throws {
         let (solver, queue) = try makeSolver(radius: 0.06, maxDim: 0.06)
+        // Global frictionCoeff defaults to 0 (frictionless world unless a body or
+        // collider says otherwise); an unset floor now inherits that default
+        // (roadmap item 6 — a collider used to just mirror the body's own
+        // material). Give the floor an explicit grippy friction so the per-body
+        // μ=√(μA·μFloor) combination is controlled by the BOX's own friction,
+        // which is what this test is actually isolating.
+        solver.setColliders([.plane(normal: SIMD3(0, 1, 0), offset: 0, friction: 1.0)])
         let he = SIMD3<Float>(0.04, 0.04, 0.04)
         let slick = solver.spawnBox(at: SIMD3(-0.8, 0.041, -0.5), halfExtents: he,
                                     velocity: SIMD3(2.0, 0, 0), friction: 0.02)
@@ -752,5 +759,42 @@ final class CoinDEMGenericEngineTests: XCTestCase {
                              "μ=0.02 box slides well past the μ=0.9 box")
         XCTAssertLessThan(simd_length(solver.velocity(of: grippy!)!), 0.05,
                           "grippy box has stopped")
+    }
+
+    // ── Static collider materials (roadmap item 6) ──────────────────────────────
+    // Two IDENTICAL boxes (no per-body override — both inherit the global
+    // material) slid onto two DIFFERENT static floor planes, an icy one and a
+    // rubber one. Before this fix a static side just mirrored the body's own
+    // material, so two identical bodies could never tell an icy floor from a
+    // rubber one apart — this proves the collider's OWN (μ, e) now controls it.
+    func testStaticColliderMaterialDistinguishesIcyFromRubberFloor() throws {
+        let (solver, queue) = try makeSolver(radius: 0.06, maxDim: 0.06,
+                                             boundsMin: SIMD3(-2, -0.5, -2), boundsMax: SIMD3(2, 2, 2))
+        // Bounded boxes, not planes — a plane is an infinite half-space, so two
+        // overlapping ones would both apply everywhere and never isolate a floor
+        // material by location. Same top surface (y=0), disjoint Z ranges.
+        solver.setColliders([
+            .box(center: SIMD3(0, -0.02, -0.5), halfExtents: SIMD3(2, 0.02, 0.5), friction: 0.02),  // icy, z∈[-1,0]
+            .box(center: SIMD3(0, -0.02,  0.5), halfExtents: SIMD3(2, 0.02, 0.5), friction: 1.0),    // rubber, z∈[0,1]
+        ])
+        // Both boxes get an explicit, IDENTICAL, "neutral grippy" body friction —
+        // global frictionCoeff defaults to 0, and μC=√(μA·μB) means an unset
+        // body (μA=0) would floor μC to 0 regardless of the collider, masking
+        // the very thing this test isolates.
+        let he = SIMD3<Float>(0.04, 0.04, 0.04)
+        let onIce   = solver.spawnBox(at: SIMD3(-0.8, 0.041, -0.5), halfExtents: he,
+                                      velocity: SIMD3(2.0, 0, 0), friction: 1.0)
+        let onRubber = solver.spawnBox(at: SIMD3(-0.8, 0.041,  0.5), halfExtents: he,
+                                       velocity: SIMD3(2.0, 0, 0), friction: 1.0)
+        XCTAssertNotNil(onIce); XCTAssertNotNil(onRubber)
+        step(solver, queue, frames: 240)
+
+        let xIce    = solver.position(of: onIce!)!.x - (-0.8)
+        let xRubber = solver.position(of: onRubber!)!.x - (-0.8)
+        print("STATIC_COLLIDER_MATERIAL ice=\(xIce) rubber=\(xRubber)")
+        XCTAssertGreaterThan(xIce, xRubber + 0.2,
+                             "identical box slides much further on the icy-material floor")
+        XCTAssertLessThan(simd_length(solver.velocity(of: onRubber!)!), 0.05,
+                          "identical box has stopped on the rubber-material floor")
     }
 }
