@@ -15,6 +15,7 @@ let package = Package(
     products: [
         .library(name: "VisualizerCore", targets: ["VisualizerCore"]),
         .library(name: "VisualizerRendering", targets: ["VisualizerRendering"]),
+        .library(name: "VisualizerHumans", targets: ["VisualizerHumans"]),
     ],
     targets: [
         .target(
@@ -39,6 +40,25 @@ let package = Package(
             name: "VisualizerRenderingTests",
             dependencies: ["VisualizerRendering"],
             path: "VisualizerRendering/Tests/VisualizerRenderingTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "VisualizerHumans",
+            dependencies: ["VisualizerRendering"],
+            path: "VisualizerHumans/Sources/VisualizerHumans",
+            resources: [.process("Resources")],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "VisualizerHumansTests",
+            dependencies: ["VisualizerHumans"],
+            path: "VisualizerHumans/Tests/VisualizerHumansTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .executableTarget(
+            name: "humans-preview",
+            dependencies: ["VisualizerHumans", "VisualizerRendering"],
+            path: "tools/humans-preview",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]

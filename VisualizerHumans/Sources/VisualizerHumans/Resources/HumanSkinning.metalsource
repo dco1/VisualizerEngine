@@ -1,0 +1,41 @@
+// Linear-blend skinning for generated humans. Kept as SOURCE (runtime-compiled
+// once, cached) because SwiftPM's CLI build does not compile .metal resources
+// into a metallib — this path works identically under swift test, swift run,
+// and Xcode. Must match PosedHuman.skin(...) — the CPU reference — exactly.
+#include <metal_stdlib>
+using namespace metal;
+
+struct HumanSkinParams { uint vertexCount; };
+
+kernel void human_skin_lbs(
+    device const float3* bindPositions [[buffer(0)]],   // SIMD3<Float>, stride 16
+    device const float3* bindNormals [[buffer(1)]],
+    device const ushort4* joints [[buffer(2)]],
+    device const float4* weights [[buffer(3)]],
+    device const float4x4* matrices [[buffer(4)]],      // PosedHuman.skinningMatrices
+    device packed_float3* outPositions [[buffer(5)]],   // 12-byte, GPU-mesh convention
+    device packed_float3* outNormals [[buffer(6)]],
+    constant HumanSkinParams& params [[buffer(7)]],
+    uint id [[thread_position_in_grid]])
+{
+    if (id >= params.vertexCount) { return; }
+    const float4 p = float4(bindPositions[id], 1.0);
+    const float4 n = float4(bindNormals[id], 0.0);
+    const ushort4 j = joints[id];
+    const float4 w = weights[id];
+
+    float4 sp = float4(0.0);
+    float4 sn = float4(0.0);
+    for (int k = 0; k < 4; ++k) {
+        const float wk = w[k];
+        if (wk > 0.0) {
+            const float4x4 m = matrices[j[k]];
+            sp += (m * p) * wk;
+            sn += (m * n) * wk;
+        }
+    }
+    outPositions[id] = packed_float3(sp.xyz);
+    const float3 nn = sn.xyz;
+    const float len = length(nn);
+    outNormals[id] = packed_float3(len > 1e-9 ? nn / len : float3(0.0, 1.0, 0.0));
+}
