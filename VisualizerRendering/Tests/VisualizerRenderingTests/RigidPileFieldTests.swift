@@ -108,8 +108,9 @@ final class RigidPileFieldTests: XCTestCase {
     // So the bound below is 0.01, two orders under the old tail and comfortably above
     // exactly-zero: a settled pile measures 0, and anything that leaves a body genuinely
     // moving (≈0.14 m/s on one body) or brings back the stale-velocity artefact trips it.
-    // NOT asserted, by design: the settled ARRANGEMENT still differs run to run — the
-    // gate is on rest, not on reproducing one particular pile. ────────────────────────
+    // The pile is also reproducible now — the contact ORDER used to permute every run
+    // (see testConstraintSolveIsDeterministic), so these three runs settle identically
+    // rather than being three samples of a distribution. ─────────────────────────────
     func testPileOfMessRestQuiet() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
         let engine = SimEngine(device: device)
@@ -195,6 +196,75 @@ final class RigidPileFieldTests: XCTestCase {
         // settling a body a few frames later, not for the old stale-velocity spread.
         XCTAssertLessThanOrEqual(worstAwake, 2, "constraint solver: a settled pile has ~zero awake bodies")
         XCTAssertLessThan(worstKE, 0.01, "constraint solver settles the full-density mixed pile dead-still, every run")
+    }
+
+    // ── Two identical runs stay BIT-IDENTICAL. ────────────────────────────────────
+    // The contact buffer's slots come from an atomic bump allocator, so the same physical
+    // contact lands in a different slot every run. Everything downstream must therefore
+    // be invariant to that permutation, and the two places it used to leak in were the
+    // colouring's priority (hashed from the slot index) and its single-buffered rounds
+    // (a neighbour's colour could be read before or after it was written in the same
+    // round). Before that was fixed, two lockstep runs of this config diverged by frame
+    // ~40 and ended 1.3 m apart; a physics bug could not be reproduced, and any metric
+    // over the settled pile was a lottery. Colour priority now comes from the contact's
+    // IDENTITY and the rounds ping-pong, so this holds exactly. ─────────────────────
+    func testConstraintSolveIsDeterministic() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
+        let engine = SimEngine(device: device)
+        let lib = try Self.makeLibrary(device)
+        let fill = 48
+        func makePile() throws -> RigidPileField {
+            var cfg = RigidPileField.Config(maxBodies: fill + 8, bodyScale: 0.12,
+                                            bounds: (SIMD3(-1.1, -0.5, -1.1), SIMD3(1.1, 2.6, 1.1)))
+            cfg.floorY = 0; cfg.restitution = 0.18; cfg.friction = 0.86
+            cfg.iterations = 8; cfg.maxSubsteps = 4; cfg.contactRelax = 0.5
+            cfg.useConstraintSolver = true; cfg.frictionCoeff = 0.5
+            guard let f = RigidPileField(engine: engine, library: lib, config: cfg,
+                                         colliders: RigidPileField.bin(innerHalf: SIMD2(0.4, 0.4), floorY: 0))
+            else { throw XCTSkip("field init failed") }
+            return f
+        }
+        func drop(_ f: RigidPileField, _ i: Int) {
+            var h = UInt64(bitPattern: Int64(i)) &* 0x9E3779B97F4A7C15 &+ 0xD1B54A32D192ED03
+            func rnd() -> Float { h ^= h >> 30; h &*= 0xBF58476D1CE4E5B9; h ^= h >> 27; return Float(h >> 40) / Float(1 << 24) }
+            let p = SIMD3<Float>((rnd() - 0.5) * 0.6, 1.2 + rnd() * 0.3, (rnd() - 0.5) * 0.6)
+            let t = SIMD3<Float>((rnd() - 0.5) * 5, (rnd() - 0.5) * 5, (rnd() - 0.5) * 5)
+            switch i % 3 {
+            case 0: f.dropDisc(at: p, radius: 0.075, halfThickness: 0.022, tumble: t, type: 0)
+            case 1: f.dropSphere(at: p, radius: 0.052, tumble: t, type: 1)
+            default: f.dropBox(at: p, halfExtents: SIMD3(0.042, 0.042, 0.042), tumble: t, type: 2)
+            }
+        }
+        let a = try makePile(), b = try makePile()
+        guard let queue = device.makeCommandQueue() else { throw XCTSkip("queue") }  // gpu-ok: test harness
+        for f in 0..<260 {                                   // through the noisy landing phase
+            if f < 96 { drop(a, f); drop(b, f) }
+            for pile in [a, b] {
+                guard let cb = queue.makeCommandBuffer() else { return }
+                pile.encode(to: cb, dt: 1.0 / 60.0)
+                cb.commit(); cb.waitUntilCompleted()         // gpu-ok: test harness reads synchronously
+            }
+        }
+        let n = a.solver.highWater
+        XCTAssertEqual(n, b.solver.highWater)
+        let pa = a.solver.coinBuffer.buffer.contents().bindMemory(to: CoinBody.self, capacity: max(1, n))
+        let pb = b.solver.coinBuffer.buffer.contents().bindMemory(to: CoinBody.self, capacity: max(1, n))
+        var worstPos: Float = 0, worstQuat: Float = 0, differing = 0
+        for i in 0..<n where pa[i].posInvMass.w != 0 {
+            let dp = simd_distance(SIMD3(pa[i].posInvMass.x, pa[i].posInvMass.y, pa[i].posInvMass.z),
+                                   SIMD3(pb[i].posInvMass.x, pb[i].posInvMass.y, pb[i].posInvMass.z))
+            let dq = simd_reduce_max(abs(pa[i].orient - pb[i].orient))
+            if dp > 0 || dq > 0 { differing += 1 }
+            worstPos = max(worstPos, dp); worstQuat = max(worstQuat, dq)
+        }
+        print("DETERMINISM bodies=\(n) differing=\(differing) worstPos=\(worstPos) worstQuat=\(worstQuat)")
+        XCTAssertEqual(differing, 0, "two identical runs must produce bit-identical state")
+        // Nothing was truncated or left uncoloured on the way (either would reintroduce
+        // an order dependence — a same-colour race, or a contact silently unsolved).
+        for pile in [a, b] {
+            XCTAssertEqual(pile.solver.colorStats.listOverflow, 0, "no per-body adjacency overflow")
+            XCTAssertEqual(pile.solver.colorStats.uncolored, 0, "every contact got a colour")
+        }
     }
 
     // ── The cull line recycles settled bodies (a payout). ─────────────────────────

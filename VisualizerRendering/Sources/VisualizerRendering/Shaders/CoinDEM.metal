@@ -188,6 +188,14 @@ inline float cdColliderE(device const CoinStaticCollider* colliders, uint idx, c
     return e >= 0.0 ? e : u.restitution;
 }
 
+/// Surface velocity of a KINEMATIC collider. Only the pusher plate (kind 2) moves; every
+/// other kind is world-fixed, and kind 4 (cylinder segment) reuses `vel.xyz` as its "up"
+/// axis, so this must switch on the kind rather than reading `vel` blindly.
+inline float3 cdColliderVelocity(device const CoinStaticCollider* colliders, uint idx) {
+    CoinStaticCollider c = colliders[idx];
+    return (as_type<uint>(c.a.w) == 2u) ? c.vel.xyz : float3(0.0);
+}
+
 struct CoinTransform {
     float4 col0;  // basis column 0 (xyz, 0)
     float4 col1;
@@ -1904,9 +1912,55 @@ static void cdContactTangents(float3 n, thread float3& t1, thread float3& t2) {
 }
 
 // Pack a stable key for warm-start matching: min/max body (12 bits each) + feature.
-static uint cdPairKey(uint a, uint b, uint feature) {
-    uint lo = min(a, b), hi = (b == CD_STATIC) ? 0xFFFu : max(a, b);
+// For a STATIC contact the "hi body" field is free, so it carries the COLLIDER index
+// instead: without it, a body resting in a bin corner produced the SAME key for its
+// floor contact and its wall contact (both feature 0), so `coinWarmStartMatch` seeded
+// one with the other's converged impulse — and which one won the hash slot depended on
+// the racing insert order. Collider 0 keeps the historical key.
+static uint cdPairKey(uint a, uint b, uint feature, uint colliderIdx) {
+    uint lo = min(a, b);
+    uint hi = (b == CD_STATIC) ? (0xFFFu - min(colliderIdx, 0xFFFu)) : max(a, b);
     return (lo & 0xFFFu) | ((hi & 0xFFFu) << 12) | ((feature & 0xFFu) << 24);
+}
+
+
+// ── Manifold reduction ────────────────────────────────────────────────────────
+//
+// A rigid body resting against one surface is fully constrained by ~4 well-spread
+// contact points; every extra sample is a redundant constraint that costs real solver
+// throughput. Not because of the arithmetic — because the graph colouring gives every
+// contact sharing a body its OWN colour, so the per-body contact DEGREE sets both the
+// number of colours (each an extra serialized solve pass) and the number of colouring
+// rounds. Measured on the shipped 176-body mixed pile: a coin lying flat emitted up to
+// 20 points against the bin, max degree hit 48, and the pile needed 48 colours.
+//
+// So each manifold is reduced to at most CD_MANIFOLD_MAX points: the DEEPEST (the
+// constraint that matters most), then greedily the point farthest from those already
+// kept — the standard deepest+spread reduction, which preserves the support polygon that
+// keeps a body level. Ties resolve to the lowest index, so the choice is deterministic.
+constant int CD_MANIFOLD_MAX = 4;
+
+static int cdReduceManifold(thread const float3* pos, thread const float* depth, int n,
+                            thread int* keep) {
+    if (n <= CD_MANIFOLD_MAX) { for (int i = 0; i < n; ++i) keep[i] = i; return max(n, 0); }
+    int best = 0;
+    for (int i = 1; i < n; ++i) if (depth[i] > depth[best]) best = i;
+    int m = 0;
+    keep[m++] = best;
+    while (m < CD_MANIFOLD_MAX) {
+        int pick = -1; float bestD = -1.0;
+        for (int i = 0; i < n; ++i) {
+            bool taken = false;
+            for (int j = 0; j < m; ++j) if (keep[j] == i) { taken = true; break; }
+            if (taken) continue;
+            float dmin = 1e30;
+            for (int j = 0; j < m; ++j) dmin = min(dmin, distance_squared(pos[i], pos[keep[j]]));
+            if (dmin > bestD) { bestD = dmin; pick = i; }
+        }
+        if (pick < 0) break;
+        keep[m++] = pick;
+    }
+    return m;
 }
 
 // Append one contact (atomic bump). nBtoA points from B's surface toward A.
@@ -1922,7 +1976,7 @@ static void cdEmitContact(device CoinContact* contacts,
     float3 n = normalize(nBtoA);
     float3 t1, t2; cdContactTangents(n, t1, t2);
     CoinContact c;
-    c.meta = uint4(a, b, (b == CD_STATIC) ? colliderIdx : feature, cdPairKey(a, b, feature));
+    c.meta = uint4(a, b, (b == CD_STATIC) ? colliderIdx : feature, cdPairKey(a, b, feature, colliderIdx));
     c.nrm  = float4(n, depth);
     c.rA   = float4(cp - xa, 0.0);
     c.rB   = float4((b == CD_STATIC) ? float3(0.0) : (cp - xb), 0.0);
@@ -2413,6 +2467,8 @@ kernel void coinGenerateContacts(
                 bool jIsDisc = !cdIsBox(cj);
                 float3 heJ = cdBodyHalfExtents(cj);
                 float3 cPos[8]; float3 cN[8]; float cDepth[8]; int cFeat[8];
+                float3 iPos[8]; float3 iN[8]; float iDep[8]; int iFeat[8];
+                int nIn = 0;                     // INSIDE corners, reduced to a manifold below
                 bool anyInside = false;
                 int nCand = 0;
                 float bestDepth = -1e30;
@@ -2422,10 +2478,19 @@ kernel void coinGenerateContacts(
                     if (jIsDisc) { float3 lp = cdQuatRotateInv(qj, pw - xj); if (length(lp.xz) > Rj) continue; }
                     if (depthB >= 0.0) {
                         anyInside = true;
-                        cdEmitContact(contacts, contactCount, maxContacts, id, j, uint(p), 0u, nB, pw, xi, xj, depthB);
+                        iPos[nIn] = pw; iN[nIn] = nB; iDep[nIn] = depthB; iFeat[nIn] = p; nIn++;
                     } else {
                         cPos[nCand] = pw; cN[nCand] = nB; cDepth[nCand] = depthB; cFeat[nCand] = p; nCand++;
                         bestDepth = max(bestDepth, depthB);
+                    }
+                }
+                if (anyInside) {                 // ≤4 spread corners hold a resting box
+                    int keepI[CD_MANIFOLD_MAX];
+                    int mI = cdReduceManifold(iPos, iDep, nIn, keepI);
+                    for (int i = 0; i < mI; ++i) {
+                        int q = keepI[i];
+                        cdEmitContact(contacts, contactCount, maxContacts, id, j, uint(iFeat[q]), 0u,
+                                      iN[q], iPos[q], xi, xj, iDep[q]);
                     }
                 }
                 if (!anyInside && nCand > 0) {
@@ -2505,10 +2570,20 @@ kernel void coinGenerateContacts(
                     if (pen > -spec) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, capP[p] - capR*n, xi, xi, pen);
                 }
             } else {
-                for (int p = 0; p < nFP; ++p) {
+                // Gather the touching feature points, then keep only a reduced manifold
+                // (a flat coin otherwise emits all 14 of its samples against one plane).
+                float3 mPos[CD_MAX_STATIC_FP]; float mDep[CD_MAX_STATIC_FP]; int mFeat[CD_MAX_STATIC_FP];
+                int nc = 0;
+                for (int p = 0; p < nFP && nc < CD_MAX_STATIC_FP; ++p) {
                     float3 pw = CD_PROBE(p);
                     float pen = d - dot(n, pw);
-                    if (pen > -spec) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, pw, xi, xi, pen);
+                    if (pen > -spec) { mPos[nc] = pw; mDep[nc] = pen; mFeat[nc] = p; nc++; }
+                }
+                int keep[CD_MANIFOLD_MAX];
+                int m = cdReduceManifold(mPos, mDep, nc, keep);
+                for (int i = 0; i < m; ++i) {
+                    int q = keep[i];
+                    cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(mFeat[q]), k, n, mPos[q], xi, xi, mDep[q]);
                 }
             }
         } else if (kind == 1u) {                         // axis-aligned box
@@ -2580,6 +2655,8 @@ kernel void coinGenerateContacts(
                 // the tolerance) using the SHARED depth + normal.
                 float4 qId = float4(0, 0, 0, 1);
                 float3 cPos[CD_MAX_STATIC_FP]; float3 cN[CD_MAX_STATIC_FP]; float cDepth[CD_MAX_STATIC_FP]; int cFeat[CD_MAX_STATIC_FP];
+                float3 iPos[CD_MAX_STATIC_FP]; float3 iN[CD_MAX_STATIC_FP]; float iDep[CD_MAX_STATIC_FP]; int iFeat[CD_MAX_STATIC_FP];
+                int nIn = 0;                     // INSIDE points, reduced to a manifold below
                 bool anyInside = false;
                 int nCand = 0;
                 float bestDepth = -1e30;
@@ -2590,10 +2667,19 @@ kernel void coinGenerateContacts(
                     if (oneWay && n.y < 0.5) continue;
                     if (push >= 0.0) {
                         anyInside = true;
-                        cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, pw, xi, xi, push);
+                        if (nIn < CD_MAX_STATIC_FP) { iPos[nIn] = pw; iN[nIn] = n; iDep[nIn] = push; iFeat[nIn] = p; nIn++; }
                     } else if (nCand < CD_MAX_STATIC_FP) {
                         cPos[nCand] = pw; cN[nCand] = n; cDepth[nCand] = push; cFeat[nCand] = p; nCand++;
                         bestDepth = max(bestDepth, push);
+                    }
+                }
+                if (anyInside) {                 // keep ≤4 spread points of the real manifold
+                    int keepI[CD_MANIFOLD_MAX];
+                    int mI = cdReduceManifold(iPos, iDep, nIn, keepI);
+                    for (int i = 0; i < mI; ++i) {
+                        int q = keepI[i];
+                        cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC,
+                                      uint(iFeat[q]), k, iN[q], iPos[q], xi, xi, iDep[q]);
                     }
                 }
                 if (!anyInside) {
@@ -2659,6 +2745,8 @@ kernel void coinGenerateContacts(
                 // Two-phase, shared-depth near-face manifold — see the kind==1u
                 // generic loop's comment.
                 float3 cPos[CD_MAX_STATIC_FP]; float3 cN[CD_MAX_STATIC_FP]; float cDepth[CD_MAX_STATIC_FP]; int cFeat[CD_MAX_STATIC_FP];
+                float3 iPos[CD_MAX_STATIC_FP]; float3 iN[CD_MAX_STATIC_FP]; float iDep[CD_MAX_STATIC_FP]; int iFeat[CD_MAX_STATIC_FP];
+                int nIn = 0;                     // INSIDE points, reduced to a manifold below
                 bool anyInside = false;
                 int nCand = 0;
                 float bestDepth = -1e30;
@@ -2668,10 +2756,19 @@ kernel void coinGenerateContacts(
                     if (!cdOrientedBoxPushSpeculative(pw, ctr, q, he, spec, n, push)) continue;
                     if (push >= 0.0) {
                         anyInside = true;
-                        cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, pw, xi, xi, push);
+                        if (nIn < CD_MAX_STATIC_FP) { iPos[nIn] = pw; iN[nIn] = n; iDep[nIn] = push; iFeat[nIn] = p; nIn++; }
                     } else if (nCand < CD_MAX_STATIC_FP) {
                         cPos[nCand] = pw; cN[nCand] = n; cDepth[nCand] = push; cFeat[nCand] = p; nCand++;
                         bestDepth = max(bestDepth, push);
+                    }
+                }
+                if (anyInside) {                 // keep ≤4 spread points of the real manifold
+                    int keepI[CD_MANIFOLD_MAX];
+                    int mI = cdReduceManifold(iPos, iDep, nIn, keepI);
+                    for (int i = 0; i < mI; ++i) {
+                        int q = keepI[i];
+                        cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC,
+                                      uint(iFeat[q]), k, iN[q], iPos[q], xi, xi, iDep[q]);
                     }
                 }
                 if (!anyInside) {
@@ -2767,30 +2864,76 @@ kernel void coinGenerateContacts(
 // converges in ~log(#contacts) rounds; a fixed round budget is encoded with no
 // per-round readback (mirrors how the legacy solver batches its iterations).
 
-// Per-body contact-list capacity. NOTE (measured, dense 176-body mixed pile): the true
-// per-body contact degree reaches 48–52 here — a die touching 6 neighbours emits up to
-// 8 corner points against each — so this list DOES truncate. A truncated list hides
-// neighbours from the colouring, which can then give two contacts of the same body the
-// same colour: those two threads read-modify-write that body's velocity in parallel.
-// Raising it (the loop below is bounded by the body's ACTUAL degree, so the cost is
-// memory, not time) needs the colour cap raised with it — degree d forces d distinct
-// colours — which is the open item in `solveColors`.
-constant uint CD_MAX_BODY_CONTACTS = 48u;
-// Colour cap — a colour has to fit the uint `usedMask` below, and every colour here has
-// to be SOLVED: CoinDEMSolver.maxColors mirrors this, and CoinDEMSolver.solveColors
-// dispatches one pass per colour in 0..<that. A dense mixed pile really does reach
-// colour 31 (measured), so the two must stay in lockstep.
-constant uint CD_MAX_COLORS        = 32u;
+// Per-body contact-list capacity. It must exceed the true per-body contact DEGREE: a
+// truncated list hides neighbours from the colouring, which then gives two contacts of
+// the same body the same colour, and those two threads read-modify-write that body's
+// velocity in parallel. Measured on the shipped 176-body mixed pile the degree peaks at
+// 13, so 64 is ~5× headroom; overflow is counted into `colorStats.listOverflow` (gated
+// by the tests) rather than silently truncating. The colouring loop is bounded by each
+// body's ACTUAL degree, so the cap costs memory (maxCoins × cap × 4 B), not time.
+constant uint CD_MAX_BODY_CONTACTS = 64u;
+// Colour cap. A body of degree d forces d distinct colours among its contacts, and a
+// contact conflicts with both its bodies' lists, so the count needed is O(degree). The
+// measured pile uses 13 colours against a peak degree of 13; 64 (the width of the
+// `ulong` usedMask below) is the headroom. Anything that doesn't fit stays uncoloured
+// and unsolved — counted into `colorStats.uncolored`, which the tests require to be 0.
+// The host does NOT dispatch all 64: greedy colouring always takes the lowest free
+// colour, so the live colours are 0…maxUsed and the solve sweeps only that many.
+constant uint CD_MAX_COLORS        = 64u;
+constant uint CD_COLOR_NONE        = 0xFFFFFFFFu;   // "not yet coloured"
 
 static uint cdHashU(uint x) {               // priority hash (deterministic, no RNG state)
     x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x;
 }
 
-// Append `cid` to one body's contact list (atomic, bounded).
+// A contact's colouring PRIORITY, hashed from its stable IDENTITY — bodyA, bodyB,
+// collider|feature, pairKey — and NOT from its buffer slot `cid`. Slots are handed out
+// by an atomic bump allocator in `cdEmitContact`, so the same physical contact lands in
+// a different slot every run; keying the priority off the slot made the colour
+// assignment (and therefore the Gauss-Seidel order, and therefore the settled pile) a
+// different lottery each run. Identity is a pure function of the geometry, so the whole
+// colouring is now reproducible. `meta` covers both cases: for a dynamic pair meta.z is
+// the feature, for a static contact meta.z is the collider and the feature rides in
+// meta.w's pairKey.
+static uint cdContactPriority(uint4 meta) {
+    return cdHashU(meta.x ^ cdHashU(meta.y ^ cdHashU(meta.z ^ cdHashU(meta.w))));
+}
+
+// Strict lexicographic order on that identity — the tie-break when two priorities hash
+// equal. Identities are unique per contact, so this is a total order (and if a duplicate
+// ever were emitted, the caller falls back to `cid` so the round can still make progress).
+static bool cdIdGreater(uint4 a, uint4 b) {
+    if (a.x != b.x) return a.x > b.x;
+    if (a.y != b.y) return a.y > b.y;
+    if (a.z != b.z) return a.z > b.z;
+    return a.w > b.w;
+}
+
+// Append `cid` to one body's contact list (atomic, bounded). An overflow is counted so
+// the truncation can't come back silently (`CoinDEMSolver.colorStats.listOverflow`).
 static void cdAppendBodyContact(device atomic_uint* bodyContactCount,
-                                device uint* bodyContacts, uint body, uint cid) {
+                                device uint* bodyContacts, uint body, uint cid,
+                                device atomic_uint* stats) {
     uint slot = atomic_fetch_add_explicit(&bodyContactCount[body], 1u, memory_order_relaxed);
     if (slot < CD_MAX_BODY_CONTACTS) bodyContacts[body * CD_MAX_BODY_CONTACTS + slot] = cid;
+    else atomic_fetch_add_explicit(&stats[0], 1u, memory_order_relaxed);
+}
+
+// Zero the contact append cursor ON THE GPU TIMELINE. This has to be a dispatch, not a
+// CPU write to the shared buffer: a frame encodes all `maxSubsteps` substeps into ONE
+// command buffer, so any CPU-side reset happens while ENCODING — i.e. before the GPU has
+// run a single substep. The counter then never reset between substeps, and each substep's
+// narrowphase APPENDED to the previous one's contacts: at 4 substeps the buffer carried
+// ~4× the live contacts, three quarters of them stale (generated from positions the pile
+// had already left), and the solve applied impulses for all of them. It also multiplied
+// the per-body contact degree by 4, and the degree is what sets the colour count — the
+// shipped mixed pile needed 48 colours (48 serialized solve passes per iteration) where
+// its true contact graph needs ~13.
+kernel void coinClearContactCount(
+    device atomic_uint* contactCount [[ buffer(0) ]],
+    uint id [[ thread_position_in_grid ]])
+{
+    if (id == 0) atomic_store_explicit(&contactCount[0], 0u, memory_order_relaxed);
 }
 
 kernel void coinClearBodyContacts(
@@ -2805,56 +2948,191 @@ kernel void coinBuildBodyContacts(
     device const atomic_uint& contactCount    [[ buffer(1) ]],
     device uint*              bodyContacts     [[ buffer(2) ]],
     device atomic_uint*       bodyContactCount [[ buffer(3) ]],
+    device atomic_uint*       stats            [[ buffer(4) ]],
     uint cid [[ thread_position_in_grid ]])
 {
     uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
     if (cid >= n) return;
     CoinContact c = contacts[cid];
-    cdAppendBodyContact(bodyContactCount, bodyContacts, c.meta.x, cid);
-    if (c.meta.y != CD_STATIC) cdAppendBodyContact(bodyContactCount, bodyContacts, c.meta.y, cid);
+    cdAppendBodyContact(bodyContactCount, bodyContacts, c.meta.x, cid, stats);
+    if (c.meta.y != CD_STATIC) cdAppendBodyContact(bodyContactCount, bodyContacts, c.meta.y, cid, stats);
 }
 
-// One colouring round. A contact colours itself iff its priority is the strict max
-// among still-uncoloured neighbours (ties → larger cid), choosing the lowest colour
-// no coloured neighbour occupies. Only local-priority-maxima write, and a writer's
-// neighbours never write the same round, so single-buffered colours are race-free.
+// Seed a colouring pass: every live contact starts uncoloured, with its priority
+// precomputed from its identity (so a round reads one uint per neighbour instead of
+// re-hashing four).
+kernel void coinColorInit(
+    device const CoinContact* contacts     [[ buffer(0) ]],
+    device const atomic_uint& contactCount [[ buffer(1) ]],
+    device uint*              priority     [[ buffer(2) ]],
+    device uint*              color        [[ buffer(3) ]],
+    uint cid [[ thread_position_in_grid ]])
+{
+    uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
+    if (cid >= n) return;
+    priority[cid] = cdContactPriority(contacts[cid].meta);
+    color[cid]    = CD_COLOR_NONE;
+}
+
+// One colouring round, as a PURE FUNCTION of the previous round: it reads every
+// neighbour's colour from `colorIn` and writes this contact's colour to `colorOut`
+// (ping-pong). The single-buffered version this replaces read colours that its
+// neighbours were writing in the same dispatch — safe (a writer's neighbours never
+// write the same round) but timing-dependent: a neighbour that happened to observe
+// this contact's fresh colour could colour itself a round earlier and land on a
+// different colour. Together with the identity-derived priority, the colouring is now
+// a function of the contact GRAPH alone, so two runs of the same scene colour it
+// identically.
+//
+// A contact colours itself iff its priority is the strict max among still-uncoloured
+// neighbours, taking the lowest colour no coloured neighbour occupies.
 kernel void coinColorRound(
-    device CoinContact*       contacts         [[ buffer(0) ]],
+    device const CoinContact* contacts         [[ buffer(0) ]],
     device const atomic_uint& contactCount     [[ buffer(1) ]],
     device const uint*        bodyContacts     [[ buffer(2) ]],
     device const uint*        bodyContactCount [[ buffer(3) ]],
+    device const uint*        priority         [[ buffer(4) ]],
+    device const uint*        colorIn          [[ buffer(5) ]],
+    device uint*              colorOut         [[ buffer(6) ]],
     uint cid [[ thread_position_in_grid ]])
 {
     uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
     if (cid >= n) return;
+    uint mine = colorIn[cid];
+    if (mine != CD_COLOR_NONE) { colorOut[cid] = mine; return; }   // already coloured
+
     CoinContact c = contacts[cid];
-    if (c.tan2.w >= 0.0) return;                 // already coloured
-    uint myPri = cdHashU(cid);
+    uint4 myId = c.meta;
+    uint myPri = priority[cid];
 
     uint bodies[2]; int nb = 0;
     bodies[nb++] = c.meta.x;
     if (c.meta.y != CD_STATIC) bodies[nb++] = c.meta.y;
 
-    uint usedMask = 0u;
+    ulong usedMask = 0ul;
     for (int bi = 0; bi < nb; ++bi) {
         uint body = bodies[bi];
         uint cnt = min(bodyContactCount[body], CD_MAX_BODY_CONTACTS);
         for (uint k = 0; k < cnt; ++k) {
             uint ncid = bodyContacts[body * CD_MAX_BODY_CONTACTS + k];
             if (ncid == cid) continue;
-            float ncolor = contacts[ncid].tan2.w;
-            if (ncolor < 0.0) {                  // uncoloured neighbour competes for this round
-                uint nPri = cdHashU(ncid);
-                if (nPri > myPri || (nPri == myPri && ncid > cid)) return;   // not our turn
-            } else {
-                uint cc = uint(ncolor);
-                if (cc < CD_MAX_COLORS) usedMask |= (1u << cc);
+            uint ncolor = colorIn[ncid];
+            if (ncolor == CD_COLOR_NONE) {       // uncoloured neighbour competes for this round
+                uint nPri = priority[ncid];
+                if (nPri > myPri) { colorOut[cid] = CD_COLOR_NONE; return; }
+                if (nPri == myPri) {             // hash tie → exact identity order
+                    uint4 nId = contacts[ncid].meta;
+                    bool greater = all(nId == myId) ? (ncid > cid) : cdIdGreater(nId, myId);
+                    if (greater) { colorOut[cid] = CD_COLOR_NONE; return; }
+                }
+            } else if (ncolor < CD_MAX_COLORS) {
+                usedMask |= (1ul << ncolor);
             }
         }
     }
     uint color = 0u;
-    while (color < CD_MAX_COLORS && (usedMask & (1u << color))) color++;
-    if (color < CD_MAX_COLORS) contacts[cid].tan2.w = float(color);   // else stays −1 (overflow; solved atomically)
+    while (color < CD_MAX_COLORS && (usedMask & (1ul << color))) color++;
+    colorOut[cid] = (color < CD_MAX_COLORS) ? color : CD_COLOR_NONE;
+}
+
+// Publish the finished colouring onto the contacts (tan2.w keeps carrying the colour for
+// every other reader) and count anything left uncoloured — with CD_MAX_COLORS clearing
+// the real per-body degree this should be zero, and
+// `CoinDEMSolver.colorStats.uncolored` fails the gate if it isn't.
+kernel void coinColorWriteback(
+    device CoinContact*       contacts     [[ buffer(0) ]],
+    device const atomic_uint& contactCount [[ buffer(1) ]],
+    device const uint*        color        [[ buffer(2) ]],
+    device atomic_uint*       stats        [[ buffer(3) ]],
+    constant uint&            dispatchedColors [[ buffer(4) ]],
+    uint cid [[ thread_position_in_grid ]])
+{
+    uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
+    if (cid >= n) return;
+    uint c = color[cid];
+    contacts[cid].tan2.w = (c == CD_COLOR_NONE) ? -1.0 : float(c);
+    if (c == CD_COLOR_NONE) { atomic_fetch_add_explicit(&stats[1], 1u, memory_order_relaxed); return; }
+    // stats[2] = highest colour ever used → the host sizes the next frame's colour sweep
+    // from it (greedy colouring always takes the lowest free colour, so colours
+    // 0…maxUsed are exactly the non-empty ones). stats[3] counts anything that fell
+    // beyond the sweep the host actually encoded — must stay 0.
+    atomic_fetch_max_explicit(&stats[2], c + 1u, memory_order_relaxed);
+    if (c >= dispatchedColors) atomic_fetch_add_explicit(&stats[3], 1u, memory_order_relaxed);
+}
+
+// ── Compaction: bucket the contacts BY COLOUR ─────────────────────────────────
+//
+// The solve used to dispatch every live contact once per colour and let 63/64 of the
+// threads return on a colour mismatch — so covering all the colours the colouring can
+// emit would have cost 64 full passes. Instead we counting-sort the contacts by colour
+// (exactly the coinCellCount / coinCellOffsetsScan / coinScatter pattern the broadphase
+// uses) into `colorContacts`, and each colour's solve dispatches ONLY its own slice.
+// Total threads per velocity iteration drops from colours×contacts to contacts.
+kernel void coinColorBucketClear(
+    device atomic_uint* colorCount [[ buffer(0) ]],
+    uint i [[ thread_position_in_grid ]])
+{
+    atomic_store_explicit(&colorCount[i], 0u, memory_order_relaxed);
+}
+
+kernel void coinColorBucketCount(
+    device const uint*        color        [[ buffer(0) ]],
+    device const atomic_uint& contactCount [[ buffer(1) ]],
+    device atomic_uint*       colorCount   [[ buffer(2) ]],
+    uint cid [[ thread_position_in_grid ]])
+{
+    uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
+    if (cid >= n) return;
+    uint c = color[cid];
+    if (c < CD_MAX_COLORS) atomic_fetch_add_explicit(&colorCount[c], 1u, memory_order_relaxed);
+}
+
+// Prefix-sum the 64 buckets and re-zero the counts so they serve as write cursors.
+kernel void coinColorBucketScan(
+    device uint* colorCount  [[ buffer(0) ]],
+    device uint* colorOffset [[ buffer(1) ]],
+    uint gid [[ thread_position_in_grid ]])
+{
+    if (gid != 0) return;
+    uint sum = 0;
+    for (uint c = 0; c < CD_MAX_COLORS; ++c) {
+        colorOffset[c] = sum;
+        sum += colorCount[c];
+        colorCount[c] = 0;                      // reused as the scatter cursor
+    }
+    colorOffset[CD_MAX_COLORS] = sum;
+}
+
+kernel void coinColorBucketScatter(
+    device const uint*        color         [[ buffer(0) ]],
+    device const atomic_uint& contactCount  [[ buffer(1) ]],
+    device atomic_uint*       colorCursor   [[ buffer(2) ]],
+    device const uint*        colorOffset   [[ buffer(3) ]],
+    device uint*              colorContacts [[ buffer(4) ]],
+    uint cid [[ thread_position_in_grid ]])
+{
+    uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
+    if (cid >= n) return;
+    uint c = color[cid];
+    if (c >= CD_MAX_COLORS) return;             // uncoloured: not solvable in a colour pass
+    uint slot = atomic_fetch_add_explicit(&colorCursor[c], 1u, memory_order_relaxed);
+    colorContacts[colorOffset[c] + slot] = cid;
+}
+
+// One indirect-dispatch argument triple per colour, sized to that colour's slice.
+// An empty colour gets 0 threadgroups, so unused colours are free.
+kernel void coinWriteColorArgs(
+    device const uint* colorOffset [[ buffer(0) ]],
+    device uint*       args        [[ buffer(1) ]],   // 4 uints per colour (16-B stride)
+    constant uint&     tgSize      [[ buffer(2) ]],
+    uint c [[ thread_position_in_grid ]])
+{
+    if (c >= CD_MAX_COLORS) return;
+    uint count = colorOffset[c + 1] - colorOffset[c];
+    args[c * 4 + 0] = (count + tgSize - 1u) / tgSize;   // threadgroupsPerGrid.x (0 when empty)
+    args[c * 4 + 1] = 1u;
+    args[c * 4 + 2] = 1u;
+    args[c * 4 + 3] = 0u;                               // padding to a 16-B stride
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -2926,23 +3204,43 @@ kernel void coinWriteSolveArgs(
     args[2] = 1u;                                             // .z
 }
 
-// Solve all contacts of one colour. `currentColor` is passed per-dispatch (setBytes).
+// Threadgroup count for a pass that iterates the LIVE contacts. Every contact-indexed
+// kernel guards `cid >= contactCount`, so the partial tail is covered; this just stops
+// them launching over the whole buffer CAPACITY (12k) when a settled pile has ~2.7k —
+// which matters most for the colouring, whose rounds are the densest pass in the solver.
+kernel void coinWriteContactArgs(
+    device const atomic_uint& contactCount [[ buffer(0) ]],
+    device uint*              args         [[ buffer(1) ]],
+    constant uint&            tgSize       [[ buffer(2) ]],
+    uint id [[ thread_position_in_grid ]])
+{
+    if (id != 0) return;
+    uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
+    args[0] = (n + tgSize - 1u) / tgSize;
+    args[1] = 1u;
+    args[2] = 1u;
+}
+
+// Solve all contacts of one colour. The dispatch is sized to this colour's slice of the
+// compacted `colorContacts` list, so every thread has real work (no colour filtering).
+// `currentColor` is passed per-dispatch (setBytes).
 kernel void coinSolveVelocityColor(
     device CoinBody*          coins        [[ buffer(0) ]],
     device float4*            bias         [[ buffer(1) ]],
     device CoinContact*       contacts     [[ buffer(2) ]],
-    device const atomic_uint& contactCount [[ buffer(3) ]],
+    device const uint*        colorContacts [[ buffer(3) ]],
     constant CoinUniforms&    u            [[ buffer(4) ]],
     constant uint&            currentColor [[ buffer(5) ]],
     device const uint*        asleep       [[ buffer(6) ]],
     device const float2*      material     [[ buffer(7) ]],   // per-body (μ, e); <0 = inherit
     device const CoinStaticCollider* colliders [[ buffer(8) ]],
-    uint cid [[ thread_position_in_grid ]])
+    device const uint*        colorOffset  [[ buffer(9) ]],
+    uint i [[ thread_position_in_grid ]])
 {
-    uint ncon = atomic_load_explicit(&contactCount, memory_order_relaxed);
-    if (cid >= ncon) return;
+    uint start = colorOffset[currentColor], end = colorOffset[currentColor + 1u];
+    if (start + i >= end) return;                // partial tail of the last threadgroup
+    uint cid = colorContacts[start + i];
     CoinContact c = contacts[cid];
-    if (c.tan2.w < 0.0 || uint(c.tan2.w) != currentColor) return;
 
     uint A = c.meta.x, B = c.meta.y;
     bool bStatic = (B == CD_STATIC);
@@ -2961,6 +3259,13 @@ kernel void coinSolveVelocityColor(
 
     float invMb = 0.0; float3 invIb = float3(0.0); float4 qb = float4(0,0,0,1);
     float3 vB = float3(0.0), wB = float3(0.0), bvB = float3(0.0), bwB = float3(0.0);
+    // A static collider is immovable but not necessarily STILL: the kinematic pusher
+    // plate carries the pile forward, so a contact against it targets the PLATE's surface
+    // velocity, not zero. With zero, the plate is just a wall the pile leans on and only
+    // the split-impulse position channel nudges bodies along — which is what the
+    // accumulated duplicate contacts used to paper over (the nudge landed once per stale
+    // copy still sitting in the buffer).
+    float3 vStatic = bStatic ? cdColliderVelocity(colliders, c.meta.z) : float3(0.0);
     CoinBody b;
     if (!bStatic) {
         b = coins[B];
@@ -2983,7 +3288,7 @@ kernel void coinSolveVelocityColor(
 
     // n points from B toward A: contact-point relative velocity (A − B).
     float3 vpA = vA + cross(wA, rA);
-    float3 vpB = bStatic ? float3(0.0) : (vB + cross(wB, rB));
+    float3 vpB = bStatic ? vStatic : (vB + cross(wB, rB));
     float3 vrel = vpA - vpB;
     float vn = dot(vrel, n);                       // <0 = closing along the normal
 
@@ -3042,7 +3347,7 @@ kernel void coinSolveVelocityColor(
                   + (bStatic ? 0.0 : dot(rbXn2, cdApplyInvInertiaWorld(qb, invIb, rbXn2)));
         float bound = mu * c.rA.w;
         // tangent 1
-        vrel = (vA + cross(wA, rA)) - (bStatic ? float3(0.0) : (vB + cross(wB, rB)));
+        vrel = (vA + cross(wA, rA)) - (bStatic ? vStatic : (vB + cross(wB, rB)));
         float jt1Old = c.rB.w;
         float jt1New = clamp(jt1Old - dot(vrel, t1) / max(kT1, 1e-8), -bound, bound);
         float3 Pt1 = (jt1New - jt1Old) * t1;
@@ -3050,7 +3355,7 @@ kernel void coinSolveVelocityColor(
         if (!bStatic) { vB -= invMb * Pt1; wB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, Pt1)); }
         c.rB.w = jt1New;
         // tangent 2
-        vrel = (vA + cross(wA, rA)) - (bStatic ? float3(0.0) : (vB + cross(wB, rB)));
+        vrel = (vA + cross(wA, rA)) - (bStatic ? vStatic : (vB + cross(wB, rB)));
         float jt2Old = c.tan1.w;
         float jt2New = clamp(jt2Old - dot(vrel, t2) / max(kT2, 1e-8), -bound, bound);
         float3 Pt2 = (jt2New - jt2Old) * t2;
@@ -3185,16 +3490,17 @@ kernel void coinWarmStartMatch(
 
 // Apply the warm-start impulses to the bodies' velocities (per colour, race-free).
 kernel void coinWarmStartApply(
-    device CoinBody*          coins        [[ buffer(0) ]],
-    device CoinContact*       contacts     [[ buffer(1) ]],
-    device const atomic_uint& contactCount [[ buffer(2) ]],
-    constant uint&            currentColor [[ buffer(3) ]],
-    uint cid [[ thread_position_in_grid ]])
+    device CoinBody*          coins         [[ buffer(0) ]],
+    device CoinContact*       contacts      [[ buffer(1) ]],
+    device const uint*        colorContacts [[ buffer(2) ]],
+    device const uint*        colorOffset   [[ buffer(4) ]],
+    constant uint&            currentColor  [[ buffer(5) ]],
+    uint i [[ thread_position_in_grid ]])
 {
-    uint ncon = atomic_load_explicit(&contactCount, memory_order_relaxed);
-    if (cid >= ncon) return;
+    uint start = colorOffset[currentColor], end = colorOffset[currentColor + 1u];
+    if (start + i >= end) return;
+    uint cid = colorContacts[start + i];
     CoinContact c = contacts[cid];
-    if (c.tan2.w < 0.0 || uint(c.tan2.w) != currentColor) return;
     float jn = c.rA.w, jt1 = c.rB.w, jt2 = c.tan1.w;
     if (jn == 0.0 && jt1 == 0.0 && jt2 == 0.0) return;
     uint A = c.meta.x, B = c.meta.y; bool bStatic = (B == CD_STATIC);

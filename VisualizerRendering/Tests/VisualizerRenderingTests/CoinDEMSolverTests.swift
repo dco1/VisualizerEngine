@@ -105,8 +105,11 @@ final class CoinDEMSolverTests: XCTestCase {
         XCTAssertGreaterThan(pairContacts, 0, "the two coins overlap → a coin↔coin contact")
     }
 
-    // ── Measure the colour count a DENSE (176-body) mixed pile actually needs, to
-    // safely size `solveColors` (contacts in colours ≥ solveColors are skipped). ─────
+    // ── Measure the colour count a DENSE (176-body) mixed pile actually needs. The
+    // colouring gives a body of degree d one colour per contact, so `CD_MAX_COLORS` has
+    // to clear the worst degree or the excess contacts stay uncoloured — and uncoloured
+    // means never solved. Every colour that IS emitted gets solved (the solve iterates
+    // all `maxColors` colours over the compacted per-colour lists). ──────────────────
     func testConstraintColorCountDense() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
         let engine = SimEngine(device: device)
@@ -136,16 +139,12 @@ final class CoinDEMSolverTests: XCTestCase {
         for i in 0..<n { let c = Int(ptr[i].tan2.w); if c < 0 { uncolored += 1 } else { maxColor = max(maxColor, c) } }
         print("DENSE_COLORS contacts=\(n) maxColor=\(maxColor) colors=\(maxColor+1) uncolored=\(uncolored)")
         XCTAssertLessThanOrEqual(maxColor + 1, CoinDEMSolver.maxColors, "colour count fits the colour cap")
-        // NOTE (measured 2026-08-02): this config settles to ~13 colours, so it fits
-        // `solveColors` (16) — but it is NOT the worst case. The shipped Pile of Mess
-        // settle (176 bodies dropped over 400 frames, 900 frames to rest — see
-        // RigidPileFieldTests) reaches colour 31, where 868 of 2742 contacts sit in
-        // colours ≥16 and are skipped by the solve every substep. That gap is documented
-        // with its A/B on `solveColors` and deliberately NOT asserted (raising the cap
-        // cost +45% GPU and changed no measured outcome). Print the count so a change in
-        // either direction is visible here.
-        print("DENSE_COLORS unsolvedByColorCap=\((0..<n).filter { Int(ptr[$0].tan2.w) >= solver.solveColors }.count)"
-            + "/\(n) (colours ≥ solveColors=\(solver.solveColors))")
+        XCTAssertEqual(uncolored, 0, "every contact is coloured, so every contact is solved")
+        // The denser shipped Pile of Mess settle reaches ~52 colours (RigidPileFieldTests);
+        // this config is the lighter sibling. Both must stay under CD_MAX_COLORS.
+        XCTAssertEqual(solver.colorStats.listOverflow, 0,
+                       "no body's contact list overflowed CD_MAX_BODY_CONTACTS (a truncated "
+                     + "adjacency lets two contacts of one body share a colour → race)")
     }
 
     // ── CONSTRAINT SOLVER Stage 2: graph colouring validity ────────────────────
@@ -342,6 +341,50 @@ final class CoinDEMSolverTests: XCTestCase {
         print("STAGE5_SLEEP after-drop asleep=\(solver.asleepCount)/41 KE=\(keFinal)")
         XCTAssertLessThan(keFinal, 0.02, "re-settles dead-still after the wake")
         XCTAssertEqual(CoinDiagnostics.measure(solver).belowFloorCount, 0, "nothing tunnelled")
+    }
+
+    // ── A frame's substeps must not ACCUMULATE contacts. ──────────────────────────
+    // A frame encodes all `maxSubsteps` substeps into one command buffer, so resetting
+    // the contact append cursor from the CPU reset it at ENCODE time — before the GPU had
+    // run any substep. Every substep then appended to the previous one's contacts: at 4
+    // substeps the buffer held ~4× the live contacts, three quarters of them generated
+    // from positions the pile had already left, and the solve applied impulses for all of
+    // them. It also multiplied the per-body contact degree by 4, and degree is what sets
+    // the colour count — the pile needed 48 colours (48 serialized solve passes per
+    // iteration) instead of 13. Fail-closed: one frame's contacts ≈ one substep's. ──────
+    func testContactsDoNotAccumulateAcrossSubsteps() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
+        let engine = SimEngine(device: device)
+        let lib = try Self.makeLibrary(device)
+        guard let solver = CoinDEMSolver(engine: engine, library: lib, maxCoins: 80,
+                                         coinRadius: 0.12, halfThickness: 0.12,
+                                         boundsMin: SIMD3(-1.1,-0.5,-1.1), boundsMax: SIMD3(1.1,2.6,1.1)),
+              let queue = device.makeCommandQueue() else { throw XCTSkip("init failed") }  // gpu-ok: test harness
+        solver.floorY = 0
+        solver.setColliders(RigidPileField.bin(innerHalf: SIMD2(0.42, 0.42), floorY: 0))
+        solver.solverMode = .constraint; solver.frictionCoeff = 0.5
+        solver.maxSubsteps = 4                                  // the shipped Pile of Mess setting
+        solver.sleepEnabled = false                             // keep the solver working
+        var seed: UInt64 = 0xACC0
+        func rnd() -> Float { seed = seed &* 6364136223846793005 &+ 1; return Float(seed >> 40) / Float(1 << 24) }
+        for i in 0..<60 {
+            let p = SIMD3<Float>((rnd()-0.5)*0.5, 0.4 + rnd()*0.9, (rnd()-0.5)*0.5)
+            let t = SIMD3<Float>((rnd()-0.5)*4, (rnd()-0.5)*4, (rnd()-0.5)*4)
+            switch i % 3 {
+            case 0: solver.spawn(at: p, tumble: t, radius: 0.075, halfThickness: 0.022, type: 0)
+            case 1: solver.spawnSphere(at: p, radius: 0.052, tumble: t, type: 1)
+            default: solver.spawnBox(at: p, halfExtents: SIMD3(0.044,0.044,0.044), tumble: t, type: 2)
+            }
+        }
+        for _ in 0..<500 { let cb = queue.makeCommandBuffer()!; solver.encode(to: cb, wallDt: 1.0/60.0); cb.commit(); cb.waitUntilCompleted() }  // gpu-ok: test harness
+
+        let afterFrame = solver.contactCount                    // left by the LAST substep
+        let oneSubstep = solver.generateContactsNow()           // the same state, one generation
+        print("SUBSTEP_ACCUM afterFrame=\(afterFrame) oneSubstep=\(oneSubstep) substeps=\(solver.maxSubsteps)")
+        XCTAssertGreaterThan(oneSubstep, 0, "the settled pile has contacts (else this proves nothing)")
+        XCTAssertLessThan(Float(afterFrame), Float(oneSubstep) * 1.5,
+                          "a frame's contact buffer holds ONE substep's contacts, not all "
+                        + "\(solver.maxSubsteps) substeps' — the cursor must be reset on the GPU timeline")
     }
 
     // ── A FROZEN body reports ZERO velocity. ───────────────────────────────────────

@@ -280,12 +280,39 @@ public final class CoinDEMSolver: PenetrationProbing {
     private let islandMinPipeline:  MTLComputePipelineState
     private let sleepMarkPipeline:  MTLComputePipelineState
     private let gjkEPAPipeline:     MTLComputePipelineState
-    private let writeSolveArgsPipeline: MTLComputePipelineState
+    private let colorInitPipeline:  MTLComputePipelineState
+    private let clearContactCountPipeline: MTLComputePipelineState
+    private let colorWritebackPipeline: MTLComputePipelineState
+    private let bucketClearPipeline: MTLComputePipelineState
+    private let bucketCountPipeline: MTLComputePipelineState
+    private let bucketScanPipeline:  MTLComputePipelineState
+    private let bucketScatterPipeline: MTLComputePipelineState
+    private let writeColorArgsPipeline: MTLComputePipelineState
+    private let writeContactArgsPipeline: MTLComputePipelineState
     private let jointSolveCSPipeline: MTLComputePipelineState
     private let islandUnionJointsPipeline: MTLComputePipelineState
-    private let solveArgsBuffer: MTLBuffer         // MTLDispatchThreadgroupsIndirectArguments (3×UInt32)
+    /// One MTLDispatchThreadgroupsIndirectArguments per colour, 16-byte stride (the GPU
+    /// sizes each colour's solve to that colour's slice; an empty colour gets 0 groups).
+    private let solveArgsBuffer: MTLBuffer         // 4×UInt32 × maxColors
     private let solveTGSizeBuffer: MTLBuffer       // 1×UInt32 (threadgroup size for the indirect sizing)
     private static let solveTGSize = 64
+    // ── Colouring working set (constraint path) ───────────────────────────────
+    private let contactPriorityBuffer: MTLBuffer   // UInt32[maxContacts] — identity-hashed priority
+    private let colorBuffers: [MTLBuffer]          // 2 × UInt32[maxContacts] — ping-pong colours
+    private let colorCountBuffer: MTLBuffer        // UInt32[maxColors] (count, then scatter cursor)
+    private let colorOffsetBuffer: MTLBuffer       // UInt32[maxColors + 1] — bucket starts
+    private let colorContactsBuffer: MTLBuffer     // UInt32[maxContacts] — contacts sorted by colour
+    private let colorStatsBuffer: MTLBuffer        // UInt32[4]: overflow / uncoloured / maxColourUsed / beyondSweep
+    /// How many colours the solve sweep encodes. The colouring takes the lowest free
+    /// colour, so the live colours are 0…maxUsed with nothing above; dispatching all
+    /// `maxColors` would pay ~50 empty dispatch bubbles per velocity iteration. Sized
+    /// from the highest colour the GPU has reported so far (`colorStats.maxColorUsed`)
+    /// plus headroom, and starts at the cap so the first frames can't under-dispatch.
+    private var colorSweep = CoinDEMSolver.maxColors
+    /// Spare colours dispatched beyond the worst seen, so a moment of denser packing
+    /// (which needs one colour per extra contact on the busiest body) is already covered.
+    private static let colorSweepHeadroom = 8
+    private let contactArgsBuffer: MTLBuffer       // threadgroup count for contact-sized passes
 
     // ── Storage ───────────────────────────────────────────────────────────────
     public let coinBuffer: SimBuffer<CoinBody>     // shared — CPU reads for cull
@@ -325,7 +352,9 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// substep so the colouring pass can find a contact's neighbours cheaply.
     private let bodyContactsBuffer: MTLBuffer      // maxCoins × CD_MAX_BODY_CONTACTS UInt32
     private let bodyContactCountBuffer: MTLBuffer  // maxCoins UInt32
-    private static let maxBodyContacts = 48
+    /// Mirrors `CD_MAX_BODY_CONTACTS` in CoinDEM.metal — must exceed the true per-body
+    /// contact degree or the colouring races (see the shader comment).
+    private static let maxBodyContacts = 64
     /// Per-body split-impulse BIAS (pseudo) velocity: 2 × float4 per body
     /// (linear, angular). Cleared each substep; moves position then is discarded.
     private let biasBuffer: MTLBuffer              // maxCoins × 2 × SIMD4<Float>
@@ -470,33 +499,12 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// beyond one cell are never even found).
     public var speculativeMargin: Float = 0.0
     /// The colouring's colour cap — mirrors `CD_MAX_COLORS` in CoinDEM.metal, which is
-    /// the source of truth (a contact's colour is stored in a 32-bit `usedMask`).
-    public static let maxColors = 32
+    /// the source of truth (a colour has to fit the shader's `ulong` usedMask). It must
+    /// clear the max per-body contact degree, since a body of degree d forces d distinct
+    /// colours among its contacts; the shipped dense mixed pile peaks at 13. Only the
+    /// colours actually in use are dispatched — see `colorSweep`.
+    public static let maxColors = 64
 
-    /// Colour passes per velocity iteration. **A contact whose colour is ≥ this is not
-    /// solved this substep at all** — `coinSolveVelocityColor` is dispatched once per
-    /// colour in `0..<solveColors` and returns immediately for any other colour, and the
-    /// contact buffer is regenerated and re-coloured from scratch next substep, so a
-    /// dropped contact doesn't "wait its turn", it re-enters the same lottery.
-    ///
-    /// KNOWN GAP, measured 2026-08-02 — this is 16 while the colouring emits colours up
-    /// to 31, so on the shipped Pile of Mess config (176 mixed bodies, bin 0.55) at the
-    /// settled frame 868 of 2742 contacts (32%) sat in colours 16…31 and were skipped,
-    /// on top of 331 (12%) left uncoloured (see `colorRounds`): 44% of the pile's
-    /// contacts unsolved per substep, and a different 44% every substep because contact
-    /// slots come from an atomic bump allocator (`cdEmitContact`).
-    ///
-    /// NOT raised, deliberately: setting it to `maxColors` (32) was measured against this
-    /// scene and changed nothing observable — settle frame ~300 either way, and the rest-KE
-    /// distribution over 24 runs was statistically identical (17/24 vs 18/24 dead-still,
-    /// same tail) — while costing ~4.7 ms → ~6.9 ms of GPU sim per frame (+45%), because
-    /// each colour pass launches every live contact and filters by colour, so ~31/32 of
-    /// the threads return immediately. The randomised-subset Gauss-Seidel converges this
-    /// loose heap regardless. Worth revisiting for TALL stacks (where every contact in a
-    /// column matters) and cheap to do properly: compacting contacts into per-colour lists
-    /// (a counting sort by colour, the pattern `coinCellCount`/`coinScatter` already uses)
-    /// would make all 32 colours cost LESS than today's 16.
-    public var solveColors: Int = 16
     /// Warm starting: carry each contact's converged impulse across substeps so a
     /// resting stack resumes from its solution instead of re-solving from zero.
     /// OPT-IN (default off): it's the biggest convergence win for TALL single-column
@@ -554,12 +562,15 @@ public final class CoinDEMSolver: PenetrationProbing {
         let measure: MTLComputePipelineState   // coinMeasurePenetration (diagnostic)
         let generate: MTLComputePipelineState  // coinGenerateContacts (constraint solver)
         let clearBody, buildBody, colorRound: MTLComputePipelineState   // graph colouring
+        let colorInit, colorWriteback: MTLComputePipelineState           // ping-pong colouring
+        let clearContactCount: MTLComputePipelineState
+        let bucketClear, bucketCount, bucketScan, bucketScatter: MTLComputePipelineState  // colour compaction
+        let writeColorArgs, writeContactArgs: MTLComputePipelineState
         let intVelCS, solveVelCS, intPosCS, finalizeCS: MTLComputePipelineState  // sequential impulse
         let clearHash, snapshot, warmMatch, warmApply: MTLComputePipelineState   // warm starting
         let islandInit, islandUnion, islandJump: MTLComputePipelineState          // island sleeping
         let sleepTick, islandMinReduce, sleepMark: MTLComputePipelineState
         let gjkEPA: MTLComputePipelineState                                        // GJK/EPA probe
-        let writeSolveArgs: MTLComputePipelineState                                // indirect-dispatch sizing
         let jointSolveCS, islandUnionJoints: MTLComputePipelineState               // generic joints
     }
 
@@ -598,18 +609,29 @@ public final class CoinDEMSolver: PenetrationProbing {
             let p28 = resolve("coinIslandMinReduce"),
             let p29 = resolve("coinSleepMark"),
             let p30 = resolve("coinGJKEPAProbe"),
-            let p31 = resolve("coinWriteSolveArgs"),
+            let p31 = resolve("coinWriteColorArgs"),
+            let p34 = resolve("coinColorInit"),
+            let p35 = resolve("coinColorWriteback"),
+            let p36 = resolve("coinColorBucketClear"),
+            let p37 = resolve("coinColorBucketCount"),
+            let p38 = resolve("coinColorBucketScan"),
+            let p39 = resolve("coinColorBucketScatter"),
+            let p40 = resolve("coinWriteContactArgs"),
+            let p41 = resolve("coinClearContactCount"),
             let p32 = resolve("coinJointSolveCS"),
             let p33 = resolve("coinIslandUnionJoints")
         else { return nil }
         return Pipelines(integrate: p0, cellClear: p1, cellCount: p2, scan: p3, scatter: p4,
                          contact: p5, apply: p6, finalize: p7, orient: p8, transform: p9, joint: p10,
                          measure: p11, generate: p12, clearBody: p13, buildBody: p14, colorRound: p15,
+                         colorInit: p34, colorWriteback: p35, clearContactCount: p41,
+                         bucketClear: p36, bucketCount: p37, bucketScan: p38, bucketScatter: p39,
+                         writeColorArgs: p31, writeContactArgs: p40,
                          intVelCS: p16, solveVelCS: p17, intPosCS: p18, finalizeCS: p19,
                          clearHash: p20, snapshot: p21, warmMatch: p22, warmApply: p23,
                          islandInit: p24, islandUnion: p25, islandJump: p26,
                          sleepTick: p27, islandMinReduce: p28, sleepMark: p29, gjkEPA: p30,
-                         writeSolveArgs: p31, jointSolveCS: p32, islandUnionJoints: p33)
+                         jointSolveCS: p32, islandUnionJoints: p33)
     }
 
     /// Production init: pipelines come from the engine's memoised cache (the
@@ -664,7 +686,7 @@ public final class CoinDEMSolver: PenetrationProbing {
         let p22 = pipelines.warmMatch, p23 = pipelines.warmApply
         let p24 = pipelines.islandInit, p25 = pipelines.islandUnion, p26 = pipelines.islandJump
         let p27 = pipelines.sleepTick, p28 = pipelines.islandMinReduce, p29 = pipelines.sleepMark
-        let p30 = pipelines.gjkEPA, p31 = pipelines.writeSolveArgs
+        let p30 = pipelines.gjkEPA, p31 = pipelines.writeColorArgs
         let p32 = pipelines.jointSolveCS, p33 = pipelines.islandUnionJoints
 
         // Grid: one cell ≈ one contact diameter so a 3×3×3 scan covers every
@@ -732,7 +754,24 @@ public final class CoinDEMSolver: PenetrationProbing {
             let islandMin = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * maxCoins, options: .storageModePrivate),
             let sleepTimer = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * maxCoins, options: .storageModeShared),
             let asleep = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * maxCoins, options: .storageModeShared),
-            let solveArgs = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * 4, options: .storageModePrivate),
+            let solveArgs = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * 4 * CoinDEMSolver.maxColors,
+                                           options: .storageModePrivate),
+            let contactPriority = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * contactCap,
+                                                 options: .storageModePrivate),
+            let colorA = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * contactCap,
+                                        options: .storageModePrivate),
+            let colorB = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * contactCap,
+                                        options: .storageModePrivate),
+            let colorCount = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * CoinDEMSolver.maxColors,
+                                            options: .storageModePrivate),
+            let colorOffset = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * (CoinDEMSolver.maxColors + 1),
+                                             options: .storageModePrivate),
+            let colorContacts = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * contactCap,
+                                               options: .storageModePrivate),
+            let colorStats = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * 4,
+                                            options: .storageModeShared),
+            let contactArgs = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * 4,
+                                             options: .storageModePrivate),
             let solveTG = dev.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared),
             let jointsBuf = dev.makeBuffer(length: MemoryLayout<CoinJoint>.stride * CoinDEMSolver.maxJoints,
                                            options: .storageModeShared),
@@ -785,7 +824,15 @@ public final class CoinDEMSolver: PenetrationProbing {
         self.islandMinPipeline = p28
         self.sleepMarkPipeline = p29
         self.gjkEPAPipeline = p30
-        self.writeSolveArgsPipeline = p31
+        self.writeColorArgsPipeline = p31
+        self.writeContactArgsPipeline = pipelines.writeContactArgs
+        self.colorInitPipeline = pipelines.colorInit
+        self.clearContactCountPipeline = pipelines.clearContactCount
+        self.colorWritebackPipeline = pipelines.colorWriteback
+        self.bucketClearPipeline = pipelines.bucketClear
+        self.bucketCountPipeline = pipelines.bucketCount
+        self.bucketScanPipeline = pipelines.bucketScan
+        self.bucketScatterPipeline = pipelines.bucketScatter
         self.jointSolveCSPipeline = p32
         self.islandUnionJointsPipeline = p33
         self.coinBuffer = coins
@@ -830,6 +877,14 @@ public final class CoinDEMSolver: PenetrationProbing {
         self.asleepBuffer = asleep
         solveArgs.label = "Coin.solveArgs"
         self.solveArgsBuffer = solveArgs
+        self.contactPriorityBuffer = contactPriority
+        self.colorBuffers = [colorA, colorB]
+        self.colorCountBuffer = colorCount
+        self.colorOffsetBuffer = colorOffset
+        self.colorContactsBuffer = colorContacts
+        self.colorStatsBuffer = colorStats
+        self.contactArgsBuffer = contactArgs
+        colorStats.contents().bindMemory(to: UInt32.self, capacity: 4).update(repeating: 0, count: 4)
         self.solveTGSizeBuffer = solveTG
         jointsBuf.label = "Coin.joints"
         self.jointBuffer = jointsBuf
@@ -1492,6 +1547,14 @@ public final class CoinDEMSolver: PenetrationProbing {
         }
         didSkipLastFrame = false
 
+        // Re-size the colour sweep from what the GPU has actually needed so far (read of
+        // a shared buffer written by completed frames — no stall, and no under-dispatch:
+        // it only ever grows, and `colorStats.beyondSweep` is fail-closed if it did).
+        if solverMode == .constraint {
+            let used = Int(colorStatsBuffer.contents().bindMemory(to: UInt32.self, capacity: 4)[2])
+            if used > 0 { colorSweep = min(Self.maxColors, used + Self.colorSweepHeadroom) }
+        }
+
         // Spiral-of-death guard: bank at most one frame's worth of substeps. Without
         // this, a hitch (GC pause, window drag, sleep/wake) inflates the accumulator
         // past maxSubsteps·fixedDt; every following frame then runs the full substep
@@ -1603,10 +1666,14 @@ public final class CoinDEMSolver: PenetrationProbing {
     // finalize. No position-to-velocity feedback, so a settled pile carries zero
     // restoring velocity and goes still regardless of density.
     private func encodeConstraintSubstep(_ cb: MTLCommandBuffer, coinCount: Int) {
-        // One solve pass per colour. A contact whose colour this loop never visits is
-        // dropped from the solve entirely — `solveColors` (16) is deliberately below the
-        // colouring's 32-colour cap; the measured trade-off is documented there.
-        let colors = min(solveColors, Self.maxColors)
+        // Every colour the colouring can emit is solved. Each colour's dispatch is sized
+        // by the GPU to that colour's slice of the compacted contact list, so an empty
+        // colour costs one 0-threadgroup dispatch and the total thread count per velocity
+        // iteration is the contact count — not colours × contacts.
+        // Size this substep's colour sweep from the worst colour count the GPU has
+        // reported (plus headroom for a denser moment). `colorStats.beyondSweep` is the
+        // fail-closed counter if this is ever too small.
+        let colors = colorSweep
         dispatch(cb, intVelCSPipeline, threads: coinCount, label: "Coin.cs.intVel") { enc in
             enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
             enc.setBuffer(self.biasBuffer, offset: 0, index: 1)
@@ -1615,13 +1682,6 @@ public final class CoinDEMSolver: PenetrationProbing {
         }
         encodeBroadphase(cb, coinCount: coinCount)
         encodeGenerateContacts(cb, coinCount: coinCount)
-        // Size the indirect dispatch to the ACTUAL contact count (≈600 in a settled
-        // 176-pile vs ~12k capacity → ~19× fewer GPU threads launched per solve pass).
-        dispatch(cb, writeSolveArgsPipeline, threads: 1, label: "Coin.cs.solveArgs") { enc in
-            enc.setBuffer(self.contactCountBuffer, offset: 0, index: 0)
-            enc.setBuffer(self.solveArgsBuffer, offset: 0, index: 1)
-            enc.setBuffer(self.solveTGSizeBuffer, offset: 0, index: 2)
-        }
         encodeColoring(cb)
         // Warm start: seed fresh contacts with last substep's converged impulses and
         // apply them before iterating (a resting stack resumes from its solution).
@@ -1632,37 +1692,31 @@ public final class CoinDEMSolver: PenetrationProbing {
                 }
                 needsHashClear = false
             }
-            dispatch(cb, warmMatchPipeline, threads: maxContacts, label: "Coin.cs.warmMatch") { enc in
+            dispatchOverContacts(cb, warmMatchPipeline, label: "Coin.cs.warmMatch") { enc in
                 enc.setBuffer(self.contactBuffer, offset: 0, index: 0)
                 enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
                 enc.setBuffer(self.prevContactBuffer, offset: 0, index: 2)
                 enc.setBuffer(self.pairHashBuffer, offset: 0, index: 3)
                 enc.setBuffer(self.hashSizeBuffer, offset: 0, index: 4)
             }
-            for color in 0..<colors {
-                var cc = UInt32(color)
-                dispatchIndirect(cb, warmApplyPipeline, label: "Coin.cs.warmApply") { enc in
-                    enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
-                    enc.setBuffer(self.contactBuffer, offset: 0, index: 1)
-                    enc.setBuffer(self.contactCountBuffer, offset: 0, index: 2)
-                    enc.setBytes(&cc, length: MemoryLayout<UInt32>.size, index: 3)   // coinWarmStartApply doesn't read u; the old uniform@3 bind was unused (aborts under Metal API validation)
-                }
+            dispatchPerColor(cb, warmApplyPipeline, colors: colors, label: "Coin.cs.warmApply") { enc in
+                enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
+                enc.setBuffer(self.contactBuffer, offset: 0, index: 1)
+                enc.setBuffer(self.colorContactsBuffer, offset: 0, index: 2)
+                enc.setBuffer(self.colorOffsetBuffer, offset: 0, index: 4)
             }
         }
         for _ in 0..<velocityIterations {
-            for color in 0..<colors {
-                var cc = UInt32(color)
-                dispatchIndirect(cb, solveVelCSPipeline, label: "Coin.cs.solve") { enc in
-                    enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
-                    enc.setBuffer(self.biasBuffer, offset: 0, index: 1)
-                    enc.setBuffer(self.contactBuffer, offset: 0, index: 2)
-                    enc.setBuffer(self.contactCountBuffer, offset: 0, index: 3)
-                    enc.setBuffer(self.uniformBuffer, offset: 0, index: 4)
-                    enc.setBytes(&cc, length: MemoryLayout<UInt32>.size, index: 5)
-                    enc.setBuffer(self.asleepBuffer, offset: 0, index: 6)
-                    enc.setBuffer(self.materialBuffer, offset: 0, index: 7)
-                    enc.setBuffer(self.colliderBuffer.buffer, offset: 0, index: 8)
-                }
+            dispatchPerColor(cb, solveVelCSPipeline, colors: colors, label: "Coin.cs.solve") { enc in
+                enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
+                enc.setBuffer(self.biasBuffer, offset: 0, index: 1)
+                enc.setBuffer(self.contactBuffer, offset: 0, index: 2)
+                enc.setBuffer(self.colorContactsBuffer, offset: 0, index: 3)
+                enc.setBuffer(self.uniformBuffer, offset: 0, index: 4)
+                enc.setBuffer(self.asleepBuffer, offset: 0, index: 6)
+                enc.setBuffer(self.materialBuffer, offset: 0, index: 7)
+                enc.setBuffer(self.colliderBuffer.buffer, offset: 0, index: 8)
+                enc.setBuffer(self.colorOffsetBuffer, offset: 0, index: 9)
             }
             // Generic joints: one serial Gauss-Seidel pass over all joints per
             // velocity iteration, interleaved with the contact colours so joints
@@ -1685,7 +1739,7 @@ public final class CoinDEMSolver: PenetrationProbing {
             dispatch(cb, clearHashPipeline, threads: hashSize, label: "Coin.cs.clearHash") { enc in
                 enc.setBuffer(self.pairHashBuffer, offset: 0, index: 0)
             }
-            dispatch(cb, snapshotPipeline, threads: maxContacts, label: "Coin.cs.snapshot") { enc in
+            dispatchOverContacts(cb, snapshotPipeline, label: "Coin.cs.snapshot") { enc in
                 enc.setBuffer(self.contactBuffer, offset: 0, index: 0)
                 enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
                 enc.setBuffer(self.prevContactBuffer, offset: 0, index: 2)
@@ -1880,7 +1934,12 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// Encode contact generation: zero the append cursor (CPU, shared), then append
     /// all contacts from the broadphase (must already be built this command buffer).
     private func encodeGenerateContacts(_ cb: MTLCommandBuffer, coinCount: Int) {
-        contactCountBuffer.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = 0
+        // Reset the append cursor as a DISPATCH — a CPU write would land at encode time,
+        // before any substep has run, leaving every later substep appending to the
+        // previous one's contacts (see coinClearContactCount).
+        dispatch(cb, clearContactCountPipeline, threads: 1, label: "Coin.cs.clearContactCount") { enc in
+            enc.setBuffer(self.contactCountBuffer, offset: 0, index: 0)
+        }
         var jc = UInt32(jointHighWater)
         dispatch(cb, generatePipeline, threads: coinCount, label: "Coin.cs.generate") { enc in
             enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
@@ -1928,35 +1987,113 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// random priority colours ~half the frontier per round, so ~log₂(#contacts)
     /// rounds suffice; 24 is generous headroom for a dense pile.
     ///
-    /// Contacts left over stay colour −1 and are **not solved** (there is no later
-    /// atomic stage — an older comment here claimed one). Measured on the shipped Pile
-    /// of Mess config at the settled frame: 116 of 2518 (4.6%). Raising this does NOT
-    /// help — at 64 rounds the leftover is unchanged, because they are colour-EXHAUSTION,
-    /// not round-budget: a body whose degree exceeds `maxColors` cannot have all of its
-    /// contacts in distinct colours by definition (see `CD_MAX_COLORS` in CoinDEM.metal).
+    /// Contacts left over stay colour −1 and are **not solved** — there is no later
+    /// atomic stage (an older comment here claimed one), so the budget has to be enough.
+    /// Measured on the shipped Pile of Mess config: 24 rounds leaves 0 uncoloured across
+    /// a 900-frame settle, 16 rounds leaves a handful per frame. `colorStats.uncolored`
+    /// is the fail-closed counter — a scene needing more shows up there as a number.
     public var colorRounds: Int = 24
 
     /// Encode the graph colouring of the current contact buffer: build per-body
     /// contact lists, then run `colorRounds` Jones-Plassmann rounds — all in `cb`,
     /// no per-round readback. Assumes contacts were generated this command buffer.
     private func encodeColoring(_ cb: MTLCommandBuffer) {
+        dispatch(cb, writeContactArgsPipeline, threads: 1, label: "Coin.cs.contactArgs") { enc in
+            enc.setBuffer(self.contactCountBuffer, offset: 0, index: 0)
+            enc.setBuffer(self.contactArgsBuffer, offset: 0, index: 1)
+            enc.setBuffer(self.solveTGSizeBuffer, offset: 0, index: 2)
+        }
         dispatch(cb, clearBodyPipeline, threads: maxCoins, label: "Coin.cs.clearBody") { enc in
             enc.setBuffer(self.bodyContactCountBuffer, offset: 0, index: 0)
         }
-        dispatch(cb, buildBodyPipeline, threads: maxContacts, label: "Coin.cs.buildBody") { enc in
+        dispatchOverContacts(cb, buildBodyPipeline, label: "Coin.cs.buildBody") { enc in
             enc.setBuffer(self.contactBuffer, offset: 0, index: 0)
             enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
             enc.setBuffer(self.bodyContactsBuffer, offset: 0, index: 2)
             enc.setBuffer(self.bodyContactCountBuffer, offset: 0, index: 3)
+            enc.setBuffer(self.colorStatsBuffer, offset: 0, index: 4)
         }
-        for _ in 0..<colorRounds {
-            dispatch(cb, colorRoundPipeline, threads: maxContacts, label: "Coin.cs.color") { enc in
-                enc.setBuffer(self.contactBuffer, offset: 0, index: 0)
-                enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
-                enc.setBuffer(self.bodyContactsBuffer, offset: 0, index: 2)
-                enc.setBuffer(self.bodyContactCountBuffer, offset: 0, index: 3)
+        dispatchOverContacts(cb, colorInitPipeline, label: "Coin.cs.colorInit") { enc in
+            enc.setBuffer(self.contactBuffer, offset: 0, index: 0)
+            enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
+            enc.setBuffer(self.contactPriorityBuffer, offset: 0, index: 2)
+            enc.setBuffer(self.colorBuffers[0], offset: 0, index: 3)
+        }
+        // Ping-pong the rounds: each reads the previous round's colours and writes the
+        // next, so a round is a pure function and the colouring can't depend on which
+        // neighbour's write landed first (see coinColorRound). All rounds ride ONE serial
+        // encoder — Metal orders dispatches within a compute encoder, so this is the same
+        // barrier semantics as an encoder each, minus ~`colorRounds` encoder setups.
+        var src = 0
+        if let enc = cb.makeComputeCommandEncoder() {
+            enc.label = "Coin.cs.color"
+            enc.setComputePipelineState(colorRoundPipeline)
+            enc.setBuffer(contactBuffer, offset: 0, index: 0)
+            enc.setBuffer(contactCountBuffer, offset: 0, index: 1)
+            enc.setBuffer(bodyContactsBuffer, offset: 0, index: 2)
+            enc.setBuffer(bodyContactCountBuffer, offset: 0, index: 3)
+            enc.setBuffer(contactPriorityBuffer, offset: 0, index: 4)
+            let tg = MTLSize(width: Self.solveTGSize, height: 1, depth: 1)
+            for _ in 0..<colorRounds {
+                enc.setBuffer(colorBuffers[src], offset: 0, index: 5)
+                enc.setBuffer(colorBuffers[1 - src], offset: 0, index: 6)
+                enc.dispatchThreadgroups(indirectBuffer: contactArgsBuffer, indirectBufferOffset: 0,
+                                         threadsPerThreadgroup: tg)
+                src = 1 - src
             }
+            enc.endEncoding()
         }
+        let final = colorBuffers[src]
+        var sweep = UInt32(colorSweep)
+        dispatchOverContacts(cb, colorWritebackPipeline, label: "Coin.cs.colorWriteback") { enc in
+            enc.setBuffer(self.contactBuffer, offset: 0, index: 0)
+            enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
+            enc.setBuffer(final, offset: 0, index: 2)
+            enc.setBuffer(self.colorStatsBuffer, offset: 0, index: 3)
+            enc.setBytes(&sweep, length: MemoryLayout<UInt32>.size, index: 4)
+        }
+        // Counting-sort the contacts by colour so each colour's solve dispatches only its
+        // own slice (coinCellCount/coinCellOffsetsScan/coinScatter, one level up).
+        dispatch(cb, bucketClearPipeline, threads: Self.maxColors, label: "Coin.cs.bucketClear") { enc in
+            enc.setBuffer(self.colorCountBuffer, offset: 0, index: 0)
+        }
+        dispatchOverContacts(cb, bucketCountPipeline, label: "Coin.cs.bucketCount") { enc in
+            enc.setBuffer(final, offset: 0, index: 0)
+            enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
+            enc.setBuffer(self.colorCountBuffer, offset: 0, index: 2)
+        }
+        dispatch(cb, bucketScanPipeline, threads: 1, label: "Coin.cs.bucketScan") { enc in
+            enc.setBuffer(self.colorCountBuffer, offset: 0, index: 0)
+            enc.setBuffer(self.colorOffsetBuffer, offset: 0, index: 1)
+        }
+        dispatchOverContacts(cb, bucketScatterPipeline, label: "Coin.cs.bucketScatter") { enc in
+            enc.setBuffer(final, offset: 0, index: 0)
+            enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
+            enc.setBuffer(self.colorCountBuffer, offset: 0, index: 2)   // zeroed by the scan → cursor
+            enc.setBuffer(self.colorOffsetBuffer, offset: 0, index: 3)
+            enc.setBuffer(self.colorContactsBuffer, offset: 0, index: 4)
+        }
+        dispatch(cb, writeColorArgsPipeline, threads: Self.maxColors, label: "Coin.cs.colorArgs") { enc in
+            enc.setBuffer(self.colorOffsetBuffer, offset: 0, index: 0)
+            enc.setBuffer(self.solveArgsBuffer, offset: 0, index: 1)
+            enc.setBuffer(self.solveTGSizeBuffer, offset: 0, index: 2)
+        }
+    }
+
+    /// Adjacency/colouring overflow counters, accumulated since the last `resetColorStats()`.
+    /// Both MUST stay 0: a body whose contact list overflowed is missing neighbours from
+    /// the colouring (two of its contacts can then share a colour and race), and an
+    /// uncoloured contact is never solved. Gated by CoinDEMSolverTests.
+    public var colorStats: (listOverflow: Int, uncolored: Int, maxColorUsed: Int, beyondSweep: Int) {
+        let p = colorStatsBuffer.contents().bindMemory(to: UInt32.self, capacity: 4)
+        return (Int(p[0]), Int(p[1]), Int(p[2]), Int(p[3]))
+    }
+
+    /// Zero the counters (they accumulate over frames). Also re-arms the colour sweep at
+    /// the cap, since its sizing is derived from `maxColorUsed`.
+    public func resetColorStats() {
+        colorStatsBuffer.contents().bindMemory(to: UInt32.self, capacity: 4).update(repeating: 0, count: 4)
+        colorSweep = Self.maxColors
     }
 
     /// One-shot: build the broadphase + generate contacts (and optionally colour them)
@@ -2011,17 +2148,41 @@ public final class CoinDEMSolver: PenetrationProbing {
         enc.endEncoding()
     }
 
-    /// Dispatch a contact-iterating kernel over only the ACTUAL contacts (the GPU wrote
-    /// the threadgroup count into `solveArgsBuffer` this substep) instead of the buffer
-    /// capacity — the kernel's `cid >= contactCount` guard covers the partial tail.
-    private func dispatchIndirect(_ cb: MTLCommandBuffer, _ pipeline: MTLComputePipelineState,
-                                  label: String, _ bind: (MTLComputeCommandEncoder) -> Void) {
+    /// Dispatch a contact-indexed kernel over the LIVE contacts (threadgroup count
+    /// written by `coinWriteContactArgs`) rather than the buffer capacity — a settled
+    /// 176-body pile has ~2.7k contacts against a 12k capacity, and the colouring runs
+    /// `colorRounds` passes over them.
+    private func dispatchOverContacts(_ cb: MTLCommandBuffer, _ pipeline: MTLComputePipelineState,
+                                      label: String, _ bind: (MTLComputeCommandEncoder) -> Void) {
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         enc.label = label
         enc.setComputePipelineState(pipeline)
         bind(enc)
-        enc.dispatchThreadgroups(indirectBuffer: solveArgsBuffer, indirectBufferOffset: 0,
+        enc.dispatchThreadgroups(indirectBuffer: contactArgsBuffer, indirectBufferOffset: 0,
                                  threadsPerThreadgroup: MTLSize(width: Self.solveTGSize, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    /// Dispatch one colour-slice kernel per colour, all on ONE serial compute encoder.
+    /// Each colour's threadgroup count was written by `coinWriteColorArgs` (16-byte
+    /// stride), sized to that colour's slice of `colorContacts` — so an empty colour
+    /// costs a 0-threadgroup dispatch, and the whole sweep costs one encoder instead of
+    /// `maxColors` of them. Metal executes dispatches in a compute encoder in order, so
+    /// the colour-to-colour Gauss-Seidel dependency is preserved.
+    private func dispatchPerColor(_ cb: MTLCommandBuffer, _ pipeline: MTLComputePipelineState,
+                                  colors: Int, label: String,
+                                  _ bind: (MTLComputeCommandEncoder) -> Void) {
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.label = label
+        enc.setComputePipelineState(pipeline)
+        bind(enc)
+        let tg = MTLSize(width: Self.solveTGSize, height: 1, depth: 1)
+        for color in 0..<colors {
+            var cc = UInt32(color)
+            enc.setBytes(&cc, length: MemoryLayout<UInt32>.size, index: 5)
+            enc.dispatchThreadgroups(indirectBuffer: solveArgsBuffer,
+                                     indirectBufferOffset: color * 16, threadsPerThreadgroup: tg)
+        }
         enc.endEncoding()
     }
 }
