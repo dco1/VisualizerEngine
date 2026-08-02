@@ -6929,12 +6929,24 @@ public final class IlluminatoramaRenderer {
 
     // ── Render ────────────────────────────────────────────────────────────────
 
-    /// - Parameter blocking: when true (headless snapshot export path only),
-    ///   WAIT for an in-flight slot instead of dropping the frame. The
-    ///   interactive tick passes `false` so a back-pressured GPU drops the tick
-    ///   rather than stalling the main thread; the snapshot path passes `true`
-    ///   because a dropped export render leaves `outputTexture` on a stale /
-    ///   never-rendered pool buffer → captured as magenta (no `cb.error`).
+    /// - Parameter blocking: the CAPTURE contract — `true` is the headless snapshot /
+    ///   export path, `false` the interactive tick.
+    ///
+    ///   `false` pipelines. A back-pressured GPU DROPS the tick rather than stalling the
+    ///   main thread, and the frame this call commits is not the one `outputTexture`
+    ///   holds on return — the pool promotes it on the NEXT tick. That is correct for a
+    ///   display loop, which only ever wants the freshest fully-rendered buffer.
+    ///
+    ///   `true` (a) waits for an in-flight slot instead of dropping, because a dropped
+    ///   export render leaves `outputTexture` on a stale / never-rendered pool buffer →
+    ///   captured as magenta (no `cb.error`); and (b) waits for THIS frame on the GPU and
+    ///   promotes it before returning, so `outputTexture` IS the frame you just asked for.
+    ///   Without (b) a readback taken straight after a scene mutation samples the buffer
+    ///   promoted at the TOP of this call — a frame rendered before the mutation — which
+    ///   reads exactly like "the instance upload landed a frame late". It doesn't:
+    ///   `uploadInstances` runs the same frame the change is seen. The latency was always
+    ///   the presented-buffer pool, never the upload.
+    ///
     /// Returns `true` if this call actually produced a frame, `false` if it
     /// dropped (GPU still draining the previous frames — the non-blocking
     /// `inFlightSemaphore` path) or bailed on a transient failure. Callers
@@ -7333,6 +7345,20 @@ public final class IlluminatoramaRenderer {
             sync.frameCompletedAdaptive(gpuMs: gpuMs, semaphore: sem)
         }
         cb.commit()
+
+        // CAPTURE CONTRACT (see `blocking` on this method). A snapshot caller must be
+        // able to render and then immediately read `outputTexture` and get THIS frame.
+        // The pool never promotes the in-flight buffer — `promoteCompletedBuffer()` at
+        // the top of the NEXT tick does — so without this wait every capture reads a
+        // frame at least one behind, and any test that mutates the scene and renders
+        // once is asserting against the pre-mutation image. `waitUntilCompleted()`
+        // returns only after the completion handler above has run, so `markCompleted`
+        // has already published `writeIdx` and the promote below always finds it.
+        // Live rendering (`blocking == false`) is untouched and stays pipelined.
+        if blocking {
+            cb.waitUntilCompleted()
+            promoteCompletedBuffer()
+        }
 
         // Bookkeeping for next frame:
         // - Save this frame's jittered VP as the previous VP next time.

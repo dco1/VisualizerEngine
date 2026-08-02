@@ -4212,9 +4212,24 @@ kernel void illumi_taa_resolve(
     // pixels while static pixels keep the low blend (so SSAO/SSR/GI still denoise
     // and static edges still converge). Pairs with the depth-disocclusion term
     // below, which handles the TRAILING pixels the mover vacated.
+    //
+    // NOTE `alpha` and `frame.taaHistoryBlend` are both weights of the CURRENT
+    // sample (`wC = alpha`, `wH = 1 - alpha` below) — the uniform's name is a
+    // misnomer it is too widely referenced to rename here. So the ramp target
+    // must be a FLOOR, not a fixed value: `mix(blend, 0.85, disocc)` ramps the
+    // wrong way whenever `taaHistoryBlend > 0.85` (reachable — Daydream Home's
+    // Noise Reduction dial maps n < 0.156 to blend > 0.85), handing a moving or
+    // newly-revealed pixel MORE history than a stable one, which is the exact
+    // inverse of what disocclusion rejection is for. Taking `max` keeps the
+    // ramp monotonically non-decreasing in `disoccBlend`: motion may only ever
+    // ADD current-frame weight, never remove it. Identical to the old
+    // expression for every blend ≤ 0.85 (the 0.05–0.10 tuned range), so the
+    // shipped look is unchanged. The sibling SSAO/SSR/GI resolves already ramp
+    // toward `alpha * k`, which is monotone by construction.
     float velMag = length(vel);
     float disoccBlend = smoothstep(0.0015, 0.015, velMag);
-    float alpha = mix(frame.taaHistoryBlend, 0.85, disoccBlend);
+    float velocityFloor = max(frame.taaHistoryBlend, 0.85);
+    float alpha = mix(frame.taaHistoryBlend, velocityFloor, disoccBlend);
     alpha = clamp(alpha, 0.01, 1.0);
 
     // ── Specular-ghost rejection (Phase 4.44) ────────────────────────────────
