@@ -38,6 +38,20 @@ public enum IlluminatoramaLTC {
         public let size: Int
         public let validated: Bool     // true ⇒ matched brute-force ground truth
         public let maxError: Float     // max relative error over the probe set
+        /// True when the texel data came from the binary-baked table rather than
+        /// from a runtime fit — i.e. the launch-cheap path.
+        public let fromBakedTable: Bool
+    }
+
+    /// The fitted table's raw texel payload, before it becomes textures. Separated
+    /// from `LUTs` so the fit can be run, compared and serialised with no GPU device
+    /// in hand (the generator and the regression test both do exactly that).
+    public struct Table: Sendable {
+        public let mat: [SIMD4<Float>]     // size·size packed Minv
+        public let mag: [SIMD4<Float>]     // size·size (scale, bias, 0, 1)
+        public let size: Int
+        public let validated: Bool
+        public let maxError: Float
     }
 
     // ── GGX BRDF (isotropic, N = +z, alpha = roughness²) ─────────────────────
@@ -253,10 +267,24 @@ public enum IlluminatoramaLTC {
     // again. MainActor-isolated because the renderer (its only caller) is.
     @MainActor private static var cache: [ObjectIdentifier: LUTs] = [:]
 
-    @MainActor
-    public static func makeLUTs(device: MTLDevice, size: Int = 16) -> LUTs? {
-        let key = ObjectIdentifier(device)
-        if let cached = cache[key] { return cached }
+    /// Run the FULL fit: Nelder-Mead per cell, then brute-force MC validation.
+    ///
+    /// This is the expensive path — 256 cells × (a 1600-sample split-sum integral +
+    /// ~28 simplex iterations of a 196-sample L3 error) ≈ 4.7 M double-precision BRDF
+    /// evaluations. That is **2.6 s at `-Onone`** and ~90 ms at `-O`, and the engine
+    /// package builds unoptimised in Debug — which made this single call 95 % of
+    /// Daydream Home's 2.8 s cold launch (measured via `IlluminatoramaInitTiming`,
+    /// 2026-08-02).
+    ///
+    /// The result is a CONSTANT: the fit depends on nothing but the GGX BRDF and the
+    /// table dimensions — not the scene, the device, the materials or the view. So the
+    /// default 16×16 table is fitted once, offline, and checked in as
+    /// `IlluminatoramaLTCTable`; `makeLUTs` uploads those literals. This entry point
+    /// stays public because it is the table's provenance: the generator produces the
+    /// literals with it, and `IlluminatoramaLTCTableTests` re-runs it to prove the
+    /// checked-in numbers still match the fitter (so a change to the BRDF or the fit
+    /// fails as a test, not as a silent stale table).
+    public static func fitTable(size: Int = IlluminatoramaLTCTable.size) -> Table {
         var matData = [SIMD4<Float>](repeating: .zero, count: size * size)
         var magData = [SIMD4<Float>](repeating: SIMD4(0, 0, 0, 1), count: size * size)
         var fitted = [[LTC]](repeating: [LTC](repeating: LTC(), count: size), count: size)
@@ -277,7 +305,7 @@ public enum IlluminatoramaLTC {
         }
 
         let (validated, maxErr) = validate(fitted, size: size)
-        let summary = "LTC LUT: \(size)×\(size) baked, brute-force max rel err "
+        let summary = "LTC LUT: \(size)×\(size) fitted at runtime, brute-force max rel err "
             + String(format: "%.1f%%", maxErr * 100)
             + (validated ? " — TRUSTED" : " — NOT trusted (>25%), renderer keeps MRP")
         if validated { log.notice("\(summary)") } else { log.error("\(summary)") }
@@ -287,6 +315,31 @@ public enum IlluminatoramaLTC {
         if let p = ProcessInfo.processInfo.environment["VIZ_ILLUMI_LTC_LOG"] {
             try? (summary + "\n").write(toFile: p, atomically: true, encoding: .utf8)
         }
+        return Table(mat: matData, mag: magData, size: size,
+                     validated: validated, maxError: maxErr)
+    }
+
+    /// True when `VIZ_ILLUMI_LTC_RUNTIME_FIT` forces the old fit-every-launch path.
+    /// A kill switch, not a feature: it exists so the launch cost of the baked table
+    /// can be A/B'd against the fit on ONE binary (alternating arms — the only way
+    /// these measurements come out honest; a rebuild between arms measures the build,
+    /// as the earlier `MTLBinaryArchive` attempt found out), and so a suspect table
+    /// can be bypassed in the field without a rebuild.
+    private static var runtimeFitForced: Bool {
+        let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_LTC_RUNTIME_FIT"]
+        return v != nil && v != "0"
+    }
+
+    @MainActor
+    public static func makeLUTs(device: MTLDevice, size: Int = IlluminatoramaLTCTable.size) -> LUTs? {
+        let key = ObjectIdentifier(device)
+        if let cached = cache[key] { return cached }
+        // The baked literals cover the default size; any other size still fits at
+        // runtime (no host asks for one, but the parameter is public API).
+        let useBaked = (size == IlluminatoramaLTCTable.size) && !runtimeFitForced
+        let table = useBaked ? IlluminatoramaLTCTable.baked : fitTable(size: size)
+        let matData = table.mat, magData = table.mag
+        let validated = table.validated, maxErr = table.maxError
 
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba16Float, width: size, height: size, mipmapped: false)
@@ -303,7 +356,8 @@ public enum IlluminatoramaLTC {
         let rowBytes = size * MemoryLayout<SIMD4<Float>>.stride
         matData.withUnsafeBytes { matTex.replace(region: region, mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: rowBytes) }
         magData.withUnsafeBytes { magTex.replace(region: region, mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: rowBytes) }
-        let result = LUTs(mat: matTex, mag: magTex, size: size, validated: validated, maxError: maxErr)
+        let result = LUTs(mat: matTex, mag: magTex, size: size, validated: validated,
+                          maxError: maxErr, fromBakedTable: useBaked)
         cache[key] = result
         return result
     }

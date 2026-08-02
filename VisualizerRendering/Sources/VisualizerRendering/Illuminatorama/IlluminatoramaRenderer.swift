@@ -2601,6 +2601,12 @@ public final class IlluminatoramaRenderer {
     private(set) public var outputWidth: Int
     private(set) public var outputHeight: Int
 
+    /// Phase-by-phase breakdown of how long `init` took (see
+    /// `IlluminatoramaInitTiming`). Recorded unconditionally so a host can fold it
+    /// into its own launch timeline without a special build; `VIZ_ILLUMI_INIT_TIMING`
+    /// additionally emits signposts / a sidecar file.
+    private(set) public var initTiming = IlluminatoramaInitTiming()
+
     // ── Init ──────────────────────────────────────────────────────────────────
 
     /// - Parameter shadowMapResolution: Side length (px) of each directional
@@ -2611,6 +2617,11 @@ public final class IlluminatoramaRenderer {
     ///   from `shadowMap.get_width()`, so no shader change is needed.
     public init(engine: SimEngine, width: Int, height: Int, camera: IlluminatoramaCamera,
                 shadowMapResolution: Int = 2048) throws {
+        // Stopwatch for the init breakdown. Kept in a LOCAL and assigned to
+        // `self.initTiming` at the very end — mutating a stored property while the
+        // rest of `self` is still uninitialised isn't allowed, and a local also keeps
+        // the marks out of every early-throw path.
+        var timing = IlluminatoramaInitTiming()
         self.engine = engine
         self.device = engine.device
         self.commandQueue = engine.commandQueue
@@ -2750,6 +2761,7 @@ public final class IlluminatoramaRenderer {
         gds.depthCompareFunction = .lessEqual
         gds.isDepthWriteEnabled = false
         self.glassDepthState = device.makeDepthStencilState(descriptor: gds)
+        timing.mark("render pipelines (gbuffer/shadow/glass)")
 
         // Compute pipelines via the shared cache so we don't recompile across
         // scene rebuilds.
@@ -2778,6 +2790,7 @@ public final class IlluminatoramaRenderer {
             "illumi_surfcache_reframe_deform", "illumi_surfcache_reframe_tri",
             "illumi_svgf_atrous", "illumi_svgf_variance", "illumi_taa_resolve",
         ], device: device)
+        timing.mark("compute pipeline precompile (32, concurrent)")
 
         let (initLightingKey, initLightingConstants) = Self.lightingFeatureConstants(
             ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
@@ -2905,6 +2918,7 @@ public final class IlluminatoramaRenderer {
         self.halationBlurVPipeline = halBlurV
         self.tonemapPipeline = tonemap
         self.exposureEstimatePipeline = expoEst
+        timing.mark("compute pipeline fetch (lighting/ssao/ssr/svgf/bloom/ddgi)")
 
         // ── Hardware RT pipeline (optional) ──────────────────────────
         // Only build on RT-capable hardware; the intersector kernel can't be
@@ -3011,6 +3025,7 @@ public final class IlluminatoramaRenderer {
         }
         riUB.label = "Illuminatorama.rt.instUniforms"
         self.rtInstUniformBuffer = riUB
+        timing.mark("RT + surfcache + TLAS pipelines (specialized)")
 
         // ── Depth-of-field pipeline ──────────────────────────────────
         if let dofFn = library.makeFunction(name: "illumi_dof") {
@@ -3217,6 +3232,7 @@ public final class IlluminatoramaRenderer {
         selDepthDesc.depthCompareFunction = .lessEqual
         selDepthDesc.isDepthWriteEnabled = false
         self.selectionDepthState = device.makeDepthStencilState(descriptor: selDepthDesc)
+        timing.mark("dof/vol/cloud/particle/streak/selection pipelines")
 
         // ── Phase 3 cubemaps + dummy sky ────────────────────────────────
         let (irrCube, preCube, preViews) = try Self.makeIBLCubes(device: device)
@@ -3224,6 +3240,7 @@ public final class IlluminatoramaRenderer {
         self.prefilteredCube = preCube
         self.prefilteredMipViews = preViews
         self.dummySkyTexture = Self.makeDummySky(device: device)
+        timing.mark("IBL cubes + dummy sky")
 
         // ── Phase 3.2 DFG LUT ───────────────────────────────────────────
         // Allocate and bake immediately — the LUT is view-independent so it
@@ -3251,6 +3268,7 @@ public final class IlluminatoramaRenderer {
             throw IlluminatoramaError.bufferAllocationFailed("Illuminatorama.colorLUT")
         }
         self.colorLUT = lut
+        timing.mark("DFG texture + identity colour LUT")
 
         // #60 task 5 increment 2 — bake the LTC area-light specular LUTs once,
         // self-validated against brute-force MC of the GGX BRDF. Falls back to the
@@ -3265,6 +3283,7 @@ public final class IlluminatoramaRenderer {
             self.ltcMagTexture = dfg
             self.ltcValidated = false
         }
+        timing.mark("LTC area-light LUTs")
 
         self.passTimer = IlluminatoramaPassTimer(device: device)
 
@@ -3309,6 +3328,7 @@ public final class IlluminatoramaRenderer {
         }
         ddd.label = "Illuminatorama.ddgi.dummyDepth"
         self.ddgiDummyDepthAtlas = ddd
+        timing.mark("DFG bake dispatch + DDGI resources")
 
         // ── Phase 2.5 shadow map array ──────────────────────────────────
         self.shadowMap = try Self.makeShadowMap(device: device, resolution: shadowMapResolution)
@@ -3317,6 +3337,7 @@ public final class IlluminatoramaRenderer {
             resolution: spotShadowMapResolution,
             capacity: spotShadowAtlasCapacity
         )
+        timing.mark("shadow maps (sun cascades + spot atlas)")
 
         // ── Phase 4.0/4.1 texture atlases ───────────────────────────
         //
@@ -3335,6 +3356,7 @@ public final class IlluminatoramaRenderer {
         self.nonColorAtlas = try IlluminatoramaTextureAtlas(
             device: device, pixelFormat: .bgra8Unorm,
             sliceSize: atlasSliceSize)
+        timing.mark("texture atlases (albedo + non-colour)")
 
         // ── Targets ──────────────────────────────────────────────────────
         let t = try Self.makeTargets(device: device,
@@ -3395,6 +3417,7 @@ public final class IlluminatoramaRenderer {
             pool.append(extra)
         }
         self.ldrPool = pool
+        timing.mark("render targets (internal \(self.width)×\(self.height) + LDR pool)")
 
         // ── Buffers ──────────────────────────────────────────────────────
         let initInstCap = 64
@@ -3470,6 +3493,7 @@ public final class IlluminatoramaRenderer {
         self.meshes[.box]    = IlluminatoramaMesh.unitBox(device: device)
         self.meshes[.sphere] = IlluminatoramaMesh.unitSphere(device: device)
         self.meshes[.ground] = IlluminatoramaMesh.unitGround(device: device)
+        timing.mark("buffers, rings + primitive meshes")
 
         // ── Cover-blit pipeline (for MTKView direct-present path) ────────
         if let vs = library.makeFunction(name: "illumi_coverblit_vs"),
@@ -3484,6 +3508,9 @@ public final class IlluminatoramaRenderer {
         if coverBlitPipeline == nil {
             Self.log.warning("illumi_coverblit shaders not found — present(to:) will no-op")
         }
+        timing.mark("cover-blit pipeline")
+        timing.finish()
+        self.initTiming = timing
 
         Self.log.info("Illuminatorama renderer ready (internal \(self.width)x\(self.height), output \(self.outputWidth)x\(self.outputHeight))")
     }
