@@ -2767,8 +2767,20 @@ kernel void coinGenerateContacts(
 // converges in ~log(#contacts) rounds; a fixed round budget is encoded with no
 // per-round readback (mirrors how the legacy solver batches its iterations).
 
-constant uint CD_MAX_BODY_CONTACTS = 48u;   // per-body contact-list capacity
-constant uint CD_MAX_COLORS        = 32u;   // colour fits in a uint mask
+// Per-body contact-list capacity. NOTE (measured, dense 176-body mixed pile): the true
+// per-body contact degree reaches 48–52 here — a die touching 6 neighbours emits up to
+// 8 corner points against each — so this list DOES truncate. A truncated list hides
+// neighbours from the colouring, which can then give two contacts of the same body the
+// same colour: those two threads read-modify-write that body's velocity in parallel.
+// Raising it (the loop below is bounded by the body's ACTUAL degree, so the cost is
+// memory, not time) needs the colour cap raised with it — degree d forces d distinct
+// colours — which is the open item in `solveColors`.
+constant uint CD_MAX_BODY_CONTACTS = 48u;
+// Colour cap — a colour has to fit the uint `usedMask` below, and every colour here has
+// to be SOLVED: CoinDEMSolver.maxColors mirrors this, and CoinDEMSolver.solveColors
+// dispatches one pass per colour in 0..<that. A dense mixed pile really does reach
+// colour 31 (measured), so the two must stay in lockstep.
+constant uint CD_MAX_COLORS        = 32u;
 
 static uint cdHashU(uint x) {               // priority hash (deterministic, no RNG state)
     x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x;
@@ -3681,16 +3693,34 @@ kernel void coinIslandMinReduce(
 }
 
 // Mark a body asleep iff its whole island has been slow for ≥ sleepFrames.
+//
+// FREEZING ZEROES THE VELOCITY. A frozen body's position is not integrated
+// (coinIntegratePositionCS returns for asleep[id]), so whatever was left in `vel` /
+// `angVel` at the moment it froze would sit there forever describing motion that is
+// not happening: measured on the settled Pile of Mess pile, a body frozen holding
+// 0.152 m/s still read 0.152 m/s 600 frames later having moved 0.0000 m. Every
+// consumer of `vel` — CoinDiagnostics' rest-KE gate, any velocity-driven renderer —
+// was reading that lie, and which bodies froze mid-motion is decided by the
+// non-deterministic contact ordering, so the "rest KE" of a dead-still pile came out
+// as a run-to-run lottery (see RigidPileFieldTests.testPileOfMessRestQuiet). Zeroing
+// on freeze is also what Box2D/Bullet do: asleep means at rest, so v ≡ 0. It cannot
+// lose momentum, because a frozen body was already not moving.
 kernel void coinSleepMark(
     device const uint*     label     [[ buffer(0) ]],
     device const uint*     islandMin [[ buffer(1) ]],
     device uint*           asleep    [[ buffer(2) ]],
     constant CoinUniforms& u         [[ buffer(3) ]],
     constant uint&         sleepFrames [[ buffer(4) ]],
+    device CoinBody*       coins     [[ buffer(5) ]],
     uint id [[ thread_position_in_grid ]])
 {
     if (id >= u.coinCount) return;
-    asleep[id] = (islandMin[label[id]] >= sleepFrames) ? 1u : 0u;
+    bool sleeping = (islandMin[label[id]] >= sleepFrames);
+    asleep[id] = sleeping ? 1u : 0u;
+    if (sleeping) {
+        coins[id].vel.xyz    = float3(0.0);
+        coins[id].angVel.xyz = float3(0.0);
+    }
 }
 
 // Diagnostic probe: run GJK+EPA on coins[a],coins[b]; write [overlap, depthµm, nx,ny,nz].

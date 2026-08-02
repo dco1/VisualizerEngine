@@ -82,9 +82,34 @@ final class RigidPileFieldTests: XCTestCase {
     //   • sphere↔disc / sphere↔box real closest-point contact (the old bounding-sphere
     //     fallback over-separated → marble-on-coin/die rest limit cycle)
     // A regression in either re-introduces a pervasive jitter (KE ≫ 1) or, if a contact
-    // is made too stiff, an explosion. Run 3× because the GPU Jacobi solve is non-
-    // deterministic (atomic scatter ordering) and a dense mixed pack occasionally forms
-    // a small jam pocket; we assert NONE explode and the BEST run settles quiet. ──────
+    // is made too stiff, an explosion. Run 3× because the GPU solve is not
+    // deterministic run-to-run (see below); all three runs must settle.
+    //
+    // WHERE THE BOUND COMES FROM (measured 2026-08-02). This assertion used to read
+    // `worstKE < 0.05` and failed intermittently — a measured run at 0.0548. That was
+    // not solver noise, it was a stale-velocity bug in the METRIC's input:
+    // `CoinDiagnostics` sums ½|v|² over every active body, and `coinSleepMark` froze a
+    // body without clearing its velocity. A body frozen mid-motion then reported that
+    // speed for ever while sitting perfectly still — measured carriers were asleep=1,
+    // held up to 0.152 m/s, and moved 0.0000 m over the following 600 frames, with
+    // ke@900 == ke@1500 == ke@2400 to five decimals. WHICH bodies freeze mid-motion
+    // follows the contact buffer's slot order, and slots come from an atomic bump
+    // allocator (`cdEmitContact`), so an already-dead-still pile reported a different
+    // "rest KE" every run. Two lockstep runs of this config diverge by frame ~40.
+    //
+    //   avgRestKE over 24 runs of this exact config, BEFORE (velocity kept on freeze):
+    //     18 × 0.00000, then 0.00235 0.00285 0.01095 0.01614 0.02276 0.02820
+    //     — and over 60 runs total the tail reached 0.0548 (the failure), 0.08911, 0.12840.
+    //     The old 0.05 bound sat INSIDE that distribution: ~1 run in 30 exceeded it, so
+    //     with 3 runs per test the gate failed roughly one invocation in ten.
+    //   AFTER (coinSleepMark zeroes v/ω on freeze — CoinDEM.metal):
+    //     36 runs, ALL exactly 0.00000, 0 awake bodies, max speed 0.0000.
+    //
+    // So the bound below is 0.01, two orders under the old tail and comfortably above
+    // exactly-zero: a settled pile measures 0, and anything that leaves a body genuinely
+    // moving (≈0.14 m/s on one body) or brings back the stale-velocity artefact trips it.
+    // NOT asserted, by design: the settled ARRANGEMENT still differs run to run — the
+    // gate is on rest, not on reproducing one particular pile. ────────────────────────
     func testPileOfMessRestQuiet() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
         let engine = SimEngine(device: device)
@@ -160,14 +185,16 @@ final class RigidPileFieldTests: XCTestCase {
         // CONSTRAINT solver — the new graph-colored sequential-impulse engine. At the
         // SAME shipped 176 @ 0.55 density it must settle DEAD-STILL, every run (no jam
         // pocket, no body-count / bin dodge). This is the fix for the original bug.
-        var worstKE: Float = 0
+        var worstKE: Float = 0, worstAwake: Float = 0
         for r in 0..<3 {
             let m = runConfig(label: "constraint #\(r)", constraint: true)
             XCTAssertEqual(m.below, 0, "nothing tunnelled the floor")
-            XCTAssertLessThanOrEqual(m.awake, 6, "constraint solver: a settled pile has ~zero awake bodies")
-            worstKE = max(worstKE, m.ke)
+            worstKE = max(worstKE, m.ke); worstAwake = max(worstAwake, m.awake)
         }
-        XCTAssertLessThan(worstKE, 0.05, "constraint solver settles the full-density mixed pile dead-still, every run")
+        // Both measured 0 in 36/36 runs; the margins are for a slower/faster machine
+        // settling a body a few frames later, not for the old stale-velocity spread.
+        XCTAssertLessThanOrEqual(worstAwake, 2, "constraint solver: a settled pile has ~zero awake bodies")
+        XCTAssertLessThan(worstKE, 0.01, "constraint solver settles the full-density mixed pile dead-still, every run")
     }
 
     // ── The cull line recycles settled bodies (a payout). ─────────────────────────

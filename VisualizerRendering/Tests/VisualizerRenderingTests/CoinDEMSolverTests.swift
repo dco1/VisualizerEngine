@@ -135,7 +135,17 @@ final class CoinDEMSolverTests: XCTestCase {
         var maxColor = -1, uncolored = 0
         for i in 0..<n { let c = Int(ptr[i].tan2.w); if c < 0 { uncolored += 1 } else { maxColor = max(maxColor, c) } }
         print("DENSE_COLORS contacts=\(n) maxColor=\(maxColor) colors=\(maxColor+1) uncolored=\(uncolored)")
-        XCTAssertLessThan(maxColor + 1, 32, "colour count fits the 32-colour cap")
+        XCTAssertLessThanOrEqual(maxColor + 1, CoinDEMSolver.maxColors, "colour count fits the colour cap")
+        // NOTE (measured 2026-08-02): this config settles to ~13 colours, so it fits
+        // `solveColors` (16) — but it is NOT the worst case. The shipped Pile of Mess
+        // settle (176 bodies dropped over 400 frames, 900 frames to rest — see
+        // RigidPileFieldTests) reaches colour 31, where 868 of 2742 contacts sit in
+        // colours ≥16 and are skipped by the solve every substep. That gap is documented
+        // with its A/B on `solveColors` and deliberately NOT asserted (raising the cap
+        // cost +45% GPU and changed no measured outcome). Print the count so a change in
+        // either direction is visible here.
+        print("DENSE_COLORS unsolvedByColorCap=\((0..<n).filter { Int(ptr[$0].tan2.w) >= solver.solveColors }.count)"
+            + "/\(n) (colours ≥ solveColors=\(solver.solveColors))")
     }
 
     // ── CONSTRAINT SOLVER Stage 2: graph colouring validity ────────────────────
@@ -332,6 +342,60 @@ final class CoinDEMSolverTests: XCTestCase {
         print("STAGE5_SLEEP after-drop asleep=\(solver.asleepCount)/41 KE=\(keFinal)")
         XCTAssertLessThan(keFinal, 0.02, "re-settles dead-still after the wake")
         XCTAssertEqual(CoinDiagnostics.measure(solver).belowFloorCount, 0, "nothing tunnelled")
+    }
+
+    // ── A FROZEN body reports ZERO velocity. ───────────────────────────────────────
+    // `asleep` skips position integration, so a body frozen mid-motion keeps whatever
+    // was in `vel`/`angVel` at that instant — for ever, while sitting perfectly still.
+    // Measured before the fix on a settled 176-body pile: carriers held up to 0.152 m/s
+    // and moved 0.0000 m over the next 600 frames, and `CoinDiagnostics.kineticEnergy`
+    // (a plain Σ½|v|² over active bodies) reported that as rest jitter. Because WHICH
+    // bodies freeze mid-motion follows the non-deterministic contact order, the rest-KE
+    // of an already-dead-still pile came out as a run-to-run lottery — the flake in
+    // RigidPileFieldTests.testPileOfMessRestQuiet. Fail-closed: asleep ⇒ v ≡ ω ≡ 0. ───
+    func testSleepingBodiesCarryZeroVelocity() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
+        let engine = SimEngine(device: device)
+        let lib = try Self.makeLibrary(device)
+        guard let solver = CoinDEMSolver(engine: engine, library: lib, maxCoins: 60,
+                                         coinRadius: 0.12, halfThickness: 0.12,
+                                         boundsMin: SIMD3(-1.1,-0.5,-1.1), boundsMax: SIMD3(1.1,2.6,1.1)),
+              let queue = device.makeCommandQueue() else { throw XCTSkip("init failed") }  // gpu-ok: test harness
+        solver.floorY = 0
+        solver.setColliders(RigidPileField.bin(innerHalf: SIMD2(0.42, 0.42), floorY: 0))
+        solver.solverMode = .constraint
+        solver.frictionCoeff = 0.5
+        solver.sleepFrames = 20
+
+        var seed: UInt64 = 0x5EED
+        func rnd() -> Float { seed = seed &* 6364136223846793005 &+ 1; return Float(seed >> 40) / Float(1 << 24) }
+        for i in 0..<40 {                       // a mixed heap, dropped tumbling
+            let p = SIMD3<Float>((rnd()-0.5)*0.5, 0.4 + rnd()*0.8, (rnd()-0.5)*0.5)
+            let t = SIMD3<Float>((rnd()-0.5)*4, (rnd()-0.5)*4, (rnd()-0.5)*4)
+            switch i % 3 {
+            case 0: solver.spawn(at: p, tumble: t, radius: 0.075, halfThickness: 0.022, type: 0)
+            case 1: solver.spawnSphere(at: p, radius: 0.052, tumble: t, type: 1)
+            default: solver.spawnBox(at: p, halfExtents: SIMD3(0.044,0.044,0.044), tumble: t, type: 2)
+            }
+        }
+        for _ in 0..<800 { let cb = queue.makeCommandBuffer()!; solver.encode(to: cb, wallDt: 1.0/60.0); cb.commit(); cb.waitUntilCompleted() }  // gpu-ok: test harness
+
+        let n = solver.highWater
+        let bodies = solver.coinBuffer.buffer.contents().bindMemory(to: CoinBody.self, capacity: max(1, n))
+        let asleep = solver.asleepBuffer.contents().bindMemory(to: UInt32.self, capacity: max(1, n))
+        var sleeping = 0, worstV: Float = 0, worstW: Float = 0
+        for i in 0..<n where bodies[i].posInvMass.w != 0 && asleep[i] != 0 {
+            sleeping += 1
+            worstV = max(worstV, simd_length(SIMD3(bodies[i].vel.x, bodies[i].vel.y, bodies[i].vel.z)))
+            worstW = max(worstW, simd_length(SIMD3(bodies[i].angVel.x, bodies[i].angVel.y, bodies[i].angVel.z)))
+        }
+        print("SLEEP_ZEROV asleep=\(sleeping)/\(solver.activeCount) worstV=\(worstV) worstOmega=\(worstW)")
+        XCTAssertGreaterThan(sleeping, 20, "the heap actually slept (else this proves nothing)")
+        XCTAssertEqual(worstV, 0, "a frozen body must not carry a stale linear velocity")
+        XCTAssertEqual(worstW, 0, "a frozen body must not carry a stale angular velocity")
+        // …and the rest metric therefore reads a dead-still pile as exactly zero.
+        XCTAssertEqual(CoinDiagnostics.measure(solver).kineticEnergy, 0,
+                       "rest KE of a fully-slept pile is exactly 0, not a stale-velocity residue")
     }
 
     // ── CONSTRAINT SOLVER Stage 6: GJK + EPA general convex narrowphase ────────

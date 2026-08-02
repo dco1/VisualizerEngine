@@ -469,8 +469,33 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// scheme for small fast bodies. Keep ≤ the broadphase cell size (pairs
     /// beyond one cell are never even found).
     public var speculativeMargin: Float = 0.0
-    /// Colour passes per velocity iteration. The colouring uses ≤ this many colours in
-    /// practice (≈8 for a dense pile); contacts in higher colours wait a substep.
+    /// The colouring's colour cap — mirrors `CD_MAX_COLORS` in CoinDEM.metal, which is
+    /// the source of truth (a contact's colour is stored in a 32-bit `usedMask`).
+    public static let maxColors = 32
+
+    /// Colour passes per velocity iteration. **A contact whose colour is ≥ this is not
+    /// solved this substep at all** — `coinSolveVelocityColor` is dispatched once per
+    /// colour in `0..<solveColors` and returns immediately for any other colour, and the
+    /// contact buffer is regenerated and re-coloured from scratch next substep, so a
+    /// dropped contact doesn't "wait its turn", it re-enters the same lottery.
+    ///
+    /// KNOWN GAP, measured 2026-08-02 — this is 16 while the colouring emits colours up
+    /// to 31, so on the shipped Pile of Mess config (176 mixed bodies, bin 0.55) at the
+    /// settled frame 868 of 2742 contacts (32%) sat in colours 16…31 and were skipped,
+    /// on top of 331 (12%) left uncoloured (see `colorRounds`): 44% of the pile's
+    /// contacts unsolved per substep, and a different 44% every substep because contact
+    /// slots come from an atomic bump allocator (`cdEmitContact`).
+    ///
+    /// NOT raised, deliberately: setting it to `maxColors` (32) was measured against this
+    /// scene and changed nothing observable — settle frame ~300 either way, and the rest-KE
+    /// distribution over 24 runs was statistically identical (17/24 vs 18/24 dead-still,
+    /// same tail) — while costing ~4.7 ms → ~6.9 ms of GPU sim per frame (+45%), because
+    /// each colour pass launches every live contact and filters by colour, so ~31/32 of
+    /// the threads return immediately. The randomised-subset Gauss-Seidel converges this
+    /// loose heap regardless. Worth revisiting for TALL stacks (where every contact in a
+    /// column matters) and cheap to do properly: compacting contacts into per-colour lists
+    /// (a counting sort by colour, the pattern `coinCellCount`/`coinScatter` already uses)
+    /// would make all 32 colours cost LESS than today's 16.
     public var solveColors: Int = 16
     /// Warm starting: carry each contact's converged impulse across substeps so a
     /// resting stack resumes from its solution instead of re-solving from zero.
@@ -1578,6 +1603,10 @@ public final class CoinDEMSolver: PenetrationProbing {
     // finalize. No position-to-velocity feedback, so a settled pile carries zero
     // restoring velocity and goes still regardless of density.
     private func encodeConstraintSubstep(_ cb: MTLCommandBuffer, coinCount: Int) {
+        // One solve pass per colour. A contact whose colour this loop never visits is
+        // dropped from the solve entirely — `solveColors` (16) is deliberately below the
+        // colouring's 32-colour cap; the measured trade-off is documented there.
+        let colors = min(solveColors, Self.maxColors)
         dispatch(cb, intVelCSPipeline, threads: coinCount, label: "Coin.cs.intVel") { enc in
             enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
             enc.setBuffer(self.biasBuffer, offset: 0, index: 1)
@@ -1610,7 +1639,7 @@ public final class CoinDEMSolver: PenetrationProbing {
                 enc.setBuffer(self.pairHashBuffer, offset: 0, index: 3)
                 enc.setBuffer(self.hashSizeBuffer, offset: 0, index: 4)
             }
-            for color in 0..<solveColors {
+            for color in 0..<colors {
                 var cc = UInt32(color)
                 dispatchIndirect(cb, warmApplyPipeline, label: "Coin.cs.warmApply") { enc in
                     enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
@@ -1621,7 +1650,7 @@ public final class CoinDEMSolver: PenetrationProbing {
             }
         }
         for _ in 0..<velocityIterations {
-            for color in 0..<solveColors {
+            for color in 0..<colors {
                 var cc = UInt32(color)
                 dispatchIndirect(cb, solveVelCSPipeline, label: "Coin.cs.solve") { enc in
                     enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
@@ -1726,6 +1755,7 @@ public final class CoinDEMSolver: PenetrationProbing {
             enc.setBuffer(self.asleepBuffer, offset: 0, index: 2)
             enc.setBuffer(self.uniformBuffer, offset: 0, index: 3)
             enc.setBytes(&sf, length: MemoryLayout<UInt32>.size, index: 4)
+            enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 5)   // freezing zeroes v/ω
         }
     }
 
@@ -1896,8 +1926,14 @@ public final class CoinDEMSolver: PenetrationProbing {
 
     /// Number of graph-colouring rounds encoded per substep. Jones-Plassmann with a
     /// random priority colours ~half the frontier per round, so ~log₂(#contacts)
-    /// rounds suffice; 24 is generous headroom for a dense pile (the leftover, if any,
-    /// stay colour −1 and are skipped — handled atomically in a later stage).
+    /// rounds suffice; 24 is generous headroom for a dense pile.
+    ///
+    /// Contacts left over stay colour −1 and are **not solved** (there is no later
+    /// atomic stage — an older comment here claimed one). Measured on the shipped Pile
+    /// of Mess config at the settled frame: 116 of 2518 (4.6%). Raising this does NOT
+    /// help — at 64 rounds the leftover is unchanged, because they are colour-EXHAUSTION,
+    /// not round-budget: a body whose degree exceeds `maxColors` cannot have all of its
+    /// contacts in distinct colours by definition (see `CD_MAX_COLORS` in CoinDEM.metal).
     public var colorRounds: Int = 24
 
     /// Encode the graph colouring of the current contact buffer: build per-body

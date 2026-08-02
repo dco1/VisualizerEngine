@@ -17,7 +17,12 @@ public struct CoinDiagnostics {
 
     public struct Report: CustomStringConvertible {
         public var activeCount: Int
-        public var kineticEnergy: Float      // Σ ½|v|²  (unit mass)
+        /// Σ ½|v|² (unit mass) over ACTIVE bodies. An asleep body contributes exactly 0:
+        /// `coinSleepMark` zeroes v/ω when it freezes a body, so this reads "is anything
+        /// actually moving" rather than "what was the last velocity anyone wrote" — a
+        /// fully-settled pile measures exactly 0. (It used to include the stale velocity
+        /// of bodies frozen mid-motion, which made every rest gate built on it flaky.)
+        public var kineticEnergy: Float
         public var maxSpeed: Float
         public var belowFloorCount: Int      // tunnelling
         public var minY: Float
