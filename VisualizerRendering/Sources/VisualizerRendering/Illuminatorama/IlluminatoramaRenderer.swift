@@ -2404,18 +2404,66 @@ public final class IlluminatoramaRenderer {
     private let rtTLASPipeline: MTLComputePipelineState?
     /// Whether the device + instanced-RT pipeline are available.
     public var rtTLASSupported: Bool { rtTLASPipeline != nil }
-    private var rtBLASByMesh: [ObjectIdentifier: MTLAccelerationStructure] = [:]
-    private var rtNormalsByMesh: [ObjectIdentifier: [SIMD4<Float>]] = [:]
-    // Phase B — deforming-mesh BLAS refit. A DynamicMesh / GPU-fed mesh keeps a
-    // STABLE topology (vertex+index count fixed; only positions move each frame),
-    // so its BLAS is built once with `.refit` usage and re-fit per frame from the
-    // live (repacked) vertex buffer — instead of being frozen at build-time verts,
-    // which made the RT trace see stale geometry (shadows/GI lit for the old pose).
-    // The refit is encoded on the FRAME command buffer AFTER `encodeGPURepacks`, so
-    // Metal sequences repack-write → refit-read; the BLAS references `mesh.vertexBuffer`,
-    // the same buffer the repack writes in place.
-    private var rtBLASRefitDesc: [ObjectIdentifier: MTLPrimitiveAccelerationStructureDescriptor] = [:]
-    private var rtBLASRefitScratch: [ObjectIdentifier: MTLBuffer] = [:]
+    /// Everything the RT path caches per registered mesh: its BLAS, its object-space
+    /// per-triangle normals, and — for a deforming (GPU-fed) mesh — the descriptor and
+    /// scratch its per-frame in-place refit needs. ONE entry, not four parallel maps, so a
+    /// mesh's RT state can only ever be added, found and dropped as a unit.
+    ///
+    /// **The entry OWNS its mesh, and that is load-bearing.** The cache is keyed by
+    /// `ObjectIdentifier(mesh)` — a raw ADDRESS. A document editor rebuilds its whole scene
+    /// on every edit (`HouseRenderBridge.load()` drops the previous scene's mesh handles and
+    /// registers new ones), and `IlluminatoramaMeshHandle.deinit` evicts the renderer entry
+    /// ASYNCHRONOUSLY (`Task { @MainActor … removeMesh }`). So without a strong reference the
+    /// key dangles the moment that task runs, and the very next `IlluminatoramaMesh` the
+    /// allocator hands out can land on the recycled address — at which point the cache
+    /// "hits" and gives brand-new geometry an acceleration structure built from a mesh it
+    /// has never seen, still referencing the dead mesh's released vertex/index buffers.
+    /// Holding the mesh pins the address for exactly as long as the entry exists;
+    /// `pruneRTMeshCache()` is the only thing that lets go.
+    private struct RTMeshEntry {
+        /// STRONG on purpose — see above. Never make this `weak`/`unowned`.
+        let mesh: IlluminatoramaMesh
+        let blas: MTLAccelerationStructure
+        let normals: [SIMD4<Float>]
+        // Phase B — deforming-mesh BLAS refit. A DynamicMesh / GPU-fed mesh keeps a
+        // STABLE topology (vertex+index count fixed; only positions move each frame),
+        // so its BLAS is built once with `.refit` usage and re-fit per frame from the
+        // live (repacked) vertex buffer — instead of being frozen at build-time verts,
+        // which made the RT trace see stale geometry (shadows/GI lit for the old pose).
+        // The refit is encoded on the FRAME command buffer AFTER `encodeGPURepacks`, so
+        // Metal sequences repack-write → refit-read; the BLAS references `mesh.vertexBuffer`,
+        // the same buffer the repack writes in place. `nil` for static meshes.
+        var refit: (desc: MTLPrimitiveAccelerationStructureDescriptor, scratch: MTLBuffer)?
+    }
+    private var rtMeshCache: [ObjectIdentifier: RTMeshEntry] = [:]
+    /// Whether any cached mesh needs the per-frame refit. Stored rather than derived so the
+    /// per-frame static-skip test stays O(1); maintained by `pruneRTMeshCache()`, which runs
+    /// on every rebuild — the only occasion the answer can change.
+    private var rtHasDeformingBLAS = false
+    /// Times the BLAS cache served an entry built from a DIFFERENT mesh object than the one
+    /// asked for — i.e. a recycled address collided with a dead entry. Structurally
+    /// impossible while entries own their meshes, and gated at 0 by
+    /// `RTMeshCacheIdentityTests`, which is what proved this was happening.
+    public private(set) var rtStaleBLASReuseCount = 0
+    /// TEST-OBSERVABLE: live RT cache entries. Can never exceed `registeredMeshCount`.
+    public var rtBLASCacheCount: Int { rtMeshCache.count }
+    /// TEST-OBSERVABLE: how many meshes are currently registered with the renderer.
+    public var registeredMeshCount: Int { meshes.count }
+
+    /// Drop every cached entry whose mesh is no longer registered, releasing its BLAS, its
+    /// normals and — the point of the whole exercise — the mesh itself, so the address it
+    /// occupied becomes reusable only once nothing can look it up any more.
+    ///
+    /// Called from `rebuildRTAccel()`, i.e. exactly when the TLAS topology changed, which is
+    /// the only moment the set of live meshes can have moved.
+    private func pruneRTMeshCache() {
+        // Filtered unconditionally: equal counts do NOT imply equal sets (a scene can shed
+        // one mesh and gain another in the same rebuild), and this runs on topology changes
+        // only, never per frame.
+        let live = Set(meshes.values.map(ObjectIdentifier.init))
+        rtMeshCache = rtMeshCache.filter { live.contains($0.key) }
+        rtHasDeformingBLAS = rtMeshCache.values.contains { $0.refit != nil }
+    }
     /// Dev A/B override (VIZ_ILLUMI_NO_BLAS_REFIT=1) — freeze deforming BLASes at
     /// build pose to compare RT-traces-stale vs current. Default off (refit on).
     private static let noBLASRefit =
@@ -5823,7 +5871,7 @@ public final class IlluminatoramaRenderer {
             // points) or deforming BLASes (GPU-fed vertices the CPU compare
             // can't see) force the refit every frame, as before.
             if instanceStableFrames >= 1, glassStableFrames >= 1,
-               rtCurveSets.isEmpty, rtBLASRefitDesc.isEmpty, rtTLASActive {
+               rtCurveSets.isEmpty, !rtHasDeformingBLAS, rtTLASActive {
                 staticSkipStats.tlasRefitsSkipped += 1
                 return
             }
@@ -5930,19 +5978,18 @@ public final class IlluminatoramaRenderer {
     /// BLAS references), and Metal sequences the compute-write → AS-refit-read on
     /// the shared command buffer. No `waitUntilCompleted` — refit is cheap + async.
     private func refitDeformingBLAS(_ cb: MTLCommandBuffer) {
-        guard !rtBLASRefitDesc.isEmpty else { return }
+        guard rtHasDeformingBLAS else { return }
         // Dev A/B override: VIZ_ILLUMI_NO_BLAS_REFIT=1 freezes deforming BLASes at
         // their build-time pose (the pre-Phase-B behaviour) so the RT-traces-stale
         // -vs-current difference is directly checkable. Default: refit (on).
         if Self.noBLASRefit { return }
         guard let enc = cb.makeAccelerationStructureCommandEncoder() else { return }
         enc.label = "Illuminatorama.rt.blas.refit"
-        for (mid, desc) in rtBLASRefitDesc {
-            guard let blas = rtBLASByMesh[mid],
-                  let scratch = rtBLASRefitScratch[mid] else { continue }
-            enc.refit(sourceAccelerationStructure: blas, descriptor: desc,
-                      destinationAccelerationStructure: blas,
-                      scratchBuffer: scratch, scratchBufferOffset: 0)
+        for entry in rtMeshCache.values {
+            guard let refit = entry.refit else { continue }
+            enc.refit(sourceAccelerationStructure: entry.blas, descriptor: refit.desc,
+                      destinationAccelerationStructure: entry.blas,
+                      scratchBuffer: refit.scratch, scratchBufferOffset: 0)
         }
         enc.endEncoding()
     }
@@ -5963,6 +6010,10 @@ public final class IlluminatoramaRenderer {
     /// TLAS. Runs on a topology change.
     private func rebuildRTAccel() {
         rtTLASActive = false
+        // The scene's mesh set just changed — release every cached entry whose mesh is gone
+        // BEFORE looking anything up below, so the cache never outlives the addresses it is
+        // keyed by (see `RTMeshEntry`). Also refreshes `rtHasDeformingBLAS`.
+        pruneRTMeshCache()
         // AAA glass (#60): the canonical flattened glass list in TLAS-append order.
         // Glass instances ride the SAME TLAS as the opaque/curve instances (so glass
         // refracts/reflects real geometry and other glass) but carry mask 0x02, so
@@ -5979,7 +6030,12 @@ public final class IlluminatoramaRenderer {
         for group in meshGroups {
             guard let mesh = meshes[group.kind], mesh.indexCount >= 3 else { continue }
             let mid = ObjectIdentifier(mesh)
-            if rtBLASByMesh[mid] != nil { continue }
+            if let cached = rtMeshCache[mid] {
+                // Ownership makes this impossible; assert it anyway, because when it was
+                // possible it silently traced the wrong geometry through every glass pane.
+                if cached.mesh !== mesh { rtStaleBLASReuseCount += 1 }
+                continue
+            }
             let deforming = deformingKinds.contains(group.kind)
             let geom = MTLAccelerationStructureTriangleGeometryDescriptor()
             geom.vertexBuffer = mesh.vertexBuffer
@@ -6028,20 +6084,18 @@ public final class IlluminatoramaRenderer {
                   let scratch = device.makeBuffer(length: max(sizes.buildScratchBufferSize, 16),
                                                    options: .storageModePrivate) else { continue }
             blas.label = deforming ? "Illuminatorama.rt.blas.deforming" : "Illuminatorama.rt.blas"
-            rtBLASByMesh[mid] = blas
-            rtNormalsByMesh[mid] = mesh.objectFaceNormals()
+            var entry = RTMeshEntry(mesh: mesh, blas: blas,
+                                    normals: mesh.objectFaceNormals(), refit: nil)
             pending.append((blas, d, scratch))
             // Retain the descriptor + a refit-sized scratch so the per-frame refit
             // can re-encode without re-deriving sizes. Refit scratch can differ from
             // build scratch; size it explicitly.
-            if deforming {
-                rtBLASRefitDesc[mid] = d
-                if let rscratch = device.makeBuffer(
-                        length: max(sizes.refitScratchBufferSize, 16),
-                        options: .storageModePrivate) {
-                    rtBLASRefitScratch[mid] = rscratch
-                }
+            if deforming, let rscratch = device.makeBuffer(
+                    length: max(sizes.refitScratchBufferSize, 16),
+                    options: .storageModePrivate) {
+                entry.refit = (desc: d, scratch: rscratch)
             }
+            rtMeshCache[mid] = entry
         }
         // (a2) Curve BLASes (#60 item 7) — one per registered set, rebuilt on
         // every topology change (cheap: that's the whole point of curve
@@ -6083,12 +6137,17 @@ public final class IlluminatoramaRenderer {
         }
         // (a3) Glass BLASes (#60 AAA glass) — one per distinct glass mesh kind not
         // already cached (a glass kind may be shared with an opaque mesh, e.g.
-        // `.box`; `rtBLASByMesh` dedupes). Static (no refit / no primUV bake): glass
+        // `.box`; `rtMeshCache` dedupes). Static (no refit / no primUV bake): glass
         // doesn't participate in the surface cache as a hit surface.
         for (kind, _) in glassFlat {
             guard let mesh = meshes[kind], mesh.indexCount >= 3 else { continue }
             let mid = ObjectIdentifier(mesh)
-            if rtBLASByMesh[mid] != nil { continue }
+            if let cached = rtMeshCache[mid] {
+                // Ownership makes this impossible; assert it anyway, because when it was
+                // possible it silently traced the wrong geometry through every glass pane.
+                if cached.mesh !== mesh { rtStaleBLASReuseCount += 1 }
+                continue
+            }
             let geom = MTLAccelerationStructureTriangleGeometryDescriptor()
             geom.vertexBuffer = mesh.vertexBuffer
             geom.vertexStride = MemoryLayout<IlluminatoramaVertex>.stride
@@ -6103,8 +6162,8 @@ public final class IlluminatoramaRenderer {
                   let scratch = device.makeBuffer(length: max(sizes.buildScratchBufferSize, 16),
                                                    options: .storageModePrivate) else { continue }
             blas.label = "Illuminatorama.rt.blas.glass"
-            rtBLASByMesh[mid] = blas
-            rtNormalsByMesh[mid] = mesh.objectFaceNormals()
+            rtMeshCache[mid] = RTMeshEntry(mesh: mesh, blas: blas,
+                                           normals: mesh.objectFaceNormals(), refit: nil)
             pending.append((blas, d, scratch))
         }
         if !pending.isEmpty {
@@ -6128,11 +6187,11 @@ public final class IlluminatoramaRenderer {
             guard let mesh = meshes[group.kind] else { continue }
             let mid = ObjectIdentifier(mesh)
             if slot[mid] != nil { continue }
-            guard let blas = rtBLASByMesh[mid], let nrm = rtNormalsByMesh[mid] else { continue }
+            guard let cached = rtMeshCache[mid] else { continue }
             slot[mid] = (rtBLASList.count, concat.count)
-            rtBLASList.append(blas)
+            rtBLASList.append(cached.blas)
             rtResidentBuffers.append(mesh.vertexBuffer); rtResidentBuffers.append(mesh.indexBuffer)
-            concat.append(contentsOf: nrm)
+            concat.append(contentsOf: cached.normals)
         }
         // Glass meshes join the same BLAS list + concat normals (a glass hit's
         // normal resolves through `objNormal[normalBase + prim]`, same as opaque).
@@ -6140,11 +6199,11 @@ public final class IlluminatoramaRenderer {
             guard let mesh = meshes[kind] else { continue }
             let mid = ObjectIdentifier(mesh)
             if slot[mid] != nil { continue }
-            guard let blas = rtBLASByMesh[mid], let nrm = rtNormalsByMesh[mid] else { continue }
+            guard let cached = rtMeshCache[mid] else { continue }
             slot[mid] = (rtBLASList.count, concat.count)
-            rtBLASList.append(blas)
+            rtBLASList.append(cached.blas)
             rtResidentBuffers.append(mesh.vertexBuffer); rtResidentBuffers.append(mesh.indexBuffer)
-            concat.append(contentsOf: nrm)
+            concat.append(contentsOf: cached.normals)
         }
         guard !rtBLASList.isEmpty, !concat.isEmpty else { return }
         rtObjNormalBuffer = device.makeBuffer(
