@@ -176,6 +176,35 @@ public final class IlluminatoramaRenderer {
     public var stabilityDebug: (full: Int, shape: Int, glass: Int) {
         (instanceStableFrames, instanceShapeStableFrames, glassStableFrames)
     }
+
+    /// Read-only per-frame DRAW CENSUS for host-side profiling (additive; nothing
+    /// in the renderer reads it). Answers "what does one frame of this document
+    /// actually cost in draw work?" without the host having to re-derive the
+    /// grouped layout or keep its own mesh table:
+    ///
+    ///   • `instances`         — CPU instance refs the host set this frame.
+    ///   • `meshGroups`        — distinct draw groups (≈ draw calls in the raster passes).
+    ///   • `expandedTriangles` — instance-EXPANDED triangle count (Σ group.count ×
+    ///                           mesh tris), i.e. what the G-buffer + shadow passes
+    ///                           actually rasterise, not the per-mesh sum.
+    ///   • `rtActive` / `rtAutoDisabled` — whether the ray-traced TLAS path is live,
+    ///                           and whether the renderer self-disabled it (heavy /
+    ///                           thrashing scene). A silently auto-disabled RT changes
+    ///                           what a measured frame means, so profilers must see it.
+    ///   • `gpuRepackTasks`    — count of compute-fed geometry tasks (e.g. the grass
+    ///                           field). NON-ZERO DEFEATS THE SHADOW STATIC-SKIP
+    ///                           (`sceneStaticForShadows`), so this is the number that
+    ///                           explains "why is my camera-only frame still re-rendering
+    ///                           every spot/point shadow map?".
+    public var frameDrawCensus: (instances: Int, meshGroups: Int, expandedTriangles: Int,
+                                 rtActive: Bool, rtAutoDisabled: Bool, gpuRepackTasks: Int) {
+        var tris = 0
+        for g in meshGroups {
+            if let m = meshes[g.kind] { tris += g.count * (m.indexCount / 3) }
+        }
+        return (instances.count, meshGroups.count, tris,
+                rtTLASActive, rtAutoDisabled, gpuRepackTasks.count)
+    }
     private var lastUploadedInstances: [InstanceRef] = []
     private var instanceStableFrames: Int = 0
     /// Frames since any instance's SHAPE (meshKind / modelMatrix / sway fields)
@@ -948,8 +977,68 @@ public final class IlluminatoramaRenderer {
     /// Silicon's tile memory absorbs much of the bandwidth hit on the
     /// G-buffer pass; the lighting kernel is the dominant cost.
     ///
-    /// Changes take effect on the next `resize(width:height:)` call.
-    public var internalRenderScale: Float = 1.5
+    /// **Values BELOW 1.0 render sub-native and upscale on present** — the
+    /// draft/navigation lever. A deferred frame at this quality tier is almost
+    /// purely fill-bound (measured on an architectural document: ≈4 ms fixed +
+    /// 2.3 ms per internal megapixel), so the pixel count is the one knob that
+    /// moves the whole frame. 1.5 → 1.0 on a 2560×1440 canvas measured
+    /// 22.9 ms → 14.2 ms (−38 %). The tonemap is the only pass that bridges
+    /// internal → output and it samples with a `filter::linear`,
+    /// `clamp_to_edge` sampler in NORMALISED coordinates, so it magnifies as
+    /// correctly as it minifies; nothing downstream assumes internal ≥ output.
+    /// Clamped to `internalRenderScaleRange` (0.5 … 4.0) — see
+    /// `minInternalRenderScale` for why 0.5 is the floor.
+    ///
+    /// Assigning this **reallocates the internal render targets immediately**
+    /// (it re-runs `resize` at the current output size) and resets every
+    /// temporal accumulator, exactly as an output resize does. That is a real
+    /// cost — see `resize` for the measured numbers — so hosts that flip
+    /// between a draft and a photoreal tier must debounce the transition
+    /// (drag-start / settle), never drive it per frame. `resize` preserves
+    /// `outputTexture`'s identity across an SSAA-only change, so no host
+    /// rebinding is needed.
+    public var internalRenderScale: Float = IlluminatoramaRenderer.defaultInternalRenderScale {
+        didSet {
+            // Write the clamped value back so the property always READS as what
+            // the pipeline is actually running at. Assigning a property inside
+            // its own `didSet` does not re-enter the observer, so this cannot
+            // recurse — and the resize below still runs, using `clamped`.
+            let clamped = min(Self.maxInternalRenderScale,
+                              max(Self.minInternalRenderScale, internalRenderScale))
+            if clamped != internalRenderScale { internalRenderScale = clamped }
+            // `oldValue` is always already clamped (this observer maintains that
+            // invariant), so this comparison is apples-to-apples.
+            guard clamped != oldValue, outputWidth > 0, outputHeight > 0 else { return }
+            // Re-derive the internal targets at the new scale. `resize` is a
+            // no-op when the rounded internal dims land on the same numbers.
+            resize(width: outputWidth, height: outputHeight)
+        }
+    }
+
+    /// The shipped default, named once so `init` (which cannot read the
+    /// memberwise default before `self` is formed) and the property declaration
+    /// can't drift apart.
+    public nonisolated static let defaultInternalRenderScale: Float = 1.5
+
+    /// Floor for `internalRenderScale`. **0.5** — a half-linear (quarter-pixel)
+    /// internal frame is the lowest tier that still resolves architectural
+    /// detail through the tonemap's 4-tap bilinear magnification, and it is the
+    /// point where the derived chains bottom out usefully: SSAO/bloom run at
+    /// internal/2 and halation at internal/4, so 0.5 of a 1280×800 canvas is
+    /// still a 160×100 halation buffer. Below this the derived chains degenerate
+    /// toward single-texel buffers, TAA/SSR reprojection has too few samples to
+    /// converge, and the upscale is mush — a worse trade than simply drawing
+    /// less. Nothing in the pipeline *crashes* below 0.5 (every derived size is
+    /// `max(1, …)`-guarded and `internalDims` floors at 2×2), so this is a
+    /// quality floor, not a safety one.
+    public nonisolated static let minInternalRenderScale: Float = 0.5
+    /// Above ~4× the internal targets alone run to gigabytes and every pass is
+    /// bandwidth-starved; the ceiling exists so a mis-typed slider can't try to
+    /// allocate a 16× frame and fail every texture.
+    public nonisolated static let maxInternalRenderScale: Float = 4.0
+    public nonisolated static var internalRenderScaleRange: ClosedRange<Float> {
+        minInternalRenderScale...maxInternalRenderScale
+    }
 
     // ── Phase 3 IBL knobs ────────────────────────────────────────────
     /// Master scale on diffuse + specular IBL contribution. 1 = unscaled.
@@ -1613,9 +1702,37 @@ public final class IlluminatoramaRenderer {
     /// lookup (same as disabled). Default 0.05 converges in ~20 frames.
     public var ddgiIrrCacheBlend: Float = 0.05
     private var previousSsaoEnabled: Bool = false
+    private var previousSSAOIntensityActive: Bool = false
 
     private var currentAOHistoryTexture: MTLTexture { aoHistoryToggle ? aoHistoryB : aoHistoryA }
     private var previousAOHistoryTexture: MTLTexture { aoHistoryToggle ? aoHistoryA : aoHistoryB }
+
+    /// Does SSAO contribute anything this frame? At `ssaoIntensity <= 0` all
+    /// three SSAO kernels are per-pixel early-outs that write the constant 1.0
+    /// (see `illumi_ssao` / `illumi_ssao_spatial` in Illuminatorama.metal) — the
+    /// dispatches still ran, still bound the depth + normal G-buffer targets and
+    /// still paid their encoder overhead, to produce a value known on the CPU.
+    /// Measured 1.7 ms of a 22.9 ms frame at 3840×2160 for output nobody uses.
+    /// Mirrors the identical `ssrIntensity > 0` gate the SSR chain already has.
+    private var ssaoActive: Bool { ssaoIntensity > 0 }
+
+    /// Do the SSAO dispatches actually get encoded this frame? Normally the
+    /// negation of "SSAO is off", but if the neutral texture could not be
+    /// allocated the chain runs anyway so the AO the lighting pass reads is
+    /// still correct (the kernels' own early-outs write 1.0). Read by all three
+    /// SSAO encoders AND by the end-of-frame history toggle, so the skip can
+    /// never leave the ping-pong half-advanced.
+    private var ssaoChainEncodes: Bool { ssaoActive || aoNeutralTexture == nil }
+
+    /// 1×1 white AO texture bound in place of the AO history while SSAO is
+    /// skipped. Without it, the lighting kernel would keep reading whatever
+    /// occlusion the AO history held when SSAO was last on — a frozen AO
+    /// stencil baked into the image for as long as intensity stayed at 0. Made
+    /// (and cleared to 1.0 by a clear-only render pass) the first frame it is
+    /// needed, then reused; the lighting kernel derives its sample coordinate
+    /// from `aoTex.get_width()/get_height()` and clamps, so a 1×1 source reads
+    /// as "no occlusion anywhere" at any internal resolution.
+    private var aoNeutralTexture: MTLTexture?
 
     // SSR spatiotemporal: raw gather → temporal → composite into hdrComposite.
     private var ssrRawTexture: MTLTexture        // full-res, rgba16Float
@@ -1753,7 +1870,12 @@ public final class IlluminatoramaRenderer {
     // These let the lighting and composite passes bind the right texture
     // depending on whether the per-signal denoiser is on.
     private var aoSourceTexture: MTLTexture {
-        ssaoDenoiseEnabled ? currentAOHistoryTexture : aoTexture
+        // SSAO skipped this frame ⇒ read the neutral 1.0 source, never a stale
+        // history. Falls back to the normal path if the neutral texture could
+        // not be allocated (correctness over the saving — `encodeSSAOPass` runs
+        // the real passes in that case too).
+        if !ssaoActive, let neutral = aoNeutralTexture { return neutral }
+        return ssaoDenoiseEnabled ? currentAOHistoryTexture : aoTexture
     }
     private var ssrDenoisedTexture: MTLTexture {
         ssrDenoiseEnabled ? currentSSRHistoryTexture : ssrRawTexture
@@ -2414,9 +2536,29 @@ public final class IlluminatoramaRenderer {
     // faulted AS traces to magenta. The descriptor-driven per-scene RT opt-in
     // (Phase 4.36/4.37) runs RT in the live tick loop, so any flagged scene
     // could trip this. Two gates make RT fail safe (fall back to non-RT, never
-    // hang): an UP-FRONT size cap, and a rebuild-THRASH counter. Once tripped,
-    // `rtAutoDisabled` latches until the next scene attach (`resetRTGuard()`).
-    private var rtAutoDisabled: Bool = false
+    // hang): an UP-FRONT size cap, and a rebuild-THRASH counter.
+    //
+    // The guard used to LATCH until the next scene attach, and that was wrong
+    // for an editor. In a document app the model mutates on every tick of a
+    // drag (push/pull a wall ⇒ new wall meshes ⇒ a new topology hash every
+    // frame), so seven frames into the drag the thrash counter tripped, RT
+    // glass switched off mid-gesture, and it NEVER came back: a perf spike
+    // followed by a permanent visual pop, with no user-reachable way to restore
+    // it short of reopening the document. The guard's real job is "don't rebuild
+    // a thrashing TLAS", which stops being true the moment the scene settles.
+    //
+    // So the trip is now RECOVERABLE. While disabled the renderer keeps
+    // evaluating cheap evidence each frame — the size caps (a scene can shrink
+    // back under them) and the topology hash — and re-arms RT once the topology
+    // has held still for `rtRecoveryStableFrames`. A genuinely thrashing scene
+    // (Forest: GPU-fed leaf geometry, a different hash every single frame) never
+    // satisfies that and stays disabled exactly as before, which is the
+    // property the hang-proofing depends on.
+    /// The guard's whole state, as one testable value (see
+    /// `IlluminatoramaRTHangGuard` for the recovery semantics and why they
+    /// changed from a permanent latch).
+    private var rtGuard = IlluminatoramaRTHangGuard()
+    private var rtAutoDisabled: Bool { rtGuard.autoDisabled }
     private var rtConsecutiveRebuilds: Int = 0
     /// Rebuild this many frames running ⇒ topology is thrashing ⇒ disable RT.
     /// Allows a few legitimate settle-frames at scene load before giving up.
@@ -2424,6 +2566,14 @@ public final class IlluminatoramaRenderer {
     /// thrash counter can't catch a SINGLE catastrophic rebuild that never
     /// returns.)
     private static let rtRebuildThrashLimit: Int = 6
+
+    /// Read-only view of the RT hang-guard for hosts and profilers. A silently
+    /// auto-disabled TLAS changes what a measured frame MEANS (no RT glass, no
+    /// RT GI), so this must be inspectable rather than inferred from pixels.
+    public var rtGuardState: (autoDisabled: Bool, trip: IlluminatoramaRTGuardTrip?,
+                              tripCount: Int, framesUntilRetry: Int?) {
+        (rtGuard.autoDisabled, rtGuard.trip, rtGuard.tripCount, rtGuard.framesUntilRetry)
+    }
     /// Scenes past ANY of these caps are too heavy for per-frame RT in the live
     /// tick loop (a single rebuild — thousands of BLAS + CPU normal readbacks +
     /// `waitUntilCompleted` — would stall for seconds-to-minutes). Checked UP
@@ -2459,7 +2609,7 @@ public final class IlluminatoramaRenderer {
     /// `IlluminatoramaOverlay.setExtractedSceneRT`) so a freshly-shown scene
     /// gets a clean chance at RT regardless of what the previous scene did.
     public func resetRTGuard() {
-        rtAutoDisabled = false
+        rtGuard.reset()
         rtConsecutiveRebuilds = 0
     }
 
@@ -2627,11 +2777,11 @@ public final class IlluminatoramaRenderer {
         self.commandQueue = engine.commandQueue
         self.shadowMapResolution = shadowMapResolution
         // `width` / `height` are the OUTPUT (host-visible) target size; the
-        // internal pipeline runs at `output × initialScale`. The init scale
-        // mirrors the default `internalRenderScale` field above — we can't
-        // read `self.internalRenderScale` before its memberwise default
-        // applies, so duplicate the literal here.
-        let initialScale: Float = 1.5
+        // internal pipeline runs at `output × initialScale`. We can't read
+        // `self.internalRenderScale` before its memberwise default applies, so
+        // read the SAME static the property's default expression reads — one
+        // source, no literal to keep in sync.
+        let initialScale = Self.defaultInternalRenderScale
         self.outputWidth  = max(1, width)
         self.outputHeight = max(1, height)
         let (iw, ih) = Self.internalDims(outputW: self.outputWidth,
@@ -3859,7 +4009,7 @@ public final class IlluminatoramaRenderer {
     /// passes so downstream reads see fresh interleaved vertices.
     private func encodeGPURepacks(_ cb: MTLCommandBuffer) {
         guard !gpuRepackTasks.isEmpty else { return }
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "gpuMesh.repack") else { return }
         enc.label = "Illuminatorama.gpuMesh.repack"
         enc.setComputePipelineState(repackPosNormPipeline)
         for task in gpuRepackTasks {
@@ -5553,6 +5703,17 @@ public final class IlluminatoramaRenderer {
         return h
     }
 
+    /// ONE place that turns the RT hang-guard off, so the two trip sites can't
+    /// drift in what state they leave behind. `recordTrip` reports whether this
+    /// was a real transition, so the log fires once per trip rather than once
+    /// per frame (both trips are re-evaluated every frame now, and a per-frame
+    /// `warning` would be a log flood for the whole length of a drag).
+    private func tripRTGuard(_ trip: IlluminatoramaRTGuardTrip, _ detail: String) {
+        rtTLASActive = false
+        guard rtGuard.recordTrip(trip) else { return }
+        Self.log.warning("Illuminatorama RT auto-disabled (\(trip.rawValue)) — \(detail). Falling back to non-RT.")
+    }
+
     private func updateRTAccel(_ cb: MTLCommandBuffer) {
         // P1c — surface-cache scenes now ride the TLAS too: the lighting pass
         // reads cards via `soupTriBase[instance_id] + primitive_id`, while the
@@ -5566,7 +5727,7 @@ public final class IlluminatoramaRenderer {
         let hasGlass = !glassGroups.isEmpty
         let extractedRT = buildRTFromExtractedScene && rtEnabled
             && !meshGroups.isEmpty && !instances.isEmpty
-        guard rtTLASSupported, !rtAutoDisabled, (extractedRT || hasGlass) else {
+        guard rtTLASSupported, (extractedRT || hasGlass) else {
             rtTLASActive = false; return }
         // Curve primitives (#60 item 7): adopt registry changes BEFORE the
         // topology hash, so a registration/unregistration lands as a rebuild.
@@ -5574,38 +5735,67 @@ public final class IlluminatoramaRenderer {
         // Hang-proof gate 1 (up-front size cap — the PRIMARY defence): a scene
         // this heavy would stall on its very first rebuild (which never returns
         // for minutes), so the thrash counter below could never catch it. Reject
-        // BEFORE any build, based on a cheap cost estimate. Latches until the
-        // next scene attach.
-        var estTriangles = 0
-        for g in meshGroups {
-            if let m = meshes[g.kind] { estTriangles += m.indexCount / 3 }
-        }
+        // BEFORE any build, based on a cheap cost estimate. Re-evaluated EVERY
+        // frame (the estimate is a loop over ≤128 mesh groups), so a scene that
+        // sheds geometry — a floor hidden, a city context switched off — gets RT
+        // back without a scene re-attach.
         var glassInstCount = 0
-        for (kind, insts) in glassGroups {
-            glassInstCount += insts.count
-            if let m = meshes[kind] { estTriangles += m.indexCount / 3 }
-        }
+        for (_, insts) in glassGroups { glassInstCount += insts.count }
         // A glass-only TLAS (glass opted in, full-scene RT lighting off) traces from
         // only the glass fragments, so it carries a much higher triangle ceiling than
         // the per-pixel RT-lighting path — an interior with a lawn otherwise trips the
         // strict cap and its windows silently drop to the flat fallback.
         let triCap = extractedRT ? Self.rtMaxTrianglesForLiveRT
                                  : Self.rtMaxTrianglesForGlassOnlyRT
-        if instances.count + glassInstCount > Self.rtMaxInstancesForLiveRT
+        // O(1) caps first, triangle sum only if they pass. This ordering matters
+        // now that the guard re-evaluates every frame instead of latching: a
+        // scene that busts the mesh-group cap (thousands of groups) would
+        // otherwise pay a full dictionary-lookup loop every frame purely to
+        // re-confirm it is still too heavy.
+        var overCap = instances.count + glassInstCount > Self.rtMaxInstancesForLiveRT
             || meshGroups.count > Self.rtMaxMeshGroupsForLiveRT
-            || estTriangles > triCap {
-            rtAutoDisabled = true
-            rtTLASActive = false
-            Self.log.warning("""
-                Illuminatorama RT auto-disabled — scene too heavy for live-loop \
-                RT (\(self.instances.count) instances, \(self.meshGroups.count) mesh \
-                groups, ~\(estTriangles) tris; caps \
-                \(Self.rtMaxInstancesForLiveRT)/\(Self.rtMaxMeshGroupsForLiveRT)/\(triCap)). \
-                Falling back to non-RT.
+        var estTriangles = -1                     // −1 = not computed (cap already busted)
+        if !overCap {
+            estTriangles = 0
+            for g in meshGroups {
+                if let m = meshes[g.kind] { estTriangles += m.indexCount / 3 }
+            }
+            for (kind, _) in glassGroups {
+                if let m = meshes[kind] { estTriangles += m.indexCount / 3 }
+            }
+            overCap = estTriangles > triCap
+        }
+        if overCap {
+            let tris = estTriangles < 0 ? "n/a" : "~\(estTriangles)"
+            tripRTGuard(.sceneTooHeavy, """
+                scene too heavy for live-loop RT \
+                (\(instances.count) instances, \(meshGroups.count) mesh groups, \
+                \(tris) tris; caps \
+                \(Self.rtMaxInstancesForLiveRT)/\(Self.rtMaxMeshGroupsForLiveRT)/\(triCap))
                 """)
             return
         }
         let topo = rtTopologyHash()
+        // Recovery gate: the scene is back under the size caps, so the only
+        // reason RT could still be off is the thrash trip. Re-arm it once the
+        // topology has genuinely settled — a scene that is STILL churning (a
+        // drag in progress, Forest's per-frame leaf geometry) never gets here
+        // because its hash moves every frame and the counter keeps resetting.
+        if rtAutoDisabled {
+            let previousTrip = rtGuard.trip?.rawValue ?? "?"
+            guard rtGuard.admitsRetry(topologyHash: topo) else {
+                rtTLASActive = false
+                return
+            }
+            Self.log.info("""
+                Illuminatorama RT re-armed — topology held for \
+                \(IlluminatoramaRTHangGuard.recoveryStableFrames) frames after a \
+                \(previousTrip) trip.
+                """)
+            rtConsecutiveRebuilds = 0
+            // Fall through: `topo` will differ from `rtTLASTopologyHash` (or the
+            // TLAS is nil), so the rebuild branch below builds it once.
+        }
         if topo != rtTLASTopologyHash || rtTLAS == nil {
             // Hang-proof gate 2 (rebuild-thrash): topology changing every frame
             // (GPU-fed / regenerated geometry — e.g. Forest's LeafField + bark +
@@ -5613,12 +5803,10 @@ public final class IlluminatoramaRenderer {
             // magenta. Allow a few legitimate settle frames, then disable.
             rtConsecutiveRebuilds += 1
             if rtConsecutiveRebuilds > Self.rtRebuildThrashLimit {
-                rtAutoDisabled = true
-                rtTLASActive = false
-                Self.log.warning("""
-                    Illuminatorama RT auto-disabled — TLAS rebuilt \
-                    \(self.rtConsecutiveRebuilds) frames running (topology \
-                    thrashing: GPU-fed / animated-topology scene). Falling back to non-RT.
+                tripRTGuard(.topologyThrashing, """
+                    TLAS rebuilt \(rtConsecutiveRebuilds) frames running (topology \
+                    thrashing: GPU-fed / animated-topology / actively-edited scene). \
+                    Retrying after \(IlluminatoramaRTHangGuard.recoveryStableFrames) settled frames
                     """)
                 return
             }
@@ -6778,6 +6966,47 @@ public final class IlluminatoramaRenderer {
         }
     }
 
+    /// Resize to a new OUTPUT size, reallocating every internal target at
+    /// `output × internalRenderScale`. Also the path an `internalRenderScale`
+    /// change takes (its `didSet` calls this at the unchanged output size), so
+    /// the two are one mechanism, not two.
+    ///
+    /// **Cost — the numbers a host needs before it wires this to an
+    /// interaction.** MEASURED on an M1 Max, allocating the exact target list
+    /// `makeTargets` builds, output 2560×1440:
+    ///
+    /// | scale | internal | target set |
+    /// |---|---|---|
+    /// | 0.5 | 1280×720 | 179 MB |
+    /// | 1.0 | 2560×1440 | 715 MB |
+    /// | 1.5 | 3840×2160 | 1609 MB |
+    ///
+    /// (a flat 194 bytes per internal pixel: twenty `rgba16Float` full-res
+    /// buffers plus depth ×2, velocity, layer and the SVGF counters).
+    ///
+    ///   • **CPU side of the swap: ~0.15 ms** (p50 0.14–0.17 ms over n=21
+    ///     alternating transitions, any tier pair). Negligible.
+    ///   • **First GPU use of the new set: ~30 µs per MB** — Metal backs
+    ///     `.private` textures lazily, so the page-in lands on the frame after
+    ///     the resize: +5 ms at scale 0.5, +24 ms at 1.0, +44 ms at 1.5, one
+    ///     time. THIS is the hitch, not the allocation.
+    ///   • **Every temporal accumulator is reset** (TAA, SSAO, SSR and RT-GI
+    ///     reproject against nothing next frame), so the image also visibly
+    ///     re-converges over the following handful of frames.
+    ///
+    /// Consequence: a quality-tier flip is a DEBOUNCED, edge-triggered action —
+    /// drop on interaction-start, restore once the interaction has settled. Two
+    /// transitions per gesture cost roughly 24 ms + 44 ms of page-in against a
+    /// saving of ~8.7 ms per frame (1.5 → 1.0 at this canvas size), so it pays
+    /// for itself after ~8 dragged frames and is a large net loss if driven per
+    /// frame. (Keeping two target sets alive to swap between them was considered
+    /// and rejected: 2.3 GB resident to avoid a transition that happens twice
+    /// per gesture. Rendering into a sub-rect of max-size targets — viewport
+    /// scissor — was also rejected: it removes the realloc but needs a "virtual
+    /// size" threaded through every normalised-UV site in the shader library
+    /// (tonemap magnify, TAA/SSR reprojection, bloom chain), risks half-texel
+    /// and edge-bleed errors at every one of them, and keeps the full 1.6 GB
+    /// resident even in draft mode.)
     public func resize(width: Int, height: Int) {
         let outW = max(1, width)
         let outH = max(1, height)
@@ -6919,12 +7148,30 @@ public final class IlluminatoramaRenderer {
     /// Map an output size + scale to the internal render-target size,
     /// rounding to multiples of 2 so the half-res bloom / AO textures
     /// don't end up off-by-one on odd output dimensions.
-    private static func internalDims(outputW: Int, outputH: Int,
-                                      scale: Float) -> (Int, Int) {
-        let s = max(1.0, scale)
-        let iw = max(2, Int((Float(outputW) * s).rounded()) & ~1)
-        let ih = max(2, Int((Float(outputH) * s).rounded()) & ~1)
-        return (iw, ih)
+    ///
+    /// The clamp used to be `max(1.0, scale)` — sub-native rendering was
+    /// impossible, which meant the ONLY direction the pixel cost could move was
+    /// up. A deferred frame is fill-bound, so that clamp was the thing standing
+    /// between the app and a draft/navigation quality tier. It is now
+    /// `internalRenderScaleRange` (0.5 … 4.0); see `minInternalRenderScale`.
+    ///
+    /// Rounding notes: `& ~1` truncates to an even number AFTER `.rounded()`, so
+    /// an odd product rounds DOWN by one — deliberate, because every derived
+    /// chain divides (÷2 for SSAO/bloom, ÷4 for halation) and an even parent is
+    /// what keeps those aligned. `nonZeroSize` never returns 0: a 0-wide texture
+    /// is a hard Metal allocation failure, and `resize` would then silently keep
+    /// the old size forever.
+    ///
+    /// `internal` (not `private`) so the pure-arithmetic contract is testable
+    /// without a Metal device — `swift test` on this package has no metallib and
+    /// cannot construct a renderer at all.
+    nonisolated static func internalDims(outputW: Int, outputH: Int,
+                                         scale: Float) -> (Int, Int) {
+        let s = min(maxInternalRenderScale, max(minInternalRenderScale, scale))
+        func nonZeroSize(_ v: Int) -> Int {
+            max(2, Int((Float(v) * s).rounded()) & ~1)
+        }
+        return (nonZeroSize(max(1, outputW)), nonZeroSize(max(1, outputH)))
     }
 
     // ── Render ────────────────────────────────────────────────────────────────
@@ -7001,6 +7248,11 @@ public final class IlluminatoramaRenderer {
         previousTaaEnabled = taaEnabled
         if ssaoDenoiseEnabled && !previousSsaoEnabled { aoNeedsFirstFrame  = true }
         previousSsaoEnabled = ssaoDenoiseEnabled
+        // SSAO is skipped entirely while `ssaoIntensity <= 0` (the chain gate
+        // below), so its temporal history goes stale during the off period —
+        // re-prime it when intensity comes back, exactly as SSR does.
+        if ssaoActive && !previousSSAOIntensityActive { aoNeedsFirstFrame = true }
+        previousSSAOIntensityActive = ssaoActive
         if ssrDenoiseEnabled  && !previousSsrEnabled  { ssrNeedsFirstFrame = true }
         previousSsrEnabled  = ssrDenoiseEnabled
         // SSR is skipped entirely while `ssrIntensity <= 0` (see the gather/temporal/
@@ -7370,7 +7622,12 @@ public final class IlluminatoramaRenderer {
             taaNeedsFirstFrame = false
             historyToggle.toggle()
         }
-        if ssaoDenoiseEnabled {
+        // Only when SSAO actually RAN this frame. While it's skipped
+        // (`ssaoIntensity <= 0`) the history must neither toggle nor clear its
+        // first-frame flag — otherwise the ping-pong would keep advancing over
+        // two buffers nothing is writing, and a later re-enable would blend
+        // against arbitrarily old occlusion. Same contract as the SSR chain.
+        if ssaoDenoiseEnabled && ssaoChainEncodes {
             aoNeedsFirstFrame = false
             aoHistoryToggle.toggle()
         }
@@ -7479,7 +7736,7 @@ public final class IlluminatoramaRenderer {
         pass.colorAttachments[0].loadAction = .clear
         pass.colorAttachments[0].storeAction = .store
         pass.colorAttachments[0].clearColor = MTLClearColor(red: 0.85, green: 0.86, blue: 0.90, alpha: 1)
-        if let enc = cb.makeRenderCommandEncoder(descriptor: pass) {
+        if let enc = timedRenderEncoder(cb, pass, "blankSky") {
             enc.label = "Illuminatorama.blankSky"
             enc.endEncoding()
         }
@@ -7504,7 +7761,7 @@ public final class IlluminatoramaRenderer {
             pass.depthAttachment.storeAction = .store
             pass.depthAttachment.clearDepth = 1.0
 
-            guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { continue }
+            guard let enc = timedRenderEncoder(cb, pass, "shadow.sunCascades") else { continue }
             enc.label = "Illuminatorama.shadow.c\(cascade)"
             enc.setRenderPipelineState(shadowPipeline)
             enc.setDepthStencilState(depthState)
@@ -7714,7 +7971,7 @@ public final class IlluminatoramaRenderer {
             spotShadowPassLabels.append("Illuminatorama.spotShadow.s\(slice)")
         }
         for slice in 0..<count {
-            guard let enc = cb.makeRenderCommandEncoder(descriptor: spotShadowPassDescs[slice]) else { continue }
+            guard let enc = timedRenderEncoder(cb, spotShadowPassDescs[slice], "shadow.spot") else { continue }
             enc.label = spotShadowPassLabels[slice]
             enc.setRenderPipelineState(shadowPipeline)
             enc.setDepthStencilState(depthState)
@@ -7875,7 +8132,7 @@ public final class IlluminatoramaRenderer {
             let cube = Int(pl.shadowCubeIndex)
             for f in 0..<6 {
                 let slice = cube * 6 + f
-                guard let enc = cb.makeRenderCommandEncoder(descriptor: pointShadowPassDescs[slice]) else { continue }
+                guard let enc = timedRenderEncoder(cb, pointShadowPassDescs[slice], "shadow.point") else { continue }
                 enc.label = pointShadowPassLabels[slice]
                 enc.setRenderPipelineState(shadowPipeline)
                 enc.setDepthStencilState(depthState)
@@ -8319,7 +8576,7 @@ public final class IlluminatoramaRenderer {
         pass.depthAttachment.texture = depthTexture
         pass.depthAttachment.loadAction = .load          // test vs scene depth
         pass.depthAttachment.storeAction = .dontCare     // no depth write
-        guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return }
+        guard let enc = timedRenderEncoder(cb, pass, "glass") else { return }
         enc.label = useRT ? "Illuminatorama.glass.rt"
             : (cheap ? "Illuminatorama.glass.cheap\(effectiveCheapMode)\(autoCheapFallback && glassCheapMode == 0 ? "-auto" : "")" : "Illuminatorama.glass.fallback")
         enc.setRenderPipelineState(pipeline)
@@ -8417,7 +8674,7 @@ public final class IlluminatoramaRenderer {
         pass.depthAttachment.storeAction = .store
         pass.depthAttachment.clearDepth = 1.0
 
-        guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return }
+        guard let enc = timedRenderEncoder(cb, pass, "gbuffer") else { return }
         enc.label = "Illuminatorama.gbuffer"
         enc.setRenderPipelineState(gbufferPipeline)
         enc.setDepthStencilState(depthState)
@@ -8566,7 +8823,7 @@ public final class IlluminatoramaRenderer {
         iblLastBakeTime = time
 
         let sky = equirectSky ?? dummySkyTexture
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "iblBake") else { return }
         enc.label = "Illuminatorama.iblBake"
 
         // ── Diffuse irradiance ─────────────────────────────────────
@@ -8824,7 +9081,7 @@ public final class IlluminatoramaRenderer {
         let raysPerProbe = max(1, ddgiRaysPerProbe)
         let sky = equirectSky ?? dummySkyTexture
 
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "ddgi") else { return }
         enc.label = "Illuminatorama.ddgi"
 
         // ── Trace: (raysPerProbe, probeCount) 2D dispatch ───────────────
@@ -8868,7 +9125,43 @@ public final class IlluminatoramaRenderer {
         enc.endEncoding()
     }
 
+    /// Make (once) and clear the 1×1 neutral-white AO texture. A clear-only
+    /// render pass is the cheapest portable way to put a known value into a
+    /// `.private` texture — the same idiom `encodeBlankSkyPass` already uses —
+    /// and it costs one encoder, one time, only on a frame where SSAO is off.
+    /// Returns false if the texture could not be allocated, in which case the
+    /// caller must fall back to actually running the SSAO passes.
+    @discardableResult
+    private func ensureNeutralAOTexture(_ cb: MTLCommandBuffer) -> Bool {
+        if aoNeutralTexture != nil { return true }
+        let d = MTLTextureDescriptor()
+        d.textureType = .type2D
+        d.pixelFormat = .r16Float          // matches the AO chain's format
+        d.width = 1
+        d.height = 1
+        d.usage = [.renderTarget, .shaderRead]
+        d.storageMode = .private
+        guard let tex = device.makeTexture(descriptor: d) else {
+            Self.log.error("Illuminatorama: neutral AO texture allocation failed — SSAO skip disabled")
+            return false
+        }
+        tex.label = "Illuminatorama.ao.neutral"
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = tex
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .store
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: 1, green: 1, blue: 1, alpha: 1)
+        guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return false }
+        enc.label = "Illuminatorama.ao.neutralClear"
+        enc.endEncoding()
+        aoNeutralTexture = tex
+        return true
+    }
+
     private func encodeSSAOPass(_ cb: MTLCommandBuffer) {
+        // Skip the whole SSAO chain when it can only produce 1.0. The lighting
+        // pass reads `aoNeutralTexture` instead (see `aoSourceTexture`).
+        if !ssaoActive, ensureNeutralAOTexture(cb) { return }
         let halfW = max(1, width / 2)
         let halfH = max(1, height / 2)
         guard let enc = timedComputeEncoder(cb, "ssao") else { return }
@@ -8883,7 +9176,7 @@ public final class IlluminatoramaRenderer {
     }
 
     private func encodeSSAOSpatialFilter(_ cb: MTLCommandBuffer) {
-        guard ssaoDenoiseEnabled else { return }
+        guard ssaoDenoiseEnabled, ssaoChainEncodes else { return }
         let halfW = max(1, width / 2)
         let halfH = max(1, height / 2)
         guard let enc = timedComputeEncoder(cb, "ssao.spatial") else { return }
@@ -8899,7 +9192,7 @@ public final class IlluminatoramaRenderer {
     }
 
     private func encodeSSAOTemporalPass(_ cb: MTLCommandBuffer) {
-        guard ssaoDenoiseEnabled else { return }
+        guard ssaoDenoiseEnabled, ssaoChainEncodes else { return }
         let halfW = max(1, width / 2)
         let halfH = max(1, height / 2)
         guard let enc = timedComputeEncoder(cb, "ssao.temporal") else { return }
@@ -8989,6 +9282,16 @@ public final class IlluminatoramaRenderer {
             return cb.makeComputeCommandEncoder(descriptor: pd)
         }
         return cb.makeComputeCommandEncoder()
+    }
+
+    /// Raster counterpart of `timedComputeEncoder` — brackets the render pass with
+    /// the same GPU timestamp pair so the G-buffer / shadow / glass / tonemap
+    /// passes appear in the per-pass breakdown instead of vanishing into an
+    /// untimed remainder. No-op (plain encoder) when the pass timer is off.
+    private func timedRenderEncoder(_ cb: MTLCommandBuffer,
+                                    _ pass: MTLRenderPassDescriptor,
+                                    _ label: String) -> MTLRenderCommandEncoder? {
+        cb.makeRenderCommandEncoder(descriptor: passTimer.attach(to: pass, label: label))
     }
 
     private func encodeLightingPass(_ cb: MTLCommandBuffer) {
@@ -9265,7 +9568,7 @@ public final class IlluminatoramaRenderer {
             blend: max(0.01, min(1.0, rtGITemporalBlend)),
             gammaClamp: max(1.0, rtGITemporalClamp))
         memcpy(rtGITemporalUniformBuffer.contents(), &u, MemoryLayout<RTGITemporalUniforms>.stride)
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "rt.giTemporal") else { return }
         enc.label = "Illuminatorama.rt.giTemporal"
         enc.setComputePipelineState(rtGITemporalPipeline)
         enc.setTexture(rtDiffuseTexture,           index: 0)  // current raw GI
@@ -9363,7 +9666,7 @@ public final class IlluminatoramaRenderer {
                                    enabled: 0, radius: 0,
                                    kDepth: 0, kNorm: 0)
         memcpy(rtDenoiseUniformBuffer.contents(), &du, MemoryLayout<RTDenoiseUniforms>.stride)
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "svgf.composite") else { return }
         enc.label = "Illuminatorama.svgf.composite"
         enc.setComputePipelineState(rtDenoisePipeline)
         enc.setTexture(source,              index: 0)
@@ -9392,7 +9695,7 @@ public final class IlluminatoramaRenderer {
             kDepth: max(0, rtDenoiseDepthSensitivity),
             kNorm: max(0, rtDenoiseNormalSharpness))
         memcpy(rtDenoiseUniformBuffer.contents(), &u, MemoryLayout<RTDenoiseUniforms>.stride)
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "rt.denoise") else { return }
         enc.label = "Illuminatorama.rt.denoise"
         enc.setComputePipelineState(rtDenoisePipeline)
         enc.setTexture(rtDiffuseDenoiseSource, index: 0)
@@ -9423,7 +9726,7 @@ public final class IlluminatoramaRenderer {
             width: UInt32(width), height: UInt32(height), feather: volFeather,
             isOutdoor: volOutdoorMode ? 1 : 0)
         memcpy(volUniformBuffer.contents(), &u, MemoryLayout<VolUniforms>.stride)
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "volumetric") else { return }
         enc.label = "Illuminatorama.volumetric"
         enc.setComputePipelineState(pipeline)
         enc.setTexture(depthTexture, index: 0)
@@ -9450,7 +9753,7 @@ public final class IlluminatoramaRenderer {
             maxDist: volSpotBeamMaxDistance, frameSeed: volFrameSeed,
             width: UInt32(width), height: UInt32(height))
         memcpy(volSpotUniformBuffer.contents(), &u, MemoryLayout<VolSpotUniforms>.stride)
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "volumetricSpots") else { return }
         enc.label = "Illuminatorama.volumetricSpots"
         enc.setComputePipelineState(pipeline)
         enc.setTexture(depthTexture, index: 0)
@@ -9479,7 +9782,7 @@ public final class IlluminatoramaRenderer {
         var u = CloudInViewUniforms(invViewProjection: fu.invViewProjection,
                                     cameraWorldPos: SIMD4<Float>(fu.cameraWorldPos, 0))
         memcpy(cloudInViewUniformBuffer.contents(), &u, MemoryLayout<CloudInViewUniforms>.stride)
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "cloudInView") else { return }
         enc.label = "Illuminatorama.cloudInView"
         enc.setComputePipelineState(pipeline)
         enc.setTexture(hdrCompositeTexture, index: 0)
@@ -9611,7 +9914,7 @@ public final class IlluminatoramaRenderer {
             focusDist: max(0.05, dofFocusDistance), aperture: max(0, dofAperture),
             maxRadius: max(0, dofMaxRadius), focusRange: max(0.05, dofFocusRange),
             width: UInt32(width), height: UInt32(height))
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "dof") else { return }
         enc.label = "Illuminatorama.dof"
         enc.setComputePipelineState(pipeline)
         enc.setTexture(displaySource, index: 0)
@@ -9769,7 +10072,7 @@ public final class IlluminatoramaRenderer {
         let now = CACurrentMediaTime()
         lastFrameDuration = max(0.001, min(0.5, now - lastExposureTickTime))
         lastExposureTickTime = now
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "exposureEstimate") else { return }
         enc.label = "Illuminatorama.exposureEstimate"
         enc.setComputePipelineState(exposureEstimatePipeline)
         enc.setTexture(displaySource, index: 0)
@@ -10021,7 +10324,7 @@ public final class IlluminatoramaRenderer {
         guard easedHalationIntensity > 0 else { return }
         let quarterW = max(1, width / 4)
         let quarterH = max(1, height / 4)
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        guard let enc = timedComputeEncoder(cb, "halation") else { return }
         enc.label = "Illuminatorama.halation"
 
         enc.setComputePipelineState(halationThresholdPipeline)
@@ -10053,7 +10356,7 @@ public final class IlluminatoramaRenderer {
         pass.colorAttachments[0].texture = tonemapWriteTarget
         pass.colorAttachments[0].loadAction = .dontCare
         pass.colorAttachments[0].storeAction = .store
-        guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return }
+        guard let enc = timedRenderEncoder(cb, pass, "tonemap") else { return }
         enc.label = "Illuminatorama.tonemap"
         enc.setRenderPipelineState(tonemapPipeline)
         enc.setFragmentTexture(bloomTonemapSource, index: 0)

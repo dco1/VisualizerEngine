@@ -33,8 +33,11 @@ final class IlluminatoramaPassTimer: @unchecked Sendable {
 
     private static let log = Logger(subsystem: AppLog.subsystem, category: "illuminatoramaPassTimer")
 
-    /// Max stage-boundary samples per frame (2 per timed pass → 16 passes).
-    private static let capacity = 32
+    /// Max stage-boundary samples per frame (2 per timed pass → 48 passes).
+    /// Raised from 32 when RENDER passes joined the census: with only the compute
+    /// passes timed, ~80 % of a frame's GPU time landed in the untimed remainder
+    /// and the breakdown couldn't answer "which pass owns the frame".
+    private static let capacity = 96
 
     let enabled: Bool
     private let sidecarPath: String?
@@ -124,6 +127,46 @@ final class IlluminatoramaPassTimer: @unchecked Sendable {
         labels.append(label)
         nextIndex += 2
         return pd
+    }
+
+    /// Attach start/end GPU timestamp sampling to an EXISTING render pass
+    /// descriptor, so the raster passes (G-buffer, sun cascades, spot/point
+    /// shadow slices, glass, tonemap) join the same per-pass census the compute
+    /// passes are in. Returns the descriptor unchanged when timing is off or the
+    /// per-frame sample budget is spent — the caller always gets a usable
+    /// descriptor, so this is safe to wrap around every raster pass.
+    ///
+    /// Render encoders sample at FRAGMENT-start / FRAGMENT-end, NOT vertex-start.
+    /// Measured: bracketing vertex-start→fragment-end made the timed passes sum to
+    /// **2.5× the command buffer's own GPU time** — on a TBDR GPU a fullscreen
+    /// pass's trivial vertex stage is scheduled almost immediately, so that span
+    /// stretches across the whole frame and overlaps every other pass. The
+    /// fragment stage is where a fill-bound pass actually spends its time and the
+    /// fragment intervals are far closer to disjoint, so the sum cross-checks
+    /// against `gpuEndTime − gpuStartTime` instead of exceeding it. Raster passes
+    /// still pipeline somewhat — treat the sum as an upper bound and read the
+    /// `timedFraction` line before trusting any single number.
+    ///
+    /// NOTE the descriptor may be a CACHED one (the shadow-slice descriptors are
+    /// built once and reused every frame), so the attachment is REWRITTEN each
+    /// call with this frame's sample indices — never appended to.
+    @discardableResult
+    func attach(to pass: MTLRenderPassDescriptor, label: String) -> MTLRenderPassDescriptor {
+        guard enabled, let att = pass.sampleBufferAttachments[0] else { return pass }
+        guard let sampleBuffer, nextIndex + 2 <= Self.capacity else {
+            // Out of budget this frame. A cached descriptor would otherwise keep
+            // LAST frame's indices and double-write those slots — clear it.
+            att.sampleBuffer = nil
+            return pass
+        }
+        att.sampleBuffer = sampleBuffer
+        att.startOfVertexSampleIndex = MTLCounterDontSample
+        att.endOfVertexSampleIndex = MTLCounterDontSample
+        att.startOfFragmentSampleIndex = nextIndex
+        att.endOfFragmentSampleIndex = nextIndex + 1
+        labels.append(label)
+        nextIndex += 2
+        return pass
     }
 
     /// Resolve the frame's per-pass timestamps (call from the command buffer's

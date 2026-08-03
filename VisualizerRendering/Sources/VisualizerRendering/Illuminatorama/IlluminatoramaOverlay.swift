@@ -442,11 +442,18 @@ public final class IlluminatoramaOverlay {
         renderer.shadowPcfRadius = UInt32(max(0, min(2, s.shadowPcfRadius)))
         renderer.shadowMaxDistance = Float(s.shadowMaxDistance)
 
-        // Internal render scale — resize() is a no-op when nothing changes.
-        // When it does change it swaps `outputTexture`; the rebind right
-        // after `renderer.render()` (see `tick()`) catches that for free.
-        if abs(renderer.internalRenderScale - Float(s.internalRenderScale)) > 1e-3 {
-            renderer.internalRenderScale = Float(s.internalRenderScale)
+        // Internal render scale. Compare against the CLAMPED value the renderer
+        // would actually adopt: the setter clamps to
+        // `internalRenderScaleRange`, so comparing against the raw setting would
+        // make an out-of-range persisted value (or a widened slider) differ
+        // forever and re-run this block — and the SceneKit rebind — every single
+        // frame. Setting the property reallocates on its own now; `resize` here
+        // is the no-op that keeps this call site correct if that ever changes.
+        let wantScale = min(IlluminatoramaRenderer.maxInternalRenderScale,
+                            max(IlluminatoramaRenderer.minInternalRenderScale,
+                                Float(s.internalRenderScale)))
+        if abs(renderer.internalRenderScale - wantScale) > 1e-3 {
+            renderer.internalRenderScale = wantScale
             renderer.resize(width: renderer.outputWidth, height: renderer.outputHeight)
             displayScene.background.contents = renderer.outputTexture
             boundOutputTexture = ObjectIdentifier(renderer.outputTexture)
