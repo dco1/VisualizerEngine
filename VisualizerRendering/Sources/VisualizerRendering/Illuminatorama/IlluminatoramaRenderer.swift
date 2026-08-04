@@ -8577,7 +8577,16 @@ public final class IlluminatoramaRenderer {
         u.glassInstanceBase = UInt32(rtGlassInstanceBase)
         u.maxBounces = max(2, min(10, rtGlassMaxBounces))
         u.shadowRays = max(0, min(8, rtGlassShadowRays))
-        u.frameSeed = rtInstFrameSeed
+        // The glass pass samples its sun shadow stochastically (one cone ray by default) and
+        // decorrelates the sequence per frame so that TAA can average it back into a smooth
+        // penumbra — `rtGlassShadowRays`' own docs say "TAA cleans the penumbra". When TAA is
+        // NOT resolving, nothing ever averages it, and a walking seed turns that sampling noise
+        // into speckle that CRAWLS on a completely static frame: the camera has stopped, the
+        // scene has stopped, and the trim around a window still boils. Freeze the seed in that
+        // case. The sampling error is identical in magnitude — it just stops moving, which is
+        // the difference between a fixed dither the eye reads as texture and a defect. Strict
+        // no-op for any scene running TAA.
+        u.frameSeed = taaEnabled ? rtInstFrameSeed : 0
         u.surfCacheEnabled = cacheOn ? 1 : 0
         u.surfTriCount = cacheOn ? UInt32(rtTriangleCount) : 0
         u.surfAtlasW = cacheOn ? UInt32(surfAtlasW) : 0
