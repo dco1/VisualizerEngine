@@ -810,6 +810,52 @@ public final class IlluminatoramaMesh {
         return out
     }
 
+    /// Per-triangle MESH UVs — the same `(uvA, uvB, uvC)` the rasteriser
+    /// interpolates in `illumi_fs` — flattened to 3 entries per triangle, in the
+    /// EXACT triangle order `objectFaceNormals()` uses. A ray-traced hit therefore
+    /// reads its texture coordinates at `uv[(normalBase + primitive_id) * 3 + k]`,
+    /// the same `normalBase + prim` indexing the normals already use, and can
+    /// barycentric-interpolate a real atlas sample instead of collapsing the
+    /// surface to the instance's mean albedo (docs/known-issues.md
+    /// "Through-glass scenery is UNTEXTURED"). Returns `[]` if the buffers aren't
+    /// CPU-readable — the shader falls back to the mean albedo in that case.
+    public func objectFaceUVs() -> [SIMD2<Float>] {
+        let triCount = indexCount / 3
+        guard triCount > 0 else { return [] }
+        guard vertexBuffer.storageMode != .private else { return [] }
+        let stride = MemoryLayout<IlluminatoramaVertex>.stride
+        // uv sits after position (float3 + pad) and normal (float3 + pad).
+        let uvOffset = MemoryLayout<IlluminatoramaVertex>.offset(of: \.uv) ?? 32
+        let vcount = vertexCount
+        let vbase = vertexBuffer.contents()
+        let ibase = indexBuffer.contents()
+        var out = [SIMD2<Float>](); out.reserveCapacity(triCount * 3)
+        for t in 0..<triCount {
+            var idx = (0, 0, 0)
+            if indexType == .uint16 {
+                let o = t * 3 * 2
+                idx = (Int(ibase.load(fromByteOffset: o,     as: UInt16.self)),
+                       Int(ibase.load(fromByteOffset: o + 2, as: UInt16.self)),
+                       Int(ibase.load(fromByteOffset: o + 4, as: UInt16.self)))
+            } else {
+                let o = t * 3 * 4
+                idx = (Int(ibase.load(fromByteOffset: o,     as: UInt32.self)),
+                       Int(ibase.load(fromByteOffset: o + 4, as: UInt32.self)),
+                       Int(ibase.load(fromByteOffset: o + 8, as: UInt32.self)))
+            }
+            // Same out-of-range guard as objectFaceNormals: a raw pointer load past
+            // the readable vertex block is UB, and the array MUST stay exactly
+            // 3×triCount long or every later triangle's UVs shift.
+            guard idx.0 < vcount, idx.1 < vcount, idx.2 < vcount else {
+                out.append(.zero); out.append(.zero); out.append(.zero); continue
+            }
+            for i in [idx.0, idx.1, idx.2] {
+                out.append(vbase.load(fromByteOffset: i * stride + uvOffset, as: SIMD2<Float>.self))
+            }
+        }
+        return out
+    }
+
     /// Object-space positions + flat `UInt32` index list read straight from this
     /// mesh's CPU-readable shared-storage buffers (same access pattern as
     /// `objectFaceNormals`). The surface-cache TLAS path (P1c) uses this to bake

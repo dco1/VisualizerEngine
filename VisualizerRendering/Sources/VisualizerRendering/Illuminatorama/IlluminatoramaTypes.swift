@@ -861,6 +861,30 @@ struct IlluminatoramaGlassRTUniforms {
     var wobbleAmp: Float = 0
     /// Global rate multiplier for the beating oscillation modes.
     var wobbleFreq: Float = 1
+    // ── Through-glass parity with the deferred pass ──────────────────
+    // Everything below defaults to "off / neutral", so a host that sets none of
+    // it renders exactly as before.
+    /// Number of local point / spot lights bound at fragment buffers 14 / 15. A
+    /// re-shaded opaque hit accumulates them with the same falloff + cone math the
+    /// deferred kernel uses (no shadow rays — cheap), so a lamp-lit room seen
+    /// through a window isn't black.
+    var pointLightCount: UInt32 = 0
+    var spotLightCount: UInt32 = 0
+    /// Interior day-light separation, mirroring `FrameUniforms.interiorMask` /
+    /// `interiorIBL*` / `interiorAmbient`. A hit whose instance layer intersects
+    /// `interiorMask` gets its sky-IBL scaled by mix(side, up, saturate(N.y)) and
+    /// its ambient supplement scaled by `interiorAmbient` — without this the glass
+    /// pass fills interiors at raw exterior strength and lands several times short.
+    var interiorMask: UInt32 = 0
+    var interiorIBLUp: Float = 1
+    var interiorIBLSide: Float = 1
+    var interiorAmbient: Float = 1
+    /// Whether `objUV` (fragment buffer 12) + the albedo atlas (fragment texture 4)
+    /// are bound and safe to sample. 0 ⇒ fall back to the per-instance mean albedo.
+    var albedoAtlasEnabled: UInt32 = 0
+    /// Bound of `objUV` in float2 entries — a hit past it falls back (guards a mesh
+    /// whose UVs weren't CPU-readable).
+    var objUVCount: UInt32 = 0
 }
 
 /// Per-frame uniforms for the glass caustics kernels. Mirror of `CausticUniforms`

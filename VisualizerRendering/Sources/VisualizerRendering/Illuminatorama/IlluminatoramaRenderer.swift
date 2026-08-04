@@ -2425,6 +2425,10 @@ public final class IlluminatoramaRenderer {
         let mesh: IlluminatoramaMesh
         let blas: MTLAccelerationStructure
         let normals: [SIMD4<Float>]
+        /// Per-triangle mesh UVs (3 per triangle), in the SAME triangle order as
+        /// `normals` — so one `normalBase + primitive_id` resolves both a hit's
+        /// world normal and its texture coordinates. Feeds `rtObjUVBuffer`.
+        let uvs: [SIMD2<Float>]
         // Phase B — deforming-mesh BLAS refit. A DynamicMesh / GPU-fed mesh keeps a
         // STABLE topology (vertex+index count fixed; only positions move each frame),
         // so its BLAS is built once with `.refit` usage and re-fit per frame from the
@@ -2490,6 +2494,13 @@ public final class IlluminatoramaRenderer {
     private var rtBLASList: [MTLAccelerationStructure] = []   // index = accelerationStructureIndex
     private var rtObjNormalBuffer: MTLBuffer?    // concatenated object-space per-tri normals (float4)
     private var rtObjNormalCount: Int = 0
+    /// Concatenated per-triangle MESH UVs (3 × `float2` per triangle), built in
+    /// lockstep with `rtObjNormalBuffer` so a hit reads its texture coordinates at
+    /// `(normalBase + primitive_id) * 3`. Lets a ray-traced hit take a REAL albedo
+    /// atlas sample instead of the instance's mean albedo — the through-glass
+    /// "flat slabs" fix. Nil when no mesh exposed CPU-readable vertices.
+    private var rtObjUVBuffer: MTLBuffer?
+    private var rtObjUVCount: Int = 0
     // Surface cache (P1c): per-TLAS-instance base offset into the grouped soup
     // triangle list (== the `triCard`/`triUVa`/`triUVc` index space). Built
     // alongside the world-space soup in `rebuildRTAccel` when the cache is on,
@@ -6085,7 +6096,8 @@ public final class IlluminatoramaRenderer {
                                                    options: .storageModePrivate) else { continue }
             blas.label = deforming ? "Illuminatorama.rt.blas.deforming" : "Illuminatorama.rt.blas"
             var entry = RTMeshEntry(mesh: mesh, blas: blas,
-                                    normals: mesh.objectFaceNormals(), refit: nil)
+                                    normals: mesh.objectFaceNormals(),
+                                    uvs: mesh.objectFaceUVs(), refit: nil)
             pending.append((blas, d, scratch))
             // Retain the descriptor + a refit-sized scratch so the per-frame refit
             // can re-encode without re-deriving sizes. Refit scratch can differ from
@@ -6163,7 +6175,8 @@ public final class IlluminatoramaRenderer {
                                                    options: .storageModePrivate) else { continue }
             blas.label = "Illuminatorama.rt.blas.glass"
             rtMeshCache[mid] = RTMeshEntry(mesh: mesh, blas: blas,
-                                           normals: mesh.objectFaceNormals(), refit: nil)
+                                           normals: mesh.objectFaceNormals(),
+                                           uvs: mesh.objectFaceUVs(), refit: nil)
             pending.append((blas, d, scratch))
         }
         if !pending.isEmpty {
@@ -6182,6 +6195,19 @@ public final class IlluminatoramaRenderer {
         rtBLASList.removeAll(keepingCapacity: true)
         rtResidentBuffers.removeAll(keepingCapacity: true)
         var concat: [SIMD4<Float>] = []
+        // Per-triangle mesh UVs, concatenated in LOCKSTEP with `concat` (3 entries
+        // per normal). A mesh whose UVs couldn't be read (GPU-private vertices) is
+        // padded with zeros so `normalBase * 3` stays a valid index for every later
+        // mesh — a short array here would shift every subsequent mesh's UVs.
+        var concatUV: [SIMD2<Float>] = []
+        func appendMesh(_ cached: RTMeshEntry) {
+            concat.append(contentsOf: cached.normals)
+            let want = cached.normals.count * 3
+            concatUV.append(contentsOf: cached.uvs.prefix(want))
+            if cached.uvs.count < want {
+                concatUV.append(contentsOf: repeatElement(.zero, count: want - cached.uvs.count))
+            }
+        }
         var slot: [ObjectIdentifier: (asIndex: Int, normalBase: Int)] = [:]
         for group in meshGroups {
             guard let mesh = meshes[group.kind] else { continue }
@@ -6191,7 +6217,7 @@ public final class IlluminatoramaRenderer {
             slot[mid] = (rtBLASList.count, concat.count)
             rtBLASList.append(cached.blas)
             rtResidentBuffers.append(mesh.vertexBuffer); rtResidentBuffers.append(mesh.indexBuffer)
-            concat.append(contentsOf: cached.normals)
+            appendMesh(cached)
         }
         // Glass meshes join the same BLAS list + concat normals (a glass hit's
         // normal resolves through `objNormal[normalBase + prim]`, same as opaque).
@@ -6203,13 +6229,18 @@ public final class IlluminatoramaRenderer {
             slot[mid] = (rtBLASList.count, concat.count)
             rtBLASList.append(cached.blas)
             rtResidentBuffers.append(mesh.vertexBuffer); rtResidentBuffers.append(mesh.indexBuffer)
-            concat.append(contentsOf: cached.normals)
+            appendMesh(cached)
         }
         guard !rtBLASList.isEmpty, !concat.isEmpty else { return }
         rtObjNormalBuffer = device.makeBuffer(
             bytes: concat, length: MemoryLayout<SIMD4<Float>>.stride * concat.count,
             options: .storageModeShared)
         rtObjNormalCount = concat.count
+        rtObjUVBuffer = device.makeBuffer(
+            bytes: concatUV, length: MemoryLayout<SIMD2<Float>>.stride * max(1, concatUV.count),
+            options: .storageModeShared)
+        rtObjUVBuffer?.label = "Illuminatorama.rt.objUV"
+        rtObjUVCount = concatUV.count
         // Curve pool buffers must stay resident for the intersector (the curve
         // BLASes reference them), and the shading kernels read them at hits.
         if !rtCurveBLASList.isEmpty,
@@ -6254,8 +6285,21 @@ public final class IlluminatoramaRenderer {
                 desc.transformationMatrix = packed4x3(inst.modelMatrix)
                 descPtr[i] = desc
                 let nm = inst.normalMatrix
+                // The normal matrix's column `.w` lanes are dead weight for RT (every
+                // consumer builds a float3x3 from `.xyz`), so they carry the two facts
+                // a re-shaded hit needs to shade like the deferred pass does:
+                //   nrm0.w = albedo atlas slice PLUS ONE — so the memset-0 default
+                //            (curve instances, unslotted instances) decodes to −1 =
+                //            "untextured, use the mean albedo" rather than slice 0
+                //   nrm1.w = the instance's light-layer bits (bit-cast; drives light
+                //            masking + the interior day-light separation)
+                // Without these a hit through glass collapses to one flat colour under
+                // exterior-strength fill — the "flat slabs" bug.
+                var c0 = nm.columns.0, c1 = nm.columns.1
+                c0.w = Float(inst.albedoTextureSlice + 1)
+                c1.w = Float(bitPattern: inst.layer)
                 dataPtr[i] = RTInstanceData(
-                    nrm0: nm.columns.0, nrm1: nm.columns.1, nrm2: nm.columns.2,
+                    nrm0: c0, nrm1: c1, nrm2: nm.columns.2,
                     albedoTriBase: SIMD4(inst.albedo, Float(s.normalBase)))
             }
         }
@@ -6297,8 +6341,14 @@ public final class IlluminatoramaRenderer {
                 desc.transformationMatrix = packed4x3(inst.modelMatrix)
                 descPtr[i] = desc
                 let nm = inst.normalMatrix
+                // Glass hits read their material from `glassData`, never the albedo
+                // atlas — declare "untextured" (0 ⇒ slice −1) and "all layers" so the
+                // shared hit-shading helpers can't misread a stale normal-matrix pad.
+                var c0 = nm.columns.0, c1 = nm.columns.1
+                c0.w = 0
+                c1.w = Float(bitPattern: UInt32.max)
                 dataPtr[i] = RTInstanceData(
-                    nrm0: nm.columns.0, nrm1: nm.columns.1, nrm2: nm.columns.2,
+                    nrm0: c0, nrm1: c1, nrm2: nm.columns.2,
                     albedoTriBase: SIMD4(inst.tintIor.x, inst.tintIor.y, inst.tintIor.z, Float(s.normalBase)))
                 glassData[gi] = IlluminatoramaRTGlassData(
                     tintIor: inst.tintIor, rdrf: inst.rdrf, dispersionPad: inst.dispersionPad)
@@ -8614,6 +8664,19 @@ public final class IlluminatoramaRenderer {
         // Oscillation-mode undulation — only on the cheap path (bubble shells).
         u.wobbleAmp = cheap ? max(0, bubbleWobbleAmp) : 0
         u.wobbleFreq = max(0.01, bubbleWobbleFreq)
+        // ── Through-glass parity with the deferred pass (RT path only) ───────
+        // A refracted ray's hit used to be shaded by a strictly poorer model than
+        // the same surface one pixel to the left: mean albedo, no texture, no local
+        // lights, exterior-strength fill. These three give it the same inputs.
+        let rtShade = useRT
+        u.albedoAtlasEnabled = (rtShade && rtObjUVBuffer != nil && rtObjUVCount > 0) ? 1 : 0
+        u.objUVCount = UInt32(rtObjUVCount)
+        u.pointLightCount = rtShade ? UInt32(pointLights.count) : 0
+        u.spotLightCount = rtShade ? UInt32(spotLights.count) : 0
+        u.interiorMask = rtShade ? interiorLayerMask : 0
+        u.interiorIBLUp = max(0, interiorIBLUp)
+        u.interiorIBLSide = max(0, interiorIBLSide)
+        u.interiorAmbient = max(0, interiorAmbient)
         memcpy(glassRTUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaGlassRTUniforms>.stride)
 
         // Screen-space cheap glass (mode 2) samples the scene BEHIND the pane: copy
@@ -8690,6 +8753,18 @@ public final class IlluminatoramaRenderer {
             // its diffuse IBL, so transmitted scenery gets the sky fill (not just
             // the flat ambient supplement) and matches the world beside the pane.
             enc.setFragmentTexture(irradianceCube, index: 3)
+            // Through-glass TEXTURE parity: the per-triangle mesh UVs + the albedo
+            // atlas (and its per-slice letterbox table), so a re-shaded hit samples
+            // the SAME texel the G-buffer would instead of the instance's mean
+            // albedo. Without these the world behind a pane is flat slabs.
+            enc.setFragmentBuffer(rtObjUVBuffer ?? instData, offset: 0, index: 12)
+            enc.setFragmentBuffer(albedoAtlas.uvScaleBuffer, offset: 0, index: 13)
+            enc.setFragmentTexture(albedoAtlas.texture, index: 4)
+            // Local lights: the deferred kernel accumulates point + spot; the glass
+            // pass used to have sun-only, so a lamp-lit room went black through a
+            // window. Same ring buffers the lighting kernel reads this frame.
+            enc.setFragmentBuffer(pointLightBuffer, offset: 0, index: 14)
+            enc.setFragmentBuffer(spotLightBuffer, offset: 0, index: 15)
             // The TLAS references the BLASes which reference mesh buffers — all
             // must be resident for the fragment-stage intersector.
             for blas in rtBLASList { enc.useResource(blas, usage: .read) }
