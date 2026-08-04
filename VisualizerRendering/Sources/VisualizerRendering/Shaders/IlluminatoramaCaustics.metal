@@ -1,5 +1,10 @@
 #include <metal_stdlib>
 #include <metal_raytracing>
+// This pass reads the SAME `rtInstanceDataBuffer` the glass and deferred RT paths
+// read, so it takes `RTInstanceData`/`PrimUV` from the shared header rather than
+// keeping a fourth hand-maintained mirror that silently mis-strides the moment a
+// field is added (which is exactly what `emissionPad` would have done).
+#include "IlluminatoramaSecondary.h"
 using namespace metal;
 using namespace raytracing;
 
@@ -29,13 +34,6 @@ using namespace raytracing;
 // `(py*atlasW + px)*3 + c`.
 
 struct RTGlassData { float4 tintIor; float4 rdrf; float4 dispersionPad; };
-
-struct RTInstanceData {
-    float4 nrm0; float4 nrm1; float4 nrm2;
-    float4 albedoTriBase;
-};
-
-struct PrimUV { float2 uvA; float2 uvB; float2 uvC; };
 
 struct CausticUniforms {
     float4x4 invViewProjection;

@@ -269,6 +269,12 @@ kernel void illumi_rt_lighting(
     half4 nrH = gNormalRgh.read(gid);
     half4 amH = gAlbedoMet.read(gid);
     float3 N = octDecode(float2(nrH.rg));
+    // LOAD-BEARING FLOOR, not a cosmetic clamp: the glossy-reflection cone below is
+    // `roughness² · k` gated on a threshold, and this 0.045 is what keeps that cone
+    // (≥ 2.4e-3 rad) above the ~1e-3 rad at which a cone is sub-pixel and a single
+    // stochastic sample of it is pure per-pixel NOISE rather than blur. The AAA glass
+    // pass had no such floor and shipped visible edge jitter because of it. Lower this
+    // and read `secondaryConeVisible` in IlluminatoramaSecondary.h first.
     float roughness = max(0.045, float(nrH.b));
     float3 albedo = float3(amH.rgb);
     float metalness = float(amH.a);
@@ -484,7 +490,13 @@ kernel void illumi_rt_lighting(
         float3 V = normalize(u.cameraWorldPos - P);
         float NdotV = saturate(dot(N, V));
         float3 R = reflect(-V, N);
-        // Glossy cone widens with roughness; mirror surfaces stay tight.
+        // Glossy cone widens with roughness; mirror surfaces stay tight. This is a
+        // textual twin of the TLAS kernel's cone (IlluminatoramaRTInstanced.metal)
+        // and of the glass pass's, which now share ONE policy in
+        // IlluminatoramaSecondary.h (`kReflConeK` / `secondaryConeVisible`). This
+        // soup kernel does not include that header (it shades a world-space triangle
+        // soup, not instances, so none of the rest applies); it is kept in step by
+        // hand and is safe only because of the roughness floor noted above.
         float coneTheta = roughness * roughness * 1.2;
         // Schlick Fresnel with metal-aware F0.
         float3 F0 = mix(float3(0.04), albedo, metalness);

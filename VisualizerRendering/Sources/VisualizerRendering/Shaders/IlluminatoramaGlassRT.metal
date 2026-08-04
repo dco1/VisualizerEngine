@@ -1,5 +1,10 @@
 #include <metal_stdlib>
 #include <metal_raytracing>
+// The ONE secondary-ray surface shader (mirror structs, RNG, scatter-cone policy,
+// surface-cache read, and `shadeSecondarySurface`), shared with the deferred TLAS
+// kernel in IlluminatoramaRTInstanced.metal. Nothing declared there may be
+// re-declared here — that is the point.
+#include "IlluminatoramaSecondary.h"
 using namespace metal;
 using namespace raytracing;
 
@@ -66,27 +71,8 @@ struct RTGlassData {
     float4 dispersionPad;
 };
 
-// Compact per-instance RT data (grouped order == TLAS instance_id). nrm0..2 are
-// the columns of the 3×3 normal matrix; albedoTriBase.xyz = albedo, .w = the
-// instance's base offset into `objNormal`. Mirror of Swift `RTInstanceData`.
-struct RTInstanceData {
-    float4 nrm0; float4 nrm1; float4 nrm2;
-    float4 albedoTriBase;
-};
-
-// Surface-cache card material (only albedo/emission/normal.w read here, but the
-// full layout is needed so `cards[card]` strides correctly). Mirror of
-// `SurfCard` in IlluminatoramaSurfaceCache.metal.
-struct SurfCard {
-    float4 origin; float4 uAxis; float4 vAxis; float4 normal;
-    float4 albedo; float4 emission;
-    float4 originB; float4 uAxisB; float4 vAxisB; float4 normalB;
-    float4 albedoB; float4 emissionB;
-};
-
-// Per-mesh card UVs baked into the BLAS primitive_data (#60 item 6). Mirror of
-// Swift `IlluminatoramaPrimUV` (3×float2, 24 B).
-struct PrimUV { float2 uvA; float2 uvB; float2 uvC; };
+// `RTInstanceData`, `SurfCard` and `PrimUV` are the shared mirror structs — see
+// IlluminatoramaSecondary.h.
 
 struct GlassRTUniforms {
     float3 cameraWorldPos;  float rayTMin;
@@ -123,23 +109,8 @@ struct GlassRTUniforms {
     uint   objUVCount;          // bound of objUV in float2 entries
 };
 
-// Mirrors of the deferred kernel's local-light currency (Metal has no cross-file
-// linkage — keep in lockstep with `PointLight` / `SpotLight` in Illuminatorama.metal
-// and the Swift `IlluminatoramaPointLight` / `IlluminatoramaSpotLight`).
-struct GlassPointLight {
-    float3 position;  float radius;
-    float3 color;     uint  layerMask;
-    uint   castsShadow; int shadowCubeIndex; int _pad0; int _pad1;
-};
-struct GlassSpotLight {
-    float3   position;   float innerCone;
-    float3   direction;  float outerCone;
-    float3   color;      float radius;
-    float4x4 shadowMatrix;
-    int      shadowSliceIndex;
-    uint     layerMask;
-    int      _pad1; int _pad2;
-};
+// The local-light currency (`RTPointLight` / `RTSpotLight`) is shared — see
+// IlluminatoramaSecondary.h.
 
 // Mirror of FrameUniforms' leading fields the glass VS needs (viewProjection is
 // first). Only viewProjection is read; the rest pad to the right offset is
@@ -149,60 +120,10 @@ struct GlassFrameUniforms {
     float4x4 viewProjection;
 };
 
-// ── Small helpers (duplicated from the sibling kernels) ──────────────────────
-
-static inline uint pcgHash(uint v) {
-    uint state = v * 747796405u + 2891336453u;
-    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    return (word >> 22u) ^ word;
-}
-static inline float rnd(thread uint& seed) { seed = pcgHash(seed); return float(seed) * (1.0 / 4294967296.0); }
-static inline void onb(float3 n, thread float3& t, thread float3& b) {
-    float s = n.z >= 0.0 ? 1.0 : -1.0; float a = -1.0 / (s + n.z); float d = n.x * n.y * a;
-    t = float3(1.0 + s * n.x * n.x * a, s * d, -s * n.x);
-    b = float3(d, s + n.y * n.y * a, -n.y);
-}
-static inline float3 coneSample(float3 dir, float theta, float u1, float u2) {
-    float cosT = mix(cos(theta), 1.0, u1); float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
-    float phi = 2.0 * M_PI_F * u2; float3 t, b; onb(dir, t, b);
-    return normalize(t * (sinT * cos(phi)) + b * (sinT * sin(phi)) + dir * cosT);
-}
-// ── Frosting cone: ONE definition of how wide it is and whether it is worth sampling ──
-//
-// A rough pane scatters the transmitted/reflected ray inside a cone whose half-angle
-// grows with roughness². Below a certain width that cone cannot frost ANYTHING — it
-// displaces the image by a fraction of a pixel — but it is still sampled with a single
-// stochastic ray, so the only thing it delivers is that displacement as per-pixel NOISE.
-// Architectural glazing lives exactly there: a polished pane at roughness 0.02 gets a
-// 5.6e-4 rad cone, about a third of a pixel at a normal lens and frame size, and paid
-// for it with visibly ragged silhouettes seen through the glass (measured: 0.21 px of
-// excess edge jitter vs the same view with the pane removed, and +36% high-frequency
-// speckle on textured surfaces behind it).
-//
-// So: skip the cone entirely when it is sub-pixel, and when it IS wide enough to see,
-// sample it enough times to resolve it. Both questions are answered from the same
-// number — the count used to be `uint(roughness * 3.0 + 0.5)`, which TRUNCATES to a
-// single sample for every roughness below 0.167, i.e. for every pane that could
-// actually frost. A cone worth tracing is a cone worth averaging.
-constant float kGlassMinConeRad = 1.0e-3;   // ≈0.06°, about half a pixel at a normal lens
-static inline float glassConeRad(float roughness) { return roughness * roughness * 1.4; }
-static inline bool glassConeVisible(float roughness) {
-    return glassConeRad(roughness) > kGlassMinConeRad;
-}
-/// Stochastic samples to average for a cone of this width. Exactly 1 when the cone is
-/// sub-pixel (and then nothing jitters, so the one sample is deterministic).
-static inline uint glassConeSamples(float roughness, float perRoughness, uint cap) {
-    if (!glassConeVisible(roughness)) { return 1u; }
-    return min(cap, 1u + uint(ceil(roughness * perRoughness)));
-}
-static inline float2 dirToEquirectUV(float3 d) {
-    return float2(atan2(d.z, d.x) * (1.0 / (2.0 * M_PI_F)) + 0.5,
-                  acos(clamp(d.y, -1.0, 1.0)) * (1.0 / M_PI_F));
-}
-static inline float3 sampleSky(texture2d<float, access::sample> sky, float3 dir, float scale) {
-    constexpr sampler s(filter::linear, s_address::repeat, t_address::clamp_to_edge);
-    return sky.sample(s, dirToEquirectUV(normalize(dir))).rgb * scale;
-}
+// RNG (`pcgHash`/`rnd`), `onb`/`coneSample`, the sky sample and the scatter-cone
+// policy (`secondaryConeRad`/`secondaryConeVisible`/`secondaryConeSamples`, with
+// `kGlassConeK` as this path's width coefficient) are all shared — see
+// IlluminatoramaSecondary.h.
 
 // ── THIN-FILM INTERFERENCE (soap-bubble iridescence) ─────────────────────────
 // Reflected colour from a single thin dielectric film over a higher-index
@@ -251,110 +172,29 @@ static inline float filmFbm(float3 p) {
     return 0.65 * valueNoise3(p) + 0.35 * valueNoise3(p * 2.7 + 11.3);
 }
 
-// World normal of a triangle hit from the per-instance normal matrix.
-static inline float3 hitWorldNormal(uint iid, uint prim,
-                                    const device RTInstanceData* insts,
-                                    const device float4* objNormal) {
-    RTInstanceData d = insts[iid];
-    uint triBase = uint(d.albedoTriBase.w);
-    float3 nObj = objNormal[triBase + prim].xyz;
-    float3x3 nm = float3x3(d.nrm0.xyz, d.nrm1.xyz, d.nrm2.xyz);
-    float3 n = nm * nObj;
-    float len = length(n);
-    return len > 1e-8 ? n / len : float3(0.0, 1.0, 0.0);
-}
+// `hitWorldNormal`, `secondaryLayerBits`, the textured-albedo tap
+// (`secondaryAlbedo` + `secondaryAtlasSample`) and `sampleSurfCacheRT` are shared —
+// see IlluminatoramaSecondary.h. The albedo tap in particular is the term that
+// stopped the world behind a pane reading as flat slabs, and it is now the SAME
+// code the deferred reflection path runs.
 
-// ── Textured hit albedo ──────────────────────────────────────────────────────
-// The reason the world behind a pane used to read as flat slabs: an opaque hit was
-// shaded with `insts[iid].albedoTriBase.xyz`, the instance's MEAN albedo, with no
-// texture lookup at all — so a plank floor, a tiled wall and a rug all collapsed to
-// one colour each. These two helpers give a hit the same albedo the G-buffer would
-// have written: the per-triangle mesh UVs (concatenated in lockstep with
-// `objNormal`, 3 per triangle) barycentric-interpolated and sampled out of the same
-// albedo atlas slice the instance draws with.
-
-// Aspect-correct atlas sample. Mirror of `sampleAtlasAspect` in Illuminatorama.metal:
-// `uvScale[slice]` is the fraction of the square slice the letterboxed source fills;
-// (1,1) takes the hardware-repeat fast path, otherwise the letterboxed axis is tiled
-// manually and half-texel inset so filtering never bleeds into the empty band.
-static inline float4 glassSampleAtlas(texture2d_array<float, access::sample> atlas,
-                                      sampler s, float2 uv, uint slice,
-                                      const device float2* uvScale) {
-    float2 sc = uvScale[slice];
-    if (sc.x >= 0.999f && sc.y >= 0.999f) { return atlas.sample(s, uv, slice); }
-    float2 texSize = float2(atlas.get_width(), atlas.get_height());
-    float2 halfTexel = 0.5f / texSize;
-    float2 manual = clamp(fract(uv) * sc, halfTexel, sc - halfTexel);
-    float2 st;
-    st.x = (sc.x >= 0.999f) ? uv.x : manual.x;
-    st.y = (sc.y >= 0.999f) ? uv.y : manual.y;
-    return atlas.sample(s, st, slice);
-}
-
-// Albedo at an opaque triangle hit — the atlas texel when the instance carries a
-// slice AND the mesh's UVs are resident, else the per-instance mean (the previous
-// behaviour, which stays the fallback for untextured/GPU-private meshes).
-// Deliberately a SINGLE tap: no hex anti-tiling blend, no normal/roughness maps —
-// this is a secondary ray, and three extra atlas reads per bounce is not worth it.
-static inline float3 hitAlbedo(uint iid, uint prim, float2 bary,
-                               const device RTInstanceData* insts,
-                               const device float2* objUV,
-                               const device float2* uvScale,
-                               texture2d_array<float, access::sample> albedoAtlas,
-                               constant GlassRTUniforms& u) {
-    RTInstanceData d = insts[iid];
-    float3 mean = d.albedoTriBase.xyz;
-    if (u.albedoAtlasEnabled == 0u) { return mean; }
-    // Slice is stored PLUS ONE so the memset-0 default (curve / unslotted instances)
-    // decodes to −1 = untextured, instead of silently sampling atlas slice 0.
-    int slice = int(d.nrm0.w) - 1;
-    if (slice < 0) { return mean; }
-    uint base = (uint(d.albedoTriBase.w) + prim) * 3u;
-    if (base + 2u >= u.objUVCount) { return mean; }  // UVs weren't readable
-    float2 uvA = objUV[base], uvB = objUV[base + 1u], uvC = objUV[base + 2u];
-    float w0 = 1.0 - bary.x - bary.y;
-    float2 uv = w0 * uvA + bary.x * uvB + bary.y * uvC;
-    constexpr sampler texSmp(filter::linear, mip_filter::linear, address::repeat);
-    return glassSampleAtlas(albedoAtlas, texSmp, uv, uint(slice), uvScale).rgb;
-}
-
-// The instance's light-layer bits (bit-cast into the normal matrix's dead `nrm1.w`
-// lane by `rebuildRTAccel`). Drives local-light masking and the interior day-light
-// separation, exactly as `fragLayer` does in the deferred kernel.
-static inline uint hitLayer(uint iid, const device RTInstanceData* insts) {
-    return as_type<uint>(insts[iid].nrm1.w);
-}
-
-// Surface-cache outgoing radiance at a triangle hit (albedo·irradiance +
-// emission). Mirror of `sampleSurfCacheRT` in IlluminatoramaRTInstanced.metal.
-static inline float3 sampleSurfCacheRT(
-    texture2d<float, access::sample> atlas, uint prim, float2 bary,
-    const device SurfCard* cards,
-    const device uint* triCard, const device float4* triUVa, const device float4* triUVc,
-    const device void* primData, const device float4* cardRect, uint atlasW, uint atlasH)
-{
-    uint card = triCard[prim];
-    float4 rect = cardRect[card];
-    float2 uvA, uvB, uvC;
-    if (primData != nullptr) {
-        const device PrimUV* pd = (const device PrimUV*)primData;
-        uvA = pd->uvA; uvB = pd->uvB; uvC = pd->uvC;
-    } else {
-        float4 a = triUVa[prim], c = triUVc[prim];
-        uvA = a.xy; uvB = a.zw; uvC = c.xy;
-    }
-    float w0 = 1.0 - bary.x - bary.y;
-    float2 uv = saturate(w0 * uvA + bary.x * uvB + bary.y * uvC);
-    float2 inset = 0.5 / max(float2(1.0), rect.zw);
-    uv = clamp(uv, inset, 1.0 - inset);
-    float2 px = rect.xy + uv * rect.zw;
-    constexpr sampler samp(filter::linear, address::clamp_to_edge);
-    float3 irr = atlas.sample(samp, px / float2(atlasW, atlasH)).rgb;
-    SurfCard sc = cards[card];
-    bool useB = sc.normal.w > 0.5 && (uvA.x + uvA.y > 1.0);
-    float3 albedo   = useB ? sc.albedoB.xyz   : sc.albedo.xyz;
-    float3 emission = useB ? sc.emissionB.xyz : sc.emission.xyz;
-    return albedo * irr + emission;
+/// This pass's uniforms → the shared `SecondaryShadeParams`. ONE place where the
+/// glass block is translated into the secondary-shading contract; every field of
+/// the glass block that participates in hit shading is listed here, so a term
+/// added to one side cannot be silently dropped on the other.
+static inline SecondaryShadeParams glassSecondaryParams(constant GlassRTUniforms& u) {
+    SecondaryShadeParams p;
+    p.sunDir = u.sunDir;               p.sunSoftnessRad = u.sunSoftnessRad;
+    p.sunColor = u.sunColor;           p.skyIntensity = u.skyIntensity;
+    p.skyAmbient = u.skyAmbient;       p.shadowRays = u.shadowRays;
+    p.interiorMask = u.interiorMask;
+    p.interiorIBLUp = u.interiorIBLUp; p.interiorIBLSide = u.interiorIBLSide;
+    p.interiorAmbient = u.interiorAmbient;
+    p.albedoAtlasEnabled = u.albedoAtlasEnabled;
+    p.objUVCount = u.objUVCount;
+    p.pointLightCount = u.pointLightCount;
+    p.spotLightCount = u.spotLightCount;
+    return p;
 }
 
 // ── Vertex stage ─────────────────────────────────────────────────────────────
@@ -465,9 +305,12 @@ vertex GlassVSOut illumi_glass_rt_vs(
 //   11 surfCards SurfCard[]
 // Fragment textures: 0 = sky equirect, 1 = surface-cache atlas.
 
+/// Buffers this pass reads. Everything the SHARED secondary shading needs lives in
+/// `sec` (one `SecondaryScene`, filled identically by every RT path); the rest is
+/// genuinely glass-specific (the dielectric material table) or surface-cache
+/// plumbing this pass addresses itself.
 struct GlassRTState {
-    const device RTInstanceData* insts;
-    const device float4*         objNormal;
+    SecondaryScene               sec;
     const device RTGlassData*    glassData;
     const device uint*           triCard;
     const device float4*         triUVa;
@@ -475,103 +318,29 @@ struct GlassRTState {
     const device uint*           soupTriBase;
     const device float4*         surfCardRect;
     const device SurfCard*       surfCards;
-    // Through-glass parity (see `hitAlbedo` / `shadeOpaqueHit`).
-    const device float2*         objUV;        // 3 per triangle, `objNormal` order
-    const device float2*         uvScale;      // albedo atlas per-slice letterbox
-    const device GlassPointLight* pointLights;
-    const device GlassSpotLight*  spotLights;
 };
 
-// Indirect (sky + ambient) fill for a re-shaded hit — the SAME terms the deferred
-// lighting pass applies, so the world seen THROUGH glass matches the world beside it
-// (PHOTOREALISM #4: the old flat `albedo * skyAmbient` fill skipped the sky-IBL
-// irradiance entirely, so transmitted scenery lost the sky's cool fill and read
-// hotter + more saturated than the deferred render of the same surface):
-//   • diffuse IBL — the renderer's cosine-convolved `irradianceCube` sampled along
-//     the hit normal, × `iblIntensity` (mirrors `diffuseIBL * frame.iblIntensity`;
-//     kD ≈ 1 for the rough dielectrics a refracted ray typically lands on).
-//   • ambient supplement — upness-weighted 40 % → 100 %, exactly the deferred
-//     `mix(ambCol * 0.4, ambCol, upness)` shaping of `frame.ambientColor`.
-//   • interior separation — a hit whose instance layer intersects `interiorMask`
-//     gets the SAME treatment the deferred kernel gives an interior fragment: its
-//     sky IBL scaled by mix(side, up, saturate(N.y)) and its ambient supplement
-//     scaled by `interiorAmbient`. Without this the glass pass filled interiors at
-//     raw exterior strength — several times short of the room beside the pane, in
-//     the wrong direction on both terms. Both factors are exactly 1.0 (an IEEE
-//     no-op) for any host that never opts in.
-static inline float3 indirectFill(float3 hitN, uint hitLayerBits,
-                                  constant GlassRTUniforms& u,
-                                  texturecube<float, access::sample> irrCube)
-{
-    constexpr sampler cubeSmp(filter::linear);
-    float iblK = 1.0, ambK = 1.0;
-    if (u.interiorMask != 0u && hitLayerBits != 0xFFFFFFFFu &&
-        (hitLayerBits & u.interiorMask) != 0u) {
-        iblK = mix(u.interiorIBLSide, u.interiorIBLUp, saturate(hitN.y));
-        ambK = u.interiorAmbient;
-    }
-    float3 irr = irrCube.sample(cubeSmp, hitN).rgb * max(0.0, u.skyIntensity) * iblK;
-    float upness = saturate(hitN.y * 0.5 + 0.5);
-    return irr + mix(u.skyAmbient * 0.4, u.skyAmbient, upness) * ambK;
-}
-
-// Local point + spot lights at a re-shaded hit — the same falloff and cone math the
-// deferred lighting kernel applies, LAMBERT-only (albedo/π · N·L) and with NO shadow
-// rays: this is a secondary ray, and a shadow ray per light per bounce is not worth
-// it. The layer mask IS honoured (unlike the deferred path, which lets a
-// shadow-mapped light ignore it) because without a shadow map the mask is the only
-// thing keeping a lamp from lighting the room on the other side of a wall.
-// Returns the irradiance-weighted sum; the caller multiplies by albedo.
-static inline float3 localLightFill(float3 P, float3 N, uint layerBits,
-                                    constant GlassRTUniforms& u, GlassRTState st)
-{
-    float3 sum = float3(0.0);
-    for (uint i = 0u; i < u.pointLightCount; ++i) {
-        GlassPointLight pl = st.pointLights[i];
-        if ((pl.layerMask & layerBits) == 0u) continue;
-        float3 toL = pl.position - P;
-        float dist = length(toL);
-        if (dist > pl.radius) continue;
-        float3 L = toL / max(dist, 1e-4);
-        float nl = saturate(dot(N, L));
-        if (nl <= 0.0) continue;
-        float atten = 1.0 / max(dist * dist, 1e-4);
-        float window = saturate(1.0 - pow(dist / pl.radius, 4.0));
-        sum += pl.color * (atten * window * window * nl);
-    }
-    for (uint i = 0u; i < u.spotLightCount; ++i) {
-        GlassSpotLight sl = st.spotLights[i];
-        if ((sl.layerMask & layerBits) == 0u) continue;
-        float3 toL = sl.position - P;
-        float dist = length(toL);
-        if (dist > sl.radius) continue;
-        float3 L = toL / max(dist, 1e-4);
-        float coneAtten = smoothstep(sl.outerCone, sl.innerCone,
-                                     dot(normalize(sl.direction), -L));
-        if (coneAtten <= 0.0) continue;
-        float nl = saturate(dot(N, L));
-        if (nl <= 0.0) continue;
-        float atten = 1.0 / max(dist * dist, 1e-4);
-        float window = saturate(1.0 - pow(dist / sl.radius, 4.0));
-        sum += sl.color * (atten * window * window * coneAtten * nl);
-    }
-    return sum * (1.0 / M_PI_F);
-}
-
 // Re-shade or cache-read an OPAQUE triangle hit's outgoing radiance.
+//
+// The re-shade itself is `shadeSecondarySurface` — the ONE secondary-ray surface
+// shader (IlluminatoramaSecondary.h), shared with the deferred TLAS reflection
+// path. What is left here is only what is genuinely glass-pass-specific: this
+// pass's own surface-cache addressing (no residency feedback, no variance readout)
+// and facing the hit normal against the ray that found it.
 static float3 shadeOpaqueHit(thread intersector<triangle_data, instancing>& isect,
                              instance_acceleration_structure accel,
                              uint iid, uint prim, float2 bary, float3 hitP, float3 rd,
                              constant GlassRTUniforms& u,
                              GlassRTState st,
-                             texture2d<float, access::sample> sky,
                              texture2d<float, access::sample> surfAtlas,
                              texturecube<float, access::sample> irrCube,
                              texture2d_array<float, access::sample> albedoAtlas,
                              thread uint& seed,
                              intersection_result<triangle_data, instancing> res)
 {
-    uint layerBits = hitLayer(iid, st.insts);
+    SecondaryShadeParams p = glassSecondaryParams(u);
+    float3 hitN = hitWorldNormal(iid, prim, st.sec.insts, st.sec.objNormal);
+    if (dot(hitN, rd) > 0.0) hitN = -hitN;             // face the incoming ray
     // Surface-cache-when-available: a resident card returns full multi-bounce L_out.
     if (u.surfCacheEnabled != 0) {
         uint gp = st.soupTriBase[iid] + prim;
@@ -583,39 +352,14 @@ static float3 shadeOpaqueHit(thread intersector<triangle_data, instancing>& isec
                                      st.surfCardRect, u.surfAtlasW, u.surfAtlasH);
         }
         if (hitCard != 0xFFFFFFFFu) {
-            SurfCard sc = st.surfCards[hitCard];
-            float3 scN = hitWorldNormal(iid, prim, st.insts, st.objNormal);
-            if (dot(scN, rd) > 0.0) scN = -scN;
-            return sc.emission.xyz + sc.albedo.xyz * indirectFill(scN, layerBits, u, irrCube);
+            return secondaryCardFallback(st.surfCards[hitCard], hitN,
+                                         secondaryLayerBits(iid, st.sec.insts), p, irrCube);
         }
     }
-    // Re-shade: TEXTURED albedo + indirect (sky IBL + ambient, interior-separated)
-    // + local point/spot lights + direct sun (shadow ray) — the same terms, at the
-    // same strengths, the deferred lighting pass applies. Anything missing here is
-    // visible as the world through a pane being shaded differently from the world
-    // beside it, which is exactly the bug this pass had.
-    float3 hitN = hitWorldNormal(iid, prim, st.insts, st.objNormal);
-    if (dot(hitN, rd) > 0.0) hitN = -hitN;             // face the incoming ray
-    float3 hitA = hitAlbedo(iid, prim, bary, st.insts, st.objUV, st.uvScale, albedoAtlas, u);
-    float3 rad = hitA * indirectFill(hitN, layerBits, u, irrCube);
-    rad += hitA * localLightFill(hitP, hitN, layerBits, u, st);
-    float3 Ld = normalize(u.sunDir);
-    float hN = saturate(dot(hitN, Ld));
-    if (hN > 0.0 && u.shadowRays > 0) {
-        isect.accept_any_intersection(true);
-        uint hits = 0u;
-        for (uint s = 0; s < u.shadowRays; ++s) {
-            ray sr;
-            sr.origin = hitP + hitN * 2e-3;
-            sr.direction = coneSample(Ld, u.sunSoftnessRad, rnd(seed), rnd(seed));
-            sr.min_distance = 2e-3; sr.max_distance = 1e4;
-            if (isect.intersect(sr, accel, 0x01u).type != intersection_type::none) hits++;
-        }
-        isect.accept_any_intersection(false);
-        float vis = 1.0 - float(hits) / float(u.shadowRays);
-        rad += hitA * (1.0 / M_PI_F) * u.sunColor * hN * vis;
-    }
-    return rad;
+    SecondaryHit h;
+    h.P = hitP; h.N = hitN; h.bary = bary;
+    h.instanceID = iid; h.primitiveID = prim;
+    return shadeSecondarySurface(isect, accel, h, p, st.sec, irrCube, albedoAtlas, seed);
 }
 
 // Beer–Lambert attenuation over a path of length L inside glass of tint `tint`
@@ -645,8 +389,9 @@ static float3 traceRefractionPath(
     float3 rd = refract(-V, Ng, 1.0 / max(1.0, iorEntry));
     if (dot(rd, rd) < 1e-8) rd = reflect(-V, Ng);      // grazing guard
     // Frosted: jitter the transmitted ray in a cone ∝ roughness². A sub-pixel cone is
-    // skipped outright — see `glassConeVisible`; on a polished pane it was pure noise.
-    if (glassConeVisible(roughness)) rd = coneSample(normalize(rd), glassConeRad(roughness), rnd(seed), rnd(seed));
+    // skipped outright — see `secondaryConeVisible`; on a polished pane it was pure noise.
+    if (secondaryConeVisible(roughness, kGlassConeK))
+        rd = coneSample(normalize(rd), secondaryConeRad(roughness, kGlassConeK), rnd(seed), rnd(seed));
     float3 ro = P - Ng * eps;                           // start just inside
     float3 throughput = float3(1.0);
     bool inside = true;                                 // inside the entry medium
@@ -672,7 +417,7 @@ static float3 traceRefractionPath(
             uint gi = iid - u.glassInstanceBase;
             RTGlassData gd = st.glassData[gi];
             float hitIOR = max(1.0, gd.tintIor.w);
-            float3 hn = hitWorldNormal(iid, res.primitive_id, st.insts, st.objNormal);
+            float3 hn = hitWorldNormal(iid, res.primitive_id, st.sec.insts, st.sec.objNormal);
             bool exiting = dot(r.direction, hn) > 0.0;  // leaving the medium we're in
             float3 n = exiting ? -hn : hn;              // normal against the ray
             float n1 = curIOR;
@@ -685,7 +430,8 @@ static float3 traceRefractionPath(
                 ro = hitP + n * eps;                    // nudge to the incoming side
                 continue;
             }
-            if (glassConeVisible(gr)) t2 = coneSample(normalize(t2), glassConeRad(gr), rnd(seed), rnd(seed));
+            if (secondaryConeVisible(gr, kGlassConeK))
+                t2 = coneSample(normalize(t2), secondaryConeRad(gr, kGlassConeK), rnd(seed), rnd(seed));
             rd = t2;
             ro = hitP - n * eps;                        // cross the boundary
             // Update medium state. Exiting ⇒ now in air; entering ⇒ in the new glass.
@@ -696,7 +442,7 @@ static float3 traceRefractionPath(
         // Opaque surface: shade it and stop.
         float3 rad = shadeOpaqueHit(isect, accel, iid, res.primitive_id,
                                     res.triangle_barycentric_coord, hitP, r.direction,
-                                    u, st, sky, surfAtlas, irrCube, albedoAtlas, seed, res);
+                                    u, st, surfAtlas, irrCube, albedoAtlas, seed, res);
         return throughput * rad;
     }
     // Bounce budget exhausted — return the accumulated sky as a fallback.
@@ -718,7 +464,8 @@ static float3 traceReflection(
 {
     float eps = max(u.rayTMin, 1e-3);
     float3 dir = R;
-    if (glassConeVisible(roughness)) dir = coneSample(normalize(R), glassConeRad(roughness), rnd(seed), rnd(seed));
+    if (secondaryConeVisible(roughness, kGlassConeK))
+        dir = coneSample(normalize(R), secondaryConeRad(roughness, kGlassConeK), rnd(seed), rnd(seed));
     if (dot(dir, Ng) <= 0.0) dir = R;                   // keep it above the surface
     ray r; r.origin = P + Ng * eps; r.direction = normalize(dir);
     r.min_distance = eps; r.max_distance = 1e4;
@@ -737,7 +484,7 @@ static float3 traceReflection(
     float3 hitP = r.origin + r.direction * res.distance;
     return shadeOpaqueHit(isect, accel, res.instance_id, res.primitive_id,
                           res.triangle_barycentric_coord, hitP, r.direction,
-                          u, st, sky, surfAtlas, irrCube, albedoAtlas, seed, res);
+                          u, st, surfAtlas, irrCube, albedoAtlas, seed, res);
 }
 
 fragment float4 illumi_glass_rt_fs(
@@ -756,8 +503,8 @@ fragment float4 illumi_glass_rt_fs(
     const device SurfCard*           surfCards   [[buffer(11)]],
     const device float2*             objUV       [[buffer(12)]],
     const device float2*             albedoUVScale [[buffer(13)]],
-    const device GlassPointLight*    pointLights [[buffer(14)]],
-    const device GlassSpotLight*     spotLights  [[buffer(15)]],
+    const device RTPointLight*       pointLights [[buffer(14)]],
+    const device RTSpotLight*        spotLights  [[buffer(15)]],
     texture2d<float, access::sample> sky         [[texture(0)]],
     texture2d<float, access::sample> surfAtlas   [[texture(1)]],
     texturecube<float, access::sample> irrCube   [[texture(3)]],
@@ -776,11 +523,12 @@ fragment float4 illumi_glass_rt_fs(
     if (dot(N, V) < 0.0) N = -N;                        // face the viewer (front surface)
 
     GlassRTState st;
-    st.insts = insts; st.objNormal = objNormal; st.glassData = glassData;
+    st.sec.insts = insts;        st.sec.objNormal = objNormal;
+    st.sec.objUV = objUV;        st.sec.uvScale = albedoUVScale;
+    st.sec.pointLights = pointLights; st.sec.spotLights = spotLights;
+    st.glassData = glassData;
     st.triCard = triCard; st.triUVa = triUVa; st.triUVc = triUVc;
     st.soupTriBase = soupTriBase; st.surfCardRect = surfCardRect; st.surfCards = surfCards;
-    st.objUV = objUV; st.uvScale = albedoUVScale;
-    st.pointLights = pointLights; st.spotLights = spotLights;
 
     intersector<triangle_data, instancing> isect;
     isect.set_triangle_cull_mode(triangle_cull_mode::none);
@@ -818,7 +566,7 @@ fragment float4 illumi_glass_rt_fs(
         // noisy (TAA cleans it when static but it shimmers under motion). Average
         // a few stochastic path traces — count scales with roughness, so polished
         // glass pays for exactly one and only frosted glass pays more.
-        uint nRefr = glassConeSamples(roughness, 3.0, 4u);
+        uint nRefr = secondaryConeSamples(roughness, kGlassConeK, 3.0, 4u);
         if (nRefr <= 1u) {
             refr = traceRefractionPath(isect, accel, P, V, N, ior, tint, density,
                                        roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed);
@@ -837,7 +585,7 @@ fragment float4 illumi_glass_rt_fs(
     float3 R = reflect(-V, N);
     float3 refl;
     {
-        uint nRefl = glassConeSamples(roughness, 2.0, 3u);
+        uint nRefl = secondaryConeSamples(roughness, kGlassConeK, 2.0, 3u);
         float3 acc = float3(0.0);
         for (uint s = 0u; s < nRefl; ++s) {
             acc += traceReflection(isect, accel, P, N, R, roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed);

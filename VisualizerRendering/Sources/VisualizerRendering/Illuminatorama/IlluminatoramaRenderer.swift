@@ -1342,13 +1342,20 @@ public final class IlluminatoramaRenderer {
     /// to be > 0; this lets a host disable the 3× cost wholesale.
     public var rtGlassDispersionEnabled: Bool = true
 
-    // ── Through-glass shading parity: three ABLATION switches ───────────────
-    // A refracted ray's opaque hit is shaded with the same inputs the deferred pass
-    // uses — the surface's texture, the local point/spot lights, and the interior
-    // fill separation — instead of a per-instance mean colour under exterior-strength
-    // sky. Each is separately suppressible so a harness can attribute an image-quality
+    // ── Secondary-ray shading parity: three ABLATION switches ───────────────
+    // A SECONDARY ray's opaque hit — refraction or reflection out of the glass pass,
+    // a glossy reflection or GI bounce out of the deferred TLAS kernel — is shaded
+    // with the same inputs the deferred pass uses for a directly-visible surface:
+    // the surface's texture, the local point/spot lights, and the interior fill
+    // separation, instead of a per-instance mean colour under exterior-strength sky.
+    // Each is separately suppressible so a harness can attribute an image-quality
     // number to ONE of them rather than to all three at once. Production leaves all
     // three on; turning one off restores exactly the pre-parity behaviour for that term.
+    //
+    // The `glassHit` prefix is historical — glass was simply where the divergence was
+    // FOUND. Since the shading body was unified into `shadeSecondarySurface`
+    // (IlluminatoramaSecondary.h), these gate every secondary path, which is the only
+    // way an ablation number stays meaningful.
 
     /// Sample the albedo atlas at the hit's barycentric UV. Off ⇒ per-instance mean albedo.
     public var glassHitTexturingEnabled: Bool = true
@@ -2390,6 +2397,13 @@ public final class IlluminatoramaRenderer {
     private struct RTInstanceData {
         var nrm0: SIMD4<Float>; var nrm1: SIMD4<Float>; var nrm2: SIMD4<Float>
         var albedoTriBase: SIMD4<Float>   // xyz = albedo, w = objNormal base (as Float)
+        /// xyz = the instance's SELF-LIT radiance (the emission scalar, intensity
+        /// already folded in). A lamp shade, a TV panel and the night window glow are
+        /// all lit by this term and by nothing else, so a secondary ray that omits it
+        /// renders every one of them dim or absent — seen through a pane, the lamp
+        /// lighting the room went missing. Read by `secondaryEmission` in
+        /// IlluminatoramaSecondary.h. w reserved.
+        var emissionPad: SIMD4<Float> = .zero
     }
     /// Mirror of `RTInstUniforms`.
     private struct RTInstUniforms {
@@ -2417,7 +2431,62 @@ public final class IlluminatoramaRenderer {
         var debugSurfCacheVar: UInt32 = 0
         // Phase 5 / A — residency feedback gate (was _padc1).
         var surfFeedbackEnabled: UInt32 = 0
+        // ── Secondary-hit shading parity (shared with the AAA glass pass) ────
+        // Feed `SecondaryShadeParams` in IlluminatoramaSecondary.h. Defaults are
+        // off/neutral, so a host that wires none of them renders as before.
+        var skyIntensity: Float = 1
+        var interiorMask: UInt32 = 0
+        var interiorIBLUp: Float = 1
+        var interiorIBLSide: Float = 1
+        var interiorAmbient: Float = 1
+        var albedoAtlasEnabled: UInt32 = 0
+        var objUVCount: UInt32 = 0
+        var pointLightCount: UInt32 = 0
+        var spotLightCount: UInt32 = 0
     }
+    /// **The ONE place an instance becomes `RTInstanceData`.** The normal matrix's
+    /// column `.w` lanes are dead weight for RT (every consumer builds a float3x3
+    /// from `.xyz`), so they carry the two facts a re-shaded secondary hit needs to
+    /// shade like the deferred pass does:
+    ///   nrm0.w = albedo atlas slice PLUS ONE — so the memset-0 default (curve
+    ///            instances, unslotted instances) decodes to −1 = "untextured, use
+    ///            the mean albedo" rather than slice 0
+    ///   nrm1.w = the instance's light-layer bits (bit-cast; drives light masking +
+    ///            the interior day-light separation)
+    /// plus `emissionPad`, the self-lit radiance.
+    ///
+    /// This exists because the per-frame REFIT used to write `dataPtr[i].nrm0 =
+    /// nm.columns.0` directly — which wipes both packed lanes, so from the second
+    /// frame after a rebuild every secondary hit silently lost its texture and its
+    /// light masking, and (once emission joined the struct) would have kept a stale
+    /// glow while the real one ramped with nightfall. Rebuild and refit must produce
+    /// byte-identical rows; the only way to guarantee that is to have one function.
+    ///
+    /// `normalBase` is the instance's offset into the concatenated `objNormal` /
+    /// `objUV`, which is topology (fixed at rebuild), so the refit passes back the
+    /// value already in the row.
+    private static func rtInstanceRow(_ inst: IlluminatoramaInstance, normalBase: Float) -> RTInstanceData {
+        var c0 = inst.normalMatrix.columns.0, c1 = inst.normalMatrix.columns.1
+        c0.w = Float(inst.albedoTextureSlice + 1)
+        c1.w = Float(bitPattern: inst.layer)
+        return RTInstanceData(nrm0: c0, nrm1: c1, nrm2: inst.normalMatrix.columns.2,
+                              albedoTriBase: SIMD4(inst.albedo, normalBase),
+                              emissionPad: SIMD4(inst.emission, 0))
+    }
+
+    /// Glass sibling of `rtInstanceRow`. A dielectric boundary is never a shaded hit
+    /// surface — the bounce loop reads its material from `rtGlassDataBuffer` — so the
+    /// packed lanes are pinned to explicit "untextured / every layer / no emission"
+    /// values instead of being left to whatever the normal matrix's padding holds.
+    private static func rtGlassInstanceRow(_ inst: IlluminatoramaGlassInstance, normalBase: Float) -> RTInstanceData {
+        var c0 = inst.normalMatrix.columns.0, c1 = inst.normalMatrix.columns.1
+        c0.w = 0                                    // untextured
+        c1.w = Float(bitPattern: UInt32.max)        // unmasked by any light layer
+        return RTInstanceData(nrm0: c0, nrm1: c1, nrm2: inst.normalMatrix.columns.2,
+                              albedoTriBase: SIMD4(inst.tintIor.x, inst.tintIor.y, inst.tintIor.z, normalBase),
+                              emissionPad: .zero)
+    }
+
     private let rtTLASPipeline: MTLComputePipelineState?
     /// Whether the device + instanced-RT pipeline are available.
     public var rtTLASSupported: Bool { rtTLASPipeline != nil }
@@ -6301,23 +6370,7 @@ public final class IlluminatoramaRenderer {
                 desc.intersectionFunctionTableOffset = 0
                 desc.transformationMatrix = packed4x3(inst.modelMatrix)
                 descPtr[i] = desc
-                let nm = inst.normalMatrix
-                // The normal matrix's column `.w` lanes are dead weight for RT (every
-                // consumer builds a float3x3 from `.xyz`), so they carry the two facts
-                // a re-shaded hit needs to shade like the deferred pass does:
-                //   nrm0.w = albedo atlas slice PLUS ONE — so the memset-0 default
-                //            (curve instances, unslotted instances) decodes to −1 =
-                //            "untextured, use the mean albedo" rather than slice 0
-                //   nrm1.w = the instance's light-layer bits (bit-cast; drives light
-                //            masking + the interior day-light separation)
-                // Without these a hit through glass collapses to one flat colour under
-                // exterior-strength fill — the "flat slabs" bug.
-                var c0 = nm.columns.0, c1 = nm.columns.1
-                c0.w = Float(inst.albedoTextureSlice + 1)
-                c1.w = Float(bitPattern: inst.layer)
-                dataPtr[i] = RTInstanceData(
-                    nrm0: c0, nrm1: c1, nrm2: nm.columns.2,
-                    albedoTriBase: SIMD4(inst.albedo, Float(s.normalBase)))
+                dataPtr[i] = Self.rtInstanceRow(inst, normalBase: Float(s.normalBase))
             }
         }
         // (c2) Curve-set instance descriptors (#60 item 7) — one per set,
@@ -6357,16 +6410,7 @@ public final class IlluminatoramaRenderer {
                 desc.intersectionFunctionTableOffset = 0
                 desc.transformationMatrix = packed4x3(inst.modelMatrix)
                 descPtr[i] = desc
-                let nm = inst.normalMatrix
-                // Glass hits read their material from `glassData`, never the albedo
-                // atlas — declare "untextured" (0 ⇒ slice −1) and "all layers" so the
-                // shared hit-shading helpers can't misread a stale normal-matrix pad.
-                var c0 = nm.columns.0, c1 = nm.columns.1
-                c0.w = 0
-                c1.w = Float(bitPattern: UInt32.max)
-                dataPtr[i] = RTInstanceData(
-                    nrm0: c0, nrm1: c1, nrm2: nm.columns.2,
-                    albedoTriBase: SIMD4(inst.tintIor.x, inst.tintIor.y, inst.tintIor.z, Float(s.normalBase)))
+                dataPtr[i] = Self.rtGlassInstanceRow(inst, normalBase: Float(s.normalBase))
                 glassData[gi] = IlluminatoramaRTGlassData(
                     tintIor: inst.tintIor, rdrf: inst.rdrf, dispersionPad: inst.dispersionPad)
             }
@@ -6726,9 +6770,13 @@ public final class IlluminatoramaRenderer {
                 guard i < total else { break }
                 let inst = instPtr[i]
                 descPtr[i].transformationMatrix = packed4x3(inst.modelMatrix)
-                let nm = inst.normalMatrix
-                dataPtr[i].nrm0 = nm.columns.0; dataPtr[i].nrm1 = nm.columns.1; dataPtr[i].nrm2 = nm.columns.2
-                dataPtr[i].albedoTriBase = SIMD4(inst.albedo, dataPtr[i].albedoTriBase.w)
+                // Whole row through the ONE packer. Writing `nrm0`/`nrm1` straight
+                // from the normal matrix — as this did — wiped the albedo-atlas slice
+                // and the light-layer mask packed into their `.w` lanes, so from the
+                // second frame after a rebuild every re-shaded secondary hit lost its
+                // texture and its light masking. `normalBase` is topology, so it comes
+                // back out of the row.
+                dataPtr[i] = Self.rtInstanceRow(inst, normalBase: dataPtr[i].albedoTriBase.w)
             }
         }
         // Glass instances [rtGlassInstanceBase, …): refresh transform + normal +
@@ -6740,9 +6788,7 @@ public final class IlluminatoramaRenderer {
                 guard i < cap else { break }
                 let inst = entry.inst
                 descPtr[i].transformationMatrix = packed4x3(inst.modelMatrix)
-                let nm = inst.normalMatrix
-                dataPtr[i].nrm0 = nm.columns.0; dataPtr[i].nrm1 = nm.columns.1; dataPtr[i].nrm2 = nm.columns.2
-                dataPtr[i].albedoTriBase = SIMD4(inst.tintIor.x, inst.tintIor.y, inst.tintIor.z, dataPtr[i].albedoTriBase.w)
+                dataPtr[i] = Self.rtGlassInstanceRow(inst, normalBase: dataPtr[i].albedoTriBase.w)
                 gPtr[gi] = IlluminatoramaRTGlassData(
                     tintIor: inst.tintIor, rdrf: inst.rdrf, dispersionPad: inst.dispersionPad)
             }
@@ -6848,6 +6894,23 @@ public final class IlluminatoramaRenderer {
             u.curveInstanceBase = UInt32(instances.count)
             u.curveSetCount = UInt32(rtCurveInstanceCount)
         }
+        // ── Secondary-hit shading parity with the deferred pass ──────────────
+        // A GI / reflection hit is now shaded by the SAME body the glass pass uses
+        // (`shadeSecondarySurface`), so it gets the same inputs: the mesh UVs +
+        // albedo atlas (a reflected plank floor used to be one flat colour), the
+        // local point/spot lights, the cosine-convolved irradiance cube, and the
+        // interior day-light separation. The three `glassHit*Enabled` switches gate
+        // BOTH paths — they were never glass-specific, only glass-first.
+        u.skyIntensity = max(0, iblIntensity)
+        u.albedoAtlasEnabled = (glassHitTexturingEnabled
+                                && rtObjUVBuffer != nil && rtObjUVCount > 0) ? 1 : 0
+        u.objUVCount = UInt32(rtObjUVCount)
+        u.pointLightCount = glassHitLocalLightsEnabled ? UInt32(pointLights.count) : 0
+        u.spotLightCount = glassHitLocalLightsEnabled ? UInt32(spotLights.count) : 0
+        u.interiorMask = glassHitInteriorFillEnabled ? interiorLayerMask : 0
+        u.interiorIBLUp = max(0, interiorIBLUp)
+        u.interiorIBLSide = max(0, interiorIBLSide)
+        u.interiorAmbient = max(0, interiorAmbient)
         memcpy(rtInstUniformBuffer.contents(), &u, MemoryLayout<RTInstUniforms>.stride)
 
         guard let enc = timedComputeEncoder(cb, "rtLightingTLAS") else { return }
@@ -6882,6 +6945,15 @@ public final class IlluminatoramaRenderer {
         // signature requires it); written only when `surfFeedbackEnabled`. Dummy =
         // instData when the cache/feedback buffer isn't live (never written then).
         enc.setBuffer(surfCardRequestedBuffer ?? instData, offset: 0, index: 14)
+        // Secondary-hit shading parity (buffers 15–18, textures 6–7). Same
+        // resources the glass pass binds for the same job; dummies keep the
+        // bindings valid when a term is off (the uniforms gate every read).
+        enc.setBuffer(rtObjUVBuffer ?? instData, offset: 0, index: 15)
+        enc.setBuffer(albedoAtlas.uvScaleBuffer, offset: 0, index: 16)
+        enc.setBuffer(pointLightBuffer, offset: 0, index: 17)
+        enc.setBuffer(spotLightBuffer, offset: 0, index: 18)
+        enc.setTexture(irradianceCube, index: 6)
+        enc.setTexture(albedoAtlas.texture, index: 7)
         // The TLAS references the BLASes, which reference the mesh vertex/index
         // buffers (and the curve BLASes the pooled curve buffers) — all must be
         // resident for the intersector.
