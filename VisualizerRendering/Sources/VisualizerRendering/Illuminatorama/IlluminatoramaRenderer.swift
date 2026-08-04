@@ -1342,6 +1342,23 @@ public final class IlluminatoramaRenderer {
     /// to be > 0; this lets a host disable the 3× cost wholesale.
     public var rtGlassDispersionEnabled: Bool = true
 
+    // ── Through-glass shading parity: three ABLATION switches ───────────────
+    // A refracted ray's opaque hit is shaded with the same inputs the deferred pass
+    // uses — the surface's texture, the local point/spot lights, and the interior
+    // fill separation — instead of a per-instance mean colour under exterior-strength
+    // sky. Each is separately suppressible so a harness can attribute an image-quality
+    // number to ONE of them rather than to all three at once. Production leaves all
+    // three on; turning one off restores exactly the pre-parity behaviour for that term.
+
+    /// Sample the albedo atlas at the hit's barycentric UV. Off ⇒ per-instance mean albedo.
+    public var glassHitTexturingEnabled: Bool = true
+    /// Accumulate point + spot lights at the hit. Off ⇒ sun + sky only, so a lamp-lit
+    /// room goes dark through a window.
+    public var glassHitLocalLightsEnabled: Bool = true
+    /// Apply the host's interior IBL/ambient separation at the hit. Off ⇒ an interior
+    /// surface gets exterior-strength fill, several times short.
+    public var glassHitInteriorFillEnabled: Bool = true
+
     /// CHEAP semi-transparent glass (no TLAS, no per-frank BLAS). Off (0) keeps the
     /// plain Fresnel+sky fallback unchanged for every other scene. A host opts in
     /// when it wants "semi-transparent glass" rather than "hardware-RT refraction"
@@ -8668,12 +8685,18 @@ public final class IlluminatoramaRenderer {
         // A refracted ray's hit used to be shaded by a strictly poorer model than
         // the same surface one pixel to the left: mean albedo, no texture, no local
         // lights, exterior-strength fill. These three give it the same inputs.
+        // …each independently suppressible, so the three can be ABLATED against a gate. They
+        // landed together, which made the shipped number (detail through a pane, vs the same
+        // view with the glazing removed) unattributable — and an unattributed win teaches
+        // nothing about where to spend the next hour on the sibling RT paths. Ship-path
+        // default for all three is `true`; only a harness sets them.
         let rtShade = useRT
-        u.albedoAtlasEnabled = (rtShade && rtObjUVBuffer != nil && rtObjUVCount > 0) ? 1 : 0
+        u.albedoAtlasEnabled = (rtShade && glassHitTexturingEnabled
+                                && rtObjUVBuffer != nil && rtObjUVCount > 0) ? 1 : 0
         u.objUVCount = UInt32(rtObjUVCount)
-        u.pointLightCount = rtShade ? UInt32(pointLights.count) : 0
-        u.spotLightCount = rtShade ? UInt32(spotLights.count) : 0
-        u.interiorMask = rtShade ? interiorLayerMask : 0
+        u.pointLightCount = (rtShade && glassHitLocalLightsEnabled) ? UInt32(pointLights.count) : 0
+        u.spotLightCount = (rtShade && glassHitLocalLightsEnabled) ? UInt32(spotLights.count) : 0
+        u.interiorMask = (rtShade && glassHitInteriorFillEnabled) ? interiorLayerMask : 0
         u.interiorIBLUp = max(0, interiorIBLUp)
         u.interiorIBLSide = max(0, interiorIBLSide)
         u.interiorAmbient = max(0, interiorAmbient)
