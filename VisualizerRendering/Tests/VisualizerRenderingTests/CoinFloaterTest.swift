@@ -1,4 +1,5 @@
 import XCTest
+import Foundation
 import Metal
 import simd
 @testable import VisualizerRendering
@@ -17,8 +18,10 @@ final class CoinFloaterTest: XCTestCase {
         let url = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("Sources/VisualizerRendering/Shaders/CoinDEM.metal")
-        guard let s = try? String(contentsOf: url, encoding: .utf8) else { throw XCTSkip("no shader") }
-        return try d.makeLibrary(source: s, options: nil)
+        // A source-string compile has NO include path, so any local `#include "…"` in the
+        // shader must be spliced in first — see MetalSourceLoader.
+        guard FileManager.default.fileExists(atPath: url.path) else { throw XCTSkip("no shader") }
+        return try MetalSourceLoader.makeLibrary(device: d, contentsOf: url)
     }
 
     func testNoPhysicallyFloatingCoins() throws {

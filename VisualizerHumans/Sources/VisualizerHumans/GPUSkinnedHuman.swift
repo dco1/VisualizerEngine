@@ -39,11 +39,17 @@ public final class GPUSkinnedHuman {
         if let cached = libraries[key] {
             library = cached
         } else {
-            guard let url = Bundle.module.url(forResource: "HumanSkinning", withExtension: "metalsource"),
-                  let source = try? String(contentsOf: url, encoding: .utf8) else {
+            guard let url = Bundle.module.url(forResource: "HumanSkinning", withExtension: "metalsource") else {
                 throw SkinError.libraryCompile
             }
-            library = try device.makeLibrary(source: source, options: nil)
+            // Through `MetalSourceLoader` like every other runtime source-string compile: a
+            // source string carries no include path, so a local `#include "…"` would fail with
+            // "file not found" the day this shader grows one. Today it has none — which is
+            // exactly when the loader is free to adopt.
+            guard let lib = try? MetalSourceLoader.makeLibrary(device: device, contentsOf: url) else {
+                throw SkinError.libraryCompile
+            }
+            library = lib
             libraries[key] = library
         }
         guard let fn = library.makeFunction(name: "human_skin_lbs") else { throw SkinError.pipeline }

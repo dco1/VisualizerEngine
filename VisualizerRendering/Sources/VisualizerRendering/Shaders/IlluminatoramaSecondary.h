@@ -47,6 +47,7 @@
 
 #include <metal_stdlib>
 #include <metal_raytracing>
+#include "IlluminatoramaNightSky.h"
 
 using namespace metal;
 using namespace raytracing;
@@ -138,9 +139,28 @@ static inline float2 dirToEquirectUV(float3 d) {
     return float2(atan2(d.z, d.x) * (1.0 / (2.0 * M_PI_F)) + 0.5,
                   acos(clamp(d.y, -1.0, 1.0)) * (1.0 / M_PI_F));
 }
-static inline float3 sampleSky(texture2d<float, access::sample> sky, float3 dir, float scale) {
+/// What a secondary ray sees when it escapes to the sky: the equirect dome PLUS the
+/// analytic celestials.
+///
+/// The celestials are not optional decoration here — the dome is deliberately baked
+/// WITHOUT stars or moon (`Params.celestialsInDome = false`, because dome texels
+/// magnify a star into a blob), so a path that samples only the dome renders the night
+/// sky as flat black. That is exactly what a window used to do: standing in a room at
+/// night, the sky above the roofline carried the whole star field (a primary ray, drawn
+/// by Illuminatorama.metal's sky branch) and the sky through the glass was empty
+/// (a refracted ray, drawn here). Sampling the dome and the celestials in ONE function
+/// is what keeps the two views of the same sky the same sky.
+///
+/// `night` zeroed ⇒ `nightCelestials` returns 0 ⇒ byte-identical to the dome-only
+/// sample, so every daytime scene and every host that never sets the night params is
+/// unaffected. `pixAngle` sizes the star point-spread; a secondary ray uses the primary
+/// pixel angle, which is correct to within the ray's own (small) divergence.
+static inline float3 sampleSky(texture2d<float, access::sample> sky, float3 dir, float scale,
+                               NightSkyParams night, float pixAngle) {
     constexpr sampler s(filter::linear, s_address::repeat, t_address::clamp_to_edge);
-    return sky.sample(s, dirToEquirectUV(normalize(dir))).rgb * scale;
+    float3 d = normalize(dir);
+    return sky.sample(s, dirToEquirectUV(d)).rgb * scale
+         + nightCelestials(d, night, pixAngle);
 }
 
 // ── The scatter cone: ONE definition of how wide it is, whether it is worth

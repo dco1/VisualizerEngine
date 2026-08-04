@@ -8787,6 +8787,23 @@ public final class IlluminatoramaRenderer {
         u.interiorIBLUp = max(0, interiorIBLUp)
         u.interiorIBLSide = max(0, interiorIBLSide)
         u.interiorAmbient = max(0, interiorAmbient)
+        // ── The night sky, THROUGH the glass ─────────────────────────────────
+        // Same fields the deferred sky branch reads, from the same properties, so a
+        // window and the sky beside it show one sky. Without this the pane sampled the
+        // celestial-free dome and a night window rendered flat black while the open sky
+        // carried the whole star field. All-zero (any non-night host) ⇒ shader no-op.
+        u.nightSkyParams = SIMD4(max(0, nightSkyStarBrightness),
+                                 max(0, nightSkyMoonIntensity),
+                                 max(0, nightSkyMoonAngularRadius), 0)
+        u.nightMoonDir = SIMD4(nightSkyMoonDirection == .zero
+                               ? SIMD3<Float>(0, 1, 0) : simd_normalize(nightSkyMoonDirection), 0)
+        u.nightSunDir = SIMD4(nightSkySunDirection == .zero
+                              ? SIMD3<Float>(0, -1, 0) : simd_normalize(nightSkySunDirection), 0)
+        // One pixel's angular size, derived exactly as the primary branch derives it
+        // (tan(fovY/2) = 1/P[1][1], over the render height) so a star is the same size
+        // seen directly and seen through a pane.
+        u.nightPixAngle = (2.0 / max(camera.projectionMatrix[1][1], 1e-6))
+                          / Float(max(hdrCompositeTexture.height, 1))
         memcpy(glassRTUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaGlassRTUniforms>.stride)
 
         // Screen-space cheap glass (mode 2) samples the scene BEHIND the pane: copy

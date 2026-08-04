@@ -1,4 +1,5 @@
 import XCTest
+import Foundation
 import Metal
 import simd
 @testable import VisualizerRendering
@@ -19,8 +20,10 @@ final class CoinRenderPathTest: XCTestCase {
         let dir = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("Sources/VisualizerRendering/Shaders/CoinDEM.metal")
-        guard let src = try? String(contentsOf: dir, encoding: .utf8) else { throw XCTSkip("no shader") }
-        let lib = try device.makeLibrary(source: src, options: nil)
+        // A source-string compile has NO include path, so any local `#include "…"` in the
+        // shader must be spliced in first — see MetalSourceLoader.
+        guard FileManager.default.fileExists(atPath: dir.path) else { throw XCTSkip("no shader") }
+        let lib = try MetalSourceLoader.makeLibrary(device: device, contentsOf: dir)
 
         guard let solver = CoinDEMSolver(engine: engine, library: lib, maxCoins: 16,
                                          coinRadius: 0.12, halfThickness: 0.009,

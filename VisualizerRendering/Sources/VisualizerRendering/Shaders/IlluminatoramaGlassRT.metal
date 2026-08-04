@@ -107,7 +107,29 @@ struct GlassRTUniforms {
     float  interiorAmbient;
     uint   albedoAtlasEnabled;  // 1 ⇒ objUV (buffer 12) + albedoAtlas (texture 4) live
     uint   objUVCount;          // bound of objUV in float2 entries
+    // ── Analytic night sky through the glass ─────────────────────────────────
+    // Mirrors FrameUniforms' nightSkyParams / nightMoonDir / nightSunDir. The sky
+    // dome is baked WITHOUT celestials, so without these a night window renders a
+    // flat black pane while the sky beside it is full of stars. All-zero ⇒ exact
+    // no-op (see `sampleSky` / `nightCelestials`).
+    float4 nightSkyParams;      // x = starBrightness, y = moonIntensity, z = moonAngRadius
+    float4 nightMoonDir;        // xyz = unit direction toward the moon
+    float4 nightSunDir;         // xyz = unit direction toward the (below-horizon) sun
+    float  nightPixAngle;       // angular size of one output pixel (radians)
+    float  _nightPad0; float _nightPad1; float _nightPad2;
 };
+
+/// This pass's view of the shared night-sky currency — the mirror of
+/// `frameNightSky` in Illuminatorama.metal, reading the same packing order.
+static inline NightSkyParams glassNightSky(constant GlassRTUniforms& u) {
+    NightSkyParams p;
+    p.starBrightness = u.nightSkyParams.x;
+    p.moonIntensity  = u.nightSkyParams.y;
+    p.moonAngRadius  = u.nightSkyParams.z;
+    p.moonDir        = u.nightMoonDir.xyz;
+    p.toSun          = u.nightSunDir.xyz;
+    return p;
+}
 
 // The local-light currency (`RTPointLight` / `RTSpotLight`) is shared — see
 // IlluminatoramaSecondary.h.
@@ -405,7 +427,7 @@ static float3 traceRefractionPath(
         auto res = isect.intersect(r, accel, 0x03u);    // opaque + glass
         if (res.type != intersection_type::triangle) {
             // Escaped to the sky.
-            return throughput * sampleSky(sky, rd, u.skyIntensity);
+            return throughput * sampleSky(sky, rd, u.skyIntensity, glassNightSky(u), u.nightPixAngle);
         }
         uint iid = res.instance_id;
         float t = res.distance;
@@ -446,7 +468,7 @@ static float3 traceRefractionPath(
         return throughput * rad;
     }
     // Bounce budget exhausted — return the accumulated sky as a fallback.
-    return throughput * sampleSky(sky, rd, u.skyIntensity);
+    return throughput * sampleSky(sky, rd, u.skyIntensity, glassNightSky(u), u.nightPixAngle);
 }
 
 // Trace one reflection ray off the entry surface (single bounce; a glass hit
@@ -472,14 +494,14 @@ static float3 traceReflection(
     isect.accept_any_intersection(false);
     auto res = isect.intersect(r, accel, 0x03u);
     if (res.type != intersection_type::triangle) {
-        return sampleSky(sky, dir, u.skyIntensity);
+        return sampleSky(sky, dir, u.skyIntensity, glassNightSky(u), u.nightPixAngle);
     }
     if (res.instance_id >= u.glassInstanceBase) {
         // Reflection landing on another glass surface: approximate with the sky
         // behind it tinted by the glass colour (avoids a second full path).
         uint gi = res.instance_id - u.glassInstanceBase;
         float3 tint = st.glassData[gi].tintIor.xyz;
-        return sampleSky(sky, dir, u.skyIntensity) * tint;
+        return sampleSky(sky, dir, u.skyIntensity, glassNightSky(u), u.nightPixAngle) * tint;
     }
     float3 hitP = r.origin + r.direction * res.distance;
     return shadeOpaqueHit(isect, accel, res.instance_id, res.primitive_id,
@@ -641,7 +663,7 @@ fragment float4 illumi_glass_fallback_fs(
         float3 glint = u.sunColor * (specA * 1.6 * max(0.05, u.reflStrength));
         // Sky reflection (usually a dark void here) scaled by reflectivity, plus a
         // faint tinted Fresnel rim so the silhouette/edges read even with no sky.
-        float3 refl = sampleSky(sky, R, u.skyIntensity) * reflMul;
+        float3 refl = sampleSky(sky, R, u.skyIntensity, glassNightSky(u), u.nightPixAngle) * reflMul;
         float3 rim  = tint * (F * 0.5 + 0.04);
 
         if (u.cheapGlassMode == 2u && u.viewW > 0.5) {
@@ -734,10 +756,10 @@ fragment float4 illumi_glass_fallback_fs(
     }
 
     // ── Plain Fresnel + sky fallback (unchanged; non-RT hardware) ─────────────
-    float3 refl = sampleSky(sky, R, u.skyIntensity) * reflMul;
+    float3 refl = sampleSky(sky, R, u.skyIntensity, glassNightSky(u), u.nightPixAngle) * reflMul;
     float3 T = refract(-V, N, 1.0 / ior);
     if (dot(T, T) < 1e-8) T = R;
-    float3 refr = sampleSky(sky, T, u.skyIntensity) * tint;
+    float3 refr = sampleSky(sky, T, u.skyIntensity, glassNightSky(u), u.nightPixAngle) * tint;
     float3 color = mix(refr, refl, F);
     float alpha = clamp(0.22 + F * 0.72, 0.0, 1.0);   // see-through head-on, opaque at grazing
     return float4(color, alpha);

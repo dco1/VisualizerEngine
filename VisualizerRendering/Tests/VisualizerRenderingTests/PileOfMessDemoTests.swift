@@ -1,4 +1,5 @@
 import XCTest
+import Foundation
 import Metal
 import SceneKit
 import simd
@@ -21,10 +22,12 @@ final class PileOfMessDemoTests: XCTestCase {
         let shader = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
             .appendingPathComponent("Sources/VisualizerRendering/Shaders/CoinDEM.metal")
-        guard let src = try? String(contentsOf: shader, encoding: .utf8) else {
+        // A source-string compile has NO include path, so any local `#include "…"` in the
+        // shader must be spliced in first — see MetalSourceLoader.
+        guard FileManager.default.fileExists(atPath: shader.path) else {
             throw XCTSkip("CoinDEM.metal not found")
         }
-        return try device.makeLibrary(source: src, options: nil)
+        return try MetalSourceLoader.makeLibrary(device: device, contentsOf: shader)
     }
 
     func testRenderPileOfMess() throws {

@@ -885,6 +885,18 @@ struct IlluminatoramaGlassRTUniforms {
     /// Bound of `objUV` in float2 entries — a hit past it falls back (guards a mesh
     /// whose UVs weren't CPU-readable).
     var objUVCount: UInt32 = 0
+    /// Analytic night sky, mirroring `FrameUniforms.nightSkyParams` / `nightMoonDir` /
+    /// `nightSunDir`. The sky dome is baked WITHOUT celestials (they blur at dome
+    /// resolution), so a refracted or reflected ray that samples only the dome renders
+    /// the night sky as flat black — a window at night showed an empty pane while the
+    /// sky beside it carried the full star field. All-zero ⇒ exact no-op.
+    var nightSkyParams: SIMD4<Float> = .zero
+    var nightMoonDir: SIMD4<Float> = SIMD4(0, 1, 0, 0)
+    var nightSunDir: SIMD4<Float> = SIMD4(0, -1, 0, 0)
+    /// Angular size of one output pixel (radians) — sets the star point-spread and the
+    /// moon's limb anti-aliasing, exactly as the primary sky branch computes it.
+    var nightPixAngle: Float = 0
+    var _nightPad0: Float = 0; var _nightPad1: Float = 0; var _nightPad2: Float = 0
 }
 
 /// Per-frame uniforms for the glass caustics kernels. Mirror of `CausticUniforms`
