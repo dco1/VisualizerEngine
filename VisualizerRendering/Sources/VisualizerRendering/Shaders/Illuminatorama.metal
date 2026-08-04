@@ -815,13 +815,27 @@ static inline float4 sampleAtlasAspect(texture2d_array<float, access::sample> at
 static inline float2 hexHash2D(float2 p) {
     // Integer bit-mixing hash — no sin/cos. Same constants as the CPU reference.
     // p is in skewed-lattice coordinates (integer-valued at cell vertices).
-    float px = p.x * 73856093.0f + p.y * 19349663.0f;
-    float py = p.x * 83492791.0f + p.y * 23994923.0f;
-    int ix = int(px); int iy = int(py);
-    ix ^= ix >> 11; ix *= 0x45d9f3b; ix ^= ix >> 16;
-    iy ^= iy >> 11; iy *= 0x45d9f3b; iy ^= iy >> 16;
-    return float2(float(ix & 0xFF) / 128.0f - 1.0f,
-                  float(iy & 0xFF) / 128.0f - 1.0f);
+    //
+    // The multiply happens in INTEGERS, after the coordinate is rounded — not in float
+    // with an int() cast on the product. That cast was an overflow: at 73856093 per
+    // lattice unit, `int()` leaves signed 32-bit range at |p| ≈ 26 cells. Daydream's
+    // ground is ONE quad spanning ±750 m sampled at 2 m per tile, so the lattice runs to
+    // ±375 — past the break about 51 m from the origin, across nearly the whole yard.
+    // Out-of-range float→int is undefined in Metal; where it saturates, every cell beyond
+    // that hashes identically, the three-tap blend collapses to one sample, and the
+    // anti-tiling it exists to provide is silently off. The tell was that it only ever
+    // looked right in tests, which all frame a room near the origin.
+    //
+    // Unsigned throughout: wrapping multiply is defined behaviour for uint (it is not for
+    // int), and `>>` is a logical shift, so the mix cannot be perturbed by sign extension.
+    int cx = int(floor(p.x + 0.5));
+    int cy = int(floor(p.y + 0.5));
+    uint ix = uint(cx) * 73856093u ^ uint(cy) * 19349663u;
+    uint iy = uint(cx) * 83492791u ^ uint(cy) * 23994923u;
+    ix ^= ix >> 11; ix *= 0x45d9f3bu; ix ^= ix >> 16;
+    iy ^= iy >> 11; iy *= 0x45d9f3bu; iy ^= iy >> 16;
+    return float2(float(ix & 0xFFu) / 128.0f - 1.0f,
+                  float(iy & 0xFFu) / 128.0f - 1.0f);
 }
 
 // `strength` gates the whole effect. When strength <= 0 (the DEFAULT for every

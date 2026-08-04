@@ -418,8 +418,23 @@ public final class IlluminatoramaRenderer {
     public var selectionOutlineColor: SIMD3<Float> = SIMD3(0.0, 0.7, 1.0)
     /// RGB color of the *hover* halo in linear HDR space (pre-intensity).
     public var hoverOutlineColor: SIMD3<Float> = SIMD3(1.0, 0.78, 0.12)
-    /// Dilation radius in pixels. Controls halo thickness.
+    /// Dilation radius of the halo, in **output** pixels — what the viewer actually sees.
+    ///
+    /// It used to be consumed as-is against the mask textures, which are sized at the INTERNAL
+    /// resolution, so the halo's apparent thickness was `selectionOutlineWidth / internalRenderScale`
+    /// and moved with a lever that has nothing to do with selection. A host that drops the render
+    /// scale during a gesture — which Daydream Home does, edge-triggered on gesture start — got a
+    /// halo that visibly FATTENS the instant you grab the thing it is drawn around and snaps thin
+    /// when you let go. Across that app's shipped tiers the same 6 landed anywhere from 4.0 to
+    /// 10.9 output px, a 2.7× spread, at its most obvious precisely when the outline is on screen.
+    /// `resolvedOutlineRadius` converts at the point of use so the number means one thing.
     public var selectionOutlineWidth: Int = 6
+
+    /// `selectionOutlineWidth` in INTERNAL pixels — the space the mask textures live in. Never
+    /// below 1, or the dilation degenerates and the halo disappears at low render scales.
+    public var resolvedOutlineRadius: Int32 {
+        Int32(max(1, (Float(max(1, selectionOutlineWidth)) * internalRenderScale).rounded()))
+    }
     /// Bounding-box proxies drawn only in the halo mask pass (never the G-buffer),
     /// so highlighted elements keep their real material while gaining a halo. One
     /// solid box per selected/hovered element, its `highlight` set to 1 or 2.
@@ -10228,7 +10243,7 @@ public final class IlluminatoramaRenderer {
             (1, selectionOutlineColor),
             (2, hoverOutlineColor),
         ]
-        var radius = Int32(max(1, selectionOutlineWidth))
+        var radius = resolvedOutlineRadius
 
         for m in modes {
             guard highlightMaskInstances.contains(where: { $0.highlight == m.mode }) else { continue }
