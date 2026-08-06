@@ -318,6 +318,21 @@ public final class IlluminatoramaRenderer {
     public var exposure: Float = 1.0
     public var bloomThreshold: Float = 1.0
     public var bloomIntensity: Float = 0.6
+    /// Bloom soft knee, as a FRACTION of `bloomThreshold` (S1.2). 0 restores the
+    /// hard `max(0, lum - T)` cut byte-for-byte; the curve above T·(1+knee) is
+    /// identical either way, so this only softens the pop as a light crosses the
+    /// bar. Default 0.5 — half a stop of ramp, the Unity/Karis convention.
+    public var bloomSoftKnee: Float = 0.5
+    /// Upsample scatter: the CONVEX blend weight toward the blurred low mip on
+    /// the way up the pyramid. 0 leaves only the finest level (a tight rim), 1
+    /// only the coarsest (a formless wash). Level i ends up weighted
+    /// (1-s)·s^i — a geometric series that sums to exactly 1 at ANY level count,
+    /// so changing this changes the halo's SHAPE and never its total energy.
+    /// Default 0.7.
+    public var bloomScatter: Float = 0.7
+    /// 3×3 tent radius on the up-chain, in LOW-mip texels. 1.0 is the plain tent;
+    /// larger values widen each level's contribution without adding taps.
+    public var bloomTentRadius: Float = 1.0
     /// Screen-space SUN lens flare strength in the tonemap pass (ghost train +
     /// halo + anamorphic streak, optically occluded by sampling the HDR frame at
     /// the sun's screen position). 0 = OFF (the default for every scene) → an
@@ -1499,9 +1514,21 @@ public final class IlluminatoramaRenderer {
     /// screen-space glass (mode 2) is in use. The glass pass samples this for the
     /// scene behind the pane (you can't sample a render target you're also writing).
     private var glassBackdropTexture: MTLTexture?
-    private var bloomBrightHalf: MTLTexture
-    private var bloomBlurHHalf: MTLTexture
-    private var bloomBlurVHalf: MTLTexture
+    /// Bloom mip pyramid (S1.2). SEPARATE non-mipmapped textures per level, not
+    /// one mipmapped texture — three reasons, all of them Metal facts rather than
+    /// taste: a compute `access::write` texture only ever addresses level 0, so
+    /// mip writes would need a stored `makeTextureView` per level anyway;
+    /// automatic hazard tracking is per-RESOURCE, so one mipmapped texture would
+    /// serialise the whole chain against itself; and accumulating in place would
+    /// want `access::read_write`, which for `rgba16Float` requires
+    /// ReadWriteTextureTier2 (fine on Apple silicon, absent on older Intel Macs).
+    ///
+    /// `bloomDownChain[0]` is internal/2 and each level halves again;
+    /// `bloomUpChain` is one SHORTER — the smallest level needs no accumulation
+    /// buffer because it is read straight off the down chain to seed the up pass.
+    /// `bloomUpChain[0]` (== internal/2) is what the tonemap samples.
+    private var bloomDownChain: [MTLTexture]
+    private var bloomUpChain: [MTLTexture]
     // Halation runs at a QUARTER of the internal resolution — a wide diffuse halo has
     // no high-frequency detail to lose, and the coarse grid buys radius for free.
     private var halationBrightQuarter: MTLTexture
@@ -1947,9 +1974,10 @@ public final class IlluminatoramaRenderer {
     private let svgfVariancePipeline: MTLComputePipelineState  // Phase 4.44 SVGF
     private let svgfAtrousPipeline: MTLComputePipelineState    // Phase 4.44 SVGF
     private let taaResolvePipeline: MTLComputePipelineState
-    private let bloomThresholdPipeline: MTLComputePipelineState
-    private let bloomBlurHPipeline: MTLComputePipelineState
-    private let bloomBlurVPipeline: MTLComputePipelineState
+    // Bloom mip pyramid (S1.2): prefilter (full-res HDR → mip0) + down + up.
+    private let bloomPrefilterPipeline: MTLComputePipelineState
+    private let bloomDownPipeline: MTLComputePipelineState
+    private let bloomUpPipeline: MTLComputePipelineState
     private let halationThresholdPipeline: MTLComputePipelineState
     private let halationBlurHPipeline: MTLComputePipelineState
     private let halationBlurVPipeline: MTLComputePipelineState
@@ -3086,7 +3114,7 @@ public final class IlluminatoramaRenderer {
         // below then hit the warm cache. (`illumi_lighting` uses the specialized
         // variant path, so it's compiled by the guard, not here.)
         cache.precompile([
-            "illumi_bloom_blur_h", "illumi_bloom_blur_v", "illumi_bloom_threshold",
+            "illumi_bloom_down", "illumi_bloom_prefilter", "illumi_bloom_up",
             "illumi_ddgi_trace", "illumi_ddgi_update_depth", "illumi_ddgi_update_irradiance",
             "illumi_dfg_bake", "illumi_exposure_estimate",
             "illumi_halation_blur_h", "illumi_halation_blur_v", "illumi_halation_threshold",
@@ -3159,14 +3187,14 @@ public final class IlluminatoramaRenderer {
         guard let taa = cache.pipelineState(name: "illumi_taa_resolve", device: device) else {
             throw IlluminatoramaError.pipelineCreationFailed("illumi_taa_resolve")
         }
-        guard let threshold = cache.pipelineState(name: "illumi_bloom_threshold", device: device) else {
-            throw IlluminatoramaError.pipelineCreationFailed("illumi_bloom_threshold")
+        guard let bloomPre = cache.pipelineState(name: "illumi_bloom_prefilter", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_bloom_prefilter")
         }
-        guard let blurH = cache.pipelineState(name: "illumi_bloom_blur_h", device: device) else {
-            throw IlluminatoramaError.pipelineCreationFailed("illumi_bloom_blur_h")
+        guard let bloomDown = cache.pipelineState(name: "illumi_bloom_down", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_bloom_down")
         }
-        guard let blurV = cache.pipelineState(name: "illumi_bloom_blur_v", device: device) else {
-            throw IlluminatoramaError.pipelineCreationFailed("illumi_bloom_blur_v")
+        guard let bloomUp = cache.pipelineState(name: "illumi_bloom_up", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_bloom_up")
         }
         // Film halation — its own threshold + wide gaussian, quarter-res. The pipelines
         // are always built (cheap, and it keeps `let` initialisation simple); the passes
@@ -3220,9 +3248,9 @@ public final class IlluminatoramaRenderer {
         self.prefilterBakePipeline = prefBake
         self.dfgBakePipeline = dfgBake
         self.taaResolvePipeline = taa
-        self.bloomThresholdPipeline = threshold
-        self.bloomBlurHPipeline = blurH
-        self.bloomBlurVPipeline = blurV
+        self.bloomPrefilterPipeline = bloomPre
+        self.bloomDownPipeline = bloomDown
+        self.bloomUpPipeline = bloomUp
         self.halationThresholdPipeline = halThreshold
         self.halationBlurHPipeline = halBlurH
         self.halationBlurVPipeline = halBlurV
@@ -3685,9 +3713,8 @@ public final class IlluminatoramaRenderer {
         self.gbufferLayer        = t.layer
         self.historyA            = t.historyA
         self.historyB            = t.historyB
-        self.bloomBrightHalf     = t.bloomBright
-        self.bloomBlurHHalf      = t.bloomBlurH
-        self.bloomBlurVHalf      = t.bloomBlurV
+        self.bloomDownChain      = t.bloomDown
+        self.bloomUpChain        = t.bloomUp
         self.halationBrightQuarter = t.halationBright
         self.halationBlurHQuarter  = t.halationBlurH
         self.halationBlurVQuarter  = t.halationBlurV
@@ -7245,9 +7272,8 @@ public final class IlluminatoramaRenderer {
             self.gbufferLayer        = t.layer
             self.historyA            = t.historyA
             self.historyB            = t.historyB
-            self.bloomBrightHalf     = t.bloomBright
-            self.bloomBlurHHalf      = t.bloomBlurH
-            self.bloomBlurVHalf      = t.bloomBlurV
+            self.bloomDownChain      = t.bloomDown
+            self.bloomUpChain        = t.bloomUp
             self.halationBrightQuarter = t.halationBright
             self.halationBlurHQuarter  = t.halationBlurH
             self.halationBlurVQuarter  = t.halationBlurV
@@ -10379,27 +10405,56 @@ public final class IlluminatoramaRenderer {
         enc.endEncoding()
     }
 
+    /// The texture the tonemap samples as "bloom": the TOP of the pyramid, at
+    /// internal/2. `bloomUpChain` is empty only in the degenerate one-level case
+    /// (a frame too small for a second mip), where the prefilter output is the
+    /// whole effect.
+    private var bloomResultTexture: MTLTexture {
+        bloomUpChain.first ?? bloomDownChain[0]
+    }
+
+    /// The Karis / Call-of-Duty dual-filter pyramid (S1.2): prefilter the HDR to
+    /// mip0, box-downsample to the top of the chain, then tent-upsample back
+    /// down, blending CONVEXLY with each down level on the way (see the shader's
+    /// section header for why convex and not additive).
+    ///
+    /// One encoder for the whole chain. `makeComputeCommandEncoder()` is a SERIAL
+    /// dispatch encoder, so Metal inserts the level-to-level barriers itself —
+    /// each dispatch reads a resource the previous one wrote.
     private func encodeBloomPasses(_ cb: MTLCommandBuffer) {
-        let halfW = max(1, width / 2)
-        let halfH = max(1, height / 2)
         guard let enc = timedComputeEncoder(cb, "bloom") else { return }
         enc.label = "Illuminatorama.bloom"
-
-        enc.setComputePipelineState(bloomThresholdPipeline)
-        enc.setTexture(bloomTonemapSource, index: 0)
-        enc.setTexture(bloomBrightHalf, index: 1)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
-        dispatch(enc, pipeline: bloomThresholdPipeline, width: halfW, height: halfH)
 
-        enc.setComputePipelineState(bloomBlurHPipeline)
-        enc.setTexture(bloomBrightHalf, index: 0)
-        enc.setTexture(bloomBlurHHalf, index: 1)
-        dispatch(enc, pipeline: bloomBlurHPipeline, width: halfW, height: halfH)
+        // Prefilter — full-res HDR → mip0. The ONLY level that thresholds, and
+        // the only one that applies the Karis firefly weighting.
+        let mip0 = bloomDownChain[0]
+        enc.setComputePipelineState(bloomPrefilterPipeline)
+        enc.setTexture(bloomTonemapSource, index: 0)
+        enc.setTexture(mip0, index: 1)
+        dispatch(enc, pipeline: bloomPrefilterPipeline, width: mip0.width, height: mip0.height)
 
-        enc.setComputePipelineState(bloomBlurVPipeline)
-        enc.setTexture(bloomBlurHHalf, index: 0)
-        enc.setTexture(bloomBlurVHalf, index: 1)
-        dispatch(enc, pipeline: bloomBlurVPipeline, width: halfW, height: halfH)
+        // Down chain — each level is a 13-tap box of the one above it.
+        enc.setComputePipelineState(bloomDownPipeline)
+        for level in 1..<bloomDownChain.count {
+            let dst = bloomDownChain[level]
+            enc.setTexture(bloomDownChain[level - 1], index: 0)
+            enc.setTexture(dst, index: 1)
+            dispatch(enc, pipeline: bloomDownPipeline, width: dst.width, height: dst.height)
+        }
+
+        // Up chain — coarsest to finest. The first step is seeded from the
+        // smallest DOWN level (which is why the up chain is one texture shorter).
+        enc.setComputePipelineState(bloomUpPipeline)
+        let last = bloomDownChain.count - 1
+        for level in stride(from: last - 1, through: 0, by: -1) {
+            let low = (level == last - 1) ? bloomDownChain[last] : bloomUpChain[level + 1]
+            let dst = bloomUpChain[level]
+            enc.setTexture(low, index: 0)
+            enc.setTexture(bloomDownChain[level], index: 1)
+            enc.setTexture(dst, index: 2)
+            dispatch(enc, pipeline: bloomUpPipeline, width: dst.width, height: dst.height)
+        }
         enc.endEncoding()
     }
 
@@ -10630,7 +10685,7 @@ public final class IlluminatoramaRenderer {
         enc.label = "Illuminatorama.tonemap"
         enc.setRenderPipelineState(tonemapPipeline)
         enc.setFragmentTexture(bloomTonemapSource, index: 0)
-        enc.setFragmentTexture(bloomBlurVHalf, index: 1)
+        enc.setFragmentTexture(bloomResultTexture, index: 1)
         // Issue #65 — 3D colour-grade LUT at texture(2). Always bound (identity by
         // default), so the shader never branches on nil; the grade is gated by
         // `colorLUTAmount` in the uniforms.
@@ -10942,6 +10997,14 @@ public final class IlluminatoramaRenderer {
                                  max(1, easedHalationRadius),
                                  0)
         u.halationTint = SIMD4(easedHalationTint.x, easedHalationTint.y, easedHalationTint.z, 0)
+        // Bloom pyramid (S1.2): soft knee (fraction of the threshold) / upsample
+        // scatter / tent radius. Scatter is clamped to [0,1] because the up-chain
+        // blend must stay CONVEX — outside that range the geometric series stops
+        // summing to 1 and the chain gains or loses energy.
+        u.bloomParams = SIMD4(max(0, bloomSoftKnee),
+                              min(max(bloomScatter, 0), 1),
+                              max(0, bloomTentRadius),
+                              0)
         // Phase 9 — film LUT strength: 0 when no LUT is bound (bypasses the shader branch).
         u.filmLUTStrength = filmLUTTexture != nil ? max(0, min(1, filmLUTStrength)) : 0
         // Tonemap colour-grade. Neutral defaults (6500/0/1/1/1) are exact no-ops in
@@ -11171,9 +11234,10 @@ public final class IlluminatoramaRenderer {
         var layer: MTLTexture
         var historyA: MTLTexture
         var historyB: MTLTexture
-        var bloomBright: MTLTexture
-        var bloomBlurH: MTLTexture
-        var bloomBlurV: MTLTexture
+        // Bloom mip pyramid (S1.2) — see `bloomDownChain` for why these are
+        // separate per-level textures rather than one mipmapped resource.
+        var bloomDown: [MTLTexture]      // level 0 = internal/2, each halving
+        var bloomUp: [MTLTexture]        // one SHORTER than `bloomDown`
         // Film halation — quarter-res (see `halationBrightQuarter`).
         var halationBright: MTLTexture
         var halationBlurH: MTLTexture
@@ -11206,6 +11270,39 @@ public final class IlluminatoramaRenderer {
         var sssDiffuse: MTLTexture       // full-res rgba16Float — diffuse + mask
         var sssBlurTmp: MTLTexture       // full-res rgba16Float — horizontal-blur intermediate
         var sssBlurOut: MTLTexture       // full-res rgba16Float — separable-blur result
+    }
+
+    // ── Bloom pyramid geometry (S1.2) ─────────────────────────────────────────
+
+    /// Deepest level a bloom pyramid over an `halfW × halfH` mip0 may have.
+    ///
+    /// Two bounds, both about the filter rather than about memory. The 13-tap box
+    /// reaches ±2 texels and the tent ±1, so a level whose SHORT side is under 8
+    /// texels has clamped edge taps on most of its rows — past that the halo
+    /// stops widening and starts smearing the frame border inward. And the reach
+    /// doubles per level, so 7 levels is the cap: the coarsest mip is then a
+    /// handful of texels covering the whole frame, a formless wash rather than a
+    /// halo.
+    ///
+    /// **8, not 16, and that is a MEASURED number.** Each level restores one
+    /// octave of the profile's self-similar ~0.45–0.5 falloff and the last level
+    /// always falls off a cliff, so the pyramid's useful reach is one octave
+    /// short of its depth. Cutting at a 16-texel short side gives 5 levels on a
+    /// 1200 × 900 frame, and the gate measured exactly the predicted cliff there:
+    /// octave ratios 0.53 · 0.52 · 0.44 · **0.21 · 0.02** — a halo dead by ~120
+    /// output px, which cannot carry the "tail past 200 px" this pass exists to
+    /// produce. Halving the bound buys the octave back.
+    static func bloomLevelCount(halfW: Int, halfH: Int) -> Int {
+        let minSide = max(1, min(halfW, halfH))
+        var levels = 1
+        while levels < 7 && (minSide >> levels) >= 8 { levels += 1 }
+        return levels
+    }
+
+    /// Pixel size of pyramid level `level` (0 = mip0 at internal/2). Floored at 1
+    /// so an extreme aspect ratio can't ask for a zero-width texture.
+    static func bloomLevelSize(halfW: Int, halfH: Int, level: Int) -> (Int, Int) {
+        (max(1, halfW >> level), max(1, halfH >> level))
     }
 
     // ── Phase 2.5 cascade constants ───────────────────────────────────────────
@@ -11628,15 +11725,26 @@ public final class IlluminatoramaRenderer {
         let sssBlurOut = try make(label: "Illuminatorama.sss.blurOut",
                                   format: .rgba16Float, w: internalW, h: internalH,
                                   usage: [.shaderRead, .shaderWrite])
-        let bb = try make(label: "Illuminatorama.bloom.bright",
-                          format: .rgba16Float, w: halfW, h: halfH,
-                          usage: [.shaderRead, .shaderWrite])
-        let bh = try make(label: "Illuminatorama.bloom.blurH",
-                          format: .rgba16Float, w: halfW, h: halfH,
-                          usage: [.shaderRead, .shaderWrite])
-        let bv = try make(label: "Illuminatorama.bloom.blurV",
-                          format: .rgba16Float, w: halfW, h: halfH,
-                          usage: [.shaderRead, .shaderWrite])
+        // Bloom mip pyramid (S1.2). Level 0 is half the internal resolution — the
+        // same size and format the old single-gaussian target was, which is why
+        // the tonemap's binding and sampler are untouched by this change.
+        let bloomLevels = Self.bloomLevelCount(halfW: halfW, halfH: halfH)
+        var bloomDown: [MTLTexture] = []
+        var bloomUp: [MTLTexture] = []
+        for level in 0..<bloomLevels {
+            let (lw, lh) = Self.bloomLevelSize(halfW: halfW, halfH: halfH, level: level)
+            bloomDown.append(try make(label: "Illuminatorama.bloom.down\(level)",
+                                      format: .rgba16Float, w: lw, h: lh,
+                                      usage: [.shaderRead, .shaderWrite]))
+            // The SMALLEST level gets no up-chain buffer: the up pass is seeded by
+            // reading `bloomDown.last` directly, so allocating one would be a
+            // texture nothing ever writes.
+            if level < bloomLevels - 1 {
+                bloomUp.append(try make(label: "Illuminatorama.bloom.up\(level)",
+                                        format: .rgba16Float, w: lw, h: lh,
+                                        usage: [.shaderRead, .shaderWrite]))
+            }
+        }
         // Film halation at QUARTER res — a wide diffuse halo carries no detail worth
         // preserving, and the coarse grid is what makes a 9-tap gaussian reach ~64
         // full-res texels. Allocated unconditionally so the tonemap always has a
@@ -11673,7 +11781,7 @@ public final class IlluminatoramaRenderer {
             albedoMet: am, normalRgh: nr, emission: em, depth: depth,
             hdr: hdr, ao: ao, hdrComposite: hdrComposite, rtDiffuse: rtDiffuse,
             velocity: velocity, layer: layer, historyA: historyA, historyB: historyB,
-            bloomBright: bb, bloomBlurH: bh, bloomBlurV: bv,
+            bloomDown: bloomDown, bloomUp: bloomUp,
             halationBright: hb, halationBlurH: hbh, halationBlurV: hbv,
             ldr: ldr,
             aoFiltered: aoFiltered, aoHistoryA: aoHistA, aoHistoryB: aoHistB,

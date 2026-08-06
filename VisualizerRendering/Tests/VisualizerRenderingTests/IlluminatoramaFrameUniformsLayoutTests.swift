@@ -22,7 +22,7 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
     /// Metal's `sizeof(FrameUniforms)` (verified via static_assert). The Swift stride
     /// must match exactly or `uploadFrameUniforms`'s copy writes a differently-shaped
     /// blob than the shader reads.
-    private static let metalStride = 1248
+    private static let metalStride = 1264
 
     func testFrameUniformsStrideMatchesMetal() {
         XCTAssertEqual(MemoryLayout<IlluminatoramaFrameUniforms>.stride,
@@ -41,6 +41,7 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
         assertOffset(\.lensFlareParams, 1200, "lensFlareParams")
         assertOffset(\.halationParams,  1216, "halationParams")
         assertOffset(\.halationTint,    1232, "halationTint")
+        assertOffset(\.bloomParams,     1248, "bloomParams")
     }
 
     private func assertOffset(_ key: PartialKeyPath<IlluminatoramaFrameUniforms>,

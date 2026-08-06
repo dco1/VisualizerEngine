@@ -402,6 +402,20 @@ public struct IlluminatoramaFrameUniforms {
     // mirror of the Metal FrameUniforms.
     public var halationParams: SIMD4<Float> = .zero
     public var halationTint: SIMD4<Float> = .zero
+    // ── Bloom pyramid (S1.2) ─────────────────────────────────────────────────
+    // The Karis / Call-of-Duty dual-filter pyramid's three knobs.
+    // `x` = soft-knee width as a FRACTION of `bloomThreshold`. 0 reproduces the
+    //       old hard `max(0, lum - T)` cut exactly; the curve is identical to the
+    //       hard one above T·(1+x) at any setting, so this only ever softens the
+    //       pop as a light crosses the bar.
+    // `y` = upsample scatter — the CONVEX `mix` weight toward the blurred low mip
+    //       (0 = finest level only, 1 = coarsest only). Convex is load-bearing:
+    //       level i ends up weighted (1-y)·y^i, which sums to exactly 1, so the
+    //       chain's DC gain is 1 and `bloomIntensity` keeps its old meaning.
+    // `z` = 3×3 tent radius in LOW-mip texels. `w` reserved.
+    // ONE new 16-byte cluster (stride 1248 → 1264); mirror of the Metal
+    // FrameUniforms.bloomParams.
+    public var bloomParams: SIMD4<Float> = SIMD4(0.5, 0.7, 1.0, 0)
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20
