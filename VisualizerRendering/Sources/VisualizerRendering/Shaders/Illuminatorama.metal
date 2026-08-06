@@ -784,10 +784,16 @@ static inline float2 soilNormalGrad(float2 p) {
 // keeping one uniform-size square slice array.
 static inline float4 sampleAtlasAspect(texture2d_array<float, access::sample> atlas,
                                        sampler s, float2 uv, uint slice,
-                                       const device float2* uvScale) {
+                                       const device float2* uvScale,
+                                       float2 duvdx, float2 duvdy) {
     float2 sc = uvScale[slice];
     if (sc.x >= 0.999f && sc.y >= 0.999f) {
-        return atlas.sample(s, uv, slice);            // square → hardware repeat
+        // Square → hardware repeat. S1.1: EXPLICIT gradients, taken from the caller's
+        // ORIGINAL uv. Now that the atlas has a mip chain, letting the texture unit
+        // infer the LOD would differ two per-cell hex-hash offsets across a quad at a
+        // lattice boundary (see sampleAtlasHex) and select the 1x1 mip — a triangular
+        // grid of mean-coloured lines over every surface.
+        return atlas.sample(s, uv, slice, gradient2d(duvdx, duvdy));
     }
     // Per-axis: the axis that fills the slice (sc == 1) keeps the raw uv so the
     // hardware `repeat` sampler wraps it seamlessly; only the LETTERBOXED axis
@@ -801,7 +807,13 @@ static inline float4 sampleAtlasAspect(texture2d_array<float, access::sample> at
     float2 st;
     st.x = (sc.x >= 0.999f) ? uv.x : manual.x;
     st.y = (sc.y >= 0.999f) ? uv.y : manual.y;
-    return atlas.sample(s, st, slice);
+    // S1.1: st = fract(uv)*sc, so d(st) = sc*d(uv) everywhere EXCEPT the fract() step,
+    // where the implicit derivative would be +/-sc — the coarsest mip along a grid line
+    // at every tile boundary. Rebuild it from the PRE-fract uv.
+    float2 axisScale = float2((sc.x >= 0.999f) ? 1.0f : sc.x,
+                              (sc.y >= 0.999f) ? 1.0f : sc.y);
+    return atlas.sample(s, st, slice,
+                        gradient2d(duvdx * axisScale, duvdy * axisScale));
 }
 
 // Phase 7 — hex-stochastic atlas sample. Breaks repeating tiling on large planar
@@ -841,16 +853,17 @@ static inline float2 hexHash2D(float2 p) {
 
 // `strength` gates the whole effect. When strength <= 0 (the DEFAULT for every
 // scene that never opts in) this returns EXACTLY `sampleAtlasAspect(atlas, s, uv,
-// slice, uvScale)` — the identical single texture read the pre-anti-tiling shader
+// slice, uvScale, duvdx, duvdy)` — the identical single texture read the pre-anti-tiling shader
 // did — so opted-out scenes (Visualizer) are byte-for-byte unchanged. For
 // strength in (0,1] the three-tap hex blend is mixed in by `strength`, so the
 // caller can dial the de-repetition from subtle to full.
 static inline float4 sampleAtlasHex(texture2d_array<float, access::sample> atlas,
                                      sampler s, float2 uv, uint slice,
                                      const device float2* uvScale,
-                                     float strength) {
+                                     float strength,
+                                     float2 duvdx, float2 duvdy) {
     // Exact single-sample fast path — identical to sampleAtlasAspect, no extra taps.
-    float4 single = sampleAtlasAspect(atlas, s, uv, slice, uvScale);
+    float4 single = sampleAtlasAspect(atlas, s, uv, slice, uvScale, duvdx, duvdy);
     if (strength <= 0.0f) { return single; }
     const float sq3over2 = 0.8660254f;         // sqrt(3)/2
     // Skew UV to triangular lattice: (u, v) → (u + v*0.5, v*sqrt(3)/2)
@@ -883,9 +896,9 @@ static inline float4 sampleAtlasHex(texture2d_array<float, access::sample> atlas
     float p0 = w0 * w0 * w0, p1 = w1 * w1 * w1, p2 = w2 * w2 * w2;
     float pSum = max(p0 + p1 + p2, 1e-6f);
 
-    float4 c0 = sampleAtlasAspect(atlas, s, uv + h0, slice, uvScale);
-    float4 c1 = sampleAtlasAspect(atlas, s, uv + h1, slice, uvScale);
-    float4 c2 = sampleAtlasAspect(atlas, s, uv + h2, slice, uvScale);
+    float4 c0 = sampleAtlasAspect(atlas, s, uv + h0, slice, uvScale, duvdx, duvdy);
+    float4 c1 = sampleAtlasAspect(atlas, s, uv + h1, slice, uvScale, duvdx, duvdy);
+    float4 c2 = sampleAtlasAspect(atlas, s, uv + h2, slice, uvScale, duvdx, duvdy);
     float4 hex = (c0 * p0 + c1 * p1 + c2 * p2) / pSum;
     // Blend the de-repeated hex result toward the plain single sample by strength.
     // strength==1 → full hex, strength==0 handled by the early-out above.
@@ -930,7 +943,26 @@ fragment GBufferOut illumi_fs(
     GBufferOut o;
     constexpr sampler texSampler(filter::linear,
                                  mip_filter::linear,
-                                 address::repeat);
+                                 address::repeat,
+                                 // S1.1 — 8x. The archviz camera's whole problem is the
+                                 // grazing floor, where the footprint is a long thin
+                                 // ellipse and trilinear picks the mip fitting its MAJOR
+                                 // axis, over-blurring the minor one by the same ratio.
+                                 // 8x recovers ~3 mip levels along the minor axis. Not
+                                 // 16x: the hex blend already triples every atlas read.
+                                 // Apple GPUs spend taps proportional to the ACTUAL
+                                 // anisotropy, not the cap, so head-on surfaces pay
+                                 // nothing.
+                                 max_anisotropy(8));
+
+    // S1.1 — ONE screen-space UV derivative pair for the whole fragment, taken here in
+    // UNIFORM control flow from the interpolated uv BEFORE any hex-hash offset, fract()
+    // wrap or detail-frequency scale. Every atlas read below hands these to gradient2d
+    // rather than letting the texture unit infer a LOD from an offset uv. Taking them
+    // inside the `if (inst.*TextureSlice >= 0)` branches instead would be undefined:
+    // quad-mate lanes can be inactive there.
+    float2 duvdx = dfdx(in.uv);
+    float2 duvdy = dfdy(in.uv);
 
     // Phase 4.5 — tangent-space normal-map sampling. The atlas is the
     // same `bgra8Unorm` non-colour atlas as metallic/roughness; the
@@ -949,15 +981,35 @@ fragment GBufferOut illumi_fs(
         // but gives correct appearance after renormalize below.
         float4 nmSample = sampleAtlasHex(nonColorAtlas, texSampler, in.uv,
                                          uint(inst.normalTextureSlice), nonColorUVScale,
-                                         frame.antiTilingStrength * inst.antiTilingScale);
+                                         frame.antiTilingStrength * inst.antiTilingScale, duvdx, duvdy);
         float3 tangentN = normalize(nmSample.xyz * 2.0 - 1.0);
         // Phase 7 detail normal — blended on top of the macro normal at
         // higher UV frequency (pores, weave, grain). Uses overlay-normal
         // blend: partial-derivative add in tangent space, then renormalize.
         if (inst.detailNormalTextureSlice >= 0) {
             float2 detailUV = in.uv * inst.detailNormalUVScale;
+            // S1.1 — the detail band is handed the UNSCALED gradient pair ON PURPOSE, and
+            // this is a deliberate, measured exception to the rule the rest of this shader
+            // follows.
+            //
+            // The mip-correct thing is to scale by `detailNormalUVScale` (8×) to match the
+            // frequency actually being sampled. I did that first, and it BROKE the band:
+            // `testDetailNormalAddsGrazingMicroRelief` collapsed from ~1.4× to 1.0002× on
+            // aluminum and 0.97× on brushed-nickel — i.e. detail normals stopped doing
+            // anything at all. Correct LOD for an 8×-frequency band means selecting a mip
+            // ~3 levels coarser, which averages the pore/weave/grain perturbation to flat.
+            // The band exists precisely to survive there, and per the 2026-08-02
+            // whole-library A/B it is the ONE thing that measurably moves metals.
+            //
+            // Passing the unscaled pair makes this band sample about as sharply as it did
+            // when the atlas had no mip chain at all — so it is the STATUS QUO for detail
+            // normals, not a new under-filtering defect, while every other atlas read gets
+            // proper mips. The honest cost is that this band can still alias at grazing
+            // angles; the real fix is a detail-band roughness/AO companion (roadmap S2.4),
+            // which makes the effect survive filtering instead of depending on sharpness.
             float4 dnSample = sampleAtlasAspect(nonColorAtlas, texSampler, detailUV,
-                                                uint(inst.detailNormalTextureSlice), nonColorUVScale);
+                                                uint(inst.detailNormalTextureSlice), nonColorUVScale,
+                                                duvdx, duvdy);
             float3 dn = dnSample.xyz * 2.0 - 1.0;
             tangentN = normalize(float3(tangentN.xy + dn.xy, tangentN.z));
         }
@@ -976,7 +1028,7 @@ fragment GBufferOut illumi_fs(
         // infinitely-tiling region, so aspect is preserved.
         float4 tx = sampleAtlasHex(albedoAtlas, texSampler, in.uv,
                                     uint(inst.albedoTextureSlice), albedoUVScale,
-                                    frame.antiTilingStrength * inst.antiTilingScale);
+                                    frame.antiTilingStrength * inst.antiTilingScale, duvdx, duvdy);
         albedo = tx.rgb;
     }
     // Phase 4.17 — modulate albedo by per-vertex color (default white,
@@ -994,7 +1046,7 @@ fragment GBufferOut illumi_fs(
         // how the asset was authored. Falling back to R keeps single-
         // channel grayscale metallic maps working without per-scene wiring.
         float4 tx = sampleAtlasAspect(nonColorAtlas, texSampler, in.uv,
-                                      uint(inst.metallicTextureSlice), nonColorUVScale);
+                                      uint(inst.metallicTextureSlice), nonColorUVScale, duvdx, duvdy);
         metallic = tx.r;
     }
 
@@ -1004,7 +1056,7 @@ fragment GBufferOut illumi_fs(
         // roughness variation doesn't lag the albedo tile seam.
         float4 tx = sampleAtlasHex(nonColorAtlas, texSampler, in.uv,
                                     uint(inst.roughnessTextureSlice), nonColorUVScale,
-                                    frame.antiTilingStrength * inst.antiTilingScale);
+                                    frame.antiTilingStrength * inst.antiTilingScale, duvdx, duvdy);
         roughness = tx.g;
     }
 
@@ -1578,7 +1630,7 @@ fragment GBufferOut illumi_fs(
     float3 emission = inst.emission;
     if (inst.emissionTextureSlice >= 0) {
         float4 tx = sampleAtlasAspect(albedoAtlas, texSampler, in.uv,
-                                      uint(inst.emissionTextureSlice), albedoUVScale);
+                                      uint(inst.emissionTextureSlice), albedoUVScale, duvdx, duvdy);
         // Phase 4.27b — scale the emission texture by the material's
         // `emission.intensity` so a texture-driven glow reads at its tuned
         // HDR brightness (Pizza's heat coils were flat at intensity 1).

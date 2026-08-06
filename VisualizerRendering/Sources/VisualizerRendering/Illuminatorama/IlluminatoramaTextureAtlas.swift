@@ -64,6 +64,18 @@ public final class IlluminatoramaTextureAtlas {
     /// Side of each slice, in pixels. Source images are downsampled (or
     /// upsampled) to this resolution at registration time.
     public let sliceSize: Int
+    /// Mip levels each slice carries: the full chain down to 1×1 (512² → 10). S1.1 —
+    /// before this the atlases were single-level, so the G-buffer sampler's
+    /// `mip_filter::linear` was inert and every minified floor sampled bilinear-only at
+    /// level 0. Measured on the real Metal path at a grazing camera: the FAR floor band
+    /// carried 23 % MORE high-frequency energy than the resolved foreground (9.54 vs
+    /// 7.73) — an inversion that is pure minification aliasing.
+    public let mipLevels: Int
+
+    /// `floor(log2(n)) + 1` — the standard full chain.
+    static func mipLevelCount(for sliceSize: Int) -> Int {
+        max(1, Int(floor(log2(Double(max(1, sliceSize))))) + 1)
+    }
     /// Current number of slices the atlas can hold. Grows on demand —
     /// reads via the public property; the underlying texture is
     /// reallocated when the cap is exceeded.
@@ -124,7 +136,12 @@ public final class IlluminatoramaTextureAtlas {
         d.width = sliceSize
         d.height = sliceSize
         d.arrayLength = capacity
-        d.usage = [.shaderRead]
+        // S1.1 — the full chain. Static slices have every level filled from Core Graphics
+        // in `upload`, so `.renderTarget` is here ONLY so `generateMipmaps` can regenerate
+        // a LIVE slice's chain (`blitLiveSlice`), which the driver implements with render
+        // passes.
+        d.mipmapLevelCount = Self.mipLevelCount(for: sliceSize)
+        d.usage = [.shaderRead, .renderTarget]
         // `.managed` would let us upload via blit on Intel; on Apple Silicon
         // `.shared` and `.managed` perform identically. Use `.shared` so
         // `texture.replace(region:…)` works directly without a blit encoder.
@@ -141,6 +158,7 @@ public final class IlluminatoramaTextureAtlas {
         self.uvScaleBuffer = uv
         self.device = device
         self.sliceSize = sliceSize
+        self.mipLevels = Self.mipLevelCount(for: sliceSize)
         self.capacity = capacity
     }
 
@@ -317,66 +335,80 @@ public final class IlluminatoramaTextureAtlas {
     /// Render a CGImage into a transient BGRA buffer at `sliceSize`,
     /// uploading it into the atlas at `slice`. Returns `true` on success.
     private func upload(cgImage: CGImage, to slice: Int) -> Bool {
-        let bytesPerPixel = 4
-        let bytesPerRow = sliceSize * bytesPerPixel
-        let bufferSize = sliceSize * sliceSize * bytesPerPixel
-        var buffer = [UInt8](repeating: 0, count: bufferSize)
         let cs = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
         // bgra8Unorm_srgb expects BGRA channel order. CG's bitmap info uses
         // .premultipliedFirst + byteOrder32Little to lay out BGRA on a
         // little-endian host.
         let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue
                        | CGBitmapInfo.byteOrder32Little.rawValue
-        guard let ctx = buffer.withUnsafeMutableBytes({ raw -> CGContext? in
-            guard let base = raw.baseAddress else { return nil }
-            return CGContext(
-                data: base,
-                width: sliceSize,
-                height: sliceSize,
-                bitsPerComponent: 8,
-                bytesPerRow: bytesPerRow,
-                space: cs,
-                bitmapInfo: bitmapInfo
-            )
-        }) else {
-            Self.log.error("CGContext init failed for slice \(slice, privacy: .public)")
-            return false
-        }
         // Phase 4.25 — aspect-preserving letterbox. Instead of squishing a
         // non-square source into the full square (which distorted Forest bark,
         // Eggs warehouse walls, VintageDiner tile), fit the image to the slice
         // preserving its aspect and record the filled fraction as `uvScale`.
-        // A 4:1 wide tile fills the full width and the top quarter of the
-        // height → uvScale (1, 0.25); the empty band stays zeroed and the
-        // shader's half-texel-inset manual tiling never samples into it.
         //
-        // Anchor at CG-top (y = sliceSize − drawH): a CGBitmapContext stores
-        // row 0 at the image top, and Metal texture v=0 is buffer row 0, so
-        // drawing at high CG-y lands the image in texture v ∈ [0, uvScale.y] —
-        // exactly the sub-rect the shader samples. (origin x = 0 → u ∈ [0,
-        // uvScale.x].)
+        // Anchor at CG-top (y = n − drawH): a CGBitmapContext stores row 0 at the
+        // image top, and Metal texture v=0 is buffer row 0, so drawing at high
+        // CG-y lands the image in texture v ∈ [0, uvScale.y] — exactly the
+        // sub-rect the shader samples. (origin x = 0 → u ∈ [0, uvScale.x].)
         let aspect = Double(cgImage.width) / Double(max(cgImage.height, 1))  // w / h
         var sx: CGFloat = 1, sy: CGFloat = 1
         if aspect >= 1 { sy = CGFloat(1.0 / aspect) } else { sx = CGFloat(aspect) }
-        let drawW = CGFloat(sliceSize) * sx
-        let drawH = CGFloat(sliceSize) * sy
-        ctx.interpolationQuality = .high
-        ctx.draw(cgImage, in: CGRect(x: 0, y: CGFloat(sliceSize) - drawH,
-                                     width: drawW, height: drawH))
+
+        // S1.1 — build the FULL mip chain, one Core Graphics draw per level from the
+        // ORIGINAL source rather than a box-reduction of level 0 (better filtering, and
+        // no re-quantising an 8-bit image repeatedly). `.shared` storage means
+        // `replace(region:mipmapLevel:slice:)` writes each level directly, so this needs
+        // no blit encoder and `register(contents:)` stays synchronous.
+        for level in 0..<mipLevels {
+            let n = max(1, sliceSize >> level)
+            let bytesPerRow = n * 4
+            let bufferSize = bytesPerRow * n
+            var buffer = [UInt8](repeating: 0, count: bufferSize)
+            let drew: Bool = buffer.withUnsafeMutableBytes { raw -> Bool in
+                guard let base = raw.baseAddress,
+                      let ctx = CGContext(data: base, width: n, height: n,
+                                          bitsPerComponent: 8, bytesPerRow: bytesPerRow,
+                                          space: cs, bitmapInfo: bitmapInfo)
+                else { return false }
+                let drawW = CGFloat(n) * sx
+                let drawH = CGFloat(n) * sy
+                ctx.interpolationQuality = .high
+                // WRAP-FILL rather than letterbox-and-leave-black. For a SQUARE source
+                // (sx == sy == 1, which is every slice Daydream Home registers) this is
+                // exactly ONE draw at (0, 0, n, n) — byte-identical to the pre-S1.1
+                // level-0 upload. For a letterboxed source it additionally TILES the
+                // image across the empty band. Level 0 is unchanged either way because
+                // the shader clamps its reads to [halfTexel, sc − halfTexel] and never
+                // touches the padding; what it buys is that the COARSE levels average
+                // image-against-image instead of image-against-BLACK. Without it a 4:1
+                // wall texture would read ~4× too dark in the distance, since the mip
+                // pyramid would be averaging in the zeroed band.
+                let stepX = max(drawW, 1), stepY = max(drawH, 1)
+                let nx = min(64, Int((CGFloat(n) / stepX).rounded(.up)))
+                let ny = min(64, Int((CGFloat(n) / stepY).rounded(.up)))
+                for j in 0..<ny {
+                    let y = CGFloat(n) - drawH - CGFloat(j) * stepY
+                    for i in 0..<nx {
+                        ctx.draw(cgImage, in: CGRect(x: CGFloat(i) * stepX, y: y,
+                                                     width: drawW, height: drawH))
+                    }
+                }
+                return true
+            }
+            guard drew else {
+                Self.log.error("CGContext init failed for slice \(slice, privacy: .public) mip \(level, privacy: .public)")
+                return false
+            }
+            buffer.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                texture.replace(region: MTLRegionMake3D(0, 0, 0, n, n, 1),
+                                mipmapLevel: level, slice: slice,
+                                withBytes: base, bytesPerRow: bytesPerRow,
+                                bytesPerImage: bufferSize)
+            }
+        }
         uvScaleBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: capacity)[slice]
             = SIMD2<Float>(Float(sx), Float(sy))
-        let region = MTLRegionMake3D(0, 0, 0, sliceSize, sliceSize, 1)
-        buffer.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            texture.replace(
-                region: region,
-                mipmapLevel: 0,
-                slice: slice,
-                withBytes: base,
-                bytesPerRow: bytesPerRow,
-                bytesPerImage: bufferSize
-            )
-        }
         return true
     }
 
@@ -393,7 +425,8 @@ public final class IlluminatoramaTextureAtlas {
         d.width = sliceSize
         d.height = sliceSize
         d.arrayLength = newCapacity
-        d.usage = [.shaderRead]
+        d.mipmapLevelCount = mipLevels
+        d.usage = [.shaderRead, .renderTarget]
         d.storageMode = .shared
         guard let newTex = device.makeTexture(descriptor: d),
               let cb = blitQueue.makeCommandBuffer(),
