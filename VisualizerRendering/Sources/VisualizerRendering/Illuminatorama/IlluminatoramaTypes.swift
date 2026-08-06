@@ -599,11 +599,30 @@ public struct IlluminatoramaInstance {
     /// extractor, and has no texture to multiply, so this is a no-op there.
     /// Repurposes the former `_padSlice0` slot — same 4 bytes, stride stays 208.
     public var emissionIntensity: Float = 1.0
-    /// Former trailing pad, repurposed (#60 item 7): non-zero ⇒ this instance
-    /// is raster-only (its TLAS instance gets mask 0, so RT rays never
-    /// intersect it; the RT representation comes from elsewhere — e.g. a
-    /// registered `IlluminatoramaCurveSet` twin). Same 4 bytes.
+    /// Former trailing pad, repurposed (#60 item 7). How this instance appears to
+    /// the ray tracer — THREE states, mapped to TLAS instance masks in
+    /// `rebuildRTAccel`:
+    ///
+    ///   `0` (default) — ordinary traced geometry (mask `0x01`).
+    ///   `rtExcludeFully` (1) — raster-only: mask `0x00`, so RT rays never
+    ///     intersect it and the RT representation comes from elsewhere (a
+    ///     registered `IlluminatoramaCurveSet` twin, a superquadric proxy).
+    ///   `rtInvisibleOccluder` (2) — real to LIGHT, never drawn (mask `0x04`).
+    ///     Shadow + GI rays are stopped by it; camera-visible rays (glass
+    ///     refraction, glossy reflections) pass straight through. This is the
+    ///     lighting-only ceiling over a roofless dollhouse: it must stop the sky
+    ///     from flooding an interior GI bounce, while never appearing in the
+    ///     picture. Value 1 could not express that — it is the whole reason
+    ///     interiors flooded when RT GI was enabled.
+    ///
+    /// Same 4 bytes; kept as `Int32` rather than an enum so the struct layout the
+    /// Metal mirror depends on is untouched.
     public var rtExclude: Int32 = 0
+    /// `rtExclude` value: raster-only, never intersected by any ray.
+    public static let rtExcludeFully: Int32 = 1
+    /// `rtExclude` value: invisible occluder — stops transport rays (shadow, GI),
+    /// invisible to camera-visible rays (glass refraction, glossy reflections).
+    public static let rtInvisibleOccluder: Int32 = 2
     // Phase 7 — detail-normal path for close-range pores/weave/grain.
     // Sampled at `detailNormalUVScale × in.uv` and blended into the
     // macro normal map result. Stride grows from 208 → 224 (next 16-byte

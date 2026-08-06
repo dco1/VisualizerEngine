@@ -292,6 +292,16 @@ struct SecondaryShadeParams {
     uint   objUVCount;      // bound of objUV in float2 entries
     // Local lights bound in `SecondaryScene`. 0/0 ⇒ sun + sky only.
     uint   pointLightCount; uint spotLightCount;
+    // C3 — which TLAS instances stop this hit's SUN SHADOW ray. 0x01 = opaque
+    // (glass 0x02 never casts a solid shadow). A transport path adds 0x04, the
+    // "invisible occluder" bit: a slab that is real to light and never drawn —
+    // Daydream's lighting-only `ceilshadow.*` ceilings. Per-CALLER rather than
+    // hard-coded, because the two callers want different answers: an RT GI bounce
+    // landing on a floor under a virtual ceiling must be shadowed by it, while the
+    // glass pass must keep 0x01 exactly — the through-glass artefact fixed by
+    // excluding those slabs from RT is the reason this bit exists as a third state
+    // instead of just un-excluding them (see HouseRenderBridge's `rtExclude`).
+    uint   occluderMask;
 };
 
 /// The device buffers the shading reads. Textures are passed separately —
@@ -460,7 +470,8 @@ static inline float3 secondaryLocalLightFill(float3 P, float3 N, uint layerBits,
 // ── Direct sun ───────────────────────────────────────────────────────────────
 
 /// Fraction of the sun disc visible from a secondary hit, by shadow ray(s) against
-/// the OPAQUE mask (0x01) — glass (0x02) never casts a solid shadow. `theta == 0`
+/// the caller's `occluderMask` (0x01 opaque, +0x04 invisible occluders on a
+/// transport path) — glass (0x02) never casts a solid shadow. `theta == 0`
 /// (`sunSoftnessRad`) degenerates to a hard ray, so a caller that cannot afford a
 /// soft penumbra pays exactly one trace and gets the old behaviour.
 ///
@@ -482,7 +493,7 @@ static inline float secondarySunVisibility(thread Isect& isect,
         sr.origin = P + N * 2e-3;
         sr.direction = coneSample(Ld, p.sunSoftnessRad, rnd(seed), rnd(seed));
         sr.min_distance = 2e-3; sr.max_distance = 1e4;
-        if (isect.intersect(sr, accel, 0x01u).type != intersection_type::none) hits++;
+        if (isect.intersect(sr, accel, p.occluderMask).type != intersection_type::none) hits++;
     }
     isect.accept_any_intersection(false);
     return 1.0 - float(hits) / float(p.shadowRays);

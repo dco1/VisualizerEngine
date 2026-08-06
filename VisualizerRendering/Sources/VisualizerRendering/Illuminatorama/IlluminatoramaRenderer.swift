@@ -507,6 +507,86 @@ public final class IlluminatoramaRenderer {
     public var rtSpecStrength: Float = 0.25
     public private(set) var rtSupported: Bool = false
 
+    // ── Who computes the sun's DIRECT term (C1) ──────────────────────
+    //
+    // THE BUG THIS EXISTS TO MAKE IMPOSSIBLE: the RT lighting kernels end with
+    // `outHDR += direct + indirect + reflection`, and `direct` was computed
+    // unconditionally whenever `shadowRays > 0` (default 4). The frame graph never
+    // suppressed the DEFERRED lighting pass — it only chose *which* RT pass ran —
+    // so a host that flipped `rtEnabled` on a normally-lit scene got the sun
+    // TWICE, on top of everything else. Every Visualizer host avoided that by
+    // CONVENTION (each one zeroes `directionalLightColor` + `shadowsEnabled`
+    // itself, and `IlluminatoramaSceneExtractor` does it for the descriptor path);
+    // a convention is exactly what a new host forgets. Daydream Home forgot it, and
+    // "RT GI washes interiors out" was mostly this.
+    //
+    // Ownership is now a stated property of the renderer, and the RT kernels are
+    // told the answer in a uniform (`directSunEnabled`) instead of assuming it.
+    public enum RTSunOwnership: Sendable {
+        /// The DEFERRED lighting pass owns the sun; the RT pass contributes only
+        /// GI + reflections. In this mode `rtGIStrength = 0` + `rtReflStrength = 0`
+        /// makes an RT-on frame BIT-IDENTICAL to an RT-off frame — the property
+        /// `IlluminatoramaRTSunOwnershipTests` gates, and the cheapest possible
+        /// alarm on this whole class of bug.
+        ///
+        /// This is the right mode when the deferred BRDF is richer than the RT
+        /// one (it is: cascades, clearcoat, sheen, anisotropy, transmission) and
+        /// RT is wanted for transport, not for the sun.
+        case deferred
+        /// The RT pass owns the sun — soft shadow rays sampled across the sun's
+        /// angular disc, i.e. a true penumbra the cascades can't produce. The
+        /// renderer FORCES the deferred directional light + cascaded shadows off
+        /// for the frame, so choosing this can't leave the sun double-counted.
+        case rayTraced
+        /// Resolve from observable state: `rayTraced` iff the host has already
+        /// zeroed `directionalLightColor` (the hand-over every RT host in
+        /// Visualizer performs), else `deferred`. This is the default because it
+        /// reproduces EXACTLY what every existing host does today — the scenes
+        /// that hand the sun over keep RT's sun, and a host that never did (i.e.
+        /// was double-counting) stops.
+        case automatic
+    }
+    /// Who computes the sun's direct term while an RT lighting pass is running.
+    /// See `RTSunOwnership`. Default `.automatic`.
+    public var rtSunOwnership: RTSunOwnership = .automatic
+
+    // ── TLAS instance masks (C3) ─────────────────────────────────────
+    //
+    // Three states, not two. The first two are old:
+    //   0x01  traced — an ordinary opaque/curve instance.
+    //   0x02  AAA glass — a pane, so it never casts a solid shadow.
+    //   0x00  excluded — present in the TLAS layout, never intersected. The RT
+    //         representation lives elsewhere (a superquadric's proxy, a curve twin).
+    // and the third is new:
+    //   0x04  INVISIBLE OCCLUDER — real to LIGHT, never drawn. Daydream Home's
+    //         lighting-only `ceilshadow.*` ceilings are the case: a roofless
+    //         dollhouse needs a ceiling that stops the sun (it is already a
+    //         shadow-map occluder) but must not appear in the picture. With only
+    //         the binary states available, the bridge had to pick "excluded", and
+    //         then every GI ray leaving an interior surface through the open top
+    //         missed everything and returned FULL SKY — the patio flood
+    //         `+InteriorLight` exists to prevent.
+    //
+    // The split is by ray PURPOSE, not by pass: transport rays (shadow, GI) trace
+    // `0x01|0x04`; camera-visible rays (glass primary/refraction, glossy
+    // reflections) trace without 0x04, so an undrawn slab is never shown.
+    static let rtMaskTraced: UInt32 = 0x01
+    static let rtMaskGlass: UInt32 = 0x02
+    static let rtMaskInvisibleOccluder: UInt32 = 0x04
+    /// Shadow + GI ray mask: opaque/curve + invisible occluders.
+    static let rtTransportRayMask: UInt32 = rtMaskTraced | rtMaskInvisibleOccluder
+    /// `rtSunOwnership` resolved against the current lighting state. Read by the
+    /// frame-uniform fill (to suppress the deferred sun) and by both RT lighting
+    /// encoders (to suppress the RT sun) — one answer, two consumers, so they
+    /// cannot disagree.
+    var rtOwnsDirectSun: Bool {
+        switch rtSunOwnership {
+        case .deferred:  return false
+        case .rayTraced: return true
+        case .automatic: return simd_length_squared(directionalLightColor) <= 0
+        }
+    }
+
     // ── RT diffuse denoiser ──────────────────────────────────────────
     // The RT pass writes its noisy diffuse (soft shadow + 1-bounce GI) term to
     // its own buffer; this depth+normal-guided bilateral cleans it BEFORE it
@@ -2149,7 +2229,10 @@ public final class IlluminatoramaRenderer {
         var leafTransmission: Float = 0      // mirrors _padRT0 in the Metal struct
         // Curve primitives (#60 item 7, incr. 2): 1 ⇒ soup AS holds a curve
         // geometry descriptor; mirrors `curvesEnabled` (was `_padRT1`) in Metal.
-        var curvesEnabled: UInt32 = 0; var _padRT2: UInt32 = 0
+        var curvesEnabled: UInt32 = 0
+        /// C1 — 0 ⇒ the deferred pass already shaded the sun here (mirrors
+        /// `directSunEnabled`, was `_padRT2`). See `RTSunOwnership`.
+        var directSunEnabled: UInt32 = 0
     }
     /// Mirror of `RTDenoiseUniforms` in Illuminatorama.metal (stride 32, 16-aligned).
     private struct RTDenoiseUniforms {
@@ -2498,6 +2581,11 @@ public final class IlluminatoramaRenderer {
         var objUVCount: UInt32 = 0
         var pointLightCount: UInt32 = 0
         var spotLightCount: UInt32 = 0
+        // C1 — 0 ⇒ the deferred pass already shaded the sun here; this kernel must
+        // not add it again (see `RTSunOwnership`). C3 — the shadow/GI ray mask,
+        // 0x01 opaque | 0x04 invisible occluder.
+        var directSunEnabled: UInt32 = 0
+        var transportRayMask: UInt32 = 0x05
     }
     /// **The ONE place an instance becomes `RTInstanceData`.** The normal matrix's
     /// column `.w` lanes are dead weight for RT (every consumer builds a float3x3
@@ -6415,11 +6503,22 @@ public final class IlluminatoramaRenderer {
                 let inst = instPtr[i]
                 var desc = MTLAccelerationStructureInstanceDescriptor()
                 desc.accelerationStructureIndex = UInt32(s.asIndex)
-                // Raster-only instances (#60 item 7) get mask 0: present in the
-                // TLAS layout but never intersected. Opaque instances get mask 0x01
-                // (AAA glass uses 0x02), so opaque/cache rays — which trace with
-                // 0x01 — match exactly what they hit before glass joined the TLAS.
-                desc.mask = inst.rtExclude != 0 ? 0x00 : 0x01
+                // Three states — see the `rtMask*` constants. `rtExclude` 1 is the
+                // original raster-only case (#60 item 7): present in the TLAS
+                // layout, never intersected, its RT representation supplied
+                // elsewhere. `rtExclude` 2 is the INVISIBLE OCCLUDER (C3): real to
+                // transport rays, invisible to camera-visible ones. Everything else
+                // is an ordinary traced opaque instance (AAA glass uses 0x02), so
+                // rays tracing 0x01 hit exactly what they hit before glass joined
+                // the TLAS.
+                switch inst.rtExclude {
+                case IlluminatoramaInstance.rtExcludeFully:
+                    desc.mask = 0x00
+                case IlluminatoramaInstance.rtInvisibleOccluder:
+                    desc.mask = Self.rtMaskInvisibleOccluder
+                default:
+                    desc.mask = Self.rtMaskTraced
+                }
                 desc.options = .opaque
                 desc.intersectionFunctionTableOffset = 0
                 desc.transformationMatrix = packed4x3(inst.modelMatrix)
@@ -6965,6 +7064,16 @@ public final class IlluminatoramaRenderer {
         u.interiorIBLUp = max(0, interiorIBLUp)
         u.interiorIBLSide = max(0, interiorIBLSide)
         u.interiorAmbient = max(0, interiorAmbient)
+        // C1 — exactly one sun (see `RTSunOwnership`). This pass is ADDITIVE over a
+        // complete deferred frame; with the old "compute direct whenever
+        // shadowRays > 0" gate (default 4) and no deferred suppression, flipping
+        // `rtEnabled` added a second sun. `.automatic` reproduces every existing
+        // host; a host that keeps its deferred sun now gets GI + reflections only.
+        u.directSunEnabled = rtOwnsDirectSun ? 1 : 0
+        // C3 — shadow + GI rays see opaque (0x01) AND invisible occluders (0x04):
+        // slabs that are real to light and never drawn. Camera-visible rays
+        // (reflections here, refraction in the glass pass) deliberately don't.
+        u.transportRayMask = Self.rtTransportRayMask
         memcpy(rtInstUniformBuffer.contents(), &u, MemoryLayout<RTInstUniforms>.stride)
 
         guard let enc = timedComputeEncoder(cb, "rtLightingTLAS") else { return }
@@ -7008,6 +7117,11 @@ public final class IlluminatoramaRenderer {
         enc.setBuffer(spotLightBuffer, offset: 0, index: 18)
         enc.setTexture(irradianceCube, index: 6)
         enc.setTexture(albedoAtlas.texture, index: 7)
+        // C2 — the noisy diffuse (soft shadow + GI) goes to its own buffer so the
+        // temporal accumulator + SVGF/bilateral can clean it, exactly as the soup
+        // path does. Before this the TLAS kernel composited it inline, which is
+        // why both denoisers sat in the soup-only `else` branch doing nothing.
+        enc.setTexture(rtDiffuseTexture, index: 8)
         // The TLAS references the BLASes, which reference the mesh vertex/index
         // buffers (and the curve BLASes the pooled curve buffers) — all must be
         // resident for the intersector.
@@ -7742,24 +7856,18 @@ public final class IlluminatoramaRenderer {
         // opaque geometry falls back to deferred lighting (exactly as in the
         // `rtEnabled == false` case), the surface-cache update + caustic splat still
         // run, and the glass still refracts via the live TLAS. See the flag's doc.
+        //
+        // C2 — the denoise chain is now shared. It used to live INSIDE the soup
+        // `else` branch, so the TLAS path composited 4 GI rays raw; in an app that
+        // also runs with TAA off, nothing cleaned them at all ("dark noisy
+        // blotches"). Both lighting kernels now write the same `rtDiffuseTexture`,
+        // so the same chain reads it whichever one ran.
         if rtTLASActive && rtEnabled && rtOpaqueLightingEnabled {
             encodeRTLightingTLASPass(cb)
+            encodeRTDiffuseDenoiseChain(cb)
         } else if !rtTLASActive {
             encodeRTLightingPass(cb)
-            // Temporally accumulate the RT diffuse (GI) so it keeps converging
-            // under camera motion (kills the wall crawl) BEFORE the spatial
-            // denoise reads it. No-op unless rtGITemporalEnabled.
-            encodeRTGITemporalAccum(cb)
-            // Phase 4.44 — SVGF à-trous cascade replaces the fixed-radius
-            // bilateral when enabled. Falls back to the original bilateral path.
-            if effectiveSVGFEnabled && rtGITemporalEnabled && rtEnabled && rtSupported {
-                encodeSVGFCascade(cb)
-            } else {
-                // Bilateral-clean the RT diffuse (shadow+GI) buffer into the
-                // composite before TAA. The TLAS path still composites diffuse
-                // inline, so this only runs for the direct-AS (room) path.
-                encodeRTDenoiseComposite(cb)
-            }
+            encodeRTDiffuseDenoiseChain(cb)
         }
         // Volumetric god-ray shaft in the air. No-op unless enabled.
         encodeVolumetricPass(cb)
@@ -9810,6 +9918,10 @@ public final class IlluminatoramaRenderer {
             emitterCount: UInt32(activeEmitterLightCount),
             leafTransmission: max(0, leafTransmission))
         u.curvesEnabled = curvesOn ? 1 : 0
+        // C1 — exactly one sun. See `RTSunOwnership`; `.automatic` (the default)
+        // reproduces every existing soup host, all of which zero
+        // `directionalLightColor` before enabling RT.
+        u.directSunEnabled = rtOwnsDirectSun ? 1 : 0
         memcpy(rtUniformBuffer.contents(), &u, MemoryLayout<RTUniforms>.stride)
 
         guard let enc = cb.makeComputeCommandEncoder() else { return }
@@ -9860,6 +9972,37 @@ public final class IlluminatoramaRenderer {
         enc.endEncoding()
     }
 
+    /// **True when an RT lighting pass wrote `rtDiffuseTexture` this frame** — the one
+    /// precondition every consumer of that buffer shares, in one place so they cannot
+    /// drift apart (C2: they used to guard on the SOUP path's resources, which is why
+    /// nothing denoised the TLAS path — `rtPipeline`/`rtAccel` are nil there).
+    private var rtDiffuseWrittenThisFrame: Bool {
+        guard rtEnabled, rtSupported else { return false }
+        // A live TLAS routes to `encodeRTLightingTLASPass`, which only runs (and only
+        // writes the buffer) when the opaque lighting pass is enabled. A glass-only
+        // TLAS therefore correctly reports false.
+        if rtTLASActive { return rtOpaqueLightingEnabled }
+        return rtPipeline != nil && rtAccel != nil && rtTriangleCount > 0
+    }
+
+    /// Clean the RT diffuse (soft shadow + 1-bounce GI) and composite it. Shared by
+    /// BOTH lighting paths — see the frame-graph call sites. Order matters: temporal
+    /// accumulation first (it feeds the spatial filter a far less noisy input), then
+    /// either the SVGF à-trous cascade or the fixed-radius bilateral.
+    private func encodeRTDiffuseDenoiseChain(_ cb: MTLCommandBuffer) {
+        // Temporally accumulate the RT diffuse (GI) so it keeps converging under
+        // camera motion (kills the wall crawl) BEFORE the spatial denoise reads it.
+        // No-op unless rtGITemporalEnabled.
+        encodeRTGITemporalAccum(cb)
+        // Phase 4.44 — SVGF à-trous cascade replaces the fixed-radius bilateral when
+        // enabled. Falls back to the original bilateral path.
+        if effectiveSVGFEnabled && rtGITemporalEnabled && rtEnabled && rtSupported {
+            encodeSVGFCascade(cb)
+        } else {
+            encodeRTDenoiseComposite(cb)
+        }
+    }
+
     /// Temporal accumulation of the RT diffuse (1-bounce GI + soft shadow)
     /// term: velocity-reprojected exponential history so the GI keeps
     /// converging under camera motion. Reads the raw RT diffuse + previous
@@ -9867,8 +10010,7 @@ public final class IlluminatoramaRenderer {
     /// denoise then reads via `rtDiffuseDenoiseSource`, and which becomes next
     /// frame's history after the per-frame toggle). No-op unless enabled.
     private func encodeRTGITemporalAccum(_ cb: MTLCommandBuffer) {
-        guard rtGITemporalEnabled, rtEnabled, rtSupported,
-              rtPipeline != nil, rtAccel != nil, rtTriangleCount > 0 else { return }
+        guard rtGITemporalEnabled, rtDiffuseWrittenThisFrame else { return }
         var u = RTGITemporalUniforms(
             width: UInt32(width), height: UInt32(height),
             enabled: 1,
@@ -9904,9 +10046,7 @@ public final class IlluminatoramaRenderer {
     /// Only runs when `svgfEnabled && rtGITemporalEnabled && rtEnabled`.
     /// Replaces `encodeRTDenoiseComposite` for the GI term on this path.
     private func encodeSVGFCascade(_ cb: MTLCommandBuffer) {
-        guard effectiveSVGFEnabled,
-              rtGITemporalEnabled, rtEnabled, rtSupported,
-              rtPipeline != nil, rtAccel != nil, rtTriangleCount > 0 else { return }
+        guard effectiveSVGFEnabled, rtGITemporalEnabled, rtDiffuseWrittenThisFrame else { return }
 
         let levels = max(1, min(5, effectiveSVGFLevels))
         let W = UInt32(width), H = UInt32(height)
@@ -9990,12 +10130,11 @@ public final class IlluminatoramaRenderer {
     /// Depth + normal guided bilateral over the RT diffuse buffer, adding the
     /// cleaned soft-shadow + 1-bounce-GI term into the HDR composite (additive,
     /// own-pixel read-modify-write) before the volumetric / TAA passes. Gated on
-    /// the same conditions as `encodeRTLightingPass` so it only composites a
-    /// buffer that was actually written this frame; with `rtDenoiseEnabled` off
-    /// it passes the raw diffuse straight through (the old additive behaviour).
+    /// `rtDiffuseWrittenThisFrame`, so it only composites a buffer some lighting
+    /// pass actually wrote — EITHER path, since C2; with `rtDenoiseEnabled` off it
+    /// passes the raw diffuse straight through (the old additive behaviour).
     private func encodeRTDenoiseComposite(_ cb: MTLCommandBuffer) {
-        guard rtEnabled, rtSupported,
-              rtPipeline != nil, rtAccel != nil, rtTriangleCount > 0 else { return }
+        guard rtDiffuseWrittenThisFrame else { return }
         var u = RTDenoiseUniforms(
             width: UInt32(width), height: UInt32(height),
             enabled: rtDenoiseEnabled ? 1 : 0,
@@ -10955,6 +11094,19 @@ public final class IlluminatoramaRenderer {
             plushSheen: max(0, plushSheen),
             plushTransmission: max(0, plushTransmission)
         )
+        // C1 — sun ownership, enforced here rather than left to the host. With
+        // `rtSunOwnership == .rayTraced` the RT lighting pass computes the sun
+        // (soft disc shadows), so the deferred directional + its cascades MUST go
+        // dark for this frame or the sun lands twice. Same condition every
+        // Visualizer host already applies by hand (`rtOn = rtEnabled &&
+        // rtSupported`), so those scenes see no change — they zero the colour
+        // themselves and resolve to `.automatic`-rayTraced anyway; this is the
+        // belt for the next host that doesn't know the convention. `.automatic`
+        // is deliberately NOT handled here: it MEANS "the host already did it".
+        if rtSunOwnership == .rayTraced, rtEnabled, rtSupported, rtOpaqueLightingEnabled {
+            u.directionalLightColor = .zero
+            u.shadowEnabled = 0
+        }
         // Tree wind (#58 #1): repurpose the two free pad floats as the vertex-
         // shader vegetation-wind knobs. _padPhase2A = strength (max canopy sway,
         // ~m), _padPhase2B = heading (radians). 0 strength → exact no-op (the

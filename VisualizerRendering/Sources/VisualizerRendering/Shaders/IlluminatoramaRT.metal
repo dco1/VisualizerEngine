@@ -54,7 +54,15 @@ struct RTUniforms {
     // a curve geometry descriptor (round Catmull-Rom wood), so curve hits occlude
     // + shade. Repurposes _padRT1 (same 4 bytes). Unread by the base (curve-free)
     // pipeline variant. Keep in lockstep with the Swift RTUniforms mirror.
-    uint  curvesEnabled; uint _padRT2;           // keep stride 16-byte aligned
+    uint  curvesEnabled;
+    // C1 — who computes the sun's DIRECT term. 0 ⇒ the DEFERRED lighting pass
+    // already shaded the sun at this pixel and this kernel must not shade it
+    // again; 1 ⇒ the host handed the sun to RT (deferred directional + cascades
+    // forced off). This pass is additive over a complete deferred frame, so with
+    // the gate at "always" (the old `shadowRays > 0`, default 4) a host that only
+    // wanted GI got the sun twice. Repurposes _padRT1's neighbour `_padRT2` —
+    // same 4 bytes, stride unchanged. See `IlluminatoramaRenderer.RTSunOwnership`.
+    uint  directSunEnabled;
 };
 
 // Analytic point emitter — mirrored from Illuminatorama.metal. Keep in lockstep.
@@ -302,7 +310,7 @@ kernel void illumi_rt_lighting(
     float3 Ld = normalize(u.sunDir);
     float NdotL = saturate(dot(N, Ld));
     float3 direct = float3(0.0);
-    if (NdotL > 0.0 && u.shadowRays > 0) {
+    if (u.directSunEnabled != 0 && NdotL > 0.0 && u.shadowRays > 0) {
         isect.accept_any_intersection(true);   // occlusion-only
         uint hits = 0;
         for (uint s = 0; s < u.shadowRays; ++s) {
@@ -334,7 +342,10 @@ kernel void illumi_rt_lighting(
     // arrives through the leaf from the sun side, so the occlusion test is cast
     // from a point nudged toward the sun (`P + Ld·ε`) — offsetting along +N as
     // the front-face test does would self-shadow the leaf's own triangle.
-    if (nrH.a < 0.5h && u.leafTransmission > 0.0 && u.shadowRays > 0) {
+    // C1: this is a SUN term, so it belongs to whoever owns the sun. The deferred
+    // lighting kernel has its own leaf-transmission block; running both adds the
+    // back-light twice.
+    if (u.directSunEnabled != 0 && nrH.a < 0.5h && u.leafTransmission > 0.0 && u.shadowRays > 0) {
         float3 V = normalize(u.cameraWorldPos - P);
         float back = saturate(dot(-N, Ld));              // sun on the FAR face
         if (back > 0.0) {

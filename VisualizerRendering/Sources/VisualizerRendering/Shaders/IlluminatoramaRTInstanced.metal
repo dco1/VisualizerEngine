@@ -83,6 +83,28 @@ struct RTInstUniforms {
     uint  objUVCount;           // bound of objUV in float2 entries
     uint  pointLightCount;      // local lights at buffers 16 / 17
     uint  spotLightCount;
+    // ── C1: who computes the sun's DIRECT term ───────────────────────────────
+    // 0 ⇒ the DEFERRED lighting pass already shaded the sun at this pixel, so this
+    // kernel must NOT shade it again. This pass is ADDITIVE on top of a complete
+    // deferred frame (`outHDR.write(prev.rgb + …)` at the bottom), and the frame
+    // graph does not suppress deferred lighting when RT is on — it only picks
+    // WHICH RT pass runs. With this at 0 and `giStrength`/`reflStrength` also 0,
+    // this kernel adds EXACTLY zero and an RT-on frame is bit-identical to an
+    // RT-off one. That property is the gate; see `IlluminatoramaRenderer
+    // .RTSunOwnership`.
+    // 1 ⇒ the host handed the sun to RT (deferred directional + cascades forced
+    // off), and the soft-disc penumbra below is the only sun in the frame.
+    uint  directSunEnabled;
+    // ── C3: which TLAS instances stop a TRANSPORT ray ────────────────────────
+    // Mask for shadow + GI rays. 0x01 = opaque; 0x04 = "invisible occluder" — a
+    // slab that is real to LIGHT but never drawn (Daydream's lighting-only
+    // `ceilshadow.*` ceilings over a roofless dollhouse). Without 0x04 a GI ray
+    // leaving an interior surface through the open top hits nothing and returns
+    // FULL SKY, flooding the room with the exact patio light the ceiling exists
+    // to stop. Camera-visible rays (glass refraction, and the glossy reflections
+    // below) deliberately do NOT carry 0x04 — an undrawn slab must not appear in
+    // the picture. Host default 0x05.
+    uint  transportRayMask;
 };
 
 // ── Curve primitives (#60 item 7) ────────────────────────────────────────────
@@ -213,6 +235,11 @@ static inline SecondaryShadeParams fullRadianceParams(constant RTInstUniforms& u
     p.objUVCount = u.objUVCount;
     p.pointLightCount = u.pointLightCount;
     p.spotLightCount = u.spotLightCount;
+    // C3 — a secondary hit found by this kernel is on a TRANSPORT path, so its own
+    // sun shadow ray honours invisible occluders too. Without this a GI bounce that
+    // lands on a floor under a lighting-only ceiling would come back full-sunlit and
+    // put the light straight back that the transport mask on the bounce ray removed.
+    p.occluderMask = u.transportRayMask;
     return p;
 }
 
@@ -264,6 +291,13 @@ kernel void illumi_rt_lighting_tlas(
     const device RTSpotLight*             spotLights  [[buffer(18)]],
     texturecube<float, access::sample>    irrCube     [[texture(6)]],
     texture2d_array<float, access::sample> albedoAtlas [[texture(7)]],
+    // C2 — the noisy diffuse (soft shadow + 1-bounce GI) goes OUT to its own
+    // buffer for the temporal accumulator + SVGF/bilateral to clean, exactly as
+    // the soup kernel has always done. It used to be composited inline here, and
+    // that is the whole reason neither denoiser ran on this path: they consume
+    // THIS texture, and nothing was writing it. With this app's TAA also off,
+    // 4 GI rays reached the screen raw — the "dark noisy blotches".
+    texture2d<half, access::write>        rtDiffuse   [[texture(8)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -311,18 +345,25 @@ kernel void illumi_rt_lighting_tlas(
     SecondaryShadeParams secBounce = giBounceParams(u);       // GI bounces (no sky double-count)
 
     // ── Direct sun (soft shadows) ─────────────────────────────────
+    //
+    // C1: gated on `directSunEnabled`, NOT on `shadowRays > 0`. `shadowRays`
+    // defaults to 4, so the old gate meant "always" — and this pass is additive
+    // over a deferred frame that already shaded the sun. Two sun terms is what
+    // made turning RT on look WORSE. Now exactly one of the two runs, and which
+    // one is the renderer's stated `rtSunOwnership`.
     float3 direct = float3(0.0);
     float NdotL = saturate(dot(N, Ld));
-    if (NdotL > 0.0 && u.shadowRays > 0) {
+    if (u.directSunEnabled != 0 && NdotL > 0.0 && u.shadowRays > 0) {
         isect.accept_any_intersection(true);
         uint hits = 0;
         for (uint s = 0; s < u.shadowRays; ++s) {
             ray r; r.origin = Pofs; r.direction = coneSample(Ld, u.sunSoftnessRad, rnd(seed), rnd(seed));
             r.min_distance = max(u.rayTMin, 1e-3); r.max_distance = 1e4;
-            // Any occluder counts — triangles always; curves when enabled. Mask
-            // 0x01 = opaque + curve instances only; glass (mask 0x02, #60 AAA
-            // glass) is excluded so a clear pane doesn't cast a solid shadow.
-            if (isect.intersect(r, accel, 0x01u).type != intersection_type::none) hits++;
+            // Any occluder counts — triangles always; curves when enabled.
+            // `transportRayMask` = 0x01 opaque + curve | 0x04 invisible occluder
+            // (C3). Glass (mask 0x02, #60 AAA glass) is excluded either way so a
+            // clear pane doesn't cast a solid shadow.
+            if (isect.intersect(r, accel, u.transportRayMask).type != intersection_type::none) hits++;
         }
         float vis = 1.0 - float(hits) / float(u.shadowRays);
         float3 V = normalize(u.cameraWorldPos - P);
@@ -342,7 +383,10 @@ kernel void illumi_rt_lighting_tlas(
             float3 dir = cosineSample(N, rnd(seed), rnd(seed));
             ray r; r.origin = Pofs; r.direction = dir;
             r.min_distance = max(u.rayTMin, 1e-3); r.max_distance = u.maxGIDist;
-            auto res = isect.intersect(r, accel, 0x01u);  // opaque+curve only (exclude glass mask 0x02)
+            // C3: transport mask — opaque + curve + INVISIBLE OCCLUDER. Without
+            // 0x04 a GI ray leaving an interior through the roofless dollhouse's
+            // open top misses everything and returns full sky.
+            auto res = isect.intersect(r, accel, u.transportRayMask);
             if (res.type == intersection_type::triangle) {
                 if (u.surfCacheEnabled != 0) {
                     // Cached path: reconstruct the hit's full outgoing radiance
@@ -415,7 +459,7 @@ kernel void illumi_rt_lighting_tlas(
                         isect.accept_any_intersection(true);
                         ray sr; sr.origin = hitP + hitN * 2e-3; sr.direction = Ld;
                         sr.min_distance = 2e-3; sr.max_distance = 1e4;
-                        float sv = (isect.intersect(sr, accel, 0x01u).type != intersection_type::none) ? 0.0 : 1.0;
+                        float sv = (isect.intersect(sr, accel, u.transportRayMask).type != intersection_type::none) ? 0.0 : 1.0;
                         hitRad += cs.albedoRoughness.xyz * (1.0 / M_PI_F) * u.sunColor * hN * sv;
                         isect.accept_any_intersection(false);
                     }
@@ -488,7 +532,13 @@ kernel void illumi_rt_lighting_tlas(
             if (dot(dir, N) <= 0.0) continue;
             ray r; r.origin = Pofs; r.direction = dir;
             r.min_distance = max(u.rayTMin, 1e-3); r.max_distance = u.reflMaxDist;
-            auto res = isect.intersect(r, accel, 0x01u);  // opaque+curve only (exclude glass mask 0x02)
+            // C3 — DELIBERATELY the opaque mask, NOT `transportRayMask`. A
+            // reflection is a CAMERA-VISIBLE ray: whatever it hits is drawn into
+            // the picture. An invisible occluder (0x04) is a slab that exists for
+            // light and is deliberately not drawn, so showing one in a glossy floor
+            // would put a ceiling in the frame that is nowhere else in it. Flagged
+            // for Danny; measured in `testRTReflectionRaysDoNotShowInvisibleCeilings`.
+            auto res = isect.intersect(r, accel, 0x01u);
             if (kRTCurvesEnabled && res.type == intersection_type::curve) {
                 // Curve reflection hit (#60 item 7) — same shading shape as the
                 // triangle re-shade below (ambient + sun + the set's emission).
@@ -506,7 +556,7 @@ kernel void illumi_rt_lighting_tlas(
                         isect.accept_any_intersection(true);
                         ray sr; sr.origin = hitP + hitN * 2e-3; sr.direction = Ld;
                         sr.min_distance = 2e-3; sr.max_distance = 1e4;
-                        float sv = (isect.intersect(sr, accel, 0x01u).type != intersection_type::none) ? 0.0 : 1.0;
+                        float sv = (isect.intersect(sr, accel, u.transportRayMask).type != intersection_type::none) ? 0.0 : 1.0;
                         isect.accept_any_intersection(false);
                         hitRad += cA * (1.0 / M_PI_F) * u.sunColor * hN * sv;
                     }
@@ -571,6 +621,7 @@ kernel void illumi_rt_lighting_tlas(
         // isolation — replacing the lit composite makes the stale-pose ghost on a
         // moved object visible (it's sub-grain in the normal additive composite).
         outHDR.write(half4(half3(indirect + reflection), prev.a), gid);
+        rtDiffuse.write(half4(0.0h), gid);   // isolation view owns the pixel; add nothing
         return;
     }
     if (u.debugSurfCacheVar != 0) {
@@ -582,8 +633,18 @@ kernel void illumi_rt_lighting_tlas(
         // landed on, not the primary surface. This is what B1's filter will drive.
         float v = surfVarN > 0u ? surfVarAcc / float(surfVarN) : 0.0;
         outHDR.write(half4(half3(half(v)), prev.a), gid);
+        rtDiffuse.write(half4(0.0h), gid);   // isolation view owns the pixel; add nothing
         return;
     }
-    float3 add = direct + indirect + reflection;
-    outHDR.write(half4(prev.rgb + half3(add), prev.a), gid);
+    // C2 — split by FREQUENCY, matching `illumi_rt_lighting` (the soup kernel):
+    //   • reflection is sharp and varies across a flat surface that shares
+    //     depth+normal, so a depth+normal bilateral would smear it → composite
+    //     straight in;
+    //   • direct + indirect is the low-frequency Monte-Carlo grain → out to
+    //     `rtDiffuse`, where `encodeRTGITemporalAccum` and then SVGF (or the
+    //     fixed-radius bilateral) clean it before it reaches the composite.
+    // Sky pixels early-out at the top, so `rtDiffuse` is left untouched there and
+    // the denoise pass guards on the same depth test.
+    outHDR.write(half4(prev.rgb + half3(reflection), prev.a), gid);
+    rtDiffuse.write(half4(half3(direct + indirect), 1.0h), gid);
 }

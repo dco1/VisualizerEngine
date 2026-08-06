@@ -408,9 +408,11 @@ kernel void illumi_surfcache_update_tlas(
         ray sr;
         sr.origin = Pofs; sr.direction = Ld;
         sr.min_distance = max(u.rayTMin, 1e-3); sr.max_distance = 1e4;
-        // Mask 0x01 = opaque + curve only; AAA glass (mask 0x02) is excluded so
-        // a clear pane doesn't occlude the cache's sun visibility / GI gather.
-        auto sres = isect.intersect(sr, accel, 0x01u);
+        // 0x01 = opaque + curve; 0x04 = invisible occluders (C3) — slabs real to
+        // LIGHT and never drawn, e.g. a lighting-only ceiling. These are TRANSPORT
+        // rays, so both count. AAA glass (mask 0x02) is still excluded so a clear
+        // pane doesn't occlude the cache's sun visibility / GI gather.
+        auto sres = isect.intersect(sr, accel, 0x05u);
         float vis = (sres.type != intersection_type::none) ? 0.0 : 1.0;
         // Albedo-free irradiance (#60 task 2) — albedo applied per card at read.
         direct = (1.0 / M_PI_F) * u.sunColor.xyz * NdotL * vis;
@@ -425,7 +427,8 @@ kernel void illumi_surfcache_update_tlas(
         ray r;
         r.origin = Pofs; r.direction = dir;
         r.min_distance = max(u.rayTMin, 1e-3); r.max_distance = u.maxDist;
-        auto res = isect.intersect(r, accel, 0x01u);  // opaque+curve only (exclude glass mask 0x02)
+        // Transport ray — opaque+curve + invisible occluders (C3); glass (0x02) excluded.
+        auto res = isect.intersect(r, accel, 0x05u);
         if (res.type == intersection_type::triangle) {
             uint prim = soupTriBase[res.instance_id] + res.primitive_id;
             if (prim >= u.triangleCount) continue;

@@ -216,6 +216,12 @@ static inline SecondaryShadeParams glassSecondaryParams(constant GlassRTUniforms
     p.objUVCount = u.objUVCount;
     p.pointLightCount = u.pointLightCount;
     p.spotLightCount = u.spotLightCount;
+    // C3 — the glass pass keeps the PLAIN opaque mask on purpose. Its rays are
+    // camera-visible (a refraction ray is what the eye sees through the pane), and
+    // the lighting-only ceiling slabs were excluded from RT precisely because this
+    // path refracted into one and re-shaded it as a flat slab. The invisible-
+    // occluder bit is for TRANSPORT rays only.
+    p.occluderMask = 0x01u;
     return p;
 }
 
