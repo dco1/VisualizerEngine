@@ -3820,23 +3820,52 @@ static inline float ssaoHash12(float2 p) {
     return fract((p3.x + p3.y) * p3.z);
 }
 
+// Cosine-weighted HEMISPHERE kernel, +Z = the surface normal.
+//
+// EVERY z is strictly positive, and that is the whole point. This kernel replaces a
+// SPHERE kernel (2026-08-05) whose 10 negative-z vectors were placed BELOW the surface
+// plane — i.e. inside the wall — by the `TBN` basis below. A point inside a wall is
+// trivially "occluded" by that wall: the depth buffer at its screen position is the
+// wall itself, the occlusion test passes, and `rangeCheck` returns 1.0 because the depth
+// difference is ~0. Every flat surface in the scene therefore carried a constant
+// occlusion pedestal of 1 − 8/16 = 0.500 (two of the ten sank less than the old fixed
+// 0.01 m bias). Measured: a bare wall in an open room read AO 0.503, dead flat, when it
+// should read 1.0. That is Danny's "painted with a sponge… black mold", and it is why
+// raising `ssaoIntensity` deepened it while shrinking `ssaoRadius` pulled the sunken
+// samples back under the bias and made it retreat.
+//
+// The sphere kernel is the Crytek/NVIDIA-SDK-era one, which is only correct in the
+// original formulation that rescales occlusion about 0.5. A normal-oriented hemisphere
+// estimator like this one requires a hemisphere kernel; the two are not interchangeable.
+//
+// Generated deterministically (see the doc comment on
+// `HouseRenderBridgeGPUTests_WallSplotch.testSSAOFieldIsUnoccludedOnAFlatWall`):
+//   u1 = (i+0.5)/16, u2 = bitReverse4(i)/16
+//   dir = (sqrt(u1)·cos 2πu2, sqrt(u1)·sin 2πu2, sqrt(1−u1))    ← cosine-weighted
+//   len = 0.35 + 0.65·((bitReverse4(i)+0.5)/16)²                ← clusters near contact
+// Cosine weighting is not cosmetic: AO is ∫V(ω)cosθ dω/π, so with cosine-distributed
+// directions the estimator below is exactly `occlusion / samples` with unit weights.
+// The length uses the BIT-REVERSED index so the most grazing samples are not also the
+// longest — that pairing is what lets a normal-map tilt push a sample under the true
+// geometric surface. As generated, the shallowest sample still sits 0.075 m above the
+// plane at radius 0.5, ~5× the bias below.
 constant float3 kSsaoKernel[16] = {
-    float3( 0.5381,  0.1856, -0.4319),
-    float3( 0.1379,  0.2486,  0.4430),
-    float3( 0.3371,  0.5679, -0.0057),
-    float3(-0.6999, -0.0451, -0.0019),
-    float3( 0.0689, -0.1598, -0.8547),
-    float3( 0.0560,  0.0069, -0.1843),
-    float3(-0.0146,  0.1402,  0.0762),
-    float3( 0.0100, -0.1924, -0.0344),
-    float3(-0.3577, -0.5301, -0.4358),
-    float3(-0.3169,  0.1063,  0.0158),
-    float3( 0.0103, -0.5869,  0.0046),
-    float3(-0.0897, -0.4940,  0.3287),
-    float3( 0.7119, -0.0154, -0.0918),
-    float3(-0.0533,  0.0596, -0.5411),
-    float3( 0.0352, -0.0631,  0.5460),
-    float3(-0.4776,  0.2847, -0.0271)
+    float3( 0.061984,  0.000000,  0.345113),
+    float3(-0.163334,  0.000000,  0.507827),
+    float3( 0.000000,  0.158674,  0.368724),
+    float3( 0.000000, -0.349250,  0.660021),
+    float3( 0.137201,  0.137201,  0.310181),
+    float3(-0.261156, -0.261156,  0.510303),
+    float3(-0.206091,  0.206091,  0.352354),
+    float3( 0.427886, -0.427886,  0.644202),
+    float3( 0.239532,  0.099218,  0.243540),
+    float3(-0.412295, -0.170778,  0.369137),
+    float3(-0.132314,  0.319434,  0.250238),
+    float3( 0.263683, -0.636588,  0.431023),
+    float3( 0.128907,  0.311210,  0.178245),
+    float3(-0.241067, -0.581988,  0.271083),
+    float3(-0.433441,  0.179537,  0.150895),
+    float3( 0.872965, -0.361594,  0.169707)
 };
 
 kernel void illumi_ssao(
@@ -3890,6 +3919,16 @@ kernel void illumi_ssao(
     float3x3 TBN = float3x3(T, B, Nview);
 
     float radius = max(0.001, frame.ssaoRadius);
+    // Self-occlusion guard, in view-space metres. Scales with BOTH the sample radius
+    // and the view depth, because the two error sources it absorbs do: a sample's
+    // height above the surface is proportional to `radius` (so a fixed bias cancels
+    // real contact signal at small radii and none at large ones), and the half-res
+    // G-buffer read plus depth quantisation grow with distance. The old value was a
+    // fixed 0.01 m, which combined with the sphere kernel above to make `ssaoRadius`
+    // behave as a hidden pedestal control — shrinking the radius pulled sunken samples
+    // back under the bias, which is exactly the "lowering the radius makes them retreat
+    // to the edges" behaviour Danny reported and worked around.
+    float bias = radius * 0.02 + 0.0015 * abs(Pview.z);
     float occlusion = 0.0;
     const uint samples = 16;
     for (uint i = 0; i < samples; ++i) {
@@ -3909,10 +3948,12 @@ kernel void illumi_ssao(
         float3 scenePos = viewPosFromDepth(sampleNDC.xy, sceneDepth, frame.invProjection);
         // Range check — only count occluders within `radius` of P.
         float rangeCheck = smoothstep(0.0, 1.0, radius / max(1e-4, abs(Pview.z - scenePos.z)));
-        // Bias slightly to avoid self-occlusion on flat surfaces.
         // View-space Z is negative going away from the camera, so an occluder
         // is "in front of" the sample when its Z is GREATER (less negative).
-        if (scenePos.z > sampleView.z + 0.01) {
+        // With the hemisphere kernel every sample sits ABOVE its own surface, so a
+        // plane can no longer occlude itself at any orientation and `bias` is back to
+        // guarding quantisation only — it is not load-bearing for flatness.
+        if (scenePos.z > sampleView.z + bias) {
             occlusion += rangeCheck;
         }
     }
@@ -5987,6 +6028,9 @@ fragment float4 illumi_tonemap_fs(
     // Quarter-res halation halo. Always bound (the texture exists); its contents are
     // stale when halationParams.x == 0, and the branch below never reads it then.
     texture2d<half, access::sample> inHalation [[texture(8)]],
+    // Half-res AO field for `DebugTerm.ssao` (16) — the same texture the lighting
+    // pass multiplies its indirect terms by. Only read when debugTerm == 16.
+    texture2d<half, access::sample> inAO     [[texture(9)]],
     constant FrameUniforms&         frame    [[buffer(0)]],
     // Phase 4.21 — auto-exposure read (see below).
     const device ExposureState&     expoState [[buffer(1)]]
@@ -6054,6 +6098,11 @@ fragment float4 illumi_tonemap_fs(
                 float2 a   = v * 40.0;
                 float3 c   = float3(0.5 + a.x, 0.5 + a.y, 0.5 - 0.5 * saturate(mag * 40.0));
                 return float4(saturate(c), 1.0);
+            }
+            case 16u: { // RAW AO field — the multiplier, pre-tonemap. 1 = unoccluded.
+                constexpr sampler aoS(filter::linear, address::clamp_to_edge, coord::normalized);
+                float a = float(inAO.sample(aoS, in.uv).r);
+                return float4(a, a, a, 1.0);
             }
             default: break;
         }

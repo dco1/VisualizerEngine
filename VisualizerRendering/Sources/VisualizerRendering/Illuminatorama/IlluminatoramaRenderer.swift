@@ -696,6 +696,18 @@ public final class IlluminatoramaRenderer {
         /// `VIZ_ILLUMI_MV_DEBUG` motion-vector overlay.
         case albedo = 10, gbufferNormal = 11, roughness = 12
         case metalness = 13, depth = 14, velocity = 15
+        /// RAW ambient-occlusion field — the exact half-res value `illumi_lighting`
+        /// multiplies the indirect terms by, read BEFORE tonemapping so the readout
+        /// is the true multiplier and not a tone-curve-compressed ratio. Greyscale:
+        /// white = 1.0 (unoccluded), black = 0 (fully occluded).
+        ///
+        /// This is the instrument that indicted `kSsaoKernel` (2026-08-05): a flat
+        /// wall in the middle of a room MUST read ≈1.0 here, and before the
+        /// hemisphere fix it read ≈0.44 — the whole room sat on an occlusion
+        /// pedestal. Composite views cannot show that, because albedo, the
+        /// illumination gradient and the tonemapper all ride on top of it. Reach for
+        /// this before theorising about any AO complaint.
+        case ssao = 16
     }
     public var debugTerm: DebugTerm = .normal
     /// Tracked by the renderer each frame (set from the host's
@@ -10708,6 +10720,11 @@ public final class IlluminatoramaRenderer {
         // unconditionally); its contents are stale when halationIntensity == 0,
         // and the shader's branch is gated on the same uniform, so it isn't read then.
         enc.setFragmentTexture(halationBlurVQuarter, index: 8)
+        // The AO field at texture(9) for `DebugTerm.ssao` — the same texture the
+        // lighting pass multiplies its indirect terms by (post-denoise when the
+        // denoiser is on), so the debug view IS the shipped multiplier, not a
+        // re-derivation. Always bound; only read when `debugTerm == 16`.
+        enc.setFragmentTexture(aoSourceTexture, index: 9)
         enc.setFragmentBuffer(frameUniformBuffer, offset: 0, index: 0)
         // Phase 4.21 — exposure buffer at buffer(1). The fragment reads
         // `expoState.smoothedExposure` when `frame.autoExposureEnabled`
