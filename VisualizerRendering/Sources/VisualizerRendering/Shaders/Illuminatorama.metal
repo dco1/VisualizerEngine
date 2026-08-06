@@ -2301,24 +2301,23 @@ constant bool kLightingDFGLUTEnabled       [[function_constant(2)]];
 constant bool kLightingDDGIEnabled         [[function_constant(3)]];
 constant bool kLightingDDGIIrrCacheEnabled [[function_constant(4)]];
 
-static inline float sunVisibility(
+// One cascade's answer, everything that depends on the cascade index in one place.
+// Factored out of `sunVisibility` for S1.4 (cascade-split blending), which needs to
+// evaluate TWO cascades for the pixels inside a boundary's fade band — every one of
+// the three cascade-dependent quantities below (matrix, depth bias, normal-offset
+// push) has to travel with the index, and having them inline made a second
+// evaluation impossible without duplicating them.
+static inline float cascadeVisibility(
     depth2d_array<float, access::sample> shadowMap,
     sampler                              shadowSampler,
     constant FrameUniforms&              frame,
     float3 worldPos,
     float3 N,
-    float  NdotL
+    float  slope,
+    uint   cascade
 ) {
-    if (!kLightingShadowEnabled) return 1.0;  // function_constant(1) — see decls above
-    // Pick the cascade from view-space depth. We use -view.z (positive
-    // distance) so the splits in frame.cascadeSplitsView are also positive.
-    float4 vp = frame.view * float4(worldPos, 1.0);
-    float viewDist = -vp.z;
-    uint cascade = pickCascade(viewDist, frame.cascadeSplitsView.xyz);
-
     // Slope-scaled depth bias — surfaces nearly parallel to the light direction
     // need more bias to avoid acne, but biasing too much causes peter-panning.
-    float slope = clamp(1.0 - NdotL, 0.0, 1.0);
     float bias = frame.shadowBias + frame.shadowSlopeBias * slope;
     // Outer cascades cover larger world extents, so a fixed bias becomes too
     // tight in light-NDC space — scale by cascade index.
@@ -2350,6 +2349,60 @@ static inline float sunVisibility(
 
     return sampleCascade(shadowMap, shadowSampler, biasedPos,
                          cascadeVP, cascade, bias, frame.shadowPcfRadius);
+}
+
+// ── S1.4 — cascade-split blending ────────────────────────────────────────────
+//
+// Fraction of a cascade's own depth range, at its FAR end, over which its answer
+// cross-fades into the next cascade's. `pickCascade` alone is a hard select, and
+// the three quantities above ALL change with the index at once: the PCF kernel's
+// world footprint (each cascade is fitted to its own sub-frustum sphere, so the
+// outer ones are several times coarser), the depth bias, and the normal-offset
+// push. A shadow edge crossing a split therefore kinks, and open ground picks up
+// a line — the artefact this fixes.
+//
+// 0.10 is the usual figure and it costs what it looks like: only pixels inside
+// the band take the second tap, i.e. ~10 % of the *depth* range of the cascades
+// that have a successor (cascade 2 has none), and far less than 10 % of a typical
+// frame's pixels. Outside the band `t == 0` and this is bit-identical to the hard
+// select, so nothing but the seam moves.
+constant float kCascadeBlendFraction = 0.10;
+
+static inline float sunVisibility(
+    depth2d_array<float, access::sample> shadowMap,
+    sampler                              shadowSampler,
+    constant FrameUniforms&              frame,
+    float3 worldPos,
+    float3 N,
+    float  NdotL
+) {
+    if (!kLightingShadowEnabled) return 1.0;  // function_constant(1) — see decls above
+    // Pick the cascade from view-space depth. We use -view.z (positive
+    // distance) so the splits in frame.cascadeSplitsView are also positive.
+    float4 vp = frame.view * float4(worldPos, 1.0);
+    float viewDist = -vp.z;
+    float3 splits = frame.cascadeSplitsView.xyz;
+    uint cascade = pickCascade(viewDist, splits);
+    float slope = clamp(1.0 - NdotL, 0.0, 1.0);
+
+    float v = cascadeVisibility(shadowMap, shadowSampler, frame, worldPos, N, slope, cascade);
+
+    // Inside the last `kCascadeBlendFraction` of this cascade's range, fade into the
+    // next one. `cascade == 2` is the outermost, so it has nothing to fade into (its
+    // far edge is `shadowMaxDistance`, where `sampleCascade` already falls back to
+    // "lit" — a different boundary with a different fix).
+    if (cascade < 2u) {
+        float nearZ = (cascade == 0u) ? 0.0 : splits.x;
+        float farZ  = (cascade == 0u) ? splits.x : splits.y;
+        float band  = (farZ - nearZ) * kCascadeBlendFraction;
+        float t = (band > 1e-4) ? saturate((viewDist - (farZ - band)) / band) : 0.0;
+        if (t > 0.0) {
+            float vNext = cascadeVisibility(shadowMap, shadowSampler, frame,
+                                            worldPos, N, slope, cascade + 1u);
+            v = mix(v, vNext, t);
+        }
+    }
+    return v;
 }
 
 static inline float3 brdf(
@@ -3397,14 +3450,60 @@ kernel void illumi_lighting(
         if (kLightingDFGLUTEnabled) {  // function_constant(2)
             constexpr sampler dfgSampler(filter::linear, address::clamp_to_edge);
             float2 dfg = float2(dfgLUT.sample(dfgSampler, float2(NdotV, roughness)).rg);
-            specularIBL = specEnv * (F0 * dfg.x + dfg.y);
+            float3 FssEss = F0 * dfg.x + dfg.y;      // the split-sum single-scatter result
+            // ── S1.3b — multi-scatter GGX energy compensation ────────────────
+            // Single-scattering GGX DROPS the light that would have bounced a
+            // second time between microfacets, and the loss grows with roughness:
+            // `dfg.x + dfg.y` IS the directional albedo of the lobe, so
+            // `Ems = 1 − (dfg.x + dfg.y)` is exactly the energy going missing.
+            // On a dielectric that is invisible (F0 = 0.04 ⇒ the returned light is
+            // ~0.5 %), but on a metal it is a colour shift as well as a darkening,
+            // because what is dropped is Fresnel-weighted — rough gold renders
+            // grey-brown instead of gold.
+            //
+            // Fdez-Agüera 2019 ("A Multiple-Scattering Microfacet Model for
+            // Real-Time Image-Based Lighting", JCGT 8.1) closes it with ONE extra
+            // term built from the LUT already sampled above: the missing energy is
+            // re-emitted having undergone an average Fresnel `F_avg`, which for
+            // Schlick integrates to `F0 + (1 − F0)/21`, and the geometric series of
+            // further bounces sums to `1 / (1 − F_avg·Ems)`. No new texture, no new
+            // sample — four lines on top of the split sum.
+            float  Ems    = saturate(1.0 - (dfg.x + dfg.y));
+            float3 Favg   = F0 + (1.0 - F0) * (1.0 / 21.0);
+            float3 FmsEms = (Ems * FssEss * Favg) / max(1.0 - Favg * Ems, 1e-4);
+            specularIBL = specEnv * (FssEss + FmsEms);
         } else {
+            // No LUT ⇒ no `Ems` to compensate with. Lagarde's roughness-Schlick
+            // fallback has no energy budget to speak of; leaving it alone keeps this
+            // toggle a clean A/B of the split sum itself.
             specularIBL = specEnv * F;
         }
 
-        indirect = (diffuseIBL + specularIBL) * frame.iblIntensity * ao * interiorIBLK;
+        // ── S1.3a — specular occlusion ───────────────────────────────────────
+        // `ao` is a DIFFUSE visibility estimate: it answers "how much of the whole
+        // hemisphere can this point see?", which is the right question for a
+        // Lambertian lobe and the wrong one for a specular one. A near-mirror
+        // integrates a narrow cone around the reflection vector, and in a shallow
+        // cavity that cone is still looking at open sky, so multiplying it by raw
+        // `ao` over-darkens every glossy surface near a wall, a corner or a crease.
+        //
+        // Frostbite's horizon-based approximation (Lagarde & de Rousiers, *Moving
+        // Frostbite to PBR*, §4.10.2) reconstructs a specular visibility from the
+        // three things that decide it: how much of the hemisphere is open (`ao`),
+        // how far the reflection lobe leans toward the horizon (`NdotV`), and how
+        // wide the lobe is (`roughness`, through the exponent). The exponent
+        // `exp2(−16·roughness − 1)` is what carries the physics: at roughness 1 it
+        // is 7.6e−6, `pow(x, e) → 1`, and the whole expression collapses to exactly
+        // `ao` — a matte surface is occluded exactly as much as a diffuse one, which
+        // is correct and also makes this an arithmetic no-op for most of the
+        // material library. It only opens up as the surface polishes.
+        float specOcc = saturate(pow(NdotV + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
+
+        // Diffuse and the ambient supplement below keep RAW `ao`; only the specular
+        // lobe takes `specOcc`.
+        indirect = (diffuseIBL * ao + specularIBL * specOcc) * frame.iblIntensity * interiorIBLK;
         dbgDiffuseIBL = diffuseIBL * frame.iblIntensity * ao * interiorIBLK;
-        dbgSpecularIBL = specularIBL * frame.iblIntensity * ao * interiorIBLK;
+        dbgSpecularIBL = specularIBL * frame.iblIntensity * specOcc * interiorIBLK;
         // `ambientColor` is now a TRUE ambient term — only SCN `.ambient`
         // lights (uniform, no NdotL) feed it. As of #60 task 5 the secondary
         // SCN directionals (fill, back) are NO LONGER folded in here; they
@@ -3459,6 +3558,14 @@ kernel void illumi_lighting(
             // Interior separation: a lacquered interior floor's clearcoat environment
             // reflection is the same open-top skylight the diffuse IBL is — dim it by
             // the same factor (×1.0 no-op when the feature is off).
+            // NOTE: the clearcoat lobes deliberately keep RAW `ao`, unlike the base
+            // specular IBL above (S1.3a). They are specular and physically want the
+            // same treatment — a 0.08-roughness coat is about as narrow a lobe as this
+            // renderer has, so specular occlusion would open them up the most of
+            // anything — but every clearcoated material in the library (terrazzo,
+            // marble, polished concrete, lacquered wood) would shift at once, and
+            // S1.3 is scoped to the specular IBL term. Left as a follow-up rather than
+            // an unmeasured side effect.
             clearcoat += env * Fcc * frame.iblIntensity * ao * interiorIBLK;
         }
         clearcoat *= houseCC;
