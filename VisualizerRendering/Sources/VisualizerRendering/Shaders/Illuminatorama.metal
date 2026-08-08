@@ -445,9 +445,33 @@ struct Instance {
     // patterns (tile grids, wallpaper, directional wood) whose offset samples
     // would double-print/dice the pattern. NEW 16-byte cluster: stride 240 → 256.
     float    antiTilingScale;
-    float    _padAntiTiling0;
-    float    _padAntiTiling1;
-    float    _padAntiTiling2;
+    // ── S2.4 detail-band relief companions (was `_padAntiTiling0/1`) ──────────
+    // The detail band used to carry a NORMAL and nothing else, which is a
+    // specular-band effect: measured over a whole material library it moved metals
+    // 1.2–3.4x and every dielectric ~1.00x, because a matte surface's broad diffuse
+    // lobe averages a fine normal perturbation away. These two read the SAME detail
+    // slice's BLUE channel — a micro-occlusion the host bakes from the same height
+    // field as the normal, in a channel the shader already fetched and discarded.
+    //
+    // detailOcclusionStrength: how much of that occlusion multiplies ALBEDO (⇒ the
+    //   DIFFUSE lobe — the half a dielectric can actually show).
+    // detailRoughnessStrength: how much the occluded (pit) texels are additionally
+    //   roughened — micro-cavities scatter more than the open surface.
+    //
+    // Both default 0, and a slice whose blue is 255 yields occ == 1 either way, so a
+    // host that never opts in — and any foreign detail-normal image — is byte-identical.
+    // Reinterpreted pads: stride stays 256.
+    float    detailOcclusionStrength;
+    float    detailRoughnessStrength;
+    // Tile frequency for the OCCLUSION tap, independent of `detailNormalUVScale` (was
+    // `_padAntiTiling2`). It has to be separate, and this is the measured reason:
+    // at the normal's 8x on a 2 m macro tile a detail texel is ~0.5 mm and a feature
+    // ~2 mm — an order of magnitude below one pixel at any archviz camera. Sampled
+    // mip-correctly (which occlusion must be, or it is just noise) that averages to a
+    // FLAT tint and shows nothing. The occlusion therefore runs at a coarser, actually
+    // resolvable band while the normal keeps its fine one; both read the same baked
+    // tile, so this costs no memory. 0 falls back to `detailNormalUVScale`.
+    float    detailOcclusionUVScale;
 };
 
 struct Vertex {
@@ -980,6 +1004,16 @@ fragment GBufferOut illumi_fs(
     // `0.5*(N+1)`. Decode with `2*sample - 1`, then transform into
     // world via TBN. When no normal map is bound, fall through to the
     // geometric normal `n`.
+    // ── S2.4 — the detail band's diffuse-visible companion ────────────────────
+    // Micro-occlusion sampled from the detail slice's BLUE channel and applied to the
+    // albedo/roughness THIS fragment is about to write. Declared out here (not inside the
+    // normal-map branch) so the value survives to the albedo and roughness blocks below.
+    // 1.0 = fully open = the exact pre-S2.4 result; every path that doesn't bind a detail
+    // slice leaves it at 1.0, and ×1.0 / +0.0 are IEEE no-ops.
+    float detailOcc = 1.0;
+    const bool wantsDetailRelief = (inst.detailOcclusionStrength > 0.0 ||
+                                    inst.detailRoughnessStrength > 0.0);
+
     if (inst.normalTextureSlice >= 0 &&
         length_squared(in.worldTangent.xyz) > 1e-4) {
         float3 T = normalize(in.worldTangent.xyz);
@@ -1015,13 +1049,46 @@ fragment GBufferOut illumi_fs(
             // when the atlas had no mip chain at all — so it is the STATUS QUO for detail
             // normals, not a new under-filtering defect, while every other atlas read gets
             // proper mips. The honest cost is that this band can still alias at grazing
-            // angles; the real fix is a detail-band roughness/AO companion (roadmap S2.4),
-            // which makes the effect survive filtering instead of depending on sharpness.
+            // angles.
+            //
+            // S2.4 UPDATE (2026-08-06): that companion now exists (see just below), and it
+            // does NOT retire this exception — it explains it. The companion survives
+            // filtering by running at a resolvable frequency; this band does not, because at
+            // 8x on a 2 m macro tile a texel is ~0.5 mm. So what "correct LOD kills the
+            // effect" actually means here is that **this band's contribution is sub-pixel
+            // aliasing** — which is also why it reads on mirror-like metal and on nothing
+            // else. Retiring the exception means moving the detail NORMAL to a resolvable
+            // frequency too, which is a look change, not a filtering fix.
             float4 dnSample = sampleAtlasAspect(nonColorAtlas, texSampler, detailUV,
                                                 uint(inst.detailNormalTextureSlice), nonColorUVScale,
                                                 duvdx, duvdy);
             float3 dn = dnSample.xyz * 2.0 - 1.0;
+            // NOTE: `dn.z` is deliberately not used — the blend is a partial-derivative add
+            // in tangent space, so blue was always dead weight here. S2.4 puts the detail
+            // occlusion in it (see below).
             tangentN = normalize(float3(tangentN.xy + dn.xy, tangentN.z));
+
+            // S2.4 — the occlusion is a SECOND tap of the same slice, at its own frequency
+            // and with MIP-CORRECT gradients. Both differences are load-bearing:
+            //
+            //  * Mip-correct, because occlusion is a non-negative quantity: a coarser mip
+            //    averages it to its MEAN, so it degrades into a slight uniform darkening
+            //    rather than vanishing (the normal's failure mode) or aliasing (the
+            //    normal's cost — and the whole reason S1.1 had to hand THIS band unscaled
+            //    gradients). Reading it off `dnSample` would inherit that defect.
+            //  * Its own frequency, because mip-correct sampling at the NORMAL's 8× shows
+            //    nothing: measured, that band is ~0.5 mm per texel on a 2 m macro tile, so
+            //    correct filtering is doing exactly its job when it returns a flat mean.
+            //    Occlusion has to run where the camera can resolve it to read as relief.
+            if (wantsDetailRelief) {
+                float occScale = inst.detailOcclusionUVScale > 0.0
+                               ? inst.detailOcclusionUVScale : inst.detailNormalUVScale;
+                float2 occUV = in.uv * occScale;
+                float4 occSample = sampleAtlasAspect(nonColorAtlas, texSampler, occUV,
+                                                     uint(inst.detailNormalTextureSlice), nonColorUVScale,
+                                                     duvdx * occScale, duvdy * occScale);
+                detailOcc = occSample.z;   // [0,1], 1 = open. 255-blue slices ⇒ exactly 1.
+            }
         }
         // World normal = T*x + B*y + N*z. Equivalent to a TBN matrix
         // multiply but cheaper to spell out as a single dot per axis.
@@ -1068,6 +1135,27 @@ fragment GBufferOut illumi_fs(
                                     uint(inst.roughnessTextureSlice), nonColorUVScale,
                                     frame.antiTilingStrength * inst.antiTilingScale, duvdx, duvdy);
         roughness = tx.g;
+    }
+
+    // ── S2.4 detail-band relief: apply the micro-occlusion ────────────────────
+    // Placed here because both terms land on quantities the G-buffer already writes —
+    // albedo (color 0) and roughness (color 1.z). NOTHING new is carried to the lighting
+    // pass. That was the design constraint: `normalRoughness.w` is already a
+    // material-class tag (foliage / SSS band / plush / 1+anisotropy) and has no room, and
+    // a fifth G-buffer target would cost every pixel of every frame for a close-range
+    // effect. In a deferred renderer a micro-AO on albedo IS a diffuse-only term for a
+    // dielectric (F0 is the fixed 0.04, not the albedo), which is exactly the lobe the
+    // detail normal could not reach.
+    //
+    // `detailOcc` is 1.0 unless a detail slice was bound AND the instance opted in, so
+    // this is an exact no-op for every existing scene.
+    if (wantsDetailRelief) {
+        // Micro-shadowing: the pits between pores/weave/granules lose part of their
+        // hemisphere to their own rim.
+        albedo *= mix(1.0, detailOcc, saturate(inst.detailOcclusionStrength));
+        // Micro-cavity roughening: the same pits scatter more widely than the open
+        // surface between them. Survives mip filtering (see the sample site above).
+        roughness = saturate(roughness + inst.detailRoughnessStrength * (1.0 - detailOcc));
     }
 
     // ── Procedural soil material (#58 #11/#12/#13) ───────────────────────────
@@ -6389,9 +6477,40 @@ fragment float4 illumi_tonemap_fs(
     // output pixels. 0 strength → exact no-op.
     if (frame.filmGrainStrength > 0.0) {
         float cell = max(frame.filmGrainSize, 1.0);
-        float2 gp = floor(in.position.xy / cell);
-        float n = fract(sin(dot(gp, float2(12.9898, 78.233)) + frame.time * 91.7) * 43758.5453);
-        n -= 0.5;                                     // ∈ [-0.5, 0.5]
+        float2 gpf = floor(max(in.position.xy, 0.0) / cell);
+        // ── The hash is an INTEGER bit mix, not `fract(sin(...))` ────────────────
+        // It used to be
+        //     fract(sin(dot(gp, float2(12.9898, 78.233)) + frame.time * 91.7) * 43758.5453)
+        // and that form is unconditionally broken for any host whose clock is not near
+        // zero. The ONLY spatial term is `dot(gp, k)` — at most ~3.4e4 over a 480×360
+        // frame, and just 13.0 (x) / 78.2 (y) between NEIGHBOURING pixels. It was added
+        // to `frame.time * 91.7`, which is unbounded, and the sum was then handed to
+        // `sin`, whose argument reduction has no precision left to resolve a 13-wide step
+        // riding on 3e7. `n` therefore collapses to a CONSTANT, and "grain" degenerates
+        // into a flat `-0.5 * strength * mask` DARKENING of the whole frame — the exact
+        // opposite of grain, which is zero-mean and high-frequency by definition.
+        //
+        // MEASURED on the real Metal path (Daydream Home fixture house, 480×360, grain
+        // dial at the top ⇒ strength 0.20), sweeping `frame.time` alone:
+        //     t =      0    high-freq energy +10.19   mean luma  −0.62   ← healthy grain
+        //     t =    1e4                     +10.47              −1.08
+        //     t =    1e5                      +8.33              −5.60   ← degrading
+        //     t = 3.4e5                       +0.21             −19.93   ← no noise at all
+        // 3.4e5 s is not exotic: it is `CACurrentMediaTime()` on a Mac that has been awake
+        // four days, which is what this app hands `renderer.time`. The effect died silently
+        // as a function of the USER'S UPTIME.
+        //
+        // A bit hash has no magnitude sensitivity — every input bit is mixed, so the pixel
+        // coordinate can never be swallowed by a large time term. Time enters as its own
+        // mixed word rather than as an addend inside a transcendental, and it is taken as
+        // RAW IEEE BITS (`as_type`), which extracts the most decorrelation the host's
+        // `float` clock can carry: any two frames whose `frame.time` differ at all reseed.
+        uint2 gp = uint2(gpf);
+        uint  h  = (gp.x * 73856093u) ^ (gp.y * 19349663u) ^ (as_type<uint>(frame.time) * 83492791u);
+        h ^= h >> 16; h *= 0x7feb352du;
+        h ^= h >> 15; h *= 0x846ca68bu;
+        h ^= h >> 16;
+        float n = float(h) * (1.0 / 4294967296.0) - 0.5;   // uniform ∈ [-0.5, 0.5)
         float lumG = dot(mapped, float3(0.2126, 0.7152, 0.0722));
         float mask = 4.0 * lumG * (1.0 - lumG);       // parabola: 1 at mid-grey, 0 at ends
         mapped = saturate(mapped + n * frame.filmGrainStrength * mask);

@@ -673,9 +673,52 @@ public struct IlluminatoramaInstance {
     // materials (tile, wallpaper, wood planks, brick) and leave 1 elsewhere.
     // NEW 16-byte cluster (offsets 240-255): stride 240 → 256; three float pads.
     public var antiTilingScale: Float = 1
-    public var _padAntiTiling0: Float = 0
-    public var _padAntiTiling1: Float = 0
-    public var _padAntiTiling2: Float = 0
+    // ── S2.4 — the detail band's diffuse-visible companions ────────────────────
+    // Reinterpret the former `_padAntiTiling0/1` (same 4 bytes each, stride stays 256).
+    //
+    // **The measured problem.** Before this, the detail band carried a NORMAL and nothing
+    // else. A whole-library A/B on the real Metal path (2026-08-02) put the grazing
+    // micro-contrast ratio at matte-black 3.44 / aluminum 1.43 / brushed-nickel 1.41 and
+    // **~1.00 on all 38 dielectrics** — velvet 1.01, cork 1.02, paint 1.00, linen 1.00.
+    // A fine normal perturbation is a specular-band effect; a matte surface's broad diffuse
+    // lobe plus rough specular lobe average it straight out. More frequency didn't help
+    // (a 5× coarser sweep moved velvet to 1.06).
+    //
+    // **What these read.** The detail-normal slice's BLUE channel, which the G-buffer shader
+    // has always fetched and never used (it blends `tangentN.xy + dn.xy` and reconstructs
+    // nothing from z). Hosts bake a micro-occlusion there from the same height field the
+    // detail normal comes from — so no new atlas slice, no extra texture fetch for the value
+    // itself, and no G-buffer channel (both terms are applied in the G-buffer FRAGMENT, on
+    // the albedo and roughness it was going to write anyway; `normalRoughness.w` stays the
+    // material-class tag it already is).
+
+    /// How strongly the detail band's micro-occlusion multiplies **albedo**, i.e. the
+    /// DIFFUSE lobe — the half of the BRDF a matte dielectric can actually show. 0 (default)
+    /// ⇒ `mix(1, occ, 0)` is exactly 1 ⇒ no change. 1 ⇒ the baked occlusion at full depth.
+    public var detailOcclusionStrength: Float = 0
+    /// How strongly occluded (pit) texels are additionally **roughened** — micro-cavities
+    /// scatter more widely than the open surface between them. Added as
+    /// `roughness + strength × (1 − occ)`. 0 (default) ⇒ exact no-op.
+    ///
+    /// Unlike the normal, this survives mip filtering: occlusion is a non-negative quantity
+    /// whose coarse levels converge to its MEAN, so a distant surface keeps the roughening
+    /// (it just loses the contrast), which is the Toksvig-correct behaviour.
+    public var detailRoughnessStrength: Float = 0
+    /// Tile frequency for the OCCLUSION tap, independent of `detailNormalUVScale`
+    /// (reinterprets the former `_padAntiTiling2`). `0` ⇒ fall back to `detailNormalUVScale`.
+    ///
+    /// **Why it can't just share the normal's frequency — measured, not assumed.** At the
+    /// normal's 8× on a 2 m macro tile, one detail texel is ~0.5 mm and one relief feature is
+    /// ~2 mm: an order of magnitude below a pixel at any archviz camera. Sampled mip-correctly
+    /// that band returns a flat mean and shows nothing (the first S2.4 build measured velvet
+    /// 1.09 → 1.12, cork 1.01 → 1.04 — i.e. nothing). Sampling it sharp instead would only
+    /// reproduce the detail normal's own defect: its 1.4–3.4× on metals is *sub-pixel aliasing*,
+    /// which is why S1.1 found that mip-correct gradients collapse aluminum to 1.0002×.
+    ///
+    /// So the occlusion runs at a coarser, actually resolvable band (cm-scale — plaster tooth,
+    /// cork granules, weave), while the normal keeps its fine one. Same baked tile, two
+    /// frequencies: no extra memory, one extra fetch.
+    public var detailOcclusionUVScale: Float = 0
 
     public init(
         modelMatrix: simd_float4x4,
