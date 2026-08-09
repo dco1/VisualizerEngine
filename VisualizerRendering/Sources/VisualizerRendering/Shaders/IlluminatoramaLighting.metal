@@ -202,9 +202,70 @@ static inline float sunVisibility(
     return v;
 }
 
+// ── Cloth sheen (Phase 7b, re-sited 2026-08-09) ──────────────────────────────────
+//
+// A woven fabric is not a rough dielectric with a GGX highlight. Its surface is a forest of
+// near-vertical fibres, so the light it sends back is concentrated at GRAZING angles — the
+// velvety bloom along the rim of a cushion, and the reason velvet reads as velvet. GGX has no
+// such lobe; without a sheen term upholstery renders as painted plaster.
+//
+// **Estevez & Kulla 2017 ("Production Friendly Microfacet Sheen BRDF", SIGGRAPH talk)**
+// replace GGX's Beckmann-like NDF with an inverted-Gaussian "Charlie" distribution, whose
+// density is highest for microfacets standing PERPENDICULAR to the surface. Paired with
+// Ashikhmin & Premoze / Neubelt & Pettineo's velvet visibility term (which stays finite as
+// either cosine goes to zero, exactly where GGX's Smith term collapses), it is four lines and
+// no texture.
+//
+// The `alpha → 0` guard matters: `invAlpha` becomes the exponent, so a zero roughness is an
+// infinite power. Clamped at 1e-3.
+static inline float clothSheenD(float alpha, float NdotH) {
+    float invAlpha = 1.0 / max(alpha, 1e-3);
+    float cos2h = NdotH * NdotH;
+    float sin2h = max(1.0 - cos2h, 1e-7);
+    return (2.0 + invAlpha) * pow(sin2h, invAlpha * 0.5) / (2.0 * M_PI_F);
+}
+
+/// Ashikhmin/Neubelt velvet visibility — finite at grazing, where Smith-GGX goes to zero and
+/// takes the whole sheen lobe with it.
+static inline float clothSheenV(float NdotV, float NdotL) {
+    return 1.0 / max(4.0 * (NdotL + NdotV - NdotL * NdotV), 1e-5);
+}
+
+/// One fixed sheen roughness for the whole library. The strength already arrives per material
+/// (packed as a negative `emission.alpha`); a per-material sheen ROUGHNESS would need a second
+/// instance field, and the instance stride is not this change's to move. 0.30 is a soft,
+/// broad nap — right for linen and wool, and velvet's much higher STRENGTH is what separates it.
+constant float kClothSheenRoughness = 0.30;
+
+/// Fibre-tip colour: cloth sheen is scattered by the pale tips of the nap, not by the dyed
+/// core, so it is markedly whiter than the base albedo. Same mix the Phase-7b bolt-on used, so
+/// this re-siting is a MECHANISM change and not a restyling of the fabric library.
+static inline float3 clothSheenColor(float3 albedo) { return albedo * 0.4 + float3(0.6); }
+
+/// Directional albedo of the Charlie/Neubelt lobe, for the environment (IBL/ambient) arm.
+///
+/// **A declared approximation**, in the same spirit as the area light's most-representative-
+/// point specular above: the correct term is a fitted sheen DFG LUT (Estevez & Kulla §4), and
+/// baking a second LUT is out of scope for this landing. What has to be right is the SHAPE —
+/// the lobe returns very little at normal incidence and rises steeply toward grazing — and that
+/// is what this reproduces. Replacing it with a LUT read later changes magnitude, not
+/// behaviour.
+static inline float clothSheenEnvAlbedo(float NdotV) {
+    return 0.08 + 0.92 * pow(1.0 - saturate(NdotV), 4.0);
+}
+
+/// `sheenStrength` — the material's cloth-sheen scalar (velvet 0.85 / linen 0.30), unpacked
+/// from the NEGATIVE `emission.alpha` the G-buffer writes. **0 is an exact early-out**: the
+/// function returns the identical expression it always returned, so every non-fabric surface —
+/// and every Visualizer scene, none of which set `sheen` — is byte-for-byte unchanged.
+///
+/// `sheenOut`, when non-null, receives ONLY the sheen part of this call's contribution. That is
+/// what keeps `DebugTerm.clothSheen` an honest instrument now that the lobe is no longer a
+/// separable bolt-on: the term can still be isolated without evaluating the light loops twice.
 static inline float3 brdf(
     float3 N, float3 V, float3 L, float3 albedo, float metallic, float roughness, float3 lightColor,
-    float anisotropy = 0.0, float3 grainT = float3(0.0)
+    float anisotropy = 0.0, float3 grainT = float3(0.0),
+    float sheenStrength = 0.0, thread float3 *sheenOut = nullptr
 ) {
     float3 H = normalize(V + L);
     float NdotL = saturate(dot(N, L));
@@ -235,7 +296,15 @@ static inline float3 brdf(
     float3 spec = (D * G * F) / (4.0 * NdotV * NdotL + 1e-7);
     float3 kd = (1.0 - F) * (1.0 - metallic);
     float3 diff = kd * albedo / M_PI_F;
-    return (diff + spec) * lightColor * NdotL;
+    // THE EXACT EARLY-OUT. Everything above this line is untouched, and this is the expression
+    // `brdf` has always returned; a surface with no cloth sheen therefore cannot move by a bit.
+    if (!(sheenStrength > 0.0)) return (diff + spec) * lightColor * NdotL;
+
+    float  Ds = clothSheenD(kClothSheenRoughness, NdotH);
+    float  Vs = clothSheenV(NdotV, NdotL);
+    float3 sheen = clothSheenColor(albedo) * (sheenStrength * Ds * Vs);
+    if (sheenOut != nullptr) *sheenOut += sheen * lightColor * NdotL;
+    return (diff + spec + sheen) * lightColor * NdotL;
 }
 
 // Issue #65 — the DIFFUSE-ONLY half of `brdf`, byte-for-byte the same diffuse
@@ -535,6 +604,17 @@ kernel void illumi_lighting(
     float3 N         = octDecode(float2(nrH.rg));
     float  roughness = max(0.045, float(nrH.b));
     float3 emission  = float3(emH.rgb);
+    // Phase 7b — the material's cloth-sheen strength, unpacked from the NEGATIVE emission
+    // alpha the G-buffer writes (a surface is polished OR cloth, never both, so one channel
+    // carries either). Declared HERE, above every light path, because that is the whole point
+    // of the 2026-08-09 re-siting: it used to be read at the very bottom of this kernel, after
+    // the point and spot loops had already closed, so a lamp-lit sofa received no sheen at all.
+    // 0 for every non-cloth surface, and `brdf` early-outs exactly on 0.
+    float  sheenStrength = (emH.a < -0.001h) ? float(-emH.a) : 0.0;
+    // Sheen-only accumulator for `DebugTerm.clothSheen` (17). Every `brdf` call below is handed
+    // `&clothSheen`, so the term can still be isolated even though it is no longer a separable
+    // bolt-on. Untouched (and dead-stripped) when nothing in the scene is cloth.
+    float3 clothSheen = float3(0.0);
     // Light-layer bitfield for this fragment. Default (host never set a layer)
     // reads 0xFFFFFFFF, so (light.layerMask & fragLayer) is always non-zero below
     // ⇒ every light contributes exactly as before.
@@ -595,8 +675,14 @@ kernel void illumi_lighting(
         grainT = (abs(dot(N, up)) > 0.95) ? normalize(float3(1.0, 0.0, 0.0) - N * N.x)
                                           : normalize(cross(N, up));
     }
+    // NOTE the sheen accounting: `directSun` is scaled by `visibility` AFTER the call, so the
+    // sheen `brdf` pushed into `clothSheen` has to be shadowed by hand to match. Every other
+    // call site folds its attenuation into `lightColor`, so this is the only one that does.
+    float3 directSunSheen = float3(0.0);
     float3 directSun = brdf(N, V, Ld, albedo, metallic, roughness,
-                            frame.directionalLightColor, aniso, grainT) * visibility;
+                            frame.directionalLightColor, aniso, grainT,
+                            sheenStrength, &directSunSheen) * visibility;
+    clothSheen += directSunSheen * visibility;
     if (isSSS) sssDiffuse += brdfDiffuse(N, V, Ld, albedo, metallic,
                                          frame.directionalLightColor) * visibility;
 
@@ -721,7 +807,8 @@ kernel void illumi_lighting(
             }
         }
         if (visibility <= 0.0) continue;
-        pointSum += brdf(N, V, L, albedo, metallic, roughness, pl.color * atten * visibility);
+        pointSum += brdf(N, V, L, albedo, metallic, roughness, pl.color * atten * visibility,
+                         0.0, float3(0.0), sheenStrength, &clothSheen);
         if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic,
                                              pl.color * atten * visibility);
     }
@@ -790,7 +877,8 @@ kernel void illumi_lighting(
         }
         if (visibility <= 0.0) continue;
         spotSum += brdf(N, V, L, albedo, metallic, roughness,
-                        sl.color * atten * visibility);
+                        sl.color * atten * visibility,
+                        0.0, float3(0.0), sheenStrength, &clothSheen);
         if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic,
                                              sl.color * atten * visibility);
     }
@@ -814,7 +902,8 @@ kernel void illumi_lighting(
     float3 dirFillSum = float3(0.0);
     for (uint i = 0; i < frame.directionalLightCount; ++i) {
         DirectionalLight dl = extraDirectionals[i];
-        dirFillSum += brdf(N, V, dl.dir, albedo, metallic, roughness, dl.color);
+        dirFillSum += brdf(N, V, dl.dir, albedo, metallic, roughness, dl.color,
+                           0.0, float3(0.0), sheenStrength, &clothSheen);
         if (isSSS) sssDiffuse += brdfDiffuse(N, V, dl.dir, albedo, metallic, dl.color);
     }
 
@@ -997,6 +1086,20 @@ kernel void illumi_lighting(
         indirect = (diffuseIBL * ao + specularIBL * specOcc) * frame.iblIntensity * interiorIBLK;
         dbgDiffuseIBL = diffuseIBL * frame.iblIntensity * ao * interiorIBLK;
         dbgSpecularIBL = specularIBL * frame.iblIntensity * specOcc * interiorIBLK;
+        // ── Cloth sheen, environment arm ─────────────────────────────────────
+        // The direct arm lives in `brdf`; this is the other half. A cushion in a room the sun
+        // never reaches is lit almost entirely by the environment, and the Phase-7b bolt-on
+        // never consulted it — `ambSheen` read `frame.ambientColor` alone, which is 0 in every
+        // Daydream Home scene, so an indoor sofa had no sheen from ANY source. Driven by the
+        // SAME irradiance the diffuse lobe uses, through the same `iblIntensity × interiorIBLK`
+        // and raw `ao`, so it dims with the room exactly as the diffuse does.
+        if (sheenStrength > 0.0) {
+            float3 sheenEnv = clothSheenColor(albedo)
+                            * (sheenStrength * clothSheenEnvAlbedo(NdotV))
+                            * irradianceSat * ao * frame.iblIntensity * interiorIBLK;
+            indirect += sheenEnv;
+            clothSheen += sheenEnv;
+        }
         // `ambientColor` is now a TRUE ambient term — only SCN `.ambient`
         // lights (uniform, no NdotL) feed it. As of #60 task 5 the secondary
         // SCN directionals (fill, back) are NO LONGER folded in here; they
@@ -1008,6 +1111,17 @@ kernel void illumi_lighting(
         float3 ambSupp = mix(ambCol * 0.4, ambCol, upness) * albedo;
         indirect += ambSupp * ao * interiorAmbK;
         dbgAmbient = ambSupp * ao * interiorAmbK;
+        // Ambient sheen — the same lobe against the flat ambient term, so a scene that lights
+        // its interior with `ambientColor` rather than an IBL probe still gets fabric. Uses
+        // `interiorAmbK` for the same reason the supplement above does. Exact no-op when
+        // `ambientColor` is 0 (every Daydream Home scene today) or the surface is not cloth.
+        if (sheenStrength > 0.0) {
+            float3 ambSheen = clothSheenColor(albedo)
+                            * (sheenStrength * clothSheenEnvAlbedo(NdotV))
+                            * mix(ambCol * 0.4, ambCol, upness) * ao * interiorAmbK;
+            indirect += ambSheen;
+            clothSheen += ambSheen;
+        }
     } else {
         // Legacy hemispheric ambient — only the diffuse term, no spec.
         float upness = saturate(N.y * 0.5 + 0.5);
@@ -1118,22 +1232,22 @@ kernel void illumi_lighting(
         plushSheenTerm = sheenTint * fres * frame.plushSheen * (sunSheen + ambSheen);
     }
 
-    // ── Phase 7b — per-material cloth sheen (velvet/wool/linen) ───────────────
-    // Fabric packs its sheen strength as a NEGATIVE emission.alpha (reuses the clearcoat
-    // channel; a surface is polished OR cloth, never both). A soft grazing-Fresnel
-    // retroreflective rim — the velvety glow real cloth catches, which a single GGX lobe
-    // can't give. Strength = -emission.alpha. No-op for every non-cloth surface (a ≥ 0).
-    float3 clothSheen = float3(0.0);
-    float sheenStrength = float(-emH.a);
-    if (sheenStrength > 0.001f) {
-        float  fres = pow(1.0 - saturate(dot(N, V)), 2.5);    // grazing-angle edge
-        float3 sheenTint = albedo * 0.4 + float3(0.6);        // fibre-tip warm white
-        float3 sunSheen = frame.directionalLightColor * (NdotL_sun * visibility);
-        float3 ambSheen = desaturateFill(frame.ambientColor, frame.iblDiffuseDesaturation) * ao;
-        clothSheen = sheenTint * fres * sheenStrength * (sunSheen + ambSheen);
-    }
-
-    float3 color = directSun + transmission + dirFillSum + pointSum + spotSum + areaSum + indirect + emission + clearcoat + hotdogCC + plushSheenTerm + clothSheen;
+    // ── Phase 7b cloth sheen — NO LONGER SUMMED HERE (2026-08-09) ─────────────
+    // The lobe used to be a bolt-on at exactly this point: one grazing-Fresnel term built from
+    // `frame.directionalLightColor · NdotL_sun · visibility` plus `frame.ambientColor · ao`,
+    // added to `color` after the point and spot loops had closed. It could therefore see only
+    // the sun — a lamp-lit sofa got nothing, and neither did one lit purely by the sky, because
+    // `ambientColor` is 0 in every Daydream Home scene and the IBL was never consulted. That is
+    // photorealism gap #8, "upholstery reads as plaster", measured at
+    // `HouseRenderBridgeGPUTests_ClothSheen.testB0ClothSheenTermAcrossFourLightingConfigs`:
+    // night-with-lamps and night-with-everything-off returned the SAME number to the last digit.
+    //
+    // It now lives inside `brdf` (Charlie D + Ashikhmin/Neubelt V), so every light type picks it
+    // up from ONE place with no per-light-type code, plus an environment arm in the IBL block.
+    // `clothSheen` above is only the DEBUG accumulator — the energy is already inside
+    // `directSun` / `pointSum` / `spotSum` / `dirFillSum` / `indirect`, so adding it again here
+    // would double-count it.
+    float3 color = directSun + transmission + dirFillSum + pointSum + spotSum + areaSum + indirect + emission + clearcoat + hotdogCC + plushSheenTerm;
 
     // Per-term split-render: isolate ONE contribution so a flooded/flat scene
     // can be decomposed. Surfaces only — sky already returned above.
@@ -1145,6 +1259,10 @@ kernel void illumi_lighting(
         case 5u: color = dbgSpecularIBL;  break;  // specular IBL (× iblIntensity × ao)
         case 6u: color = emission;        break;  // G-buffer emissive surface
         case 7u: color = dbgAmbient;      break;  // ambient supplement
+        // 17 — the per-material cloth sheen lobe on its own. NOT a G-buffer channel: the
+        // tonemap's `debugTerm >= 10` branch has no case for 17, so it falls through and this
+        // value is tonemapped exactly like cases 1–7. Zero on every non-cloth surface.
+        case 17u: color = clothSheen;     break;  // cloth sheen (velvet/linen/wool)
         default: break;                           // 0 = full composite
     }
     outHDR.write(half4(half3(color), 1.0h), gid);

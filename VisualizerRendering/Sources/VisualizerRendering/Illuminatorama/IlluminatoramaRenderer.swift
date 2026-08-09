@@ -806,6 +806,17 @@ public final class IlluminatoramaRenderer {
         /// illumination gradient and the tonemapper all ride on top of it. Reach for
         /// this before theorising about any AO complaint.
         case ssao = 16
+        /// Isolates the per-material **cloth sheen** lobe (velvet / linen / wool — strength
+        /// arrives packed as a NEGATIVE `emission.a`, see `IlluminatoramaGBuffer.metal`).
+        /// Unlike 10–16 this is a LIGHTING term, not a G-buffer channel: `illumi_lighting`
+        /// handles it and the tonemap's `>= 10` G-buffer branch deliberately has no case for
+        /// it, so it falls through and the term is tonemapped like cases 1–7.
+        ///
+        /// This is the instrument that measured gap #8 (2026-08-09): before the lobe moved
+        /// into `brdf()` it was evaluated ONCE, after the point/spot loops had closed, from
+        /// the sun and `frame.ambientColor` alone — so a lamp-lit sofa received exactly zero
+        /// sheen and read as plaster. A night-with-lamps frame MUST show fabric here.
+        case clothSheen = 17
     }
     public var debugTerm: DebugTerm = .normal
     /// Tracked by the renderer each frame (set from the host's
