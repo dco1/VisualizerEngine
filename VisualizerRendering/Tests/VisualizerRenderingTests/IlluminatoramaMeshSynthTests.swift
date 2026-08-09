@@ -26,12 +26,14 @@ final class IlluminatoramaMeshSynthTests: XCTestCase {
 
     private static func makeShaderLibrary(device: MTLDevice) throws -> MTLLibrary {
         // #filePath: …/Tests/VisualizerRenderingTests/IlluminatoramaMeshSynthTests.swift
-        // shader:    …/Sources/VisualizerRendering/Shaders/Illuminatorama.metal
+        // shader:    …/Sources/VisualizerRendering/Shaders/IlluminatoramaMesh.metal
+        // (the synth kernels moved out of the 7.4k-line Illuminatorama.metal when it was
+        //  split per-pass; they now live in the Mesh file, which includes Common.h.)
         let shader = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()      // VisualizerRenderingTests
             .deletingLastPathComponent()      // Tests
             .deletingLastPathComponent()      // package root
-            .appendingPathComponent("Sources/VisualizerRendering/Shaders/Illuminatorama.metal")
+            .appendingPathComponent("Sources/VisualizerRendering/Shaders/IlluminatoramaMesh.metal")
         // A source-string compile has NO include path, so any local `#include "…"` in the
         // shader must be spliced in first — see MetalSourceLoader.
         guard FileManager.default.fileExists(atPath: shader.path) else {
