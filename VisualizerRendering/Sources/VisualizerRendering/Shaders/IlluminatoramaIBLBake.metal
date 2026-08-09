@@ -184,8 +184,47 @@ kernel void illumi_prefilter_bake(
 //
 // Reference: Karis 2013 "Real Shading in Unreal Engine 4" — equations 4–5.
 
+// ── S1.6 — the IBL Smith remap ──────────────────────────────────────────────
+//
+// Karis specifies TWO Schlick-GGX `k` remaps and they are not interchangeable:
+//
+//   analytic light source :  k = (roughness + 1)² / 8   ← a deliberate widening
+//                                                          that fakes an area
+//                                                          light's softening
+//   split-sum IBL integral:  k = α / 2  (α = roughness²) ← the plain Smith-GGX
+//                                                          height-correlated
+//                                                          approximation
+//
+// `geometrySmith` in IlluminatoramaCommon.h carries the ANALYTIC form, which is
+// correct where it is used (the direct sun / point / spot lobes in
+// IlluminatoramaLighting.metal) and wrong here. The two diverge hardest exactly
+// where a LUT error is most visible — on polished surfaces at grazing angles: at
+// roughness 0.12 and NdotV ≈ 0.3 the analytic form gives G ≈ 0.54 against the IBL
+// form's ≈ 1.0, i.e. the LUT was reporting that a MIRROR loses ~40 % of its energy.
+//
+// This is defined locally rather than fixed in the shared header on purpose: the
+// header's `geometrySmith` is the analytic-light G and must stay that way.
+static inline float dfgSchlickGGX_IBL(float NdotX, float k) {
+    return NdotX / (NdotX * (1.0 - k) + k);
+}
+static inline float dfgSmith_IBL(float NdotV, float NdotL, float roughness) {
+    float alpha = roughness * roughness;
+    float k     = alpha * 0.5;
+    return dfgSchlickGGX_IBL(NdotV, k) * dfgSchlickGGX_IBL(NdotL, k);
+}
+
+/// Which `k` remap the bake integrates with. 1 = the correct IBL form (`k = α/2`),
+/// 0 = the historical analytic-light form (`k = (r+1)²/8`) this LUT shipped with
+/// since Phase 3.2. Host-selected once at init via
+/// `IlluminatoramaRenderer.dfgUseIBLGeometryRemap`; a buffer rather than a function
+/// constant so the shipping pipeline cache is untouched.
+struct DFGBakeParams {
+    uint useIBLRemap;
+};
+
 kernel void illumi_dfg_bake(
     texture2d<half, access::write> outLUT [[texture(0)]],
+    constant DFGBakeParams&        params [[buffer(0)]],
     uint2                          gid   [[thread_position_in_grid]]
 ) {
     uint W = outLUT.get_width();
@@ -216,7 +255,9 @@ kernel void illumi_dfg_bake(
         float VdotH = max(dot(V, H), 0.0);
 
         if (NdotL > 0.0) {
-            float G     = geometrySmith(NdotV, NdotL, roughness);
+            float G     = params.useIBLRemap != 0u
+                        ? dfgSmith_IBL(NdotV, NdotL, roughness)
+                        : geometrySmith(NdotV, NdotL, roughness);
             // G_Vis: the split-sum measure-change factor.
             float G_Vis = (G * VdotH) / max(NdotH * NdotV, 1e-6);
             float Fc    = pow(1.0 - VdotH, 5.0);

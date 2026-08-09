@@ -1249,6 +1249,49 @@ public final class IlluminatoramaRenderer {
     /// view/material/scene-independent, so there is no rebake cost.
     public var dfgLUTEnabled: Bool = true
 
+    /// **S1.6 — which Smith-GGX `k` remap `illumi_dfg_bake` integrates the split
+    /// sum with.** `true` = Karis's IBL form `k = α/2` (physically the right one for
+    /// this integral); `false` = the analytic-light form `k = (roughness+1)²/8` the
+    /// LUT shipped with from Phase 3.2 until S1.6, which under-reports the lobe's
+    /// directional albedo and so darkens specular IBL on every polished surface —
+    /// worst at low roughness and grazing angles (roughness 0.12 / NdotV 0.3:
+    /// G ≈ 0.54 against the correct ≈ 1.0).
+    ///
+    /// The LUT is baked ONCE in `init`, so this is read at construction time and a
+    /// later change has no effect on an existing renderer — build a new one (which
+    /// is exactly what makes an in-process A/B possible: flip, construct, measure).
+    /// Env override `VIZ_ILLUMI_DFG_IBL_K=0|1` for a no-recompile A/B in a host app.
+    ///
+    /// This changes the LOOK of both host apps, so it is deliberately one switch in
+    /// one place rather than a silent constant edit.
+    public nonisolated(unsafe) static var dfgUseIBLGeometryRemap: Bool = {
+        if let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_DFG_IBL_K"] {
+            return v != "0"
+        }
+        return dfgIBLGeometryRemapDefault
+    }()
+
+    /// The shipping default for ``dfgUseIBLGeometryRemap``. Named so the decision is
+    /// greppable and reversible in one line.
+    ///
+    /// **`false` — the HISTORICAL, SHIPPING behaviour** (`k = (roughness+1)²/8`), i.e. the
+    /// LUT every frame both apps have ever rendered was baked with. It stays the default
+    /// deliberately: S1.6 measured the corrected bake but did NOT adopt it.
+    ///
+    /// **Flipping this to `true` is a LOOK CHANGE, not a bug fix landing.** It brightens
+    /// specular IBL on every polished surface — metals, marble, gloss, glazing — in BOTH
+    /// Daydream Home and Visualizer, at once, with no per-app opt-out. That is Danny's call
+    /// to make and it has not been made; until it is, the corrected arm is reachable for
+    /// measurement only (set ``dfgUseIBLGeometryRemap`` directly, or `VIZ_ILLUMI_DFG_IBL_K=1`),
+    /// which is what lets one binary render both arms side by side.
+    public nonisolated static let dfgIBLGeometryRemapDefault = false
+
+    /// The baked split-sum DFG LUT (RG16F, `x` = F0 scale, `y` = bias, keyed on
+    /// (NdotV, roughness) over (0,1]). Exposed read-only so a gate can measure the
+    /// integral the GPU actually produced rather than re-deriving it on the CPU —
+    /// storage is `.private`, so a reader must blit it to a shared texture.
+    public var dfgLUTTexture: MTLTexture { dfgLUT }
+
     // ── Output ────────────────────────────────────────────────────────────────
 
     /// Final LDR texture, ready to bind to `SCNMaterial.diffuse.contents`.
@@ -3749,6 +3792,10 @@ public final class IlluminatoramaRenderer {
             enc.label = "Illuminatorama.dfgBake"
             enc.setComputePipelineState(dfgBake)
             enc.setTexture(dfg, index: 0)
+            // S1.6 — pick the `k` remap the split-sum integral is baked with. Read
+            // ONCE, here, because the LUT is never rebaked.
+            var dfgUseIBLRemap: UInt32 = Self.dfgUseIBLGeometryRemap ? 1 : 0
+            enc.setBytes(&dfgUseIBLRemap, length: MemoryLayout<UInt32>.stride, index: 0)
             let sz  = Self.dfgLUTSize
             let tgw = dfgBake.threadExecutionWidth
             let tgh = max(1, dfgBake.maxTotalThreadsPerThreadgroup / tgw)
