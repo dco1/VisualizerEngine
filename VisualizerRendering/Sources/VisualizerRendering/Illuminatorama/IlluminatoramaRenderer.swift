@@ -414,7 +414,25 @@ public final class IlluminatoramaRenderer {
     private var easedHalationRadius: Float = 64
     private var easedHalationTint: SIMD3<Float> = SIMD3(1.0, 0.32, 0.12)
     private var lastPostFXEaseTime: CFTimeInterval = 0
+    /// The scene animation clock, in **seconds since the session started** — reaches the GPU as
+    /// `FrameUniforms.time` and drives every shader oscillator (`applyTreeWind`, `applySway`
+    /// mode 2's self-oscillating pendant, the shadow passes' `shadowTime`, `applyCurveWind`,
+    /// the film-grain reseed) plus the `iblRebakeInterval` fallback.
+    ///
+    /// **It must be SESSION-relative, and it must stay small.** This is a `Float`, so its
+    /// resolution is `time.ulp` — proportional to its own magnitude. A host that assigns a
+    /// *boot*-relative clock (`CACurrentMediaTime()`, which is awake-uptime since boot) hands
+    /// the GPU a clock whose ulp is 31.25 ms after four days of uptime: consecutive 60 fps
+    /// frames narrow to the SAME float, so every oscillator judders in ~32 Hz steps, and the
+    /// resolution halves again every time uptime doubles. Use `RenderClock` (which documents the
+    /// full precision table and the rejected wrap-the-clock alternative) or an accumulated
+    /// `elapsed` starting at 0; assign a pinned literal only for deterministic captures.
+    ///
+    /// `render()` warns ONCE on stderr if the value it is given is too coarse to animate.
     public var time: Float = 0
+    /// One-shot latch for the coarse-animation-clock warning in `render()` — a host that feeds a
+    /// boot-relative clock would otherwise emit one line per frame forever.
+    private var warnedCoarseAnimationClock = false
     /// Vertex-shader tree-wind knobs (#58 #1). `treeWindStrength` is the max
     /// canopy sway in ~metres (0 = no wind, an exact shader no-op); `treeWindHeading`
     /// is the wind/gust travel direction in radians. Per-vertex sway weights ride
@@ -7566,6 +7584,16 @@ public final class IlluminatoramaRenderer {
     /// fixed Timer cadence, and to skip re-presenting a stale `outputTexture`.
     @discardableResult
     public func render(blocking: Bool = false) -> Bool {
+        // Fail LOUD on a boot-relative animation clock. `time` is a Float used as a phase by
+        // every GPU oscillator, so a large absolute value quantises all of them (see `time`'s
+        // doc and `RenderClock`). This is the check that would have caught the defect on the
+        // first frame instead of after it silently killed the film grain; it costs one compare
+        // per frame and never fires for a host that sends a session-relative clock.
+        if !warnedCoarseAnimationClock && RenderClock.isTooCoarse(CFTimeInterval(time)) {
+            warnedCoarseAnimationClock = true
+            let m = RenderClock.coarseClockDiagnosis(CFTimeInterval(time)) + "\n"
+            FileHandle.standardError.write(Data(m.utf8))
+        }
         // Promote any pool buffer whose render completed since last tick to
         // the presented `outputTexture`. Done first so consumers binding
         // `outputTexture` this tick see the freshest fully-rendered frame.
