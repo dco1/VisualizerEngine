@@ -97,6 +97,29 @@ public final class IlluminatoramaTextureAtlas {
     /// 8-byte stride that matches Metal `float2` exactly (no SIMD3/float3
     /// padding trap). Mutable: `grow()` re-allocates it alongside the texture.
     public private(set) var uvScaleBuffer: MTLBuffer
+    /// S2.5 — per-slice MEAN of the slice's contents **in the space the shader samples**
+    /// (i.e. linear for the sRGB albedo atlas, raw for the non-colour atlas), as
+    /// `float4(mean.r, mean.g, mean.b, valid)`.
+    ///
+    /// This is μ for the variance-preserving hex blend (`sampleAtlasHex`). A weighted
+    /// average of three i.i.d. taps has variance `σ²·Σwᵢ²` — up to **3× less** than one
+    /// tap at a triangle centroid — which is the mechanism by which the naive linear
+    /// blend visibly flattens a floor's contrast. Restoring it needs the *distribution*
+    /// mean, not the local one: `out = μ + (blend − μ)/√(Σwᵢ²)`.
+    ///
+    /// **Why the host and not the coarsest mip.** Mikkelsen's paper takes μ from the top
+    /// mip, which is wrong here twice over: the albedo atlas is `bgra8Unorm_srgb` so the
+    /// hardware returns `srgbToLinear(mean_srgb)` where we need `mean(srgbToLinear)` — a
+    /// Jensen bias that is always *darker* than the true linear mean, so rescaling around
+    /// it would systematically brighten every de-repeated surface — and a letterboxed
+    /// slice's coarse levels average the wrap-fill padding in. Computed here from the
+    /// level-0 bytes over the VALID (non-letterbox) sub-rect, in linear space, it is exact.
+    ///
+    /// `w == 0` means "no mean recorded" (an unwritten slot, or a live/blitted slice whose
+    /// contents the host never saw) and the shader then falls back to the plain linear
+    /// blend. Fail-safe by construction: the zero-filled default buffer disables the
+    /// rescale rather than rescaling around black.
+    public private(set) var sliceMeanBuffer: MTLBuffer
 
     private let device: MTLDevice
     private let blitQueue: MTLCommandQueue
@@ -148,7 +171,8 @@ public final class IlluminatoramaTextureAtlas {
         d.storageMode = .shared
         guard let t = device.makeTexture(descriptor: d),
               let q = device.makeCommandQueue(), // gpu-ok: one-time setup; atlas is not a solver, no SimEngine needed
-              let uv = Self.makeUVScaleBuffer(device: device, capacity: capacity) else {
+              let uv = Self.makeUVScaleBuffer(device: device, capacity: capacity),
+              let mn = Self.makeSliceMeanBuffer(device: device, capacity: capacity) else {
             throw IlluminatoramaError.bufferAllocationFailed("albedoAtlas")
         }
         t.label = "Illuminatorama.albedoAtlas"
@@ -156,6 +180,7 @@ public final class IlluminatoramaTextureAtlas {
         self.texture = t
         self.blitQueue = q
         self.uvScaleBuffer = uv
+        self.sliceMeanBuffer = mn
         self.device = device
         self.sliceSize = sliceSize
         self.mipLevels = Self.mipLevelCount(for: sliceSize)
@@ -177,6 +202,29 @@ public final class IlluminatoramaTextureAtlas {
         return buf
     }
 
+    /// S2.5 — per-slice mean table, ZERO-filled. `w == 0` ⇒ "unknown", which the shader
+    /// reads as "skip the variance-preserving rescale and blend linearly". So a slot that
+    /// is bound-but-never-uploaded (or a live-blitted one) can never rescale around a
+    /// bogus μ; it just gets the pre-S2.5 behaviour.
+    private static func makeSliceMeanBuffer(device: MTLDevice, capacity: Int) -> MTLBuffer? {
+        let stride = MemoryLayout<SIMD4<Float>>.stride   // 16 bytes == Metal float4
+        guard let buf = device.makeBuffer(length: stride * capacity,
+                                          options: .storageModeShared) else { return nil }
+        buf.label = "Illuminatorama.atlasSliceMean"
+        let p = buf.contents().bindMemory(to: SIMD4<Float>.self, capacity: capacity)
+        for i in 0..<capacity { p[i] = SIMD4<Float>(0, 0, 0, 0) }
+        return buf
+    }
+
+    /// sRGB → linear, per the IEC 61966-2-1 curve the GPU's `_srgb` texture view applies.
+    /// 256-entry table: the mean is a sum over `sliceSize²` texels and a per-texel `pow`
+    /// would dominate registration.
+    private static let srgbToLinear256: [Float] = (0..<256).map { i in
+        let c = Float(i) / 255.0
+        return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
+    }
+    private static let identity256: [Float] = (0..<256).map { Float($0) / 255.0 }
+
     /// Drop the slice-allocation table. Underlying texture stays allocated
     /// for re-use; the old slices simply become "free" for future
     /// `register(image:)` calls to overwrite. Called on scene switch by
@@ -195,6 +243,17 @@ public final class IlluminatoramaTextureAtlas {
     private var freeSlices: [Int32] = []
     /// TEST-OBSERVABLE: how many freed slots are currently awaiting reuse.
     public var freeSliceCount: Int { freeSlices.count }
+
+    /// **A/B ABLATION INSTRUMENT** — mark every slice's mean "unknown", which is exactly the
+    /// fail-safe path `sampleAtlasHex` already has, i.e. it puts the sampler back on the
+    /// pre-S2.5 plain linear blend. This exists so a GPU test can measure the linear and the
+    /// variance-preserving arms **in one run, against the same bake and the same exposure
+    /// history**, without a production dial that would otherwise be a permanently-shipped
+    /// lever nobody moves. Undone by re-registering the material (or reloading the scene).
+    public func markAllSliceMeansUnknownForAblation() {
+        let p = sliceMeanBuffer.contents().bindMemory(to: SIMD4<Float>.self, capacity: capacity)
+        for i in 0..<capacity { p[i].w = 0 }
+    }
 
     public func freeSlice(_ slice: Int32) {
         guard slice >= 0, Int(slice) < nextSlice, !freeSlices.contains(slice) else { return }
@@ -297,6 +356,11 @@ public final class IlluminatoramaTextureAtlas {
         }
         let slice = Int32(nextSlice)
         nextSlice += 1
+        // S2.5 — a live slice's contents never pass through the host, so there is no μ for
+        // it. Mark it unknown (w = 0) so `sampleAtlasHex` blends linearly rather than
+        // rescaling around a stale predecessor's mean if this slot was recycled.
+        sliceMeanBuffer.contents().bindMemory(to: SIMD4<Float>.self, capacity: capacity)[Int(slice)]
+            = SIMD4<Float>(0, 0, 0, 0)
         // Default this slice to mid-grey so a binding that hasn't been blitted
         // yet (the one-frame warmup) reads as a neutral surface, not garbage.
         let region = MTLRegionMake3D(0, 0, 0, sliceSize, sliceSize, 1)
@@ -399,6 +463,33 @@ public final class IlluminatoramaTextureAtlas {
                 Self.log.error("CGContext init failed for slice \(slice, privacy: .public) mip \(level, privacy: .public)")
                 return false
             }
+            // S2.5 — μ for the variance-preserving hex blend, taken from LEVEL 0 over the
+            // VALID (pre-wrap-fill) sub-rect only, in the space the shader samples. See
+            // `sliceMeanBuffer` for why neither the coarsest mip nor the full square works.
+            if level == 0 {
+                let lut = (pixelFormat == .bgra8Unorm_srgb || pixelFormat == .rgba8Unorm_srgb)
+                        ? Self.srgbToLinear256 : Self.identity256
+                // Buffer row 0 is CG-top, which is texture v = 0 — the same anchor the
+                // draw above uses — so the valid image occupies rows 0..<n·sy, cols 0..<n·sx.
+                let vw = max(1, min(n, Int((CGFloat(n) * sx).rounded())))
+                let vh = max(1, min(n, Int((CGFloat(n) * sy).rounded())))
+                var sumB = 0.0, sumG = 0.0, sumR = 0.0
+                buffer.withUnsafeBytes { raw in
+                    guard let p = raw.bindMemory(to: UInt8.self).baseAddress else { return }
+                    for y in 0..<vh {
+                        var o = y * bytesPerRow
+                        for _ in 0..<vw {
+                            sumB += Double(lut[Int(p[o])])          // BGRA byte order
+                            sumG += Double(lut[Int(p[o + 1])])
+                            sumR += Double(lut[Int(p[o + 2])])
+                            o += 4
+                        }
+                    }
+                }
+                let inv = 1.0 / Double(vw * vh)
+                sliceMeanBuffer.contents().bindMemory(to: SIMD4<Float>.self, capacity: capacity)[slice]
+                    = SIMD4<Float>(Float(sumR * inv), Float(sumG * inv), Float(sumB * inv), 1)
+            }
             buffer.withUnsafeBytes { raw in
                 guard let base = raw.baseAddress else { return }
                 texture.replace(region: MTLRegionMake3D(0, 0, 0, n, n, 1),
@@ -437,14 +528,22 @@ public final class IlluminatoramaTextureAtlas {
         // Copy slice 0..nextSlice from old texture into new texture at the
         // same indices. `nextSlice` is "the next slot to write", so it's
         // also the count of in-use slices.
+        //
+        // EVERY MIP LEVEL, not just level 0. Before S2.5 this loop copied level 0 alone,
+        // so a single atlas growth silently left every already-registered slice with an
+        // UNDEFINED mip chain — i.e. it threw away exactly the chain S1.1 exists to build,
+        // and only for scenes big enough to grow past the initial capacity (never a test).
         for slice in 0..<nextSlice {
-            blit.copy(from: texture,
-                      sourceSlice: slice, sourceLevel: 0,
-                      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                      sourceSize: MTLSize(width: sliceSize, height: sliceSize, depth: 1),
-                      to: newTex,
-                      destinationSlice: slice, destinationLevel: 0,
-                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            for level in 0..<mipLevels {
+                let n = max(1, sliceSize >> level)
+                blit.copy(from: texture,
+                          sourceSlice: slice, sourceLevel: level,
+                          sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                          sourceSize: MTLSize(width: n, height: n, depth: 1),
+                          to: newTex,
+                          destinationSlice: slice, destinationLevel: level,
+                          destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            }
         }
         blit.endEncoding()
         cb.commit()
@@ -452,13 +551,18 @@ public final class IlluminatoramaTextureAtlas {
         // Grow the per-slice UV-scale table in lockstep with the texture:
         // carry the in-use entries (0..<nextSlice) forward, default the rest to
         // (1,1). CPU-side copy of a tiny shared buffer — no GPU blit needed.
-        guard let newUV = Self.makeUVScaleBuffer(device: device, capacity: newCapacity) else {
+        guard let newUV = Self.makeUVScaleBuffer(device: device, capacity: newCapacity),
+              let newMean = Self.makeSliceMeanBuffer(device: device, capacity: newCapacity) else {
             return false
         }
         let oldP = uvScaleBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: capacity)
         let newP = newUV.contents().bindMemory(to: SIMD2<Float>.self, capacity: newCapacity)
         for i in 0..<nextSlice { newP[i] = oldP[i] }
         uvScaleBuffer = newUV
+        let oldM = sliceMeanBuffer.contents().bindMemory(to: SIMD4<Float>.self, capacity: capacity)
+        let newM = newMean.contents().bindMemory(to: SIMD4<Float>.self, capacity: newCapacity)
+        for i in 0..<nextSlice { newM[i] = oldM[i] }
+        sliceMeanBuffer = newMean
         Self.log.info("Atlas grew \(self.capacity, privacy: .public) → \(newCapacity, privacy: .public) slices")
         texture = newTex
         capacity = newCapacity

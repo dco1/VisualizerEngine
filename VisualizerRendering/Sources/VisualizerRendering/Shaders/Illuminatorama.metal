@@ -891,9 +891,32 @@ static inline float2 hexHash2D(float2 p) {
 // did — so opted-out scenes (Visualizer) are byte-for-byte unchanged. For
 // strength in (0,1] the three-tap hex blend is mixed in by `strength`, so the
 // caller can dial the de-repetition from subtle to full.
+//
+// S2.5 — the blend is VARIANCE-PRESERVING, not the naive linear `mix` this shipped with.
+//
+// The three taps read three uncorrelated regions of the same texture, so they behave as
+// i.i.d. draws from one distribution with mean μ and variance σ². A weighted average with
+// Σwᵢ = 1 keeps the mean but carries variance σ²·Σwᵢ², and Σwᵢ² runs from 1 (a cell centre,
+// one tap) down to 1/3 (a triangle centroid, three equal taps). So the old blend threw away
+// up to **⅔ of the material's contrast**, worst exactly in the middle of every lattice
+// triangle — a de-repeat that pays for itself in a soft, washed floor, which is the
+// contrast-flattening docs/MATERIALS_AND_TEXTURES §6 warns about.
+//
+// The fix restores the second moment: `out = μ + (blend − μ)/√(Σwᵢ²)`. It is exact at a
+// cell centre (Σwᵢ² = 1 ⇒ no change ⇒ still continuous with the single-tap fast path) and
+// scales by √3 at a centroid. μ comes from `sliceMean[slice]`, computed host-side in the
+// SAME space the sampler returns (see IlluminatoramaTextureAtlas.sliceMeanBuffer); when the
+// host never recorded one (`w == 0`, e.g. a live-blitted slice) this degrades to the old
+// linear blend rather than rescaling around garbage.
+//
+// This is the cheap half of Mikkelsen's histogram-preserving hex tiling: it preserves the
+// first two moments but not the tails, so the [0,1] clamp below still clips where the true
+// inverse-CDF would have curved. See the S2.5 note in VISUAL_QUALITY_STRETCH for why the
+// full Gaussianised-texture + inverse-CDF-LUT form is NOT worth its baked resource here.
 static inline float4 sampleAtlasHex(texture2d_array<float, access::sample> atlas,
                                      sampler s, float2 uv, uint slice,
                                      const device float2* uvScale,
+                                     const device float4* sliceMean,
                                      float strength,
                                      float2 duvdx, float2 duvdy) {
     // Exact single-sample fast path — identical to sampleAtlasAspect, no extra taps.
@@ -934,6 +957,18 @@ static inline float4 sampleAtlasHex(texture2d_array<float, access::sample> atlas
     float4 c1 = sampleAtlasAspect(atlas, s, uv + h1, slice, uvScale, duvdx, duvdy);
     float4 c2 = sampleAtlasAspect(atlas, s, uv + h2, slice, uvScale, duvdx, duvdy);
     float4 hex = (c0 * p0 + c1 * p1 + c2 * p2) / pSum;
+
+    // Variance-preserving rescale (see the header note). `w` is the normalised weight
+    // triple, so dot(w,w) == Σwᵢ² ∈ [1/3, 1] and rsqrt of it ∈ [1, √3].
+    float4 mu = sliceMean[slice];
+    if (mu.w > 0.5f) {
+        float3 w = float3(p0, p1, p2) / pSum;
+        float rescale = rsqrt(max(dot(w, w), 1e-6f));
+        // rgb only: nothing reads alpha off a hex tap (albedo takes .rgb, the normal map
+        // .xyz, roughness .g), and the albedo atlas's alpha is premultiplication state,
+        // not a signal whose contrast means anything.
+        hex.rgb = clamp(mu.rgb + (hex.rgb - mu.rgb) * rescale, 0.0f, 1.0f);
+    }
     // Blend the de-repeated hex result toward the plain single sample by strength.
     // strength==1 → full hex, strength==0 handled by the early-out above.
     return mix(single, hex, saturate(strength));
@@ -955,6 +990,13 @@ fragment GBufferOut illumi_fs(
     // `SIMD2<Float>` exactly.
     const device float2*                        albedoUVScale   [[buffer(3)]],
     const device float2*                        nonColorUVScale [[buffer(5)]],
+    // S2.5 — per-slice mean (rgb) + validity (w) for each atlas, the μ the
+    // variance-preserving hex blend rescales around. Same indexing as the UV-scale
+    // tables; `float4` (16-byte stride) matches the host's `SIMD4<Float>`. A zeroed
+    // entry (w == 0) means "unknown" and the blend stays linear, so a scene that
+    // never registers a slice through the host path is unaffected.
+    const device float4*                        albedoSliceMean [[buffer(7)]],
+    const device float4*                        nonColorSliceMean [[buffer(8)]],
     // Phase 4.0 — atlas of diffuse-albedo textures. Each slice is the
     // 512×512 BGRA8-sRGB upload from `IlluminatoramaTextureAtlas`; the
     // texture-format's sRGB→linear decode happens automatically inside
@@ -1025,6 +1067,7 @@ fragment GBufferOut illumi_fs(
         // but gives correct appearance after renormalize below.
         float4 nmSample = sampleAtlasHex(nonColorAtlas, texSampler, in.uv,
                                          uint(inst.normalTextureSlice), nonColorUVScale,
+                                         nonColorSliceMean,
                                          frame.antiTilingStrength * inst.antiTilingScale, duvdx, duvdy);
         float3 tangentN = normalize(nmSample.xyz * 2.0 - 1.0);
         // Phase 7 detail normal — blended on top of the macro normal at
@@ -1105,6 +1148,7 @@ fragment GBufferOut illumi_fs(
         // infinitely-tiling region, so aspect is preserved.
         float4 tx = sampleAtlasHex(albedoAtlas, texSampler, in.uv,
                                     uint(inst.albedoTextureSlice), albedoUVScale,
+                                    albedoSliceMean,
                                     frame.antiTilingStrength * inst.antiTilingScale, duvdx, duvdy);
         albedo = tx.rgb;
     }
@@ -1133,6 +1177,7 @@ fragment GBufferOut illumi_fs(
         // roughness variation doesn't lag the albedo tile seam.
         float4 tx = sampleAtlasHex(nonColorAtlas, texSampler, in.uv,
                                     uint(inst.roughnessTextureSlice), nonColorUVScale,
+                                    nonColorSliceMean,
                                     frame.antiTilingStrength * inst.antiTilingScale, duvdx, duvdy);
         roughness = tx.g;
     }

@@ -9140,6 +9140,11 @@ public final class IlluminatoramaRenderer {
         // `illumi_fs`'s signature.
         enc.setFragmentBuffer(albedoAtlas.uvScaleBuffer, offset: 0, index: 3)
         enc.setFragmentBuffer(nonColorAtlas.uvScaleBuffer, offset: 0, index: 5)
+        // S2.5 — per-slice mean tables (μ for the variance-preserving hex blend). Pass-wide
+        // like the UV-scale tables; fragment (7)/(8) are otherwise unused by this pass, and
+        // (6) is the superquadric param buffer set per-group below.
+        enc.setFragmentBuffer(albedoAtlas.sliceMeanBuffer, offset: 0, index: 7)
+        enc.setFragmentBuffer(nonColorAtlas.sliceMeanBuffer, offset: 0, index: 8)
         // Phase 7 — bind the per-frame uniforms to the FRAGMENT stage too (they were
         // already bound to vertex at buffer(1)) so `illumi_fs` can read
         // `antiTilingStrength`. Pass-wide (constant across the draw loop).
