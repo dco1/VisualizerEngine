@@ -447,26 +447,62 @@ public final class IlluminatoramaRenderer {
     /// `highlight == 1` in `selectionOutlineColor`, `highlight == 2` in
     /// `hoverOutlineColor`.
     public var selectionOutlineEnabled: Bool = false
-    /// RGB color of the *selected* halo in linear HDR space (pre-intensity).
-    public var selectionOutlineColor: SIMD3<Float> = SIMD3(0.0, 0.7, 1.0)
-    /// RGB color of the *hover* halo in linear HDR space (pre-intensity).
-    public var hoverOutlineColor: SIMD3<Float> = SIMD3(1.0, 0.78, 0.12)
-    /// Dilation radius of the halo, in **output** pixels — what the viewer actually sees.
-    ///
-    /// It used to be consumed as-is against the mask textures, which are sized at the INTERNAL
-    /// resolution, so the halo's apparent thickness was `selectionOutlineWidth / internalRenderScale`
-    /// and moved with a lever that has nothing to do with selection. A host that drops the render
-    /// scale during a gesture — which Daydream Home does, edge-triggered on gesture start — got a
-    /// halo that visibly FATTENS the instant you grab the thing it is drawn around and snaps thin
-    /// when you let go. Across that app's shipped tiers the same 6 landed anywhere from 4.0 to
-    /// 10.9 output px, a 2.7× spread, at its most obvious precisely when the outline is on screen.
-    /// `resolvedOutlineRadius` converts at the point of use so the number means one thing.
-    public var selectionOutlineWidth: Int = 6
 
-    /// `selectionOutlineWidth` in INTERNAL pixels — the space the mask textures live in. Never
-    /// below 1, or the dilation degenerates and the halo disappears at low render scales.
-    public var resolvedOutlineRadius: Int32 {
-        Int32(max(1, (Float(max(1, selectionOutlineWidth)) * internalRenderScale).rounded()))
+    /// The look of ONE highlight mode's halo. Selection and hover differ in nothing but these
+    /// three numbers, so they are one type with two values — not two parallel sets of properties
+    /// that drift apart the moment a third mode (locked? conflicted?) shows up.
+    public struct HighlightOutlineStyle: Equatable, Sendable {
+        /// RGB in linear space, pre-intensity. This is what makes the mode identifiable at a
+        /// glance, so it only survives if `intensity` keeps the ring off the clipping point.
+        public var color: SIMD3<Float>
+        /// How far the halo reaches from the silhouette, in **output** pixels — what the viewer
+        /// actually sees, at any internal render scale (`resolvedOutlineRadius`). The ring ramps
+        /// from full intensity against the element to nothing at this distance.
+        public var width: Float
+        /// PEAK additive brightness of the ring, in tonemapper-input units: 1.0 lands just under
+        /// the ACES shoulder, so ~0.9 is a strong glow that still carries its hue and ~0.5 is a
+        /// quiet hint. The composite divides out the frame's exposure, so this is a *displayed*
+        /// brightness — the same in a night scene and a noon one.
+        ///
+        /// It used to be a hardcoded 7.0, chosen to shove the ring past `bloomThreshold` and let
+        /// bloom do the feathering. That is what made the halo read as a hard WHITE band (7×
+        /// anything with a channel at 1.0 clips long before the shoulder, so blue and amber were
+        /// the same colour where it counted) sitting in a wash of its own bloom across the
+        /// enclosed object — measured at 23–27% of the frame repainted around one sofa. The ring
+        /// now feathers itself, so it does not need to be bloom-bait.
+        public var intensity: Float
+
+        public init(color: SIMD3<Float>, width: Float, intensity: Float) {
+            self.color = color; self.width = width; self.intensity = intensity
+        }
+
+        /// A committed choice — the brighter, wider of the two.
+        public static let selection = HighlightOutlineStyle(
+            color: SIMD3(0.0, 0.7, 1.0), width: 3.0, intensity: 0.9)
+        /// A passing hint. Deliberately quieter than `.selection`: the pointer sweeps across
+        /// elements constantly, and a hover that shouts as loud as a selection makes the canvas
+        /// flicker as you move the mouse.
+        public static let hover = HighlightOutlineStyle(
+            color: SIMD3(1.0, 0.78, 0.12), width: 2.0, intensity: 0.55)
+    }
+
+    /// Halo style for `highlight == 1` (selected) and `highlight == 2` (hovered).
+    public var selectionOutline: HighlightOutlineStyle = .selection
+    public var hoverOutline: HighlightOutlineStyle = .hover
+
+    /// A style's `width` in INTERNAL pixels — the space the mask textures live in. Never below 1,
+    /// or the dilation degenerates and the halo disappears at low render scales.
+    ///
+    /// The width is authored in OUTPUT pixels and used to be consumed as-is against the mask
+    /// textures, which are sized at the INTERNAL resolution — so the halo's apparent thickness was
+    /// `width / internalRenderScale` and moved with a lever that has nothing to do with selection.
+    /// A host that drops the render scale during a gesture — which Daydream Home does,
+    /// edge-triggered on gesture start — got a halo that visibly FATTENS the instant you grab the
+    /// thing it is drawn around and snaps thin when you let go. Across that app's shipped tiers one
+    /// setting of 6 landed anywhere from 4.0 to 10.9 output px, a 2.7× spread, at its most obvious
+    /// precisely when the outline is on screen.
+    public func resolvedOutlineRadius(_ style: HighlightOutlineStyle) -> Int32 {
+        Int32(max(1, (max(1, style.width) * internalRenderScale).rounded()))
     }
     /// Bounding-box proxies drawn only in the halo mask pass (never the G-buffer),
     /// so highlighted elements keep their real material while gaining a halo. One
@@ -2278,7 +2314,18 @@ public final class IlluminatoramaRenderer {
     private struct SelectionOutlineParams {
         var colorIntensity: SIMD4<Float>
         var width: Int32; var height: Int32
-        var _pad0: Int32 = 0; var _pad1: Int32 = 0
+        var ringGain: Float; var manualExposure: Float
+        var autoExposure: Int32
+        var _pad0: Int32 = 0
+    }
+
+    /// TEST-OBSERVABLE: the auto-exposure multiplier the tonemap applied on the last completed
+    /// frame (slot 1 of the shared `ExposureState` buffer). It is the scale a host has to divide
+    /// out to express anything composited *before* the tonemap in displayed brightness — and the
+    /// control any such claim needs, since a test that never checks this number cannot tell an
+    /// exposure-invariant result from two scenes that happened to be exposed the same.
+    public var lastAutoExposure: Float {
+        exposureBuffer.contents().advanced(by: 4).assumingMemoryBound(to: Float.self).pointee
     }
 
     /// Matches the Metal `ExtParticleParams` struct byte-for-byte.
@@ -10568,14 +10615,15 @@ public final class IlluminatoramaRenderer {
 
         // Mode 1 = selected (blue); mode 2 = hover (yellow). Skip a mode with no
         // boxes so we don't pay for an all-clear composite.
-        let modes: [(mode: Int32, color: SIMD3<Float>)] = [
-            (1, selectionOutlineColor),
-            (2, hoverOutlineColor),
+        let modes: [(mode: Int32, style: HighlightOutlineStyle)] = [
+            (1, selectionOutline),
+            (2, hoverOutline),
         ]
-        var radius = resolvedOutlineRadius
 
         for m in modes {
             guard highlightMaskInstances.contains(where: { $0.highlight == m.mode }) else { continue }
+            // Each mode carries its own width, so the radius is per-pass, not per-frame.
+            var radius = resolvedOutlineRadius(m.style)
 
             // ── Render pass: rasterize this mode's boxes into the mask ─────────
             let rp = MTLRenderPassDescriptor()
@@ -10620,16 +10668,24 @@ public final class IlluminatoramaRenderer {
             dispatch(comp, pipeline: dilateVPipeline, width: w, height: h)
 
             // Ring → additive composite. `bloomTonemapSource` is dofOutputTexture
-            // (if DOF ran) or displaySource. 7× pushes the ring past the bloom
-            // threshold so it blooms into a soft feathered halo.
+            // (if DOF ran) or displaySource. The dilation above already feathered the
+            // ring, so the intensity is a look, not a lever for reaching the bloom
+            // threshold — and staying under it is what keeps the halo off the rest of
+            // the frame. `exposureBuffer` lets the kernel divide out the very exposure
+            // the tonemap will apply (the estimator ran earlier in this command buffer).
             var params = SelectionOutlineParams(
-                colorIntensity: SIMD4(m.color.x, m.color.y, m.color.z, 7.0),
-                width: Int32(w), height: Int32(h))
+                colorIntensity: SIMD4(m.style.color.x, m.style.color.y, m.style.color.z,
+                                      m.style.intensity),
+                width: Int32(w), height: Int32(h),
+                ringGain: Float(radius + 1) / Float(radius),
+                manualExposure: exposure,
+                autoExposure: autoExposureEnabled ? 1 : 0)
             comp.setComputePipelineState(compPipeline)
             comp.setTexture(maskTex,            index: 0)
             comp.setTexture(dilTex,             index: 1)
             comp.setTexture(bloomTonemapSource, index: 2)
             comp.setBytes(&params, length: MemoryLayout<SelectionOutlineParams>.stride, index: 0)
+            comp.setBuffer(exposureBuffer, offset: 0, index: 1)
             dispatch(comp, pipeline: compPipeline, width: w, height: h)
 
             comp.endEncoding()
