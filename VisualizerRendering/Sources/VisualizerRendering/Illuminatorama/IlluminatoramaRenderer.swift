@@ -2965,6 +2965,17 @@ public final class IlluminatoramaRenderer {
     private static let rtMaxInstancesForLiveRT: Int = 2048
     private static let rtMaxMeshGroupsForLiveRT: Int = 128
     private static let rtMaxTrianglesForLiveRT: Int = 150_000
+    /// Diagnostic override for the mesh-group cap (`VIZ_ILLUMI_RT_GROUPCAP`, e.g. 512):
+    /// lets a harness MEASURE a scene past the shipped cap — what the first TLAS build
+    /// actually costs at N groups, and the steady per-frame tax — before anyone decides
+    /// whether the cap itself should move. Mirrors `VIZ_ILLUMI_RT_TG`: an instrument,
+    /// not a shipped setting; nil (unset/invalid) = the shipped cap. Read per-renderer
+    /// (not a static latch) so one test process can measure both arms.
+    private lazy var rtMeshGroupCapOverride: Int? = {
+        if let s = ProcessInfo.processInfo.environment["VIZ_ILLUMI_RT_GROUPCAP"],
+           let v = Int(s), v > 0 { return v }
+        return nil
+    }()
     /// Triangle cap for the GLASS-ONLY TLAS (AAA glass opted in, but full-scene RT
     /// lighting is OFF). The strict 150k cap above is sized so a per-pixel RT
     /// lighting/GI pass stays sub-frame — but a glass-only TLAS is traced by ONLY
@@ -6136,7 +6147,7 @@ public final class IlluminatoramaRenderer {
         // otherwise pay a full dictionary-lookup loop every frame purely to
         // re-confirm it is still too heavy.
         var overCap = instances.count + glassInstCount > Self.rtMaxInstancesForLiveRT
-            || meshGroups.count > Self.rtMaxMeshGroupsForLiveRT
+            || meshGroups.count > (rtMeshGroupCapOverride ?? Self.rtMaxMeshGroupsForLiveRT)
         var estTriangles = -1                     // −1 = not computed (cap already busted)
         if !overCap {
             estTriangles = 0
