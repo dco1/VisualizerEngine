@@ -196,6 +196,11 @@ public enum GrassFillerMesh {
                      density: density, heightScale: heightScale, groundHeight: groundHeight)
         let mesh = IlluminatoramaMesh(device: device, vertices: s.vertices, indices: s.indices)
         mesh.doubleSided = true
+        // A filler card is a zero-thickness open shell: it has no back face for the shadow
+        // pass's second-depth (`cull .front`) trick to store, so front-face culling would
+        // discard the very face that intercepts the sun and the card would cast nothing.
+        // See `IlluminatoramaMesh.shadowCastsBothFaces`.
+        mesh.shadowCastsBothFaces = true
         return mesh
     }
 }

@@ -43,6 +43,30 @@ public final class IlluminatoramaMesh {
     /// its back side to the camera and would otherwise render HOLLOW.
     public var doubleSided: Bool = false
 
+    /// Cast shadows from BOTH faces (shadow passes use cull `.none` instead of the
+    /// default `.front`). Opt-in, default false — an unset mesh keeps the renderer's
+    /// historical behaviour byte-for-byte.
+    ///
+    /// **Why this is not just `doubleSided`.** The shadow passes cull FRONT faces, which
+    /// stores the *second* depth (the back of the caster) and is the renderer's PRIMARY
+    /// acne defence — `shadowBias` (0.0003), `shadowSlopeBias` (0.0) and the normal-offset
+    /// push in `cascadeVisibility` are all deliberately set to near-nothing *because* this
+    /// second-depth trick already separates a lit receiver from its own occluder. That
+    /// trick is only valid for a **closed solid**, where a back face exists behind every
+    /// front face. For an **open shell** — a leaf card, a grass ribbon, a zero-thickness
+    /// sheet — the face that intercepts the light IS the only face, so culling it means
+    /// the mesh writes no shadow depth where it should and its shadow is displaced (or
+    /// absent) by the depth of whatever shell lies beyond.
+    ///
+    /// `doubleSided` is a *shading* property ("don't go hollow when the camera sees the
+    /// back"), and closed solids legitimately set it — Daydream's whole structural shell,
+    /// millwork and stairs are `doubleSided` so the cutaway shows interior faces. Driving
+    /// the shadow cull off `doubleSided` would therefore hand two-sided shadow casting to
+    /// every wall and floor in the scene, i.e. remove the primary acne defence from exactly
+    /// the flat, sun-facing geometry it was calibrated for. Hence a separate, narrow,
+    /// default-off flag that only genuinely open geometry opts into.
+    public var shadowCastsBothFaces: Bool = false
+
     public init(device: MTLDevice, vertices: [IlluminatoramaVertex], indices: [UInt16]) {
         guard let vb = device.makeBuffer(
             bytes: vertices,

@@ -126,6 +126,10 @@ public struct IlluminatoramaGPUMeshDescriptor {
     /// dynamic surfaces (a marching-cubes fluid that tilts or pours) so the
     /// back side renders instead of going hollow. Default false.
     public let doubleSided: Bool
+    /// Cast shadows from both faces (shadow passes use cull `.none`). Opt-in, default
+    /// false. See `IlluminatoramaMesh.shadowCastsBothFaces` for why this is deliberately
+    /// separate from `doubleSided`.
+    public let shadowCastsBothFaces: Bool
 
     public init(positionBuffer: MTLBuffer,
                 normalBuffer: MTLBuffer,
@@ -142,10 +146,12 @@ public struct IlluminatoramaGPUMeshDescriptor {
                 uvStride: Int = 8,
                 colorBuffer: MTLBuffer? = nil,
                 colorStride: Int = 16,
-                doubleSided: Bool = false) {
+                doubleSided: Bool = false,
+                shadowCastsBothFaces: Bool = false) {
         self.colorBuffer = colorBuffer
         self.colorStride = colorStride
         self.doubleSided = doubleSided
+        self.shadowCastsBothFaces = shadowCastsBothFaces
         self.positionBuffer = positionBuffer
         self.normalBuffer = normalBuffer
         self.positionStride = positionStride

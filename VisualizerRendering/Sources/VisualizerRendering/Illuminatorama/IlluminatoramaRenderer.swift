@@ -921,6 +921,25 @@ public final class IlluminatoramaRenderer {
     /// bias can't fix — too much causes "peter-panning" (shadows visibly
     /// detached from their caster's contact line with the receiver).
     public var shadowSlopeBias: Float = 0.0
+    /// **TEST LEVER — production must leave this false.** Makes the three shadow passes
+    /// pick their cull mode from `IlluminatoramaMesh.doubleSided` instead of the narrow
+    /// `shadowCastsBothFaces` opt-in. This is the "obvious" version of the open-shell
+    /// shadow fix, and it exists only so an A/B can MEASURE what it costs: `doubleSided`
+    /// is a shading property that closed solids set freely (Daydream's walls, floors,
+    /// millwork and stairs all do), so routing the shadow cull through it removes the
+    /// second-depth acne defence from the entire structural shell. Keep it reachable so
+    /// the acne is a number in a gate rather than a claim in a comment.
+    public var shadowCullFollowsDoubleSidedForTest: Bool = false
+
+    /// Cull mode for `mesh` in a shadow pass. `.front` (second-depth casting) is the
+    /// renderer's primary acne defence and the default for everything; a mesh that is an
+    /// OPEN shell has no second depth to store and opts into `.none` — see
+    /// `IlluminatoramaMesh.shadowCastsBothFaces`.
+    private func shadowCullMode(_ mesh: IlluminatoramaMesh) -> MTLCullMode {
+        let bothFaces = shadowCullFollowsDoubleSidedForTest ? mesh.doubleSided
+                                                            : mesh.shadowCastsBothFaces
+        return bothFaces ? .none : .front
+    }
     /// PCF kernel radius in shadow-map texels: 0 = single tap, 1 = 3×3, 2 = 5×5.
     public var shadowPcfRadius: UInt32 = 1
     /// How far from the camera the outermost cascade extends, in metres. Past
@@ -4304,6 +4323,7 @@ public final class IlluminatoramaRenderer {
             label: "Illuminatorama.gpuMesh"
         )
         mesh.doubleSided = descriptor.doubleSided
+        mesh.shadowCastsBothFaces = descriptor.shadowCastsBothFaces
         let kind = MeshKind.custom("gpuMesh#\(UUID().uuidString)")
         meshes[kind] = mesh
         // Issue #65 — side buffer for last frame's positions. Matches the
@@ -8213,7 +8233,10 @@ public final class IlluminatoramaRenderer {
             // Front-face cull keeps the shadow projection biased on the
             // back faces of geometry, which combats acne on lit surfaces
             // without the peter-panning a constant bias alone would cause.
-            enc.setCullMode(.front)
+            // Set per group below (`shadowCullMode`) — an OPEN shell has no
+            // back face to store, so it opts out and casts two-sided.
+            var cull: MTLCullMode = .front
+            enc.setCullMode(cull)
             enc.setFrontFacing(.counterClockwise)
 
             var lightVP = cascadeVPs[cascade]
@@ -8233,6 +8256,8 @@ public final class IlluminatoramaRenderer {
             for group in meshGroups {
                 if directionalShadowExcludedKinds.contains(group.kind) { continue }  // e.g. lamps — no sun shadow
                 guard let mesh = meshes[group.kind] else { continue }
+                let want = shadowCullMode(mesh)
+                if want != cull { cull = want; enc.setCullMode(cull) }
                 let off = instStride * group.start
                 enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
                 enc.setVertexBuffer(currentInstanceBuffer, offset: off, index: 2)
@@ -8420,8 +8445,10 @@ public final class IlluminatoramaRenderer {
             enc.label = spotShadowPassLabels[slice]
             enc.setRenderPipelineState(shadowPipeline)
             enc.setDepthStencilState(depthState)
-            // Same back-face-cast trick as the cascaded path.
-            enc.setCullMode(.front)
+            // Same back-face-cast trick as the cascaded path, and the same per-group
+            // opt-out for open shells (`shadowCullMode`).
+            var cull: MTLCullMode = .front
+            enc.setCullMode(cull)
             enc.setFrontFacing(.counterClockwise)
 
             var lightVP = spotLights[slice].shadowMatrix
@@ -8440,6 +8467,8 @@ public final class IlluminatoramaRenderer {
             let instStride = MemoryLayout<IlluminatoramaInstance>.stride
             for group in meshGroups {
                 guard let mesh = meshes[group.kind] else { continue }
+                let want = shadowCullMode(mesh)
+                if want != cull { cull = want; enc.setCullMode(cull) }
                 let off = instStride * group.start
                 enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
                 enc.setVertexBuffer(currentInstanceBuffer, offset: off, index: 2)
@@ -8581,8 +8610,10 @@ public final class IlluminatoramaRenderer {
                 enc.label = pointShadowPassLabels[slice]
                 enc.setRenderPipelineState(shadowPipeline)
                 enc.setDepthStencilState(depthState)
-                // Back-face cast, same acne mitigation as the sun / spot maps.
-                enc.setCullMode(.front)
+                // Back-face cast, same acne mitigation as the sun / spot maps, and the
+                // same per-group opt-out for open shells (`shadowCullMode`).
+                var cull: MTLCullMode = .front
+                enc.setCullMode(cull)
                 enc.setFrontFacing(.counterClockwise)
 
                 var lightVP = faces[slice]
@@ -8592,6 +8623,8 @@ public final class IlluminatoramaRenderer {
 
                 for group in meshGroups {
                     guard let mesh = meshes[group.kind] else { continue }
+                    let want = shadowCullMode(mesh)
+                    if want != cull { cull = want; enc.setCullMode(cull) }
                     let off = instStride * group.start
                     enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
                     enc.setVertexBuffer(currentInstanceBuffer, offset: off, index: 2)

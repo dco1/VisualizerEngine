@@ -219,7 +219,11 @@ public final class GrassRibbonRenderer {
             bodyIndexCount: indexCount,
             bodyIndexType: .uint32,
             colorBuffer: colorBuffer,
-            doubleSided: true)
+            doubleSided: true,
+            // A blade ribbon is an open shell — no back face for the shadow pass's
+            // second-depth (`cull .front`) trick, so front-face culling discards the lit
+            // face and the blade casts nothing. See `IlluminatoramaMesh.shadowCastsBothFaces`.
+            shadowCastsBothFaces: true)
     }
 
     /// Override the per-blade width multipliers (blade order = solver chain
