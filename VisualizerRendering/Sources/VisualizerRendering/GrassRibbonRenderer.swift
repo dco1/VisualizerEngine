@@ -33,8 +33,47 @@ public final class GrassRibbonRenderer {
     private static let log = Logger(subsystem: AppLog.subsystem, category: "GrassRibbonRenderer")
 
     public let solver: PBDFieldSolver
-    public let geometry: SCNGeometry
-    public let node: SCNNode
+
+    // ── SceneKit wrappers: BUILT ON DEMAND, and that is a memory fix ──────────────
+    //
+    // A SceneKit host adds `node` to its scene graph; a native Illuminatorama host takes
+    // `illuminatoramaDescriptor()` instead and never touches either of these. Building them
+    // eagerly in `init` therefore cost the native hosts an `SCNGeometry` they never drew —
+    // and, measured 2026-08-11 on Daydream Home's lawn rebuild, that geometry **is never
+    // released**: a field's `SCNGeometry` and `SCNNode` were still alive after the
+    // `GrassRibbonRenderer` that owned them had deinited, pinning the position, normal and
+    // index buffers they were constructed over (~29 MB per re-scatter at 60k blades, linear
+    // and unbounded — a `weak` probe across successive rebuilds named them as the only two
+    // survivors). Nothing in the host holds them, so the retention is inside SceneKit, which
+    // registers a geometry built over MTLBuffers with its own resource machinery; the only
+    // reliable way not to pay it is not to create the object.
+    //
+    // Building on first access keeps every SceneKit host byte-identical (the first `node` read
+    // builds exactly what `init` used to) while a native host allocates nothing. Written as an
+    // explicit backing store rather than `lazy` so `hasSceneKitWrappers` can report whether they
+    // exist WITHOUT creating them — a `lazy` property cannot be inspected without forcing it, and
+    // a gate that has to touch the thing it is checking for measures its own probe.
+    private var _geometry: SCNGeometry?
+    private var _node: SCNNode?
+
+    public var geometry: SCNGeometry {
+        if let g = _geometry { return g }
+        let g = makeGeometry()
+        _geometry = g
+        return g
+    }
+
+    public var node: SCNNode {
+        if let n = _node { return n }
+        let n = SCNNode(geometry: geometry)
+        _node = n
+        return n
+    }
+
+    /// TEST-OBSERVABLE: have the SceneKit wrappers been materialised? A native Illuminatorama
+    /// host must answer `false` for the lifetime of the field — see `geometry` for what it costs
+    /// when they exist.
+    public var hasSceneKitWrappers: Bool { _geometry != nil || _node != nil }
 
     private let expandPipeline: MTLComputePipelineState
     private let uniformBuffer: MTLBuffer
@@ -148,21 +187,41 @@ public final class GrassRibbonRenderer {
         }
         wsBuf.label = "Grass.widthScales"
 
+        self.solver         = solver
+        self.expandPipeline = expand
+        self.uniformBuffer  = uBuf
+        self.positionBuffer = posBuf
+        self.normalBuffer   = normBuf
+        self.indexBuffer    = idxBuf
+        self.widthScaleBuffer = wsBuf
+        self.indexCount     = indices.count
+        self.vertexCount    = verts
+        self.bladeCount     = blades
+        self.particlesPerBlade = perBld
+        self.baseHalfWidth  = baseHalfWidth
+        self.tipHalfWidthFrac = tipHalfWidthFrac
+    }
+
+    /// The SceneKit geometry over the compute-written blade buffers — exactly what `init` used
+    /// to build eagerly, now built on first access to `geometry` / `node` (see those properties
+    /// for why). Sources reference the live MTLBuffers, so the geometry animates with the field
+    /// without a CPU round-trip, as before.
+    private func makeGeometry() -> SCNGeometry {
         let stride12 = MemoryLayout<Float>.stride * 3  // packed_float3
         let posSource = SCNGeometrySource(
-            buffer: posBuf.buffer,
+            buffer: positionBuffer.buffer,
             vertexFormat: .float3, semantic: .vertex,
-            vertexCount: verts, dataOffset: 0, dataStride: stride12
+            vertexCount: vertexCount, dataOffset: 0, dataStride: stride12
         )
         let normSource = SCNGeometrySource(
-            buffer: normBuf.buffer,
+            buffer: normalBuffer.buffer,
             vertexFormat: .float3, semantic: .normal,
-            vertexCount: verts, dataOffset: 0, dataStride: stride12
+            vertexCount: vertexCount, dataOffset: 0, dataStride: stride12
         )
         let element = SCNGeometryElement(
-            buffer: idxBuf,
+            buffer: indexBuffer,
             primitiveType: .triangles,
-            primitiveCount: indices.count / 3,
+            primitiveCount: indexCount / 3,
             bytesPerIndex: MemoryLayout<UInt32>.stride
         )
 
@@ -177,22 +236,7 @@ public final class GrassRibbonRenderer {
         mat.metalness.contents = 0.0
         mat.isDoubleSided = true
         geom.firstMaterial = mat
-
-        self.solver         = solver
-        self.geometry       = geom
-        self.node           = SCNNode(geometry: geom)
-        self.expandPipeline = expand
-        self.uniformBuffer  = uBuf
-        self.positionBuffer = posBuf
-        self.normalBuffer   = normBuf
-        self.indexBuffer    = idxBuf
-        self.widthScaleBuffer = wsBuf
-        self.indexCount     = indices.count
-        self.vertexCount    = verts
-        self.bladeCount     = blades
-        self.particlesPerBlade = perBld
-        self.baseHalfWidth  = baseHalfWidth
-        self.tipHalfWidthFrac = tipHalfWidthFrac
+        return geom
     }
 
     /// Bridge descriptor for native-Illuminatorama scenes. Hand this to
