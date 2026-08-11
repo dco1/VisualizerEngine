@@ -2821,6 +2821,19 @@ public final class IlluminatoramaRenderer {
     /// TEST-OBSERVABLE: how many meshes are currently registered with the renderer.
     public var registeredMeshCount: Int { meshes.count }
 
+    /// TEST-OBSERVABLE: the live registry's KEYS, rendered as strings.
+    ///
+    /// `registeredMeshCount` can say a host is leaking meshes but not WHICH ones, and a count is
+    /// where that investigation stalls: a mesh is evicted only by `IlluminatoramaMeshHandle.deinit`,
+    /// so "the count grew" leaves every registration path a suspect. Diffing the key set across one
+    /// rebuild names the survivors outright — and the key format itself distinguishes the two ways
+    /// a mesh can outlive its scene (a `gpuMesh#UUID` key means a handle is still retained
+    /// somewhere; any other key means the mesh was inserted outside the handle contract and nothing
+    /// can ever evict it).
+    ///
+    /// Added 2026-08-11 for the ~231 MB-per-scene-rebuild leak (docs/MEMORY_FOOTPRINT.md).
+    public var registeredMeshKeyDescriptions: [String] { meshes.keys.map { String(describing: $0) } }
+
     /// Drop every cached entry whose mesh is no longer registered, releasing its BLAS, its
     /// normals and — the point of the whole exercise — the mesh itself, so the address it
     /// occupied becomes reusable only once nothing can look it up any more.

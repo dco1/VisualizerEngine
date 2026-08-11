@@ -66,10 +66,35 @@ public final class IlluminatoramaMeshHandle {
         // leak across scene reloads. Capture `kind` because `self` is
         // gone by the time the closure body runs.
         let evictKind = kind
-        // deinit can be called off the main actor (e.g. from a frame's
-        // ARC release); shuttle to MainActor before touching the renderer.
-        Task { @MainActor [weak renderer] in
-            renderer?.removeMesh(evictKind)
+        // ── THE EVICTION MUST NOT BE DEFERRED WHEN IT DOESN'T HAVE TO BE ──
+        //
+        // This was `Task { @MainActor in renderer?.removeMesh(evictKind) }`
+        // unconditionally, and that hop is a memory leak with a very long
+        // fuse. A host that rebuilds its scene SYNCHRONOUSLY on the main
+        // actor — `HouseRenderBridge.load()`, which drops the previous
+        // scene's handles and immediately registers the next scene's —
+        // never yields to the main-actor executor in between, so not one
+        // of those queued evictions runs. Every mesh the old scene
+        // registered stays in the renderer's table, holding its vertex and
+        // index buffers, and (once frames render) its BLAS too.
+        //
+        // Measured 2026-08-11 on Daydream Home, byte-identical house every
+        // iteration: +231 MB per rebuild, perfectly linear, 21 GB over 85
+        // rebuilds, with the renderer's registry growing +12/rebuild and
+        // releasing EXACTLY ZERO. See docs/MEMORY_FOOTPRINT.md.
+        //
+        // `deinit` genuinely can run off the main actor (an ARC release
+        // inside a frame), so the async path has to stay for that case —
+        // but when we are already on the main actor there is nothing to
+        // shuttle, and eviction becomes immediate and synchronous.
+        if Thread.isMainThread {
+            MainActor.assumeIsolated {
+                renderer?.removeMesh(evictKind)
+            }
+        } else {
+            Task { @MainActor [weak renderer] in
+                renderer?.removeMesh(evictKind)
+            }
         }
     }
 }
