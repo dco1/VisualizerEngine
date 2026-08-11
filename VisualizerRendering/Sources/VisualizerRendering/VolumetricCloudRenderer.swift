@@ -125,8 +125,15 @@ public final class VolumetricCloudRenderer {
         /// Power applied to the elevation curve. 1 = linear; >1 = horizon
         /// band sits lower (sky stays deep blue across more of the dome).
         public var hazePower: Float = 1.6
-        /// How fast rays below the horizon fade to ground colour. 0..1; 0.5
-        /// is a soft transition, 1 is hard.
+        /// How fast rays below the horizon fade to ground colour. 1 (the default) is the
+        /// physical rate; **smaller is softer** — the haze band under the horizon gets
+        /// proportionally wider — and larger hands over to `groundColor` sooner.
+        ///
+        /// Live in `.nishita` since 2026-08-11, where it scales the airlight handover
+        /// `exp(-k/theta)` (`nishitaAtmosphereColor`). It had been documented as exactly
+        /// this control since it was added and read by NEITHER atmosphere; the
+        /// `.proceduralGradient` path still ignores it (its own fade is a fixed
+        /// `smoothstep(-0.30, 0)` on elevation).
         public var groundBlend: Float = 1.0
 
         // ── Cloud slab + shape ────────────────────────────────
@@ -480,9 +487,20 @@ public final class VolumetricCloudRenderer {
         }
 
         // ── Dome pass: expensive, throttled ────────────────────────
+        //
+        // The throttle is a WALL CLOCK, and a wall clock cannot see a changed sky. A host that
+        // alters the dome's own inputs — `groundColor`, the sun, the sky ladder — gets the
+        // PREVIOUS dome for up to `minRenderInterval`, and in a headless capture (a whole A/B
+        // inside 200 ms) that means it may never bake the params under test at all: the arms
+        // silently share one dome, and which one they share depends on what ran before in the
+        // process. Daydream's yard A/B (lawn frame vs ground-hidden frame) hit exactly this and
+        // failed as "the void is as green as the lawn" — the same family as the post-FX easing
+        // trap. `markDomeDirty()` is the escape hatch: opt-in, so hosts that never call it are
+        // byte-identical, and it costs one extra bake per call.
         let now = CACurrentMediaTime()
-        if now - lastDomeRenderTime < minRenderInterval { return }
+        if !domeDirty && now - lastDomeRenderTime < minRenderInterval { return }
         guard domeSem.wait(timeout: .now()) == .success else { return }
+        domeDirty = false
         lastDomeRenderTime = now
         if !dispatchKernel(target: outputTexture,
                            resolution: resolution,
@@ -692,6 +710,16 @@ public final class VolumetricCloudRenderer {
     /// warm re-render, the classic suite-position flake in GPU tests).
     public var minRenderInterval: CFTimeInterval
     private var lastDomeRenderTime: CFTimeInterval = 0
+    private var domeDirty = false
+
+    /// Bake the dome on the NEXT `render(params:)`, ignoring `minRenderInterval` once.
+    ///
+    /// Call it whenever the dome's own inputs change — sun direction, the sky/ground colours,
+    /// the cloud shape — rather than relying on the wall-clock throttle to come round: the
+    /// throttle cannot see a param change, so a fast sequence of frames (a scrub, or any
+    /// headless capture) can render an entirely stale dome. Purely additive: a host that never
+    /// calls it behaves exactly as before.
+    public func markDomeDirty() { domeDirty = true }
 
     private static func makeTexture(device: MTLDevice,
                                     width: Int,

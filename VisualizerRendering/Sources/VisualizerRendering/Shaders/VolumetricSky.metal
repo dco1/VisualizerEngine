@@ -690,15 +690,66 @@ inline float3 nishitaScatter(float3 rayDir, float3 sunDir, float intensity) {
 // from a 3 m camera leaves ~1° of sky-below-horizon exposed). Sample the
 // scattering at a grazing direction instead and fade to groundColor as the
 // ray steepens; the band under the horizon now continues the horizon haze.
+//
+// 2026-08-11 — that fix corrected the VALUE and left the band FLAT, and the
+// flatness is what the exterior hero has been showing ever since: a dead level
+// warm plateau, +/-1 code value over 24 px, butting the lawn with a 25-code
+// one-row step (PHOTOREALISM #10). Two things were wrong and both are here.
+//
+//  1. The haze was read 0.004 rad ABOVE the horizon, which is a measurably
+//     BRIGHTER sample than the last above-horizon pixel: the band stepped UP
+//     ~5 code values crossing the horizon and then held. It is read at the
+//     true horizon now. A horizontal ray never meets the planet from a viewer
+//     above it (`rayGroundHit`: b = 0, c = 2R + 1 > 0, disc < 0), so elevation
+//     0 still gets the full-length march the clamp was protecting — and it is
+//     continuous with the pixel above it by construction.
+//
+//  2. Below the horizon NO atmosphere sample can continue the gradient: the
+//     march hits the planet, which is precisely what produced the near-black
+//     stripe. The continuation that is physical is AIRLIGHT. A ray depressed
+//     by theta ends on ground at distance ~ h/theta, and what comes back is
+//     the ground's own colour attenuated by exp(-d/D) with scattered air
+//     making up the rest — written in the one variable a sky shader has:
+//
+//         groundWeight = exp(-k / theta)
+//
+//     Pure haze at the horizon (theta -> 0), the ground's own colour a
+//     fraction of a degree down. The `smoothstep(0, 0.35)` this replaces
+//     spread that transition over 20 degrees, so the first degree — the ONLY
+//     part a finite ground plane ever leaves visible — was 99.6 % haze, i.e.
+//     one constant. `groundColor.w` (`Params.groundBlend`) scales k: it has
+//     always been DOCUMENTED as exactly this control ("how fast rays below the
+//     horizon fade to ground colour") and was read by neither atmosphere.
+//
+// Same march, same dome bake, no extra tap: zero per-frame cost.
+//
+// NOT a mirror of the ray. Mirroring is the other obvious way to "un-flatten"
+// the band, and on this sky it is backwards: nishita DARKENS toward the
+// horizon here (the exterior hero falls 182 -> 164 over the 13 px above it),
+// so a mirrored band climbs back to ~197 and meets the 125 lawn with a
+// ~72-code step — three times the seam it set out to remove.
 inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u) {
     float intensity = max(0.0f, u.atmosphereParams.y);
     if (rayDir.y >= 0.0f) {
         return nishitaScatter(rayDir, u.sunDir.xyz, intensity);
     }
-    float3 grazing = normalize(float3(rayDir.x, 0.004f, rayDir.z));
+    // The horizontal component, guarded: at the NADIR (0, -1, 0) — which the full-sphere
+    // dome bake does sample — x and z are both zero and `normalize` of a zero vector is NaN.
+    // The old clamp could not hit this (its y was 0.004, never a zero vector); a NaN here
+    // would poison the dome texel and, through it, the IBL convolution. The fallback
+    // direction is arbitrary because at the nadir the ground weight is ~1 anyway.
+    float2 hxz = float2(rayDir.x, rayDir.z);
+    float hlen = length(hxz);
+    float3 grazing = (hlen > 1e-5f) ? float3(hxz.x / hlen, 0.0f, hxz.y / hlen)
+                                    : float3(1.0f, 0.0f, 0.0f);
     float3 horizonHaze = nishitaScatter(grazing, u.sunDir.xyz, intensity);
-    float depth = smoothstep(0.0f, 0.35f, -rayDir.y);   // 0 at horizon → 1 steep down
-    return mix(horizonHaze, u.groundColor.xyz, depth);
+    // Airlight scale in radians of depression: the 1/e point of the haze->ground
+    // handover. 0.0035 rad (~0.2 deg) is one eye-height in ~3 km of haze, which is
+    // where a real horizon hands over.
+    const float kAirlightTheta = 0.0035f;
+    float theta = max(-rayDir.y, 1e-6f);
+    float ground = exp(-(kAirlightTheta / max(u.groundColor.w, 0.05f)) / theta);
+    return mix(horizonHaze, u.groundColor.xyz, ground);
 }
 
 // Sun disk — a soft circular hotspot anchored to the sun's 3D direction.
