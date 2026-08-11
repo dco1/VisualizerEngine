@@ -3055,6 +3055,37 @@ public final class IlluminatoramaRenderer {
     /// the hang-guard. Still bounded so a pathological scene auto-disables rather
     /// than stalling the first BLAS build. Only consulted on the glass-only path.
     private static let rtMaxTrianglesForGlassOnlyRT: Int = 1_200_000
+    /// Mesh-GROUP cap for the GLASS-ONLY TLAS — the exact asymmetry the triangle caps
+    /// above already encode (150 k live vs 1.2 M glass-only), applied to the other axis.
+    ///
+    /// **Why it had to move.** 128 is a *live-RT* number: there, a topology change can
+    /// mean a full rebuild every frame in the tick loop, so the cap has to keep one
+    /// rebuild well inside a frame. The glass-only path rebuilds only on a real topology
+    /// change (the thrash guard below still catches per-frame churn) and hosts run it in a
+    /// settled/photo lane, so it can carry far more. Meanwhile 128 is *small* for real
+    /// content: an architectural document's group count is "how many distinct geometries",
+    /// which scales with rooms and cabinetry — one group per wall edge, per room floor,
+    /// per millwork sub-part. A 2-storey furnished house measures 209 and every pane in it
+    /// silently dropped to the flat Fresnel fallback, scene-wide, on exactly the class of
+    /// scene AAA glass exists for.
+    ///
+    /// **512 is measured, not guessed** (Daydream `DocumentRTCensusTests
+    /// .testRTGlassBuildCostVersusMeshGroupCount`: a real document padded with N extra
+    /// distinct 12-triangle groups, so group count is the only variable moving):
+    ///
+    ///     groups │  209    309    509    909   1509
+    ///     rebuild│ 21.2   29.1   34.5   46.2   60.2  ms
+    ///     steady │ 22.4   21.6   23.7   29.1   30.5  ms
+    ///
+    /// **There is no cliff on this axis** — the rebuild frame is linear at ≈0.030 ms per
+    /// group out to 3× this cap, so the failure mode a cap must prevent (a first build that
+    /// never returns) is a triangle/instance phenomenon, not a group one. At 512 the
+    /// worst-case rebuild frame is ~34 ms: a hitch in a lane that has no vsync budget, and
+    /// nowhere near the seconds-to-minutes stall the guard exists for. The cap stays finite
+    /// so a pathological scene still auto-disables rather than degrading unboundedly.
+    ///
+    /// The live-RT path keeps 128, untouched — Visualizer's live-RT scenes are unaffected.
+    private static let rtMaxMeshGroupsForGlassOnlyRT: Int = 512
 
     /// Surface-cache (P1c) caps for the TLAS path. The cache allocates one
     /// per-triangle micro-card over the INSTANCE-EXPANDED soup (count =
@@ -6210,13 +6241,20 @@ public final class IlluminatoramaRenderer {
         // strict cap and its windows silently drop to the flat fallback.
         let triCap = extractedRT ? Self.rtMaxTrianglesForLiveRT
                                  : Self.rtMaxTrianglesForGlassOnlyRT
+        // …and the same asymmetry on the mesh-GROUP axis. A furnished architectural
+        // document carries 200+ distinct geometries (one group per wall edge / room floor /
+        // millwork sub-part), so the live-RT 128 turned AAA glass off scene-wide on every
+        // real document. See `rtMaxMeshGroupsForGlassOnlyRT` for the measured ladder.
+        let groupCap = rtMeshGroupCapOverride
+            ?? (extractedRT ? Self.rtMaxMeshGroupsForLiveRT
+                            : Self.rtMaxMeshGroupsForGlassOnlyRT)
         // O(1) caps first, triangle sum only if they pass. This ordering matters
         // now that the guard re-evaluates every frame instead of latching: a
         // scene that busts the mesh-group cap (thousands of groups) would
         // otherwise pay a full dictionary-lookup loop every frame purely to
         // re-confirm it is still too heavy.
         var overCap = instances.count + glassInstCount > Self.rtMaxInstancesForLiveRT
-            || meshGroups.count > (rtMeshGroupCapOverride ?? Self.rtMaxMeshGroupsForLiveRT)
+            || meshGroups.count > groupCap
         var estTriangles = -1                     // −1 = not computed (cap already busted)
         if !overCap {
             estTriangles = 0
@@ -6234,7 +6272,8 @@ public final class IlluminatoramaRenderer {
                 scene too heavy for live-loop RT \
                 (\(instances.count) instances, \(meshGroups.count) mesh groups, \
                 \(tris) tris; caps \
-                \(Self.rtMaxInstancesForLiveRT)/\(Self.rtMaxMeshGroupsForLiveRT)/\(triCap))
+                \(Self.rtMaxInstancesForLiveRT)/\(groupCap)/\(triCap) — \
+                \(extractedRT ? "live-RT" : "glass-only") path)
                 """)
             return
         }
