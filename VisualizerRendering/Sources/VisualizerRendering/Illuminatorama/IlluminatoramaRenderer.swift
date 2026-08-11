@@ -2834,6 +2834,15 @@ public final class IlluminatoramaRenderer {
     /// Added 2026-08-11 for the ~231 MB-per-scene-rebuild leak (docs/MEMORY_FOOTPRINT.md).
     public var registeredMeshKeyDescriptions: [String] { meshes.keys.map { String(describing: $0) } }
 
+    /// TEST-OBSERVABLE: how many per-frame GPU repack tasks are live.
+    ///
+    /// A repack task is the heavier half of a compute-fed mesh — it retains the caller's position,
+    /// normal, UV and colour buffers plus the renderer's own interleaved vertex and previous-position
+    /// buffers. `registeredMeshCount` can look healthy while these accumulate, because they are
+    /// evicted on a separate line of `removeMesh`. Exposed alongside the mesh count so a host can
+    /// tell "the mesh table is balanced" from "the memory behind it is".
+    public var gpuRepackTaskCount: Int { gpuRepackTasks.count }
+
     /// Drop every cached entry whose mesh is no longer registered, releasing its BLAS, its
     /// normals and — the point of the whole exercise — the mesh itself, so the address it
     /// occupied becomes reusable only once nothing can look it up any more.
