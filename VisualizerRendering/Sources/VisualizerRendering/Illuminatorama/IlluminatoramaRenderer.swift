@@ -1350,6 +1350,31 @@ public final class IlluminatoramaRenderer {
     /// to make and it has not been made; until it is, the corrected arm is reachable for
     /// measurement only (set ``dfgUseIBLGeometryRemap`` directly, or `VIZ_ILLUMI_DFG_IBL_K=1`),
     /// which is what lets one binary render both arms side by side.
+    ///
+    /// **Both host apps have now measured an exterior, and they agree on the verdict while
+    /// disagreeing on the mechanism — which is worth knowing before anyone re-opens this.**
+    /// Visualizer's `meadow` (2026-08-09): **+9.74 % whole-frame**, visibly worse, read as
+    /// veiling glare, and attributed to GRASS as the maximum-exposure case. Daydream Home's
+    /// curb hero with 57 636 XPBD blades and four trees (2026-08-11, arms in separate
+    /// processes because the LUT is baked once in `init`; each arm re-shot the same rig for
+    /// its own drift floor):
+    ///
+    /// | region | legacy | IBL `k` | Δ | that arm's drift |
+    /// |---|---|---|---|---|
+    /// | whole frame | 140.111 | 141.454 | **+0.96 %** | 0.017 |
+    /// | lawn, sunlit | 146.599 | 146.957 | +0.24 % | **±0.57 — inside it** |
+    /// | stucco wall | 142.581 | 142.945 | +0.26 % | ±0.16 |
+    /// | driveway | 139.376 | 139.600 | +0.16 % | ±0.03 |
+    /// | **tree canopy** | 99.289 | **104.267** | **+5.01 %** | ±0.01 |
+    /// | sky | 198.964 | 198.964 | **+0.000** | ±0.01 |
+    ///
+    /// So the whole-frame cost is an order of magnitude smaller here (0.96 % vs 9.74 %), the
+    /// LAWN does not move beyond its own noise, and the sky — correctly — does not move at
+    /// all. **The mover is foliage.** A leaf card is a big rough dielectric, which is exactly
+    /// what this remap lifts, and looked at 2× the crown picks up a cool blue-grey sky sheen
+    /// and loses its green. That IS Visualizer's veiling glare, arriving through the trees
+    /// instead of the grass. **Recommendation unchanged: do not flip it.** Published
+    /// `s16-dfg-exterior`, `s16-dfg-canopy`.
     public nonisolated static let dfgIBLGeometryRemapDefault = false
 
     /// The baked split-sum DFG LUT (RG16F, `x` = F0 scale, `y` = bias, keyed on
