@@ -335,6 +335,20 @@ struct FrameUniforms {
     // ONE new 16-byte cluster (stride 1248 → 1264); mirror of
     // IlluminatoramaFrameUniforms.bloomParams.
     float4   bloomParams;
+    // ── Diagram look (flat shading + outlines) ───────────────────────────────
+    // diagramParams: x = mix (0 = OFF, an exact no-op — the tonemap branch is
+    // gated on it, so non-opting scenes are byte-for-byte unchanged), y = light
+    // wrap (0 = perfectly flat fills, 1 = full sky/ground hemisphere term),
+    // z = outline strength (0 = no line work), w = orthographic flag (0/1 — tells
+    // the view-vector derivations the eye is at infinity; not a look control).
+    // diagramOutline: xyz = outline colour (linear RGB), w reserved.
+    // diagramEdge: x = depth sensitivity, y = normal sensitivity, z = line
+    // thickness in output pixels, w reserved.
+    // THREE new 16-byte clusters (stride 1264 → 1312); mirror of
+    // IlluminatoramaFrameUniforms.
+    float4   diagramParams;
+    float4   diagramOutline;
+    float4   diagramEdge;
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift
@@ -479,7 +493,41 @@ struct Instance {
     // resolvable band while the normal keeps its fine one; both read the same baked
     // tile, so this costs no memory. 0 falls back to `detailNormalUVScale`.
     float    detailOcclusionUVScale;
+    // ── S2.5 half 2 — per-PATTERN-CELL value jitter (the coherent categories' de-repeat) ──
+    // NEW 16-byte cluster (offsets 256-271): stride 256 -> 272.
+    //
+    // The hex blend above is invalid for a COHERENT pattern (a tile grid, a plank run):
+    // offsetting the UV superimposes misaligned copies, so those materials run with
+    // antiTilingScale == 0 and had no de-repeat at all. What they actually want is what a
+    // real tile/plank floor has — batch-to-batch VALUE variation from unit to unit — and
+    // that needs no UV displacement and no extra texture tap:
+    //
+    //     cell = floor(uv * patternCells)
+    //
+    // `uv` keeps counting across the whole surface (only the atlas LOOKUP wraps), so the
+    // cell index is unique per physical tile/plank over the entire floor even though the
+    // texture repeats every UV unit. Hashing it to a +/- `patternJitter` tone multiplier
+    // therefore breaks the macro repeat while leaving the grout grid, the plank seams and
+    // the grain direction exactly where the bake put them.
+    //
+    // NOT per UV TILE: a UV tile is ~2 m and holds many physical units, so a per-tile hash
+    // paints a 2 m checkerboard with hard seams — one visible grid traded for a coarser,
+    // uglier one.
+    //
+    // patternCells: pattern cells per macro UV tile, per axis. A component of 0 means "no
+    //   subdivision on this axis" and yields a constant cell index there — which is what a
+    //   plank run wants (one tone down the whole board, varying board to board).
+    // patternJitter: half-amplitude of the multiplicative tone jitter (0.05 = +/-5 %).
+    //   0 (the default, and every scene that never opts in) is an exact no-op.
+    float2   patternCells;
+    float    patternJitter;
+    float    _padPattern0;
 };
+
+// The Swift mirror (`IlluminatoramaInstance._assertStride240`) has always asserted this
+// side of the contract; this is the other side, and it costs a compile. A Swift field
+// added without its Metal twin used to be caught only by a wrong-looking render.
+static_assert(sizeof(Instance) == 272, "Instance must match IlluminatoramaInstance (272 bytes)");
 
 struct Vertex {
     float3 position;

@@ -265,6 +265,112 @@ vertex TonemapVSOut illumi_tonemap_vs(uint vid [[vertex_id]]) {
     return o;
 }
 
+// ── Diagram look: flat fills + screen-space outlines ─────────────────────────
+//
+// Turns the G-buffer into an architectural drawing: flat albedo fills shaded only
+// by orientation, with ink lines along depth and normal discontinuities. It reads
+// the SAME three G-buffer textures the debug-view readouts already bind (albedo,
+// oct-normal, depth), so the whole look costs one branch in this fragment — no
+// extra pass, no extra attachment, no second forward path.
+//
+// Two deliberate choices, both about what a drawing is NOT:
+//
+//   • The fill ignores every light in the scene. A drawing's tone comes from which
+//     way a face points, not from where a lamp is — so a fixed "paper light"
+//     direction gives the three face families of an axonometric (top / left-facing
+//     / right-facing) three distinct tones that hold still as the sun moves.
+//
+//   • Edges are found from the SECOND difference of linear view depth, not the
+//     first. A first difference is large wherever a surface is merely oblique, so
+//     a floor seen at a grazing angle inks over solid black; the second difference
+//     is ~0 across any flat plane at ANY slope and spikes only where the surface
+//     actually breaks — which is the definition of the line we want.
+//
+// Depth is linearised through `frame.invProjection`, so this is correct under both
+// projections; nothing here assumes a perspective frustum.
+struct IllumiDiagramTap { float z; float3 n; };
+
+/// One cross-tap: linear view-space depth (positive metres from the eye plane) plus
+/// the world normal, at a pixel offset from `uv`. Sky taps read back at ~zFar, which
+/// is what makes the building's silhouette against open sky the strongest edge in
+/// the frame — no separate sky mask needed.
+static inline IllumiDiagramTap illumiDiagramTap(float2 uv, float2 offsetPx,
+                                                float2 gSize, float2 dSize,
+                                                constant FrameUniforms& frame,
+                                                texture2d<half, access::read> gNormalRgh,
+                                                depth2d<float,  access::read> gDepth)
+{
+    float2 tuv = clamp(uv + offsetPx / dSize, 0.0, 0.99999);
+    float  d   = gDepth.read(uint2(tuv * dSize));
+    float2 ndc = float2(tuv.x * 2.0 - 1.0, 1.0 - tuv.y * 2.0);
+    IllumiDiagramTap t;
+    t.z = abs(viewPosFromDepth(ndc, d, frame.invProjection).z);
+    t.n = octDecode(float2(gNormalRgh.read(uint2(tuv * gSize)).rg));
+    return t;
+}
+
+static inline float3 illumiDiagramColor(float2 uv,
+                                        constant FrameUniforms& frame,
+                                        texture2d<half, access::read> gAlbedoMet,
+                                        texture2d<half, access::read> gNormalRgh,
+                                        depth2d<float,  access::read> gDepth)
+{
+    float2 gSize = float2(gAlbedoMet.get_width(), gAlbedoMet.get_height());
+    float2 dSize = float2(gDepth.get_width(), gDepth.get_height());
+
+    // Sampling the depth texture at a pixel OFFSET means working in its texel grid;
+    // `thickness` is specified in output pixels, which is the same grid here (the
+    // G-buffer is at internal resolution and this fragment runs per output pixel).
+    float thick = max(0.25, frame.diagramEdge.z);
+
+    IllumiDiagramTap c = illumiDiagramTap(uv, float2( 0.0,   0.0),   gSize, dSize, frame, gNormalRgh, gDepth);
+    IllumiDiagramTap l = illumiDiagramTap(uv, float2(-thick, 0.0),   gSize, dSize, frame, gNormalRgh, gDepth);
+    IllumiDiagramTap r = illumiDiagramTap(uv, float2( thick, 0.0),   gSize, dSize, frame, gNormalRgh, gDepth);
+    IllumiDiagramTap u = illumiDiagramTap(uv, float2( 0.0,  -thick), gSize, dSize, frame, gNormalRgh, gDepth);
+    IllumiDiagramTap d = illumiDiagramTap(uv, float2( 0.0,   thick), gSize, dSize, frame, gNormalRgh, gDepth);
+
+    // ── Fill ────────────────────────────────────────────────────────────────
+    uint2  gp     = uint2(clamp(uv, 0.0, 0.99999) * gSize);
+    float3 albedo = float3(gAlbedoMet.read(gp).rgb);
+    // A fixed studio direction, well off-axis in all three components so no two
+    // face families of an axonometric box land on the same tone.
+    const float3 paperLight = normalize(float3(0.36, 0.86, 0.38));
+    float  key   = 0.5 + 0.5 * dot(c.n, paperLight);
+    float  wrap  = clamp(frame.diagramParams.y, 0.0, 1.0);
+    // wrap = 0 ⇒ `shade` is exactly 1.0 ⇒ perfectly flat fills.
+    float  shade = mix(1.0, mix(0.62, 1.0, key), wrap);
+    float3 fill  = albedo * shade;
+
+    // Open sky is PAPER — the drawing sits on a white page, not under a gradient.
+    // Depth 1.0 is the far plane in this [0,1] convention (near = 0), so a pixel
+    // nothing was rasterised into reads back at the clear value.
+    float  dC    = gDepth.read(uint2(clamp(uv, 0.0, 0.99999) * dSize));
+    const float3 paper = float3(1.0);
+    float3 base  = (dC >= 0.99999) ? paper : fill;
+
+    // ── Ink ─────────────────────────────────────────────────────────────────
+    // Second difference of linear depth, normalised by distance so one threshold
+    // works at every zoom (a 2 cm step reads as an edge up close and, correctly,
+    // does not from across the yard).
+    float depthSens  = max(1e-3, frame.diagramEdge.x);
+    float normalSens = max(1e-3, frame.diagramEdge.y);
+    float invZ       = 1.0 / max(c.z, 0.05);
+    float ddx        = abs(l.z + r.z - 2.0 * c.z) * invZ;
+    float ddy        = abs(u.z + d.z - 2.0 * c.z) * invZ;
+    float depthEdge  = smoothstep(0.0, 0.006 / depthSens, max(ddx, ddy));
+
+    // Normal discontinuity — the only thing that can see the crease where two
+    // faces of one object meet at the same depth (a cabinet's corner, a wall
+    // returning). Smooth curvature stays under the threshold and does not ink.
+    float nDiff = max(max(1.0 - dot(c.n, l.n), 1.0 - dot(c.n, r.n)),
+                      max(1.0 - dot(c.n, u.n), 1.0 - dot(c.n, d.n)));
+    float normalEdge = smoothstep(0.06 / normalSens, 0.30 / normalSens, nDiff);
+
+    float  edge = max(depthEdge, normalEdge) * clamp(frame.diagramParams.z, 0.0, 1.0);
+    float3 ink  = frame.diagramOutline.rgb;
+    return mix(base, ink, edge);
+}
+
 fragment float4 illumi_tonemap_fs(
     TonemapVSOut                    in       [[stage_in]],
     texture2d<half, access::sample> inHDR    [[texture(0)]],
@@ -362,6 +468,19 @@ fragment float4 illumi_tonemap_fs(
             }
             default: break;
         }
+    }
+
+    // ── Diagram look ─────────────────────────────────────────────────────────
+    // At FULL strength the drawing replaces the image outright, so return here and
+    // skip the entire tone chain below — exposure, ACES, grade, grain, LUT and the
+    // lens FX all operate on a photograph this mode isn't making. That is the common
+    // case and it makes the mode cheaper than a photoreal frame rather than dearer.
+    //
+    // Below full strength the drawing has to cross-fade against the finished image,
+    // which does not exist yet — so that case falls through and blends at the end.
+    // `mix == 0` (every scene's default) enters neither branch: exact no-op.
+    if (frame.diagramParams.x >= 0.999) {
+        return float4(illumiDiagramColor(in.uv, frame, gAlbedoMet, gNormalRgh, gDepth), 1.0);
     }
 
     // `in.uv` is the output pixel centre in normalised coords, equivalent to
@@ -740,6 +859,15 @@ fragment float4 illumi_tonemap_fs(
         float3 graded = filmLUT.sample(lutSampler, uvw).rgb;
         mapped = mix(mapped, graded, frame.filmLUTStrength);
         mapped = saturate(mapped);
+    }
+
+    // ── Diagram cross-fade ───────────────────────────────────────────────────
+    // Partial strengths only (full strength returned above, before the tone chain).
+    // The blend is against the FINISHED image, so dragging the dial reads as the
+    // photograph resolving into a drawing rather than as two half-graded images.
+    if (frame.diagramParams.x > 0.0) {
+        float3 diagram = illumiDiagramColor(in.uv, frame, gAlbedoMet, gNormalRgh, gDepth);
+        mapped = mix(mapped, diagram, saturate(frame.diagramParams.x));
     }
 
     // Write LINEAR. The output attachment is `.bgra8Unorm_srgb`, so the GPU

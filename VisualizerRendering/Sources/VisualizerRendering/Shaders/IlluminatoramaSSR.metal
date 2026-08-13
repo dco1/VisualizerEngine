@@ -66,7 +66,15 @@ kernel void illumi_ssr_gather(
     float4x4 invProj = frame.invProjection;
     float3 Pview = viewPosFromDepth(ndc, depth, invProj);
     float3 Nview = normalize((frame.view * float4(Nworld, 0.0)).xyz);
-    float3 Vview = normalize(-Pview);
+    // Surface → eye, in view space. Under perspective the eye sits at the view-space
+    // origin, so that is just `−Pview`. Under a PARALLEL projection the eye is at
+    // infinity along +Z and every pixel shares one view direction — using `−Pview`
+    // there would rotate the reflection vector across the frame and slide reflections
+    // over flat surfaces as the camera pans. (Same correction as the lighting kernel's
+    // world-space V; both read the one `diagramParams.w` ortho flag.)
+    float3 Vview = (frame.diagramParams.w > 0.5)
+                 ? float3(0.0, 0.0, 1.0)
+                 : normalize(-Pview);
     float3 Rview = reflect(-Vview, Nview);
     if (Rview.z >= 0.0) {
         outSSRRaw.write(half4(0.0h), gid);

@@ -368,6 +368,41 @@ public final class IlluminatoramaRenderer {
     public var vignetteExtent: Float = 0.55
     public var filmGrainStrength: Float = 0
     public var filmGrainSize: Float = 1.5
+
+    // ── Diagram look ─────────────────────────────────────────────────────────
+    /// Cross-fade into the architectural-drawing look, 0…1. **0 is OFF and an exact
+    /// no-op**: the tonemap branch never runs, so every existing scene renders
+    /// byte-identically. 1 replaces the shaded composite with flat, hemisphere-wrapped
+    /// G-buffer albedo plus screen-space outlines.
+    ///
+    /// This is a POST pass over the G-buffer, not a second forward path — it costs one
+    /// extra branch in a fragment shader that already has albedo, normal and depth
+    /// bound. The passes it makes pointless (bloom, DoF, grain, film LUT) are not
+    /// disabled here: a host that wants the cheap version turns them off itself, and
+    /// leaving them independent keeps this one knob honest about what it does.
+    ///
+    /// Pair it with `camera.projection = .orthographic(...)` for a true axonometric.
+    /// The two are deliberately separate — a flat-shaded perspective and a photoreal
+    /// axonometric are both legitimate, and neither implies the other.
+    public var diagramMix: Float = 0
+    /// How much the flat fills vary with surface orientation, 0…1. 0 = perfectly flat
+    /// (a white box is one white silhouette and only the outlines separate its faces);
+    /// 1 = a full sky/ground hemisphere term. ~0.35 keeps planes legible without the
+    /// image drifting back toward a render.
+    public var diagramWrap: Float = 0.35
+    /// Outline strength, 0…1. 0 = fills only, no line work.
+    public var diagramOutlineStrength: Float = 1.0
+    /// Outline colour (linear RGB). Near-black by default, as an ink line would be.
+    public var diagramOutlineColor: SIMD3<Float> = SIMD3(0.10, 0.11, 0.13)
+    /// How readily a DEPTH step becomes a line. Higher = more lines (silhouettes and
+    /// near-coplanar overlaps both draw); lower = silhouettes only.
+    public var diagramEdgeDepthSensitivity: Float = 1.0
+    /// How readily a NORMAL change becomes a line. This is what draws the crease where
+    /// two faces of the same object meet — a depth-only detector cannot see it.
+    public var diagramEdgeNormalSensitivity: Float = 1.0
+    /// Line thickness in OUTPUT pixels. The detector samples a cross at this radius, so
+    /// non-integer values are legitimate; much above ~2 reads as a smudge, not a pen.
+    public var diagramEdgeThickness: Float = 1.0
     /// Film **halation**: the wide, warm halo real film wears around blown highlights.
     /// Light punches through the emulsion, reflects off the back of the base and
     /// re-exposes it from behind; the anti-halation backing lets red survive that
@@ -8444,17 +8479,20 @@ public final class IlluminatoramaRenderer {
         cascadeSplitsView = SIMD4(splitsPos[1], splitsPos[2], splitsPos[3], 0)
 
         let invView = camera.viewMatrix.inverse
-        let halfFovY = camera.fovYRadians * 0.5
-        let tanHalfFovY = tan(halfFovY)
-        let aspect = camera.aspect
 
         let toLight = simd_normalize(directionalLightDirection)
 
         for c in 0..<count {
             let n = splitsPos[c]
             let f = splitsPos[c + 1]
-            let hHN = n * tanHalfFovY, hWN = hHN * aspect
-            let hHF = f * tanHalfFovY, hWF = hHF * aspect
+            // Frustum extents at each split plane. Asking the camera keeps this correct
+            // for BOTH projections: under perspective the extents open out with
+            // distance, under orthographic they are constant (a box, not a pyramid), and
+            // a hardcoded `d · tan(fov/2)` here would silently fit the cascades to a cone
+            // the ortho camera does not have — shadows would land in the wrong places
+            // rather than fail loudly.
+            let (hHN, hWN) = camera.halfExtents(atViewDistance: n)
+            let (hHF, hWF) = camera.halfExtents(atViewDistance: f)
             // View-space corners (Metal/right-handed: looking down -Z), generated
             // procedurally from the index bits (b0 = ±x, b1 = ±y, b2 = near/far)
             // — same 8 corners the old literal arrays held, no allocation.
@@ -9211,8 +9249,17 @@ public final class IlluminatoramaRenderer {
         // One pixel's angular size, derived exactly as the primary branch derives it
         // (tan(fovY/2) = 1/P[1][1], over the render height) so a star is the same size
         // seen directly and seen through a pane.
-        u.nightPixAngle = (2.0 / max(camera.projectionMatrix[1][1], 1e-6))
-                          / Float(max(hdrCompositeTexture.height, 1))
+        //
+        // Perspective only. Under a parallel projection P[1][1] is 1/halfHeight, so
+        // `2/P[1][1]` is a LENGTH in metres rather than an angle — feeding that here
+        // would scale every star by the frame's world size (a 40 m axonometric frame
+        // would draw stars ~100× oversized). A parallel camera has no per-pixel angle
+        // to speak of, so fall back to the stored `fovYRadians`: unused for framing in
+        // that mode, but still the honest "what lens is this roughly" value.
+        let pixExtent = camera.isOrthographic
+            ? 2 * tan(camera.fovYRadians * 0.5)
+            : 2.0 / max(camera.projectionMatrix[1][1], 1e-6)
+        u.nightPixAngle = pixExtent / Float(max(hdrCompositeTexture.height, 1))
         memcpy(glassRTUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaGlassRTUniforms>.stride)
 
         // Screen-space cheap glass (mode 2) samples the scene BEHIND the pane: copy
@@ -11121,10 +11168,12 @@ public final class IlluminatoramaRenderer {
         // Issue #65 — screen-space velocity at texture(3) for motion blur. Always
         // bound; gated by `motionBlurStrength` (0 = the tonemap skips the gather).
         enc.setFragmentTexture(velocityTexture, index: 3)
-        // Issue #65 — G-buffer channels at texture(4..6) for the Debug-view
-        // readouts (albedo / normal / roughness / metalness / depth). Always
-        // bound; the fragment only reads them when `debugTerm >= 10` (the
-        // G-buffer cases), so a default `.normal` render never samples them.
+        // Issue #65 — G-buffer channels at texture(4..6): albedo / normal /
+        // roughness / metalness / depth. Always bound. TWO consumers now read
+        // them — the Debug-view readouts (`debugTerm >= 10`) and the diagram
+        // look (`diagramParams.x > 0`), which builds its flat fills and its
+        // outlines out of exactly these three. Both are gated on their own
+        // uniform, so a default photoreal render still samples neither.
         enc.setFragmentTexture(gbufferAlbedoMet, index: 4)
         enc.setFragmentTexture(gbufferNormalRgh, index: 5)
         enc.setFragmentTexture(depthTexture, index: 6)
@@ -11450,6 +11499,22 @@ public final class IlluminatoramaRenderer {
         u.bloomParams = SIMD4(max(0, bloomSoftKnee),
                               min(max(bloomScatter, 0), 1),
                               max(0, bloomTentRadius),
+                              0)
+        // Diagram look. `mix` 0 (the default) keeps the tonemap branch unentered, so
+        // this is an exact no-op for every scene that never opts in. The `w` slot is
+        // the ORTHOGRAPHIC flag, not a look control: it is read straight off the live
+        // camera so the shaders' view-vector derivations can never disagree with the
+        // projection actually being used — a hand-set flag here would be a second
+        // source of truth for "is the eye at infinity".
+        u.diagramParams = SIMD4(min(max(diagramMix, 0), 1),
+                                min(max(diagramWrap, 0), 1),
+                                min(max(diagramOutlineStrength, 0), 1),
+                                camera.isOrthographic ? 1 : 0)
+        u.diagramOutline = SIMD4(diagramOutlineColor.x, diagramOutlineColor.y,
+                                 diagramOutlineColor.z, 0)
+        u.diagramEdge = SIMD4(max(0, diagramEdgeDepthSensitivity),
+                              max(0, diagramEdgeNormalSensitivity),
+                              max(0.25, diagramEdgeThickness),
                               0)
         // Phase 9 — film LUT strength: 0 when no LUT is bound (bypasses the shader branch).
         u.filmLUTStrength = filmLUTTexture != nil ? max(0, min(1, filmLUTStrength)) : 0

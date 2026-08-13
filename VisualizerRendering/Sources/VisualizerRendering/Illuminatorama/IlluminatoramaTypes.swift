@@ -416,6 +416,33 @@ public struct IlluminatoramaFrameUniforms {
     // ONE new 16-byte cluster (stride 1248 → 1264); mirror of the Metal
     // FrameUniforms.bloomParams.
     public var bloomParams: SIMD4<Float> = SIMD4(0.5, 0.7, 1.0, 0)
+    // ── Diagram look (flat shading + outlines) ───────────────────────────────
+    // An architectural-drawing mode: the tonemap pass REPLACES the shaded image
+    // with hemisphere-wrapped G-buffer albedo and lays screen-space outlines over
+    // it, in the same fragment that already has albedo/normal/depth bound for the
+    // debug-view readouts (no extra pass, no extra binding, no extra texture).
+    //
+    // `diagramParams`:
+    //   x = mix, 0…1. **0 is OFF and an exact no-op** — the branch never runs and
+    //       every existing scene tonemaps byte-identically. 1 is the full drawing.
+    //   y = light wrap, 0…1. 0 = perfectly flat fills (every face of a white wall
+    //       the same white, so only the outlines separate them); 1 = a full
+    //       sky/ground hemisphere term, so up-faces read lighter than side-faces.
+    //       The reference look sits around 0.35 — enough for planes to read, not
+    //       so much that it turns back into shading.
+    //   z = outline strength, 0…1. 0 = no line work.
+    //   w = orthographic flag (0/1). NOT a look control: it tells the shaders the
+    //       eye is at infinity, so the ones that derive a view vector use the
+    //       camera's constant forward instead of `eye − surface`. Set from
+    //       `camera.isOrthographic`, never by hand.
+    // `diagramOutline`: xyz = outline colour (linear RGB), w reserved.
+    // `diagramEdge`: x = depth sensitivity, y = normal sensitivity, z = line
+    //       thickness in output pixels, w reserved.
+    // THREE new 16-byte clusters (stride 1264 → 1312); mirror of the Metal
+    // FrameUniforms.
+    public var diagramParams: SIMD4<Float> = .zero
+    public var diagramOutline: SIMD4<Float> = SIMD4(0.10, 0.11, 0.13, 0)
+    public var diagramEdge: SIMD4<Float> = SIMD4(1.0, 1.0, 1.0, 0)
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20
@@ -720,6 +747,40 @@ public struct IlluminatoramaInstance {
     /// frequencies: no extra memory, one extra fetch.
     public var detailOcclusionUVScale: Float = 0
 
+    // ── S2.5 half 2 — per-PATTERN-CELL value jitter ───────────────────────────
+    // New 16-byte cluster (offsets 256-271): stride 256 → 272.
+    //
+    // The de-repeat for the COHERENT categories, which the hex blend cannot serve. A hex
+    // tap offsets the UV, which superimposes misaligned copies of a regular pattern (grout
+    // double-prints, plank grain dices), so those materials ship with `antiTilingScale = 0`
+    // and had no de-repeat at all. The right one for them is what a real tiled floor has:
+    // unit-to-unit VALUE variation.
+    //
+    // `uv` counts up across the whole surface — only the atlas LOOKUP wraps — so
+    // `floor(uv * patternCells)` is a unique index per physical tile/plank over the entire
+    // floor even though the texture repeats every UV unit. Hashing that index to a small
+    // tone multiplier breaks the macro repeat **without displacing any UV** and **without a
+    // single extra texture tap**.
+
+    /// Pattern cells per macro UV tile, per axis — e.g. a 4×4 tile grid baked into one UV
+    /// tile is `(4, 4)`; a 16-plank floor whose planks run unbroken along v is `(16, 0)`.
+    ///
+    /// A component of **0** means "no subdivision on this axis": the cell index there is
+    /// constant, so a plank keeps ONE tone down its whole length and varies board to board.
+    /// `(0, 0)` (the default) disables the effect entirely.
+    ///
+    /// It must be the pattern's real cell count and nothing else. A count of 1 would be a
+    /// per-UV-TILE hash — a ~2 m checkerboard with hard seams, i.e. one visible grid swapped
+    /// for a coarser and uglier one. Hosts take this from the generator argument that drew
+    /// the grid; deriving it a second time downstream is how the two drift apart.
+    public var patternCells: SIMD2<Float> = .zero
+    /// Half-amplitude of the per-cell multiplicative tone jitter (0.05 ⇒ ±5 %). 0 (default)
+    /// is an exact no-op, so Visualizer and any host that never opts in are byte-identical.
+    /// Real tile/plank batch variation lives around 3–6 %.
+    public var patternJitter: Float = 0
+    /// Trailing pad of the S2.5-half-2 cluster (keeps the 16-byte alignment `float4x4` needs).
+    public var _padPattern0: Float = 0
+
     public init(
         modelMatrix: simd_float4x4,
         albedo: SIMD3<Float> = SIMD3(0.8, 0.8, 0.8),
@@ -752,10 +813,10 @@ public struct IlluminatoramaInstance {
         self.normalMatrix = Self.normalMatrix(from: m)
     }
 
-    /// Compile-time guard: Swift and Metal structs must agree on 256 bytes.
+    /// Compile-time guard: Swift and Metal structs must agree on 272 bytes.
     /// If this fires, either a Swift field was added without the matching Metal
     /// field (or vice versa), or alignment changed unexpectedly.
-    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 256, "IlluminatoramaInstance stride must be 256") }()
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 272, "IlluminatoramaInstance stride must be 272") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //
@@ -1039,6 +1100,27 @@ public struct IlluminatoramaVertex {
 /// Camera state the host supplies each frame. Illuminatorama derives all
 /// matrices from this — the host doesn't need to compute view/projection.
 public struct IlluminatoramaCamera {
+    /// How the camera flattens the world onto the frame.
+    ///
+    /// `.perspective` is the shipped default and the only mode the renderer had until
+    /// the axonometric/diagram look needed a parallel projection. Under `.orthographic`
+    /// there is no vanishing point: parallel world lines stay parallel on screen, which
+    /// is what makes an isometric drawing read as a drawing rather than as a photograph
+    /// taken from far away with a long lens.
+    ///
+    /// **`fovYRadians` is ignored under `.orthographic`** — the frame is sized by
+    /// `halfHeight` in METRES instead of by an angle, so the framing no longer depends
+    /// on how far the eye is from the subject. Anything deriving a cone half-angle from
+    /// the camera must branch on this (`halfExtents(atViewDistance:)` is the one place
+    /// that does; the shadow-cascade fitter reads it).
+    public enum Projection: Equatable, Sendable {
+        case perspective
+        /// Parallel projection framing `halfHeight` metres above and below the view
+        /// centre. Frame half-width follows from `aspect`, exactly as it does for the
+        /// perspective case.
+        case orthographic(halfHeight: Float)
+    }
+
     public var position: SIMD3<Float>
     public var target: SIMD3<Float>
     public var up: SIMD3<Float>
@@ -1046,6 +1128,8 @@ public struct IlluminatoramaCamera {
     public var aspect: Float
     public var zNear: Float
     public var zFar: Float
+    /// Perspective (default) or parallel. See `Projection`.
+    public var projection: Projection
 
     public init(
         position: SIMD3<Float>,
@@ -1054,7 +1138,8 @@ public struct IlluminatoramaCamera {
         fovYRadians: Float = .pi / 3,
         aspect: Float = 16.0 / 9.0,
         zNear: Float = 0.1,
-        zFar: Float = 200
+        zFar: Float = 200,
+        projection: Projection = .perspective
     ) {
         self.position = position
         self.target = target
@@ -1063,6 +1148,31 @@ public struct IlluminatoramaCamera {
         self.aspect = aspect
         self.zNear = zNear
         self.zFar = zFar
+        self.projection = projection
+    }
+
+    /// True when this camera projects in parallel. Read it rather than pattern-matching
+    /// at call sites, so a future third projection doesn't have to be found by grep.
+    public var isOrthographic: Bool {
+        if case .orthographic = projection { return true }
+        return false
+    }
+
+    /// Half-height and half-width of the view frustum at view-space distance `d` — the
+    /// ONE place the two projections' framing differs, so anything that needs frustum
+    /// extents (cascade fitting, culling) gets both modes right by construction rather
+    /// than by each call site remembering to branch.
+    ///
+    /// Perspective: extents grow linearly with distance (`d · tan(fov/2)`).
+    /// Orthographic: extents are CONSTANT — that is the whole definition of parallel.
+    public func halfExtents(atViewDistance d: Float) -> (height: Float, width: Float) {
+        switch projection {
+        case .perspective:
+            let h = d * tan(fovYRadians * 0.5)
+            return (h, h * aspect)
+        case .orthographic(let halfHeight):
+            return (halfHeight, halfHeight * aspect)
+        }
     }
 
     public var viewMatrix: simd_float4x4 {
@@ -1080,16 +1190,33 @@ public struct IlluminatoramaCamera {
     }
 
     public var projectionMatrix: simd_float4x4 {
-        // Right-handed perspective with depth range [0, 1] (Metal-conventional).
-        let yScale = 1 / tan(fovYRadians * 0.5)
-        let xScale = yScale / aspect
         let zRange = zFar - zNear
-        return simd_float4x4(
-            SIMD4(xScale, 0, 0, 0),
-            SIMD4(0, yScale, 0, 0),
-            SIMD4(0, 0, -zFar / zRange, -1),
-            SIMD4(0, 0, -(zFar * zNear) / zRange, 0)
-        )
+        switch projection {
+        case .perspective:
+            // Right-handed perspective with depth range [0, 1] (Metal-conventional).
+            let yScale = 1 / tan(fovYRadians * 0.5)
+            let xScale = yScale / aspect
+            return simd_float4x4(
+                SIMD4(xScale, 0, 0, 0),
+                SIMD4(0, yScale, 0, 0),
+                SIMD4(0, 0, -zFar / zRange, -1),
+                SIMD4(0, 0, -(zFar * zNear) / zRange, 0)
+            )
+        case .orthographic(let halfHeight):
+            // Right-handed parallel projection, same [0, 1] depth convention. Note the
+            // w row is (0,0,0,1), not (0,0,-1,0): clip.w is a constant 1, so the
+            // perspective divide is a no-op and screen size stops depending on depth.
+            // Centred on the view axis, so left/right and bottom/top are symmetric and
+            // the general off-centre ortho form collapses to two scales + a depth bias.
+            let hH = max(halfHeight, 1e-4)
+            let hW = max(hH * aspect, 1e-4)
+            return simd_float4x4(
+                SIMD4(1 / hW, 0, 0, 0),
+                SIMD4(0, 1 / hH, 0, 0),
+                SIMD4(0, 0, -1 / zRange, 0),
+                SIMD4(0, 0, -zNear / zRange, 1)
+            )
+        }
     }
 }
 

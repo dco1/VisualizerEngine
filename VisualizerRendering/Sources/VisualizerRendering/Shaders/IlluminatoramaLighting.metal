@@ -621,7 +621,15 @@ kernel void illumi_lighting(
     uint   fragLayer = gLayer.read(gid).r;
 
     float3 worldPos = worldPosFromDepth(ndc, depth, frame.invViewProjection);
-    float3 V = normalize(frame.cameraWorldPos - worldPos);
+    // Surface → eye. Under a PARALLEL projection the eye is not a point: every
+    // pixel is viewed along the same direction, so `cameraWorldPos − worldPos`
+    // (which fans out from a finite eye) would put a fake radial gradient in
+    // every view-dependent term — specular highlights sliding across a flat wall
+    // as if lit by a nearby lamp. The camera's forward is the constant view axis;
+    // `invView`'s third column is −forward in this right-handed convention.
+    float3 V = (frame.diagramParams.w > 0.5)
+             ? normalize(frame.invView[2].xyz)
+             : normalize(frame.cameraWorldPos - worldPos);
 
     // Issue #65 — screen-space SSS. SSS-flagged pixels carry ≈0.95h in
     // normalRoughness.w (vertex-colour alpha ∈ [0.90,0.98]; above the foliage 0.0
