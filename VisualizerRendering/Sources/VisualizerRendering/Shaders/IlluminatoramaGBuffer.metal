@@ -1022,7 +1022,30 @@ fragment GBufferOut illumi_fs(
     // plastic. Gated by the foliage flag (w < 0.5 ⇒ foliage) → exact no-op for
     // every non-foliage surface and every scene that ships vertex alpha 1.
     float matRough = (foliageFlag < 0.5h) ? min(roughness, 0.46) : roughness;
-    o.normalRoughness = half4(half(oct.x), half(oct.y), half(matRough), foliageFlag);
+    // Phase 7c — grain anisotropy, and the reason it had never done anything on this
+    // path. The deferred lighting pass reads `(w - 1)` as the anisotropy amount when
+    // `w > 1.001h` (IlluminatoramaLighting.metal), and the superquadric impostor path
+    // has written it that way since Phase 7c shipped — but THIS shader, which every
+    // ordinary mesh goes through, only ever wrote the class tag. So `inst.anisotropy`
+    // reached the instance buffer and stopped: every wood floor and brushed-metal
+    // surface in a deferred scene rendered with a round, isotropic highlight.
+    //
+    // The tag and the anisotropy share one channel, which is why this is a branch and
+    // not an add. `foliageFlag` is one of four DISCRETE class tags (0.0 foliage / 0.55
+    // plush / 0.75 casing / 1.0 ordinary opaque) and every consumer reads them as bands
+    // bounded ABOVE (< 0.5h, (0.5,0.6), (0.6,0.9), (0.90,0.99)) — so adding anisotropy
+    // to a tagged pixel would silently reclassify it into the next band up. Only the
+    // ordinary-opaque tag carries it; a leaf or a plush surface keeps its class and
+    // forgoes anisotropy, which costs nothing (neither ships a grain tangent).
+    //
+    // Exactly identity when `inst.anisotropy == 0`: the write is `1.0h + 0.0h`, the same
+    // bits the old line produced, so every scene that never sets the field — which is
+    // every Visualizer scene — is bit-identical. The clamp is insurance the field has
+    // nowhere else in the pipeline: `brdf()` splits GGX as `ab = a * (1 - 0.7 * aniso)`,
+    // which goes NEGATIVE past aniso ≈ 1.43.
+    half wTag = foliageFlag;
+    if (wTag >= 1.0h) wTag = 1.0h + half(clamp(inst.anisotropy, 0.0f, 1.0f));
+    o.normalRoughness = half4(half(oct.x), half(oct.y), half(matRough), wTag);
     // Phase 4.9 — emission can be a texture (used heavily by Plus scenes
     // for glow effects on rails / lamps / fire) or a scalar. Both are
     // additive on top of the lit colour. Sampling from the sRGB-decoded
