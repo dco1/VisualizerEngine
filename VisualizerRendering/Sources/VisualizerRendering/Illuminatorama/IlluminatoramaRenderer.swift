@@ -6324,7 +6324,9 @@ public final class IlluminatoramaRenderer {
         // this heavy would stall on its very first rebuild (which never returns
         // for minutes), so the thrash counter below could never catch it. Reject
         // BEFORE any build, based on a cheap cost estimate. Re-evaluated EVERY
-        // frame (the estimate is a loop over ≤128 mesh groups), so a scene that
+        // frame (the O(1) caps below bound the triangle sum to a loop over at
+        // most `groupCap` mesh groups — 128 on the live-RT arm, 512 on the
+        // glass-only arm since S3.6), so a scene that
         // sheds geometry — a floor hidden, a city context switched off — gets RT
         // back without a scene re-attach.
         var glassInstCount = 0
