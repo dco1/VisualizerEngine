@@ -1964,6 +1964,8 @@ public final class IlluminatoramaRenderer {
     private var gbufferLayer: MTLTexture
     private var historyA: MTLTexture
     private var historyB: MTLTexture
+    /// The TAA resolve's downstream output (see `Targets.taaResolved`).
+    private var taaResolvedTexture: MTLTexture
     /// When true, historyA holds the previous frame's TAA output and we
     /// write the current frame's resolve into historyB. Toggled each frame.
     private var historyToggle: Bool = false
@@ -1974,6 +1976,14 @@ public final class IlluminatoramaRenderer {
     /// `previousViewProjection` at the end of render() so next frame's
     /// vertex shader sees the right matrix.
     private var lastFrameViewProjection: simd_float4x4 = matrix_identity_float4x4
+    /// The sub-pixel projection jitter baked into `previousViewProjection`, in
+    /// NDC. Paired with `lastFrameJitterNDC` exactly as the two VP matrices are:
+    /// the velocity buffer differences two JITTERED matrices, so removing the
+    /// jitter again needs both frames' offsets, not just this one's.
+    private var previousJitterNDC: SIMD2<Float> = .zero
+    /// The jitter applied this frame; copied into `previousJitterNDC` at the end
+    /// of render() alongside the matrix it belongs to.
+    private var lastFrameJitterNDC: SIMD2<Float> = .zero
     /// Incremented every TAA-enabled render so the Halton(2,3) jitter walks
     /// through its sequence and accumulates as proper supersampling.
     private var taaFrameIndex: UInt32 = 0
@@ -4102,6 +4112,7 @@ public final class IlluminatoramaRenderer {
         self.gbufferLayer        = t.layer
         self.historyA            = t.historyA
         self.historyB            = t.historyB
+        self.taaResolvedTexture  = t.taaResolved
         self.bloomDownChain      = t.bloomDown
         self.bloomUpChain        = t.bloomUp
         self.halationBrightQuarter = t.halationBright
@@ -7696,6 +7707,7 @@ public final class IlluminatoramaRenderer {
             self.gbufferLayer        = t.layer
             self.historyA            = t.historyA
             self.historyB            = t.historyB
+            self.taaResolvedTexture  = t.taaResolved
             self.bloomDownChain      = t.bloomDown
             self.bloomUpChain        = t.bloomUp
             self.halationBrightQuarter = t.halationBright
@@ -8284,6 +8296,7 @@ public final class IlluminatoramaRenderer {
         // - Advance the jitter index so the Halton sequence walks forward.
         // - We've now written a valid history frame.
         previousViewProjection = lastFrameViewProjection
+        previousJitterNDC = lastFrameJitterNDC
         if taaEnabled {
             taaFrameIndex &+= 1
             taaNeedsFirstFrame = false
@@ -10605,6 +10618,10 @@ public final class IlluminatoramaRenderer {
         // disocclusion (a fast mover vacated this pixel) even when the vacated
         // surface and the mover share luma, which neighbourhood clamping can't.
         enc.setTexture(previousDepthTexture,    index: 5)
+        // The downstream frame, kept OUT of the accumulator at index 3 so the
+        // resolve's acutance sharpen is applied once on the way out instead of
+        // compounding inside the history every frame.
+        enc.setTexture(taaResolvedTexture,      index: 6)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
         dispatch(enc, pipeline: taaResolvePipeline, width: width, height: height)
         enc.endEncoding()
@@ -10613,7 +10630,7 @@ public final class IlluminatoramaRenderer {
     /// What bloom + tonemap should read from this frame. With TAA on, that's
     /// the history texture we just wrote to; otherwise the SSR-composited HDR.
     private var postFXSource: MTLTexture {
-        taaEnabled ? currentHistoryTexture : hdrCompositeTexture
+        taaEnabled ? taaResolvedTexture : hdrCompositeTexture
     }
 
     /// True for the remainder of a frame once `encodePostResolveFX` has drawn
@@ -11367,6 +11384,7 @@ public final class IlluminatoramaRenderer {
         // averages out the sub-pixel offsets as supersampling.
         let unjitteredProj = camera.projectionMatrix
         let proj: simd_float4x4
+        let jitterNDC: SIMD2<Float>
         if taaEnabled && taaJitterPixels > 0 {
             let h2 = Self.halton(taaFrameIndex &+ 1, base: 2) - 0.5
             let h3 = Self.halton(taaFrameIndex &+ 1, base: 3) - 0.5
@@ -11378,9 +11396,17 @@ public final class IlluminatoramaRenderer {
             var J = matrix_identity_float4x4
             J.columns.3 = SIMD4(jx, jy, 0, 1)
             proj = J * unjitteredProj
+            jitterNDC = SIMD2(jx, jy)
         } else {
             proj = unjitteredProj
+            jitterNDC = .zero
         }
+        // `J` is a pure NDC translation (clip.xy += j · clip.w), so the jitter
+        // enters every projected point as a constant additive NDC offset — which
+        // is exactly why it can be removed from the velocity by subtraction
+        // rather than by carrying a second pair of matrices. See
+        // `IlluminatoramaFrameUniforms.taaJitterDelta`.
+        lastFrameJitterNDC = jitterNDC
         let vp = proj * view
         let invVP = vp.inverse
         let invProj = proj.inverse
@@ -11545,6 +11571,13 @@ public final class IlluminatoramaRenderer {
                               max(0, diagramEdgeNormalSensitivity),
                               max(0.25, diagramEdgeThickness),
                               0)
+        // S4.2 — the jitter the velocity buffer must NOT carry. Both matrices it
+        // differences are jittered (this frame's, and last frame's inside
+        // `previousViewProjection`), so the delta of the two offsets is what is
+        // left over on top of the surface's real motion. Zero whenever jitter is
+        // off, which is every frame of every scene that never opts in.
+        u.taaJitterDelta = SIMD4(jitterNDC.x - previousJitterNDC.x,
+                                 jitterNDC.y - previousJitterNDC.y, 0, 0)
         // Phase 9 — film LUT strength: 0 when no LUT is bound (bypasses the shader branch).
         u.filmLUTStrength = filmLUTTexture != nil ? max(0, min(1, filmLUTStrength)) : 0
         // Tonemap colour-grade. Neutral defaults (6500/0/1/1/1) are exact no-ops in
@@ -11774,6 +11807,12 @@ public final class IlluminatoramaRenderer {
         var layer: MTLTexture
         var historyA: MTLTexture
         var historyB: MTLTexture
+        /// The TAA resolve's DOWNSTREAM output — the sharpened frame bloom and
+        /// tonemap read. Separate from the ping-pong pair because those two are
+        /// the ACCUMULATOR, and the acutance sharpen must not compound inside it.
+        var taaResolved: MTLTexture
+        // Bloom mip pyramid (S1.2) — see `bloomDownChain` for why these are
+        // separate per-level textures rather than one mipmapped resource.
         // Bloom mip pyramid (S1.2) — see `bloomDownChain` for why these are
         // separate per-level textures rather than one mipmapped resource.
         var bloomDown: [MTLTexture]      // level 0 = internal/2, each halving
@@ -12192,6 +12231,9 @@ public final class IlluminatoramaRenderer {
         let historyB = try make(label: "Illuminatorama.historyB",
                                 format: .rgba16Float, w: internalW, h: internalH,
                                 usage: [.shaderRead, .shaderWrite])
+        let taaResolved = try make(label: "Illuminatorama.taaResolved",
+                                   format: .rgba16Float, w: internalW, h: internalH,
+                                   usage: [.shaderRead, .shaderWrite])
         // AO and bloom run at half of the INTERNAL resolution (still oversampled
         // vs the output when SSAA is on).
         let halfW = max(1, internalW / 2)
@@ -12321,6 +12363,7 @@ public final class IlluminatoramaRenderer {
             albedoMet: am, normalRgh: nr, emission: em, depth: depth,
             hdr: hdr, ao: ao, hdrComposite: hdrComposite, rtDiffuse: rtDiffuse,
             velocity: velocity, layer: layer, historyA: historyA, historyB: historyB,
+            taaResolved: taaResolved,
             bloomDown: bloomDown, bloomUp: bloomUp,
             halationBright: hb, halationBlurH: hbh, halationBlurV: hbv,
             ldr: ldr,

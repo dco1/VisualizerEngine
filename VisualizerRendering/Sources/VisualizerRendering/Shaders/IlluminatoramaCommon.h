@@ -349,6 +349,25 @@ struct FrameUniforms {
     float4   diagramParams;
     float4   diagramOutline;
     float4   diagramEdge;
+    // ── TAA jitter, subtracted back out of the motion vectors (S4.2) ─────────
+    // xy = THIS frame's sub-pixel projection jitter minus the PREVIOUS frame's,
+    // in NDC units; zw reserved.
+    //
+    // `previousViewProjection` is the previous frame's JITTERED VP and the
+    // current VP is jittered too, so `currNDC − prevNDC` carries the difference
+    // of two different sample offsets on top of the surface's real motion. Left
+    // in, the resolve reprojects the history by exactly that difference and
+    // realigns it onto the CURRENT sub-pixel sample — so successive frames stop
+    // contributing different samples to a fixed output pixel, which is the whole
+    // mechanism of jitter supersampling. Subtracting this delta is the standard
+    // formulation: it pins the history to the output pixel grid while the samples
+    // move across it.
+    //
+    // Zero whenever jitter is off (the default, and every frame of every scene
+    // that never sets `taaJitterPixels`) ⇒ `− 0` is an IEEE no-op ⇒ the velocity
+    // buffer is byte-identical. ONE new 16-byte cluster (stride 1312 → 1328);
+    // mirror of IlluminatoramaFrameUniforms.taaJitterDelta.
+    float4   taaJitterDelta;
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift

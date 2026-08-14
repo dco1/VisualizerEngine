@@ -23,10 +23,12 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
     /// must match exactly or `uploadFrameUniforms`'s copy writes a differently-shaped
     /// blob than the shader reads.
     /// 1264 → 1312 with the three diagram clusters (`diagramParams` / `diagramOutline` /
-    /// `diagramEdge`). Verified against Metal by compiling a scratch kernel carrying
-    /// `static_assert(sizeof(FrameUniforms) == 1312)` and
-    /// `static_assert(offsetof(FrameUniforms, diagramParams) == 1264)` — both hold.
-    private static let metalStride = 1312
+    /// `diagramEdge`); 1312 → 1328 with `taaJitterDelta` (S4.2). Verified against Metal by
+    /// compiling a scratch kernel carrying `static_assert(sizeof(FrameUniforms) == 1328)`,
+    /// which holds while the same assert at 1312 fails — i.e. the assert is live, not a
+    /// tautology. (`offsetof` is not available in Metal; the tail offsets below are the
+    /// Swift-side half of the check, and the field is APPENDED, so stride pins it.)
+    private static let metalStride = 1328
 
     func testFrameUniformsStrideMatchesMetal() {
         XCTAssertEqual(MemoryLayout<IlluminatoramaFrameUniforms>.stride,
@@ -49,6 +51,7 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
         assertOffset(\.diagramParams,   1264, "diagramParams")
         assertOffset(\.diagramOutline,  1280, "diagramOutline")
         assertOffset(\.diagramEdge,     1296, "diagramEdge")
+        assertOffset(\.taaJitterDelta,  1312, "taaJitterDelta")
     }
 
     private func assertOffset(_ key: PartialKeyPath<IlluminatoramaFrameUniforms>,

@@ -105,24 +105,33 @@ kernel void illumi_taa_resolve(
     texture2d<half,  access::read>    currentHDR  [[texture(0)]],
     texture2d<half,  access::sample>  historyHDR  [[texture(1)]],
     texture2d<half,  access::read>    velocityTex [[texture(2)]],
-    texture2d<half,  access::write>   outHDR      [[texture(3)]],
+    // TWO outputs, and the split is the point. `outHistory` is the ACCUMULATOR —
+    // it is what this kernel reads back as `historyHDR` next frame, so nothing
+    // that is a per-frame correction may be written into it. `outResolved` is the
+    // frame handed to bloom/tonemap, and carries the acutance sharpen. See the
+    // sharpen block at the tail.
+    texture2d<half,  access::write>   outHistory  [[texture(3)]],
     // Phase 4.44 — depth, so the resolve can tell a sky pixel (cleared depth,
     // zero velocity) from genuinely-static geometry and synthesise a
     // camera-only motion vector for the former.
     depth2d<float,   access::read>    gDepth      [[texture(4)]],
     // Previous frame's depth — for disocclusion rejection (see below).
     depth2d<float,   access::read>    gPrevDepth  [[texture(5)]],
+    texture2d<half,  access::write>   outResolved [[texture(6)]],
     constant FrameUniforms&           frame       [[buffer(0)]],
     uint2                             gid         [[thread_position_in_grid]]
 ) {
-    uint W = outHDR.get_width();
-    uint H = outHDR.get_height();
+    uint W = outHistory.get_width();
+    uint H = outHistory.get_height();
     if (gid.x >= W || gid.y >= H) return;
 
     float3 current = float3(currentHDR.read(gid).rgb);
 
+    // Every early-out writes BOTH targets: a pixel that skips the resolve still
+    // has to prime the accumulator, or next frame reads a stale history for it.
     if (frame.taaEnabled == 0u || frame.taaIsFirstFrame != 0u) {
-        outHDR.write(half4(half3(current), 1.0h), gid);
+        outHistory.write(half4(half3(current), 1.0h), gid);
+        outResolved.write(half4(half3(current), 1.0h), gid);
         return;
     }
 
@@ -165,14 +174,21 @@ kernel void illumi_taa_resolve(
         float4 prevClip = frame.previousViewProjection * float4(dir, 0.0);
         if (prevClip.w > 1e-5) {
             float2 prevNDC = prevClip.xy / prevClip.w;
-            vel = (ndc - prevNDC) * float2(0.5, -0.5);
+            // Same jitter removal as the G-buffer's write (S4.2): `ndc` is this
+            // pixel under the JITTERED projection and `prevNDC` is the same ray
+            // under last frame's jittered VP, so the delta of the two offsets
+            // rides on top of the camera's real rotation. Sky has to agree with
+            // geometry here or the horizon reprojects differently from the wall
+            // under it. Zero when jitter is off.
+            vel = ((ndc - prevNDC) - frame.taaJitterDelta.xy) * float2(0.5, -0.5);
         }
     }
 
     float2 historyUV = uv - vel;
 
     if (any(historyUV < float2(0.0)) || any(historyUV > float2(1.0))) {
-        outHDR.write(half4(half3(current), 1.0h), gid);
+        outHistory.write(half4(half3(current), 1.0h), gid);
+        outResolved.write(half4(half3(current), 1.0h), gid);
         return;
     }
 
@@ -297,14 +313,26 @@ kernel void illumi_taa_resolve(
     float wH = (1.0 - alpha) * (1.0 / (1.0 + max(0.0, historyYCoCg.x)));
     float3 resultYCoCg = (currentYCoCg * wC + historyYCoCg * wH) / max(1e-5, wC + wH);
 
-    // ── Mild luma sharpen ─────────────────────────────────────────────────────
+    // ── Mild luma sharpen — DOWNSTREAM ONLY, never into the accumulator ───────
     // Catmull-Rom history + temporal averaging soften the image; restore a touch
     // of acutance by boosting the result luma toward the current-frame high-pass
     // (current − neighbourhood mean). Luma-only so it can't add chroma fringing;
     // clamped to the neighbourhood luma range so it can't reintroduce a ghost.
-    resultYCoCg.x += 0.25 * (currentYCoCg.x - m1.x);
-    resultYCoCg.x  = clamp(resultYCoCg.x, minC.x, maxC.x);
+    //
+    // It applies to the frame handed downstream and NOT to the frame written back
+    // as history. Sharpening the accumulated value re-applies the correction on
+    // top of itself every frame — at a real accumulation weight the history
+    // dominates, so it compounds at ~1/α until it saturates at the clamp:
+    // overshoot halos on every silhouette, speckle on flat surfaces. The
+    // fingerprint that pinned it: the fake "detail" it added scaled with the
+    // temporal blend weight (×1.42 at α=0.1 vs ×1.73 at α=1/32), and real
+    // resolution cannot depend on α. A per-frame correction does not belong in an
+    // accumulator; it belongs on the way out of one.
+    float3 accum     = max(float3(0.0), YCoCgtoRGB(resultYCoCg));
+    float3 sharpened = resultYCoCg;
+    sharpened.x += 0.25 * (currentYCoCg.x - m1.x);
+    sharpened.x  = clamp(sharpened.x, minC.x, maxC.x);
 
-    float3 result = max(float3(0.0), YCoCgtoRGB(resultYCoCg));
-    outHDR.write(half4(half3(result), 1.0h), gid);
+    outHistory.write(half4(half3(accum), 1.0h), gid);
+    outResolved.write(half4(half3(max(float3(0.0), YCoCgtoRGB(sharpened))), 1.0h), gid);
 }

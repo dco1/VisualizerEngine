@@ -1045,7 +1045,13 @@ fragment GBufferOut illumi_fs(
     // TAA kernel is `historyUV = currentUV - velocity`.
     float2 currNDC = in.currentClip.xy  / in.currentClip.w;
     float2 prevNDC = in.previousClip.xy / in.previousClip.w;
-    float2 velocityUV = (currNDC - prevNDC) * float2(0.5, -0.5);
+    // Both clip positions come from JITTERED matrices — this frame's VP and, via
+    // `previousViewProjection`, last frame's — so their difference carries the
+    // difference of two sample offsets on top of the surface's real motion. Take
+    // it back out (`taaJitterDelta`), or the resolve realigns the history onto
+    // the current sub-pixel sample and jitter supersampling cancels itself. Zero
+    // whenever jitter is off ⇒ an IEEE no-op ⇒ byte-identical velocity.
+    float2 velocityUV = ((currNDC - prevNDC) - frame.taaJitterDelta.xy) * float2(0.5, -0.5);
     o.velocity        = half2(velocityUV);
     o.layer           = in.layer;   // light-layer bitfield (default 0xFFFFFFFF)
     return o;

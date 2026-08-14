@@ -443,6 +443,25 @@ public struct IlluminatoramaFrameUniforms {
     public var diagramParams: SIMD4<Float> = .zero
     public var diagramOutline: SIMD4<Float> = SIMD4(0.10, 0.11, 0.13, 0)
     public var diagramEdge: SIMD4<Float> = SIMD4(1.0, 1.0, 1.0, 0)
+    /// **This frame's sub-pixel jitter minus the previous frame's, in NDC** (xy;
+    /// zw reserved) — the amount the G-buffer and the TAA resolve subtract back
+    /// out of `currNDC − prevNDC` so the velocity buffer carries the motion of
+    /// the SURFACE and not the motion of the sample pattern (S4.2).
+    ///
+    /// Both matrices the velocity is differenced from are jittered — the current
+    /// VP with this frame's offset, `previousViewProjection` with last frame's —
+    /// so without this the resolve reprojects the history by exactly the jitter
+    /// delta and realigns it onto the current sub-pixel sample. Successive frames
+    /// then never contribute a *different* sample to a fixed output pixel, which
+    /// is the entire mechanism of jitter supersampling. Removing the delta is the
+    /// standard formulation: it pins the history to the output pixel grid while
+    /// the samples move across it.
+    ///
+    /// Zero whenever `taaJitterPixels` is 0 — the default, and every frame of
+    /// every scene that never opts in — so the subtraction is an IEEE no-op and
+    /// the velocity buffer is byte-identical. ONE new 16-byte cluster
+    /// (stride 1312 → 1328); mirror of the Metal `FrameUniforms.taaJitterDelta`.
+    public var taaJitterDelta: SIMD4<Float> = .zero
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20
