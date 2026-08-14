@@ -564,11 +564,38 @@ fragment float4 illumi_glass_rt_fs(
     // Per-fragment seed for the stochastic cones; varies per frame so TAA averages.
     uint seed = pcgHash(uint(in.clipPos.x) + uint(in.clipPos.y) * 9781u + u.frameSeed * 6151u);
 
-    // Fresnel (Schlick) from IOR.
+    // ── Fresnel: a pane is a SLAB, not one interface ─────────────────────────
+    // `Fs` is Schlick for ONE air–glass surface. A window has TWO of them, and the
+    // light that gets past the front surface meets the back one on its way out —
+    // some of it reflects there, comes back, partially exits toward the eye, and so
+    // on. Summing that geometric series (incoherent, non-absorbing) is the standard
+    // slab result:
+    //
+    //     R_slab = 2·Fs / (1 + Fs)
+    //
+    // At normal incidence on float glass that is 0.0769 rather than 0.0400 — the
+    // sheen a real window carries is very nearly TWICE what a single interface
+    // gives. It still goes to 1 at grazing, so the silhouette is unchanged; what
+    // changes is the head-on read, which is exactly where a pane was disappearing
+    // and the window was reading as an open hole.
+    //
+    // The complement matters just as much. The transmitted lobe below is weighted
+    // `1 − R_slab` = 0.923 head-on; before this it was `1 − Fs` = 0.960, because the
+    // entry surface's Fresnel was charged and the EXIT surface's never was
+    // (`traceRefractionPath` refracts across the exit boundary without a
+    // transmission factor). The pane was passing more light than two surfaces can.
+    //
+    // ASSUMPTION, stated: the series is summed with no absorption between the
+    // surfaces (a = 1). Exact for clear glass; for a deeply body-tinted pane the
+    // internal bounce is attenuated, so the true R_slab sits between Fs and this
+    // value and we slightly over-state the sheen. Beer–Lambert still attenuates the
+    // transmitted path itself inside `traceRefractionPath`, so only the second-order
+    // internal bounce is idealised.
     float cosI = saturate(dot(N, V));
     float f0s = (ior - 1.0) / (ior + 1.0);
     float F0 = f0s * f0s;
-    float F = F0 + (1.0 - F0) * pow(1.0 - cosI, 5.0);
+    float Fs = F0 + (1.0 - F0) * pow(1.0 - cosI, 5.0);
+    float F = saturate(2.0 * Fs / (1.0 + Fs));
 
     float3 P = in.worldPos;
 
