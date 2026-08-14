@@ -1651,6 +1651,29 @@ public final class IlluminatoramaRenderer {
     /// to be > 0; this lets a host disable the 3× cost wholesale.
     public var rtGlassDispersionEnabled: Bool = true
 
+    /// **Take the transmitted lobe from the frame we already rendered, near normal.**
+    ///
+    /// The RT glass pass re-derives the world behind a pane with `shadeSecondarySurface`,
+    /// which is a poorer model than the deferred kernel that shaded the same surfaces one
+    /// pixel to the side. Measured on a real document, the transmitted world came out
+    /// **1.20× the same view with the glazing removed** — a pane brighter than its own hole,
+    /// which is what stops a settled window reading as glass. Real float glass transmits ~0.92.
+    ///
+    /// With this on, at near-normal incidence — where a 6 mm pane's ray displacement is
+    /// sub-pixel — the transmitted radiance is sampled from the pre-glass composite instead of
+    /// re-shaded. That is parity with the neighbouring pixels by construction, and one texture
+    /// tap is cheaper than a ray cast plus a re-shade. It fades back to the traced path over
+    /// cosθ 0.95 → 0.80, so curved or strongly-refracting glass (jewels, bubbles) keeps the RT
+    /// path across essentially its whole silhouette and is unaffected.
+    ///
+    /// ONLY for glazing that does not absorb (clear panes): screen space knows the radiance
+    /// arriving at the pane but not the path length through it, so it cannot apply
+    /// Beer–Lambert. Body-tinted, fluted and block glazing keep the traced path — see the gate
+    /// in `illumi_glass_rt_fs`, and the exact-tie measurement that made it necessary.
+    ///
+    /// Costs one full-frame blit of the composite per frame when the RT glass pass runs.
+    public var rtGlassScreenSpaceTransmission: Bool = true
+
     // ── Secondary-ray shading parity: three ABLATION switches ───────────────
     // A SECONDARY ray's opaque hit — refraction or reflection out of the glass pass,
     // a glossy reflection or GI bounce out of the deferred TLAS kernel — is shaded
@@ -9205,6 +9228,10 @@ public final class IlluminatoramaRenderer {
         // Cheap glass: only on the non-RT path, and only if opted in OR auto-fallback.
         let cheap = !useRT && effectiveCheapMode != 0
         u.cheapGlassMode = cheap ? UInt32(effectiveCheapMode) : 0
+        // Screen-space transmission parity is an RT-path feature: the cheap paths already
+        // read the composite (mode 2) or have no transmitted lobe to speak of (modes 0/1).
+        let ssTransmissionOn = useRT && rtGlassScreenSpaceTransmission
+        u.ssTransmissionEnabled = ssTransmissionOn ? 1 : 0
         u.viewW = Float(hdrCompositeTexture.width)
         u.viewH = Float(hdrCompositeTexture.height)
         // Thin-film iridescence (cheap mode 2 only; default strength 0 = no-op).
@@ -9265,7 +9292,9 @@ public final class IlluminatoramaRenderer {
         // Screen-space cheap glass (mode 2) samples the scene BEHIND the pane: copy
         // the pre-glass composite into a backdrop texture (can't sample the render
         // target we're about to write). One full-frame GPU blit; no ray tracing.
-        let useBackdrop = cheap && effectiveCheapMode == 2
+        // The RT path needs it too now: screen-space transmission parity samples the
+        // pre-glass composite for the transmitted lobe at near-normal incidence.
+        let useBackdrop = (cheap && effectiveCheapMode == 2) || ssTransmissionOn
         if useBackdrop {
             if glassBackdropTexture?.width != hdrCompositeTexture.width
                 || glassBackdropTexture?.height != hdrCompositeTexture.height {

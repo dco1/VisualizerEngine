@@ -978,8 +978,16 @@ struct IlluminatoramaGlassRTUniforms {
     /// Cheap glass mode for the fallback shader: 0 = plain Fresnel+sky (unchanged
     /// for every other scene), 1 = synthetic tinted+glint, 2 = screen-space refraction.
     var cheapGlassMode: UInt32 = 0
-    /// Viewport size in pixels (mode 2 maps `clipPos.xy` → backdrop UV).
+    /// Viewport size in pixels (mode 2 + SS parity map `clipPos.xy` → backdrop UV).
     var viewW: Float = 0; var viewH: Float = 0
+    /// Screen-space transmission parity on the RT path. 0 = OFF ⇒ exactly the previous
+    /// behaviour. When on, the transmitted lobe of a pane is taken from the pre-glass
+    /// composite at near-normal incidence (where a thin pane's ray displacement is
+    /// sub-pixel) instead of being re-derived by `shadeSecondarySurface`, so the world
+    /// through a window is the same pixels as the world beside it. Fades back to the
+    /// traced path over cosθ 0.95 → 0.80. Field order must match `GlassRTUniforms` in
+    /// IlluminatoramaGlassRT.metal — it sits between `viewH` and `time`.
+    var ssTransmissionEnabled: UInt32 = 0
     // ── Thin-film iridescence (soap bubbles — Bubble Lab) ────────────
     /// Animation clock (seconds) for the swirling film-thickness field. Driven
     /// from `renderer.time`.

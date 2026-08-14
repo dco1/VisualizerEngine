@@ -88,7 +88,13 @@ struct GlassRTUniforms {
     uint   surfAtlasW;          uint surfAtlasH;
     uint   dispersionEnabled;   // global gate; per-instance value still required
     uint   cheapGlassMode;      // 0 = plain fallback, 1 = synthetic, 2 = screen-space
-    float  viewW; float viewH;  // viewport px (mode 2: clipPos.xy → backdrop UV)
+    float  viewW; float viewH;  // viewport px (mode 2 + SS parity: clipPos.xy → backdrop UV)
+    // ── Screen-space transmission parity (RT path) ───────────────────────────
+    // 0 = OFF ⇒ exactly the previous behaviour. When on, the RT pane's TRANSMITTED
+    // lobe is taken from the pre-glass composite at near-normal incidence instead of
+    // being re-derived, so the world seen through a pane is the same pixels as the
+    // world beside it rather than a second, poorer shading of it.
+    uint   ssTransmissionEnabled;
     // ── Thin-film iridescence (soap bubbles — Bubble Lab) ────────────────────
     float  time;                // swirl-animation clock (seconds)
     float  thinFilmStrength;    // 0 = OFF (exact no-op for every other scene)
@@ -401,6 +407,13 @@ static inline float3 beerLambert(float3 tint, float density, float L) {
 // Trace one refraction path from the entry surface and return the radiance that
 // reaches the eye through the glass. `iorEntry` is the wavelength-specific IOR
 // (for dispersion the caller calls this 3× with split IORs).
+/// `outAbsorb` receives the Beer–Lambert throughput this path accumulated — the absorption
+/// alone, over the TRUE geometric path length inside the glass, with no shading in it. The
+/// screen-space transmission parity in `illumi_glass_rt_fs` needs exactly that: it replaces the
+/// re-shaded radiance with the composite's, and must then tint it by the same amount of glass
+/// the ray actually travelled through. Guessing a nominal thickness instead is wrong by more
+/// than an order of magnitude — a 6 mm pane against an 80 mm guess turned bronze glazing from
+/// 0.80 transmission to 0.31 and tripped `testSettledPaneTransmitsTheViewBehindIt`.
 static float3 traceRefractionPath(
     thread intersector<triangle_data, instancing>& isect,
     instance_acceleration_structure accel,
@@ -410,8 +423,10 @@ static float3 traceRefractionPath(
     texture2d<float, access::sample> surfAtlas,
     texturecube<float, access::sample> irrCube,
     texture2d_array<float, access::sample> albedoAtlas,
-    thread uint& seed)
+    thread uint& seed,
+    thread float3& outAbsorb)
 {
+    outAbsorb = float3(1.0);
     float eps = max(u.rayTMin, 1e-3);
     // Refract into the glass at the entry surface.
     float3 rd = refract(-V, Ng, 1.0 / max(1.0, iorEntry));
@@ -433,6 +448,7 @@ static float3 traceRefractionPath(
         auto res = isect.intersect(r, accel, 0x03u);    // opaque + glass
         if (res.type != intersection_type::triangle) {
             // Escaped to the sky.
+            outAbsorb = throughput;
             return throughput * sampleSky(sky, rd, u.skyIntensity, glassNightSky(u), u.nightPixAngle);
         }
         uint iid = res.instance_id;
@@ -471,9 +487,11 @@ static float3 traceRefractionPath(
         float3 rad = shadeOpaqueHit(isect, accel, iid, res.primitive_id,
                                     res.triangle_barycentric_coord, hitP, r.direction,
                                     u, st, surfAtlas, irrCube, albedoAtlas, seed, res);
+        outAbsorb = throughput;
         return throughput * rad;
     }
     // Bounce budget exhausted — return the accumulated sky as a fallback.
+    outAbsorb = throughput;
     return throughput * sampleSky(sky, rd, u.skyIntensity, glassNightSky(u), u.nightPixAngle);
 }
 
@@ -535,6 +553,7 @@ fragment float4 illumi_glass_rt_fs(
     const device RTSpotLight*        spotLights  [[buffer(15)]],
     texture2d<float, access::sample> sky         [[texture(0)]],
     texture2d<float, access::sample> surfAtlas   [[texture(1)]],
+    texture2d<float, access::sample> backdrop    [[texture(2)]],
     texturecube<float, access::sample> irrCube   [[texture(3)]],
     texture2d_array<float, access::sample> albedoAtlas [[texture(4)]])
 {
@@ -600,6 +619,14 @@ fragment float4 illumi_glass_rt_fs(
     float3 P = in.worldPos;
 
     // ── Refraction (with optional chromatic dispersion) ──────────────────────
+    // `refrAbsorb` is the Beer–Lambert throughput of the traced path — absorption only, over
+    // the TRUE path length inside the glass. Screen-space transmission parity below tints the
+    // composite by exactly this, so a bronze pane absorbs like 6 mm of bronze glass and not
+    // like a guessed slab. `ssAbsorbValid` is false for the paths where a single scalar
+    // absorption is not meaningful (dispersion splits it three ways) or where screen space
+    // cannot represent the result anyway (a frosted cone blurs what it samples).
+    float3 refrAbsorb = float3(1.0);
+    bool ssAbsorbValid = false;
     float3 refr;
     if (u.dispersionEnabled != 0u && dispersion > 1e-4) {
         // Normal dispersion: blue bends more (higher IOR) than red. Split the IOR
@@ -607,14 +634,18 @@ fragment float4 illumi_glass_rt_fs(
         // paths — gated, so only dispersive glass pays it.
         float spread = dispersion * 0.04 * ior;         // ±IOR offset
         uint s0 = seed;
+        float3 dropAbsorb;
         float r = traceRefractionPath(isect, accel, P, V, N, ior - spread, tint, density,
-                                      roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed).r;
+                                      roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
+                                      dropAbsorb).r;
         seed = s0 ^ 0x1234u;
         float g = traceRefractionPath(isect, accel, P, V, N, ior, tint, density,
-                                      roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed).g;
+                                      roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
+                                      dropAbsorb).g;
         seed = s0 ^ 0x9abcu;
         float bb = traceRefractionPath(isect, accel, P, V, N, ior + spread, tint, density,
-                                       roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed).b;
+                                       roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
+                                       dropAbsorb).b;
         refr = float3(r, g, bb);
     } else {
         // Frosted glass jitters the refraction in a cone, so a single sample is
@@ -624,14 +655,77 @@ fragment float4 illumi_glass_rt_fs(
         uint nRefr = secondaryConeSamples(roughness, kGlassConeK, 3.0, 4u);
         if (nRefr <= 1u) {
             refr = traceRefractionPath(isect, accel, P, V, N, ior, tint, density,
-                                       roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed);
+                                       roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
+                                       refrAbsorb);
+            ssAbsorbValid = true;
         } else {
             float3 acc = float3(0.0);
             for (uint s = 0u; s < nRefr; ++s) {
+                float3 coneAbsorb;
                 acc += traceRefractionPath(isect, accel, P, V, N, ior, tint, density,
-                                           roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed);
+                                           roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
+                                           coneAbsorb);
             }
             refr = acc / float(nRefr);
+        }
+    }
+
+    // ── Screen-space transmission parity ─────────────────────────────────────
+    //
+    // THE PROBLEM THIS SOLVES. `traceRefractionPath` re-derives the world behind the
+    // pane with `shadeSecondarySurface`, which is a strictly poorer model than the
+    // deferred kernel that shaded the SAME surfaces one pixel to the side: mean
+    // albedo where there is no atlas slice, one texture tap with no anti-tiling
+    // blend, no normal/roughness maps, Lambert-only local lights, no AO, and no `kd`
+    // energy split. Measured on a real document, the transmitted world came out
+    // **1.20× the same view with the glazing removed** — a pane brighter than the
+    // hole it sits in, which is why a settled window read as a bright gap in the wall
+    // instead of as glass. Real float glass transmits ~0.92.
+    //
+    // THE FIX. At near-normal incidence we do not have to re-derive anything. A 6 mm
+    // pane displaces the transmitted ray by thickness·(1 − 1/n)·tanθ, which is far
+    // under one pixel there — so the radiance arriving through the pane IS the
+    // radiance already computed for the pixel behind it, sitting in the pre-glass
+    // composite. Sampling it is exact, it is parity with the neighbouring deferred
+    // pixels BY CONSTRUCTION rather than by matching constants, and it costs one
+    // texture tap instead of a ray cast plus a full re-shade.
+    //
+    // WHERE IT STOPS. The displacement grows with the angle and screen space cannot
+    // answer for anything off-screen or occluded, so this hands back to the ray-traced
+    // path over 0.95 → 0.80 cosθ (≈18°→37° off normal). That is also where Fresnel
+    // starts handing the pixel to the reflection lobe, so the seam falls where the
+    // transmitted term matters least. Strongly-refracting geometry — a jewel, a
+    // bubble, anything curved — spends almost none of its silhouette inside that cone,
+    // so it keeps the RT path throughout and is unaffected.
+    //
+    // Absorption still applies: the composite is the radiance ENTERING the glass, so
+    // it is attenuated by the same Beer–Lambert coefficient the traced path uses,
+    // with the low head-on / rising-at-grazing path length cheap mode 2 established.
+    //
+    // RESTRICTED TO GLAZING THAT DOES NOT ABSORB, and that restriction is load-bearing.
+    // Screen space knows the radiance arriving at the pane but not the path length through
+    // it, so it cannot apply Beer–Lambert. For clear glazing that is not an approximation at
+    // all — `tint = 1` makes the absorption term identically 1 — but for a body-tinted pane it
+    // is the whole character of the glass. Measured, with this gate absent: bronze glazing
+    // (density 80/m over a ~20 mm pane, so ≈0.55/0.42/0.34 transmission) rendered at
+    // **0.99999988 of an open aperture**, and fluted at **exactly 1.0** — the pane had stopped
+    // contributing anything. The transmission ladder went green on those numbers, which is
+    // what an exact tie is always worth: proof the thing under test dropped out, not proof it
+    // passed. Tinted, fluted and block glazing therefore keep the traced path.
+    bool absorbs = density > 1e-3 && any(clamp(tint, 0.0, 1.0) < 0.999);
+    if (u.ssTransmissionEnabled != 0u && ssAbsorbValid && !absorbs
+        && u.viewW > 0.5 && u.viewH > 0.5) {
+        float w = smoothstep(0.80, 0.95, cosI);
+        if (w > 0.0) {
+            constexpr sampler bdSmp(filter::linear, address::clamp_to_edge);
+            float2 uv = in.clipPos.xy / float2(u.viewW, u.viewH);
+            // `refrAbsorb` is the traced path's own Beer–Lambert throughput over the real
+            // geometric path inside this pane, so the composite is tinted by exactly the glass
+            // the ray went through. A nominal thickness must NOT be substituted here: an 80 mm
+            // guess against a 6 mm pane took bronze glazing from 0.80 transmission to 0.31 and
+            // tripped `testSettledPaneTransmitsTheViewBehindIt` — a window you cannot see
+            // through is not a window.
+            refr = mix(refr, backdrop.sample(bdSmp, uv).rgb * refrAbsorb, w);
         }
     }
 
