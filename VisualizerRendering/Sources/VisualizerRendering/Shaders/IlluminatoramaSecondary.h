@@ -536,7 +536,15 @@ static inline float3 shadeSecondarySurface(thread Isect& isect,
     rad += A * secondaryLocalLightFill(h.P, h.N, layerBits, p, sc);
     float3 Ld = normalize(p.sunDir);
     float nl = saturate(dot(h.N, Ld));
-    if (nl > 0.0 && p.shadowRays > 0u) {
+    // `shadowRays == 0` means "do not TEST the shadow", not "do not light the surface".
+    // `secondarySunVisibility` says so itself — its first line returns 1.0 for that case — but
+    // gating the whole term on `shadowRays > 0u` made that return unreachable and quietly turned
+    // the knob into a sun kill switch: a host dropping the ray to save a trace lost the direct
+    // sun on everything seen through a pane or in a reflection, while the same surface one pixel
+    // to the side kept it. Measured on the real document at `rtGlassShadowRays = 0`: the
+    // through-glass world fell from 1.197× the open aperture to 1.049×, i.e. the sun it should
+    // have been given was 15 points of ratio, silently absent.
+    if (nl > 0.0) {
         float vis = secondarySunVisibility(isect, accel, h.P, h.N, Ld, p, seed);
         rad += A * (1.0 / M_PI_F) * p.sunColor * nl * vis;
     }
