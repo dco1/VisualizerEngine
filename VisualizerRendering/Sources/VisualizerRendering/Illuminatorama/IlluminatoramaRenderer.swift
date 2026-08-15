@@ -1666,11 +1666,6 @@ public final class IlluminatoramaRenderer {
     /// cosθ 0.95 → 0.80, so curved or strongly-refracting glass (jewels, bubbles) keeps the RT
     /// path across essentially its whole silhouette and is unaffected.
     ///
-    /// ONLY for glazing that does not absorb (clear panes): screen space knows the radiance
-    /// arriving at the pane but not the path length through it, so it cannot apply
-    /// Beer–Lambert. Body-tinted, fluted and block glazing keep the traced path — see the gate
-    /// in `illumi_glass_rt_fs`, and the exact-tie measurement that made it necessary.
-    ///
     /// Costs one full-frame blit of the composite per frame when the RT glass pass runs.
     public var rtGlassScreenSpaceTransmission: Bool = true
 
@@ -9448,8 +9443,20 @@ public final class IlluminatoramaRenderer {
         enc.label = "Illuminatorama.gbuffer"
         enc.setRenderPipelineState(gbufferPipeline)
         enc.setDepthStencilState(depthState)
-        enc.setCullMode(.back)
         enc.setFrontFacing(.counterClockwise)
+        // Cull mode is a PER-MESH decision here (a two-sided mesh draws `.none`),
+        // so it is set inside the draw loop below and deliberately NOT set
+        // pass-wide: a pass-wide `.back` is immediately re-issued by the first
+        // group, and re-issuing the same value per group is exactly what Metal's
+        // validation layer reports as `redundant setCullMode.` /
+        // `previous setCullMode was unused.`. Those are severity-2 warnings, but
+        // under the debug layer's assert warning mode (Xcode's GPU frame capture
+        // / break-on-validation) `_MTLMessageContextEnd…OrAbort` takes the ABORT
+        // arm — so a redundant state set is a crash, not a log line. Track the
+        // last value and set only on a change, exactly as the shadow passes do.
+        // Metal's own default is `.none`, and every drawn group states its cull
+        // explicitly, so dropping the pass-wide set changes no pixels.
+        var cull: MTLCullMode? = nil
 
         // Phase 4.0/4.1 — bind the per-material texture atlases once for the
         // whole G-buffer pass. Per-instance slice indices select the slice
@@ -9502,7 +9509,8 @@ public final class IlluminatoramaRenderer {
             // Two-sided meshes (open / dynamic MC fluid surfaces) render cull
             // `.none` so they don't go hollow when their back side faces the
             // camera; the fragment shader flips the normal for back faces.
-            enc.setCullMode(mesh.doubleSided ? .none : .back)
+            let want: MTLCullMode = mesh.doubleSided ? .none : .back
+            if cull != want { cull = want; enc.setCullMode(want) }
             let off = instStride * group.start
             // Issue #65 — deforming GPU meshes draw with the kUsePrevVerts pipeline
             // and bind their per-vertex prev positions at buffer(5); every other
@@ -9549,7 +9557,7 @@ public final class IlluminatoramaRenderer {
         // the same per-group offset as the instance buffer (grouped-order aligned).
         if let sqPipe = superquadricImpostorPipeline, !impostorMeshKinds.isEmpty {
             enc.setRenderPipelineState(sqPipe)
-            enc.setCullMode(.front)
+            if cull != .front { cull = .front; enc.setCullMode(.front) }
             let pStride = MemoryLayout<IlluminatoramaInstance.SuperquadricParam>.stride
             for group in meshGroups where impostorMeshKinds.contains(group.kind) {
                 guard let mesh = meshes[group.kind] else { continue }
@@ -11813,8 +11821,6 @@ public final class IlluminatoramaRenderer {
         /// tonemap read. Separate from the ping-pong pair because those two are
         /// the ACCUMULATOR, and the acutance sharpen must not compound inside it.
         var taaResolved: MTLTexture
-        // Bloom mip pyramid (S1.2) — see `bloomDownChain` for why these are
-        // separate per-level textures rather than one mipmapped resource.
         // Bloom mip pyramid (S1.2) — see `bloomDownChain` for why these are
         // separate per-level textures rather than one mipmapped resource.
         var bloomDown: [MTLTexture]      // level 0 = internal/2, each halving
