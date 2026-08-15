@@ -983,6 +983,16 @@ public final class IlluminatoramaRenderer {
     public var interiorIrradianceSide: SIMD3<Float> = .zero
     public var interiorIrradianceDown: SIMD3<Float> = .zero
     public var interiorIrradianceWeight: Float = 0
+    /// Daylight apertures for the band GRADATION (S3.5 Stage D): the host's glazed
+    /// openings, one rect each. With `interiorApertureGradation` > 0, interior fragments
+    /// scale their BAND irradiance by an approximate summed solid angle of these — a wall
+    /// point near its window reads brighter than the same wall 8 m away, which no
+    /// normal-only term can produce. Empty list or strength 0 (the defaults) ⇒ factor is
+    /// exactly 1.0 ⇒ byte-identical. Primary (deferred) pass only: the secondary paths
+    /// carry the flat bands — a reflection of a wall does not re-derive its gradation.
+    public var interiorApertures: [IlluminatoramaInteriorAperture] = []
+    /// 0 = off (default); 1 = the full gradation. Fractional = partial (a look dial).
+    public var interiorApertureGradation: Float = 0
 
     /// ── Analytic night sky (stars + moon at SCREEN resolution) ──────────────
     /// The 2048×1024 equirect dome is far coarser than the frame, so celestials
@@ -3342,6 +3352,10 @@ public final class IlluminatoramaRenderer {
     private var areaLightCapacity: Int
     private var extraDirectionalRing: [MTLBuffer]
     private var extraDirectionalBuffer: MTLBuffer { extraDirectionalRing[frameRingIndex] }
+
+    private var interiorApertureRing: [MTLBuffer]
+    private var interiorApertureBuffer: MTLBuffer { interiorApertureRing[frameRingIndex] }
+    private var interiorApertureCapacity: Int = 0
     private var extraDirectionalCapacity: Int
     private var frameUniformRing: [MTLBuffer]
     private var frameUniformBuffer: MTLBuffer { frameUniformRing[frameRingIndex] }
@@ -4257,6 +4271,13 @@ public final class IlluminatoramaRenderer {
             MemoryLayout<IlluminatoramaDirectionalLight>.stride * initLightCap,
             "Illuminatorama.extraDirectionals", "extraDirectionals")
         self.extraDirectionalCapacity = initLightCap
+
+        // Interior daylight apertures (S3.5 Stage D) — lighting kernel buffer(7). One
+        // per glazed opening; a whole storey is typically 10–30, grow-on-demand covers more.
+        self.interiorApertureRing = try makeRing(
+            MemoryLayout<IlluminatoramaInteriorAperture>.stride * initLightCap,
+            "Illuminatorama.interiorApertures", "interiorApertures")
+        self.interiorApertureCapacity = initLightCap
 
         self.frameUniformRing = try makeRing(
             MemoryLayout<IlluminatoramaFrameUniforms>.stride,
@@ -8086,6 +8107,7 @@ public final class IlluminatoramaRenderer {
         uploadSpotLights()
         uploadAreaLights()
         uploadExtraDirectionals()
+        uploadInteriorApertures()
 
         // Pick a free pool buffer for this frame's tonemap output (never the
         // presented one SceneKit may sample, nor the one still in flight).
@@ -10195,6 +10217,10 @@ public final class IlluminatoramaRenderer {
         // allocated — never read, because the kernel only indexes it for lights with
         // `shadowCubeIndex >= 0`, and those exist only when the feature is on.
         enc.setBuffer(pointShadowFaceBuffer ?? pointLightBuffer, offset: 0, index: 6)
+        // Interior daylight apertures (S3.5 Stage D). Always bound — the kernel gates
+        // on the count/strength packed in frame.interiorIrrDown.w / interiorIrrSide.w,
+        // both 0 for every scene that never opts in.
+        enc.setBuffer(interiorApertureBuffer, offset: 0, index: 7)
         dispatch(enc, pipeline: pipe, width: width, height: height)
         enc.endEncoding()
     }
@@ -11412,6 +11438,9 @@ public final class IlluminatoramaRenderer {
         growRing(&extraDirectionalRing, &extraDirectionalCapacity,
                  needed: extraDirectionals.count, type: IlluminatoramaDirectionalLight.self,
                  label: "Illuminatorama.extraDirectionals")
+        growRing(&interiorApertureRing, &interiorApertureCapacity,
+                 needed: interiorApertures.count, type: IlluminatoramaInteriorAperture.self,
+                 label: "Illuminatorama.interiorApertures")
     }
 
     /// Advance the eased Post-FX shadows toward their slider targets. `Instant`
@@ -11675,8 +11704,13 @@ public final class IlluminatoramaRenderer {
         // exact cube sample ⇒ byte-identical for every scene that never opts in.
         let irrW = max(0, min(1, interiorIrradianceWeight))
         u.interiorIrrUp = SIMD4(simd_max(interiorIrradianceUp, .zero), irrW)
-        u.interiorIrrSide = SIMD4(simd_max(interiorIrradianceSide, .zero), 0)
-        u.interiorIrrDown = SIMD4(simd_max(interiorIrradianceDown, .zero), 0)
+        // The two spare .w lanes carry the aperture GRADATION (S3.5 Stage D):
+        // side.w = strength (0 = off), down.w = aperture count (float-encoded; exact
+        // for any realistic count). Both 0 by default ⇒ the kernel's factor is 1.0.
+        u.interiorIrrSide = SIMD4(simd_max(interiorIrradianceSide, .zero),
+                                  max(0, min(1, interiorApertureGradation)))
+        u.interiorIrrDown = SIMD4(simd_max(interiorIrradianceDown, .zero),
+                                  Float(interiorApertures.count))
         // Analytic night sky. All-zero defaults keep the kernel's sky branch an
         // exact no-op; hosts fade the brightnesses with nightBlend themselves.
         u.nightSkyParams = SIMD4(max(0, nightSkyStarBrightness),
@@ -11835,6 +11869,18 @@ public final class IlluminatoramaRenderer {
                 spotLightBuffer.contents(),
                 base,
                 MemoryLayout<IlluminatoramaSpotLight>.stride * spotLights.count
+            )
+        }
+    }
+
+    private func uploadInteriorApertures() {
+        guard !interiorApertures.isEmpty else { return }
+        interiorApertures.withUnsafeBufferPointer { src in
+            guard let base = src.baseAddress else { return }
+            memcpy(
+                interiorApertureBuffer.contents(),
+                base,
+                MemoryLayout<IlluminatoramaInteriorAperture>.stride * interiorApertures.count
             )
         }
     }

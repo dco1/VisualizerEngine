@@ -522,6 +522,27 @@ public struct IlluminatoramaAreaLight {
     }
 }
 
+/// A daylight APERTURE for the interior-irradiance gradation (S3.5 Stage D) — a glazed
+/// opening's rectangle, reduced to what the per-pixel sky-visibility estimate needs:
+/// where it is, which way it faces into the room, and its area. The lighting kernel sums
+/// an approximate solid angle over these per interior fragment and grades the interior
+/// irradiance BANDS by it, which is what lets a wall be brighter 0.5 m from its window
+/// than 8 m from it — the flatness no normal-only term could fix. 32 bytes, mirror of the
+/// Metal `InteriorAperture` (buffer 7 of the lighting kernel).
+public struct IlluminatoramaInteriorAperture {
+    public var center: SIMD3<Float>          // aperture centre (world)
+    public var width: Float                  // metres
+    public var inward: SIMD3<Float>          // unit normal INTO the room
+    public var height: Float                 // metres
+
+    public init(center: SIMD3<Float>, inward: SIMD3<Float>, width: Float, height: Float) {
+        self.center = center
+        self.inward = inward
+        self.width = width
+        self.height = height
+    }
+}
+
 public struct IlluminatoramaPointLight {
     public var position: SIMD3<Float>
     public var radius: Float

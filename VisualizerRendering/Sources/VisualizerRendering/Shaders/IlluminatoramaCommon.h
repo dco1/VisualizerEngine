@@ -427,6 +427,14 @@ struct AreaLight {
     float3 color;    float radius;     // premultiplied color + distance-falloff range
 };
 
+// A daylight aperture (S3.5 Stage D) — a glazed opening reduced to what the interior
+// irradiance gradation needs. Mirror of Swift `IlluminatoramaInteriorAperture` (32 B),
+// bound at lighting kernel buffer(7). See the band branch in IlluminatoramaLighting.metal.
+struct InteriorAperture {
+    float3 center;   float width;      // aperture centre (world) + metres
+    float3 inward;   float height;     // unit normal INTO the room + metres
+};
+
 struct SpotLight {
     float3   position;
     float    innerCone;       // cos(spotInnerAngle / 2)

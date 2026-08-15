@@ -564,6 +564,9 @@ kernel void illumi_lighting(
     const device DirectionalLight*          extraDirectionals [[buffer(5)]],
     // Per-face view-projection matrices for shadowed point lights (6 per cube).
     const device float4x4*                  pointShadowFaces [[buffer(6)]],
+    // Interior daylight apertures (S3.5 Stage D) — gates on the count/strength in
+    // frame.interiorIrrDown.w / interiorIrrSide.w, both 0 unless the host opts in.
+    const device InteriorAperture*          interiorApertures [[buffer(7)]],
     uint2                                   gid             [[thread_position_in_grid]]
 ) {
     uint w = outHDR.get_width();
@@ -1044,6 +1047,47 @@ kernel void illumi_lighting(
                               N.y >= 0.0 ? frame.interiorIrrUp.xyz
                                          : frame.interiorIrrDown.xyz,
                               abs(N.y));
+            // ── S3.5 Stage D — the bands GRADE with daylight-aperture proximity ──
+            // The bands (like the scalars before them) are functions of the surface
+            // NORMAL alone, so a wall point 0.5 m from its window and one 8 m away
+            // read identically (R2wall ≈ 0.98, measured — the flatness no dial could
+            // fix). Grade them by summed daylight PROXIMITY over the room's glazed
+            // apertures:
+            //     Ω_i = A / (d² + A)
+            // — the finite-rect solid-angle form WITHOUT foreshortening, on purpose.
+            // A cosine-weighted (sky-visibility) form cancels along a side wall: the
+            // far end sees the window more squarely exactly as it sees it farther,
+            // and the gradient this term exists to produce vanishes. What actually
+            // brightens the wall beside a window in a photograph is the bounce glow
+            // of the lit zone in front of it, which is isotropic — proximity, not
+            // aspect. The aperture's inward normal is used only for CONTAINMENT
+            // (nothing behind the window plane — the outdoors, the next room on the
+            // far side of the same wall — may brighten). Cross-room leak through an
+            // interior partition is accepted the way pre-mask point lights accepted
+            // it: 1/d² bounds it, and the clamp bounds its worst case.
+            //
+            // Normalized so Ω_ref (a 3 m² window at ~3.5 m — mid-room) maps to 1.0,
+            // then root-compressed and clamped: this is an AMBIENT gradient, not a
+            // spotlight — the direct sun + window cones carry the hard directional
+            // story. Count/strength ride the band clusters' spare .w lanes — both 0
+            // unless the host opts in, keeping the factor exactly 1.0 (and the loop
+            // unentered) for every other scene.
+            uint  apCount = uint(frame.interiorIrrDown.w);
+            float apStrength = saturate(frame.interiorIrrSide.w);
+            if (apCount > 0u && apStrength > 0.0) {
+                float omega = 0.0;
+                for (uint i = 0u; i < apCount; ++i) {
+                    InteriorAperture ap = interiorApertures[i];
+                    float3 toP = worldPos - ap.center;
+                    if (dot(ap.inward, toP) < -0.05) continue;   // outdoor side
+                    float d2   = max(dot(toP, toP), 1e-3);
+                    float area = ap.width * ap.height;
+                    omega += area / (d2 + area);
+                }
+                const float omegaRef = 0.20;
+                float factor = clamp(sqrt(omega / omegaRef), 0.55, 1.65);
+                band *= mix(1.0, factor, apStrength);
+            }
             irradianceSat = mix(irradianceSat, band, interiorBandW);
         }
         float3 diffuseIBL = kD * irradianceSat * albedo;
