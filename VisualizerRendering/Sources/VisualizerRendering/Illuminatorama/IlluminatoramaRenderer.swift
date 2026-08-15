@@ -965,6 +965,24 @@ public final class IlluminatoramaRenderer {
     public var interiorIBLUp: Float = 1
     public var interiorIBLSide: Float = 1
     public var interiorAmbient: Float = 1
+    /// Interior irradiance BANDS — the room's own three-band diffuse environment
+    /// (the lawn-green-ceiling fix). The irradiance cube is baked from the outdoor
+    /// sky dome, so an interior ceiling (N.y = −1) otherwise samples the GROUND
+    /// half and renders in the lawn's colour — the `interiorIBL*` scalars can dim
+    /// that, never recolour it. Interior fragments blend their diffuse irradiance
+    /// toward these host-authored values by `interiorIrradianceWeight`
+    /// (0 = the exact cube sample, the default — byte-identical for every scene
+    /// that never opts in; hosts ramp the weight with daylight so night keeps the
+    /// cube). As the weight → 1 the DIFFUSE interior scalar folds to 1.0 (the
+    /// bands already carry the up/side weighting it faked); specular keeps the
+    /// scalar and the prefiltered cube. Units match the cube sample they replace
+    /// (pre-`iblIntensity` irradiance). Applied by the deferred kernel AND by
+    /// secondary-hit shading (glass refraction / RT reflections / GI), so the room
+    /// seen through a pane agrees with the room beside it.
+    public var interiorIrradianceUp: SIMD3<Float> = .zero
+    public var interiorIrradianceSide: SIMD3<Float> = .zero
+    public var interiorIrradianceDown: SIMD3<Float> = .zero
+    public var interiorIrradianceWeight: Float = 0
 
     /// ── Analytic night sky (stars + moon at SCREEN resolution) ──────────────
     /// The 2048×1024 equirect dome is far coarser than the frame, so celestials
@@ -2831,6 +2849,11 @@ public final class IlluminatoramaRenderer {
         // 0x01 opaque | 0x04 invisible occluder.
         var directSunEnabled: UInt32 = 0
         var transportRayMask: UInt32 = 0x05
+        var _padIrr0: UInt32 = 0; var _padIrr1: UInt32 = 0; var _padIrr2: UInt32 = 0
+        // Interior irradiance bands — mirror of the Metal RTInstUniforms tail.
+        var interiorIrrUp: SIMD4<Float> = .zero
+        var interiorIrrSide: SIMD4<Float> = .zero
+        var interiorIrrDown: SIMD4<Float> = .zero
     }
     /// **The ONE place an instance becomes `RTInstanceData`.** The normal matrix's
     /// column `.w` lanes are dead weight for RT (every consumer builds a float3x3
@@ -7394,6 +7417,13 @@ public final class IlluminatoramaRenderer {
         u.interiorIBLUp = max(0, interiorIBLUp)
         u.interiorIBLSide = max(0, interiorIBLSide)
         u.interiorAmbient = max(0, interiorAmbient)
+        // Interior irradiance bands — same values as the deferred pass, so a GI
+        // bounce or reflection at an interior hit sees the same room it would on
+        // screen (the lawn-green-ceiling fix, secondary side).
+        let rtIrrW = max(0, min(1, interiorIrradianceWeight))
+        u.interiorIrrUp = SIMD4(simd_max(interiorIrradianceUp, .zero), rtIrrW)
+        u.interiorIrrSide = SIMD4(simd_max(interiorIrradianceSide, .zero), 0)
+        u.interiorIrrDown = SIMD4(simd_max(interiorIrradianceDown, .zero), 0)
         // C1 — exactly one sun (see `RTSunOwnership`). This pass is ADDITIVE over a
         // complete deferred frame; with the old "compute direct whenever
         // shadowRays > 0" gate (default 4) and no deferred suppression, flipping
@@ -9295,6 +9325,12 @@ public final class IlluminatoramaRenderer {
         u.interiorIBLUp = max(0, interiorIBLUp)
         u.interiorIBLSide = max(0, interiorIBLSide)
         u.interiorAmbient = max(0, interiorAmbient)
+        // Interior irradiance bands — the room seen THROUGH a pane must agree with
+        // the room beside it (the lawn-green-ceiling fix, glass side).
+        let glassIrrW = max(0, min(1, interiorIrradianceWeight))
+        u.interiorIrrUp = SIMD4(simd_max(interiorIrradianceUp, .zero), glassIrrW)
+        u.interiorIrrSide = SIMD4(simd_max(interiorIrradianceSide, .zero), 0)
+        u.interiorIrrDown = SIMD4(simd_max(interiorIrradianceDown, .zero), 0)
         // ── The night sky, THROUGH the glass ─────────────────────────────────
         // Same fields the deferred sky branch reads, from the same properties, so a
         // window and the sky beside it show one sky. Without this the pane sampled the
@@ -11635,6 +11671,12 @@ public final class IlluminatoramaRenderer {
         u.interiorIBLUp = max(0, interiorIBLUp)
         u.interiorIBLSide = max(0, interiorIBLSide)
         u.interiorAmbient = max(0, interiorAmbient)
+        // Interior irradiance bands. Weight 0 (default) ⇒ the diffuse path is the
+        // exact cube sample ⇒ byte-identical for every scene that never opts in.
+        let irrW = max(0, min(1, interiorIrradianceWeight))
+        u.interiorIrrUp = SIMD4(simd_max(interiorIrradianceUp, .zero), irrW)
+        u.interiorIrrSide = SIMD4(simd_max(interiorIrradianceSide, .zero), 0)
+        u.interiorIrrDown = SIMD4(simd_max(interiorIrradianceDown, .zero), 0)
         // Analytic night sky. All-zero defaults keep the kernel's sky branch an
         // exact no-op; hosts fade the brightnesses with nightBlend themselves.
         u.nightSkyParams = SIMD4(max(0, nightSkyStarBrightness),

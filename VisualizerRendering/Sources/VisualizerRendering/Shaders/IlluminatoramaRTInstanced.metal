@@ -105,6 +105,15 @@ struct RTInstUniforms {
     // below) deliberately do NOT carry 0x04 — an undrawn slab must not appear in
     // the picture. Host default 0x05.
     uint  transportRayMask;
+    uint  _padIrr0; uint _padIrr1; uint _padIrr2;   // align the float4 cluster below
+    // ── Interior irradiance bands (mirror of FrameUniforms.interiorIrr*) ─────
+    // A GI bounce or reflection landing on an interior ceiling must see the
+    // FLOOR's bounce, not the outdoor cube's lawn — same fix, same values, as
+    // the deferred pass. xyz = irradiance, `interiorIrrUp.w` = blend weight
+    // (0 = the exact cube sample — the default, byte-identical).
+    float4 interiorIrrUp;
+    float4 interiorIrrSide;
+    float4 interiorIrrDown;
 };
 
 // ── Curve primitives (#60 item 7) ────────────────────────────────────────────
@@ -231,6 +240,9 @@ static inline SecondaryShadeParams fullRadianceParams(constant RTInstUniforms& u
     p.interiorMask = u.interiorMask;
     p.interiorIBLUp = u.interiorIBLUp; p.interiorIBLSide = u.interiorIBLSide;
     p.interiorAmbient = u.interiorAmbient;
+    p.interiorIrrUp = u.interiorIrrUp.xyz;     p.interiorIrrW = u.interiorIrrUp.w;
+    p.interiorIrrSide = u.interiorIrrSide.xyz;
+    p.interiorIrrDown = u.interiorIrrDown.xyz;
     p.albedoAtlasEnabled = u.albedoAtlasEnabled;
     p.objUVCount = u.objUVCount;
     p.pointLightCount = u.pointLightCount;

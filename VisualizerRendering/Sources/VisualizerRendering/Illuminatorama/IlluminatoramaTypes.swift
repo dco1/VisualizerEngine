@@ -462,6 +462,14 @@ public struct IlluminatoramaFrameUniforms {
     /// the velocity buffer is byte-identical. ONE new 16-byte cluster
     /// (stride 1312 → 1328); mirror of the Metal `FrameUniforms.taaJitterDelta`.
     public var taaJitterDelta: SIMD4<Float> = .zero
+    /// Interior irradiance bands — the lawn-green-ceiling fix. xyz = irradiance,
+    /// `interiorIrrUp.w` = band blend weight (0 = the exact cube sample, the default;
+    /// hosts ramp it with daylight). See the Metal `FrameUniforms` twin for the physics
+    /// and the fold of the diffuse interior scalar. THREE new 16-byte clusters
+    /// (stride 1328 → 1376); mirror of `FrameUniforms.interiorIrr*`.
+    public var interiorIrrUp: SIMD4<Float> = .zero
+    public var interiorIrrSide: SIMD4<Float> = .zero
+    public var interiorIrrDown: SIMD4<Float> = .zero
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20
@@ -1061,6 +1069,10 @@ struct IlluminatoramaGlassRTUniforms {
     /// moon's limb anti-aliasing, exactly as the primary sky branch computes it.
     var nightPixAngle: Float = 0
     var _nightPad0: Float = 0; var _nightPad1: Float = 0; var _nightPad2: Float = 0
+    // Interior irradiance bands — mirror of the Metal GlassRTUniforms tail.
+    var interiorIrrUp: SIMD4<Float> = .zero
+    var interiorIrrSide: SIMD4<Float> = .zero
+    var interiorIrrDown: SIMD4<Float> = .zero
 }
 
 /// Per-frame uniforms for the glass caustics kernels. Mirror of `CausticUniforms`

@@ -368,6 +368,27 @@ struct FrameUniforms {
     // buffer is byte-identical. ONE new 16-byte cluster (stride 1312 → 1328);
     // mirror of IlluminatoramaFrameUniforms.taaJitterDelta.
     float4   taaJitterDelta;
+    // ── Interior irradiance bands (the lawn-green-ceiling fix) ───────────────
+    // A room's own three-band diffuse environment, host-supplied. The irradiance
+    // cube is baked from the OUTDOOR sky dome — sky above, ground below — so an
+    // interior ceiling (N.y = −1) samples the ground half and renders in the
+    // lawn's colour; no scalar can recolour it. Interior fragments
+    // (frame.interiorMask) blend their diffuse irradiance toward these bands by
+    // `interiorIrrUp.w` (0 → exact cube sample, the default — every scene that
+    // never sets it is byte-identical; hosts ramp w with daylight so night keeps
+    // the cube):
+    //   N.y = +1 → interiorIrrUp   (floors: ceiling + wall bounce)
+    //   N.y =  0 → interiorIrrSide (walls: room mix)
+    //   N.y = −1 → interiorIrrDown (ceilings: FLOOR bounce — not lawn)
+    // As w → 1 the DIFFUSE interior scalar folds to 1.0 (the bands already carry
+    // the up/side weighting `interiorIBLUp/Side` faked); the SPECULAR lobe keeps
+    // the scalar and the prefiltered cube. Units are pre-`iblIntensity`
+    // irradiance, exactly like the cube sample they replace.
+    // THREE new 16-byte clusters (stride 1328 → 1376); mirror of
+    // IlluminatoramaFrameUniforms.
+    float4   interiorIrrUp;    // xyz = irradiance, w = band blend weight (0 = off)
+    float4   interiorIrrSide;  // xyz = irradiance, w unused
+    float4   interiorIrrDown;  // xyz = irradiance, w unused
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift

@@ -287,6 +287,12 @@ struct SecondaryShadeParams {
     // (both factors exactly 1.0, an IEEE no-op).
     uint   interiorMask;
     float  interiorIBLUp; float interiorIBLSide; float interiorAmbient;
+    // Interior irradiance bands (mirror of FrameUniforms.interiorIrr*): the room's
+    // own three-band diffuse environment, blended over the cube sample by
+    // `interiorIrrW` on interior hits. 0 (default) ⇒ the exact cube behaviour.
+    float3 interiorIrrUp;   float interiorIrrW;
+    float3 interiorIrrSide; float _padIrrS;
+    float3 interiorIrrDown; float _padIrrD;
     // Albedo atlas: 0 ⇒ fall back to the instance's mean albedo.
     uint   albedoAtlasEnabled;
     uint   objUVCount;      // bound of objUV in float2 entries
@@ -399,13 +405,25 @@ static inline float3 secondaryIndirectFill(float3 hitN, uint hitLayerBits,
                                            texturecube<float, access::sample> irrCube)
 {
     constexpr sampler cubeSmp(filter::linear);
-    float iblK = 1.0, ambK = 1.0;
+    float iblK = 1.0, ambK = 1.0, bandW = 0.0;
     if (p.interiorMask != 0u && hitLayerBits != 0xFFFFFFFFu &&
         (hitLayerBits & p.interiorMask) != 0u) {
         iblK = mix(p.interiorIBLSide, p.interiorIBLUp, saturate(hitN.y));
         ambK = p.interiorAmbient;
+        bandW = saturate(p.interiorIrrW);
     }
-    float3 irr = irrCube.sample(cubeSmp, hitN).rgb * max(0.0, p.skyIntensity) * iblK;
+    // Interior irradiance bands — the deferred kernel's lawn-green-ceiling fix,
+    // applied to a secondary hit the same way: the band replaces the outdoor cube
+    // sample AND folds the diffuse interior scalar to 1 as it takes over (the band
+    // already carries the up/side weighting the scalar faked).
+    float3 cubeIrr = irrCube.sample(cubeSmp, hitN).rgb * iblK;
+    if (bandW > 0.0) {
+        float3 band = mix(p.interiorIrrSide,
+                          hitN.y >= 0.0 ? p.interiorIrrUp : p.interiorIrrDown,
+                          saturate(abs(hitN.y)));
+        cubeIrr = mix(cubeIrr, band, bandW);
+    }
+    float3 irr = cubeIrr * max(0.0, p.skyIntensity);
     float upness = saturate(hitN.y * 0.5 + 0.5);
     return irr + mix(p.skyAmbient * 0.4, p.skyAmbient, upness) * ambK;
 }

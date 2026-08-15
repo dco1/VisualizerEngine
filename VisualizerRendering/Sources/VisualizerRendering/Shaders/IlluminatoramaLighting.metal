@@ -928,11 +928,22 @@ kernel void illumi_lighting(
     // no-ops (×1.0) for every scene that never sets `interiorMask`.
     float interiorIBLK = 1.0;
     float interiorAmbK = 1.0;
+    // Interior irradiance-band blend weight (FrameUniforms.interiorIrrUp.w). 0 for
+    // every exterior fragment and every scene that never sets the bands — the diffuse
+    // path below is then the exact cube sample it always was.
+    float interiorBandW = 0.0;
     if (frame.interiorMask != 0u && fragLayer != 0xFFFFFFFFu &&
         (fragLayer & frame.interiorMask) != 0u) {
         interiorIBLK = mix(frame.interiorIBLSide, frame.interiorIBLUp, saturate(N.y));
         interiorAmbK = frame.interiorAmbient;
+        interiorBandW = saturate(frame.interiorIrrUp.w);
     }
+    // The DIFFUSE lobe's interior factor. As the host's irradiance bands take over
+    // (w → 1) it folds to exactly 1.0: the bands already carry the up/side/down
+    // weighting the `interiorIBLUp/Side` scalars faked, and scaling them again would
+    // double-apply it. The SPECULAR lobe keeps `interiorIBLK` — it still samples the
+    // outdoor prefiltered cube (RT reflections own the structured part of that story).
+    float interiorIBLKd = mix(interiorIBLK, 1.0, interiorBandW);
 
     // ── Indirect (IBL + optional DDGI for diffuse) ──────────────────
     float3 indirect;
@@ -1022,6 +1033,19 @@ kernel void illumi_lighting(
         float desat = frame.iblDiffuseDesaturation * smoothstep(0.35, 0.75, srcSat);
         float effBoost = satBoost * (1.0 - desat);
         float3 irradianceSat = max(mix(float3(irrLum), irradianceSrc, effBoost), 0.0);
+        // ── Interior irradiance bands (see FrameUniforms.interiorIrr*) ───────
+        // Replace the OUTDOOR cube's irradiance with the room's own three-band
+        // environment on interior fragments: a ceiling's hemisphere sees the
+        // floor's bounce, not the lawn on the far side of it. Host-authored
+        // values — the grey-probe saturation rescue above exists for baked
+        // probes and must not distort them, so the blend happens after it.
+        if (interiorBandW > 0.0) {
+            float3 band = mix(frame.interiorIrrSide.xyz,
+                              N.y >= 0.0 ? frame.interiorIrrUp.xyz
+                                         : frame.interiorIrrDown.xyz,
+                              abs(N.y));
+            irradianceSat = mix(irradianceSat, band, interiorBandW);
+        }
         float3 diffuseIBL = kD * irradianceSat * albedo;
 
         // Specular IBL: sample prefilteredCube along the world reflection
@@ -1091,8 +1115,9 @@ kernel void illumi_lighting(
 
         // Diffuse and the ambient supplement below keep RAW `ao`; only the specular
         // lobe takes `specOcc`.
-        indirect = (diffuseIBL * ao + specularIBL * specOcc) * frame.iblIntensity * interiorIBLK;
-        dbgDiffuseIBL = diffuseIBL * frame.iblIntensity * ao * interiorIBLK;
+        indirect = (diffuseIBL * ao * interiorIBLKd + specularIBL * specOcc * interiorIBLK)
+                 * frame.iblIntensity;
+        dbgDiffuseIBL = diffuseIBL * frame.iblIntensity * ao * interiorIBLKd;
         dbgSpecularIBL = specularIBL * frame.iblIntensity * specOcc * interiorIBLK;
         // ── Cloth sheen, environment arm ─────────────────────────────────────
         // The direct arm lives in `brdf`; this is the other half. A cushion in a room the sun
@@ -1104,7 +1129,7 @@ kernel void illumi_lighting(
         if (sheenStrength > 0.0) {
             float3 sheenEnv = clothSheenColor(albedo)
                             * (sheenStrength * clothSheenEnvAlbedo(NdotV))
-                            * irradianceSat * ao * frame.iblIntensity * interiorIBLK;
+                            * irradianceSat * ao * frame.iblIntensity * interiorIBLKd;
             indirect += sheenEnv;
             clothSheen += sheenEnv;
         }

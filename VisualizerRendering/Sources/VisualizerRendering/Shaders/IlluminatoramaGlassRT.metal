@@ -123,6 +123,14 @@ struct GlassRTUniforms {
     float4 nightSunDir;         // xyz = unit direction toward the (below-horizon) sun
     float  nightPixAngle;       // angular size of one output pixel (radians)
     float  _nightPad0; float _nightPad1; float _nightPad2;
+    // ── Interior irradiance bands (mirror of FrameUniforms.interiorIrr*) ─────
+    // The room seen THROUGH a pane must agree with the room beside it: without
+    // these, the deferred pass fixes the lawn-green ceiling and the same ceiling
+    // through glass keeps it. xyz = irradiance, `interiorIrrUp.w` = blend weight
+    // (0 = the exact cube sample — the default, byte-identical).
+    float4 interiorIrrUp;
+    float4 interiorIrrSide;
+    float4 interiorIrrDown;
 };
 
 /// This pass's view of the shared night-sky currency — the mirror of
@@ -218,6 +226,9 @@ static inline SecondaryShadeParams glassSecondaryParams(constant GlassRTUniforms
     p.interiorMask = u.interiorMask;
     p.interiorIBLUp = u.interiorIBLUp; p.interiorIBLSide = u.interiorIBLSide;
     p.interiorAmbient = u.interiorAmbient;
+    p.interiorIrrUp = u.interiorIrrUp.xyz;     p.interiorIrrW = u.interiorIrrUp.w;
+    p.interiorIrrSide = u.interiorIrrSide.xyz;
+    p.interiorIrrDown = u.interiorIrrDown.xyz;
     p.albedoAtlasEnabled = u.albedoAtlasEnabled;
     p.objUVCount = u.objUVCount;
     p.pointLightCount = u.pointLightCount;
