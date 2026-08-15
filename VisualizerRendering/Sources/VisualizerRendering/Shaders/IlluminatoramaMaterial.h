@@ -137,6 +137,20 @@ static inline float2 hexHash2D(float2 p) {
                   float(iy & 0xFFu) / 128.0f - 1.0f);
 }
 
+// S2.5 half 2 — one scalar hash in [-1, 1) for the per-PATTERN-CELL value jitter
+// (consumed in IlluminatoramaGBuffer.metal; the field contract lives on
+// `Instance.patternCells` in IlluminatoramaCommon.h). Same integer bit-mixing family and
+// the same overflow discipline as `hexHash2D` above: round in float, convert to int ONCE,
+// then mix in uint where wrapping multiply is defined behaviour. The input is already
+// integer-valued (`floor(uv * patternCells)`); the +0.5 round only guards FP noise.
+static inline float patternCellHash(float2 cell) {
+    int cx = int(floor(cell.x + 0.5f));
+    int cy = int(floor(cell.y + 0.5f));
+    uint h = uint(cx) * 73856093u ^ uint(cy) * 19349663u;
+    h ^= h >> 11; h *= 0x45d9f3bu; h ^= h >> 16;
+    return float(h & 0xFFFFu) / 32768.0f - 1.0f;
+}
+
 // `strength` gates the whole effect. When strength <= 0 (the DEFAULT for every
 // scene that never opts in) this returns EXACTLY `sampleAtlasAspect(atlas, s, uv,
 // slice, uvScale, duvdx, duvdy)` — the identical single texture read the pre-anti-tiling shader

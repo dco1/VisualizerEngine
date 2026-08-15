@@ -408,6 +408,22 @@ fragment GBufferOut illumi_fs(
                                     albedoSliceMean,
                                     frame.antiTilingStrength * inst.antiTilingScale, duvdx, duvdy);
         albedo = tx.rgb;
+        // S2.5 half 2 — per-PATTERN-CELL value jitter, the COHERENT categories' de-repeat
+        // (full contract on `Instance.patternCells` in IlluminatoramaCommon.h). The hex
+        // blend above is invalid for a tile grid or a plank run (it superimposes misaligned
+        // copies), so those materials ship antiTilingScale = 0 and, until this line, had no
+        // de-repeat at all. `in.uv` counts up across the whole surface — only the atlas
+        // LOOKUP wraps — so `floor(uv * patternCells)` indexes each physical tile / plank /
+        // course uniquely over the entire floor, and a ± tone multiplier hashed from it
+        // breaks the macro repeat with no UV displacement (grout and seams stay put) and no
+        // extra texture tap. A bonded axis ships patternCells = 0 there: floor(uv·0) = 0
+        // keeps that axis's index constant, so a running-bond COURSE varies as a whole and
+        // a cell boundary never cuts through an offset tile mid-body.
+        // `patternJitter == 0` — the default, and every scene that never opts in — is an
+        // exact no-op, so Visualizer is byte-identical.
+        if (inst.patternJitter != 0.0f) {
+            albedo *= 1.0f + inst.patternJitter * patternCellHash(floor(in.uv * inst.patternCells));
+        }
     }
     // Phase 4.17 — modulate albedo by per-vertex color (default white,
     // so a no-op for meshes that ship no .color source). This is where
