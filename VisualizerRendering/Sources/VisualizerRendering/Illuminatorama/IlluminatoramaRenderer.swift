@@ -722,6 +722,25 @@ public final class IlluminatoramaRenderer {
     // RT owns scene-geometry reflections — same "RT owns it" contract the sun
     // already uses.
     public var rtReflectionsEnabled: Bool = false
+    /// **Reflections as their own TLAS trigger (S3.4).** Default `false`: the TLAS is
+    /// built only for extracted-scene RT or AAA glass, exactly as before, and every
+    /// existing host is byte-identical. When `true` (and `rtEnabled` +
+    /// `rtReflectionsEnabled`), the extracted-instance TLAS is built even for a scene
+    /// with no glass and no full-scene RT — under the **glass-arm caps**, not the strict
+    /// live-RT ones, and for the same reason glass gets the higher ceiling: the
+    /// per-pixel cost is bounded by the fraction of the frame that *qualifies*
+    /// (`roughness ≤ rtReflRoughnessCutoff`), not by the whole frame, and hosts run
+    /// reflections in a settled/photo lane. The pass this feeds is the SAME TLAS
+    /// lighting kernel; a host that wants reflections WITHOUT paying the sun/GI ray
+    /// terms sets `rtSunOwnership = .deferred` and `rtGIStrength = 0` — each term is
+    /// gated independently in the kernel, so those rays are never traced.
+    ///
+    /// This exists because the alternative — enabling `buildRTFromExtractedScene` —
+    /// swaps the caps to the strict live-RT pair (128 groups / 150 k tris), which a
+    /// real architectural document busts (4000 Sunset measures 176 / 490 k), tripping
+    /// `.sceneTooHeavy` and taking RT GLASS down with it. Reflections must not be able
+    /// to regress glass; on this trigger they share its caps instead.
+    public var rtTLASForReflections: Bool = false
     /// Master scale on the reflection contribution. 0 = off.
     public var rtReflStrength: Float = 1.0
     /// Max reflection ray length, metres.
@@ -6310,7 +6329,12 @@ public final class IlluminatoramaRenderer {
         let hasGlass = !glassGroups.isEmpty
         let extractedRT = buildRTFromExtractedScene && rtEnabled
             && !meshGroups.isEmpty && !instances.isEmpty
-        guard rtTLASSupported, (extractedRT || hasGlass) else {
+        // Third trigger (S3.4): RT reflections opted into the TLAS on their own. Rides
+        // the glass-arm caps below (extractedRT stays false), so it can never trip the
+        // strict live-RT pair on a real document — see `rtTLASForReflections`.
+        let reflectionsRT = rtTLASForReflections && rtEnabled && rtReflectionsEnabled
+            && !meshGroups.isEmpty && !instances.isEmpty
+        guard rtTLASSupported, (extractedRT || hasGlass || reflectionsRT) else {
             rtTLASActive = false; return }
         // Curve primitives (#60 item 7): adopt registry changes BEFORE the
         // topology hash, so a registration/unregistration lands as a rebuild.
