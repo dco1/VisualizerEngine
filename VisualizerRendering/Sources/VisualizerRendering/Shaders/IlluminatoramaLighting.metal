@@ -336,12 +336,29 @@ static inline float3 brdfDiffuse(
 // approximation pending the fitted GGX LTC specular LUT (increment 2).
 
 // Vector irradiance of one polygon edge (clamped-cosine), v1/v2 normalised.
+//
+// Hill & Heitz's rational fit of θ/sin θ (the LTC reference implementation), NOT the
+// literal acos form this shipped with first. The literal form is singular exactly where
+// a WINDOW PORTAL lives: a fragment coplanar with the light (the wall the portal is cut
+// into — every fragment of it) sees two corners in near-opposite directions, θ→π,
+// sin θ→0, θ/sin θ→∞ while cross(v1,v2)→0 — 0·∞ = NaN, and the TAA settle smears one
+// NaN into a fully black frame (measured: the first portal arm rendered 1 152 000 black
+// pixels). A −0.9999 clamp tames the infinity but leaves acos's catastrophic
+// cancellation at both ends — salt-and-pepper speckle across any coplanar floor or
+// ceiling. The fit is stable at BOTH limits (the x → −1 branch pairs the 1/√(1−x²)
+// growth against the cross's shrink analytically) and is what production LTC ships.
+// Visualizer's softboxes float in open space and never exercised these limits; the
+// sub-percent difference from the acos form elsewhere is the fit's documented accuracy.
 static inline float3 ltcIntegrateEdge(float3 v1, float3 v2) {
-    float  cosT  = clamp(dot(v1, v2), -1.0, 1.0);
-    float  theta = acos(cosT);
-    float3 cr    = cross(v1, v2);
-    float  s     = (theta > 1e-5) ? theta / sin(theta) : 1.0;   // sinc limit at θ→0
-    return cr * s;
+    float x = clamp(dot(v1, v2), -1.0, 1.0);
+    float y = abs(x);
+    float a = 0.8543985 + (0.4965155 + 0.0145206 * y) * y;
+    float b = 3.4175940 + (4.1616724 + y) * y;
+    float v = a / b;
+    float thetaSinTheta = (x > 0.0)
+        ? v
+        : 0.5 * rsqrt(max(1.0 - x * x, 1e-7)) - v;
+    return cross(v1, v2) * thetaSinTheta;
 }
 
 // Clamped-cosine form factor of the quad (corners p0..p3 CCW, relative to the
@@ -349,7 +366,13 @@ static inline float3 ltcIntegrateEdge(float3 v1, float3 v2) {
 // clamps the receiver to the front hemisphere, two-sided takes |·|.
 static inline float ltcPolygonForm(float3 N, float3 p0, float3 p1, float3 p2, float3 p3,
                                    bool twoSided) {
-    float3 L0 = normalize(p0), L1 = normalize(p1), L2 = normalize(p2), L3 = normalize(p3);
+    // Length-guarded normalise: a fragment AT a light corner (a portal's jamb pixel)
+    // hands normalize() a zero vector — the remaining NaN seed once the edge integral
+    // above went stable.
+    float3 L0 = p0 * rsqrt(max(dot(p0, p0), 1e-8));
+    float3 L1 = p1 * rsqrt(max(dot(p1, p1), 1e-8));
+    float3 L2 = p2 * rsqrt(max(dot(p2, p2), 1e-8));
+    float3 L3 = p3 * rsqrt(max(dot(p3, p3), 1e-8));
     float3 vsum = ltcIntegrateEdge(L0, L1) + ltcIntegrateEdge(L1, L2)
                 + ltcIntegrateEdge(L2, L3) + ltcIntegrateEdge(L3, L0);
     float z = dot(vsum, N) * (1.0 / (2.0 * M_PI_F));
@@ -379,11 +402,19 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
     window *= window;
     if (window <= 0.0) return float3(0.0);
 
-    // Quad corners relative to the shaded point (CCW seen from +nL).
+    // Quad corners relative to the shaded point — wound CLOCKWISE as seen from +nL,
+    // which is COUNTER-clockwise as seen from a receiver ON the +nL side, the
+    // orientation the edge integral's sign convention wants. The previous (CCW-from-
+    // +nL) order made `z` NEGATIVE at every legitimately-lit receiver: two-sided
+    // lights take |z| and never noticed (every Visualizer softbox is two-sided), but
+    // the first ONE-sided light — a window portal — rendered `max(0, z)` = zero
+    // diffuse everywhere, with normal-map jitter flickering individual pixels across
+    // the clamp as salt-and-pepper speckle. Measured: a ×6 intensity change moved the
+    // near-window floor probe 0.3 luma before this flip.
     float3 p0 = al.center - al.ex - al.ey - worldPos;
-    float3 p1 = al.center + al.ex - al.ey - worldPos;
+    float3 p1 = al.center - al.ex + al.ey - worldPos;
     float3 p2 = al.center + al.ex + al.ey - worldPos;
-    float3 p3 = al.center - al.ex + al.ey - worldPos;
+    float3 p3 = al.center + al.ex - al.ey - worldPos;
 
     // Diffuse — exact polygon clamped-cosine (LTC, M = identity).
     float  ff = ltcPolygonForm(N, p0, p1, p2, p3, twoSided);
@@ -401,19 +432,40 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
         float4 t1 = ltcMat.sample(lutSamp, uv);              // Minv (a,b,c,d)
         float2 t2 = ltcMag.sample(lutSamp, uv).xy;           // (scale, bias)
         // Tangent frame: T1 in the view-incidence plane (matches the fit's frame).
-        float3 T1 = normalize(V - N * dot(V, N));
+        // Guarded for V ∥ N — a fragment viewed dead-on (the wall straight ahead of a
+        // walkthrough eye) makes V − N(V·N) a zero vector, and normalize(0) is the other
+        // NaN this pass can seed. At normal incidence the LTC frame's azimuth is
+        // irrelevant (the fit is isotropic there), so any tangent perpendicular to N is
+        // exact, not approximate.
+        float3 Tv = V - N * dot(V, N);
+        float  TvLen = length(Tv);
+        float3 T1 = (TvLen > 1e-5) ? Tv / TvLen
+                  : normalize(cross(N, (fabs(N.y) < 0.99) ? float3(0, 1, 0) : float3(1, 0, 0)));
         float3 T2 = cross(N, T1);
         float3x3 worldToTan = transpose(float3x3(T1, T2, N)); // rows = T1,T2,N
         float3x3 Minv = float3x3(float3(t1.x, 0.0, t1.y),
                                  float3(0.0,  1.0, 0.0),
                                  float3(t1.z, 0.0, t1.w));
-        float3 q0 = normalize(Minv * (worldToTan * p0));
-        float3 q1 = normalize(Minv * (worldToTan * p1));
-        float3 q2 = normalize(Minv * (worldToTan * p2));
-        float3 q3 = normalize(Minv * (worldToTan * p3));
+        // Same corner-fragment length guard as ltcPolygonForm — p ≈ 0 at a jamb pixel.
+        float3 m0 = Minv * (worldToTan * p0), m1 = Minv * (worldToTan * p1);
+        float3 m2 = Minv * (worldToTan * p2), m3 = Minv * (worldToTan * p3);
+        float3 q0 = m0 * rsqrt(max(dot(m0, m0), 1e-8));
+        float3 q1 = m1 * rsqrt(max(dot(m1, m1), 1e-8));
+        float3 q2 = m2 * rsqrt(max(dot(m2, m2), 1e-8));
+        float3 q3 = m3 * rsqrt(max(dot(m3, m3), 1e-8));
         float3 vsum = ltcIntegrateEdge(q0, q1) + ltcIntegrateEdge(q1, q2)
                     + ltcIntegrateEdge(q2, q3) + ltcIntegrateEdge(q3, q0);
         float ltcSpec = max(0.0, vsum.z / (2.0 * M_PI_F));
+        // Firefly guard, measured not hypothetical: at grazing incidence on a low-roughness
+        // texel the inverse LTC matrix stretches the polygon toward the horizon and the
+        // integral spikes — white sparkle clusters on any wall flanking a window PORTAL
+        // (an area light coplanar with real walls exercises grazing geometry a floating
+        // softbox never does), and the worst spikes go non-finite and TAA smears them into
+        // black holes. A clamped-cosine form factor is ≤ 1 by definition; 2.0 leaves the
+        // fit slack while amputating the divergence, and the non-finite scrub is the last
+        // line — one NaN pixel poisons the whole neighbourhood through bloom.
+        if (!isfinite(ltcSpec)) ltcSpec = 0.0;
+        ltcSpec = min(ltcSpec, 2.0);
         spec = ltcSpec * (F0 * t2.x + (1.0 - F0) * t2.y);
     } else {
         // Fallback — most-representative-point: the rect point closest to the
@@ -899,6 +951,10 @@ kernel void illumi_lighting(
     float3 areaSum = float3(0.0);
     bool areaLTC = frame.areaLTCEnabled != 0u;
     for (uint i = 0; i < frame.areaLightCount; ++i) {
+        // Light-layer mask — same rule as point/spot. An area light has no shadow map
+        // and no visibility term, so the mask is its ONLY containment (a window portal
+        // without it lights the yard through the back of its own wall).
+        if ((areaLights[i].layerMask & fragLayer) == 0u) continue;
         areaSum += evalAreaLight(areaLights[i], worldPos, N, V, albedo, metallic, roughness,
                                  ltcMat, ltcMag, areaLTC);
     }

@@ -993,6 +993,11 @@ public final class IlluminatoramaRenderer {
     public var interiorApertures: [IlluminatoramaInteriorAperture] = []
     /// 0 = off (default); 1 = the full gradation. Fractional = partial (a look dial).
     public var interiorApertureGradation: Float = 0
+    /// A/B DEBUG: overrides the LTC-specular arm of the area-light eval (nil = the
+    /// baked LUT's own validation decides, the shipped behaviour). `false` forces the
+    /// most-representative-point fallback — the bisect lever for separating "the LTC
+    /// transform misbehaves" from "the polygon integral misbehaves" on a live scene.
+    public var areaLTCOverride: Bool?
 
     /// ── Analytic night sky (stars + moon at SCREEN resolution) ──────────────
     /// The 2048×1024 equirect dome is far coarser than the frame, so celestials
@@ -11569,7 +11574,7 @@ public final class IlluminatoramaRenderer {
             ddgiIrrCacheBlend: max(0.0, min(1.0, ddgiIrrCacheBlend)),
             leafTransmission: max(0, leafTransmission),
             areaLightCount: UInt32(areaLights.count),
-            areaLTCEnabled: ltcValidated ? 1 : 0,
+            areaLTCEnabled: (areaLTCOverride ?? ltcValidated) ? 1 : 0,
             directionalLightCount: UInt32(extraDirectionals.count),
             plushSheen: max(0, plushSheen),
             plushTransmission: max(0, plushTransmission)

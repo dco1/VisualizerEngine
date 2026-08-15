@@ -505,20 +505,26 @@ public struct IlluminatoramaAreaLight {
     /// 1 = emits from both faces; 0 = front only (the `+normal` hemisphere).
     public var twoSided: Float
     public var ex: SIMD3<Float>              // half-width edge vector (world)
-    public var _pad0: Float = 0
+    /// Light-layer mask (was `_pad0` — same 4 bytes, stride unchanged; the rule
+    /// PointLight/SpotLight already follow). Default 0xFFFFFFFF ⇒ affects every
+    /// fragment — byte-identical for every existing caller. An area light has no
+    /// shadow map and no visibility term, so this is its only containment.
+    public var layerMask: UInt32 = 0xFFFF_FFFF
     public var ey: SIMD3<Float>              // half-height edge vector (world)
     public var _pad1: Float = 0
     public var color: SIMD3<Float>           // pre-multiplied intensity
     public var radius: Float                 // distance-falloff range (metres)
 
     public init(center: SIMD3<Float>, ex: SIMD3<Float>, ey: SIMD3<Float>,
-                color: SIMD3<Float>, radius: Float, twoSided: Bool = false) {
+                color: SIMD3<Float>, radius: Float, twoSided: Bool = false,
+                layerMask: UInt32 = 0xFFFF_FFFF) {
         self.center = center
         self.ex = ex
         self.ey = ey
         self.color = color
         self.radius = radius
         self.twoSided = twoSided ? 1 : 0
+        self.layerMask = layerMask
     }
 }
 

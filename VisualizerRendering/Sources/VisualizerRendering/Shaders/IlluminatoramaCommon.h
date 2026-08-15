@@ -422,7 +422,12 @@ struct PointLight {
 // Rectangle corners = center ± ex ± ey; emitting normal = normalize(cross(ex,ey)).
 struct AreaLight {
     float3 center;   float twoSided;   // twoSided: 1 = emit both faces, 0 = front only
-    float3 ex;       float _pad0;      // half-width edge vector (world)
+    // Light-layer mask (was `_pad0` — same 4 bytes, stride unchanged; same rule as
+    // PointLight/SpotLight). Default 0xFFFFFFFF ⇒ affects every fragment,
+    // byte-identical to the pre-mask behaviour. This is what CONTAINS a window
+    // portal: an unmasked area light has no visibility term and no shadow map, so
+    // without it a portal lights the yard through the back of its own wall.
+    float3 ex;       uint layerMask;   // half-width edge vector (world) + mask
     float3 ey;       float _pad1;      // half-height edge vector (world)
     float3 color;    float radius;     // premultiplied color + distance-falloff range
 };
