@@ -26,7 +26,9 @@ public struct IlluminatoramaFrameUniforms {
     /// directions back into world space for cubemap sampling.
     public var invView: simd_float4x4
     public var cameraWorldPos: SIMD3<Float>
-    public var _padCamera: Float = 0
+    /// Aerial-perspective extinction σ (1/m); 0 = exact no-op. Repurposes the former
+    /// `_padCamera` pad — see the Metal twin in IlluminatoramaCommon.h for the contract.
+    public var aerialPerspectiveDensity: Float = 0
     public var directionalLightDir: SIMD3<Float>      // world-space, toward light
     public var _padDir: Float = 0
     public var directionalLightColor: SIMD3<Float>    // pre-multiplied intensity

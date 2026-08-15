@@ -51,7 +51,15 @@ struct FrameUniforms {
     float4x4 invProjection;
     float4x4 invView;
     float3   cameraWorldPos;
-    float    _padCamera;
+    // Aerial perspective — extinction coefficient σ (1/m) for the distance-haze blend the
+    // deferred lighting pass applies to its FULL composite (never the isolated debug
+    // terms): `color = mix(airlight, color, exp(-σ·viewDist))`, airlight sampled from the
+    // prefiltered sky cube at the view azimuth's horizon so it follows time of day with no
+    // extra plumbing. Repurposes the former `_padCamera` slot. 0 — the default, and every
+    // scene that never opts in — is an exact no-op. A clear-day Rayleigh σ is ~1e-4
+    // (visibility ≈ 39 km: 4 % haze at 400 m); this is the physically-plausible scale,
+    // not a fog effect.
+    float    aerialPerspectiveDensity;   // was _padCamera
     float3   directionalLightDir;
     float    _padDir;
     float3   directionalLightColor;

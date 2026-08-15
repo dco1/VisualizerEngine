@@ -1929,6 +1929,15 @@ public final class IlluminatoramaRenderer {
     public var contactShadowLength: Float = 0.05
     public var contactShadowSteps: UInt32 = 12
     public var contactShadowThickness: Float = 0.02
+    /// Aerial perspective — extinction coefficient σ (1/m) for the distance-haze blend
+    /// applied to the deferred lighting pass's FULL composite (never the isolated debug
+    /// terms): `mix(airlight, color, exp(-σ·viewDist))`, with the airlight colour sampled
+    /// from the prefiltered sky cube at the view azimuth's horizon, so it follows time of
+    /// day and sky state with no host plumbing. 0 (the default, and every scene that never
+    /// opts in) = an EXACT shader no-op. Physically plausible clear-day Rayleigh is ~1e-4
+    /// (≈4 % haze at 400 m) — this is the far-field cue that keeps a distant ground plane
+    /// from arriving at the horizon fully saturated, not a fog effect.
+    public var aerialPerspectiveDensity: Float = 0
     /// Screen-space subsurface scattering (issue #65). Jimenez-style separable SSS
     /// for skin / wax / marble / food. `sssStrength` 0 = OFF → the lighting pass
     /// skips the side-buffer write and the blur/composite passes aren't encoded →
@@ -11632,6 +11641,8 @@ public final class IlluminatoramaRenderer {
         u.contactShadowLength    = max(0, contactShadowLength)
         u.contactShadowSteps     = min(max(contactShadowSteps, 1), 32)
         u.contactShadowThickness = max(0, contactShadowThickness)
+        // Aerial perspective. 0 → exact no-op (the lighting kernel skips the blend).
+        u.aerialPerspectiveDensity = max(0, aerialPerspectiveDensity)
         // Screen-space subsurface scattering (issue #65). 0 strength → no-op (the
         // lighting pass skips the side-buffer write; the blur/composite passes
         // aren't encoded). The env override (VIZ_ILLUMI_SSS) wins for headless verify.

@@ -1398,6 +1398,38 @@ kernel void illumi_lighting(
         case 17u: color = clothSheen;     break;  // cloth sheen (velvet/linen/wool)
         default: break;                           // 0 = full composite
     }
+    // ── Aerial perspective (opt-in; frame.aerialPerspectiveDensity 0 ⇒ exact no-op) ──────
+    // The far-field cue a normal frame never had (PHOTOREALISM #10 cause c): distant
+    // geometry arrives at the horizon fully saturated and butts the sky's haze in one
+    // pixel row. Beer–Lambert extinction toward an airlight colour sampled from the
+    // prefiltered sky cube at the VIEW AZIMUTH's horizon — the inscatter the atmosphere
+    // actually shows in that direction, so the tint follows time of day, sun azimuth and
+    // sky state with no host plumbing, and goes dark at night by itself. Applied to the
+    // FULL composite only: an isolated debug term must stay the term it names, or every
+    // term-decomposition instrument in this project inherits a distance-dependent bias.
+    // At the physically-plausible σ ≈ 1e-4 an interior (< 20 m) sits at T > 0.998 —
+    // invisible — so this is a statement about the far field, not a fog look.
+    if (frame.aerialPerspectiveDensity > 0.0 && frame.debugTerm == 0u && kLightingIBLEnabled) {
+        float viewDist = length(frame.cameraWorldPos - worldPos);
+        float t = exp(-frame.aerialPerspectiveDensity * viewDist);
+        if (t < 0.9999) {
+            float3 vd = worldPos - frame.cameraWorldPos;
+            float horiz = length(vd.xz);
+            // Degenerate straight-down view: no meaningful azimuth, and the ground there
+            // is metres away anyway — skip rather than sample a garbage direction.
+            if (horiz > 1e-4) {
+                constexpr sampler apSampler(filter::linear, mip_filter::linear);
+                // Just above the horizon (the below-horizon cube rows are ground fill),
+                // at a coarse mip: the broad inscatter colour, not a cloud texel.
+                float3 hDir = normalize(float3(vd.x / horiz, 0.03, vd.z / horiz));
+                float  mips = float(max(frame.iblPrefilteredMipCount, 1u));
+                float3 airlight = float3(prefilteredCube.sample(apSampler, hDir,
+                                                                level(max(mips - 3.0, 0.0))).rgb)
+                                  * frame.iblIntensity;
+                color = mix(airlight, color, t);
+            }
+        }
+    }
     outHDR.write(half4(half3(color), 1.0h), gid);
 
     // Issue #65 — hand the diffuse-lit term to the separable SSS blur. rgb = the
