@@ -1161,6 +1161,10 @@ kernel void illumi_lighting(
         // floor's bounce, not the lawn on the far side of it. Host-authored
         // values — the grey-probe saturation rescue above exists for baked
         // probes and must not distort them, so the blend happens after it.
+        // The daylight-aperture gradation factor (Stage D below) — computed once here
+        // because BOTH band consumers grade by it: the diffuse band on N and the
+        // specular band on R. Position-dependent only, so one value serves both.
+        float apBandFactor = 1.0;
         if (interiorBandW > 0.0) {
             float3 band = mix(frame.interiorIrrSide.xyz,
                               N.y >= 0.0 ? frame.interiorIrrUp.xyz
@@ -1205,7 +1209,8 @@ kernel void illumi_lighting(
                 }
                 const float omegaRef = 0.20;
                 float factor = clamp(sqrt(omega / omegaRef), 0.55, 1.65);
-                band *= mix(1.0, factor, apStrength);
+                apBandFactor = mix(1.0, factor, apStrength);
+                band *= apBandFactor;
             }
             irradianceSat = mix(irradianceSat, band, interiorBandW);
         }
@@ -1223,6 +1228,28 @@ kernel void illumi_lighting(
         float mipCount = float(max(frame.iblPrefilteredMipCount, 1u));
         float lod = roughness * (mipCount - 1.0);
         float3 specEnv = float3(prefilteredCube.sample(cubeSampler, R, level(lod)).rgb);
+        // ── Interior irradiance bands, SPECULAR half (the lawn-green fridge) ─────
+        // The prefiltered cube is the OUTDOOR world, and indoors it is wrong CONTENT
+        // at every roughness — a rough interior lobe integrates the cube's lawn/
+        // horizon ring on every wall-normal surface. Dielectrics dilute it through
+        // albedo; METALS show it pure (measured at the kitchen hero: fridge face
+        // (116, 120, 85) — G > R with blue collapsed, the lawn's exact signature —
+        // beside warm dielectrics on every side). The diffuse half was banded on
+        // 2026-08-15; this is the same replacement along the REFLECTION direction,
+        // graded by the same aperture proximity. The roughness ramp exists only to
+        // protect the sharp-lobe story that RT reflections own (mirror 0.02, off-TV
+        // glass 0.04 stay on cube/RT); by brushed steel's 0.28 mean the band has
+        // essentially taken over. interiorBandW = 0 ⇒ exact no-op, byte-identical
+        // for every scene that never sets the bands.
+        float specBandW = 0.0;
+        if (interiorBandW > 0.0) {
+            float3 specBand = mix(frame.interiorIrrSide.xyz,
+                                  R.y >= 0.0 ? frame.interiorIrrUp.xyz
+                                             : frame.interiorIrrDown.xyz,
+                                  abs(R.y)) * apBandFactor;
+            specBandW = interiorBandW * smoothstep(0.05, 0.30, roughness);
+            specEnv = mix(specEnv, specBand, specBandW);
+        }
         float3 specularIBL;
         if (kLightingDFGLUTEnabled) {  // function_constant(2)
             constexpr sampler dfgSampler(filter::linear, address::clamp_to_edge);
@@ -1277,11 +1304,15 @@ kernel void illumi_lighting(
         float specOcc = saturate(pow(NdotV + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
 
         // Diffuse and the ambient supplement below keep RAW `ao`; only the specular
-        // lobe takes `specOcc`.
-        indirect = (diffuseIBL * ao * interiorIBLKd + specularIBL * specOcc * interiorIBLK)
+        // lobe takes `specOcc`. The specular interior factor folds to 1.0 exactly as
+        // far as the band replaced the cube (`specBandW`) — the bands carry their own
+        // level, and scaling them by the cube-era `interiorIBLK` would double-apply
+        // it. At specBandW = 0 this is bit-identically the old product.
+        float interiorIBLKs = mix(interiorIBLK, 1.0, specBandW);
+        indirect = (diffuseIBL * ao * interiorIBLKd + specularIBL * specOcc * interiorIBLKs)
                  * frame.iblIntensity;
         dbgDiffuseIBL = diffuseIBL * frame.iblIntensity * ao * interiorIBLKd;
-        dbgSpecularIBL = specularIBL * frame.iblIntensity * specOcc * interiorIBLK;
+        dbgSpecularIBL = specularIBL * frame.iblIntensity * specOcc * interiorIBLKs;
         // ── Cloth sheen, environment arm ─────────────────────────────────────
         // The direct arm lives in `brdf`; this is the other half. A cushion in a room the sun
         // never reaches is lit almost entirely by the environment, and the Phase-7b bolt-on
