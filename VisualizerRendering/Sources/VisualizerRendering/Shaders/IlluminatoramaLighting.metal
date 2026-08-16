@@ -379,6 +379,52 @@ static inline float ltcPolygonForm(float3 N, float3 p0, float3 p1, float3 p2, fl
     return twoSided ? abs(z) : max(0.0, z);
 }
 
+// Clip the LTC-space quad to z ≥ 0 — the shading horizon in clamped-cosine space —
+// before edge integration (Heitz et al. 2016, the reference implementation's 16-case
+// table; cases 5 and 10 are the impossible alternating configurations). Operates on
+// UNNORMALISED vertices: each below-horizon vertex is replaced by the z = 0 intercept
+// of its edge, which is a linear combination that only means "the intercept" before
+// normalisation. Returns the clipped vertex count (0, 3, 4 or 5) and pads L[3]/L[4]
+// with L[0] so the caller can integrate a fixed edge list.
+//
+// WHY: without this, the below-horizon part of the transformed polygon feeds the edge
+// integral — the grazing-incidence divergence the firefly clamp below was amputating.
+// Measured on the portal harness (a wall-coplanar area light drives every flanking
+// floor/ceiling fragment through exactly this geometry): the unclipped integral
+// scattered 73 817 sparkle px across the isolated area term where the MRP fallback
+// shows 4 010. The DIFFUSE polygon form above keeps its clipless `max(0, z)`
+// deliberately — it never diverges, and every shipped interior level was calibrated
+// against it.
+static inline int ltcClipQuadToHorizon(thread float3* L) {
+    int config = 0;
+    if (L[0].z > 0.0) config += 1;
+    if (L[1].z > 0.0) config += 2;
+    if (L[2].z > 0.0) config += 4;
+    if (L[3].z > 0.0) config += 8;
+    int n = 0;
+    switch (config) {
+    case 0: break;
+    case 1: n = 3; L[1] = -L[1].z * L[0] + L[0].z * L[1]; L[2] = -L[3].z * L[0] + L[0].z * L[3]; break;
+    case 2: n = 3; L[0] = -L[0].z * L[1] + L[1].z * L[0]; L[2] = -L[2].z * L[1] + L[1].z * L[2]; break;
+    case 3: n = 4; L[2] = -L[2].z * L[1] + L[1].z * L[2]; L[3] = -L[3].z * L[0] + L[0].z * L[3]; break;
+    case 4: n = 3; L[0] = -L[3].z * L[2] + L[2].z * L[3]; L[1] = -L[1].z * L[2] + L[2].z * L[1]; break;
+    case 5: break;
+    case 6: n = 4; L[0] = -L[0].z * L[1] + L[1].z * L[0]; L[3] = -L[3].z * L[2] + L[2].z * L[3]; break;
+    case 7: n = 5; L[4] = -L[3].z * L[0] + L[0].z * L[3]; L[3] = -L[3].z * L[2] + L[2].z * L[3]; break;
+    case 8: n = 3; L[0] = -L[0].z * L[3] + L[3].z * L[0]; L[1] = -L[2].z * L[3] + L[3].z * L[2]; L[2] = L[3]; break;
+    case 9: n = 4; L[1] = -L[1].z * L[0] + L[0].z * L[1]; L[2] = -L[2].z * L[3] + L[3].z * L[2]; break;
+    case 10: break;
+    case 11: n = 5; L[4] = L[3]; L[3] = -L[2].z * L[3] + L[3].z * L[2]; L[2] = -L[2].z * L[1] + L[1].z * L[2]; break;
+    case 12: n = 4; L[1] = -L[1].z * L[2] + L[2].z * L[1]; L[0] = -L[0].z * L[3] + L[3].z * L[0]; break;
+    case 13: n = 5; L[4] = L[3]; L[3] = L[2]; L[2] = -L[2].z * L[1] + L[1].z * L[2]; L[1] = -L[1].z * L[0] + L[0].z * L[1]; break;
+    case 14: n = 5; L[4] = -L[0].z * L[3] + L[3].z * L[0]; L[0] = -L[0].z * L[1] + L[1].z * L[0]; break;
+    case 15: n = 4; break;
+    }
+    if (n == 3) L[3] = L[0];
+    if (n == 4) L[4] = L[0];
+    return n;
+}
+
 // Full rectangular area-light contribution at a shaded point.
 static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, float3 V,
                                    float3 albedo, float metallic, float roughness,
@@ -446,24 +492,41 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
         float3x3 Minv = float3x3(float3(t1.x, 0.0, t1.y),
                                  float3(0.0,  1.0, 0.0),
                                  float3(t1.z, 0.0, t1.w));
-        // Same corner-fragment length guard as ltcPolygonForm — p ≈ 0 at a jamb pixel.
-        float3 m0 = Minv * (worldToTan * p0), m1 = Minv * (worldToTan * p1);
-        float3 m2 = Minv * (worldToTan * p2), m3 = Minv * (worldToTan * p3);
-        float3 q0 = m0 * rsqrt(max(dot(m0, m0), 1e-8));
-        float3 q1 = m1 * rsqrt(max(dot(m1, m1), 1e-8));
-        float3 q2 = m2 * rsqrt(max(dot(m2, m2), 1e-8));
-        float3 q3 = m3 * rsqrt(max(dot(m3, m3), 1e-8));
-        float3 vsum = ltcIntegrateEdge(q0, q1) + ltcIntegrateEdge(q1, q2)
-                    + ltcIntegrateEdge(q2, q3) + ltcIntegrateEdge(q3, q0);
-        float ltcSpec = max(0.0, vsum.z / (2.0 * M_PI_F));
-        // Firefly guard, measured not hypothetical: at grazing incidence on a low-roughness
-        // texel the inverse LTC matrix stretches the polygon toward the horizon and the
-        // integral spikes — white sparkle clusters on any wall flanking a window PORTAL
-        // (an area light coplanar with real walls exercises grazing geometry a floating
-        // softbox never does), and the worst spikes go non-finite and TAA smears them into
-        // black holes. A clamped-cosine form factor is ≤ 1 by definition; 2.0 leaves the
-        // fit slack while amputating the divergence, and the non-finite scrub is the last
-        // line — one NaN pixel poisons the whole neighbourhood through bloom.
+        // Transform UNNORMALISED, clip to the shading horizon, then normalise the clipped
+        // polygon and integrate its edges — the reference LTC pipeline. Clipping must
+        // precede normalisation (the z = 0 intercepts are linear combinations of the
+        // unnormalised vertices); the rsqrt length guard is the same corner-fragment
+        // guard as ltcPolygonForm — p ≈ 0 at a jamb pixel.
+        float3 P[5] = { Minv * (worldToTan * p0), Minv * (worldToTan * p1),
+                        Minv * (worldToTan * p2), Minv * (worldToTan * p3), float3(0.0) };
+        float ltcSpec = 0.0;
+        int nClip = ltcClipQuadToHorizon(P);
+        if (nClip > 0) {
+            for (int k = 0; k < 5; ++k) P[k] = P[k] * rsqrt(max(dot(P[k], P[k]), 1e-8));
+            float3 vsum = ltcIntegrateEdge(P[0], P[1]) + ltcIntegrateEdge(P[1], P[2])
+                        + ltcIntegrateEdge(P[2], P[3]);
+            if (nClip >= 4) vsum += ltcIntegrateEdge(P[3], P[4]);
+            if (nClip == 5) vsum += ltcIntegrateEdge(P[4], P[0]);
+            ltcSpec = max(0.0, vsum.z / (2.0 * M_PI_F));
+            // Horizon FADE, and it must be the smooth clipless form factor `ff` doing the
+            // windowing: where the light polygon sits essentially in the receiver's own
+            // horizon plane (a portal seen from its far floor or flanking wall), normal-map
+            // jitter tilts the shading normal enough to flip the WHOLE polygon above/below
+            // the horizon per pixel — a binary on/off of a small integral times an HDR-bright
+            // colour, i.e. residual speckle no LUT smoothing can touch (a NoV row clamp and a
+            // roughness floor were both built and measured INERT: 1 627 → 1 624 spikes).
+            // `ff` is jitter-stable by construction (a z-projection, no clip discontinuity),
+            // so scaling by its onset turns the flip into a fade. Above the onset band the
+            // multiplier is exactly 1 — the highlight in front of the window is untouched.
+            ltcSpec *= smoothstep(0.0, 0.02, ff);
+        }
+        // Firefly guard, kept as belt-and-braces behind the horizon clip. Before the clip
+        // this pair was load-bearing: the unclipped integral diverged at grazing incidence
+        // into white sparkle clusters on any wall flanking a window PORTAL (measured:
+        // 73 817 sparkle px on the isolated area term vs the MRP fallback's 4 010), and
+        // the worst spikes went non-finite — one NaN pixel poisons the neighbourhood
+        // through bloom. With the polygon clipped the integral is bounded by construction;
+        // these now bind only on pathological LUT texels.
         if (!isfinite(ltcSpec)) ltcSpec = 0.0;
         ltcSpec = min(ltcSpec, 2.0);
         spec = ltcSpec * (F0 * t2.x + (1.0 - F0) * t2.y);
