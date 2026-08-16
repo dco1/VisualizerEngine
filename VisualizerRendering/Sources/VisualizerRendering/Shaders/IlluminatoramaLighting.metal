@@ -586,6 +586,63 @@ static inline float3 desaturateFill(float3 c, float amount) {
 // so the darkening is densest right at the contact and fades along the ray
 // (this also softens the discrete ray-step boundary). The caller skips this
 // entirely when strength == 0, so it's an exact no-op by default.
+//
+// ── The SCREEN-EXTENT guard (added 2026-08-16) ───────────────────────────────
+//
+// The march reach is a fixed WORLD length, but every occluder test reads the
+// depth buffer at INTEGER PIXEL granularity (`uint2(uv * dims)`, a point read)
+// and accepts a hit inside a fixed WORLD window (`bias` … `bias + thickness`).
+// Nothing tied those two together. Past the distance where the WHOLE march
+// projects to less than a pixel this function stops measuring contact at all:
+// every step lands in the fragment's own texel or its immediate neighbour, so
+// the test degenerates into "is the depth STEP between adjacent pixels of a
+// receding surface inside the window?" — and on ground seen at a grazing angle
+// that is a PERIODIC function of screen position.
+//
+// It shipped as a quilt. Daydream Home's exterior hero (21 mm lens ⇒ fovY 59.5°
+// over 960 px ⇒ ~925 px/rad; reach 5 cm ⇒ 46.2/d px, sub-pixel past ~46 m) grew
+// a screen-locked 5.1 × 6.1 px lattice across its whole far lawn, plus ~3.3 % of
+// darkening from occluders that do not exist. It reads as a texture tile repeat
+// and is not one: the period stayed pinned while the ground under it receded
+// 3.7×, which no world-space repeat can do.
+//
+// So: measure the march's PROJECTED extent and fade the result out below it. A
+// reach that cannot cross a texel carries no occlusion information, and the
+// honest answer there is zero — this removes darkening that was never earned,
+// it does not trade one artefact for another. The threshold is in PIXELS and
+// not in metres on purpose: the failure is a sampling-rate failure, so a
+// distance cutoff would have to be re-derived for every FOV, resolution and
+// reach, and would silently rot the first time any of the three moved.
+//
+// Near-field contact shadows — the whole point of the feature, and every case
+// Visualizer uses it for (a chip on felt, an egg on a floor, a prop on a table)
+// — sit at tens of pixels of march and are untouched.
+//
+// Established as a PREDICTION rather than a reading: sweeping the reach moves
+// the artefact's inner edge exactly where `marchPx == 1` moves it. Daydream
+// Home's `HouseRenderBridgeGPUTests+LawnStripe` measures this function's
+// far-field ripple against a contact-shadows-off floor and is the regression
+// gate for it.
+
+/// Below this projected march length (PIXELS) the march cannot reach a
+/// neighbouring texel, so its depth comparison is noise — fade to zero.
+constant float kContactShadowMinPixels  = 1.0;
+/// …and at/above this it is trusted at full strength. The ramp between the two
+/// keeps the transition from drawing a visible ring across open ground.
+constant float kContactShadowFullPixels = 2.0;
+
+/// View-space point → pixel coordinates. Returns false when the point is at or
+/// behind the eye, where the projection has no meaningful screen position.
+static inline bool illumiViewToPixels(constant FrameUniforms& frame,
+                                      float3 viewPos, uint2 dims,
+                                      thread float2& outPx) {
+    float4 clip = frame.projection * float4(viewPos, 1.0);
+    if (clip.w <= 1e-5) return false;
+    float2 ndc = clip.xy / clip.w;
+    outPx = (ndc * float2(0.5, -0.5) + 0.5) * float2(dims);
+    return true;
+}
+
 static inline float illumiContactShadow(
     depth2d<float, access::read> gDepth,
     constant FrameUniforms&      frame,
@@ -600,6 +657,18 @@ static inline float illumiContactShadow(
     // Back-facing or grazing-to-sun fragments are already unlit by NdotL and
     // self-occlude trivially — skip them to avoid contact-shadow acne.
     if (ndotl <= 0.02 || steps == 0u || lengthWS <= 0.0) return 0.0;
+
+    // Screen-extent guard — see the block comment above. Project the march's two
+    // endpoints and fade out when the whole reach is sub-texel, where the depth
+    // comparison below can only read this fragment's own neighbourhood.
+    float2 pxStart, pxEnd;
+    if (!illumiViewToPixels(frame, viewPos, dims, pxStart) ||
+        !illumiViewToPixels(frame, viewPos + LviewN * lengthWS, dims, pxEnd)) {
+        return 0.0;                     // march crosses the eye plane — no screen extent
+    }
+    float extentFade = smoothstep(kContactShadowMinPixels, kContactShadowFullPixels,
+                                  length(pxEnd - pxStart));
+    if (extentFade <= 0.0) return 0.0;  // and skip the march entirely: it can only be noise
 
     float  stepLen = lengthWS / float(steps);
     // Self-shadow guard: lift the ray off the originating surface and require
@@ -624,7 +693,10 @@ static inline float illumiContactShadow(
         float  sceneViewZ = sView.z / sView.w;
         float  diff       = (-rayPos.z) - (-sceneViewZ);  // >0: ray is BEHIND the surface
         if (diff > bias && diff < bias + thickness) {
-            return 1.0 - float(i) / float(steps);         // densest at the contact
+            // Densest at the contact, and scaled by how much of a pixel the march
+            // actually spans — a hit found by a barely-resolved march is worth
+            // proportionally less than one found by a fully-resolved one.
+            return (1.0 - float(i) / float(steps)) * extentFade;
         }
     }
     return 0.0;
