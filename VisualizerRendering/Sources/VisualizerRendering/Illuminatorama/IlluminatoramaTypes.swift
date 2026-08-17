@@ -847,8 +847,34 @@ public struct IlluminatoramaInstance {
     /// is an exact no-op, so Visualizer and any host that never opts in are byte-identical.
     /// Real tile/plank batch variation lives around 3–6 %.
     public var patternJitter: Float = 0
-    /// Trailing pad of the S2.5-half-2 cluster (keeps the 16-byte alignment `float4x4` needs).
-    public var _padPattern0: Float = 0
+    // ── Vegetation-wind opt-in (per instance) ─────────────────────────────────
+    // Reinterprets the former `_padPattern0` trailing pad — same 4 bytes, stride stays 272.
+    //
+    // **The defect this closes.** `applyTreeWind` runs in `illumi_vs`, the vertex stage of
+    // EVERY ordinary instanced draw, and its only per-vertex gate was `v.tangent.x >= 0.0001`.
+    // That is not a vegetation marker: `tangent` is the TBN basis every normal-mapped surface
+    // carries, and a host that builds tangents from world axes — Daydream Home's
+    // `HouseScene.vertex` emits `(1,0,0,1)` for every floor/ceiling and ±Z wall face — hands
+    // the shader `sway = 1.0`, the weight of an outermost canopy tip. The whole house then
+    // swings on the gust, while its ±X faces (tangent `(0,0,1,1)`, `sway = 0`) stay planted,
+    // so meshes visibly tear along their own face-orientation boundaries. The bug was latent
+    // for as long as the feature was inert (nothing set `treeWindStrength`) and shipped the
+    // day a host finally switched it on.
+    //
+    // A vertex attribute could never have been the gate, because `tangent` has a prior,
+    // universal meaning. The opt-in has to live where the intent does: the draw.
+    //
+    /// Per-instance multiplier on the frame's global vegetation wind strength
+    /// (`renderer.treeWindStrength`). **0 (the default) is an exact shader no-op**, so wind
+    /// reaches only the draws whose host declared them vegetation — foliage meshes that
+    /// deliberately pack `(swayWeight, phase, flutter)` into their vertex tangents
+    /// (`ForestGeometry`/`ForestTreeGeometry` canopies, `GrassFillerMesh` cards). Everything
+    /// else — house geometry, furniture, props, and every host that never opts in — is
+    /// untouched no matter what its tangents contain.
+    ///
+    /// It is a scale, not a flag, so a background stand can sway less than a hero tree
+    /// without a second global.
+    public var windScale: Float = 0
 
     public init(
         modelMatrix: simd_float4x4,

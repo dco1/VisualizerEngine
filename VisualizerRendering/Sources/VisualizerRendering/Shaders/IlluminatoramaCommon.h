@@ -598,7 +598,11 @@ struct Instance {
     //   0 (the default, and every scene that never opts in) is an exact no-op.
     float2   patternCells;
     float    patternJitter;
-    float    _padPattern0;
+    // Vegetation-wind opt-in (was `_padPattern0` — same 4 bytes, stride stays 272).
+    // Multiplies the frame's global wind strength for THIS instance, so `applyTreeWind`
+    // can only reach a draw whose host declared it vegetation. 0 (the default) is an
+    // exact no-op. See the Swift twin for why this had to become per-instance.
+    float    windScale;
 };
 
 // The Swift mirror (`IlluminatoramaInstance._assertStride240`) has always asserted this

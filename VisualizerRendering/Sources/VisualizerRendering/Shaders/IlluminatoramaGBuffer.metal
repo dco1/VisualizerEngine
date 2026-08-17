@@ -18,8 +18,14 @@ using namespace metal;
 // trunk base has swayWeight 0 so it stays planted while the canopy sways
 // (cantilever). Layered: macro height-weighted bend + a coarse TRAVELLING GUST
 // envelope (wind moves across the stand in waves) + high-freq leaf flutter.
-// Gated by windStrength > 0 (repurposed frame._padPhase2A) → an exact no-op for
-// every scene that doesn't set it; windHeading (frame._padPhase2B) is the dir.
+// Gated by windStrength > 0 → an exact no-op for every scene that doesn't set it;
+// windHeading (frame._padPhase2B) is the dir. `windStrength` reaching here is the
+// frame's global (repurposed frame._padPhase2A) TIMES the per-instance `windScale`,
+// which is 0 unless the host declared the draw vegetation. That per-instance term is
+// load-bearing: `windAttr` IS `v.tangent`, and a tangent is the TBN basis every
+// normal-mapped surface carries, so on ordinary geometry `windAttr.x` is a surface
+// direction, not a sway weight. Without the instance gate this function swings any
+// mesh whose tangents happen to point +X.
 static inline float3 applyTreeWind(float3 wp, float4 windAttr, float time,
                                    float windStrength, float windHeading) {
     float sway = windAttr.x;
@@ -135,13 +141,21 @@ vertex VSOut illumi_vs(
     Instance prevInst = prevInstances[iid];
 
     float4 worldP = inst.modelMatrix * float4(v.position, 1.0);
-    // Tree wind displacement (no-op unless windStrength>0 and this vert carries a
-    // sway weight). Same time for current + previous below: during a settled
-    // headless capture time is frozen so the pose is static (no TAA smear); in the
-    // live app the per-frame delta is tiny (gentle wind), matching the other
-    // deforming-geometry scenes.
+    // Tree wind displacement. THREE conditions, and the per-instance one is what keeps this
+    // off ordinary geometry: `inst.windScale` is 0 unless the host declared this draw
+    // vegetation, so a mesh carrying an honest TBN tangent (every normal-mapped surface —
+    // a floor tangent of (1,0,0,1) reads as `sway = 1.0`, a canopy tip's weight) can no
+    // longer be swung by the gust. `v.tangent.x` then selects WHICH vertices of a
+    // vegetation mesh bend and by how much, which is all it was ever able to mean.
+    //
+    // Same time for current + previous below: during a settled headless capture time is
+    // frozen so the pose is static (no TAA smear); in the live app the per-frame delta is
+    // tiny (gentle wind), matching the other deforming-geometry scenes. `windScale` is
+    // static per instance, so both arms read `inst` — taking it off `prevInst` would spike
+    // the motion vector on the frame a draw first opts in.
+    float windStrength = frame._padPhase2A * inst.windScale;
     worldP.xyz = applyTreeWind(worldP.xyz, v.tangent, frame.time,
-                               frame._padPhase2A, frame._padPhase2B);
+                               windStrength, frame._padPhase2B);
     float3 worldN = (inst.normalMatrix * float4(v.normal, 0.0)).xyz;
     // Previous-frame world position uses the previous-frame model matrix —
     // captures per-instance motion (spin, translation) on top of camera
@@ -155,7 +169,7 @@ vertex VSOut illumi_vs(
     }
     float4 prevWorldP = prevInst.modelMatrix * float4(prevObjP, 1.0);
     prevWorldP.xyz = applyTreeWind(prevWorldP.xyz, v.tangent, frame.time,
-                                   frame._padPhase2A, frame._padPhase2B);
+                                   windStrength, frame._padPhase2B);
     // Phase 4.5 — transform the object-space tangent into world. Using
     // `modelMatrix` (not normalMatrix) because a tangent is along the
     // surface — it should track non-uniform scale linearly, unlike a

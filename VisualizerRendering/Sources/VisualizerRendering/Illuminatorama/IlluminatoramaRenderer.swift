@@ -468,6 +468,8 @@ public final class IlluminatoramaRenderer {
     /// One-shot latch for the coarse-animation-clock warning in `render()` — a host that feeds a
     /// boot-relative clock would otherwise emit one line per frame forever.
     private var warnedCoarseAnimationClock = false
+    /// One-shot latch for the "wind armed but nothing opted in" warning in `uploadInstances`.
+    private var warnedWindWithoutOptIn = false
     /// Vertex-shader vegetation-wind knobs (#58 #1). `treeWindStrength` is the max
     /// canopy sway in ~metres (0 = no wind, an exact shader no-op); `treeWindHeading`
     /// is the wind/gust travel direction in radians. Per-vertex sway weights ride
@@ -475,6 +477,15 @@ public final class IlluminatoramaRenderer {
     /// and derivatives) AND by `GrassFillerMesh` static blade cards (2026-08-16),
     /// so one strength drives canopies and the sward's filler together. Set by
     /// Forest, IlluminatoramaRoom, and Daydream Home's yard.
+    ///
+    /// **This is a global, and the tangent channel is not a vegetation marker** — every
+    /// normal-mapped surface carries a tangent, so a nonzero strength alone would swing
+    /// any mesh whose tangents point along the sway axis (Daydream Home's whole house did,
+    /// while its ±X faces stayed planted, tearing meshes apart). The draw-side opt-in
+    /// `IlluminatoramaInstance.windScale` is therefore mandatory: leave it 0 on every
+    /// instance and this knob is inert no matter what you set it to. **Raising the strength
+    /// without setting `windScale` on the foliage instances is the "wind does nothing"
+    /// symptom** — check the instance, not this value.
     public var treeWindStrength: Float = 0
     public var treeWindHeading: Float = 0
 
@@ -11884,6 +11895,20 @@ public final class IlluminatoramaRenderer {
         meshGroups.removeAll(keepingCapacity: true)
         meshGroupRange.removeAll(keepingCapacity: true)
         guard !instances.isEmpty else { return }
+
+        // VEGETATION WIND, LIVENESS. `treeWindStrength` is a global, but as of 2026-08-17 the
+        // displacement also needs a per-DRAW `windScale` (see the property's own note: without
+        // it the gust reached any mesh whose tangents pointed along the sway axis, because a
+        // tangent is a TBN basis and not a sway weight). A host that raises the strength and
+        // never marks its foliage instances therefore gets NO wind and no error — the inert
+        // feature this renderer keeps re-learning. Say so once, on the frame it happens.
+        if treeWindStrength > 0, !warnedWindWithoutOptIn,
+           !instances.contains(where: { $0.data.windScale > 0 }) {
+            warnedWindWithoutOptIn = true
+            print("[illuminatorama] treeWindStrength=\(treeWindStrength) but no instance sets "
+                  + "windScale>0 — the vegetation wind is INERT. Set `windScale = 1` on the "
+                  + "foliage draws whose vertices pack (swayWeight, phase, flutter) in tangent.")
+        }
 
         // First pass — bucket by mesh kind, preserving first-seen order
         // so a stable scene gives a stable buffer layout.
