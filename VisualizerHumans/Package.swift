@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "VisualizerHumans",
-    platforms: [.macOS(.v15), .iOS(.v18)],
+    platforms: [.macOS(.v15), .iOS(.v18), .tvOS(.v18)],
     products: [
         .library(name: "VisualizerHumans", targets: ["VisualizerHumans"]),
     ],

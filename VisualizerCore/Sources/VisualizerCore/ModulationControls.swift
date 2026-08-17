@@ -1,3 +1,6 @@
+// Settings-panel UI only — no render-path role. Excluded from tvOS builds
+// because SwiftUI.Slider (and .help) don't exist there.
+#if !os(tvOS)
 import SwiftUI
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -128,3 +131,4 @@ public struct LabeledToggle<Root: AnyObject>: View {
         .tint(modulated ? Color.modulationAccent : nil)
     }
 }
+#endif
