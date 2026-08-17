@@ -468,10 +468,13 @@ public final class IlluminatoramaRenderer {
     /// One-shot latch for the coarse-animation-clock warning in `render()` — a host that feeds a
     /// boot-relative clock would otherwise emit one line per frame forever.
     private var warnedCoarseAnimationClock = false
-    /// Vertex-shader tree-wind knobs (#58 #1). `treeWindStrength` is the max
+    /// Vertex-shader vegetation-wind knobs (#58 #1). `treeWindStrength` is the max
     /// canopy sway in ~metres (0 = no wind, an exact shader no-op); `treeWindHeading`
     /// is the wind/gust travel direction in radians. Per-vertex sway weights ride
-    /// in the geometry's tangent channel. Only the Forest scene sets these.
+    /// in the geometry's tangent channel — packed by tree bakes (ForestGeometry
+    /// and derivatives) AND by `GrassFillerMesh` static blade cards (2026-08-16),
+    /// so one strength drives canopies and the sward's filler together. Set by
+    /// Forest, IlluminatoramaRoom, and Daydream Home's yard.
     public var treeWindStrength: Float = 0
     public var treeWindHeading: Float = 0
 

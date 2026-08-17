@@ -12,6 +12,19 @@ import simd
 // and the foliage-SSS alpha-0 flag as live `GrassRibbonRenderer` blades, so a
 // live↔static seam is invisible when the palettes match.
 //
+// TRAVELLING LEAN (2026-08-16): each card also packs the hierarchical-wind
+// vertex attributes into its (otherwise zero) tangent — (swayWeight, phase, 0, 0),
+// the exact ForestGeometry convention `applyTreeWind` reads in the G-buffer
+// vertex stage. Phase grows along the wind heading at `gustPhasePerMetre`, so
+// the shader's macro term `sin(time·0.9 + phase)` becomes a plane wave
+// travelling across the sward (~18 m wavelength at ~2.6 m/s — matching the live
+// XPBD field's 2.0 m/s noise drift), plus the shader's own long gust envelope.
+// GATED BY THE HOST: `renderer.treeWindStrength` is 0 by default, and
+// `applyTreeWind` is an exact no-op at strength 0 — a host that never sets it
+// (every current Visualizer GrassFillerMesh user) renders byte-identically.
+// tangent.w stays 0 (no material-class marker; wind reads only xyz), and the
+// shadow pass has no wind path, so shadows stay static (same as trees).
+//
 // GENERALIZED from the Meadow scene's `makeStaticGrassFillerMesh` (the proven
 // look — issue #58) so ANY host can drive it: Meadow's annulus + inner/outer
 // feather + 1/d² distance-LOD all fold into the caller's `density` closure, and
@@ -21,6 +34,13 @@ import simd
 // a 38 m field is ~3.7 M tris and tanks RT to ~18 fps. Keep the caller's
 // `density` honest (thin with distance) and respect `maxTriangles`.
 public enum GrassFillerMesh {
+
+    /// Radians of wind phase per metre along the wind heading, baked into each
+    /// card's tangent.y. With `applyTreeWind`'s fixed macro rate (time·0.9) this
+    /// sets the travelling wave: speed = 0.9 / 0.35 ≈ 2.6 m/s, wavelength
+    /// 2π / 0.35 ≈ 18 m — chosen to match the live XPBD field's noise drift
+    /// (windScroll/windFreq = 2.0 m/s) so the static band moves WITH the sim.
+    public static let gustPhasePerMetre: Float = 0.35
 
     public struct Params {
         /// Clump-grid pitch (m). Meadow uses 2× its live spacing.
@@ -141,6 +161,16 @@ public enum GrassFillerMesh {
                     let bright = 0.80 + bj() * 0.40
                     let warm = (bj() - 0.5) * 0.040
                     let dry: Float = bj() < 0.04 ? 1.15 : 1.0
+                    // Travelling-lean wind attributes (see header). Drawn from the
+                    // blade-LOCAL `bj()` stream AFTER the three colour draws, so
+                    // card positions and colours are byte-identical to the
+                    // pre-wind build. swayTip is the tip amplitude in metres per
+                    // unit of the host's `treeWindStrength`; phase advances along
+                    // the wind heading (the plane wave) with a small per-blade
+                    // jitter so the sward doesn't lean as one rigid sheet.
+                    let swayTip = 0.35 + bj() * 0.20
+                    let phase = (bx * windLeanDir.x + bz * windLeanDir.y) * Self.gustPhasePerMetre
+                              + (bj() - 0.5) * 0.8
                     func colorAt(_ f: Float) -> SIMD4<Float> {
                         let segC = f < 0.5
                             ? params.rootColor + (params.midColor - params.rootColor) * (f / 0.5)
@@ -160,10 +190,16 @@ public enum GrassFillerMesh {
                         let pz = bz + windLeanDir.y * leanXZ
                         let py = gy + h * f
                         let col = colorAt(f)
+                        // Quadratic height weight (root row 0 stays planted) —
+                        // the same cantilever profile trees use. w = 0: no
+                        // material-class marker; `applyTreeWind` reads only xyz.
+                        let wind = SIMD4<Float>(swayTip * f * f, phase, 0, 0)
                         verts.append(IlluminatoramaVertex(position: SIMD3(px, py, pz) + sideN * w,
-                                                          normal: sideN, uv: SIMD2(0, f), color: col))
+                                                          normal: sideN, uv: SIMD2(0, f),
+                                                          tangent: wind, color: col))
                         verts.append(IlluminatoramaVertex(position: SIMD3(px, py, pz) - sideN * w,
-                                                          normal: sideN, uv: SIMD2(1, f), color: col))
+                                                          normal: sideN, uv: SIMD2(1, f),
+                                                          tangent: wind, color: col))
                     }
                     for s in 0..<bladeSegs {
                         let r0 = base + UInt32(s * 2)
