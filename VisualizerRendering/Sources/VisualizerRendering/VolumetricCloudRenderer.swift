@@ -747,7 +747,10 @@ public final class VolumetricCloudRenderer {
 // a float4 / float2 (no bare float3 — keeps alignment trivial on both sides).
 // See the ALIGNMENT RULE in PBDSolver.swift.
 
-private struct SkyUniforms {
+// Internal (not private) so VolumetricSkyEquirectConventionTests can pack the
+// SAME uniforms the renderer does and dispatch volSkyRender from source — the
+// test that pins the writer's equirect convention (+X at u = 0) as a number.
+struct SkyUniforms {
     var cameraPos: SIMD4<Float>
     var sunDir: SIMD4<Float>
     var sunColor: SIMD4<Float>

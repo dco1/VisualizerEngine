@@ -97,9 +97,16 @@ static inline float3 sc_cosineSample(float3 n, float u1, float u2) {
     float x = r * cos(phi), y = r * sin(phi), z = sqrt(max(0.0, 1.0 - u1));
     return normalize(t * x + b * y + n * z);
 }
+// Local copy of IlluminatoramaCommon.h's dirToEquirectUV — the canonical form.
+// This file deliberately includes only metal_stdlib, so the math is duplicated
+// here (sc_-prefixed) and MUST stay identical: u wraps so +X lands at u = 0,
+// matching the equirect writer (volSkyRender). A former +0.5-offset variant
+// here made the surface-cache sky escapes feed radiance from 180° across the
+// dome — at low sun that injects the baked sun core from the anti-solar side.
 static inline float2 sc_dirToEquirectUV(float3 d) {
-    float u = atan2(d.z, d.x) * (1.0 / (2.0 * M_PI_F)) + 0.5;
-    float v = acos(clamp(d.y, -1.0, 1.0)) * (1.0 / M_PI_F);
+    float u = atan2(d.z, d.x) * (1.0 / (2.0 * M_PI_F));   // (-0.5, 0.5]
+    if (u < 0.0) u += 1.0;                                 // wrap → +X at u = 0
+    float v = 0.5 - asin(clamp(d.y, -1.0, 1.0)) * (1.0 / M_PI_F);
     return float2(u, v);
 }
 

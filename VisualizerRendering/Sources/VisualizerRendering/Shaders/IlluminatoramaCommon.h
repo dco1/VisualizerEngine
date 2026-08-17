@@ -714,13 +714,17 @@ static inline float geometrySmith(float NdotV, float NdotL, float roughness) {
 constant float kInvTwoPi = 1.0 / (2.0 * M_PI_F);
 constant float kInvPi    = 1.0 / M_PI_F;
 
-// A translation unit that includes BOTH this header and IlluminatoramaSecondary.h
-// (the deferred lighting kernel, since S4.1) would otherwise hit a redefinition:
-// Secondary.h carries its own dirToEquirectUV, and the two are NOT the same
-// function (this one wraps u so +X lands at u = 0; Secondary.h's offsets by 0.5).
-// The macro lets Secondary.h skip its copy when this one is already in scope —
-// safe because no caller of Secondary.h's sky-sampling helpers includes this
-// header (they'd have been 180° apart from day one if one did).
+// THE canonical dirToEquirectUV — one convention, everywhere. u wraps so +X
+// lands at u = 0, matching the equirect texture's WRITER (volSkyRender in
+// VolumetricSky.metal) and every reader: the background-sky raster, both IBL
+// bakes, DDGI, forward glass, and (since the 2026-08-16 fix) the RT paths.
+// Secondary.h, IlluminatoramaRT.metal and IlluminatoramaSurfaceCache.metal
+// carry byte-identical copies (they can't include this header without splicing
+// in bulk they don't want); the macro below lets Secondary.h skip its copy when
+// this one is already in scope, avoiding a redefinition in translation units
+// that include both (the deferred lighting kernel, since S4.1). Historical
+// note: Secondary.h/RT/SurfaceCache used to carry a +0.5-offset variant, which
+// put every RT sky sample 180° in azimuth from where the raster draws the sky.
 #define ILLUMI_COMMON_EQUIRECT_UV 1
 static inline float2 dirToEquirectUV(float3 dir) {
     // dir must be normalised. u in [0,1) east-around, v in [0,1] from north

@@ -226,9 +226,17 @@ static inline float3 coneSample(float3 dir, float theta, float u1, float u2) {
     return normalize(t * (sinT * cos(phi)) + b * (sinT * sin(phi)) + dir * cosT);
 }
 
+// Local copy of IlluminatoramaCommon.h's dirToEquirectUV — the canonical form.
+// This file deliberately includes only metal_stdlib (Common.h would splice in
+// ~700 lines of lighting helpers this kernel doesn't want), so the math is
+// duplicated here and MUST stay identical: u wraps so +X lands at u = 0,
+// matching the equirect writer (volSkyRender). A former +0.5-offset variant
+// here made the soup RT GI sky miss sample the dome 180° in azimuth from the
+// background raster.
 static inline float2 dirToEquirectUV(float3 d) {
-    float u = atan2(d.z, d.x) * (1.0 / (2.0 * M_PI_F)) + 0.5;
-    float v = acos(clamp(d.y, -1.0, 1.0)) * (1.0 / M_PI_F);
+    float u = atan2(d.z, d.x) * (1.0 / (2.0 * M_PI_F));   // (-0.5, 0.5]
+    if (u < 0.0) u += 1.0;                                 // wrap → +X at u = 0
+    float v = 0.5 - asin(clamp(d.y, -1.0, 1.0)) * (1.0 / M_PI_F);
     return float2(u, v);
 }
 

@@ -135,15 +135,22 @@ static inline float3 cosineSample(float3 n, float u1, float u2) {
     float r = sqrt(u1); float phi = 2.0 * M_PI_F * u2; float3 t, b; onb(n, t, b);
     return normalize(t * (r * cos(phi)) + b * (r * sin(phi)) + n * sqrt(max(0.0, 1.0 - u1)));
 }
-// Skipped when IlluminatoramaCommon.h's dirToEquirectUV is already in scope
-// (the deferred lighting kernel includes both since S4.1 — it uses only the
-// RNG/cone helpers above, never this header's sky sampling, so which of the two
-// u-conventions wins there is moot; every existing consumer of this header's
-// sky helpers includes ONLY this header and keeps this definition).
+// ONE equirect convention, everywhere: this is byte-for-byte the same math as
+// IlluminatoramaCommon.h's dirToEquirectUV (the canonical form, next to the
+// kInvTwoPi/kInvPi constants) — u wraps so +X lands at u = 0, matching the
+// equirect texture's WRITER (volSkyRender in VolumetricSky.metal). This header
+// used to carry a +0.5-offset variant, which made every RT sky escape (RT glass,
+// RT GI) sample the dome 180° in azimuth from where the background raster and
+// the IBL bakes read it. The include guard stays only so a translation unit
+// that includes both headers (the deferred lighting kernel, since S4.1) doesn't
+// hit a redefinition — both definitions are now identical, so which one wins
+// no longer matters.
 #ifndef ILLUMI_COMMON_EQUIRECT_UV
 static inline float2 dirToEquirectUV(float3 d) {
-    return float2(atan2(d.z, d.x) * (1.0 / (2.0 * M_PI_F)) + 0.5,
-                  acos(clamp(d.y, -1.0, 1.0)) * (1.0 / M_PI_F));
+    float u = atan2(d.z, d.x) * (1.0 / (2.0 * M_PI_F));   // (-0.5, 0.5]
+    if (u < 0.0) u += 1.0;                                 // wrap → +X at u = 0
+    float v = 0.5 - asin(clamp(d.y, -1.0, 1.0)) * (1.0 / M_PI_F);
+    return float2(u, v);
 }
 #endif
 /// What a secondary ray sees when it escapes to the sky: the equirect dome PLUS the
