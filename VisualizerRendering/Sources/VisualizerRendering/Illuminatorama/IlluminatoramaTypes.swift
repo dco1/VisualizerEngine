@@ -472,6 +472,19 @@ public struct IlluminatoramaFrameUniforms {
     public var interiorIrrUp: SIMD4<Float> = .zero
     public var interiorIrrSide: SIMD4<Float> = .zero
     public var interiorIrrDown: SIMD4<Float> = .zero
+    /// Ray-traced soft sun shadows in the deferred kernel (S4.1, opt-in). Read ONLY
+    /// by the `kLightingRTSunShadow` pipeline variant of `illumi_lighting` (which
+    /// replaces the cascade-map sun visibility with `rtSunShadowRayCount` cone rays
+    /// of half-angle `rtSunShadowAngle` against the TLAS); the non-RT variant —
+    /// every scene that never opts in — never reads these, so the zero defaults are
+    /// an exact no-op. `rtSunShadowSeed` WALKS only while a temporal accumulator is
+    /// live and is frozen at 0 otherwise (the glass-pass frameSeed contract: a
+    /// walking seed on a static frame is crawling speckle). ONE new 16-byte cluster
+    /// (stride 1376 → 1392); field-for-field mirror of the Metal `FrameUniforms`.
+    public var rtSunShadowSeed: UInt32 = 0
+    public var rtSunShadowAngle: Float = 0
+    public var rtSunShadowRayCount: UInt32 = 0
+    public var _padRTSunShadow: Float = 0
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20

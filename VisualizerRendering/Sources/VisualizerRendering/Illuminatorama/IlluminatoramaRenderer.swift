@@ -588,6 +588,23 @@ public final class IlluminatoramaRenderer {
     /// Sun angular radius in radians — penumbra softness. ~0.0047 rad is the
     /// real sun; larger values give softer contact shadows.
     public var rtSunSoftnessRad: Float = 0.02
+    /// **S4.1 — ray-traced soft sun shadows in the DEFERRED lighting kernel.**
+    /// When true (and a TLAS is live), `illumi_lighting`'s `kLightingRTSunShadow`
+    /// pipeline variant REPLACES the cascaded-shadow-map sun visibility with
+    /// `rtShadowRays` cone-sampled shadow rays across the sun's angular disc
+    /// (`rtSunSoftnessRad`) — a penumbra that widens with occluder distance, which
+    /// a fixed PCF footprint cannot produce. Everything else about the deferred
+    /// sun (the full BRDF, contact shadows, transmission) is untouched: only the
+    /// visibility estimate changes. Distinct from `rtSunOwnership = .rayTraced`,
+    /// which moves the whole sun term into the cruder RT-instanced kernel.
+    ///
+    /// Default `false`: the pipeline bit stays 0, the non-RT variant is selected,
+    /// and every existing host (all of Visualizer) renders byte-identically.
+    /// Frame-graph note: `updateRTAccel` runs AFTER the lighting pass, so the
+    /// kernel always traces the PREVIOUS frame's TLAS — fine for the settled
+    /// photo lane this exists for; on frame 1 (no TLAS yet) the bit derivation
+    /// (`rtSunShadowLightingActive`) falls back to the shadow-map variant.
+    public var rtSunSoftShadowsEnabled: Bool = false
     /// Strength of the one-bounce indirect contribution.
     public var rtGIStrength: Float = 1.0
     public var rtShadowRays: Int = 4
@@ -6392,7 +6409,15 @@ public final class IlluminatoramaRenderer {
         // strict live-RT pair on a real document — see `rtTLASForReflections`.
         let reflectionsRT = rtTLASForReflections && rtEnabled && rtReflectionsEnabled
             && !meshGroups.isEmpty && !instances.isEmpty
-        guard rtTLASSupported, (extractedRT || hasGlass || reflectionsRT) else {
+        // Fourth trigger (S4.1): ray-traced soft SUN shadows in the deferred kernel
+        // want the TLAS even with reflections compositing OFF (`rtReflectionsEnabled`
+        // false — shadows want the geometry, not the composite). Same shape as the
+        // reflections trigger and the same glass-arm caps, for the same reason: the
+        // strict live-RT pair auto-disables on a real document (S3.4's finding), and
+        // this feature must not be able to regress glass.
+        let sunShadowRT = rtSunSoftShadowsEnabled && rtTLASForReflections && rtEnabled
+            && !meshGroups.isEmpty && !instances.isEmpty
+        guard rtTLASSupported, (extractedRT || hasGlass || reflectionsRT || sunShadowRT) else {
             rtTLASActive = false; return }
         // Curve primitives (#60 item 7): adopt registry changes BEFORE the
         // topology hash, so a registration/unregistration lands as a rebuild.
@@ -10091,17 +10116,22 @@ public final class IlluminatoramaRenderer {
 
     /// Builds the `(variantKey, constants)` pair for `illumi_lighting`'s
     /// function-constant specialization from the host feature flags. The booleans
-    /// bind at indices 0–4 matching the `kLighting*` declarations in
-    /// Illuminatorama.metal; the key is the 5-bit string that disambiguates the
+    /// bind at indices 0–5 matching the `kLighting*` declarations in
+    /// Illuminatorama.metal; the key is the 6-bit string that disambiguates the
     /// variant in the pipeline cache. These MUST agree with the `frame.*Enabled`
     /// uniforms written in `updateFrameUniforms` — both derive from the same Bools.
     static func lightingFeatureConstants(ibl: Bool, shadow: Bool, dfg: Bool,
-                                         ddgi: Bool, ddgiIrrCache: Bool)
+                                         ddgi: Bool, ddgiIrrCache: Bool,
+                                         rtSunShadow: Bool = false)
         -> (key: String, constants: MTLFunctionConstantValues) {
         // The irradiance cache is only meaningful while DDGI is on — mirror the
         // exact derivation in updateFrameUniforms (`ddgiIrrCacheEnabled && ddgiEnabled`).
         let irrCache = ddgiIrrCache && ddgi
-        var flags = [ibl, shadow, dfg, ddgi, irrCache]
+        // index 5 — S4.1 ray-traced soft sun shadows. The caller passes the fully
+        // derived bit (`rtSunShadowLightingActive`), never the raw flag: the RT
+        // variant's TLAS argument only exists when this is true, so selecting it
+        // without a live TLAS would be an unbindable pipeline.
+        var flags = [ibl, shadow, dfg, ddgi, irrCache, rtSunShadow]
         let cv = MTLFunctionConstantValues()
         flags.withUnsafeMutableBufferPointer { buf in
             for i in 0..<buf.count {
@@ -10115,9 +10145,19 @@ public final class IlluminatoramaRenderer {
     // One-entry memo of the last resolved lighting variant, so the steady-state
     // path (flags unchanged frame-to-frame, the overwhelmingly common case) is a
     // single UInt8 compare with zero allocation — no MTLFunctionConstantValues or
-    // key string built. 0xFF is an impossible 5-bit value, so the first call misses.
+    // key string built. 0xFF is an impossible 6-bit value, so the first call misses.
     private var lastLightingFlags: UInt8 = 0xFF
     private var lastLightingPipeline: MTLComputePipelineState?
+
+    /// The fully derived S4.1 pipeline bit: soft sun shadows requested AND a TLAS
+    /// is genuinely live to trace. `rtTLASActive` is set by `updateRTAccel`, which
+    /// runs AFTER the lighting pass in the frame graph — so the kernel traces the
+    /// PREVIOUS frame's TLAS, and on the very first frame (or any frame the RT
+    /// hang-guard trips) this is false and lighting falls back to the shadow-map
+    /// variant instead of selecting a pipeline whose accel argument cannot bind.
+    private var rtSunShadowLightingActive: Bool {
+        rtSunSoftShadowsEnabled && rtTLASActive && rtTLAS != nil
+    }
 
     /// The specialized `illumi_lighting` pipeline for the current feature flags.
     /// The shared cache compiles each flag combination once and returns the
@@ -10132,16 +10172,19 @@ public final class IlluminatoramaRenderer {
     /// background compile lands the next frame picks up the specialized variant.
     private func currentLightingPipeline() -> MTLComputePipelineState {
         let irrCache = ddgiIrrCacheEnabled && ddgiEnabled
+        let rtSun = rtSunShadowLightingActive
         let bits: UInt8 = (iblEnabled     ? 1  : 0)
                         | (shadowsEnabled ? 2  : 0)
                         | (dfgLUTEnabled  ? 4  : 0)
                         | (ddgiEnabled    ? 8  : 0)
                         | (irrCache       ? 16 : 0)
+                        | (rtSun          ? 32 : 0)
         if bits == lastLightingFlags, let p = lastLightingPipeline { return p }
 
         let (key, cv) = Self.lightingFeatureConstants(
             ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
-            ddgi: ddgiEnabled, ddgiIrrCache: ddgiIrrCacheEnabled)
+            ddgi: ddgiEnabled, ddgiIrrCache: ddgiIrrCacheEnabled,
+            rtSunShadow: rtSun)
         // Non-blocking: ready variant → memoise + use it; still compiling → run
         // the uber-variant this frame and re-check next frame (no memo).
         if let ready = engine.pipelineCache.pipelineStateAsync(
@@ -10149,6 +10192,20 @@ public final class IlluminatoramaRenderer {
             lastLightingFlags = bits
             lastLightingPipeline = ready
             return ready
+        }
+        // S4.1 — the RT-sun variant compiles BLOCKING instead of falling back. The
+        // bit is only ever set in a settled/photo lane (no vsync budget), and the
+        // fallback there is not benign: the still's accumulator would blend
+        // shadow-map frames into the RT penumbra while the background compile
+        // lands. The variant is deliberately NOT in the init pre-warm either —
+        // every Visualizer host would pay its compile for a feature none of them
+        // set. (Not memoised on failure; a nil build falls through to the uber
+        // variant exactly as before.)
+        if rtSun, let built = engine.pipelineCache.pipelineState(
+            name: "illumi_lighting", device: device, constants: cv, variantKey: key) {
+            lastLightingFlags = bits
+            lastLightingPipeline = built
+            return built
         }
         return lightingPipeline
     }
@@ -10235,6 +10292,13 @@ public final class IlluminatoramaRenderer {
         // on the count/strength packed in frame.interiorIrrDown.w / interiorIrrSide.w,
         // both 0 for every scene that never opts in.
         enc.setBuffer(interiorApertureBuffer, offset: 0, index: 7)
+        // S4.1 — the TLAS for ray-traced soft sun shadows. Bound exactly when the
+        // pipeline bit is set (the accel argument only exists in that variant; if
+        // the specialized variant is still compiling and the uber fallback runs
+        // this frame, the extra binding is simply unread).
+        if rtSunShadowLightingActive, let tlas = rtTLAS {
+            enc.setAccelerationStructure(tlas, bufferIndex: 8)
+        }
         dispatch(enc, pipeline: pipe, width: width, height: height)
         enc.endEncoding()
     }
@@ -11727,6 +11791,15 @@ public final class IlluminatoramaRenderer {
                                   max(0, min(1, interiorApertureGradation)))
         u.interiorIrrDown = SIMD4(simd_max(interiorIrradianceDown, .zero),
                                   Float(interiorApertures.count))
+        // S4.1 — ray-traced soft sun shadows. Read ONLY by the kLightingRTSunShadow
+        // pipeline variant; for every other variant these are dead uniforms, so the
+        // writes cannot move a non-opting scene. The seed WALKS only while TAA is
+        // accumulating and FREEZES at 0 otherwise — the same contract as the glass
+        // pass's `frameSeed` below: with no accumulator, a walking seed turns the
+        // cone-sampling noise into speckle that crawls on a perfectly static frame.
+        u.rtSunShadowSeed = taaEnabled ? taaFrameIndex : 0
+        u.rtSunShadowAngle = max(0.0005, rtSunSoftnessRad)
+        u.rtSunShadowRayCount = UInt32(max(1, min(8, rtShadowRays)))
         // Analytic night sky. All-zero defaults keep the kernel's sky branch an
         // exact no-op; hosts fade the brightnesses with nightBlend themselves.
         u.nightSkyParams = SIMD4(max(0, nightSkyStarBrightness),

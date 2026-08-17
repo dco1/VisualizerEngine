@@ -397,6 +397,22 @@ struct FrameUniforms {
     float4   interiorIrrUp;    // xyz = irradiance, w = band blend weight (0 = off)
     float4   interiorIrrSide;  // xyz = irradiance, w unused
     float4   interiorIrrDown;  // xyz = irradiance, w unused
+    // ── Ray-traced soft sun shadows in the DEFERRED kernel (S4.1, opt-in) ────
+    // Consumed ONLY by the `kLightingRTSunShadow` (function_constant(5)) variant
+    // of `illumi_lighting`, which replaces the cascaded-shadow-map visibility
+    // with `rtSunShadowRayCount` cone-sampled shadow rays traced against the
+    // TLAS bound at buffer(8) — a true penumbra from the sun's angular radius.
+    // The non-RT variant (every scene that never opts in, and every Visualizer
+    // host) never reads these, so all-zero defaults are an exact no-op.
+    // `rtSunShadowSeed` decorrelates the cone samples per frame; the host WALKS
+    // it only while a temporal accumulator is live and freezes it otherwise
+    // (a walking seed on a static frame is crawling speckle — same contract as
+    // the glass pass's frameSeed). ONE new 16-byte cluster (stride 1376 → 1392);
+    // field-for-field mirror of IlluminatoramaFrameUniforms.
+    uint     rtSunShadowSeed;      // per-frame RNG decorrelation (0 = frozen)
+    float    rtSunShadowAngle;     // sun angular radius, radians (cone half-angle)
+    uint     rtSunShadowRayCount;  // shadow rays per pixel, host-clamped 1…8
+    float    _padRTSunShadow;
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift
@@ -698,6 +714,14 @@ static inline float geometrySmith(float NdotV, float NdotL, float roughness) {
 constant float kInvTwoPi = 1.0 / (2.0 * M_PI_F);
 constant float kInvPi    = 1.0 / M_PI_F;
 
+// A translation unit that includes BOTH this header and IlluminatoramaSecondary.h
+// (the deferred lighting kernel, since S4.1) would otherwise hit a redefinition:
+// Secondary.h carries its own dirToEquirectUV, and the two are NOT the same
+// function (this one wraps u so +X lands at u = 0; Secondary.h's offsets by 0.5).
+// The macro lets Secondary.h skip its copy when this one is already in scope —
+// safe because no caller of Secondary.h's sky-sampling helpers includes this
+// header (they'd have been 180° apart from day one if one did).
+#define ILLUMI_COMMON_EQUIRECT_UV 1
 static inline float2 dirToEquirectUV(float3 dir) {
     // dir must be normalised. u in [0,1) east-around, v in [0,1] from north
     // pole (v=0) to south pole (v=1). +X column is u=0.

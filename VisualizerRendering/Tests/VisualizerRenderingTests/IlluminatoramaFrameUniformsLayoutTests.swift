@@ -24,13 +24,15 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
     /// blob than the shader reads.
     /// 1264 → 1312 with the three diagram clusters (`diagramParams` / `diagramOutline` /
     /// `diagramEdge`); 1312 → 1328 with `taaJitterDelta` (S4.2); 1328 → 1376 with the three
-    /// interior irradiance bands (`interiorIrrUp/Side/Down` — the lawn-green-ceiling fix).
+    /// interior irradiance bands (`interiorIrrUp/Side/Down` — the lawn-green-ceiling fix);
+    /// 1376 → 1392 with the RT soft-sun-shadow cluster (`rtSunShadowSeed/Angle/RayCount` +
+    /// pad — S4.1).
     /// Verified against Metal by compiling a scratch kernel carrying
-    /// `static_assert(sizeof(FrameUniforms) == 1376)`, which holds while the same assert at
-    /// 1328 fails — i.e. the assert is live, not a tautology. (`offsetof` is not available
+    /// `static_assert(sizeof(FrameUniforms) == 1392)`, which holds while the same assert at
+    /// 1376 fails — i.e. the assert is live, not a tautology. (`offsetof` is not available
     /// in Metal; the tail offsets below are the Swift-side half of the check, and the fields
     /// are APPENDED, so stride pins them.)
-    private static let metalStride = 1376
+    private static let metalStride = 1392
 
     func testFrameUniformsStrideMatchesMetal() {
         XCTAssertEqual(MemoryLayout<IlluminatoramaFrameUniforms>.stride,
@@ -57,6 +59,11 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
         assertOffset(\.interiorIrrUp,   1328, "interiorIrrUp")
         assertOffset(\.interiorIrrSide, 1344, "interiorIrrSide")
         assertOffset(\.interiorIrrDown, 1360, "interiorIrrDown")
+        // S4.1 — RT soft-sun-shadow cluster: three scalars + a pad in ONE 16-byte
+        // cluster (uint/float/uint/float, so the scalar offsets pin the packing).
+        assertOffset(\.rtSunShadowSeed,     1376, "rtSunShadowSeed")
+        assertOffset(\.rtSunShadowAngle,    1380, "rtSunShadowAngle")
+        assertOffset(\.rtSunShadowRayCount, 1384, "rtSunShadowRayCount")
     }
 
     private func assertOffset(_ key: PartialKeyPath<IlluminatoramaFrameUniforms>,

@@ -6,6 +6,11 @@
 #include <metal_stdlib>
 #include "IlluminatoramaCommon.h"
 #include "IlluminatoramaDDGI.h"
+// S4.1 — ray-traced soft sun shadows in this kernel's `kLightingRTSunShadow`
+// variant. The header carries the shared RNG (`pcgHash`/`rnd`) and disc sampling
+// (`coneSample`) plus <metal_raytracing>; the non-RT variant dead-strips the
+// whole path at pipeline-specialization time.
+#include "IlluminatoramaSecondary.h"
 using namespace metal;
 
 static inline float distributionGGX(float NdotH, float roughness) {
@@ -97,6 +102,14 @@ constant bool kLightingShadowEnabled       [[function_constant(1)]];
 constant bool kLightingDFGLUTEnabled       [[function_constant(2)]];
 constant bool kLightingDDGIEnabled         [[function_constant(3)]];
 constant bool kLightingDDGIIrrCacheEnabled [[function_constant(4)]];
+// S4.1 — ray-traced soft sun shadows (Export Photo lane, opt-in). When true the
+// kernel REPLACES `sunVisibility`'s cascade-map answer with cone-sampled shadow
+// rays traced against the TLAS at buffer(8) — a physically-sized penumbra the
+// cascades cannot produce (their blur is a fixed PCF footprint, not distance-
+// proportional). The host sets this bit only when the TLAS is live
+// (`rtSunSoftShadowsEnabled && rtTLASActive`), so the accel binding below is
+// present exactly when the bit is.
+constant bool kLightingRTSunShadow         [[function_constant(5)]];
 
 // One cascade's answer, everything that depends on the cascade index in one place.
 // Factored out of `sunVisibility` for S1.4 (cascade-split blending), which needs to
@@ -200,6 +213,71 @@ static inline float sunVisibility(
         }
     }
     return v;
+}
+
+// ── S4.1 — ray-traced soft sun shadows (the kLightingRTSunShadow variant) ────
+//
+// Replaces `sunVisibility`'s cascade-map answer with `rtSunShadowRayCount` shadow
+// rays cone-sampled across the sun's angular disc (`rtSunShadowAngle`, radians)
+// and traced against the TLAS. The penumbra this produces WIDENS with distance
+// from the occluder — the physical behaviour a fixed-footprint PCF blur cannot
+// reproduce. The contact-shadow multiply at the call site composes after it,
+// exactly as it does over the shadow-map answer.
+//
+// Ray mask: 0x01 (opaque) + 0x04 (invisible occluder) — the C3 transport-ray
+// convention (`rtTransportRayMask`), same as the RT-instanced sun loop. Glass
+// (0x02) is excluded so a clear pane does not cast a fully hard opaque shadow.
+//
+// 0x04 was MEASURED both ways on the real document (s41-softsun-doc-off/phys,
+// 2026-08-16) before this was settled. The shadow-map arm lights a roofless
+// dollhouse interior at ≈25 % sun — the ceiling slab IS in the cascade map, but
+// PCF softness leaks that much through. The traced arm cannot reproduce a leak:
+// WITH 0x04 the interiors read −19 mean luma vs today (airtight slab shadow,
+// the documented "slabs are invisible sun-blockers by day" intent); WITHOUT it
+// they read +58 (fully sunlit — three times farther from the shipped look, and
+// against the doctrine). So the slab stays an occluder here; the residual −19
+// is flagged as a Danny look-call in known-issues § S4.1.
+constant uint kRTSunShadowRayMask = 0x01 | 0x04;
+
+static inline float rtSunSoftVisibility(
+    instance_acceleration_structure accel,
+    constant FrameUniforms&         frame,
+    float3 worldPos,
+    float3 N,
+    float3 Ld,
+    uint2  gid
+) {
+    uint rays = clamp(frame.rtSunShadowRayCount, 1u, 8u);
+    // Same seeding shape as the glass pass (pixel-decorrelated, frame-walked by
+    // `rtSunShadowSeed` — which the host freezes at 0 when nothing accumulates).
+    uint seed = pcgHash(gid.x + gid.y * 9781u + frame.rtSunShadowSeed * 6151u);
+    // Normal-offset the origin toward the SUN-FACING side of the surface: for a
+    // front-lit receiver that is +N (the usual acne guard); for a back-lit one
+    // (a leaf whose transmission term still consumes this visibility) +N would
+    // bury the origin in its own card, so flip.
+    float  ndl  = dot(N, Ld);
+    float3 offN = (ndl >= 0.0) ? N : -N;
+    float3 origin = worldPos + offN * 2e-3;
+
+    // Same intersector idiom as the glass fragment path (triangle/instancing; the
+    // deferred TLAS's curve instances, where a scene has them, are not traced by
+    // this estimate — matching `illumi_glass_rt_fs`).
+    intersector<triangle_data, instancing> isect;
+    isect.set_triangle_cull_mode(triangle_cull_mode::none);
+    isect.accept_any_intersection(true);   // shadow ray: any hit ends it
+
+    uint hits = 0u;
+    for (uint s = 0u; s < rays; ++s) {
+        ray sr;
+        sr.origin = origin;
+        sr.direction = coneSample(Ld, frame.rtSunShadowAngle, rnd(seed), rnd(seed));
+        sr.min_distance = 2e-3;
+        sr.max_distance = 1e4;
+        if (isect.intersect(sr, accel, kRTSunShadowRayMask).type != intersection_type::none) {
+            hits++;
+        }
+    }
+    return 1.0 - float(hits) / float(rays);
 }
 
 // ── Cloth sheen (Phase 7b, re-sited 2026-08-09) ──────────────────────────────────
@@ -754,6 +832,11 @@ kernel void illumi_lighting(
     // Interior daylight apertures (S3.5 Stage D) — gates on the count/strength in
     // frame.interiorIrrDown.w / interiorIrrSide.w, both 0 unless the host opts in.
     const device InteriorAperture*          interiorApertures [[buffer(7)]],
+    // S4.1 — the TLAS for ray-traced soft sun shadows. The argument EXISTS only
+    // in the kLightingRTSunShadow pipeline variant (function-constant-gated), and
+    // the host binds it exactly when it selects that variant (the bit requires a
+    // live TLAS, so there is always a real accel to bind).
+    instance_acceleration_structure         rtSunAccel      [[buffer(8), function_constant(kLightingRTSunShadow)]],
     uint2                                   gid             [[thread_position_in_grid]]
 ) {
     uint w = outHDR.get_width();
@@ -842,8 +925,18 @@ kernel void illumi_lighting(
                                     address::clamp_to_edge);
     float3 Ld = normalize(frame.directionalLightDir);
     float NdotL_sun = saturate(dot(N, Ld));
-    float visibility = sunVisibility(shadowMap, shadowSampler, frame,
-                                     worldPos, N, NdotL_sun);
+    // S4.1 — the RT variant REPLACES the cascade-map visibility with traced cone
+    // rays (still gated on kLightingShadowEnabled, whose "shadows off ⇒ 1.0"
+    // contract `sunVisibility` owns). Both flags are function constants, so the
+    // untaken branch is dead-stripped and the non-RT variant is byte-identical
+    // to what it compiled to before this constant existed.
+    float visibility;
+    if (kLightingRTSunShadow && kLightingShadowEnabled) {
+        visibility = rtSunSoftVisibility(rtSunAccel, frame, worldPos, N, Ld, gid);
+    } else {
+        visibility = sunVisibility(shadowMap, shadowSampler, frame,
+                                   worldPos, N, NdotL_sun);
+    }
     // ── Screen-space contact shadows (issue #65) ────────────────────────────
     // Fold a short screen-space ray-march occlusion into the sun visibility so
     // EVERY sun-driven term below (direct BRDF, leaf/plush transmission, the
