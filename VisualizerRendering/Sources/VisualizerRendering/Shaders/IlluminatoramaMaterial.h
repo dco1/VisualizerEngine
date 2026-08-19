@@ -151,6 +151,173 @@ static inline float patternCellHash(float2 cell) {
     return float(h & 0xFFFFu) / 32768.0f - 1.0f;
 }
 
+
+// ── Wood knots, in WORLD SPACE (not baked into the tile) ─────────────────────────────────
+//
+// **Why this cannot be a texture.** A knot is a sparse LANDMARK, and a landmark baked into a
+// tiling texture reappears on a lattice at the tile period, forever. Daydream Home's wood tile is
+// ~1 m (the resolution its grain needs), so baked knots drew a 1 m grid across every floor —
+// "it looks like a pattern rather than organic". No amount of scatter inside the tile fixes that,
+// because the scatter is what repeats.
+//
+// `uv` keeps counting up across the whole surface — only the atlas LOOKUP wraps — so a field
+// evaluated on it IS world-space and never repeats. That is the same property `patternCells`
+// relies on, used for geometry instead of tone.
+//
+// **And why it cannot be a decal quad.** The thing that separates a knot from a dark sticker is
+// that the trunk's grain FLOWS AROUND it. A decal composited on top cannot bend what is under it.
+// Here the knot returns a UV `warp` that is applied to the material samples themselves — pushed
+// radially by `r²/d`, the streamline displacement for flow past a cylinder — so the grain, the
+// pores and the ring figure all sweep around the knot exactly as they do in real wood.
+//
+// Everything is in UV units, which are isotropic in world space (uv = worldPos / uvMetres on both
+// axes), so no aspect correction is needed and a radius means the same thing on both axes.
+struct WoodKnotSample {
+    float2 warp;    // UV displacement — the grain flowing around the knot
+    float  eye;     // 1 on the branch's cut face, 0 off it
+    float  rings;   // the branch's own concentric end grain, [0,1]
+    float  rim;     // the bark line where the branch met the face
+    float  crack;   // radial drying checks
+    float  pith;    // 1 at the centre, falling to 0 at the rim
+    float2 radial;  // outward unit direction, for the core's normal dip
+};
+
+static inline float woodKnotHash(float2 cell, uint salt) {
+    int cx = int(floor(cell.x + 0.5f));
+    int cy = int(floor(cell.y + 0.5f));
+    uint h = uint(cx) * 73856093u ^ uint(cy) * 19349663u ^ salt * 83492791u;
+    h ^= h >> 11; h *= 0x45d9f3bu; h ^= h >> 16;
+    return float(h & 0xFFFFu) / 65536.0f;
+}
+
+// `knot` packs the material's knot parameters:
+//   x = lattice cells per UV unit (0 disables the whole feature — the default, and an exact
+//       no-op for every scene and every material that never opts in)
+//   y = knot radius in UV units
+//   z = darkness of the core against the wood it grew through, [0,1]
+//   w = fraction of lattice cells that carry a knot
+//
+// **`patternCells` is what makes these PLANKS rather than a sheet of wood, and that matters for
+// more than tidiness.** It carries the board comb the material already ships for its tone
+// de-repeat, and this function uses it to enforce the one thing a saw does:
+//
+//   * A knot belongs to ONE board. Its influence is clipped to the plank its centre is in,
+//     because the cut ended the grain — a knot cannot reach into the next board any more than a
+//     branch can grow across a saw kerf.
+//   * The cut itself is a FIXED POINT of the warp. The displacement is scaled to zero at both
+//     seams, so no knot can ever move a board edge.
+//
+// Both were missing in the first version, and both are the same defect wearing different
+// clothes: the warp was applied to the whole texture, and the texture contains the saw cuts.
+// Measured on the shipped oak — a large knot reaches 176 mm against a 127 mm board (1.39x the
+// board width, so it MUST spill across), and displaced the seam itself by 28.7 mm, a quarter of
+// a board. Danny, 2026-08-19: *"it looks like the knots are pulling the straight-shape of the
+// boards, this is not realistic"* — and then the framing that names the fix: *"couldn't you
+// actually build real planks, then CUT those planks to the correct size?"* This is that, in the
+// only form a per-pixel shader can express it: the grain is whatever the log had, the cut is
+// straight by definition.
+static inline WoodKnotSample sampleWoodKnots(float2 uv, float4 knot, float2 patternCells) {
+    WoodKnotSample k;
+    k.warp = float2(0.0f);
+    k.eye = 0.0f; k.rings = 0.0f; k.rim = 0.0f; k.crack = 0.0f; k.pith = 0.0f;
+    k.radial = float2(0.0f);
+    if (knot.x <= 0.0f || knot.y <= 0.0f || knot.w <= 0.0f) { return k; }
+
+    float cells = knot.x;
+    float2 base = floor(uv * cells);
+    float nearest = 1e9f;
+
+    // The plank this pixel is on, and how far into it we are. `bw <= 0` means the material is a
+    // continuous panel with no cuts at all, so nothing below clips or pins.
+    float bw = patternCells.x > 0.0f ? 1.0f / patternCells.x : 0.0f;
+    float pixelBoard = bw > 0.0f ? floor(uv.x / bw) : 0.0f;
+    // Zero AT each cut, one across the middle of the board.
+    float seamPin = 1.0f;
+    if (bw > 0.0f) {
+        float f = uv.x / bw - pixelBoard;
+        seamPin = smoothstep(0.0f, 0.16f, f) * smoothstep(0.0f, 0.16f, 1.0f - f);
+    }
+
+    // 3x3, because a knot's influence reaches a few radii and its site is jittered inside its
+    // own cell. The cell size is chosen (CPU side) so that is enough.
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            float2 cell = base + float2(float(i), float(j));
+            if (woodKnotHash(cell, 1u) > knot.w) { continue; }
+
+            // Size varies a LOT, and from a squared draw: mostly small knots with the
+            // occasional big one. A field of same-sized discs reads as a stamp.
+            //
+            // The FLOOR matters as much as the spread. At 0.45x the smallest draws were a few
+            // pixels across at room distance and the floor read as scattered pepper — the same
+            // "grime, not tooth" failure the glaze occlusion hit. A knot has to be big enough to
+            // be recognisable as one, or it is dirt.
+            float sz = woodKnotHash(cell, 5u);
+            float rad = knot.y * (0.70f + 1.00f * sz * sz);
+
+            float2 centre = (cell + float2(woodKnotHash(cell, 2u), woodKnotHash(cell, 3u))) / cells;
+            // Keep it off the plank seams. `patternCells.x` boards span one UV unit.
+            if (patternCells.x > 0.0f) {
+                float bw = 1.0f / patternCells.x;
+                float board = floor(centre.x / bw);
+                float inset = min(0.42f, rad * 1.8f / bw);
+                centre.x = clamp(centre.x, (board + inset) * bw, (board + 1.0f - inset) * bw);
+            }
+
+            // A knot is a feature of ONE plank: the cut ended it. Without this a big knot's
+            // influence (~4.5 radii) is wider than the board it sits on and bleeds into the
+            // neighbour, which reads as a single warped sheet rather than as laid boards.
+            if (bw > 0.0f && floor(centre.x / bw) != pixelBoard) { continue; }
+
+            float2 d2 = uv - centre;
+            d2.y /= 1.35f;                       // oval along the board, as a branch is
+            float d = max(length(d2), 1e-6f);
+            if (d > rad * 5.0f) { continue; }
+
+            float theta = atan2(d2.y, d2.x);
+            float ph = woodKnotHash(cell, 7u) * 6.28318531f;
+            // A SUBTLY irregular outline: a perfect circle is a drilled hole, a lumpy one is a
+            // blob. Whole harmonics of theta, so it closes on itself.
+            float lobe = sin(theta * 2.0f + ph) * 0.6f + sin(theta * 3.0f + ph * 2.1f) * 0.4f;
+            float r = rad * (1.0f + 0.10f * lobe);
+
+            // The grain flows around it, and is straight again a few radii out.
+            //
+            // ACROSS the board only. Displacing ALONG the grain slides the lines along
+            // themselves — invisible — while visibly bowing the one family of features that runs
+            // the other way: the butt joints. There is nothing to gain and a defect to lose.
+            //
+            // Scaled by `seamPin`, so the displacement is zero at both cuts however close the
+            // knot is to one. 0.55 because a full radius of deflection at the rim is more than
+            // a branch actually pushes its trunk's rings aside.
+            float push = (r * r / max(d, r)) * (1.0f - smoothstep(r * 1.8f, r * 4.5f, d));
+            k.warp.x += (d2.x / d) * push * 0.55f * seamPin;
+
+            k.eye  = max(k.eye,  1.0f - smoothstep(r * 0.94f, r * 1.10f, d));
+            k.rim  = max(k.rim,  (1.0f - smoothstep(0.0f, 0.16f, abs(d / r - 1.0f)))
+                               * (1.0f - smoothstep(r, r * 1.35f, d)));
+            k.pith = max(k.pith, 1.0f - smoothstep(0.0f, r * 0.95f, d));
+
+            // Two hairline drying checks, unequal, from near the pith to just past the rim.
+            // Four fat wedges read as a peace sign.
+            float spikes = pow(abs(sin(theta + ph * 1.7f)), 120.0f)
+                         * (0.30f + 0.70f * (0.5f + 0.5f * sin(theta + ph)));
+            k.crack = max(k.crack, spikes * smoothstep(0.0f, r * 0.15f, d)
+                                          * (1.0f - smoothstep(r * 0.95f, r * 1.35f, d)));
+
+            // The NEAREST knot owns the end grain — two overlapping eyes would interleave
+            // their rings into a moire. TWO rings across the face, not five: a 34 mm knot is
+            // ~17 texels at the shipped bake and five of them cannot be resolved.
+            if (d < nearest) {
+                nearest = d;
+                k.rings = pow(saturate(0.5f - 0.5f * cos(d / (r * 0.42f) * 6.28318531f)), 1.4f);
+                k.radial = d2 / d;
+            }
+        }
+    }
+    return k;
+}
+
 // `strength` gates the whole effect. When strength <= 0 (the DEFAULT for every
 // scene that never opts in) this returns EXACTLY `sampleAtlasAspect(atlas, s, uv,
 // slice, uvScale, duvdx, duvdy)` — the identical single texture read the pre-anti-tiling shader

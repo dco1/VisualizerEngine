@@ -311,6 +311,18 @@ fragment GBufferOut illumi_fs(
     float2 duvdx = dfdx(in.uv);
     float2 duvdy = dfdy(in.uv);
 
+    // ── World-space wood knots ────────────────────────────────────────────────
+    // `matUV` is the uv every MATERIAL sample below reads, and it is `in.uv` displaced by the
+    // knot field's flow-around warp — which is what makes the grain, the pores and the ring
+    // figure sweep around a knot instead of running straight through it. With no knots declared
+    // (`woodKnots.x == 0`, the default and every other material) the warp is exactly zero and
+    // `matUV == in.uv`, so this is byte-identical for every existing scene.
+    //
+    // `in.uv` itself is kept for the things that must NOT move with the warp: the plank-cell
+    // hash (a board index cannot slide), the soil marker, and the derivatives.
+    WoodKnotSample knot = sampleWoodKnots(in.uv, inst.woodKnots, inst.patternCells);
+    float2 matUV = in.uv + knot.warp;
+
     // Phase 4.5 — tangent-space normal-map sampling. The atlas is the
     // same `bgra8Unorm` non-colour atlas as metallic/roughness; the
     // normal map encodes tangent-space (x,y,z) into [0,1] via
@@ -336,7 +348,7 @@ fragment GBufferOut illumi_fs(
         // offset lattice samples. The blend is linear in encoded space (before
         // decode), which slightly overshoots tangent-space magnitude at boundaries
         // but gives correct appearance after renormalize below.
-        float4 nmSample = sampleAtlasHex(nonColorAtlas, texSampler, in.uv,
+        float4 nmSample = sampleAtlasHex(nonColorAtlas, texSampler, matUV,
                                          uint(inst.normalTextureSlice), nonColorUVScale,
                                          nonColorSliceMean,
                                          frame.antiTilingStrength * inst.antiTilingScale, duvdx, duvdy);
@@ -345,7 +357,7 @@ fragment GBufferOut illumi_fs(
         // higher UV frequency (pores, weave, grain). Uses overlay-normal
         // blend: partial-derivative add in tangent space, then renormalize.
         if (inst.detailNormalTextureSlice >= 0) {
-            float2 detailUV = in.uv * inst.detailNormalUVScale;
+            float2 detailUV = matUV * inst.detailNormalUVScale;
             // S1.1 — the detail band is handed the UNSCALED gradient pair ON PURPOSE, and
             // this is a deliberate, measured exception to the rule the rest of this shader
             // follows.
@@ -397,7 +409,7 @@ fragment GBufferOut illumi_fs(
             if (wantsDetailRelief) {
                 float occScale = inst.detailOcclusionUVScale > 0.0
                                ? inst.detailOcclusionUVScale : inst.detailNormalUVScale;
-                float2 occUV = in.uv * occScale;
+                float2 occUV = matUV * occScale;
                 float4 occSample = sampleAtlasAspect(nonColorAtlas, texSampler, occUV,
                                                      uint(inst.detailNormalTextureSlice), nonColorUVScale,
                                                      duvdx * occScale, duvdy * occScale);
@@ -417,7 +429,7 @@ fragment GBufferOut illumi_fs(
         // the hex cell size equals one texture tile. sampleAtlasAspect handles
         // letterbox padding per-slice; the offset just shifts into a neighbouring
         // infinitely-tiling region, so aspect is preserved.
-        float4 tx = sampleAtlasHex(albedoAtlas, texSampler, in.uv,
+        float4 tx = sampleAtlasHex(albedoAtlas, texSampler, matUV,
                                     uint(inst.albedoTextureSlice), albedoUVScale,
                                     albedoSliceMean,
                                     frame.antiTilingStrength * inst.antiTilingScale, duvdx, duvdy);
@@ -453,7 +465,7 @@ fragment GBufferOut illumi_fs(
         // (Blue) and roughness in G — but the exact channel depends on
         // how the asset was authored. Falling back to R keeps single-
         // channel grayscale metallic maps working without per-scene wiring.
-        float4 tx = sampleAtlasAspect(nonColorAtlas, texSampler, in.uv,
+        float4 tx = sampleAtlasAspect(nonColorAtlas, texSampler, matUV,
                                       uint(inst.metallicTextureSlice), nonColorUVScale, duvdx, duvdy);
         metallic = tx.r;
     }
@@ -462,7 +474,7 @@ fragment GBufferOut illumi_fs(
     if (inst.roughnessTextureSlice >= 0) {
         // Hex-stochastic roughness — same three-cell blend as albedo so
         // roughness variation doesn't lag the albedo tile seam.
-        float4 tx = sampleAtlasHex(nonColorAtlas, texSampler, in.uv,
+        float4 tx = sampleAtlasHex(nonColorAtlas, texSampler, matUV,
                                     uint(inst.roughnessTextureSlice), nonColorUVScale,
                                     nonColorSliceMean,
                                     frame.antiTilingStrength * inst.antiTilingScale, duvdx, duvdy);
@@ -488,6 +500,37 @@ fragment GBufferOut illumi_fs(
         // Micro-cavity roughening: the same pits scatter more widely than the open
         // surface between them. Survives mip filtering (see the sample site above).
         roughness = saturate(roughness + inst.detailRoughnessStrength * (1.0 - detailOcc));
+    }
+
+    // ── World-space wood knots: the branch, drawn on top of the wood it grew through ──────
+    // Placed after roughness so both channels are in hand, and expressed as a modification of
+    // the SAMPLED wood rather than as a colour of its own — which is what lets one shader term
+    // serve oak, cherry and maple without knowing which it is on.
+    if (knot.eye > 0.0f || knot.rim > 0.0f || knot.crack > 0.0f) {
+        float dark = saturate(inst.woodKnots.z);
+        // The branch's own end grain: its light and dark wood, chosen between by the concentric
+        // ring field. Mixing toward ONE flat brown is what makes a knot read as a sticker.
+        float3 knotLight = albedo * (1.0f - dark * 0.55f);
+        float3 knotDark  = albedo * (1.0f - dark);
+        // A shade redder, as resin-dense heartwood is.
+        float3 knotWood = mix(knotLight, knotDark, knot.rings) * float3(1.06f, 0.98f, 0.94f);
+        albedo = mix(albedo, knotWood, knot.eye);
+        albedo *= 1.0f - 0.34f * knot.pith;    // deepest at the pith
+        albedo *= 1.0f - 0.45f * knot.rim;     // the bark line
+        albedo *= 1.0f - 0.72f * knot.crack;   // the checks
+        // Knot wood is denser end grain and takes less finish than the face around it; the
+        // checks are raw split wood.
+        roughness = saturate(roughness + 0.07f * knot.eye + 0.10f * knot.rim + 0.22f * knot.crack);
+        // A sanded knot sits a hair below the softer wood around it, so the face dishes very
+        // slightly toward the pith and the checks are real openings. The tangent frame is rebuilt
+        // here rather than hoisted, because the normal-map block that owns it is skipped whenever
+        // no normal slice is bound — and a wood floor with no normal map still has knots.
+        float dish = 0.06f * knot.eye + 0.18f * knot.crack;
+        if (dish > 0.0f && length_squared(in.worldTangent.xyz) > 1e-4f) {
+            float3 kT = normalize(in.worldTangent.xyz);
+            float3 kB = cross(n, kT) * in.worldTangent.w;
+            n = normalize(n + normalize(kT * knot.radial.x + kB * knot.radial.y) * dish);
+        }
     }
 
     // ── Procedural soil material (#58 #11/#12/#13) ───────────────────────────

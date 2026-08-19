@@ -931,6 +931,15 @@ public struct IlluminatoramaInstance {
     /// without a second global.
     public var windScale: Float = 0
 
+    /// **World-space wood knots** — see `sampleWoodKnots` in `IlluminatoramaMaterial.h` for the
+    /// full contract and for why a knot cannot be a baked texel or a decal quad.
+    ///
+    ///   x = lattice cells per UV unit (0 = disabled — the default, and an exact no-op)
+    ///   y = knot radius in UV units
+    ///   z = darkness of the core against the wood it grew through, [0, 1]
+    ///   w = fraction of lattice cells that carry a knot
+    public var woodKnots: SIMD4<Float> = .zero
+
     public init(
         modelMatrix: simd_float4x4,
         albedo: SIMD3<Float> = SIMD3(0.8, 0.8, 0.8),
@@ -966,7 +975,7 @@ public struct IlluminatoramaInstance {
     /// Compile-time guard: Swift and Metal structs must agree on 272 bytes.
     /// If this fires, either a Swift field was added without the matching Metal
     /// field (or vice versa), or alignment changed unexpectedly.
-    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 272, "IlluminatoramaInstance stride must be 272") }()
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 288, "IlluminatoramaInstance stride must be 288") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //

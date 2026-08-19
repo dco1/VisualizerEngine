@@ -618,12 +618,25 @@ struct Instance {
     // can only reach a draw whose host declared it vegetation. 0 (the default) is an
     // exact no-op. See the Swift twin for why this had to become per-instance.
     float    windScale;
+    // ── World-space WOOD KNOTS (see `sampleWoodKnots` in IlluminatoramaMaterial.h) ──
+    // NEW 16-byte cluster (offsets 272-287): stride 272 -> 288.
+    //
+    // A knot is a sparse LANDMARK, and a landmark baked into a tiling texture reappears on a
+    // lattice at the tile period. So it is not baked: it is evaluated per pixel on the UNWRAPPED
+    // uv, which counts up across the whole surface, and it warps the material UV so the grain
+    // flows around it rather than being composited over it.
+    //
+    //   x = lattice cells per UV unit (0 = disabled — the default, and an exact no-op)
+    //   y = knot radius in UV units
+    //   z = darkness of the core against the wood it grew through, [0,1]
+    //   w = fraction of lattice cells that carry a knot
+    float4   woodKnots;
 };
 
 // The Swift mirror (`IlluminatoramaInstance._assertStride240`) has always asserted this
 // side of the contract; this is the other side, and it costs a compile. A Swift field
 // added without its Metal twin used to be caught only by a wrong-looking render.
-static_assert(sizeof(Instance) == 272, "Instance must match IlluminatoramaInstance (272 bytes)");
+static_assert(sizeof(Instance) == 288, "Instance must match IlluminatoramaInstance (288 bytes)");
 
 struct Vertex {
     float3 position;
