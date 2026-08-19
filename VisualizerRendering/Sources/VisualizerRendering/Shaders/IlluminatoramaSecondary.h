@@ -307,6 +307,11 @@ struct SecondaryShadeParams {
     float3 interiorIrrUp;   float interiorIrrW;
     float3 interiorIrrSide; float _padIrrS;
     float3 interiorIrrDown; float _padIrrD;
+    // Per-room band LEVEL (S3.5 Stage E) — a pointer into the caller's own uniform
+    // block, not a copy: 32 gains is 128 bytes, and a secondary ray must not pay
+    // that per hit. `nullptr` / 0 ⇒ every room reads 1.0, the pre-Stage-E behaviour.
+    constant float4 *interiorRoomGains;
+    float  interiorRoomGainEnabled;  float _padRoomGain0, _padRoomGain1, _padRoomGain2;
     // Albedo atlas: 0 ⇒ fall back to the instance's mean albedo.
     uint   albedoAtlasEnabled;
     uint   objUVCount;      // bound of objUV in float2 entries
@@ -396,6 +401,44 @@ static inline float3 secondaryAlbedo(SecondaryHit h,
     return secondaryAtlasSample(albedoAtlas, texSmp, uv, uint(slice), sc.uvScale).rgb;
 }
 
+// ── Per-room interior band level (S3.5 Stage E) ──────────────────────────────
+
+/// The band-level multiplier for a fragment carrying `layerBits`.
+///
+/// The interior irradiance bands give a room its diffuse environment, but their
+/// LEVEL was a frame uniform pegged to the ambient fill — so a room walled in glass
+/// and a windowless closet rendered the same ceiling. The host now measures how much
+/// daylight each ROOM actually admits (glazed area × sun/sky facing, per m² of floor)
+/// and hands one gain per light-layer bit; this resolves a fragment's bits to its
+/// room's gain.
+///
+/// SHARED because both consumers need the identical answer: the deferred kernel shades
+/// a room directly and the secondary path shades the SAME room seen through a pane or
+/// in a reflection. Two copies of this arithmetic would drift and the pane would stop
+/// agreeing with the wall beside it.
+///
+/// A fragment on a SHARED WALL carries both adjoining rooms' bits (that is how the
+/// wall gets lit from each side) and there is no per-face signal here to separate
+/// them, so it takes their MEAN — the honest answer for a surface the mask says
+/// belongs to both. Unstamped fragments (0xFFFFFFFF — exterior geometry, and every
+/// scene that never stamps layers) and a disabled table return exactly 1.0.
+static inline float interiorRoomBandGain(uint layerBits,
+                                         constant float4 *gains,
+                                         float enabled)
+{
+    if (enabled <= 0.0 || gains == nullptr) return 1.0;
+    if (layerBits == 0u || layerBits == 0xFFFFFFFFu) return 1.0;
+    float sum = 0.0, n = 0.0;
+    uint m = layerBits;
+    while (m != 0u) {
+        uint b = uint(ctz(m));
+        m &= (m - 1u);                       // clear the lowest set bit
+        sum += gains[b >> 2u][b & 3u];       // 32 gains packed as 8 float4s
+        n += 1.0;
+    }
+    return n > 0.0 ? sum / n : 1.0;
+}
+
 // ── Indirect fill ────────────────────────────────────────────────────────────
 
 /// Sky IBL + ambient at a secondary hit — the SAME terms the deferred lighting
@@ -435,6 +478,10 @@ static inline float3 secondaryIndirectFill(float3 hitN, uint hitLayerBits,
         float3 band = mix(p.interiorIrrSide,
                           hitN.y >= 0.0 ? p.interiorIrrUp : p.interiorIrrDown,
                           saturate(abs(hitN.y)));
+        // Stage E — scale to the room this hit is IN. Same call the deferred kernel
+        // makes, so a room seen through a pane matches the room seen directly.
+        band *= interiorRoomBandGain(hitLayerBits, p.interiorRoomGains,
+                                     p.interiorRoomGainEnabled);
         cubeIrr = mix(cubeIrr, band, bandW);
     }
     float3 irr = cubeIrr * max(0.0, p.skyIntensity);

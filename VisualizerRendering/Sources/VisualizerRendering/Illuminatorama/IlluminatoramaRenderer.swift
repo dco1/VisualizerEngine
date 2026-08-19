@@ -1024,6 +1024,22 @@ public final class IlluminatoramaRenderer {
     public var interiorApertures: [IlluminatoramaInteriorAperture] = []
     /// 0 = off (default); 1 = the full gradation. Fractional = partial (a look dial).
     public var interiorApertureGradation: Float = 0
+    /// Per-room BAND LEVEL (S3.5 Stage E): one multiplier per light-layer bit, applied
+    /// to a fragment's interior irradiance bands (diffuse and specular alike) according
+    /// to the room its `layer` bits name.
+    ///
+    /// The bands are otherwise ONE environment for the whole frame, so their level knows
+    /// the time of day and nothing about the room: a hall of glass and an interior closet
+    /// rendered the same ceiling. The host measures how much daylight each room's own
+    /// glazing admits and hands the levels here. A fragment on a shared wall carries both
+    /// rooms' bits and takes their mean (there is no per-face signal at this point in the
+    /// pipeline). Bits beyond `InteriorRoomGains.capacity`, an empty table, or
+    /// `interiorRoomGainsEnabled == false` (all defaults) ⇒ every resolve is exactly 1.0
+    /// ⇒ byte-identical. Carried by the deferred kernel AND both secondary paths, so a
+    /// room through a pane or in a reflection is scaled like the room seen directly.
+    public var interiorRoomGains: [Float] = []
+    /// Master enable for `interiorRoomGains`. False (default) ⇒ exact no-op.
+    public var interiorRoomGainsEnabled: Bool = false
     /// A/B DEBUG: overrides the LTC-specular arm of the area-light eval (nil = the
     /// baked LUT's own validation decides, the shipped behaviour). `false` forces the
     /// most-representative-point fallback — the bisect lever for separating "the LTC
@@ -2909,6 +2925,26 @@ public final class IlluminatoramaRenderer {
         var interiorIrrUp: SIMD4<Float> = .zero
         var interiorIrrSide: SIMD4<Float> = .zero
         var interiorIrrDown: SIMD4<Float> = .zero
+        // Per-room band level (S3.5 Stage E) — so a room in a reflection is scaled
+        // like the room seen directly. Same packing as the frame twin.
+        var interiorRoomGain0: SIMD4<Float> = .one
+        var interiorRoomGain1: SIMD4<Float> = .one
+        var interiorRoomGain2: SIMD4<Float> = .one
+        var interiorRoomGain3: SIMD4<Float> = .one
+        var interiorRoomGain4: SIMD4<Float> = .one
+        var interiorRoomGain5: SIMD4<Float> = .one
+        var interiorRoomGain6: SIMD4<Float> = .one
+        var interiorRoomGain7: SIMD4<Float> = .one
+        var interiorRoomGainMeta: SIMD4<Float> = .zero
+
+        mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
+            let p = InteriorRoomGains.pack(gains, enabled: enabled)
+            interiorRoomGain0 = p.v[0]; interiorRoomGain1 = p.v[1]
+            interiorRoomGain2 = p.v[2]; interiorRoomGain3 = p.v[3]
+            interiorRoomGain4 = p.v[4]; interiorRoomGain5 = p.v[5]
+            interiorRoomGain6 = p.v[6]; interiorRoomGain7 = p.v[7]
+            interiorRoomGainMeta = p.meta
+        }
     }
     /// **The ONE place an instance becomes `RTInstanceData`.** The normal matrix's
     /// column `.w` lanes are dead weight for RT (every consumer builds a float3x3
@@ -7496,6 +7532,7 @@ public final class IlluminatoramaRenderer {
         // screen (the lawn-green-ceiling fix, secondary side).
         let rtIrrW = max(0, min(1, interiorIrradianceWeight))
         u.interiorIrrUp = SIMD4(simd_max(interiorIrradianceUp, .zero), rtIrrW)
+        u.setInteriorRoomGains(interiorRoomGains, enabled: interiorRoomGainsEnabled)
         u.interiorIrrSide = SIMD4(simd_max(interiorIrradianceSide, .zero), 0)
         u.interiorIrrDown = SIMD4(simd_max(interiorIrradianceDown, .zero), 0)
         // C1 — exactly one sun (see `RTSunOwnership`). This pass is ADDITIVE over a
@@ -9404,6 +9441,7 @@ public final class IlluminatoramaRenderer {
         // the room beside it (the lawn-green-ceiling fix, glass side).
         let glassIrrW = max(0, min(1, interiorIrradianceWeight))
         u.interiorIrrUp = SIMD4(simd_max(interiorIrradianceUp, .zero), glassIrrW)
+        u.setInteriorRoomGains(interiorRoomGains, enabled: interiorRoomGainsEnabled)
         u.interiorIrrSide = SIMD4(simd_max(interiorIrradianceSide, .zero), 0)
         u.interiorIrrDown = SIMD4(simd_max(interiorIrradianceDown, .zero), 0)
         // ── The night sky, THROUGH the glass ─────────────────────────────────
@@ -11798,6 +11836,7 @@ public final class IlluminatoramaRenderer {
         // exact cube sample ⇒ byte-identical for every scene that never opts in.
         let irrW = max(0, min(1, interiorIrradianceWeight))
         u.interiorIrrUp = SIMD4(simd_max(interiorIrradianceUp, .zero), irrW)
+        u.setInteriorRoomGains(interiorRoomGains, enabled: interiorRoomGainsEnabled)
         // The two spare .w lanes carry the aperture GRADATION (S3.5 Stage D):
         // side.w = strength (0 = off), down.w = aperture count (float-encoded; exact
         // for any realistic count). Both 0 by default ⇒ the kernel's factor is 1.0.

@@ -413,6 +413,21 @@ struct FrameUniforms {
     float    rtSunShadowAngle;     // sun angular radius, radians (cone half-angle)
     uint     rtSunShadowRayCount;  // shadow rays per pixel, host-clamped 1…8
     float    _padRTSunShadow;
+    // ── Per-room interior band LEVEL (S3.5 Stage E) ──────────────────────────
+    // The bands above are ONE environment for the whole frame, pegged to the host's
+    // ambient fill — so a room walled in glass and a windowless closet rendered the
+    // same ceiling. These are per-ROOM levels: one gain per light-layer bit (the
+    // same 32-bit room identity `interiorMask` and `PointLight.layerMask` use),
+    // packed 4 to a float4. A fragment's bits resolve through
+    // `interiorRoomBandGain` (IlluminatoramaSecondary.h — shared with the secondary
+    // paths so a room through a pane matches the room beside it), which multiplies
+    // BOTH the diffuse and the specular band.
+    // `interiorRoomGainMeta.x` = 0 (the default, and every scene that never opts in)
+    // ⇒ the resolve returns exactly 1.0 and the frame is byte-identical.
+    // NINE new 16-byte clusters (stride 1392 → 1536); mirror of
+    // IlluminatoramaFrameUniforms.interiorRoomGain0…7 + interiorRoomGainMeta.
+    float4   interiorRoomGain[8];   // 32 room gains, bit b at [b >> 2][b & 3]
+    float4   interiorRoomGainMeta;  // x = enabled (0 = off); yzw unused
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift

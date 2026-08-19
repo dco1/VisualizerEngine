@@ -131,6 +131,10 @@ struct GlassRTUniforms {
     float4 interiorIrrUp;
     float4 interiorIrrSide;
     float4 interiorIrrDown;
+    // Per-room band level (S3.5 Stage E) — mirror of FrameUniforms.interiorRoomGain*.
+    // Carried here so a room seen THROUGH a pane is scaled like the room beside it.
+    float4 interiorRoomGain[8];
+    float4 interiorRoomGainMeta;
 };
 
 /// This pass's view of the shared night-sky currency — the mirror of
@@ -226,6 +230,8 @@ static inline SecondaryShadeParams glassSecondaryParams(constant GlassRTUniforms
     p.interiorMask = u.interiorMask;
     p.interiorIBLUp = u.interiorIBLUp; p.interiorIBLSide = u.interiorIBLSide;
     p.interiorAmbient = u.interiorAmbient;
+    p.interiorRoomGains = &u.interiorRoomGain[0];
+    p.interiorRoomGainEnabled = u.interiorRoomGainMeta.x;
     p.interiorIrrUp = u.interiorIrrUp.xyz;     p.interiorIrrW = u.interiorIrrUp.w;
     p.interiorIrrSide = u.interiorIrrSide.xyz;
     p.interiorIrrDown = u.interiorIrrDown.xyz;

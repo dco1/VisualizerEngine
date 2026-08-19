@@ -26,13 +26,15 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
     /// `diagramEdge`); 1312 → 1328 with `taaJitterDelta` (S4.2); 1328 → 1376 with the three
     /// interior irradiance bands (`interiorIrrUp/Side/Down` — the lawn-green-ceiling fix);
     /// 1376 → 1392 with the RT soft-sun-shadow cluster (`rtSunShadowSeed/Angle/RayCount` +
-    /// pad — S4.1).
+    /// pad — S4.1); 1392 → 1536 with the per-room band-gain table (S3.5 Stage E —
+    /// `interiorRoomGain[8]` + `interiorRoomGainMeta`, NINE clusters: 32 gains packed four
+    /// to a vector, one per light-layer bit, plus the enable word).
     /// Verified against Metal by compiling a scratch kernel carrying
-    /// `static_assert(sizeof(FrameUniforms) == 1392)`, which holds while the same assert at
-    /// 1376 fails — i.e. the assert is live, not a tautology. (`offsetof` is not available
+    /// `static_assert(sizeof(FrameUniforms) == 1536)`, which holds while the same assert at
+    /// 1520 fails — i.e. the assert is live, not a tautology. (`offsetof` is not available
     /// in Metal; the tail offsets below are the Swift-side half of the check, and the fields
     /// are APPENDED, so stride pins them.)
-    private static let metalStride = 1392
+    private static let metalStride = 1536
 
     func testFrameUniformsStrideMatchesMetal() {
         XCTAssertEqual(MemoryLayout<IlluminatoramaFrameUniforms>.stride,
@@ -64,6 +66,46 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
         assertOffset(\.rtSunShadowSeed,     1376, "rtSunShadowSeed")
         assertOffset(\.rtSunShadowAngle,    1380, "rtSunShadowAngle")
         assertOffset(\.rtSunShadowRayCount, 1384, "rtSunShadowRayCount")
+        // S3.5 Stage E — the per-room band-gain table. Every vector is checked, not just
+        // the first: the shader indexes it as `gains[b >> 2][b & 3]`, so a gap anywhere in
+        // the run sends one room's level to another room's fragments, which reads as a
+        // brightness bug in a room nobody edited.
+        assertOffset(\.interiorRoomGain0,   1392, "interiorRoomGain0")
+        assertOffset(\.interiorRoomGain1,   1408, "interiorRoomGain1")
+        assertOffset(\.interiorRoomGain2,   1424, "interiorRoomGain2")
+        assertOffset(\.interiorRoomGain3,   1440, "interiorRoomGain3")
+        assertOffset(\.interiorRoomGain4,   1456, "interiorRoomGain4")
+        assertOffset(\.interiorRoomGain5,   1472, "interiorRoomGain5")
+        assertOffset(\.interiorRoomGain6,   1488, "interiorRoomGain6")
+        assertOffset(\.interiorRoomGain7,   1504, "interiorRoomGain7")
+        assertOffset(\.interiorRoomGainMeta, 1520, "interiorRoomGainMeta")
+    }
+
+    /// The packing the shader's `gains[b >> 2][b & 3]` assumes, held on the Swift side that
+    /// writes it. A table whose lanes are laid out differently from the way they are read is
+    /// the same defect as a stride drift, and no stride check can see it. Tested through
+    /// `InteriorRoomGains.pack` because that is the ONE place the packing is written — the
+    /// frame, glass and RT-instanced uniform blocks all delegate to it.
+    func testGainPackingPutsEachLayerBitInTheLaneTheShaderReads() {
+        let p = InteriorRoomGains.pack((0..<32).map { Float($0) + 1 }, enabled: true)
+        XCTAssertEqual(p.v.count, 8, "32 gains, four to a vector")
+        for b in 0..<InteriorRoomGains.capacity {
+            XCTAssertEqual(p.v[b >> 2][b & 3], Float(b) + 1, "layer bit \(b)")
+        }
+        XCTAssertEqual(p.meta.x, 1, "the enable word must be stamped")
+
+        // Disabled is the inert default: all-ones vectors and a zero enable, which the
+        // shader short-circuits to exactly 1.0.
+        let off = InteriorRoomGains.pack([0.1, 0.2], enabled: false)
+        XCTAssertEqual(off.meta.x, 0)
+        XCTAssertEqual(off.v[0], SIMD4<Float>.one)
+
+        // A short table leaves the rest inert rather than zeroing them — a zero gain would
+        // black out every room whose bit fell past the end.
+        let short = InteriorRoomGains.pack([0.5], enabled: true)
+        XCTAssertEqual(short.v[0][0], 0.5)
+        XCTAssertEqual(short.v[0][1], 1.0)
+        XCTAssertEqual(short.v[7], SIMD4<Float>.one)
     }
 
     private func assertOffset(_ key: PartialKeyPath<IlluminatoramaFrameUniforms>,

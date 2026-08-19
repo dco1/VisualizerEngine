@@ -485,6 +485,61 @@ public struct IlluminatoramaFrameUniforms {
     public var rtSunShadowAngle: Float = 0
     public var rtSunShadowRayCount: UInt32 = 0
     public var _padRTSunShadow: Float = 0
+    /// Per-room interior band LEVEL (S3.5 Stage E). One gain per light-layer bit —
+    /// the same 32-bit room identity `interiorMask` and `PointLight.layerMask` use —
+    /// packed 4 to a vector, so a fragment's bits resolve to how much daylight ITS
+    /// room admits. Without this the bands are one environment for the whole frame
+    /// and a glass-walled room renders the same ceiling as a windowless closet.
+    /// `interiorRoomGainMeta.x` = 0 (the default) ⇒ the shader resolve returns
+    /// exactly 1.0 ⇒ byte-identical. Declared as eight named vectors rather than a
+    /// Swift tuple: identical memory layout to the Metal `float4 [8]`, and indexable
+    /// through `setInteriorRoomGains`. NINE new 16-byte clusters (stride 1392 →
+    /// 1536); mirror of the Metal `FrameUniforms`.
+    public var interiorRoomGain0: SIMD4<Float> = .one
+    public var interiorRoomGain1: SIMD4<Float> = .one
+    public var interiorRoomGain2: SIMD4<Float> = .one
+    public var interiorRoomGain3: SIMD4<Float> = .one
+    public var interiorRoomGain4: SIMD4<Float> = .one
+    public var interiorRoomGain5: SIMD4<Float> = .one
+    public var interiorRoomGain6: SIMD4<Float> = .one
+    public var interiorRoomGain7: SIMD4<Float> = .one
+    public var interiorRoomGainMeta: SIMD4<Float> = .zero   // x = enabled
+
+    /// Fill the eight gain vectors from a flat 32-entry table, and stamp the enable.
+    public mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
+        let p = InteriorRoomGains.pack(gains, enabled: enabled)
+        interiorRoomGain0 = p.v[0]; interiorRoomGain1 = p.v[1]
+        interiorRoomGain2 = p.v[2]; interiorRoomGain3 = p.v[3]
+        interiorRoomGain4 = p.v[4]; interiorRoomGain5 = p.v[5]
+        interiorRoomGain6 = p.v[6]; interiorRoomGain7 = p.v[7]
+        interiorRoomGainMeta = p.meta
+    }
+}
+
+/// The bit → (vector, lane) packing of the per-room band gains (S3.5 Stage E).
+///
+/// ONE place it is written, because THREE uniform blocks carry the table — the
+/// deferred frame, the glass pass and the RT-instanced pass — and the whole point of
+/// carrying it in all three is that a room seen through a pane, a room seen in a
+/// reflection and a room seen directly agree. Three hand-rolled copies of `b >> 2`
+/// is exactly how they would stop agreeing. Mirrors the shader-side indexing in
+/// `interiorRoomBandGain` (IlluminatoramaSecondary.h).
+public enum InteriorRoomGains {
+    /// The layer-bit pool size — 32, one per bit of an `IlluminatoramaInstance.layer`.
+    public static let capacity = 32
+
+    /// Pack a flat table (index = layer bit) into eight vectors + the enable word.
+    /// Disabled, or an empty table, yields all-ones vectors and a zero meta, which the
+    /// shader resolve short-circuits to exactly 1.0.
+    public static func pack(_ gains: [Float], enabled: Bool)
+        -> (v: [SIMD4<Float>], meta: SIMD4<Float>) {
+        var v = [SIMD4<Float>](repeating: .one, count: 8)
+        guard enabled, !gains.isEmpty else { return (v, .zero) }
+        for b in 0..<min(gains.count, capacity) {
+            v[b >> 2][b & 3] = max(0, gains[b])
+        }
+        return (v, SIMD4(1, 0, 0, 0))
+    }
 }
 
 /// World-space secondary directional light (#60 task 5 — retires the 4.20
@@ -1141,6 +1196,26 @@ struct IlluminatoramaGlassRTUniforms {
     var interiorIrrUp: SIMD4<Float> = .zero
     var interiorIrrSide: SIMD4<Float> = .zero
     var interiorIrrDown: SIMD4<Float> = .zero
+    // Per-room band level (S3.5 Stage E) — so a room seen through a pane is scaled
+    // like the room beside it. Same packing as the frame twin.
+    var interiorRoomGain0: SIMD4<Float> = .one
+    var interiorRoomGain1: SIMD4<Float> = .one
+    var interiorRoomGain2: SIMD4<Float> = .one
+    var interiorRoomGain3: SIMD4<Float> = .one
+    var interiorRoomGain4: SIMD4<Float> = .one
+    var interiorRoomGain5: SIMD4<Float> = .one
+    var interiorRoomGain6: SIMD4<Float> = .one
+    var interiorRoomGain7: SIMD4<Float> = .one
+    var interiorRoomGainMeta: SIMD4<Float> = .zero
+
+    mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
+        let p = InteriorRoomGains.pack(gains, enabled: enabled)
+        interiorRoomGain0 = p.v[0]; interiorRoomGain1 = p.v[1]
+        interiorRoomGain2 = p.v[2]; interiorRoomGain3 = p.v[3]
+        interiorRoomGain4 = p.v[4]; interiorRoomGain5 = p.v[5]
+        interiorRoomGain6 = p.v[6]; interiorRoomGain7 = p.v[7]
+        interiorRoomGainMeta = p.meta
+    }
 }
 
 /// Per-frame uniforms for the glass caustics kernels. Mirror of `CausticUniforms`

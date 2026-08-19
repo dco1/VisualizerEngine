@@ -1330,6 +1330,16 @@ kernel void illumi_lighting(
         // because BOTH band consumers grade by it: the diffuse band on N and the
         // specular band on R. Position-dependent only, so one value serves both.
         float apBandFactor = 1.0;
+        // ── S3.5 Stage E — the band LEVEL is per-ROOM ───────────────────────
+        // Stage D (below) gives the gradient WITHIN a room; this gives the step
+        // BETWEEN rooms, which no dial could produce while the bands were one
+        // frame uniform: the level now follows the daylight each room's own
+        // glazing admits. Position-independent, so it is resolved once here and
+        // multiplies the diffuse and specular bands alike. Exactly 1.0 for an
+        // unstamped fragment and for every scene that never fills the table.
+        float roomBandGain = interiorRoomBandGain(fragLayer,
+                                                  &frame.interiorRoomGain[0],
+                                                  frame.interiorRoomGainMeta.x);
         if (interiorBandW > 0.0) {
             float3 band = mix(frame.interiorIrrSide.xyz,
                               N.y >= 0.0 ? frame.interiorIrrUp.xyz
@@ -1375,8 +1385,11 @@ kernel void illumi_lighting(
                 const float omegaRef = 0.20;
                 float factor = clamp(sqrt(omega / omegaRef), 0.55, 1.65);
                 apBandFactor = mix(1.0, factor, apStrength);
-                band *= apBandFactor;
             }
+            // Room level × within-room gradient. Two axes, deliberately composed:
+            // Stage E says how bright this ROOM is, Stage D says where in it you
+            // are standing.
+            band *= apBandFactor * roomBandGain;
             irradianceSat = mix(irradianceSat, band, interiorBandW);
         }
         float3 diffuseIBL = kD * irradianceSat * albedo;
@@ -1411,7 +1424,7 @@ kernel void illumi_lighting(
             float3 specBand = mix(frame.interiorIrrSide.xyz,
                                   R.y >= 0.0 ? frame.interiorIrrUp.xyz
                                              : frame.interiorIrrDown.xyz,
-                                  abs(R.y)) * apBandFactor;
+                                  abs(R.y)) * apBandFactor * roomBandGain;
             specBandW = interiorBandW * smoothstep(0.05, 0.30, roughness);
             specEnv = mix(specEnv, specBand, specBandW);
         }
