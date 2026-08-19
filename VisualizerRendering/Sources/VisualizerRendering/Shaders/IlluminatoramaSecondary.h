@@ -462,12 +462,17 @@ static inline float3 secondaryIndirectFill(float3 hitN, uint hitLayerBits,
                                            texturecube<float, access::sample> irrCube)
 {
     constexpr sampler cubeSmp(filter::linear);
-    float iblK = 1.0, ambK = 1.0, bandW = 0.0;
+    float iblK = 1.0, ambK = 1.0, bandW = 0.0, roomGain = 1.0;
     if (p.interiorMask != 0u && hitLayerBits != 0xFFFFFFFFu &&
         (hitLayerBits & p.interiorMask) != 0u) {
         iblK = mix(p.interiorIBLSide, p.interiorIBLUp, saturate(hitN.y));
-        ambK = p.interiorAmbient;
         bandW = saturate(p.interiorIrrW);
+        roomGain = interiorRoomBandGain(hitLayerBits, p.interiorRoomGains,
+                                        p.interiorRoomGainEnabled);
+        // Stage E scales the ambient supplement as well as the bands — same fold the
+        // deferred kernel makes, so a room seen through a pane does not keep a fill the
+        // room beside it has lost.
+        ambK = p.interiorAmbient * mix(1.0, roomGain, bandW);
     }
     // Interior irradiance bands — the deferred kernel's lawn-green-ceiling fix,
     // applied to a secondary hit the same way: the band replaces the outdoor cube
@@ -478,10 +483,7 @@ static inline float3 secondaryIndirectFill(float3 hitN, uint hitLayerBits,
         float3 band = mix(p.interiorIrrSide,
                           hitN.y >= 0.0 ? p.interiorIrrUp : p.interiorIrrDown,
                           saturate(abs(hitN.y)));
-        // Stage E — scale to the room this hit is IN. Same call the deferred kernel
-        // makes, so a room seen through a pane matches the room seen directly.
-        band *= interiorRoomBandGain(hitLayerBits, p.interiorRoomGains,
-                                     p.interiorRoomGainEnabled);
+        band *= roomGain;   // Stage E — scale to the room this hit is IN
         cubeIrr = mix(cubeIrr, band, bandW);
     }
     float3 irr = cubeIrr * max(0.0, p.skyIntensity);

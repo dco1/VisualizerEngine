@@ -1219,10 +1219,26 @@ kernel void illumi_lighting(
     // every exterior fragment and every scene that never sets the bands — the diffuse
     // path below is then the exact cube sample it always was.
     float interiorBandW = 0.0;
+    // ── S3.5 Stage E — the interior fill's level is per-ROOM ────────────────
+    // Resolved once, here, because BOTH interior fill terms answer to it: the
+    // irradiance bands below AND the warm ambient supplement. Scaling only the
+    // bands leaves a room that admits no daylight at all lit by the supplement —
+    // measured on a sealed room, the supplement WAS its entire light budget
+    // (132.4 of 132.4 luma), so a zero-gain room stayed as bright as its
+    // neighbours. Exactly 1.0 for an unstamped fragment and for every scene that
+    // never fills the table, so this is a no-op multiply by default.
+    float roomBandGain = 1.0;
     if (frame.interiorMask != 0u && fragLayer != 0xFFFFFFFFu &&
         (fragLayer & frame.interiorMask) != 0u) {
+        roomBandGain = interiorRoomBandGain(fragLayer, &frame.interiorRoomGain[0],
+                                            frame.interiorRoomGainMeta.x);
         interiorIBLK = mix(frame.interiorIBLSide, frame.interiorIBLUp, saturate(N.y));
-        interiorAmbK = frame.interiorAmbient;
+        // The supplement is a stand-in for the light bouncing round THIS room; a room
+        // with nothing coming in has nothing to bounce. Weighted by the band blend so
+        // night — where the bands are off and the supplement lerps back to 1.0 — stays
+        // byte-identical, the same contract every other Stage C/D/E term keeps.
+        interiorAmbK = frame.interiorAmbient
+                     * mix(1.0, roomBandGain, saturate(frame.interiorIrrUp.w));
         interiorBandW = saturate(frame.interiorIrrUp.w);
     }
     // The DIFFUSE lobe's interior factor. As the host's irradiance bands take over
@@ -1329,17 +1345,10 @@ kernel void illumi_lighting(
         // The daylight-aperture gradation factor (Stage D below) — computed once here
         // because BOTH band consumers grade by it: the diffuse band on N and the
         // specular band on R. Position-dependent only, so one value serves both.
+        // Stage D gives the gradient WITHIN a room; Stage E's `roomBandGain` (resolved
+        // above, beside the ambient supplement that shares it) gives the step BETWEEN
+        // rooms — the one no dial could produce while the bands were a frame uniform.
         float apBandFactor = 1.0;
-        // ── S3.5 Stage E — the band LEVEL is per-ROOM ───────────────────────
-        // Stage D (below) gives the gradient WITHIN a room; this gives the step
-        // BETWEEN rooms, which no dial could produce while the bands were one
-        // frame uniform: the level now follows the daylight each room's own
-        // glazing admits. Position-independent, so it is resolved once here and
-        // multiplies the diffuse and specular bands alike. Exactly 1.0 for an
-        // unstamped fragment and for every scene that never fills the table.
-        float roomBandGain = interiorRoomBandGain(fragLayer,
-                                                  &frame.interiorRoomGain[0],
-                                                  frame.interiorRoomGainMeta.x);
         if (interiorBandW > 0.0) {
             float3 band = mix(frame.interiorIrrSide.xyz,
                               N.y >= 0.0 ? frame.interiorIrrUp.xyz
