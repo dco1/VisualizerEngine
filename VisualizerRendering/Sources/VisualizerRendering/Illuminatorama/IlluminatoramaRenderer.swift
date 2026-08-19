@@ -1108,8 +1108,104 @@ public final class IlluminatoramaRenderer {
     private func shadowCullMode(_ mesh: IlluminatoramaMesh) -> MTLCullMode {
         let bothFaces = shadowCullFollowsDoubleSidedForTest ? mesh.doubleSided
                                                             : mesh.shadowCastsBothFaces
-        return bothFaces ? .none : .front
+        if bothFaces { return .none }
+        return shadowStoresFrontFaces ? .back : .front
     }
+
+    /// **Which face of a closed solid writes the sun's shadow depth.**
+    ///
+    /// `false` (default) culls FRONT faces, so the map stores each occluder's BACK face —
+    /// second-depth shadow mapping, which is a strong acne defence because the stored depth sits
+    /// a whole solid's thickness behind any lit surface. Its price is at CONTACTS: where a
+    /// receiver touches the occluder's back face, stored and receiver depth are equal, the
+    /// comparison ties, and the tie resolves to LIT. A floor meeting a wall is exactly that
+    /// geometry, so the sun draws a bright line along the junction and the PCF kernel spreads it
+    /// into a band (Danny, 2026-08-18/19, the Pantry wall-foot leak).
+    ///
+    /// `true` stores the FRONT face instead. At a wall foot the stored depth is then the wall's
+    /// OUTER face — a full wall thickness in front of the receiver — so the junction is
+    /// unambiguously shadowed and no PCF tap inside the wall's footprint can escape. Acne is
+    /// then carried by `ShadowRasterBias` — the slope-scaled raster bias below, which this
+    /// property selects automatically — plus the normal-offset bias in `cascadeVisibility`.
+    public var shadowStoresFrontFaces: Bool = false
+
+    /// **Raster-time depth bias for the shadow passes — the acne defence that PAIRS with
+    /// front-face storage.**
+    ///
+    /// Second-depth needs none: the stored depth is a whole solid behind any lit surface, so
+    /// `shadowBias` is a hair of float slop and `shadowSlopeBias` is 0. Storing FRONT faces
+    /// removes that margin, and a flat surface then self-shadows wherever the depth ramp ACROSS
+    /// one shadow texel exceeds the bias — the ripple that reads as sand-bar banding on a plain
+    /// wall (Danny, 2026-08-19: "banding all over … looks like a beach-ocean floor").
+    ///
+    /// This is *not* the receiver-side `shadowSlopeBias` that was tried and reverted. That one
+    /// scales with `(1 - NdotL)`, so it dumps its full value onto grazing WALLS and detaches
+    /// their shadows from the contact line. This scales with the occluder primitive's own depth
+    /// gradient in the shadow map — dz/dtexel, exactly the quantity that produces acne — and is
+    /// applied while the caster is rasterised, so a receiver's own orientation never enters into
+    /// it. `clamp` caps the push so a face seen edge-on by the light (infinite slope) cannot
+    /// bias itself out of shadowing altogether, which is what would re-open the wall-foot leak.
+    public struct ShadowRasterBias: Equatable, Sendable {
+        /// Constant offset in depth-buffer units (see `MTLRenderCommandEncoder.setDepthBias`).
+        public var constant: Float
+        /// Multiplier on the primitive's maximum depth slope.
+        public var slopeScale: Float
+        /// Upper bound on the total bias. 0 = unbounded.
+        public var clamp: Float
+        public init(constant: Float, slopeScale: Float, clamp: Float) {
+            self.constant = constant; self.slopeScale = slopeScale; self.clamp = clamp
+        }
+        /// What second-depth needs: nothing. Named `off` rather than `none` on purpose — this
+        /// type is nearly always handled as `ShadowRasterBias?`, where `.none` is Optional's own
+        /// case and silently means "derive from the convention", i.e. the exact opposite of
+        /// switching the bias off.
+        public static let off = ShadowRasterBias(constant: 0, slopeScale: 0, clamp: 0)
+        /// **The front-face profile, and the window it sits in the middle of.** Swept on
+        /// Daydream's `4000 Sunset` (2026-08-19) against two measurements at once — wall ripple
+        /// on a patch of plain wall, and sunlit pixels on a ceilinged pantry floor, the leak
+        /// that front-face storage exists to close:
+        ///
+        /// | slopeScale | wall ripple | wall-foot leak |
+        /// |---|---|---|
+        /// | second-depth (reference) | 1.53 | 2 565 px |
+        /// | 0 | **3.52** | 0 px |
+        /// | 1 | 1.57 | — |
+        /// | **2** | **1.51** | **0 px** |
+        /// | 4 | 1.53 | 528 px |
+        /// | 8 | 1.51 | 2 675 px |
+        ///
+        /// The two failure modes bound it from both sides: under ~1 the ripple survives, at 4
+        /// and up the bias lifts the wall's stored depth clear of the floor and the leak comes
+        /// back. 2 is the middle of that window, and it lands the wall at the second-depth
+        /// reference — flat, with the contact still sealed.
+        ///
+        /// `constant` is 0 because it bought nothing (100 depth units read 1.50, inside the
+        /// run-to-run spread), and `clamp` is 0 because 0.02 was measured NON-binding: the
+        /// slopeScale-4 arm is identical to three decimal places with and without it. A guard
+        /// that never fires would only suggest a safety this profile does not have — the guard
+        /// here is slopeScale itself, and the gate that pins it.
+        public static let frontFace = ShadowRasterBias(constant: 0, slopeScale: 2, clamp: 0)
+    }
+
+    /// Overrides the profile `shadowStoresFrontFaces` would otherwise pick. `nil` derives it, so
+    /// a host that flips the convention gets the matching acne defence without a second call —
+    /// the two are one decision. Set it to sweep values in a gate.
+    public var shadowRasterBiasOverride: ShadowRasterBias?
+
+    /// The profile in force: derived from the convention unless a host overrode it.
+    var effectiveShadowRasterBias: ShadowRasterBias {
+        shadowRasterBiasOverride ?? (shadowStoresFrontFaces ? .frontFace : .off)
+    }
+
+    /// Apply `effectiveShadowRasterBias` to a shadow-pass encoder.
+    private func applyShadowRasterBias(_ enc: MTLRenderCommandEncoder) {
+        let b = effectiveShadowRasterBias
+        enc.setDepthBias(b.constant, slopeScale: b.slopeScale, clamp: b.clamp)
+    }
+
+    /// The cull mode a shadow pass starts in, so the first group does not have to correct it.
+    private var shadowInitialCullMode: MTLCullMode { shadowStoresFrontFaces ? .back : .front }
+
     /// PCF kernel radius in shadow-map texels: 0 = single tap, 1 = 3×3, 2 = 5×5.
     public var shadowPcfRadius: UInt32 = 1
     /// How far from the camera the outermost cascade extends, in metres. Past
@@ -8613,9 +8709,10 @@ public final class IlluminatoramaRenderer {
             // without the peter-panning a constant bias alone would cause.
             // Set per group below (`shadowCullMode`) — an OPEN shell has no
             // back face to store, so it opts out and casts two-sided.
-            var cull: MTLCullMode = .front
+            var cull: MTLCullMode = shadowInitialCullMode
             enc.setCullMode(cull)
             enc.setFrontFacing(.counterClockwise)
+            applyShadowRasterBias(enc)
 
             var lightVP = cascadeVPs[cascade]
             enc.setVertexBytes(&lightVP,
@@ -8828,9 +8925,10 @@ public final class IlluminatoramaRenderer {
             enc.setDepthStencilState(depthState)
             // Same back-face-cast trick as the cascaded path, and the same per-group
             // opt-out for open shells (`shadowCullMode`).
-            var cull: MTLCullMode = .front
+            var cull: MTLCullMode = shadowInitialCullMode
             enc.setCullMode(cull)
             enc.setFrontFacing(.counterClockwise)
+            applyShadowRasterBias(enc)
 
             var lightVP = spotLights[slice].shadowMatrix
             enc.setVertexBytes(&lightVP,
@@ -8993,9 +9091,10 @@ public final class IlluminatoramaRenderer {
                 enc.setDepthStencilState(depthState)
                 // Back-face cast, same acne mitigation as the sun / spot maps, and the
                 // same per-group opt-out for open shells (`shadowCullMode`).
-                var cull: MTLCullMode = .front
+                var cull: MTLCullMode = shadowInitialCullMode
                 enc.setCullMode(cull)
                 enc.setFrontFacing(.counterClockwise)
+                applyShadowRasterBias(enc)
 
                 var lightVP = faces[slice]
                 enc.setVertexBytes(&lightVP, length: MemoryLayout<simd_float4x4>.stride, index: 3)
