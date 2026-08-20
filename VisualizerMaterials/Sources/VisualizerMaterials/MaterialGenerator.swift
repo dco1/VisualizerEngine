@@ -747,65 +747,21 @@ public enum MaterialGenerator {
     /// not the carrier here; `brushStreakHeightAmp` below is.
     public nonisolated(unsafe) static var brushStreakRoughnessAmp: Double = 0.22
 
-    /// Amplitude of the MACRO band's mill drift in HEIGHT — `deriveNormals` turns this into the
-    /// normal map, and **this is what drew the corduroy.**
+    /// Amplitude of the brush streak in HEIGHT — `deriveNormals` turns this into the normal
+    /// map, and **this is what drew the corduroy.**
     ///
     /// **0.5 was a units error wearing a taste costume.** A brush groove on real stainless is
-    /// microns deep at a ~0.1 mm pitch. The macro slice's pitch is forced to ~10 mm by millwork's
-    /// 1.0 m tile at 512² (1.95 mm/texel) — roughly 100× too coarse. Holding the DEPTH fixed
-    /// while the PITCH grows 100× multiplies the surface slope by 100, and what that renders is
-    /// not a brushed finish at the wrong scale, it is **corrugation**: PHOTOREALISM #10's "tan
-    /// corduroy". 0.5 → 0.20 fixed the worst of it.
+    /// microns deep at a ~0.1 mm pitch. Here the pitch is forced to ~10 mm by millwork's 1.0 m
+    /// tile (and by a 512² bake, where one texel is 1.95 mm) — roughly 100× too coarse. Holding
+    /// the DEPTH fixed while the PITCH grows 100× multiplies the surface slope by 100, and what
+    /// that renders is not a brushed finish at the wrong scale, it is **corrugation**. At the
+    /// kitchen hero the refrigerator read as ribbed cardboard: PHOTOREALISM #10's "tan corduroy".
     ///
-    /// **0.20 → 0.04 (2026-08-20), because the band's job moved and what was left was only the
-    /// risk.** The brush now lives in the DETAIL band (`brushHairlineStrength`), where a hairline
-    /// pitch is actually expressible, so this band carries nothing but the broad mill drift a
-    /// rolled sheet genuinely has. A five-arm real-Metal sweep at the Debug Tester's appliance
-    /// station measured the fridge door's fine vertical gradient at **1.086 (0.20) / 1.082 (0.04)
-    /// / 1.081 (0.00)** — a 0.5 % span, i.e. this lever is very nearly inert at room distance
-    /// while remaining the one thing that can corrugate up close. Keeping a token 0.04 rather
-    /// than 0 leaves the rolled-sheet undulation in the normal without the ribs.
-    ///
-    /// (The first run of that sweep reported ALL FIVE arms identical to 1/255, because the
-    /// bridge's `atlasSlices` cache is keyed by `textureKey` and survives a resolver reset. See
-    /// `HouseRenderBridge.dropMaterialSliceCache()` — a material sweep without it is blind.)
-    public nonisolated(unsafe) static var brushStreakHeightAmp: Double = 0.04
-
-    /// **How hard the brush hairline is cut into the DETAIL band.** This is where a brushed
-    /// finish actually lives now, and the move is the point of the 2026-08-20 appliance audit's
-    /// §2 (docs/APPLIANCE_REALISM.md M1/M2).
-    ///
-    /// The note above is right that the MACRO tile cannot express a brush: 512² over millwork's
-    /// 1.0 m period is 1.95 mm per texel, so the finest thing the slice can hold is ~4 mm — two
-    /// orders coarser than a real hairline, and every attempt to make it read louder produced
-    /// corduroy instead. What that note stops one step short of is that the macro slice is **not
-    /// the only band**. The detail band is sampled shader-side at `detailNormalUVScale × uv`
-    /// (8 by default), so it tiles at 0.125 m — **0.24 mm per texel**, which is the right order
-    /// for a brush and about 8× finer than the macro slice can ever be.
-    ///
-    /// It is also the band that measurably WORKS on metal, and only on metal: the whole-library
-    /// A/B (2026-08-02) put brushed-steel at 1.17× and aluminium at 1.43× fine-gradient with the
-    /// detail normal on, while every matte dielectric sat at ~1.00. A rough dielectric's broad
-    /// lobe averages the perturbation away; metal reflects the environment, so the same
-    /// perturbation scrambles it. A brushed metal is therefore the single best-matched consumer
-    /// of this band in the library, and it was using it for an **isotropic** micro-tooth.
-    /// **0.55 ships, and the ceiling is ALIASING, not taste.** Same station, same sweep, fine
-    /// vertical gradient on the fridge door: **0.946 (off) → 1.082 (0.55) → 1.299 (1.10)** —
-    /// monotonic, so the band is live and it is the carrier. But at 1.10 the panel visibly ribs
-    /// again, and the ribs are ~5 cm — nothing like the 0.71 mm the field is authored at. That
-    /// is a **moiré beat**: at the 3.3 m station a door pixel spans ~2 mm, so a 0.71 mm hairline
-    /// is a third of a pixel and cannot resolve. A real brushed panel at 3 m shows no individual
-    /// hairlines either — it shows an anisotropic sheen — so the right behaviour is for this to
-    /// fade with distance, and the fact that it beats instead says the detail slice is not being
-    /// mip-filtered as hard as its footprint demands. Logged rather than fixed: it is an engine
-    /// question (the detail tap's LOD), and 0.55 sits below the beat at every distance checked.
-    public nonisolated(unsafe) static var brushHairlineStrength: Double = 0.55
-
-    /// Hairline pitch, in cells across the 0.125 m detail tile. 176 → ~0.71 mm, which is ~3
-    /// texels of the detail slice: fine enough to read as a hairline rather than a rib, coarse
-    /// enough to survive mip filtering instead of dissolving into a uniform grey the moment the
-    /// panel is more than a metre away.
-    public nonisolated(unsafe) static var brushHairlineCells: Int = 176
+    /// **0.20 ships**, chosen by looking at a four-point sweep at that rig
+    /// (`steel-corduroy-{before,h20,h8,h3}`): 0.5 corrugates, **0.20 keeps a fine directional
+    /// grain that reads as brushed satin**, 0.08 is nearly gone and 0.03 is a smooth panel. So
+    /// the brushed read survives and the ribs do not.
+    public nonisolated(unsafe) static var brushStreakHeightAmp: Double = 0.20
 
     public static func brushedSteel(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 6,
                                     base baseIn: Vec3 = Vec3(0.58, 0.585, 0.59)) -> MaterialChannels {
@@ -816,53 +772,29 @@ public enum MaterialGenerator {
         for y in 0..<size {
             for x in 0..<size {
                 let u = Double(x) / Double(size), v = Double(y) / Double(size)
-                // MACRO band: the broad MILL DRIFT of a rolled sheet — a slow variation in how
-                // polished the surface is across the panel, ~4 cm and up. Deliberately NOT the
-                // brush: at 1.95 mm/texel this band physically cannot hold a hairline, and the
-                // 10 mm "streak" it used to hold was the corduroy. The hairline is in the detail
-                // band below, at the pitch a hairline actually has.
-                let drift = Noise.fbmTiled(u * 2, v * 7, baseCells: 4, octaves: 3, seed: seed)
-                let fine  = Noise.fbmTiled(u * 1, v * 20, baseCells: 6, octaves: 2, seed: seed ^ 0x55)
+                // streaks: high frequency ACROSS the brush (v), low along it (u)
+                let streak = Noise.fbmTiled(u * 2, v * 24, baseCells: 4, octaves: 3, seed: seed)
+                let fine = Noise.fbmTiled(u * 1, v * 64, baseCells: 6, octaves: 2, seed: seed ^ 0x55)
 
                 // FLAT albedo — a brushed metal's grain is a roughness/normal phenomenon, and
                 // its albedo is its F0. See the note above for the measurement that says so.
-                ch.albedo[ch.idx(x, y)] = clampBand(legacy ? base * (0.88 + 0.20 * drift) : base)
-                // The macro roughness spread is kept at its shipped amplitude — a 7.5× sweep
-                // showed it is not what the eye reads, but it IS what `TextureAudit` reads as
-                // "this surface is not flat", and it is genuinely true of a rolled panel.
+                ch.albedo[ch.idx(x, y)] = clampBand(legacy ? base * (0.88 + 0.20 * streak) : base)
+                // …so roughness carries the whole brush. Amplitude raised 0.22 → 0.30 across
+                // the grain to take over what the tone was doing; the fine cross-hatch and the
+                // 0.28 mean are unchanged, so the satin level is where it was.
                 ch.roughness[ch.idx(x, y)] = clamp01(
-                    0.28 + (drift - 0.5) * (legacy ? 0.22 : brushStreakRoughnessAmp)
+                    0.28 + (streak - 0.5) * (legacy ? 0.22 : brushStreakRoughnessAmp)
                          + (fine - 0.5) * 0.10)
                 ch.height[ch.idx(x, y)] = clamp01(
-                    0.5 + (drift - 0.5) * (legacy ? 0.5 : brushStreakHeightAmp))
+                    0.5 + (streak - 0.5) * (legacy ? 0.5 : brushStreakHeightAmp))
                 grain[ch.idx(x, y)] = Vec2(1, 0)
             }
         }
         ch.grainTangent = grain
         ch.deriveNormals(strength: 2)
-        // DETAIL band: the brush itself. Strongly ANISOTROPIC — high frequency across the grain
-        // (v), almost none along it (u) — which is the one thing `addMicroDetail` cannot express
-        // here, because its `grainAspect` stretches along v and this grain runs along u. So the
-        // height field is written directly and handed to the same single writer
-        // (`setDetailRelief`), which derives BOTH the detail normal and S2.4's detail occlusion
-        // from it. The occlusion is the audit's I1: micro-shadow in the brush grooves, which is
-        // what makes stainless read as *touched* rather than as chrome.
-        if !legacy {
-            let cells = max(8, brushHairlineCells)
-            var h = [Double](repeating: 0, count: size * size)
-            for y in 0..<size {
-                for x in 0..<size {
-                    let u = Double(x) / Double(size), v = Double(y) / Double(size)
-                    // 4 cells along the grain vs `cells` across it: a 44:1 aspect, so the field
-                    // is a bundle of long parallel scratches, not a field of dots.
-                    h[ch.idx(x, y)] = Noise.fbmTiled(u, v * Double(cells) / 4,
-                                                     baseCells: 4, octaves: 2, seed: seed ^ 0xB2)
-                }
-            }
-            setDetailRelief(&ch, height: h, strength: brushHairlineStrength)
-        } else {
-            addMicroDetail(&ch, seed: seed ^ 0xB2, baseCells: 100, strength: 0.30)
-        }
+        // Fine satin micro-tooth between the brush grooves — a real brushed-steel face
+        // isn't a mirror at close range. Subtle so it doesn't drown the anisotropic streak.
+        addMicroDetail(&ch, seed: seed ^ 0xB2, baseCells: 100, strength: 0.30)
         return ch
     }
 
