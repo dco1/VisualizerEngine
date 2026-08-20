@@ -225,6 +225,10 @@ public final class IlluminatoramaRenderer {
     /// Spot-shadow skip signature: the atlas slices currently hold depth maps
     /// rendered with exactly these light matrices (and the stable content).
     private var lastSpotShadowMats: [simd_float4x4] = []
+    /// Which `spotLights` index owns each shadow-atlas slice, in slice order. Set by
+    /// `updateSpotShadows`; `encodeSpotShadowPasses` renders through it. A slice is no longer
+    /// a light's array index — see `IlluminatoramaSpotLight.castsShadow`.
+    private var spotShadowSliceOwners: [Int] = []
     /// Point-shadow skip signature: (position, radius) per cube-holding light in
     /// enumeration order + the cube-page assignment vector. Any ranking change,
     /// light move, or radius change breaks equality → re-render.
@@ -8855,14 +8859,24 @@ public final class IlluminatoramaRenderer {
     private func updateSpotShadows() {
         let capacity = spotShadowAtlasCapacity
         let enabled = spotShadowsEnabled
+        // Slices go to the shadow-CASTING spots, compacted — not to array indices. A spot with
+        // `castsShadow == 0` is skipped and, crucially, does not consume the slice it would
+        // have sat on, so a later caster can still have one. Before this the slice WAS the
+        // index, which made `castsShadow`'s host-side equivalent (sorting a cone to the back
+        // of the array) a no-op in any scene under capacity: the cone landed under the cap and
+        // was shadowed anyway. See `IlluminatoramaSpotLight.castsShadow`.
+        //
+        // Every spot starts unshadowed so a light that loses (or never wanted) a slice cannot
+        // sample a stale one — the same reset `updatePointShadows` does.
+        spotShadowSliceOwners.removeAll(keepingCapacity: true)
+        for i in 0..<spotLights.count { spotLights[i].shadowSliceIndex = -1 }
+        guard enabled else { return }
         for i in 0..<spotLights.count {
-            if !enabled || i >= capacity {
-                // Force the lighting kernel into the no-shadow code path
-                // so it doesn't sample stale slices when the toggle is off.
-                spotLights[i].shadowSliceIndex = -1
-                continue
-            }
-            spotLights[i].shadowSliceIndex = Int32(i)
+            guard spotLights[i].castsShadow != 0 else { continue }
+            guard spotShadowSliceOwners.count < capacity else { break }
+            let slice = spotShadowSliceOwners.count
+            spotShadowSliceOwners.append(i)
+            spotLights[i].shadowSliceIndex = Int32(slice)
             // Light view: apex at spot.position, looking down the spot's
             // direction (which already points the way light travels).
             let position = spotLights[i].position
@@ -8891,14 +8905,14 @@ public final class IlluminatoramaRenderer {
     /// spots are present, or when the host hasn't pushed any instances
     /// (no occluders → no shadow data needed).
     private func encodeSpotShadowPasses(_ cb: MTLCommandBuffer) {
-        guard spotShadowsEnabled, !spotLights.isEmpty, !instances.isEmpty else { return }
-        let count = min(spotLights.count, spotShadowAtlasCapacity)
+        guard spotShadowsEnabled, !spotShadowSliceOwners.isEmpty, !instances.isEmpty else { return }
+        let count = spotShadowSliceOwners.count
         // PERF (static-scene skip): spot shadow maps are LIGHT-space — a camera
         // orbit re-rendered every slice (up to 8 full scene depth passes) into
         // byte-identical maps every frame. When the scene content held (see
         // `sceneStaticForShadows`) and every slice's light matrix is unchanged,
         // the atlas already contains exactly these maps — reuse them.
-        let mats = (0..<count).map { spotLights[$0].shadowMatrix }
+        let mats = spotShadowSliceOwners.map { spotLights[$0].shadowMatrix }
         if sceneStaticForShadows && mats == lastSpotShadowMats {
             staticSkipStats.spotShadowPassesSkipped += count
             return
@@ -8930,7 +8944,7 @@ public final class IlluminatoramaRenderer {
             enc.setFrontFacing(.counterClockwise)
             applyShadowRasterBias(enc)
 
-            var lightVP = spotLights[slice].shadowMatrix
+            var lightVP = spotLights[spotShadowSliceOwners[slice]].shadowMatrix
             enc.setVertexBytes(&lightVP,
                                length: MemoryLayout<simd_float4x4>.stride,
                                index: 3)

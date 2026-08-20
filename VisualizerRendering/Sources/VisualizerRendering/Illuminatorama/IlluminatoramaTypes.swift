@@ -689,15 +689,31 @@ public struct IlluminatoramaSpotLight {
     /// Same masking rule as `IlluminatoramaPointLight`. Default `0xFFFFFFFF` ⇒ affects
     /// every fragment (byte-identical to prior behaviour).
     public var layerMask: UInt32 = 0xFFFF_FFFF
-    /// Two explicit pads so the struct closes on a 16-byte boundary.
-    /// Stride bumps from 96 → 176.
-    public var _padSpot1: Int32 = 0
+    /// 1 ⇒ this spot may claim a slice of the shadow atlas. 0 ⇒ it NEVER does, however few
+    /// spots the scene has — it lights without occluding anything. Default 1, so a scene that
+    /// never sets it is byte-identical to the pre-change behaviour. Was `_padSpot1`;
+    /// reinterpreted, so the struct stride is unchanged. Mirrors `IlluminatoramaPointLight
+    /// .castsShadow`, which has worked this way since the cubemap path landed.
+    ///
+    /// **Why a flag and not "sort it last".** A slice used to be purely the light's INDEX:
+    /// `updateSpotShadows` handed 0..<capacity to the first `capacity` entries. A host that
+    /// wanted an unshadowed cone could only push it toward the back of the array, which does
+    /// nothing at all while the scene is under capacity — the cone lands under the cap anyway
+    /// and is shadowed anyway. Daydream Home shipped exactly that: its lamp up-cones are
+    /// declared untrapped, the night hero carries 7 shadow-wanting cones into 8 slices, and the
+    /// spare slice went to an up-cone, which then rasterised the lamp's own finial into it and
+    /// printed a hard black hole in the middle of that lamp's ceiling pool (measured on the
+    /// 2026-08-15 tree: blob/surround 0.740 with the slice, 1.014 without). One lamp had it and
+    /// the other did not, decided by nothing but which one inherited the spare.
+    public var castsShadow: Int32 = 1
+    /// One explicit pad so the struct closes on a 16-byte boundary. Stride 176.
     public var _padSpot2: Int32 = 0
 
     public init(position: SIMD3<Float>, direction: SIMD3<Float>,
                 innerCone: Float, outerCone: Float,
                 color: SIMD3<Float>, radius: Float,
-                layerMask: UInt32 = 0xFFFF_FFFF) {
+                layerMask: UInt32 = 0xFFFF_FFFF,
+                castsShadow: Bool = true) {
         self.position = position
         self.direction = direction
         self.innerCone = innerCone
@@ -705,6 +721,7 @@ public struct IlluminatoramaSpotLight {
         self.color = color
         self.radius = radius
         self.layerMask = layerMask
+        self.castsShadow = castsShadow ? 1 : 0
     }
 }
 

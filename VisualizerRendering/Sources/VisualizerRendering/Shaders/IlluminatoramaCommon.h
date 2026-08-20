@@ -497,7 +497,11 @@ struct SpotLight {
     // 0xFFFFFFFF ⇒ affects every fragment. Reinterpreted from a former int pad, so
     // the struct stride is unchanged.
     uint     layerMask;
-    int      _padSpot1;
+    // 1 ⇒ this spot may claim a shadow-atlas slice; 0 ⇒ it never does. Host-side only —
+    // the kernel still branches on `shadowSliceIndex` — but it lives in the struct so the
+    // fact travels WITH the light instead of being inferred from its array position.
+    // Reinterpreted from a former int pad, so the struct stride is unchanged.
+    int      castsShadow;
     int      _padSpot2;
 };
 
