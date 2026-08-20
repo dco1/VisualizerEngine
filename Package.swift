@@ -14,6 +14,7 @@ let package = Package(
     platforms: [.macOS(.v15), .iOS(.v18), .tvOS(.v18)],
     products: [
         .library(name: "VisualizerCore", targets: ["VisualizerCore"]),
+        .library(name: "VisualizerMaterials", targets: ["VisualizerMaterials"]),
         .library(name: "VisualizerRendering", targets: ["VisualizerRendering"]),
         .library(name: "VisualizerHumans", targets: ["VisualizerHumans"]),
     ],
@@ -27,6 +28,21 @@ let package = Package(
             name: "VisualizerCoreTests",
             dependencies: ["VisualizerCore"],
             path: "VisualizerCore/Tests/VisualizerCoreTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // The CPU-side procedural material engine. Deliberately depends on NOTHING — see
+        // VisualizerMaterials/Package.swift. Note this umbrella omits that manifest's
+        // `-O`-in-Debug `unsafeFlags`, which SwiftPM forbids for a by-URL consumer; the
+        // path-based sub-manifest both apps actually use carries it.
+        .target(
+            name: "VisualizerMaterials",
+            path: "VisualizerMaterials/Sources/VisualizerMaterials",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "VisualizerMaterialsTests",
+            dependencies: ["VisualizerMaterials"],
+            path: "VisualizerMaterials/Tests/VisualizerMaterialsTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(
