@@ -1642,37 +1642,203 @@ public enum MaterialGenerator {
         return ch
     }
 
-    /// Engineered quartz counter (Silestone/Caesarstone style) — fine aggregate of crushed
-    /// quartz particles in a polymer matrix, subtle veining clusters, consistent base tone.
+    // MARK: - engineered quartz
+
+    /// **World metres one engineered-quartz bake spans.**
+    ///
+    /// The aggregate is a real physical size, so — like tile, wood and terrazzo — the bake has to
+    /// know how much surface it covers or it cannot draw a grain at any particular size. 1.0 m is
+    /// the counter's own UV period (the millwork meshes register at a 1 m period), which is where
+    /// this material lives; capping a wall/floor at the same number keeps a 5 mm grain 5 mm
+    /// wherever the picker allows the material (`MaterialApplicability` lets `.stone` onto a
+    /// floor, a wall and a backsplash), instead of stretching the bake over 2 m and rendering
+    /// centimetre gravel.
+    public static let quartzRunMeters: Double = 1.0
+
+    /// The run a quartz bake gets on a given surface: our own period where the mesh takes its UVs
+    /// from the material, and the mesh's period where it baked them earlier and would otherwise
+    /// render a size we never chose. Same shape as `terrazzoRun(on:)` — one rule, two materials.
+    public static func quartzRun(on tiling: SurfaceTiling) -> Double {
+        tiling.isAdjustable ? Swift.min(tiling.metresPerRepeat, quartzRunMeters)
+                            : tiling.metresPerRepeat
+    }
+
+    /// One crushed-grain population in an engineered quartz slab: how that mineral shifts the
+    /// slab's base colour, how much of the aggregate it is, and the polish it takes.
+    ///
+    /// **Polish is per-mineral, and that is where quartz's sparkle comes from.** A translucent
+    /// quartz crystal grinds to a harder face than the pigmented polyester binder around it, so a
+    /// real slab's highlight breaks into flecks. Putting the whole roughness range on one
+    /// low-frequency noise instead — which is what this material used to do — makes the same
+    /// energy read as a gloss CLOUD, and a soft gloss cloud on a near-white surface is precisely
+    /// how foam scatters.
+    public struct QuartzGrain: Sendable, Equatable {
+        /// Per-channel multiplier on the slab's base colour.
+        public var tint: Vec3
+        /// Fraction of grains that are this mineral. Need not sum to 1 — the draw normalises.
+        public var share: Double
+        /// Roughness this mineral takes at a polished finish.
+        public var polish: Double
+
+        public init(tint: Vec3, share: Double, polish: Double) {
+            self.tint = tint; self.share = share; self.polish = polish
+        }
+    }
+
+    /// **The aggregate of a white engineered quartz.** Mostly matrix-toned and warm-white filler,
+    /// a quarter translucent quartz (the glassy grains), a grey mineral fraction, and a sparse
+    /// dark pepper. The pepper is 3 % and it does most of the work: a field of near-white grains
+    /// with nothing dark in it reads as plastic, which is the same lesson terrazzo's crusher-dust
+    /// grade (`AggregateGrade.darkBias`) already records.
+    public static let quartzGrains: [QuartzGrain] = [
+        .init(tint: Vec3(1.005, 1.000, 0.992), share: 0.34, polish: 0.070),  // matrix-toned filler
+        .init(tint: Vec3(1.045, 1.032, 1.010), share: 0.24, polish: 0.065),  // warm white
+        .init(tint: Vec3(0.912, 0.918, 0.936), share: 0.24, polish: 0.032),  // translucent quartz
+        .init(tint: Vec3(0.800, 0.800, 0.818), share: 0.16, polish: 0.080),  // grey mineral
+        .init(tint: Vec3(0.575, 0.573, 0.598), share: 0.03, polish: 0.095),  // dark pepper
+    ]
+
+    /// Share-weighted mean polish of the aggregate — the datum the differential-relief term below
+    /// measures each mineral against, derived from the table rather than typed beside it.
+    public static let quartzMeanPolish: Double = {
+        let total = quartzGrains.reduce(0) { $0 + $1.share }
+        return quartzGrains.reduce(0) { $0 + $1.share * $1.polish } / Swift.max(total, 1e-9)
+    }()
+
+    /// Total of the shares, so the palette draw normalises instead of requiring the table to sum
+    /// to exactly 1 by hand.
+    public static let quartzGrainShareTotal: Double = quartzGrains.reduce(0) { $0 + $1.share }
+
+    /// **The three crushed-aggregate sizes, in real millimetres**, and how much of the surface the
+    /// two coarser ones claim. Crushed rock is graded — a slab with one grain size reads as
+    /// sandpaper — so the mosaic is drawn coarsest-last over a fine bed: statement chips over mid
+    /// fragments over the fine grain that fills everything between.
+    /// The sizes are what separate this material from terrazzo, which is the OTHER crushed-stone
+    /// mosaic in the library and the thing an over-graded quartz starts to look like: a terrazzo
+    /// chip is 3–22 mm against a 0.6 m tile, i.e. a fragment you read one at a time, while quartz
+    /// aggregate is a field you read as a texture. The fine bed sits at 5 mm because that is the
+    /// smallest grain a 512 bake can carry over a 1 m counter (`drawableMM` ≈ 3.9 mm) — the real
+    /// sub-millimetre population is simply not representable at this resolution.
+    public static let quartzGrainMM = (fine: 5.0, mid: 10.0, chip: 20.0)
+    public static let quartzMidShare = 0.28
+    public static let quartzChipShare = 0.07
+
+    /// How much height one unit of roughness difference is worth, i.e. how far the harder minerals
+    /// stand proud of the softer binder. Sized so the relief is **present in the data and
+    /// invisible in the render** — worst-case normal tilt 1.2°, gated in `QuartzCounterMaterialTests`.
+    public static let quartzReliefPerRoughness = 0.6
+
+    /// Engineered quartz counter (Silestone / Caesarstone style) — crushed quartz aggregate in a
+    /// pigmented polymer binder, ground flat and polished.
+    ///
+    /// **It read as styrofoam** (Danny, 2026-08-20), and styrofoam is a specific combination:
+    /// near-white, near-uniform, a faint isotropic mottle at centimetre-to-decimetre scale, no
+    /// resolvable structure, and dimples. The old bake had all four, for three separate reasons.
+    ///
+    /// 1. **Wrong topology.** The aggregate was `1 − smoothstep(0.04, 0.12, f1)` over a 24-cell
+    ///    Voronoi: one site per cell, masked down to a dot a few millimetres across. That is a
+    ///    pepper of ISOLATED specks at well under 1 % coverage, on a visible lattice — and you can
+    ///    see the rows and columns of it in the before frame. Engineered quartz is ~90 % aggregate
+    ///    by weight: the grains TOUCH. Islands-in-a-binder is *terrazzo's* topology (which is why
+    ///    terrazzo scatters chips with a separation test and this does not); a packed mosaic is
+    ///    this material's, and a Voronoi tessellation — every texel belongs to some grain, cells
+    ///    convex and straight-edged like crushed rock — is exactly that.
+    /// 2. **All the energy at the wrong frequency.** With no grain to look at, the only spatial
+    ///    structure left was a 3-cell fBm — a third of a metre per feature — driving tone (±3 %)
+    ///    AND roughness (0.08…0.20). Decimetre mottle is the measured signature of the sponge-paint
+    ///    defect; in the specular channel it is worse, because a gloss cloud is how foam scatters.
+    ///    Everything here is now drawn at 5–30 mm, and the batch drift that remains is a whisper.
+    /// 3. **A polished slab is GROUND FLAT.** The old height field embossed each speck (+0.20) and
+    ///    cut vein grooves (−0.10) through `deriveNormals(strength: 2)` — tens of degrees of tilt,
+    ///    i.e. a field of dimples on a white surface, which is the single strongest foam cue a
+    ///    render can carry, and it is plainly visible in the before frame as a regular lattice of
+    ///    lit bumps. Terrazzo already records this lesson ("a polished floor is GROUND FLAT… the
+    ///    old half-height step would have embossed the whole surface into gravel"). The only relief
+    ///    left is differential polish between minerals, at `strength: 0.4` over a ±0.02 field —
+    ///    **measured worst-case tilt 1.2°** (`QuartzCounterMaterialTests.testTheSlabIsGroundFlat`),
+    ///    which is present in the data and invisible in the render.
+    ///
+    /// **The veining is gone, deliberately.** A marble-look quartz is a different SKU; the white
+    /// speckled stone this entry is named for has none, and the vein term was a second decimetre
+    /// blotch source in both tone and roughness. If a veined quartz is ever wanted it is a params
+    /// spine (like `TerrazzoParams`), not a wash smeared over every slab.
+    ///
+    /// Seamless: every layer is a toroidal `voronoiTiled` / `fbmTiled` lattice.
     public static func quartzCounter(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 88,
-                                     baseColor: Vec3 = Vec3(0.88, 0.86, 0.84)) -> MaterialChannels {
+                                     baseColor: Vec3 = Vec3(0.880, 0.866, 0.845),
+                                     runMeters: Double = MaterialGenerator.quartzRunMeters)
+        -> MaterialChannels {
         var ch = MaterialChannels(size: size, category: .stone)
+        let runMM = Swift.max(runMeters, 1e-3) * 1000
+        /// Nyquist: a feature narrower than two texels cannot be drawn, only aliased. At the
+        /// counter's 1 m period and a 512 bake this is 3.9 mm, so the fine grade sits just above
+        /// the floor and nothing finer is attempted — the sub-millimetre population a real slab
+        /// also has is simply not representable here, and pretending otherwise buys noise.
+        let drawableMM = 2.0 * runMM / Double(size)
+        /// Lattice period for a target grain size, floored at what this bake can resolve.
+        func lattice(_ mm: Double) -> Int {
+            Swift.max(1, Int((runMM / Swift.max(mm, drawableMM)).rounded()))
+        }
+        let fineCells = lattice(quartzGrainMM.fine)
+        let midCells = lattice(quartzGrainMM.mid)
+        let chipCells = lattice(quartzGrainMM.chip)
+
+        /// One grain's look, from its Voronoi cell id: a weighted palette draw, a per-grain value
+        /// jitter (no two fragments of the same mineral are quite the same), and the polish that
+        /// draw implies.
+        func grain(_ id: UInt64, spread: Double) -> (color: Vec3, polish: Double) {
+            let h = Noise.mix(id)
+            var pick = Noise.unit(h) * quartzGrainShareTotal
+            var i = 0
+            while i < quartzGrains.count - 1 && pick >= quartzGrains[i].share {
+                pick -= quartzGrains[i].share
+                i += 1
+            }
+            let g = quartzGrains[i]
+            let jitter = 1 + spread * (Noise.unit(Noise.mix(h ^ 0x51)) - 0.5)
+            return (baseColor * g.tint * jitter, g.polish)
+        }
+
         for y in 0..<size {
             for x in 0..<size {
-                let u = Double(x) / Double(size), v = Double(y) / Double(size)
-                // Aggregate: fine Voronoi cells (quartz particle scatter).
-                let agg = Noise.voronoiTiled(u, v, cells: 24, jitter: 1.0, seed: seed)
-                let particle = 1 - smoothstep(0.04, 0.12, agg.f1)
-                // Subtle macro veining: long warped lines (less dramatic than marble).
-                let warpU = Noise.fbmTiled(u, v, baseCells: 2, octaves: 3, seed: seed ^ 0x11)
-                let warpV = Noise.fbmTiled(u, v, baseCells: 2, octaves: 3, seed: seed ^ 0x22)
-                let vein = Noise.fbmTiled(u + warpU * 0.18, v + warpV * 0.12,
-                                          baseCells: 3, octaves: 2, seed: seed ^ 0x33)
-                let veinMask = clamp01((vein - 0.62) * 5.0)   // narrow band
-                // Macro luma variation.
-                let macro = Noise.fbmTiled(u, v, baseCells: 3, octaves: 2, seed: seed ^ 0x44)
-                let tone = 0.97 + 0.06 * macro
-                // Particle sparkle: bright quartz flakes.
-                let sparkle = particle * Noise.unit(Noise.hash2(Int(u * 48), Int(v * 48), seed))
-                let col = baseColor * tone * (1 - 0.05 * veinMask) + Vec3(sparkle * 0.04, sparkle * 0.04, sparkle * 0.03)
-                ch.albedo[ch.idx(x, y)] = clampBand(col)
-                // Very low roughness — polished polymer surface.
-                ch.roughness[ch.idx(x, y)] = clamp01(0.08 + 0.12 * macro + 0.06 * veinMask)
-                ch.height[ch.idx(x, y)] = clamp01(0.55 + 0.20 * particle - 0.10 * veinMask + 0.15 * macro)
+                let u = (Double(x) + 0.5) / Double(size), v = (Double(y) + 0.5) / Double(size)
+
+                // Three nested mosaics, fine bed first and the coarse fragments laid over it. Each
+                // layer OVERWRITES the one beneath where it is present, so the result is a packed
+                // tessellation with no binder gaps anywhere — which is what ~90 % aggregate means.
+                var g = grain(Noise.voronoiTiled(u, v, cells: fineCells, jitter: 1.0,
+                                                 seed: seed).cellId, spread: 0.10)
+                let mid = Noise.voronoiTiled(u, v, cells: midCells, jitter: 1.0, seed: seed ^ 0x2B)
+                if Noise.unit(Noise.mix(mid.cellId ^ 0xA7)) < quartzMidShare {
+                    g = grain(mid.cellId, spread: 0.07)
+                }
+                let chip = Noise.voronoiTiled(u, v, cells: chipCells, jitter: 1.0, seed: seed ^ 0x4D)
+                if Noise.unit(Noise.mix(chip.cellId ^ 0xC3)) < quartzChipShare {
+                    g = grain(chip.cellId, spread: 0.05)
+                }
+
+                // **Batch drift, and it is a whisper on purpose.** A slab does carry a slow cloud,
+                // but at 30 cm any visible amount of it reads as blotch rather than stone. ±0.8 %
+                // on a near-white is under 2 sRGB code values once `MaterialBaker` encodes the
+                // albedo, i.e. below what survives the atlas as a mottle, while still keeping the
+                // field off mathematically flat.
+                let drift = Noise.fbmTiled(u, v, baseCells: 3, octaves: 3, seed: seed ^ 0x44) - 0.5
+                ch.albedo[ch.idx(x, y)] = clampBand(g.color * (1 + 0.016 * drift))
+
+                // Polish per grain, plus a grain-scale dither so two neighbouring fragments of the
+                // same mineral still catch the light slightly differently.
+                let dither = Noise.fbmTiled(u, v, baseCells: fineCells, octaves: 1,
+                                            seed: seed ^ 0x6E) - 0.5
+                ch.roughness[ch.idx(x, y)] = clamp01(g.polish + 0.012 * dither)
+
+                // Differential polish: the harder minerals stand a few microns proud of the softer
+                // binder. This is the ONLY relief a ground-and-polished slab has.
+                ch.height[ch.idx(x, y)] =
+                    clamp01(0.5 + (quartzMeanPolish - g.polish) * quartzReliefPerRoughness)
             }
         }
-        ch.clearcoat = 0.35   // polished quartz surface
-        ch.deriveNormals(strength: 2.0)
+        ch.clearcoat = 0.30                          // polished stone, the same lobe marble gets
+        ch.deriveNormals(strength: 0.4)              // ≈0.5° maximum tilt — see the note above
         return ch
     }
 
