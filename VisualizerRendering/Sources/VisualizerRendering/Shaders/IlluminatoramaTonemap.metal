@@ -54,6 +54,7 @@ kernel void illumi_exposure_estimate(
     device ExposureState&           state     [[buffer(0)]],
     constant uint2&                 imgSize   [[buffer(1)]],
     constant float4&                params    [[buffer(2)]],  // x=targetEV, y=halfLife, z=maxBoost, w=minBoost
+    constant float4&                params2   [[buffer(3)]],  // x=highlightProtection, y=highlightEV, zw reserved
     threadgroup float*              sharedAcc [[threadgroup(0)]],
     threadgroup uint*               sharedCnt [[threadgroup(1)]],
     uint                            tid       [[thread_position_in_threadgroup]],
@@ -70,6 +71,10 @@ kernel void illumi_exposure_estimate(
     // few opaque black pixels don't drag the average into deep shadow.
     float thisAcc = 0.0;
     uint  thisCnt = 0;
+    // Phase S5 — the highlight pass re-walks these same samples once the mean is
+    // known, so keep them rather than re-sampling the texture a second time.
+    float thisLL[32];
+    uint  thisKept = 0;
     const float minLogLum = -8.0;   // ~0.004 linear
     const float maxLogLum =  8.0;   // ~3000 linear (no over-bright HDR)
     const uint samplesPerThread = 32;
@@ -106,6 +111,7 @@ kernel void illumi_exposure_estimate(
             ll = clamp(ll, minLogLum, maxLogLum);
             thisAcc += ll;
             thisCnt += 1u;
+            thisLL[thisKept++] = ll;
         }
     }
     sharedAcc[tid] = thisAcc;
@@ -121,23 +127,73 @@ kernel void illumi_exposure_estimate(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (tid == 0u) {
-        uint cnt = sharedCnt[0];
-        float target;
-        if (cnt > 0u) {
-            target = sharedAcc[0] / float(cnt);
-        } else {
-            // No samples landed in the valid range (whole image black).
-            // Keep the previous target so the exposure stays where it
-            // was rather than snapping to mid-grey.
-            target = state.prevTargetLogLum;
+    // ── Highlight-protecting meter (opt-in; `params2.x` 0 ⇒ never runs) ──────
+    //
+    // The mean above is a GEOMETRIC mean of the whole frame, which is the right
+    // "how bright is this scene" signal and the wrong "will anything clip" signal.
+    // A doll's-house cutaway is half shaded interior: the mean sits low, exposure
+    // pumps to lift it, and the sunlit exterior — several stops above the mean —
+    // is pushed past the shoulder into flat white. Metering the mean alone cannot
+    // see that, because the pixels it blows are exactly the ones it averaged away.
+    //
+    // So: take a second statistic — the mean log-luminance of the samples ABOVE
+    // the frame mean, i.e. the upper half — and cap the exposure so THAT lands at
+    // `highlightEV` rather than wherever the mean-based answer puts it. The cap is
+    // a `min`, never a boost: it can only ever pull a frame back from clipping, so
+    // a scene with no bright half is untouched.
+    //
+    // Upper-half mean rather than a true p99: the reduction is already here, one
+    // more pass over the SAME 32 cached samples costs no texture reads, and a
+    // percentile would need a sort or a histogram. The upper half is also the more
+    // stable signal frame to frame — a p99 chases single specular pixels.
+    // Every thread derives the mean from the ALREADY-REDUCED shared slots rather
+    // than one thread broadcasting through a new threadgroup variable: same value,
+    // no second barrier, and no uninitialised-read for the compiler to flag. The
+    // whole-image-black fallback lives here so the highlight pass below and the
+    // EMA at the bottom agree on what "the frame mean" was.
+    float frameMean = (sharedCnt[0] > 0u)
+                    ? (sharedAcc[0] / float(sharedCnt[0]))
+                    : state.prevTargetLogLum;
+
+    float hiAcc = 0.0;
+    uint  hiCnt = 0u;
+    if (params2.x > 0.0) {
+        for (uint k = 0; k < thisKept; ++k) {
+            if (thisLL[k] > frameMean) { hiAcc += thisLL[k]; hiCnt += 1u; }
         }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sharedAcc[tid] = hiAcc;
+    sharedCnt[tid] = hiCnt;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgSize / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            sharedAcc[tid] += sharedAcc[tid + stride];
+            sharedCnt[tid] += sharedCnt[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0u) {
+        uint  hiN    = sharedCnt[0];
+        float hiMean = (hiN > 0u) ? (sharedAcc[0] / float(hiN)) : frameMean;
+        // `frameMean` already carries the whole-image-black fallback (it resolves
+        // to `state.prevTargetLogLum` when no sample landed in the valid range),
+        // because the highlight pass has to see the same number the mean pass did.
+        float target = frameMean;
         // Auto-exposure: we want the target luminance to land at
         // `2^targetEV`. So the exposure scalar is `2^(targetEV - target)`.
         // Negative target log lum (scene is dim) → positive exposure
         // boost. Positive target (scene is bright) → exposure compression.
         float targetEV = params.x;
         float wantedExposure = exp2(targetEV - target);
+        // Highlight cap. `protect` 0 ⇒ `mix(w, w, 0)` ⇒ bit-identical to the
+        // mean-only answer, so this is an exact no-op for every non-opting scene.
+        float protect = clamp(params2.x, 0.0, 1.0);
+        if (protect > 0.0) {
+            float hiWanted = exp2(params2.y - hiMean);
+            wantedExposure = mix(wantedExposure, min(wantedExposure, hiWanted), protect);
+        }
         // EMA toward `wantedExposure` with a half-life set by
         // `params.y` seconds. Convert half-life + dt into a per-frame
         // mix factor: `alpha = 1 - 2^(-dt / halfLife)`.
@@ -173,6 +229,58 @@ static inline float3 aces(float3 x) {
     const float d = 0.59;
     const float e = 0.14;
     return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
+}
+
+// ── Long-shouldered display curve (Uchimura's "GT" tonemapper) ───────────────
+//
+// The ACES fit above has NO white point: its constants pin the shoulder, it
+// reaches 0.80 at x = 1 and 0.98 at x = 4, and then `saturate` takes the rest.
+// A sunlit exterior sitting 2–4× above the metered mean therefore lands at
+// 244–252/255 — white with no texture in it, which is the "harsh light outside"
+// complaint. This curve keeps a straight mid-tone section of length `l` and only
+// then rolls, so the same 3× ground separates instead of clipping.
+//
+// Uchimura, "HDR Theory and Practice" (CEDEC 2017). Parameters:
+//   P = maximum display brightness (1 — we write LDR)
+//   a = mid-tone slope (contrast)
+//   m = where the straight section starts
+//   l = how LONG the straight section is  ← the lever
+//   c = black tightness, b = pedestal
+//
+// `a` is chosen to match the ACES fit's slope through mid-grey, so blending the
+// two curves moves the HIGHLIGHTS and leaves the mid-tones where the presets in
+// both apps were graded against them.
+static inline float gtCurve(float x, float P, float a, float m, float l, float c, float b) {
+    float l0 = ((P - m) * l) / a;
+    float S0 = m + l0;
+    float S1 = m + a * l0;
+    float C2 = (a * P) / (P - S1);
+    float CP = -C2 / P;
+
+    float w0 = 1.0 - smoothstep(0.0, m, x);
+    float w2 = step(m + l0, x);
+    float w1 = 1.0 - w0 - w2;
+
+    float T = m * pow(x / m, c) + b;                 // toe
+    float S = P - (P - S1) * exp(CP * (x - S0));     // shoulder
+    float L = m + a * (x - m);                       // linear mid-section
+
+    return T * w0 + L * w1 + S * w2;
+}
+
+/// The shipped ACES fit blended toward the long-shouldered curve by `shoulder`.
+/// `shoulder == 0` returns `aces(x)` **exactly** (`mix(v, _, 0) == v` in IEEE),
+/// so every scene that never opts in tonemaps byte-for-byte as before.
+static inline float3 tonemapCurve(float3 x, float shoulder, float linearLength) {
+    float3 a = aces(x);
+    if (shoulder <= 0.0) return a;
+    // m = 0.22 toe end, c = 1.33 black tightness, b = 0 pedestal are Uchimura's
+    // published defaults; `a = 1.0` holds the mid-tone slope. Only `l` is driven.
+    float l = clamp(linearLength, 0.05, 0.9);
+    float3 g = float3(gtCurve(max(x.r, 0.0), 1.0, 1.0, 0.22, l, 1.33, 0.0),
+                      gtCurve(max(x.g, 0.0), 1.0, 1.0, 0.22, l, 1.33, 0.0),
+                      gtCurve(max(x.b, 0.0), 1.0, 1.0, 0.22, l, 1.33, 0.0));
+    return saturate(mix(a, saturate(g), clamp(shoulder, 0.0, 1.0)));
 }
 
 // ── Color-grade: white-balance gain from a Kelvin temperature ───────────────
@@ -679,7 +787,9 @@ fragment float4 illumi_tonemap_fs(
     // sensor/illuminant shift), so they go in before exposure + ACES. Defaults
     // (whiteBalanceK = 6500, tint = 0) make both gains exactly (1,1,1) → no-op.
     float3 graded = mixed * whiteBalanceGain(frame.whiteBalanceK) * tintGain(frame.tint);
-    float3 mapped = aces(graded * exposure);
+    float3 mapped = tonemapCurve(graded * exposure,
+                                 frame.exteriorToneParams.x,
+                                 frame.exteriorToneParams.y);
     // Phase 4.15 — post-tonemap saturation boost. Narkowicz's fitted ACES
     // famously compresses midtone chroma harder than SCN's HDR chain, so
     // the deferred pipeline reads consistently flatter than the SCN

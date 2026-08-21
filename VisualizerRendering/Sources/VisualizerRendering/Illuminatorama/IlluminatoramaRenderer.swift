@@ -887,6 +887,47 @@ public final class IlluminatoramaRenderer {
     /// in ~1 s, slow enough that one bright pixel doesn't pump.
     public var autoExposureHalfLife: Float = 0.25
 
+    // ── Exterior tone levers — the blown-sunlit-ground family ───────────────
+    //
+    // Auto-exposure meters the frame's GEOMETRIC MEAN, which answers "how bright
+    // is this scene" and not "will anything clip". A frame that is half shaded
+    // interior and half sunlit exterior — an architectural cutaway, a room shot
+    // through an open wall — meters low, gets pumped to lift the shaded half, and
+    // pushes the sunlit half past the ACES shoulder into textureless white. The
+    // mean cannot see that: the pixels it blows are the ones it averaged away.
+    //
+    // Every knob here defaults to an EXACT no-op, so no existing scene moves.
+
+    /// Cap the exposure so the frame's bright half lands at `autoExposureHighlightEV`
+    /// rather than wherever the mean-based answer puts it. 0 (default) = OFF, an exact
+    /// no-op; 1 = the cap fully governs. The cap is a `min`, never a boost — it can
+    /// only pull a frame back from clipping, so a scene with no bright half is
+    /// untouched at any strength.
+    ///
+    /// The statistic is the mean log-luminance of the samples ABOVE the frame mean
+    /// (the upper half), not a true percentile: the reduction is already in the
+    /// kernel, it costs no extra texture reads, and it is far more stable frame to
+    /// frame than a p99 that chases single specular pixels.
+    public var autoExposureHighlightProtection: Float = 0
+    /// Where the bright half is asked to land, in log2 linear units, pre-tonemap.
+    /// 0 ⇒ 1.0 linear ⇒ ~0.80 through the ACES shoulder — bright, still textured.
+    /// Negative pulls the highlights further down. Only read when protection > 0.
+    public var autoExposureHighlightEV: Float = 0
+
+    /// Blend the shipped Narkowicz-ACES fit toward a long-shouldered Uchimura "GT"
+    /// curve of the same mid-tone slope. 0 (default) = OFF and byte-identical.
+    ///
+    /// The ACES fit has no white point — it reaches 0.80 at 1.0 and 0.98 at 4.0 and
+    /// `saturate` takes the rest — so anything 2–4× above the metered mean lands at
+    /// 244–252/255 with no texture in it. The GT curve keeps a straight mid-tone
+    /// section and only then rolls, so the same sunlit ground separates. Mid-tones
+    /// are held deliberately: the presets in both apps were graded against the ACES
+    /// slope through mid-grey, and this lever must move highlights ONLY.
+    public var tonemapShoulder: Float = 0
+    /// The GT curve's linear-section length — bigger = later, gentler shoulder.
+    /// Uchimura's published default is 0.4. Only read when `tonemapShoulder` > 0.
+    public var tonemapShoulderStart: Float = 0.4
+
     // ── Per-term split-render diagnostic ─────────────────────────────
     /// Isolates ONE lighting term in the deferred kernel so a flooded /
     /// flat scene can be decomposed (which term dominates the colour).
@@ -11245,6 +11286,13 @@ public final class IlluminatoramaRenderer {
                                    autoExposureMaxBoost,
                                    max(autoExposureMinExposure, 0.01))
         enc.setBytes(&params, length: MemoryLayout<SIMD4<Float>>.stride, index: 2)
+        // params2: x = highlight protection (0 = OFF, an exact no-op inside the
+        // kernel), y = the EV the frame's bright half is asked to land at. See
+        // `autoExposureHighlightProtection` for why the statistic is the upper-half
+        // mean rather than a percentile.
+        var params2 = SIMD4<Float>(max(0, min(1, autoExposureHighlightProtection)),
+                                   autoExposureHighlightEV, 0, 0)
+        enc.setBytes(&params2, length: MemoryLayout<SIMD4<Float>>.stride, index: 3)
         // Update the host-driven `dt` slot in the buffer — the EMA step
         // inside the kernel needs to know how much wall-time elapsed
         // since the last estimate so the half-life math is correct.
@@ -11915,6 +11963,12 @@ public final class IlluminatoramaRenderer {
                               max(0, diagramEdgeNormalSensitivity),
                               max(0.25, diagramEdgeThickness),
                               0)
+        // Exterior tone levers. `x` 0 (the default) makes the tonemap's curve blend
+        // `mix(aces, gt, 0)` — the shipped ACES value bit for bit — so every scene
+        // that never opts in is byte-identical. See `tonemapShoulder`.
+        u.exteriorToneParams = SIMD4(min(max(tonemapShoulder, 0), 1),
+                                     min(max(tonemapShoulderStart, 0.05), 0.9),
+                                     0, 0)
         // S4.2 — the jitter the velocity buffer must NOT carry. Both matrices it
         // differences are jittered (this frame's, and last frame's inside
         // `previousViewProjection`), so the delta of the two offsets is what is

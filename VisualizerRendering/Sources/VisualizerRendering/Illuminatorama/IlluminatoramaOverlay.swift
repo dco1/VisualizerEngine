@@ -534,6 +534,13 @@ public final class IlluminatoramaOverlay {
         // doesn't leave the renderer in a non-default state.
         renderer.autoExposureTargetEV = options?.autoExposureTargetEV ?? -4.0
         renderer.autoExposureEnabled  = options?.autoExposureEnabled  ?? true
+        // Same contract for the exterior tone levers: no Visualizer scene opts in
+        // today, and a host that DID set them (Daydream Home's cutaway shots) must
+        // not leak that state into the next scene shown on this renderer.
+        renderer.autoExposureHighlightProtection = 0
+        renderer.autoExposureHighlightEV = 0
+        renderer.tonemapShoulder = 0
+        renderer.tonemapShoulderStart = 0.4
         // Give the freshly-shown scene a clean chance at RT — clear any
         // auto-disable latched by a previous (thrashing/heavy) scene.
         renderer.resetRTGuard()
