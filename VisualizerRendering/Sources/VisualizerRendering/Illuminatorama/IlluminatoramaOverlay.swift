@@ -539,8 +539,6 @@ public final class IlluminatoramaOverlay {
         // not leak that state into the next scene shown on this renderer.
         renderer.autoExposureHighlightProtection = 0
         renderer.autoExposureHighlightEV = 0
-        renderer.tonemapShoulder = 0
-        renderer.tonemapShoulderStart = 0.4
         // Give the freshly-shown scene a clean chance at RT — clear any
         // auto-disable latched by a previous (thrashing/heavy) scene.
         renderer.resetRTGuard()

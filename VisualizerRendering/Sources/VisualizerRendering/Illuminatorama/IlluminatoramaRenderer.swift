@@ -914,19 +914,6 @@ public final class IlluminatoramaRenderer {
     /// Negative pulls the highlights further down. Only read when protection > 0.
     public var autoExposureHighlightEV: Float = 0
 
-    /// Blend the shipped Narkowicz-ACES fit toward a long-shouldered Uchimura "GT"
-    /// curve of the same mid-tone slope. 0 (default) = OFF and byte-identical.
-    ///
-    /// The ACES fit has no white point — it reaches 0.80 at 1.0 and 0.98 at 4.0 and
-    /// `saturate` takes the rest — so anything 2–4× above the metered mean lands at
-    /// 244–252/255 with no texture in it. The GT curve keeps a straight mid-tone
-    /// section and only then rolls, so the same sunlit ground separates. Mid-tones
-    /// are held deliberately: the presets in both apps were graded against the ACES
-    /// slope through mid-grey, and this lever must move highlights ONLY.
-    public var tonemapShoulder: Float = 0
-    /// The GT curve's linear-section length — bigger = later, gentler shoulder.
-    /// Uchimura's published default is 0.4. Only read when `tonemapShoulder` > 0.
-    public var tonemapShoulderStart: Float = 0.4
 
     // ── Per-term split-render diagnostic ─────────────────────────────
     /// Isolates ONE lighting term in the deferred kernel so a flooded /
@@ -11963,12 +11950,6 @@ public final class IlluminatoramaRenderer {
                               max(0, diagramEdgeNormalSensitivity),
                               max(0.25, diagramEdgeThickness),
                               0)
-        // Exterior tone levers. `x` 0 (the default) makes the tonemap's curve blend
-        // `mix(aces, gt, 0)` — the shipped ACES value bit for bit — so every scene
-        // that never opts in is byte-identical. See `tonemapShoulder`.
-        u.exteriorToneParams = SIMD4(min(max(tonemapShoulder, 0), 1),
-                                     min(max(tonemapShoulderStart, 0.05), 0.9),
-                                     0, 0)
         // S4.2 — the jitter the velocity buffer must NOT carry. Both matrices it
         // differences are jittered (this frame's, and last frame's inside
         // `previousViewProjection`), so the delta of the two offsets is what is

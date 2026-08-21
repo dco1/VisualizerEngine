@@ -428,23 +428,6 @@ struct FrameUniforms {
     // IlluminatoramaFrameUniforms.interiorRoomGain0…7 + interiorRoomGainMeta.
     float4   interiorRoomGain[8];   // 32 room gains, bit b at [b >> 2][b & 3]
     float4   interiorRoomGainMeta;  // x = enabled (0 = off); yzw unused
-    // ── Exterior tone levers (the blown-sunlit-ground family) ────────────────
-    // A doll's-house cutaway meters HALF interior: the frame-average metering
-    // below pumps exposure for the shaded half, and the sunlit exterior — 3–4
-    // stops above that mean — lands past the ACES shoulder as flat white with no
-    // texture left in it. Two independent levers, both 0 = OFF = byte-identical:
-    //
-    //   x = tonemapShoulder, 0…1. Blends the shipped Narkowicz-ACES fit toward a
-    //       long-shouldered Uchimura "GT" curve of the same mid-tone slope, so a
-    //       3× sunlit ground separates instead of clipping. 0 ⇒ the blend is
-    //       `mix(a, b, 0)` on the ACES value ⇒ exactly the shipped curve.
-    //   y = shoulderStart, the linear-section length handed to the GT curve.
-    //       Bigger = later, gentler shoulder. Only read when x > 0.
-    //   z, w reserved.
-    //
-    // ONE new 16-byte cluster (stride 1536 → 1552); mirror of
-    // IlluminatoramaFrameUniforms.exteriorToneParams.
-    float4   exteriorToneParams;
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift

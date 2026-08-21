@@ -504,20 +504,6 @@ public struct IlluminatoramaFrameUniforms {
     public var interiorRoomGain6: SIMD4<Float> = .one
     public var interiorRoomGain7: SIMD4<Float> = .one
     public var interiorRoomGainMeta: SIMD4<Float> = .zero   // x = enabled
-    /// Exterior tone levers — the blown-sunlit-ground family. A doll's-house cutaway
-    /// meters HALF interior, so the frame-average estimator pumps exposure for the
-    /// shaded half and the sunlit exterior lands past the ACES shoulder as flat white.
-    ///
-    ///   x = `tonemapShoulder`, 0…1. Blends the shipped Narkowicz-ACES fit toward a
-    ///       long-shouldered Uchimura "GT" curve of the same mid-tone slope. **0 is OFF
-    ///       and an exact no-op** — `mix(aces, gt, 0)` is the shipped ACES value bit for
-    ///       bit, so every scene that never opts in is byte-identical.
-    ///   y = `tonemapShoulderStart`, the GT curve's linear-section length. Bigger =
-    ///       later, gentler shoulder. Only read when x > 0.
-    ///   z, w reserved.
-    ///
-    /// ONE new 16-byte cluster (stride 1536 → 1552); mirror of the Metal `FrameUniforms`.
-    public var exteriorToneParams: SIMD4<Float> = .zero
 
     /// Fill the eight gain vectors from a flat 32-entry table, and stamp the enable.
     public mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {

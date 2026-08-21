@@ -231,58 +231,6 @@ static inline float3 aces(float3 x) {
     return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
 }
 
-// ── Long-shouldered display curve (Uchimura's "GT" tonemapper) ───────────────
-//
-// The ACES fit above has NO white point: its constants pin the shoulder, it
-// reaches 0.80 at x = 1 and 0.98 at x = 4, and then `saturate` takes the rest.
-// A sunlit exterior sitting 2–4× above the metered mean therefore lands at
-// 244–252/255 — white with no texture in it, which is the "harsh light outside"
-// complaint. This curve keeps a straight mid-tone section of length `l` and only
-// then rolls, so the same 3× ground separates instead of clipping.
-//
-// Uchimura, "HDR Theory and Practice" (CEDEC 2017). Parameters:
-//   P = maximum display brightness (1 — we write LDR)
-//   a = mid-tone slope (contrast)
-//   m = where the straight section starts
-//   l = how LONG the straight section is  ← the lever
-//   c = black tightness, b = pedestal
-//
-// `a` is chosen to match the ACES fit's slope through mid-grey, so blending the
-// two curves moves the HIGHLIGHTS and leaves the mid-tones where the presets in
-// both apps were graded against them.
-static inline float gtCurve(float x, float P, float a, float m, float l, float c, float b) {
-    float l0 = ((P - m) * l) / a;
-    float S0 = m + l0;
-    float S1 = m + a * l0;
-    float C2 = (a * P) / (P - S1);
-    float CP = -C2 / P;
-
-    float w0 = 1.0 - smoothstep(0.0, m, x);
-    float w2 = step(m + l0, x);
-    float w1 = 1.0 - w0 - w2;
-
-    float T = m * pow(x / m, c) + b;                 // toe
-    float S = P - (P - S1) * exp(CP * (x - S0));     // shoulder
-    float L = m + a * (x - m);                       // linear mid-section
-
-    return T * w0 + L * w1 + S * w2;
-}
-
-/// The shipped ACES fit blended toward the long-shouldered curve by `shoulder`.
-/// `shoulder == 0` returns `aces(x)` **exactly** (`mix(v, _, 0) == v` in IEEE),
-/// so every scene that never opts in tonemaps byte-for-byte as before.
-static inline float3 tonemapCurve(float3 x, float shoulder, float linearLength) {
-    float3 a = aces(x);
-    if (shoulder <= 0.0) return a;
-    // m = 0.22 toe end, c = 1.33 black tightness, b = 0 pedestal are Uchimura's
-    // published defaults; `a = 1.0` holds the mid-tone slope. Only `l` is driven.
-    float l = clamp(linearLength, 0.05, 0.9);
-    float3 g = float3(gtCurve(max(x.r, 0.0), 1.0, 1.0, 0.22, l, 1.33, 0.0),
-                      gtCurve(max(x.g, 0.0), 1.0, 1.0, 0.22, l, 1.33, 0.0),
-                      gtCurve(max(x.b, 0.0), 1.0, 1.0, 0.22, l, 1.33, 0.0));
-    return saturate(mix(a, saturate(g), clamp(shoulder, 0.0, 1.0)));
-}
-
 // ── Color-grade: white-balance gain from a Kelvin temperature ───────────────
 // Maps a correlated colour temperature (~2000–10000 K) to a normalized linear
 // RGB channel gain that, when MULTIPLIED into a neutral scene, warms it (low K)
@@ -787,9 +735,7 @@ fragment float4 illumi_tonemap_fs(
     // sensor/illuminant shift), so they go in before exposure + ACES. Defaults
     // (whiteBalanceK = 6500, tint = 0) make both gains exactly (1,1,1) → no-op.
     float3 graded = mixed * whiteBalanceGain(frame.whiteBalanceK) * tintGain(frame.tint);
-    float3 mapped = tonemapCurve(graded * exposure,
-                                 frame.exteriorToneParams.x,
-                                 frame.exteriorToneParams.y);
+    float3 mapped = aces(graded * exposure);
     // Phase 4.15 — post-tonemap saturation boost. Narkowicz's fitted ACES
     // famously compresses midtone chroma harder than SCN's HDR chain, so
     // the deferred pipeline reads consistently flatter than the SCN

@@ -28,14 +28,13 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
     /// 1376 → 1392 with the RT soft-sun-shadow cluster (`rtSunShadowSeed/Angle/RayCount` +
     /// pad — S4.1); 1392 → 1536 with the per-room band-gain table (S3.5 Stage E —
     /// `interiorRoomGain[8]` + `interiorRoomGainMeta`, NINE clusters: 32 gains packed four
-    /// to a vector, one per light-layer bit, plus the enable word); 1536 → 1552 with the
-    /// exterior tone levers (`exteriorToneParams` — the blown-sunlit-ground family).
+    /// to a vector, one per light-layer bit, plus the enable word).
     /// Verified against Metal by compiling a scratch kernel carrying
-    /// `static_assert(sizeof(FrameUniforms) == 1552)`, which holds while the same assert at
-    /// 1536 fails — i.e. the assert is live, not a tautology. (`offsetof` is not available
+    /// `static_assert(sizeof(FrameUniforms) == 1536)`, which holds while the same assert at
+    /// 1520 fails — i.e. the assert is live, not a tautology. (`offsetof` is not available
     /// in Metal; the tail offsets below are the Swift-side half of the check, and the fields
     /// are APPENDED, so stride pins them.)
-    private static let metalStride = 1552
+    private static let metalStride = 1536
 
     func testFrameUniformsStrideMatchesMetal() {
         XCTAssertEqual(MemoryLayout<IlluminatoramaFrameUniforms>.stride,
