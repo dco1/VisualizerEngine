@@ -98,6 +98,12 @@ public final class PaperClothSolver {
     /// edge: if it's much larger than the mesh spacing, each vertex straddles a
     /// whole patch of the other sheet and the pushout (even averaged) over-thickens
     /// contacts. 0.006 → 1.2 cm separation, matching `clothThickness` (paper is thin).
+    /// Swept self-collision radius. **Keep it well under HALF the grid spacing.**
+    ///
+    /// It is a radius for catching one fold landing on another, not a cloth thickness, and there
+    /// is no guard: set from a quilt's 20 mm loft on a sheet whose cells were 37 mm, every
+    /// neighbouring pair sat permanently in contact and the sheet inflated like a balloon and
+    /// curled its edges upward (Daydream Home, 2026-08-21). See `recommendedSelfRadius`.
     public var selfRadius: Float = 0.006
     /// Spatial-hash cell size — set ≥ 2·radius so the 27-cell stencil covers 2·radius
     /// (≈ 2× rest edge keeps buckets small for perf).
@@ -156,6 +162,11 @@ public final class PaperClothSolver {
     public var floorY: Float = 0
     public var clothThickness: Float = 0.012
     public var collideStiffness: Float = 1.0
+    /// Tangential-velocity RETENTION on contact, not friction — 0 stops a sliding contact dead,
+    /// 1 is frictionless. The name reads the other way round, and taking it at face value is a
+    /// real trap: there is no static threshold anywhere in the solve, so a sheet at rest is never
+    /// actually held. At 0.55 a duvet baked onto a bed spent the settle creeping and had slid off
+    /// onto the floor by 4.5 s (Daydream Home, 2026-08-21). Bedding-on-a-mattress wants ~0.05.
     public var collideFriction: Float = 0.45
     /// Max per-substep SDF push-out (metres). Caps the body/ceiling collider so a
     /// sheet vertex buried deep in a solid box can't be teleported the full half-
@@ -677,7 +688,99 @@ public final class PaperClothSolver {
     /// Set the static SDF colliders the paper collides with (monitor body,
     /// floor box, etc.). Tag each with an ownerID != .max so the kernel's
     /// skip-self filter never drops them (paper particles carry no ownerID).
+    /// **Every collider must carry an `ownerID` other than `.max`.**
+    ///
+    /// The collide kernel skips any collider whose owner matches the solver's, and this solver
+    /// runs with `ownerID: .max` because paper particles carry no owner — so a collider built
+    /// with `PBDCollider.box(center:halfExtents:)`'s DEFAULT owner is silently dropped, every
+    /// time, and the cloth falls straight through it. This is asserted in debug rather than left
+    /// as prose, because prose did not stop it happening (Daydream Home, 2026-08-21).
+    // ── Baking a settled drape ──────────────────────────────────────────────
+    //
+    // The solver's defaults are tuned for its origin scene: paper flying in a fountain. Draping
+    // cloth ONTO something and letting it come to rest is a different job with different traps,
+    // and these three helpers are what it took to get a duvet onto a bed (Daydream Home,
+    // 2026-08-21). They are additive — nothing here changes an existing caller.
+
+    /// Kill every air force: wind, aero, drag, turbulence, the updraft jet, and the lateral soft
+    /// wall. A settling bake wants gravity and nothing else.
+    ///
+    /// Worth calling explicitly even though it looks like a no-op on a fresh solver: `windAmp` is
+    /// 0 by default but `aero`, `drag` and `turb` are NOT, and `wallRadius` is 1.3 m — which a
+    /// queen bed's corners sit exactly on. Left alone they kicked a settling sheet up and rolled
+    /// it into a tube.
+    public func stillAir() {
+        windAmp = 0; aero = 0; drag = 0; turb = 0
+        jetUpdraft = 0
+        wallRadius = .greatestFiniteMagnitude
+    }
+
+    /// A self-collision radius that is safe for a given grid spacing — comfortably under half,
+    /// so neighbouring particles are never permanently in contact.
+    public static func recommendedSelfRadius(forSpacing spacing: Float) -> Float {
+        max(1e-4, spacing * 0.18)
+    }
+
+    /// Fold the sheet's overhang down over an axis-aligned box BEFORE the first step, so the
+    /// solver relaxes a drape instead of inventing one.
+    ///
+    /// **This is the difference between cloth that hangs and cloth that curls.** A flat sheet
+    /// released above a mattress has to find its overhang by billowing: the free edge swings past
+    /// vertical, the surplus buckles, and the fold then LOCKS — gravity does not undo a stable
+    /// fold, and no amount of settling did. The measured profile fell 100 mm and came straight
+    /// back up 110 mm with three nodes stacked at one x, cloth folded in half against itself.
+    /// Softening the bend did not fix it; disabling self-collision did not fix it; it was present
+    /// in the raw solver output before any post-processing. Starting the cloth where it is going
+    /// did fix it, and the same profile then descended monotonically for its full 263 mm.
+    ///
+    /// Call after `configureSheets` and before stepping. `top` is the height the cloth rests at;
+    /// anything whose plan position lies outside `halfExtents` is taken down the nearer face by
+    /// however far past the edge it was.
+    public func preDrape(overCenter center: SIMD3<Float>, halfExtents: SIMD3<Float>,
+                         clearance: Float = 0.004) {
+        guard sheetCount > 0 else { return }
+        let p = particleBuffer.contents
+        let top = center.y + halfExtents.y
+        for n in 0 ..< (verticesPerSheet * sheetCount) {
+            let q = p[n].position
+            let dx = abs(q.x - center.x) - halfExtents.x
+            let dz = abs(q.z - center.z) - halfExtents.z
+            let over = max(dx, dz)
+            guard over > 0 else { continue }
+            let sx = q.x < center.x ? -Float(1) : 1
+            let sz = q.z < center.z ? -Float(1) : 1
+            let x = dx > dz ? center.x + sx * (halfExtents.x + clearance) : q.x
+            let z = dz >= dx ? center.z + sz * (halfExtents.z + clearance) : q.z
+            let y = top - over
+            p[n].positionAndInvMass = SIMD4(x, y, z, p[n].invMass)
+            p[n].prevPositionAndPad = SIMD4(x, y, z, 0)
+        }
+    }
+
+    /// Pin a square patch of one sheet at wherever it currently is, by zeroing its inverse mass.
+    ///
+    /// For a BAKE, the settle is a race between two things: the hems need time to finish falling,
+    /// and `collideFriction` has no static threshold, so given that time the whole sheet creeps
+    /// and eventually walks off whatever it is lying on. Pinning the middle — the part of a
+    /// draped cloth that genuinely does not move — buys the edges as long as they need.
+    ///
+    /// Call it AFTER the cloth has landed, never before: pinned at its release pose the sheet
+    /// hangs from its own middle like a tablecloth on a nail.
+    public func pinPatch(sheet: Int = 0, halfCells: Int) {
+        guard sheet >= 0, sheet < sheetCount, gridW > 0, gridH > 0 else { return }
+        let base = sheet * verticesPerSheet
+        let p = particleBuffer.contents
+        for j in max(0, gridH / 2 - halfCells) ... min(gridH - 1, gridH / 2 + halfCells) {
+            for i in max(0, gridW / 2 - halfCells) ... min(gridW - 1, gridW / 2 + halfCells) {
+                p[base + j * gridW + i].positionAndInvMass.w = 0
+            }
+        }
+    }
+
     public func setColliders(_ colliders: [PBDCollider]) {
+        assert(!colliders.contains { $0.meta.x == .max },
+               "PaperClothSolver: a collider with ownerID == .max is skipped by the collide "
+               + "kernel and will do nothing. Tag colliders with any other id.")
         let clipped = colliders.count > colliderBuffer.capacity
             ? Array(colliders.prefix(colliderBuffer.capacity)) : colliders
         colliderBuffer.write(clipped)
