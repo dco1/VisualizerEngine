@@ -1266,8 +1266,14 @@ public enum MaterialGenerator {
     /// |---|---|---|---|
     /// | `patchCells` | 2 | 50 cm | damp/dry tone — *pattern*, deliberately a whisper |
     /// | `aggregateCells` | 9 / 19 / 37 | 11 / 5.3 / 2.7 cm | the clumps — see `earth` |
+    /// | `warpCells` | 26 | 3.8 cm | the domain warp that bends a clump out of a disc |
+    /// | `pebbleCells` | 22 | 4.5 cm | stones |
     /// | `gritCells` | 72 | 1.4 cm | grit — tone + roughness breakup |
     /// | `finesCells` | 168 | 6.0 mm | fines — roughness + relief only (3 texels: near Nyquist) |
+    ///
+    /// The detail band is not in the table because it does not get its own noise: it is
+    /// derived from `finesCells` and the litter mat, so the sub-millimetre relief and the macro
+    /// channels describe ONE surface (see `setDetailRelief`).
     enum GroundBands {
         static let patchCells = 2
         /// **Three aggregate scales, incommensurate on purpose.** 9 / 19 / 37 share no common
@@ -1286,8 +1292,6 @@ public enum MaterialGenerator {
         /// stone: a DENSE field, deliberately. A sparse landmark grids at the tile period and
         /// reads as a stamped repeat — see [[daydream-landmarks-cannot-be-baked]].
         static let pebbleCells = 22
-        /// The detail band's cell count. At 8× UV on a 1 m run this is ~1.0 mm.
-        static let microCells = 120
     }
 
     // ── EARTH: the shared bed under every bare-ground yard ────────────────────────────
