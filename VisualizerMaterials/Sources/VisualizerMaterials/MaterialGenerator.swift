@@ -1228,35 +1228,37 @@ public enum MaterialGenerator {
     // ── The YARD's run, and the band table every ground generator is written against ──
     //
     /// **World metres one ground bake spans.** The yard's generators reason in real
-    /// centimetres and then take the surface's UV period FROM the sizes they chose — the same
+    /// centimetres and the surface's UV period is taken FROM the sizes they chose — the same
     /// inversion tile and terrazzo use, and the reason those two are the materials Danny has
     /// called good. Changing this re-scales every band below; treat the two as ONE decision.
     ///
-    /// **1.0 m, not the 2.0 m the yard baked at until 2026-08-20.** Two measurements set it:
+    /// **2.0 m, and the 1.0 m this briefly shipped at was a mistake — measured, not argued.**
+    /// The reasoning for going finer was that 1.0 m halves the texel (3.91 mm → 1.95 mm) and is
+    /// the finest run that still meets the per-vertex world tint, whose floor is two terrain
+    /// cells (`TerrainMesh.focusCellMeters` = 0.5 m). Both halves of that are true and neither
+    /// mattered, because **the camera cannot use the texels it buys**:
     ///
-    ///  * **What the camera can resolve.** The `4000 Sunset` dollhouse cutaway renders the yard
-    ///    at ~13 mm per pixel, so the band that reads as *earth* rather than as *pattern* is
-    ///    2 cm … 50 cm. At the old 2 m run a texel was 3.9 mm and that band was representable —
-    ///    the yard's problem was never resolution, it was that almost no amplitude was authored
-    ///    there (measured on the frame: ~1 % luma contrast at every band from 4 to 32 px).
-    ///  * **Where the hand-off is.** Content COARSER than one run cannot come from the tile at
-    ///    all — it averages away under minification and the hex de-repeat. Above the run the
-    ///    yard is carried by the per-vertex world-space layer instead
-    ///    (`HouseScene.terrainMacroTint`), whose finest representable feature is two terrain
-    ///    cells = **1.0 m** (`TerrainMesh.focusCellMeters` is 0.5 m). 1.0 m is therefore the
-    ///    finest run that still meets that layer, and it buys 1.95 mm per texel — half the old
-    ///    texel — for everything below it.
+    /// | run | delivered grain, forest floor | delivered grain, dirt | recurrences per 512 px |
+    /// |---|---|---|---|
+    /// | 1.0 m | 8.4 % | 7.9 % | **6** |
+    /// | 2.0 m | 8.4 % | 7.4 % | **2** |
     ///
-    /// Going finer would clear `MaterialScaleAudit.touchScaleFloor` (0.75 m puts the finest
-    /// representable feature at 2.9 mm) and is a real option for a close camera, but it drops
-    /// the tile's ceiling below what the terrain mesh can pick up. That is a taste call about
-    /// which camera the yard is for; it is not free, so it is not taken here silently.
+    /// (Grain is the 2–16 px contrast on the clean yard square; recurrences are 40×40 patches
+    /// matching elsewhere in the crop at ≥ 0.60 NCC. Both measured on the `4000 Sunset`
+    /// dollhouse cutaway, hex de-repeat on, same generator, only this constant changed.)
     ///
-    /// The close-range answer for the yard is the DETAIL band rather than a shorter run — and
-    /// note it is currently INERT: `HouseRenderBridge.detailReliefStrength` ships at 0, blocked
-    /// on a frequency problem of its own. Every ground bake writes the band anyway, so switching
-    /// it on is one assignment away.
-    public static let groundRunMeters: Double = 1.0
+    /// The grain is identical because the yard renders at ~6 mm per pixel near-field and ~13 mm
+    /// mid-frame, so everything the eye resolves is ≥ 12 mm — comfortably above the 7.8 mm a
+    /// 3.91 mm texel can represent. The extra resolution lands entirely below the camera, which
+    /// is the SAME argument that retired `MaterialScaleAudit`'s 3 mm touch band for this shot,
+    /// applied one level up. What it does cost is repetition: halving the run quadruples the
+    /// repeats per unit area, and the hex de-repeat can shuffle WHERE a tile is sampled but
+    /// cannot invent new content — so the same clump turned up three times as often.
+    ///
+    /// The band table below is written in physical sizes and re-derived for this run, so it is
+    /// unchanged in millimetres. The one band that genuinely wanted the finer run is `fines`,
+    /// and it is roughness/relief only, below what the camera resolves — see its note.
+    public static let groundRunMeters: Double = 2.0
 
     /// The ground's band table, at `groundRunMeters`. Named rather than typed inline so a run
     /// change re-scales one table instead of a dozen literals, and so the physical size each
@@ -1264,34 +1266,39 @@ public enum MaterialGenerator {
     ///
     /// | band | cells | feature @ 1.0 m | carries |
     /// |---|---|---|---|
-    /// | `patchCells` | 2 | 50 cm | damp/dry tone — *pattern*, deliberately a whisper |
-    /// | `aggregateCells` | 9 / 19 / 37 | 11 / 5.3 / 2.7 cm | the clumps — see `earth` |
-    /// | `warpCells` | 26 | 3.8 cm | the domain warp that bends a clump out of a disc |
-    /// | `pebbleCells` | 22 | 4.5 cm | stones |
-    /// | `gritCells` | 72 | 1.4 cm | grit — tone + roughness breakup |
-    /// | `finesCells` | 168 | 6.0 mm | fines — roughness + relief only (3 texels: near Nyquist) |
+    /// | `patchCells` | 4 | 50 cm | damp/dry tone — *pattern*, deliberately a whisper |
+    /// | `aggregateCells` | 17 / 37 / 73 | 11.8 / 5.4 / 2.7 cm | the clumps — see `earth` |
+    /// | `warpCells` | 52 | 3.8 cm | the domain warp that bends a clump out of a disc |
+    /// | `pebbleCells` | 44 | 4.5 cm | stones |
+    /// | `gritCells` | 144 | 1.4 cm | grit — tone + roughness breakup |
+    /// | `finesCells` | 224 | 8.9 mm | fines — roughness + relief only (2.3 texels: at Nyquist) |
     ///
     /// The detail band is not in the table because it does not get its own noise: it is
     /// derived from `finesCells` and the litter mat, so the sub-millimetre relief and the macro
     /// channels describe ONE surface (see `setDetailRelief`).
     enum GroundBands {
-        static let patchCells = 2
-        /// **Three aggregate scales, incommensurate on purpose.** 9 / 19 / 37 share no common
-        /// factor, so the three lattices never come back into register and the stack has no
-        /// repeat finer than the tile itself. Even ratios (8 / 16 / 32) would line up every
-        /// fourth cell and print a coarse grid over the whole yard.
-        static let aggregateCells = [9, 19, 37]
+        static let patchCells = 4
+        /// **Three aggregate scales, and all three counts are PRIME on purpose.** 17 / 37 / 73
+        /// share no common factor, so the three lattices never come back into register and the
+        /// stack has no repeat finer than the tile itself. Even ratios (18 / 38 / 74 — the
+        /// obvious doubling of the previous 9 / 19 / 37) share a factor of 2 and line up every
+        /// other cell, printing a coarse grid over the whole yard.
+        static let aggregateCells = [17, 37, 73]
         /// The shared domain-warp field's cell count, and how far it displaces a lookup,
         /// in CELLS of the layer being warped. See `earth` — the warp is what turns a Voronoi
         /// island from a disc into a clump, so these two are look decisions, not tuning.
-        static let warpCells = 26
+        static let warpCells = 52
         static let warpCellFraction = 0.55
-        static let gritCells = 72
-        static let finesCells = 168
-        /// Stones, as a Voronoi cell count. 22 ⇒ ~4.5 cm at a 1 m run, ~1 cell in 3 carrying a
-        /// stone: a DENSE field, deliberately. A sparse landmark grids at the tile period and
-        /// reads as a stamped repeat — see [[daydream-landmarks-cannot-be-baked]].
-        static let pebbleCells = 22
+        static let gritCells = 144
+        /// **At the Nyquist limit, and that is the ceiling rather than a choice.** At
+        /// `groundRunMeters` a texel is 3.91 mm, so the finest representable feature is 7.8 mm;
+        /// 224 cells puts this band at 8.9 mm, just above it. Asking for more is not a finer
+        /// surface, it is aliasing — and this band carries no TONE for exactly that reason.
+        static let finesCells = 224
+        /// Stones, as a Voronoi cell count. 44 ⇒ ~4.5 cm, ~1 cell in 3 carrying a stone: a
+        /// DENSE field, deliberately. A sparse landmark grids at the tile period and reads as a
+        /// stamped repeat — see [[daydream-landmarks-cannot-be-baked]].
+        static let pebbleCells = 44
     }
 
     // ── EARTH: the shared bed under every bare-ground yard ────────────────────────────
