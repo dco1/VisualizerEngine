@@ -227,12 +227,19 @@ public struct MaterialScaleAudit: Equatable, Sendable {
 
     /// Residual variance per octave of a square toroidal field, finest first.
     ///
+    /// Public because the same decomposition is the right instrument on a FRAME as well as on
+    /// a bake, and the two questions are different: a bake-side number says detail was
+    /// AUTHORED, a frame-side one says it was DELIVERED — through the mip chain, the hex
+    /// anti-tiling blend (three offset samples averaged, which costs contrast by construction),
+    /// the lighting and the tone curve. `HouseRenderBridgeGPUTests_ExteriorLight` measures the
+    /// yard's grain with it.
+    ///
     /// Each level is a 2×2 box decimation of the one above (a Haar low-pass, which is exact
     /// and allocation-cheap); the octave's energy is the variance of what that decimation
     /// THREW AWAY — `level_L − upsample(level_{L+1})`. Summing the residual variances
     /// recovers the field's total variance to rounding, so the shares below are a real
     /// decomposition rather than a set of overlapping band-pass readings.
-    static func octaveVariances(_ field: [Double], size: Int) -> [Double] {
+    public static func octaveVariances(_ field: [Double], size: Int) -> [Double] {
         guard size > 1, field.count == size * size else { return [] }
         var out: [Double] = []
         var cur = field
