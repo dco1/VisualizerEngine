@@ -921,7 +921,14 @@ public enum MaterialGenerator {
                 ch.height[ch.idx(x, y)] = clamp01(loopHeight * 0.8 + fiber * 0.08)
             }
         }
-        ch.sheen = 0.0
+        // RESTORED to 0.45 (Danny, 2026-08-22). `a046075` — a LINEN-only refinement — took this
+        // to 0.0 as collateral, and the tell it was collateral is four lines up: the docstring
+        // has said "Medium sheen at grazing only" throughout. Wool is what every rug wears and
+        // is a user-pickable finish, and a correct sheen lobe in `brdf()` cannot rescue a
+        // material that asks for none. Sits between linen (0.30) and velvet (0.85), which is
+        // what "medium" means here. `MaterialTextureTests.testEveryUncoatedFabricCarriesSheen`
+        // now iterates the registry, so no future fabric can lose it silently.
+        ch.sheen = 0.45
         ch.deriveNormals(strength: 4)
         // Soft fibrous fuzz over the chunky loops — the between-loop wool haze at close range.
         addMicroDetail(&ch, seed: seed ^ 0xB4, baseCells: 60, strength: 0.70)
