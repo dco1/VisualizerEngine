@@ -8921,8 +8921,21 @@ public final class IlluminatoramaRenderer {
             // doesn't graze the edge of the shadow map.
             let halfAngle = acos(min(0.9999, max(0.01, spotLights[i].outerCone)))
             let fovY = min(2.95, halfAngle * 2 * 1.1) // clamp <170° to avoid divergence
-            let near: Float = 0.1
             let far  = max(0.5, spotLights[i].radius)
+            // DERIVED, not fixed. A hardcoded 0.1 m near plane clips the occluder nearest the
+            // bulb, and for a fixture standing against a wall that occluder IS the wall. A ray
+            // from the bulb to a floor point at horizontal distance d crosses a wall face at
+            // lateral offset o at view depth h·o/d, so the near plane silently stops shadowing
+            // beyond d = h·o/near. With a floor lamp 43 mm off a wall face (bulb 1.19 m up,
+            // 1.79 m pool) that cutoff is 0.51 m — the lamp's own foot — and its light leaks
+            // across the room. It only became reachable when `shadowStoresFrontFaces` flipped
+            // true (2026-08-19): storing the NEAR face moved the occluder from 157 mm off the
+            // light to 43 mm, inside the clip. Measured on
+            // `testWallOcclusionIsTheShadowMapNotJustConeDirection`: far-room delta 0.6 luma
+            // shipped, 71.8 with the old convention.
+            //
+            // The atlas is 512² `.depth32Float`, so far/near ≈ 500 costs nothing in precision.
+            let near = max(0.005, far * 0.002)
             let proj = Self.perspectiveRH(fovY: fovY, aspect: 1.0, near: near, far: far)
             spotLights[i].shadowMatrix = proj * lightView
         }
