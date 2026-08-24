@@ -955,16 +955,31 @@ kernel void illumi_lighting(
     }
     // Terms kept separate so the per-term split-render (frame.debugTerm) can
     // isolate any one of them; the normal path just sums them at the end.
-    // Phase 7c — grain anisotropy: normalRoughness.w carries (1 + aniso) for wood/brushed-metal
-    // pixels (opaque is exactly 1.0). Reconstruct an in-plane grain tangent from a world reference
-    // (plan-X for floors/ceilings, horizontal for walls) — approximate (per-instance, not per-
-    // plank), but it's the highlight STRETCH that kills the plastic look, not the exact grain angle.
-    float aniso = (nrH.a > 1.001h) ? float(nrH.a - 1.0h) : 0.0;
+    // Phase 7c — grain anisotropy, now with an AUTHORABLE grain axis. normalRoughness.w packs the
+    // amount AND the orientation in two bands: (1.001,2] = HORIZONTAL grain (aniso = w-1, the
+    // original encoding), (2.001,3] = VERTICAL grain (aniso = w-2). The G-buffer chose the band
+    // from the SIGN of the instance's anisotropy (negative = vertical). This is why a brushed
+    // fridge/dishwasher door can run its highlight up the panel while a range runs it across —
+    // before, the tangent was reconstructed as `cross(N, up)` (horizontal on every vertical face)
+    // and nothing could say otherwise. The reconstruction is still per-instance from a world
+    // reference (not per-plank), but it's the STRETCH plus the AXIS that kill the plastic look.
+    float aniso; bool grainVertical;
+    if (nrH.a > 2.001h)      { aniso = float(nrH.a - 2.0h); grainVertical = true;  }
+    else if (nrH.a > 1.001h) { aniso = float(nrH.a - 1.0h); grainVertical = false; }
+    else                     { aniso = 0.0;                 grainVertical = false; }
     float3 grainT = float3(0.0);
     if (aniso > 0.001) {
         float3 up = float3(0.0, 1.0, 0.0);
-        grainT = (abs(dot(N, up)) > 0.95) ? normalize(float3(1.0, 0.0, 0.0) - N * N.x)
-                                          : normalize(cross(N, up));
+        if (abs(dot(N, up)) > 0.95) {
+            // Near-horizontal face (an appliance TOP): "vertical" has no meaning in the ground
+            // plane, so fall back to the plan axes — horizontal = plan-X (unchanged), vertical = plan-Z.
+            float3 planX = normalize(float3(1.0, 0.0, 0.0) - N * N.x);
+            grainT = grainVertical ? normalize(cross(N, planX)) : planX;
+        } else {
+            float3 horiz = normalize(cross(N, up));                 // in-plane, horizontal
+            grainT = grainVertical ? normalize(cross(N, horiz))    // in-plane, up-aligned (vertical)
+                                   : horiz;
+        }
     }
     // NOTE the sheen accounting: `directSun` is scaled by `visibility` AFTER the call, so the
     // sheen `brdf` pushed into `clothSheen` has to be shadowed by hand to match. Every other

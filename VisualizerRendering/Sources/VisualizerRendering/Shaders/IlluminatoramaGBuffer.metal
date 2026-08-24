@@ -1111,13 +1111,23 @@ fragment GBufferOut illumi_fs(
     // ordinary-opaque tag carries it; a leaf or a plush surface keeps its class and
     // forgoes anisotropy, which costs nothing (neither ships a grain tangent).
     //
-    // Exactly identity when `inst.anisotropy == 0`: the write is `1.0h + 0.0h`, the same
+    // Exactly identity when `inst.anisotropy >= 0`: the write is `1.0h + clamp(a)`, the same
     // bits the old line produced, so every scene that never sets the field — which is
     // every Visualizer scene — is bit-identical. The clamp is insurance the field has
     // nowhere else in the pipeline: `brdf()` splits GGX as `ab = a * (1 - 0.7 * aniso)`,
     // which goes NEGATIVE past aniso ≈ 1.43.
+    //
+    // AUTHORABLE grain axis: the SIGN of `inst.anisotropy` chooses the band the lighting pass
+    // reads the orientation from — POSITIVE = horizontal grain (1+|a|, the original), NEGATIVE
+    // = vertical grain (2+|a|). A brushed fridge/dishwasher door ships negative anisotropy so its
+    // highlight runs UP the panel; a range ships positive so it runs across. See the decode in
+    // IlluminatoramaLighting.metal.
     half wTag = foliageFlag;
-    if (wTag >= 1.0h) wTag = 1.0h + half(clamp(inst.anisotropy, 0.0f, 1.0f));
+    if (wTag >= 1.0h) {
+        wTag = (inst.anisotropy < 0.0f)
+             ? 2.0h + half(clamp(-inst.anisotropy, 0.0f, 1.0f))
+             : 1.0h + half(clamp(inst.anisotropy, 0.0f, 1.0f));
+    }
     o.normalRoughness = half4(half(oct.x), half(oct.y), half(matRough), wTag);
     // Phase 4.9 — emission can be a texture (used heavily by Plus scenes
     // for glow effects on rails / lamps / fire) or a scalar. Both are

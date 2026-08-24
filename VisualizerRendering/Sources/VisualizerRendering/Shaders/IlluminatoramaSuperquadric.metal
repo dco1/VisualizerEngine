@@ -218,7 +218,13 @@ fragment SQImpostorFSOut illumi_superquadric_impostor_fs(
     float2 oct = octEncode(wN);
     // .w tag: 1.0 = opaque (default); 1.0 + anisotropy (>1) carries the grain-highlight stretch
     // for the deferred pass (all existing tag tests are < 1.0, so this reads as opaque to them).
-    o.normalRoughness = half4(half(oct.x), half(oct.y), half(inst.roughness), 1.0h + half(inst.anisotropy));
+    // The SIGN of anisotropy authors the grain AXIS the same way the mesh G-buffer does: positive
+    // = horizontal grain (1+a, unchanged), negative = vertical grain (2+|a|). Impostors never set
+    // vertical grain today, so the positive path stays byte-identical.
+    half sqW = (inst.anisotropy < 0.0f)
+             ? 2.0h + half(clamp(-inst.anisotropy, 0.0f, 1.0f))
+             : 1.0h + half(inst.anisotropy);
+    o.normalRoughness = half4(half(oct.x), half(oct.y), half(inst.roughness), sqW);
     o.emission        = half4(half3(inst.emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -inst.sheen));
     o.velocity        = half2(velUV);
     o.layer           = inst.layer;   // light-layer bitfield (default 0xFFFFFFFF)
