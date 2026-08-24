@@ -1052,7 +1052,10 @@ kernel void illumi_lighting(
         float  dist    = length(toLight);
         if (dist > pl.radius) continue;
         float3 L = toLight / max(dist, 1e-4);
-        float atten = 1.0 / max(dist * dist, 1e-4);
+        // Source-size softening: `1/(d² + r²)` caps the near field at `1/r²` instead of
+        // blowing up as d→0, so a finite-size source reads as a soft halo rather than a hot
+        // blob. r == 0 ⇒ exactly `1/d²` (the old path, byte-identical for scenes that never set it).
+        float atten = 1.0 / max(dist * dist + pl.softRadius * pl.softRadius, 1e-4);
         float window = saturate(1.0 - pow(dist / pl.radius, 4.0));
         atten *= window * window;
 
@@ -1124,7 +1127,9 @@ kernel void illumi_lighting(
         float coneCos   = dot(normalize(sl.direction), -L);
         float coneAtten = smoothstep(sl.outerCone, sl.innerCone, coneCos);
         if (coneAtten <= 0.0) continue;
-        float atten = 1.0 / max(dist * dist, 1e-4);
+        // Source-size softening (see the point-light path): `1/(d² + r²)` flattens the
+        // near field into a soft halo. r == 0 ⇒ exactly `1/d²`, byte-identical.
+        float atten = 1.0 / max(dist * dist + sl.softRadius * sl.softRadius, 1e-4);
         float window = saturate(1.0 - pow(dist / sl.radius, 4.0));
         atten *= window * window * coneAtten;
 

@@ -454,7 +454,13 @@ struct PointLight {
     uint   castsShadow;
     int    shadowCubeIndex;
     int    _padPointShadow0;
-    int    _padPointShadow1;
+    // Source-size term for the near-field falloff (was `_padPointShadow1`; reinterpreted,
+    // so the struct stride is unchanged). Attenuation is `1/(d² + softRadius²)` instead of
+    // `1/d²`: a point source of zero size blows up as d→0, so a wall a metre from a bulb
+    // reads as a hard blob. `softRadius` gives it a finite apparent size — the near field
+    // flattens into a soft halo while the far field stays honest inverse-square. Default 0 ⇒
+    // exactly `1/d²`, byte-identical to the prior behaviour (Visualizer never sets it).
+    float  softRadius;
 };
 
 // Rectangular area light (#60 task 5). Mirror of Swift IlluminatoramaAreaLight.
@@ -502,7 +508,11 @@ struct SpotLight {
     // fact travels WITH the light instead of being inferred from its array position.
     // Reinterpreted from a former int pad, so the struct stride is unchanged.
     int      castsShadow;
-    int      _padSpot2;
+    // Source-size term for the near-field falloff (was `_padSpot2`; reinterpreted, so the
+    // struct stride is unchanged). Same rule as `PointLight.softRadius`: attenuation is
+    // `1/(d² + softRadius²)`, so a cone from a finite-size source flattens into a soft halo
+    // near the emitter instead of a hard blob on a nearby wall. Default 0 ⇒ exactly `1/d²`.
+    float    softRadius;
 };
 
 struct Instance {

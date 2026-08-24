@@ -642,19 +642,25 @@ public struct IlluminatoramaPointLight {
     /// lights a page; the rest fall back to unshadowed. Mirrors the Metal
     /// `PointLight.shadowCubeIndex`. Default `-1`.
     public var shadowCubeIndex: Int32 = -1
-    /// Two explicit pads so the struct closes on a 16-byte boundary (stride 48 → 48;
-    /// the base struct was 32 B + the layerMask cluster). Mirror the Metal padding.
+    /// One explicit pad so the struct closes on a 16-byte boundary. Mirror the Metal padding.
     public var _padPointShadow0: Int32 = 0
-    public var _padPointShadow1: Int32 = 0
+    /// Source-size term for the near-field falloff (was `_padPointShadow1`; reinterpreted, so
+    /// the struct stride is unchanged). The lighting kernel attenuates by `1/(d² + softRadius²)`
+    /// instead of `1/d²`: a point source of zero size explodes as d→0, so a wall a metre from a
+    /// bulb reads as a hard blob. `softRadius` gives the source a finite apparent size — the near
+    /// field flattens into a soft halo while the far field stays honest inverse-square. Default 0
+    /// ⇒ exactly `1/d²`, byte-identical to the prior behaviour (Visualizer never sets it).
+    public var softRadius: Float = 0
 
     public init(position: SIMD3<Float>, radius: Float, color: SIMD3<Float>,
                 layerMask: UInt32 = 0xFFFF_FFFF,
-                castsShadow: Bool = false) {
+                castsShadow: Bool = false, softRadius: Float = 0) {
         self.position = position
         self.radius = radius
         self.color = color
         self.layerMask = layerMask
         self.castsShadow = castsShadow ? 1 : 0
+        self.softRadius = softRadius
     }
 }
 
@@ -706,14 +712,18 @@ public struct IlluminatoramaSpotLight {
     /// 2026-08-15 tree: blob/surround 0.740 with the slice, 1.014 without). One lamp had it and
     /// the other did not, decided by nothing but which one inherited the spare.
     public var castsShadow: Int32 = 1
-    /// One explicit pad so the struct closes on a 16-byte boundary. Stride 176.
-    public var _padSpot2: Int32 = 0
+    /// Source-size term for the near-field falloff (was `_padSpot2`; reinterpreted, so the
+    /// struct stride is unchanged — 176). Same rule as `IlluminatoramaPointLight.softRadius`:
+    /// the lighting kernel attenuates by `1/(d² + softRadius²)`, so a cone from a finite-size
+    /// source flattens into a soft halo near the emitter instead of a hard blob on a nearby
+    /// wall. Default 0 ⇒ exactly `1/d²`, byte-identical (Visualizer never sets it).
+    public var softRadius: Float = 0
 
     public init(position: SIMD3<Float>, direction: SIMD3<Float>,
                 innerCone: Float, outerCone: Float,
                 color: SIMD3<Float>, radius: Float,
                 layerMask: UInt32 = 0xFFFF_FFFF,
-                castsShadow: Bool = true) {
+                castsShadow: Bool = true, softRadius: Float = 0) {
         self.position = position
         self.direction = direction
         self.innerCone = innerCone
@@ -722,6 +732,7 @@ public struct IlluminatoramaSpotLight {
         self.radius = radius
         self.layerMask = layerMask
         self.castsShadow = castsShadow ? 1 : 0
+        self.softRadius = softRadius
     }
 }
 
