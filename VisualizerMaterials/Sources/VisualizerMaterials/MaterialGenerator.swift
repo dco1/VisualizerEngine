@@ -1147,6 +1147,75 @@ public enum MaterialGenerator {
         return ch
     }
 
+    /// Clipped **boxwood** hedge foliage — a dense mass of small waxy leaves read at close
+    /// range, NOT turf. The hedge placeable used the `grass` tile as a stand-in, but grass is
+    /// soil-gapped vertical blades: it reads as lawn stood on end, never as a trimmed shrub.
+    /// Boxwood is the opposite surface — a continuous canopy of overlapping oval leaves with
+    /// dark recesses between the sprays, deep green shading to lighter yellow-green where fresh
+    /// growth catches the sun, and a faint waxy leaf sheen. All structure is a Worley leaf
+    /// lattice + tiled fbm undulation, so it is fully stochastic and tileable — no coherent
+    /// period to band in a wide yard shot — and `.ground` category (yard-only + the hex
+    /// de-repeat, exactly like `grass`).
+    ///
+    /// The leaf relief lives ENTIRELY in the material (the hedge mesh is a clipped box, no
+    /// per-leaf geometry), so this is a `.needsMicroRelief` surface — it ships a detail normal.
+    public static func boxwood(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 47) -> MaterialChannels {
+        var ch = MaterialChannels(size: size, category: .ground)
+        // Deep boxwood green, and the lighter yellow-green of freshly clipped new growth.
+        let deep  = Vec3(0.045, 0.115, 0.040)
+        let fresh = Vec3(0.150, 0.250, 0.075)
+        for y in 0..<size {
+            for x in 0..<size {
+                let u = Double(x) / Double(size), v = Double(y) / Double(size)
+                // Broad clipped-canopy undulation — the shadow pockets between leaf sprays.
+                let spray = Noise.fbmTiled(u, v, baseCells: 4, octaves: 4, seed: seed)
+                // DOMAIN WARP before the leaf lattice. A raw Worley partition reads as regular
+                // stone crazing (a continuous even outline, the mosaic tell); warping the sample
+                // point with a low-freq tiled fbm buckles the cells into irregular organic
+                // clusters. The warp field is periodic, so the wrap stays seamless.
+                let wu = u + 0.05 * (Noise.fbmTiled(u, v, baseCells: 5, octaves: 2, seed: seed ^ 0x1A2B) - 0.5)
+                let wv = v + 0.05 * (Noise.fbmTiled(u, v, baseCells: 5, octaves: 2, seed: seed ^ 0x3C4D) - 0.5)
+                // TWO leaf scales so cluster size varies (a single scale is what makes a mosaic):
+                // broad sprays + the fine individual leaves within them.
+                let coarse = Noise.voronoiTiled(wu, wv, cells: 11, jitter: 0.95, seed: seed ^ 0x5C2D)
+                let fine   = Noise.voronoiTiled(wu, wv, cells: 22, jitter: 0.95, seed: seed ^ 0x77E9)
+                let dome  = clamp01(1.0 - fine.f1 * 1.4)                    // 1 at a leaf centre
+                let broad = clamp01(1.0 - coarse.f1 * 1.2)                  // 1 at a spray centre
+                // Per-leaf tint, biased toward its broad cluster so whole sprays vary together.
+                let leafT = mix(Noise.unit(fine.cellId), Noise.unit(coarse.cellId), 0.4)
+                // Within-leaf micro tonal variation (waxy highlight vs. shaded lamina).
+                let micro = Noise.fbmTiled(u * 6.0, v * 6.0, baseCells: 8, octaves: 2, seed: seed ^ 0x91A3)
+
+                // A fraction of leaves are fresh yellow-green new growth, biased toward the
+                // sun-lit sprays; the rest stay deep green.
+                let freshFrac = clamp01((leafT - 0.50) * 1.6) * clamp01(0.4 + spray)
+                var col = mix(deep, fresh, freshFrac)
+                // BROKEN gap: the leaf-edge outline only darkens where a micro-noise agrees, so
+                // the shadow between leaves reads as intermittent pockets, not a crackle net.
+                let edge = 1.0 - smoothstep(0.0, 0.10, fine.f2 - fine.f1)
+                let pocket = edge * smoothstep(0.35, 0.70, micro)
+                let shade = clamp01(0.26 * (1.0 - spray) + 0.42 * pocket)   // 0 lit … 1 recess
+                col = col * (0.82 + 0.30 * micro) * (1.0 - 0.50 * shade)
+                ch.albedo[ch.idx(x, y)] = clampBand(col)
+
+                // Waxy leaf faces read semi-glossy; the shaded recesses go matte. The spatial
+                // swing carries the roughness-std TextureAudit tell.
+                ch.roughness[ch.idx(x, y)] = clamp01(0.52 + 0.30 * shade + 0.08 * (micro - 0.5))
+
+                // Leaf clusters stand proud, recesses sink — the macro relief that reads as
+                // many small overlapping leaves once deriveNormals runs.
+                ch.height[ch.idx(x, y)] = clamp01(0.42 + 0.30 * dome + 0.18 * broad
+                                                  + 0.14 * spray - 0.22 * pocket)
+            }
+        }
+        ch.clearcoat = 0.08          // faint waxy leaf sheen — not a wet gloss
+        ch.deriveNormals(strength: 2.6)
+        // Fine leaf-lamina tooth (the macro leaves are in the height field above; this is the
+        // sub-leaf grain that stops the canopy reading plastic at a grazing angle).
+        addMicroDetail(&ch, seed: seed ^ 0xB6, baseCells: 110, strength: 0.40)
+        return ch
+    }
+
     /// Asphalt road surface: near-black base aging to worn gray; Voronoi aggregate pitting;
     /// roughness 0.82–0.95 spatially varied; micro-crack scatter via sparse fbm.
     public static func asphalt(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 61, age: Double = 0.4) -> MaterialChannels {
