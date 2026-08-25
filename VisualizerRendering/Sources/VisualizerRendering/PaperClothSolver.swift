@@ -923,8 +923,24 @@ public final class PaperClothSolver {
     /// into folds, which self-collision then stacks into the hanging cascade a tablecloth or
     /// duvet corner actually forms. The cone blends smoothly into both face mappings
     /// (`sin 2φ` → 0 at either boundary; `y = top − r` matches `top − over` there).
+    /// `cornerPleatGap > 0` starts each corner as a PLEAT — the cloth doubled back
+    /// around the corner edge in one S-fold, layers `cornerPleatGap` apart, with the
+    /// fold's amplitude ramping in with fall distance (zero at the apex, full by
+    /// mid-fall). A dropped sheet never passes through a folded state on its own:
+    /// XPBD distance constraints resist compression as firmly as stretch, so corner
+    /// surplus disperses as a millimetre-scale bow across the whole hanging face
+    /// instead of folding. A made bed's pleat is HISTORY — someone folded it.
+    ///
+    /// `cornerTuckRange` pins the small band of the fold-back layer whose fall
+    /// distance lies in the range — the TUCK. Hanging pleat layers are parallel and
+    /// press on each other with zero normal force, so friction alone cannot keep a
+    /// pleat closed (measured: 0% layering after every unanchored variant); a real
+    /// hospital corner is held mechanically. Keep the band SMALL and near the
+    /// mattress edge: pinning a long mid-air line freezes the whole drape around it.
     public func preDrape(overCenter center: SIMD3<Float>, halfExtents: SIMD3<Float>,
-                         clearance: Float = 0.004, cornerSlope: Float = 0.25) {
+                         clearance: Float = 0.004, cornerSlope: Float = 0.25,
+                         cornerPleatGap: Float = 0,
+                         cornerTuckRange: ClosedRange<Float>? = nil) {
         guard sheetCount > 0 else { return }
         let p = particleBuffer.contents
         let top = center.y + halfExtents.y
@@ -941,9 +957,34 @@ public final class PaperClothSolver {
                 // Corner: hang radially around the corner edge on a shallow cone.
                 let r = sqrt(dx * dx + dz * dz)
                 let phi = atan2(dz, dx)                       // 0 at the x face, π/2 at z
-                let rad = clearance + cornerSlope * sin(2 * phi) * r
-                x = center.x + sx * (halfExtents.x + rad * cos(phi))
-                z = center.z + sz * (halfExtents.z + rad * sin(phi))
+                var theta = phi
+                var rad = clearance + cornerSlope * sin(2 * phi) * r
+                if cornerPleatGap > 0 {
+                    let t = phi / (.pi / 2)
+                    let g = cornerPleatGap
+                    var zigTheta: Float
+                    var zigRad: Float
+                    if t < 0.45 {
+                        zigTheta = (t / 0.45) * 0.80 * (.pi / 2)
+                        zigRad = clearance
+                    } else if t < 0.65 {
+                        zigTheta = (0.80 - (t - 0.45) / 0.20 * 0.40) * (.pi / 2)
+                        zigRad = clearance + g
+                    } else {
+                        let u = (t - 0.65) / 0.35
+                        zigTheta = (0.40 + u * 0.60) * (.pi / 2)
+                        zigRad = clearance + 2 * g * (1 - u)
+                    }
+                    let w = min(max((r - 0.05) / 0.10, 0), 1)
+                    theta = phi + (zigTheta - phi) * w
+                    rad = rad + (zigRad - rad) * w
+                    if let tuck = cornerTuckRange, t >= 0.45, t < 0.65,
+                       tuck.contains(r) {
+                        p[n].positionAndInvMass.w = 0
+                    }
+                }
+                x = center.x + sx * (halfExtents.x + rad * cos(theta))
+                z = center.z + sz * (halfExtents.z + rad * sin(theta))
                 y = top - r
             } else {
                 x = dx > dz ? center.x + sx * (halfExtents.x + clearance) : q.x
