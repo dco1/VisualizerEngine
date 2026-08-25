@@ -59,6 +59,8 @@ public final class PaperClothSolver {
     private let selfCollidePipeline:MTLComputePipelineState
     private let writePosPipeline:   MTLComputePipelineState
     private let normalsPipeline:    MTLComputePipelineState
+    private let bendPipeline:       MTLComputePipelineState
+    private let stickPipeline:      MTLComputePipelineState
 
     // ── Particle / constraint storage (all sheets, flat) ────────────────
     public let particleBuffer:   SimBuffer<PBDParticle>
@@ -66,6 +68,16 @@ public final class PaperClothSolver {
     private let colliderBuffer: SimBuffer<PBDCollider>
     private var colliderCount: Int = 0
     private let lambdaBuffer:  MTLBuffer
+    // Dihedral (cloth) bend — its own constraint type, λ buffer and uniforms.
+    // Empty unless `configureSheets(dihedralCompliance:)` is given a value, so
+    // every existing caller (paper) pays nothing. See paperBendConstraint in
+    // PaperCloth.metal for why cloth needs a hinge and paper doesn't.
+    private let bendConstraintBuffer: SimBuffer<PaperBendConstraint>
+    private let bendLambdaBuffer: MTLBuffer
+    private let bendUniformBuffer: MTLBuffer   // PaperBendUniforms
+    private let stickUniformBuffer: MTLBuffer  // PaperStickUniforms
+    private var bendGroupStart: [Int] = []
+    private var bendGroupCount: [Int] = []
     private let uniformBuffer: MTLBuffer       // PBDUniforms (shared kernels)
     private let windUniformBuffer: MTLBuffer   // PaperWindUniforms (wind/aero kernel)
     private let meshUniformBuffer: MTLBuffer   // PaperMeshUniforms (mesh-pack kernels)
@@ -132,6 +144,8 @@ public final class PaperClothSolver {
     // Disjoint colour-group (start, count) pairs into constraintBuffer / lambda.
     // Order: stretch H-even/odd, V-even/odd, shear A-even/odd, B-even/odd, then
     // skip-one bend H (3-colour by x%3) and V (3-colour by y%3) — 14 groups.
+    // Dihedral hinge constraints (cloth only) colour separately into
+    // `bendGroupStart`/`bendGroupCount` — 16 groups; see configureSheets.
     private var groupStart: [Int] = []
     private var groupCount: [Int] = []
 
@@ -173,6 +187,14 @@ public final class PaperClothSolver {
     /// thickness in one step (which tears it from its still-outside neighbour into
     /// a spike). ~2× the grid rest edge — buried patches climb out over a few frames.
     public var sdfMaxPushPerStep: Float = 0.01
+    /// STATIC friction: below this tangential speed (m/s), a particle resting on a collider or
+    /// the floor does not slide at all — the stick regime `collideFriction` (a retention RATE,
+    /// no threshold) never had. 0 disables the pass entirely (default — the paper fountain's
+    /// pages are meant to slide). Cloth that has to REST on something wants ~0.05–0.15.
+    public var stickSpeed: Float = 0
+    /// How far from a surface still counts as resting for the stick pass, over and above
+    /// `clothThickness` (which inflates the colliders the same way the collide pass does).
+    public var stickBand: Float = 0.006
     private let fixedDt: Float = 1.0 / 120.0
     private var accumulator: Float = 0
     private var time: Float = 0
@@ -197,7 +219,9 @@ public final class PaperClothSolver {
               let hScatter = cache.pipelineState(name: "paperHashScatter", device: dev),
               let selfCol = cache.pipelineState(name: "paperSelfCollide", device: dev),
               let writePos = cache.pipelineState(name: "paperWritePositions", device: dev),
-              let normals  = cache.pipelineState(name: "paperRecomputeNormals", device: dev)
+              let normals  = cache.pipelineState(name: "paperRecomputeNormals", device: dev),
+              let bend     = cache.pipelineState(name: "paperBendConstraint", device: dev),
+              let stick    = cache.pipelineState(name: "paperStaticFriction", device: dev)
         else {
             Self.log.error("PaperCloth pipeline cache failed — check PaperCloth.metal ships in VisualizerRendering/Shaders/")
             return nil
@@ -211,12 +235,23 @@ public final class PaperClothSolver {
         let perSheet = gridW * gridH * 6
         let maxConstraints = maxSheets * perSheet
         let lambdaBytes = MemoryLayout<Float>.stride * max(maxConstraints, 1)
+        // Dihedral hinges: one per quad (the shared "/" diagonal) + one per
+        // interior grid edge (both axes) < 3 per vertex.
+        let maxBendConstraints = maxSheets * gridW * gridH * 3
+        let bendLambdaBytes = MemoryLayout<Float>.stride * max(maxBendConstraints, 1)
 
         guard
             let pBuf = SimBuffer<PBDParticle>(device: device, capacity: maxParticles,
                                               label: "PaperCloth.particles"),
             let cBuf = SimBuffer<PBDConstraint>(device: device, capacity: maxConstraints,
                                                 label: "PaperCloth.constraints"),
+            let bBuf = SimBuffer<PaperBendConstraint>(device: device, capacity: maxBendConstraints,
+                                                      label: "PaperCloth.bendConstraints"),
+            let blBuf = device.makeBuffer(length: bendLambdaBytes, options: .storageModePrivate),
+            let buBuf = device.makeBuffer(length: MemoryLayout<PaperBendUniforms>.stride,
+                                          options: .storageModeShared),
+            let suBuf = device.makeBuffer(length: MemoryLayout<PaperStickUniforms>.stride,
+                                          options: .storageModeShared),
             let colBuf = SimBuffer<PBDCollider>(device: device, capacity: max(1, maxColliders),
                                                 label: "PaperCloth.colliders"),
             let uBuf = device.makeBuffer(length: MemoryLayout<PBDUniforms>.stride,
@@ -242,6 +277,9 @@ public final class PaperClothSolver {
         wBuf.label = "PaperCloth.windUniforms"
         mBuf.label = "PaperCloth.meshUniforms"
         lBuf.label = "PaperCloth.lambda"
+        blBuf.label = "PaperCloth.bendLambda"
+        buBuf.label = "PaperCloth.bendUniforms"
+        suBuf.label = "PaperCloth.stickUniforms"
 
         self.engine = engine
         self.integratePipeline  = pbd.integrate
@@ -256,8 +294,14 @@ public final class PaperClothSolver {
         self.selfCollidePipeline = selfCol
         self.writePosPipeline   = writePos
         self.normalsPipeline    = normals
+        self.bendPipeline       = bend
+        self.stickPipeline      = stick
         self.particleBuffer     = pBuf
         self.constraintBuffer   = cBuf
+        self.bendConstraintBuffer = bBuf
+        self.bendLambdaBuffer   = blBuf
+        self.bendUniformBuffer  = buBuf
+        self.stickUniformBuffer = suBuf
         self.colliderBuffer     = colBuf
         self.uniformBuffer      = uBuf
         self.windUniformBuffer  = wBuf
@@ -303,10 +347,18 @@ public final class PaperClothSolver {
     /// constraint colour groups, allocate per-sheet render buffers, and build
     /// the shared triangle index buffer. Recallable to rebuild (e.g. sheet-count
     /// change), as long as counts stay within the init capacities.
+    /// `dihedralCompliance` — nil (the default) keeps the paper model: skip-one
+    /// distance bend only, zero cost, byte-identical for every existing caller.
+    /// A value adds a real XPBD dihedral HINGE across every triangle pair (the
+    /// quad diagonal + both interior grid-edge directions), which is what makes
+    /// CLOTH roll smoothly where paper creases — see paperBendConstraint in
+    /// PaperCloth.metal for the mechanism. Cloth callers pair it with a soft
+    /// (large) `bendCompliance` so the chord term stops fighting the hinge.
     public func configureSheets(_ specs: [SheetSpec],
                                 stretchCompliance: Float = 1.0e-6,
                                 shearCompliance: Float = 5.0e-6,
-                                bendCompliance: Float = 4.0e-5) {
+                                bendCompliance: Float = 4.0e-5,
+                                dihedralCompliance: Float? = nil) {
         precondition(specs.count <= maxSheets, "configureSheets: \(specs.count) > maxSheets \(maxSheets)")
         let W = gridW, H = gridH, M = W * H
         sheetCount = specs.count
@@ -395,6 +447,54 @@ public final class PaperClothSolver {
             start += g.count
         }
         constraintBuffer.write(all)
+
+        // ── Dihedral hinge constraints (cloth bend) ──
+        //
+        // One hinge per triangle pair of the render triangulation (see
+        // buildIndexBuffer: quad (x,y) splits along the "/" diagonal
+        // (x,y+1)–(x+1,y)). Three families, each graph-coloured so no two
+        // hinges in a dispatch share a particle:
+        //   D — the quad's own diagonal.        Stencil 2×2   → 4 colours (x%2, y%2).
+        //   V — interior vertical grid edges.   Stencil 3×2   → 6 colours (x%3, y%2).
+        //   H — interior horizontal grid edges. Stencil 2×3   → 6 colours (x%2, y%3).
+        // Rest angle π: the sheet is cut flat, so every hinge restores toward flat.
+        bendGroupStart.removeAll(keepingCapacity: true)
+        bendGroupCount.removeAll(keepingCapacity: true)
+        if let alpha = dihedralCompliance {
+            func hinge(_ e0: UInt32, _ e1: UInt32, _ w0: UInt32, _ w1: UInt32) -> PaperBendConstraint {
+                PaperBendConstraint(v: SIMD4(e0, e1, w0, w1), restAngle: .pi, compliance: alpha)
+            }
+            var bendGroups: [[PaperBendConstraint]] = Array(repeating: [], count: 16)
+            for s in 0..<specs.count {
+                for y in 0..<(H - 1) {
+                    for x in 0..<(W - 1) {
+                        // D: shared "/" diagonal; wings are the quad's other corners.
+                        bendGroups[(x % 2) + 2 * (y % 2)].append(
+                            hinge(gi(s, x + 1, y), gi(s, x, y + 1), gi(s, x, y), gi(s, x + 1, y + 1)))
+                        // V: edge (x,y)–(x,y+1) between quads (x-1,y) and (x,y).
+                        if x >= 1 {
+                            bendGroups[4 + (x % 3) + 3 * (y % 2)].append(
+                                hinge(gi(s, x, y), gi(s, x, y + 1), gi(s, x + 1, y), gi(s, x - 1, y + 1)))
+                        }
+                        // H: edge (x,y)–(x+1,y) between quads (x,y-1) and (x,y).
+                        if y >= 1 {
+                            bendGroups[10 + (x % 2) + 2 * (y % 3)].append(
+                                hinge(gi(s, x, y), gi(s, x + 1, y), gi(s, x, y + 1), gi(s, x + 1, y - 1)))
+                        }
+                    }
+                }
+            }
+            var allBend = [PaperBendConstraint]()
+            allBend.reserveCapacity(bendGroups.reduce(0) { $0 + $1.count })
+            var bendStart = 0
+            for g in bendGroups {
+                bendGroupStart.append(bendStart)
+                bendGroupCount.append(g.count)
+                allBend += g
+                bendStart += g.count
+            }
+            if !allBend.isEmpty { bendConstraintBuffer.write(allBend) }
+        }
 
         // ── Per-sheet render buffers (packed_float3, stride 12) ──
         positionBuffers.removeAll(keepingCapacity: true)
@@ -656,19 +756,33 @@ public final class PaperClothSolver {
                        count: particleBuffer.count, label: "PaperCloth.wind")
         }
 
-        // 2. Reset XPBD λ for this substep.
+        // 2. Reset XPBD λ for this substep (distance AND dihedral).
         if constraintBuffer.count > 0, let blit = cb.makeBlitCommandEncoder() {
             blit.label = "PaperCloth.lambdaReset"
             blit.fill(buffer: lambdaBuffer,
                       range: 0..<(MemoryLayout<Float>.stride * constraintBuffer.count), value: 0)
+            if bendConstraintBuffer.count > 0 {
+                blit.fill(buffer: bendLambdaBuffer,
+                          range: 0..<(MemoryLayout<Float>.stride * bendConstraintBuffer.count),
+                          value: 0)
+            }
             blit.endEncoding()
         }
+        if bendConstraintBuffer.count > 0 {
+            let bPtr = bendUniformBuffer.contents().bindMemory(to: PaperBendUniforms.self, capacity: 1)
+            bPtr.pointee = PaperBendUniforms(constraintCount: UInt32(bendConstraintBuffer.count), dt: dt)
+        }
 
-        // 3. Constraint iterations — each iteration cycles all 8 colour groups.
+        // 3. Constraint iterations — each iteration cycles every distance colour
+        //    group, then (cloth only) every dihedral hinge colour group.
         for _ in 0..<constraintIterations {
             for g in groupCount.indices where groupCount[g] > 0 {
                 encodeConstraintSubpass(cb, start: groupStart[g], count: groupCount[g],
                                         label: "PaperCloth.c[\(g)]")
+            }
+            for g in bendGroupCount.indices where bendGroupCount[g] > 0 {
+                encodeBendSubpass(cb, start: bendGroupStart[g], count: bendGroupCount[g],
+                                  label: "PaperCloth.bend[\(g)]")
             }
         }
 
@@ -682,6 +796,24 @@ public final class PaperClothSolver {
             encodePass(cb, pipeline: floorPipeline,
                        buffers: [particleBuffer.buffer, constraintBuffer.buffer, uniformBuffer],
                        count: particleBuffer.count, label: "PaperCloth.floor")
+        }
+
+        // 5. Static friction — LAST, so it judges the substep's final motion.
+        //    See paperStaticFriction in PaperCloth.metal: resting contacts below
+        //    `stickSpeed` hold instead of creeping.
+        if stickSpeed > 0, colliderCount > 0 || floorEnabled {
+            let sPtr = stickUniformBuffer.contents().bindMemory(to: PaperStickUniforms.self, capacity: 1)
+            sPtr.pointee = PaperStickUniforms(
+                particleCount: UInt32(particleBuffer.count),
+                colliderCount: UInt32(colliderCount),
+                dt: dt,
+                floorY: floorEnabled ? floorY : -1e9,
+                contactBand: clothThickness + stickBand,
+                stickSpeed: stickSpeed,
+                selfRadius: clothThickness)
+            encodePass(cb, pipeline: stickPipeline,
+                       buffers: [particleBuffer.buffer, colliderBuffer.buffer, stickUniformBuffer],
+                       count: particleBuffer.count, label: "PaperCloth.stick")
         }
     }
 
@@ -736,8 +868,20 @@ public final class PaperClothSolver {
     /// Call after `configureSheets` and before stepping. `top` is the height the cloth rests at;
     /// anything whose plan position lies outside `halfExtents` is taken down the nearer face by
     /// however far past the edge it was.
+    ///
+    /// **Corners start as a GATHER, not a tent.** Cloth past the edge in BOTH plan axes used to
+    /// be split by `dx > dz` onto one of the two faces, which folds the corner surplus into a
+    /// symmetric diagonal ridge — and that tent is a stable equilibrium: the settle cannot break
+    /// its symmetry, so the corner freezes as a stiff pyramid instead of falling (the classic
+    /// synthetic-bedspread corner). Real cloth never passes through that state. Corner cloth is
+    /// instead hung RADIALLY around the corner's vertical edge on a shallow cone
+    /// (`cornerSlope`): the quarter-arc a radius maps onto is several times shorter than the
+    /// cloth that has to occupy it, so the surplus has no flat minimum at all — it must buckle
+    /// into folds, which self-collision then stacks into the hanging cascade a tablecloth or
+    /// duvet corner actually forms. The cone blends smoothly into both face mappings
+    /// (`sin 2φ` → 0 at either boundary; `y = top − r` matches `top − over` there).
     public func preDrape(overCenter center: SIMD3<Float>, halfExtents: SIMD3<Float>,
-                         clearance: Float = 0.004) {
+                         clearance: Float = 0.004, cornerSlope: Float = 0.25) {
         guard sheetCount > 0 else { return }
         let p = particleBuffer.contents
         let top = center.y + halfExtents.y
@@ -749,9 +893,20 @@ public final class PaperClothSolver {
             guard over > 0 else { continue }
             let sx = q.x < center.x ? -Float(1) : 1
             let sz = q.z < center.z ? -Float(1) : 1
-            let x = dx > dz ? center.x + sx * (halfExtents.x + clearance) : q.x
-            let z = dz >= dx ? center.z + sz * (halfExtents.z + clearance) : q.z
-            let y = top - over
+            var x: Float, y: Float, z: Float
+            if dx > 0, dz > 0 {
+                // Corner: hang radially around the corner edge on a shallow cone.
+                let r = sqrt(dx * dx + dz * dz)
+                let phi = atan2(dz, dx)                       // 0 at the x face, π/2 at z
+                let rad = clearance + cornerSlope * sin(2 * phi) * r
+                x = center.x + sx * (halfExtents.x + rad * cos(phi))
+                z = center.z + sz * (halfExtents.z + rad * sin(phi))
+                y = top - r
+            } else {
+                x = dx > dz ? center.x + sx * (halfExtents.x + clearance) : q.x
+                z = dz >= dx ? center.z + sz * (halfExtents.z + clearance) : q.z
+                y = top - over
+            }
             p[n].positionAndInvMass = SIMD4(x, y, z, p[n].invMass)
             p[n].prevPositionAndPad = SIMD4(x, y, z, 0)
         }
@@ -870,12 +1025,63 @@ public final class PaperClothSolver {
         enc.endEncoding()
     }
 
+    private func encodeBendSubpass(_ cb: MTLCommandBuffer,
+                                   start: Int, count: Int, label: String) {
+        guard count > 0, let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.label = label
+        enc.setComputePipelineState(bendPipeline)
+        enc.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
+        enc.setBuffer(bendConstraintBuffer.buffer,
+                      offset: start * MemoryLayout<PaperBendConstraint>.stride, index: 1)
+        enc.setBuffer(bendUniformBuffer, offset: 0, index: 2)
+        enc.setBuffer(bendLambdaBuffer, offset: start * MemoryLayout<Float>.stride, index: 3)
+        dispatch1D(enc, pipeline: bendPipeline, count: count)
+        enc.endEncoding()
+    }
+
     private func dispatch1D(_ enc: MTLComputeCommandEncoder,
                             pipeline: MTLComputePipelineState, count: Int) {
         let w = min(count, pipeline.maxTotalThreadsPerThreadgroup)
         enc.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: max(1, w), height: 1, depth: 1))
     }
+}
+
+// ── PaperBendConstraint mirror ───────────────────────────────────────────────
+//
+// Keep field order IDENTICAL to `struct PaperBendConstraint` in PaperCloth.metal.
+// (uint4 ↔ SIMD4<UInt32>, float2 ↔ SIMD2<Float> — 32 bytes, no bare float3.)
+struct PaperBendConstraint {
+    /// x,y = the hinge's shared-edge vertices; z,w = the two wing vertices.
+    var v: SIMD4<UInt32>
+    /// Dihedral angle at rest — π for cloth cut flat.
+    var restAngle: Float
+    /// XPBD α: 0 = rigid (holds a crease), large = soft.
+    var compliance: Float
+    var _pad: SIMD2<Float> = .zero
+}
+
+// ── PaperBendUniforms mirror ─────────────────────────────────────────────────
+//
+// Keep field order IDENTICAL to `struct PaperBendUniforms` in PaperCloth.metal.
+struct PaperBendUniforms {
+    var constraintCount: UInt32
+    var dt: Float
+    var _pad: SIMD2<Float> = .zero
+}
+
+// ── PaperStickUniforms mirror ────────────────────────────────────────────────
+//
+// Keep field order IDENTICAL to `struct PaperStickUniforms` in PaperCloth.metal.
+struct PaperStickUniforms {
+    var particleCount: UInt32
+    var colliderCount: UInt32
+    var dt: Float
+    var floorY: Float
+    var contactBand: Float
+    var stickSpeed: Float
+    var selfRadius: Float
+    var _pad: Float = 0
 }
 
 // ── PaperMeshUniforms mirror ─────────────────────────────────────────────────
