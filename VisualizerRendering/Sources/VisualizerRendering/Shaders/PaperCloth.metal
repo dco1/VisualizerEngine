@@ -392,6 +392,12 @@ struct PaperHashUniforms {
     uint  verticesPerSheet;
     uint  skipRadius;      // skip same-sheet neighbours within this grid distance
     uint  legacy;          // DEBUG A/B: 1 = old summed/unclamped pushout (reproduce the blowup)
+    // Cloth-cloth STATIC friction: contacting layers whose relative tangential
+    // slip per substep is below this DISPLACEMENT (stickSpeed·dt) stop sliding
+    // against each other — a pile of folds HOLDS instead of slithering apart.
+    // 0 disables (paper pages slide).
+    float stickDisp;
+    float _pad;
 };
 
 static int3 paperCellCoord(float3 p, float cs) { return int3(floor(p / cs)); }
@@ -462,6 +468,7 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
 
     float minDist = 2.0 * u.radius;
     float3 delta  = float3(0.0);
+    float3 nbrVel = float3(0.0);   // summed Δpos of contacting neighbours (velocity·dt)
     int    hits   = 0;
 
     for (int dz = -1; dz <= 1; ++dz)
@@ -491,6 +498,7 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
             float dist = length(d);
             if (dist < minDist && dist > 1e-6) {
                 delta += (d / dist) * ((minDist - dist) * 0.5);
+                nbrVel += P[j].positionAndInvMass.xyz - P[j].prevPositionAndPad.xyz;
                 hits++;
             }
         }
@@ -515,6 +523,22 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
         }
         P[id].positionAndInvMass.xyz = pos + corr;
         P[id].prevPositionAndPad.xyz += corr * 0.5;    // bleed off inward velocity
+
+        // Static friction BETWEEN layers (see stickDisp above). Relative slip is
+        // judged tangentially — the pushout direction is the contact normal — and
+        // each side cancels HALF its share, so a symmetric pair stops together.
+        if (u.stickDisp > 0.0) {
+            float3 vSelf = pos - pi.prevPositionAndPad.xyz;
+            float3 rel   = vSelf - nbrVel / float(hits);
+            float  cl2   = length(corr);
+            if (cl2 > 1e-9) {
+                float3 n = corr / cl2;
+                rel -= n * dot(rel, n);
+            }
+            if (length(rel) < u.stickDisp) {
+                P[id].prevPositionAndPad.xyz += rel * 0.5;
+            }
+        }
     }
 }
 

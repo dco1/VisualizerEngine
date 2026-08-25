@@ -745,7 +745,10 @@ public final class PaperClothSolver {
             tableSize: UInt32(Self.hashTableSize),
             cellSize: cell, radius: radius,
             gridW: UInt32(gridW), verticesPerSheet: UInt32(verticesPerSheet),
-            skipRadius: 1, legacy: legacyPushout ? 1 : 0)
+            skipRadius: 1, legacy: legacyPushout ? 1 : 0,
+            // Layers stick below the same threshold as obstacle contact — one
+            // notion of "at rest" for the whole cloth.
+            stickDisp: stickSpeed * fixedDt)
     }
 
     private func encodeSubstep(to cb: MTLCommandBuffer, dt: Float) {
@@ -1144,4 +1147,6 @@ struct PaperHashUniforms {
     var verticesPerSheet: UInt32
     var skipRadius: UInt32
     var legacy: UInt32 = 0
+    var stickDisp: Float = 0
+    var _pad: Float = 0
 }
