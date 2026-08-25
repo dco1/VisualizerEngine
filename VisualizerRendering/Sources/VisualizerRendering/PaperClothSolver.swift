@@ -198,6 +198,11 @@ public final class PaperClothSolver {
     /// How far from a surface still counts as resting for the stick pass, over and above
     /// `clothThickness` (which inflates the colliders the same way the collide pass does).
     public var stickBand: Float = 0.006
+    /// Run the SDF collide inside the constraint iterations (every 3rd) as well as at the
+    /// end of the substep. ON resolves deep contact honestly (without it, wedged cloth can
+    /// equilibrate far inside a collider); OFF reproduces the once-per-substep dynamics,
+    /// which leave more residual wrinkle energy in the settle. A/B seam for the bake.
+    public var interleavedCollide = true
     /// Dihedral CREASING — the plastic half of fabric bending; see PaperBendUniforms in
     /// PaperCloth.metal. A hinge folded further than `dihedralYieldAngle` (radians of
     /// deviation from rest) has its rest angle creep toward the folded pose by
@@ -375,11 +380,23 @@ public final class PaperClothSolver {
     /// CLOTH roll smoothly where paper creases — see paperBendConstraint in
     /// PaperCloth.metal for the mechanism. Cloth callers pair it with a soft
     /// (large) `bendCompliance` so the chord term stops fighting the hinge.
+    /// `restSlack` — seeded, band-limited REST-LENGTH surplus (peak fractional strain,
+    /// e.g. 0.02): the material property that makes fabric hold wrinkles on a flat
+    /// surface. Real quilted/washed cloth has intrinsically more area than its plan and
+    /// CANNOT lie in a plane; without it a settled sheet is a perfect Euclidean plane.
+    /// Nothing weaker works — this was measured, twice: out-of-plane position noise is
+    /// elastic stretch and irons flat in a few iterations; in-plane compression noise is
+    /// elastic too (XPBD distance constraints are EQUALITY constraints) and the surplus
+    /// escapes out the free hems. Only surplus written into the rest lengths themselves
+    /// is inescapable — buckling is then the sheet's only resolution.
     public func configureSheets(_ specs: [SheetSpec],
                                 stretchCompliance: Float = 1.0e-6,
                                 shearCompliance: Float = 5.0e-6,
                                 bendCompliance: Float = 4.0e-5,
-                                dihedralCompliance: Float? = nil) {
+                                dihedralCompliance: Float? = nil,
+                                restSlack: Float = 0,
+                                restSlackWavelength: Float = 0.4,
+                                restSlackSeed: UInt64 = 0x0DD5_EED0) {
         precondition(specs.count <= maxSheets, "configureSheets: \(specs.count) > maxSheets \(maxSheets)")
         let W = gridW, H = gridH, M = W * H
         sheetCount = specs.count
@@ -406,8 +423,35 @@ public final class PaperClothSolver {
         // ── Constraints (8 colour groups) ──
         // index of (x,y) in sheet s
         func gi(_ s: Int, _ x: Int, _ y: Int) -> UInt32 { UInt32(s * M + y * W + x) }
+        // Rest-slack field: smooth seeded plane-wave octaves, clamped to surplus-only
+        // (slack may never PRE-TENSION the sheet). Evaluated at each constraint's
+        // midpoint so neighbouring constraints agree and the surplus is spatially
+        // coherent — patches of "extra fabric", not white noise.
+        var slackModes: [(kx: Float, kz: Float, phase: Float, amp: Float)] = []
+        if restSlack > 0 {
+            var h = restSlackSeed &* 0x9E3779B97F4A7C15 &+ 0x5DEECE66D
+            func rand01() -> Float {
+                h ^= h >> 33; h = h &* 0xFF51AFD7ED558CCD; h ^= h >> 33
+                return Float(h % 100_000) / 100_000
+            }
+            for octave in 0 ..< 2 {
+                let k = 2 * .pi / (restSlackWavelength / Float(1 << octave))
+                for _ in 0 ..< 3 {
+                    let ang = rand01() * 2 * .pi
+                    slackModes.append((cos(ang) * k, sin(ang) * k, rand01() * 2 * .pi,
+                                       restSlack / Float(1 << octave) / 3))
+                }
+            }
+        }
+        func slackAt(_ q: SIMD3<Float>) -> Float {
+            var v: Float = 0
+            for m in slackModes { v += m.amp * sin(m.kx * q.x + m.kz * q.z + m.phase) }
+            return max(0, v)
+        }
         func restLen(_ a: UInt32, _ b: UInt32) -> Float {
-            simd_length(particles[Int(b)].position - particles[Int(a)].position)
+            let pa = particles[Int(a)].position, pb = particles[Int(b)].position
+            let base = simd_length(pb - pa)
+            return slackModes.isEmpty ? base : base * (1 + slackAt((pa + pb) * 0.5))
         }
         // 14 colour groups: stretch H 0/1, V 2/3, shear A 4/5, B 6/7,
         // skip-one bend H 8/9/10 (x%3), V 11/12/13 (y%3).
@@ -826,7 +870,7 @@ public final class PaperClothSolver {
                 encodeBendSubpass(cb, start: bendGroupStart[g], count: bendGroupCount[g],
                                   label: "PaperCloth.bend[\(g)]")
             }
-            if i % 3 == 2, colliderCount > 0, !killSDF {
+            if interleavedCollide, i % 3 == 2, colliderCount > 0, !killSDF {
                 encodeClothCollide(cb)
             }
         }
@@ -1120,7 +1164,8 @@ public final class PaperClothSolver {
             colliderCount: UInt32(colliderCount),
             stiffness: collideStiffness,
             maxPush: sdfMaxPushPerStep > 0 ? sdfMaxPushPerStep : 1e30,
-            selfRadius: clothThickness)
+            selfRadius: clothThickness,
+            friction: collideFriction)
         encodePass(cb, pipeline: clothCollidePipeline,
                    buffers: [particleBuffer.buffer, colliderBuffer.buffer, clothCollideUniformBuffer],
                    count: particleBuffer.count, label: "PaperCloth.sdf")
@@ -1181,9 +1226,9 @@ struct PaperClothCollideUniforms {
     var stiffness: Float
     var maxPush: Float
     var selfRadius: Float
+    var friction: Float
     var _pad0: Float = 0
     var _pad1: Float = 0
-    var _pad2: Float = 0
 }
 
 // ── PaperStickUniforms mirror ────────────────────────────────────────────────

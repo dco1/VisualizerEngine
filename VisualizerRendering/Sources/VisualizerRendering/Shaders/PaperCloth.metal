@@ -354,7 +354,13 @@ struct PaperClothCollideUniforms {
     float stiffness;     // fraction of the penetration resolved per pass
     float maxPush;       // per-step displacement cap (m); climb out coherently
     float selfRadius;    // collider inflation (cloth thickness)
-    float _pad0, _pad1, _pad2;
+    // Tangential velocity RETENTION on contact (0…1, lower = stickier) — the same
+    // kinetic friction the shared pbdSDFCollide applies. Its absence here was a
+    // silent regression: with frictionless contact, any in-plane surplus in resting
+    // cloth drains laterally off the surface within a few substeps and the settled
+    // top irons into a perfect plane.
+    float friction;
+    float _pad0, _pad1;
 };
 
 kernel void paperClothSDFCollide(
@@ -370,6 +376,7 @@ kernel void paperClothSDFCollide(
     float3 pos  = p.positionAndInvMass.xyz;
     float3 prev = p.prevPositionAndPad.xyz;
     bool hit = false;
+    float3 cn = float3(0, 1, 0);
     for (uint c = 0u; c < u.colliderCount; ++c) {
         float3 n;
         float d = paperColliderDistance(pos, colliders[c], u.selfRadius, n);
@@ -377,12 +384,17 @@ kernel void paperClothSDFCollide(
             float disp = min(-d * u.stiffness, u.maxPush);
             pos  += n * disp;
             prev += n * disp * 0.5;   // bleed off inward velocity, same as the shared kernel
+            cn = n;
             hit = true;
         }
     }
     if (hit) {
+        // Kinetic contact friction: retain only `friction` of the tangential motion.
+        float3 v  = pos - prev;
+        float3 vn = cn * dot(v, cn);
+        float3 vt = v - vn;
         particles[id].positionAndInvMass.xyz = pos;
-        particles[id].prevPositionAndPad.xyz = prev;
+        particles[id].prevPositionAndPad.xyz = pos - (vn + vt * u.friction);
     }
 }
 
