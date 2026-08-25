@@ -343,6 +343,49 @@ static float paperColliderDistance(float3 p, PBDCollider col, float inflate,
     return l - radius;
 }
 
+// Cloth's own SDF collide — replaces the shared pbdSDFCollide for this solver.
+// Two reasons: (1) the shared kernel probes NEIGHBOUR particles (midpoint probes
+// for sparse hot-dog spines) while those neighbours are being rewritten, a
+// scheduling race that makes the bake non-deterministic — a dense cloth grid
+// needs no probes; (2) each thread then touches only its own particle, full stop.
+struct PaperClothCollideUniforms {
+    uint  particleCount;
+    uint  colliderCount;
+    float stiffness;     // fraction of the penetration resolved per pass
+    float maxPush;       // per-step displacement cap (m); climb out coherently
+    float selfRadius;    // collider inflation (cloth thickness)
+    float _pad0, _pad1, _pad2;
+};
+
+kernel void paperClothSDFCollide(
+    device PBDParticle*                 particles [[ buffer(0) ]],
+    device const PBDCollider*           colliders [[ buffer(1) ]],
+    constant PaperClothCollideUniforms& u         [[ buffer(2) ]],
+    uint id [[ thread_position_in_grid ]]
+) {
+    if (id >= u.particleCount) return;
+    PBDParticle p = particles[id];
+    if (p.positionAndInvMass.w == 0.0) return;   // pinned
+
+    float3 pos  = p.positionAndInvMass.xyz;
+    float3 prev = p.prevPositionAndPad.xyz;
+    bool hit = false;
+    for (uint c = 0u; c < u.colliderCount; ++c) {
+        float3 n;
+        float d = paperColliderDistance(pos, colliders[c], u.selfRadius, n);
+        if (d < 0.0) {
+            float disp = min(-d * u.stiffness, u.maxPush);
+            pos  += n * disp;
+            prev += n * disp * 0.5;   // bleed off inward velocity, same as the shared kernel
+            hit = true;
+        }
+    }
+    if (hit) {
+        particles[id].positionAndInvMass.xyz = pos;
+        particles[id].prevPositionAndPad.xyz = prev;
+    }
+}
+
 kernel void paperStaticFriction(
     device PBDParticle*        particles [[ buffer(0) ]],
     device const PBDCollider*  colliders [[ buffer(1) ]],
@@ -450,14 +493,20 @@ kernel void paperHashScatter(device const PBDParticle* P  [[ buffer(0) ]],
     sorted[offsets[h] + slot] = id;
 }
 
+// `S` is a SNAPSHOT of the particle buffer taken just before this dispatch. All
+// reads (own state AND neighbours) come from the snapshot; only P[id] is written.
+// Without it the kernel raced its own writes — whether a thread saw a neighbour
+// before or after its correction depended on GPU scheduling, which made the bake
+// non-deterministic run to run (amplified by chaos over hundreds of substeps).
 kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
                              device const uint* offsets      [[ buffer(1) ]],
                              device const uint* counts       [[ buffer(2) ]],  // per-bucket count (post-scatter cursor)
                              device const uint* sorted       [[ buffer(3) ]],
                              constant PaperHashUniforms& u   [[ buffer(4) ]],
+                             device const PBDParticle* S     [[ buffer(5) ]],
                              uint id [[ thread_position_in_grid ]]) {
     if (id >= u.particleCount) return;
-    PBDParticle pi = P[id];
+    PBDParticle pi = S[id];
     if (pi.positionAndInvMass.w == 0.0) return;   // pinned
 
     float3 pos = pi.positionAndInvMass.xyz;
@@ -476,8 +525,24 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
     for (int dx = -1; dx <= 1; ++dx) {
         uint h = paperHashCell(base + int3(dx, dy, dz), u.tableSize);
         uint start = offsets[h], cnt = counts[h];
+        // DETERMINISM: the scatter fills buckets through an atomic cursor, so the
+        // stored order differs run to run — and float accumulation is not
+        // associative, so the same contacts summed in a different order drift the
+        // bake by fractions of a millimetre that chaos then amplifies. Iterate each
+        // bucket in ascending particle order instead (insertion sort of a small
+        // local copy); overflow beyond the local buffer keeps scatter order, which
+        // only a degenerate all-in-one-bucket configuration would ever hit.
+        uint bucket[64];
+        uint m = min(cnt, 64u);
+        for (uint k = 0u; k < m; ++k) bucket[k] = sorted[start + k];
+        for (uint a = 1u; a < m; ++a) {
+            uint v = bucket[a];
+            uint b = a;
+            while (b > 0u && bucket[b - 1u] > v) { bucket[b] = bucket[b - 1u]; --b; }
+            bucket[b] = v;
+        }
         for (uint k = 0u; k < cnt; ++k) {
-            uint j = sorted[start + k];
+            uint j = (k < m) ? bucket[k] : sorted[start + k];
             if (j == id) continue;
             // Same-sheet pairs: skip only GRID NEIGHBOURS (within skipRadius,
             // Chebyshev), not the whole sheet. The neighbour exclusion is what
@@ -494,11 +559,11 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
                 int jx = int(lj % u.gridW), jy = int(lj / u.gridW);
                 if (uint(max(abs(jx - x), abs(jy - y))) <= u.skipRadius) continue;
             }
-            float3 d = pos - P[j].positionAndInvMass.xyz;
+            float3 d = pos - S[j].positionAndInvMass.xyz;
             float dist = length(d);
             if (dist < minDist && dist > 1e-6) {
                 delta += (d / dist) * ((minDist - dist) * 0.5);
-                nbrVel += P[j].positionAndInvMass.xyz - P[j].prevPositionAndPad.xyz;
+                nbrVel += S[j].positionAndInvMass.xyz - S[j].prevPositionAndPad.xyz;
                 hits++;
             }
         }
@@ -522,7 +587,7 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
             if (cl > u.radius) corr *= u.radius / cl;   // clamp to one radius / pass
         }
         P[id].positionAndInvMass.xyz = pos + corr;
-        P[id].prevPositionAndPad.xyz += corr * 0.5;    // bleed off inward velocity
+        P[id].prevPositionAndPad.xyz = pi.prevPositionAndPad.xyz + corr * 0.5;  // bleed off inward velocity
 
         // Static friction BETWEEN layers (see stickDisp above). Relative slip is
         // judged tangentially — the pushout direction is the contact normal — and

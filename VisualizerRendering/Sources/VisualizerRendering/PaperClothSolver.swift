@@ -61,6 +61,7 @@ public final class PaperClothSolver {
     private let normalsPipeline:    MTLComputePipelineState
     private let bendPipeline:       MTLComputePipelineState
     private let stickPipeline:      MTLComputePipelineState
+    private let clothCollidePipeline: MTLComputePipelineState
 
     // ── Particle / constraint storage (all sheets, flat) ────────────────
     public let particleBuffer:   SimBuffer<PBDParticle>
@@ -76,6 +77,7 @@ public final class PaperClothSolver {
     private let bendLambdaBuffer: MTLBuffer
     private let bendUniformBuffer: MTLBuffer   // PaperBendUniforms
     private let stickUniformBuffer: MTLBuffer  // PaperStickUniforms
+    private let clothCollideUniformBuffer: MTLBuffer  // PaperClothCollideUniforms
     private var bendGroupStart: [Int] = []
     private var bendGroupCount: [Int] = []
     private let uniformBuffer: MTLBuffer       // PBDUniforms (shared kernels)
@@ -88,6 +90,7 @@ public final class PaperClothSolver {
     private let cellOffsetsBuffer: MTLBuffer      // uint[tableSize]
     private let sortedBuffer: MTLBuffer           // uint[maxParticles]
     private let hashUniformBuffer: MTLBuffer      // PaperHashUniforms
+    private let selfSnapshotBuffer: MTLBuffer     // frozen copy read by paperSelfCollide
     public var selfCollisionEnabled: Bool = true
     /// DEBUG A/B (VIZ_PAPER_LEGACY=1): reproduce the old summed/unclamped self-
     /// collision pushout + the old oversized radius, to measure the blowup the
@@ -229,7 +232,8 @@ public final class PaperClothSolver {
               let writePos = cache.pipelineState(name: "paperWritePositions", device: dev),
               let normals  = cache.pipelineState(name: "paperRecomputeNormals", device: dev),
               let bend     = cache.pipelineState(name: "paperBendConstraint", device: dev),
-              let stick    = cache.pipelineState(name: "paperStaticFriction", device: dev)
+              let stick    = cache.pipelineState(name: "paperStaticFriction", device: dev),
+              let clothCol = cache.pipelineState(name: "paperClothSDFCollide", device: dev)
         else {
             Self.log.error("PaperCloth pipeline cache failed — check PaperCloth.metal ships in VisualizerRendering/Shaders/")
             return nil
@@ -260,6 +264,8 @@ public final class PaperClothSolver {
                                           options: .storageModeShared),
             let suBuf = device.makeBuffer(length: MemoryLayout<PaperStickUniforms>.stride,
                                           options: .storageModeShared),
+            let cuBuf = device.makeBuffer(length: MemoryLayout<PaperClothCollideUniforms>.stride,
+                                          options: .storageModeShared),
             let colBuf = SimBuffer<PBDCollider>(device: device, capacity: max(1, maxColliders),
                                                 label: "PaperCloth.colliders"),
             let uBuf = device.makeBuffer(length: MemoryLayout<PBDUniforms>.stride,
@@ -275,6 +281,8 @@ public final class PaperClothSolver {
                                           options: .storageModePrivate),
             let srBuf = device.makeBuffer(length: max(1, maxParticles) * MemoryLayout<UInt32>.stride,
                                           options: .storageModePrivate),
+            let snapBuf = device.makeBuffer(length: max(1, maxParticles) * MemoryLayout<PBDParticle>.stride,
+                                            options: .storageModePrivate),
             let huBuf = device.makeBuffer(length: MemoryLayout<PaperHashUniforms>.stride,
                                           options: .storageModeShared)
         else {
@@ -288,6 +296,7 @@ public final class PaperClothSolver {
         blBuf.label = "PaperCloth.bendLambda"
         buBuf.label = "PaperCloth.bendUniforms"
         suBuf.label = "PaperCloth.stickUniforms"
+        cuBuf.label = "PaperCloth.clothCollideUniforms"
 
         self.engine = engine
         self.integratePipeline  = pbd.integrate
@@ -304,12 +313,14 @@ public final class PaperClothSolver {
         self.normalsPipeline    = normals
         self.bendPipeline       = bend
         self.stickPipeline      = stick
+        self.clothCollidePipeline = clothCol
         self.particleBuffer     = pBuf
         self.constraintBuffer   = cBuf
         self.bendConstraintBuffer = bBuf
         self.bendLambdaBuffer   = blBuf
         self.bendUniformBuffer  = buBuf
         self.stickUniformBuffer = suBuf
+        self.clothCollideUniformBuffer = cuBuf
         self.colliderBuffer     = colBuf
         self.uniformBuffer      = uBuf
         self.windUniformBuffer  = wBuf
@@ -319,6 +330,8 @@ public final class PaperClothSolver {
         self.cellOffsetsBuffer  = coBuf
         self.sortedBuffer       = srBuf
         self.hashUniformBuffer  = huBuf
+        snapBuf.label = "PaperCloth.selfSnapshot"
+        self.selfSnapshotBuffer = snapBuf
         self.maxSheets       = maxSheets
         self.maxParticles    = maxParticles
         self.maxConstraints  = maxConstraints
@@ -659,8 +672,19 @@ public final class PaperClothSolver {
             e.setBuffer(hashUniformBuffer, offset: 0, index: 4)
             dispatch1D(e, pipeline: hashScatterPipeline, count: n); e.endEncoding()
         }
-        // Two Jacobi relaxation passes against the same buckets.
+        // Two Jacobi relaxation passes against the same buckets. Each pass reads
+        // from a SNAPSHOT of the particle buffer and writes only its own particle —
+        // without it the kernel races its own writes (whether a thread sees a
+        // neighbour before or after correction is scheduling-dependent) and the
+        // bake stops being deterministic.
         for _ in 0..<2 {
+            if let blit = cb.makeBlitCommandEncoder() {
+                blit.label = "PaperCloth.selfSnapshot"
+                blit.copy(from: particleBuffer.buffer, sourceOffset: 0,
+                          to: selfSnapshotBuffer, destinationOffset: 0,
+                          size: MemoryLayout<PBDParticle>.stride * n)
+                blit.endEncoding()
+            }
             if let e = cb.makeComputeCommandEncoder() {
                 e.label = "PaperCloth.selfCollide"; e.setComputePipelineState(selfCollidePipeline)
                 e.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
@@ -668,6 +692,7 @@ public final class PaperClothSolver {
                 e.setBuffer(cellCountsBuffer, offset: 0, index: 2)   // per-bucket count post-scatter
                 e.setBuffer(sortedBuffer, offset: 0, index: 3)
                 e.setBuffer(hashUniformBuffer, offset: 0, index: 4)
+                e.setBuffer(selfSnapshotBuffer, offset: 0, index: 5)
                 dispatch1D(e, pipeline: selfCollidePipeline, count: n); e.endEncoding()
             }
         }
@@ -786,8 +811,13 @@ public final class PaperClothSolver {
         }
 
         // 3. Constraint iterations — each iteration cycles every distance colour
-        //    group, then (cloth only) every dihedral hinge colour group.
-        for _ in 0..<constraintIterations {
+        //    group, then (cloth only) every dihedral hinge colour group. Collision is
+        //    INTERLEAVED every few iterations: with contact resolved only once per
+        //    substep, twelve constraint iterations of wedged corner cloth out-pulled
+        //    the single capped push and the equilibrium sat ~6 cm INSIDE the mattress
+        //    (the white patch punching through the drape). Contact has to keep a vote
+        //    while the constraints negotiate, exactly like the floor of a pile does.
+        for i in 0..<constraintIterations {
             for g in groupCount.indices where groupCount[g] > 0 {
                 encodeConstraintSubpass(cb, start: groupStart[g], count: groupCount[g],
                                         label: "PaperCloth.c[\(g)]")
@@ -796,13 +826,14 @@ public final class PaperClothSolver {
                 encodeBendSubpass(cb, start: bendGroupStart[g], count: bendGroupCount[g],
                                   label: "PaperCloth.bend[\(g)]")
             }
+            if i % 3 == 2, colliderCount > 0, !killSDF {
+                encodeClothCollide(cb)
+            }
         }
 
         // 4. Collision — AFTER constraints so contacts win the final position.
         if colliderCount > 0, !killSDF {
-            encodePass(cb, pipeline: collidePipeline,
-                       buffers: [particleBuffer.buffer, colliderBuffer.buffer, uniformBuffer],
-                       count: particleBuffer.count, label: "PaperCloth.sdf")
+            encodeClothCollide(cb)
         }
         if floorEnabled, !killFloor {
             encodePass(cb, pipeline: floorPipeline,
@@ -1037,6 +1068,23 @@ public final class PaperClothSolver {
         enc.endEncoding()
     }
 
+    /// Cloth-specific SDF collide (paperClothSDFCollide), not the shared pbdSDFCollide:
+    /// the shared kernel's neighbour probes race concurrent writes and cost the bake
+    /// its determinism. Same contact maths, own-particle only.
+    private func encodeClothCollide(_ cb: MTLCommandBuffer) {
+        let cPtr = clothCollideUniformBuffer.contents()
+            .bindMemory(to: PaperClothCollideUniforms.self, capacity: 1)
+        cPtr.pointee = PaperClothCollideUniforms(
+            particleCount: UInt32(particleBuffer.count),
+            colliderCount: UInt32(colliderCount),
+            stiffness: collideStiffness,
+            maxPush: sdfMaxPushPerStep > 0 ? sdfMaxPushPerStep : 1e30,
+            selfRadius: clothThickness)
+        encodePass(cb, pipeline: clothCollidePipeline,
+                   buffers: [particleBuffer.buffer, colliderBuffer.buffer, clothCollideUniformBuffer],
+                   count: particleBuffer.count, label: "PaperCloth.sdf")
+    }
+
     private func encodeBendSubpass(_ cb: MTLCommandBuffer,
                                    start: Int, count: Int, label: String) {
         guard count > 0, let enc = cb.makeComputeCommandEncoder() else { return }
@@ -1081,6 +1129,20 @@ struct PaperBendUniforms {
     var dt: Float
     var yieldAngle: Float
     var creepRate: Float
+}
+
+// ── PaperClothCollideUniforms mirror ─────────────────────────────────────────
+//
+// Keep field order IDENTICAL to `struct PaperClothCollideUniforms` in PaperCloth.metal.
+struct PaperClothCollideUniforms {
+    var particleCount: UInt32
+    var colliderCount: UInt32
+    var stiffness: Float
+    var maxPush: Float
+    var selfRadius: Float
+    var _pad0: Float = 0
+    var _pad1: Float = 0
+    var _pad2: Float = 0
 }
 
 // ── PaperStickUniforms mirror ────────────────────────────────────────────────
