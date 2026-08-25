@@ -195,6 +195,14 @@ public final class PaperClothSolver {
     /// How far from a surface still counts as resting for the stick pass, over and above
     /// `clothThickness` (which inflates the colliders the same way the collide pass does).
     public var stickBand: Float = 0.006
+    /// Dihedral CREASING — the plastic half of fabric bending; see PaperBendUniforms in
+    /// PaperCloth.metal. A hinge folded further than `dihedralYieldAngle` (radians of
+    /// deviation from rest) has its rest angle creep toward the folded pose by
+    /// `dihedralCreepRate` per solver visit. Elastic-only bending gives every fold the
+    /// same radius, which reads as rubber; creasing is what puts a crisp ridge on a
+    /// waterfall fold. Defaults keep it OFF (elastic only) for every existing caller.
+    public var dihedralYieldAngle: Float = .pi
+    public var dihedralCreepRate: Float = 0
     private let fixedDt: Float = 1.0 / 120.0
     private var accumulator: Float = 0
     private var time: Float = 0
@@ -770,7 +778,8 @@ public final class PaperClothSolver {
         }
         if bendConstraintBuffer.count > 0 {
             let bPtr = bendUniformBuffer.contents().bindMemory(to: PaperBendUniforms.self, capacity: 1)
-            bPtr.pointee = PaperBendUniforms(constraintCount: UInt32(bendConstraintBuffer.count), dt: dt)
+            bPtr.pointee = PaperBendUniforms(constraintCount: UInt32(bendConstraintBuffer.count), dt: dt,
+                                             yieldAngle: dihedralYieldAngle, creepRate: dihedralCreepRate)
         }
 
         // 3. Constraint iterations — each iteration cycles every distance colour
@@ -1067,7 +1076,8 @@ struct PaperBendConstraint {
 struct PaperBendUniforms {
     var constraintCount: UInt32
     var dt: Float
-    var _pad: SIMD2<Float> = .zero
+    var yieldAngle: Float
+    var creepRate: Float
 }
 
 // ── PaperStickUniforms mirror ────────────────────────────────────────────────

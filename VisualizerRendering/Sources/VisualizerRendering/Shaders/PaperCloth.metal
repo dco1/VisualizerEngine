@@ -210,12 +210,19 @@ struct PaperBendConstraint {
 struct PaperBendUniforms {
     uint   constraintCount;
     float  dt;
-    float2 _pad;
+    // CREASING — the plastic half of fabric bending. Elastic-only hinges give every
+    // fold the same generous radius, which reads as RUBBER. Real cloth folded past a
+    // yield angle creases: the fold keeps its shape and stops fighting back. When a
+    // hinge's deviation from rest exceeds `yieldAngle`, its rest angle creeps toward
+    // the folded pose by `creepRate` per solver visit — sustained tight folds become
+    // permanent sharp ridges; gentle curvature stays elastic and smooth.
+    float  yieldAngle;   // radians of deviation before plastic flow (≥ π = never)
+    float  creepRate;    // fraction of the excess absorbed per visit (0 = elastic only)
 };
 
 kernel void paperBendConstraint(
     device PBDParticle*                particles   [[ buffer(0) ]],
-    device const PaperBendConstraint*  constraints [[ buffer(1) ]],
+    device PaperBendConstraint*        constraints [[ buffer(1) ]],
     constant PaperBendUniforms&        u           [[ buffer(2) ]],
     device float*                      lambda      [[ buffer(3) ]],
     uint id [[ thread_position_in_grid ]]
@@ -241,7 +248,16 @@ kernel void paperBendConstraint(
     float3 n1 = n1r / l1, n2 = n2r / l2;
 
     float d   = clamp(dot(n1, n2), -1.0, 1.0);
-    float C   = acos(d) - c.restAngle;
+    float phi = acos(d);
+    // Plastic creasing (see PaperBendUniforms). Each thread owns constraints[id],
+    // so the write is race-free within a colour group like every other update.
+    float dev = phi - c.restAngle;
+    if (u.creepRate > 0.0 && abs(dev) > u.yieldAngle) {
+        float excess = abs(dev) - u.yieldAngle;
+        c.restAngle += sign(dev) * excess * u.creepRate;
+        constraints[id].restAngle = c.restAngle;
+    }
+    float C   = phi - c.restAngle;
 
     // Müller's qᵢ — note they are −∂d/∂pᵢ (verified numerically), so with
     // C = acos(d): ∇Cᵢ = −∂d/∂pᵢ/sinφ = +qᵢ/sinφ. Getting this sign wrong
