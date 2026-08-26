@@ -77,6 +77,7 @@ public final class PaperClothSolver {
     private let bendLambdaBuffer: MTLBuffer
     private let bendUniformBuffer: MTLBuffer   // PaperBendUniforms
     private let stickUniformBuffer: MTLBuffer  // PaperStickUniforms
+    private let anchorBuffer: MTLBuffer        // float4 per particle (xyz anchor, w armed)
     private let clothCollideUniformBuffer: MTLBuffer  // PaperClothCollideUniforms
     private var bendGroupStart: [Int] = []
     private var bendGroupCount: [Int] = []
@@ -203,6 +204,12 @@ public final class PaperClothSolver {
     /// equilibrate far inside a collider); OFF reproduces the once-per-substep dynamics,
     /// which leave more residual wrinkle energy in the settle. A/B seam for the bake.
     public var interleavedCollide = true
+    /// Breakable STATIC anchors (> 0 enables; metres of tangential slip before release).
+    /// True static friction: a particle that comes to rest in contact is HELD at that
+    /// spot — tangentially only, the normal stays free — until genuinely pulled past
+    /// this distance. The velocity-gate stick cannot do this job: positional relaxation
+    /// redistributes material faster than any velocity threshold and leaves it smooth.
+    public var anchorBreak: Float = 0
     /// Dihedral CREASING — the plastic half of fabric bending; see PaperBendUniforms in
     /// PaperCloth.metal. A hinge folded further than `dihedralYieldAngle` (radians of
     /// deviation from rest) has its rest angle creep toward the folded pose by
@@ -288,6 +295,8 @@ public final class PaperClothSolver {
                                           options: .storageModePrivate),
             let snapBuf = device.makeBuffer(length: max(1, maxParticles) * MemoryLayout<PBDParticle>.stride,
                                             options: .storageModePrivate),
+            let ancBuf = device.makeBuffer(length: max(1, maxParticles) * MemoryLayout<SIMD4<Float>>.stride,
+                                           options: .storageModePrivate),
             let huBuf = device.makeBuffer(length: MemoryLayout<PaperHashUniforms>.stride,
                                           options: .storageModeShared)
         else {
@@ -337,6 +346,8 @@ public final class PaperClothSolver {
         self.hashUniformBuffer  = huBuf
         snapBuf.label = "PaperCloth.selfSnapshot"
         self.selfSnapshotBuffer = snapBuf
+        ancBuf.label = "PaperCloth.anchors"
+        self.anchorBuffer = ancBuf
         self.maxSheets       = maxSheets
         self.maxParticles    = maxParticles
         self.maxConstraints  = maxConstraints
@@ -396,10 +407,41 @@ public final class PaperClothSolver {
                                 dihedralCompliance: Float? = nil,
                                 restSlack: Float = 0,
                                 restSlackWavelength: Float = 0.4,
-                                restSlackSeed: UInt64 = 0x0DD5_EED0) {
+                                restSlackSeed: UInt64 = 0x0DD5_EED0,
+                                restSlackNucleation: Float = 1.0) {
         precondition(specs.count <= maxSheets, "configureSheets: \(specs.count) > maxSheets \(maxSheets)")
         let W = gridW, H = gridH, M = W * H
         sheetCount = specs.count
+
+        // Rest-slack field: smooth seeded plane-wave octaves, clamped to surplus-only
+        // (slack may never PRE-TENSION the sheet). Evaluated at each constraint's
+        // midpoint so neighbouring constraints agree and the surplus is spatially
+        // coherent — patches of "extra fabric", not white noise.
+        var slackModes: [(kx: Float, kz: Float, phase: Float, amp: Float)] = []
+        if restSlack > 0 {
+            var h = restSlackSeed &* 0x9E3779B97F4A7C15 &+ 0x5DEECE66D
+            func rand01() -> Float {
+                h ^= h >> 33; h = h &* 0xFF51AFD7ED558CCD; h ^= h >> 33
+                return Float(h % 100_000) / 100_000
+            }
+            // ANISOTROPIC: wave vectors clustered near the sheet's RIGHT axis (±35°), so
+            // the surplus forms ELONGATED ridges along the down axis — tension-aligned
+            // wrinkles. Isotropic modes peak in round blobs, and a round bump under a
+            // blanket does not read as fabric; it reads as an object.
+            for octave in 0 ..< 2 {
+                let k = 2 * .pi / (restSlackWavelength / Float(1 << octave))
+                for _ in 0 ..< 5 {
+                    let ang = (rand01() - 0.5) * 1.2 + (rand01() < 0.5 ? 0 : .pi)
+                    slackModes.append((cos(ang) * k, sin(ang) * k, rand01() * 2 * .pi,
+                                       restSlack / Float(1 << octave) / 5))
+                }
+            }
+        }
+        func slackAt(_ q: SIMD3<Float>) -> Float {
+            var v: Float = 0
+            for m in slackModes { v += m.amp * sin(m.kx * q.x + m.kz * q.z + m.phase) }
+            return max(0, v)
+        }
 
         // ── Particles ──
         var particles = [PBDParticle](); particles.reserveCapacity(specs.count * M)
@@ -418,36 +460,30 @@ public final class PaperClothSolver {
                 }
             }
         }
+        // NUCLEATION — lift each particle by (nucleation × local slack). Slack alone is
+        // metastable: a sheet pressed dead flat has no lateral perturbation to start a
+        // buckle, and contact friction (correctly) blocks the tangential flow that would
+        // nucleate one, so the surplus just sits as invisible unresolved compression.
+        // An out-of-plane seed placed EXACTLY where the surplus is lets the sheet
+        // buckle immediately; the settle then decides the final shape. The seed must be
+        // FULL-SIZE (≈ the dune geometry the surplus implies, h ≈ λ·√(slack)): measured
+        // both halves alone AND a timid 0.1× seed — seed without slack irons flat
+        // (elastic); slack without seed stays a perfect plane (metastable); a shallow
+        // seed has too little curvature for any bending stiffness to defend against
+        // the hem tension and is pulled flat all the same.
+        if !slackModes.isEmpty, restSlackNucleation > 0 {
+            for i in 0 ..< particles.count {
+                let lift = restSlackNucleation * slackAt(particles[i].position)
+                particles[i].positionAndInvMass.y += lift
+                particles[i].prevPositionAndPad.y += lift
+            }
+        }
         particleBuffer.write(particles)
+        clearAnchors()
 
         // ── Constraints (8 colour groups) ──
         // index of (x,y) in sheet s
         func gi(_ s: Int, _ x: Int, _ y: Int) -> UInt32 { UInt32(s * M + y * W + x) }
-        // Rest-slack field: smooth seeded plane-wave octaves, clamped to surplus-only
-        // (slack may never PRE-TENSION the sheet). Evaluated at each constraint's
-        // midpoint so neighbouring constraints agree and the surplus is spatially
-        // coherent — patches of "extra fabric", not white noise.
-        var slackModes: [(kx: Float, kz: Float, phase: Float, amp: Float)] = []
-        if restSlack > 0 {
-            var h = restSlackSeed &* 0x9E3779B97F4A7C15 &+ 0x5DEECE66D
-            func rand01() -> Float {
-                h ^= h >> 33; h = h &* 0xFF51AFD7ED558CCD; h ^= h >> 33
-                return Float(h % 100_000) / 100_000
-            }
-            for octave in 0 ..< 2 {
-                let k = 2 * .pi / (restSlackWavelength / Float(1 << octave))
-                for _ in 0 ..< 3 {
-                    let ang = rand01() * 2 * .pi
-                    slackModes.append((cos(ang) * k, sin(ang) * k, rand01() * 2 * .pi,
-                                       restSlack / Float(1 << octave) / 3))
-                }
-            }
-        }
-        func slackAt(_ q: SIMD3<Float>) -> Float {
-            var v: Float = 0
-            for m in slackModes { v += m.amp * sin(m.kx * q.x + m.kz * q.z + m.phase) }
-            return max(0, v)
-        }
         func restLen(_ a: UInt32, _ b: UInt32) -> Float {
             let pa = particles[Int(a)].position, pb = particles[Int(b)].position
             let base = simd_length(pb - pa)
@@ -889,6 +925,14 @@ public final class PaperClothSolver {
         //    See paperStaticFriction in PaperCloth.metal: resting contacts below
         //    `stickSpeed` hold instead of creeping.
         if stickSpeed > 0, colliderCount > 0 || floorEnabled {
+            if pendingAnchorClear, let blit = cb.makeBlitCommandEncoder() {
+                blit.label = "PaperCloth.anchorClear"
+                blit.fill(buffer: anchorBuffer,
+                          range: 0..<(MemoryLayout<SIMD4<Float>>.stride * particleBuffer.count),
+                          value: 0)
+                blit.endEncoding()
+                pendingAnchorClear = false
+            }
             let sPtr = stickUniformBuffer.contents().bindMemory(to: PaperStickUniforms.self, capacity: 1)
             sPtr.pointee = PaperStickUniforms(
                 particleCount: UInt32(particleBuffer.count),
@@ -897,9 +941,13 @@ public final class PaperClothSolver {
                 floorY: floorEnabled ? floorY : -1e9,
                 contactBand: clothThickness + stickBand,
                 stickSpeed: stickSpeed,
-                selfRadius: clothThickness)
+                selfRadius: clothThickness,
+                anchorBreak: anchorBreak,
+                armAll: pendingAnchorArm ? 1 : 0)
+            pendingAnchorArm = false
             encodePass(cb, pipeline: stickPipeline,
-                       buffers: [particleBuffer.buffer, colliderBuffer.buffer, stickUniformBuffer],
+                       buffers: [particleBuffer.buffer, colliderBuffer.buffer, stickUniformBuffer,
+                                 anchorBuffer],
                        count: particleBuffer.count, label: "PaperCloth.stick")
         }
     }
@@ -952,6 +1000,19 @@ public final class PaperClothSolver {
     /// in the raw solver output before any post-processing. Starting the cloth where it is going
     /// did fix it, and the same profile then descended monotonically for its full 263 mm.
     ///
+    /// Release every static anchor (see `anchorBreak`). Applied on the next encode.
+    public func clearAnchors() {
+        pendingAnchorClear = true
+    }
+    private var pendingAnchorClear = true
+    /// Arm anchors NOW for every eligible resting contact, regardless of speed — call
+    /// right after placing cloth (preDrape): one substep of gravity already outruns the
+    /// speed-gated capture, so an initial resting state can never self-arm.
+    public func armAnchors() {
+        pendingAnchorArm = true
+    }
+    private var pendingAnchorArm = false
+
     /// Call after `configureSheets` and before stepping. `top` is the height the cloth rests at;
     /// anything whose plan position lies outside `halfExtents` is taken down the nearer face by
     /// however far past the edge it was.
@@ -1004,7 +1065,14 @@ public final class PaperClothSolver {
                 var theta = phi
                 var rad = clearance + cornerSlope * sin(2 * phi) * r
                 if cornerPleatGap > 0 {
-                    let t = phi / (.pi / 2)
+                    // SAME ABSOLUTE CHIRALITY at every corner, not mirrored: the
+                    // constraint colour groups sweep in a fixed order, which gives the
+                    // solve an absolute handedness — a pleat wound against it is
+                    // systematically unwound while its mirror twin survives (measured:
+                    // one corner held 2 ridges through every parameter, the other
+                    // never held any).
+                    let phiC = (sx * sz > 0) ? (.pi / 2 - phi) : phi
+                    let t = phiC / (.pi / 2)
                     let g = cornerPleatGap
                     var zigTheta: Float
                     var zigRad: Float
@@ -1020,7 +1088,8 @@ public final class PaperClothSolver {
                         zigRad = clearance + 2 * g * (1 - u)
                     }
                     let w = min(max((r - 0.05) / 0.10, 0), 1)
-                    theta = phi + (zigTheta - phi) * w
+                    let zigOut = (sx * sz > 0) ? (.pi / 2 - zigTheta) : zigTheta
+                    theta = phi + (zigOut - phi) * w
                     rad = rad + (zigRad - rad) * w
                     if let tuck = cornerTuckRange, t >= 0.45, t < 0.65,
                        tuck.contains(r) {
@@ -1242,7 +1311,8 @@ struct PaperStickUniforms {
     var contactBand: Float
     var stickSpeed: Float
     var selfRadius: Float
-    var _pad: Float = 0
+    var anchorBreak: Float = 0
+    var armAll: UInt32 = 0
 }
 
 // ── PaperMeshUniforms mirror ─────────────────────────────────────────────────

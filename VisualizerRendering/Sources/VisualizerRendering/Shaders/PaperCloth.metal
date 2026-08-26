@@ -308,7 +308,22 @@ struct PaperStickUniforms {
     float contactBand;   // distance from a surface that still counts as resting
     float stickSpeed;    // tangential speed below which the contact is static (m/s)
     float selfRadius;    // collider inflation, same value the collide pass uses
-    float _pad;
+    // Breakable STATIC anchors — true static friction. > 0 enables: a particle
+    // that comes to rest in contact ANCHORS to that spot and is held tangentially
+    // (normal free, so cloth still lifts and settles) until pulled past this slip
+    // distance (m). Velocity gating alone cannot do this: positional relaxation
+    // moves material faster than any velocity threshold, then leaves it smooth.
+    //
+    // Anchors arm only where the contact normal is OFF-VERTICAL (|n.y| < 0.85):
+    // cloth wrapping an edge is pressed into it by tension × curvature and grips
+    // hard; cloth lying flat carries only its own weight and must stay free to
+    // buckle (anchoring the flat top froze the quilt slack's dunes at 0.3 mm).
+    float anchorBreak;
+    // 1 → this pass ARMS anchors for every eligible contact regardless of speed.
+    // Needed at t = 0: after a single substep gravity already moves everything
+    // faster than any sane capture speed (g·dt ≈ 0.08 m/s), so the speed-gated
+    // capture can never catch the initial resting state on its own.
+    uint  armAll;
 };
 
 // Local copy — PBD.metal's `closestOnSegment` has internal linkage there.
@@ -402,6 +417,7 @@ kernel void paperStaticFriction(
     device PBDParticle*        particles [[ buffer(0) ]],
     device const PBDCollider*  colliders [[ buffer(1) ]],
     constant PaperStickUniforms& u       [[ buffer(2) ]],
+    device float4*             anchors   [[ buffer(3) ]],  // xyz anchor, w: 1 = armed
     uint id [[ thread_position_in_grid ]]
 ) {
     if (id >= u.particleCount) return;
@@ -418,13 +434,40 @@ kernel void paperStaticFriction(
         float  d = paperColliderDistance(pos, colliders[c], u.selfRadius, n);
         if (d < bestD) { bestD = d; bestN = n; }
     }
-    if (bestD > u.contactBand) return;           // airborne — nothing to rest on
+    bool contact = bestD <= u.contactBand;
 
     float3 vel = (pos - p.prevPositionAndPad.xyz) / u.dt;
     float3 vn  = bestN * dot(vel, bestN);
     float3 vt  = vel - vn;
-    if (length(vt) < u.stickSpeed) {
-        // STICK: the tangential motion dies; the normal component survives.
+
+    if (u.anchorBreak > 0.0) {
+        float4 a = anchors[id];
+        if (a.w > 0.5) {
+            // Anchored: hold the TANGENTIAL position at the anchor; the normal
+            // direction stays free so the cloth can still lift off or press in.
+            float3 off  = pos - a.xyz;
+            float3 offN = bestN * dot(off, bestN);
+            float3 offT = off - offN;
+            bool lifted = bestD > u.contactBand * 2.0;
+            if (lifted || length(offT) > u.anchorBreak) {
+                anchors[id] = float4(0);                       // SLIP — release
+            } else {
+                float3 held = pos - offT;
+                particles[id].positionAndInvMass.xyz = held;
+                // Kill the tangential velocity too, or it re-slips next step.
+                particles[id].prevPositionAndPad.xyz = held - vn * u.dt;
+                return;
+            }
+        }
+        bool edgeContact = contact && fabs(bestN.y) < 0.85;
+        if (edgeContact && (u.armAll != 0u || length(vt) < u.stickSpeed)) {
+            anchors[id] = float4(pos, 1.0);                    // GRIP
+        }
+        return;
+    }
+
+    if (contact && length(vt) < u.stickSpeed) {
+        // STICK (velocity mode): tangential motion dies; normal survives.
         particles[id].prevPositionAndPad.xyz = pos - vn * u.dt;
     }
 }
