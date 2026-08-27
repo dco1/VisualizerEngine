@@ -69,8 +69,8 @@ struct CoinBody {
     float4 orient;      // current visual+physical orientation quaternion (x,y,z,w)
     float4 prevOrient;  // orientation at substep start (x,y,z,w) — for deriving ω
     float4 angVel;      // xyz = angular velocity (world frame, rad/s),  w = support/rest flag
-    float4 shapeExtents;// w = shape tag (0 disc/cylinder, 1 box, 2 sphere, 3 capsule, 4 hull); box: xyz = half-extents, sphere: x = radius, capsule: x = seg half-length
-    float4 hullRef;     // hull only: x = hull index (float), yzw = per-unit-mass INVERSE inertia diag (principal frame)
+    float4 shapeExtents;// w = shape tag (0 disc/cylinder, 1 box, 2 sphere, 3 capsule, 4 hull, 5 ovoid); box: xyz = half-extents, sphere: x = radius, capsule: x = seg half-length, ovoid: x = fat radius, y = tip radius, z = tip-centre offset
+    float4 hullRef;     // hull: x = hull index (float); ovoid: x = fat-centre offset; both: yzw = per-unit-mass INVERSE inertia diag (principal frame)
 };
 
 // Plane:    a.xyz = unit normal, a.w = type tag(0);  b.w = plane offset d  (n·x = d)
@@ -319,18 +319,54 @@ static float3 cdBoxInvInertia(float3 he, float invMass) {
 }
 
 // Shape tags ride shapeExtents.w: 0 = disc/capped-cylinder, 1 = box, 2 = sphere,
-// 3 = capsule, 4 = convex hull. (Every predicate MUST be a half-open band — a
-// bare `> 0.5` box test would mis-collide every later tag as a box.)
+// 3 = capsule, 4 = convex hull, 5 = ovoid (egg). (Every predicate MUST be a
+// half-open band — a bare `> 0.5` box test would mis-collide every later tag as
+// a box, and the old bare `> 3.5` hull test would have read an ovoid's
+// hullRef.x — its fat-sphere offset — as a hull-table index.)
 static bool cdIsBox(CoinBody c)     { return c.shapeExtents.w > 0.5 && c.shapeExtents.w < 1.5; }
 static bool cdIsSphere(CoinBody c)  { return c.shapeExtents.w > 1.5 && c.shapeExtents.w < 2.5; }
 static bool cdIsCapsule(CoinBody c) { return c.shapeExtents.w > 2.5 && c.shapeExtents.w < 3.5; }
-static bool cdIsHull(CoinBody c)    { return c.shapeExtents.w > 3.5; }
+static bool cdIsHull(CoinBody c)    { return c.shapeExtents.w > 3.5 && c.shapeExtents.w < 4.5; }
+static bool cdIsEgg(CoinBody c)     { return c.shapeExtents.w > 4.5 && c.shapeExtents.w < 5.5; }
 
 // Capsule lanes: prevPos.w = cross-section RADIUS r (like a disc), vel.w = the
 // FULL half-height hl + r (so the legacy capped-cylinder path sees the correct
 // bounds), shapeExtents.x = the true SEGMENT half-length hl for exact contacts.
 static float cdCapsuleR(CoinBody c)  { return c.prevPos.w > 1e-4 ? c.prevPos.w : 0.02; }
 static float cdCapsuleHL(CoinBody c) { return max(c.shapeExtents.x, 0.0); }
+
+// ── OVOID (egg) — tag 5: a sphere-swept cone ─────────────────────────────────
+// The convex hull of TWO spheres of different radii on the local +Y axis: the
+// fat sphere (radius rFat, centre at yFat < 0) and the tip sphere (radius rTip,
+// centre at yTip > 0), with the tangent cone flank between them. Smooth
+// everywhere, so it rolls and wobbles like a real egg — no facets. Offsets are
+// measured from the COM (the body's position), which the CPU integrates over
+// the true solid of revolution at spawn, so the asymmetric mass distribution —
+// the egg's signature settle-to-the-fat-end wobble — is real, not staged.
+//
+// Lanes: shapeExtents = (rFat, rTip, yTip, 5); hullRef.x = yFat, hullRef.yzw =
+// the per-unit-mass INVERSE inertia diagonal (integrated at spawn, hull's
+// convention); prevPos.w = bounding radius; vel.w = full half-height.
+//
+// Contact strategy (constraint path ONLY, like hulls): every query treats the
+// egg as sphere probes on its axis segment with a linearly-varying radius.
+// Against a PLANE the two end-sphere probes are EXACT — the swept surface's
+// signed plane distance is linear in the sweep parameter, so its minimum is at
+// an endpoint. Against boxes/discs/cylinders it is the capsule 3-station probe
+// scheme with the station's own radius. GJK/EPA pairs get the exact support
+// map (the deeper of the two end-sphere supports).
+static float  cdEggRFat(CoinBody c) { return max(c.shapeExtents.x, 1e-4); }
+static float  cdEggRTip(CoinBody c) { return max(c.shapeExtents.y, 1e-4); }
+// World-space sphere centres: a = fat end, b = tip end.
+static void cdEggSegment(CoinBody c, thread float3& a, thread float3& b) {
+    float3 x = c.posInvMass.xyz;
+    a = x + cdQuatRotate(c.orient, float3(0.0, c.hullRef.x, 0.0));
+    b = x + cdQuatRotate(c.orient, float3(0.0, c.shapeExtents.z, 0.0));
+}
+// Surface radius at sweep parameter t (0 = fat end, 1 = tip end).
+static float cdEggRadiusAt(CoinBody c, float t) {
+    return mix(cdEggRFat(c), cdEggRTip(c), clamp(t, 0.0, 1.0));
+}
 
 // Solid capsule inverse inertia (axis = local +Y). Standard cylinder+hemisphere
 // aggregation: mass splits by volume; hemispheres carry parallel-axis terms.
@@ -354,7 +390,9 @@ static float3 cdBodyInvInertia(CoinBody c, float invMass) {
     if (cdIsCapsule(c)) return cdCapsuleInvInertia(cdCapsuleR(c), cdCapsuleHL(c), invMass);
     // Hull: the exact per-unit-mass inverse inertia diag (principal frame) was
     // integrated over the solid hull at registration and rides hullRef.yzw.
-    if (cdIsHull(c)) return invMass * c.hullRef.yzw;
+    // Ovoid: the same convention — integrated over the solid of revolution at
+    // spawn (only hullRef.x differs: hull index vs fat-sphere offset).
+    if (cdIsHull(c) || cdIsEgg(c)) return invMass * c.hullRef.yzw;
     if (cdIsSphere(c)) {
         // Solid sphere: I = (2/5) m R², isotropic ⇒ I⁻¹ = invMass / (0.4 R²) on every axis.
         float R = c.prevPos.w > 1e-4 ? c.prevPos.w : 0.12;
@@ -444,6 +482,28 @@ static void cdCapsuleSegment(CoinBody c, thread float3& a, thread float3& b) {
     float3 ax = cdQuatRotate(c.orient, float3(0, cdCapsuleHL(c), 0));
     a = c.posInvMass.xyz - ax;
     b = c.posInvMass.xyz + ax;
+}
+
+// ── Swept-sphere shapes (capsule + egg unified) ──────────────────────────────
+// Both are "a segment swept by a sphere"; the capsule's radius is constant, the
+// egg's varies linearly fat→tip. Narrowphase code that probes a capsule's
+// segment generalizes verbatim by asking the radius AT the probe.
+static bool cdIsSwept(CoinBody c) { return cdIsCapsule(c) || cdIsEgg(c); }
+static void cdSweptSegment(CoinBody c, thread float3& a, thread float3& b,
+                           thread float& ra, thread float& rb) {
+    if (cdIsEgg(c)) {
+        cdEggSegment(c, a, b);
+        ra = cdEggRFat(c); rb = cdEggRTip(c);
+    } else {
+        cdCapsuleSegment(c, a, b);
+        ra = cdCapsuleR(c); rb = ra;
+    }
+}
+// Swept radius at the segment parameter nearest world point p.
+static float cdSweptRadiusNear(float3 a, float3 b, float ra, float rb, float3 p) {
+    float3 ab = b - a;
+    float t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1e-12), 0.0, 1.0);
+    return mix(ra, rb, t);
 }
 
 
@@ -1138,7 +1198,9 @@ kernel void coinFinalize(
     // body that outran a substep). A sphere's COM rests at exactly R, so clamp it to
     // floorY + R — clamping to half that (the disc backstop) is what sank a tunneled
     // ball to its equator. Discs/boxes keep the gentle floorH·0.5 backstop.
-    float restY = cdIsSphere(c) ? cdRadiusOf(c) : floorH * 0.5;
+    float restY = cdIsSphere(c) ? cdRadiusOf(c)
+                : cdIsEgg(c)    ? min(cdEggRFat(c), cdEggRTip(c))   // side-lying egg rests ≥ its thinner end
+                :                 floorH * 0.5;
     if (x.y < u.floorY + restY) {
         x.y = u.floorY + restY;
     }
@@ -1539,6 +1601,15 @@ static float3 cdSupport(CoinBody c, float3 d,
         return ctr + cdQuatRotate(q, float3(0.0, dl.y >= 0.0 ? hl : -hl, 0.0))
                    + r * normalize(d);
     }
+    if (cdIsEgg(c)) {
+        // EXACT support of the sphere-swept cone (the hull of its two end
+        // spheres): whichever end sphere reaches farther along d.
+        float3 nd = normalize(d);
+        float3 a, b; cdEggSegment(c, a, b);
+        float pa = dot(a, nd) + cdEggRFat(c);
+        float pb = dot(b, nd) + cdEggRTip(c);
+        return pa >= pb ? (a + cdEggRFat(c) * nd) : (b + cdEggRTip(c) * nd);
+    }
     if (cdIsBox(c)) {
         float3 he = cdBodyHalfExtents(c);
         pl = float3(dl.x >= 0.0 ? he.x : -he.x, dl.y >= 0.0 ? he.y : -he.y, dl.z >= 0.0 ? he.z : -he.z);
@@ -1818,32 +1889,43 @@ kernel void coinMeasurePenetration(
                         float hlO = cdCapsuleHL(O);
                         closestLocal = float3(0.0, clamp(lp.y, -hlO, hlO), 0.0);
                         extraR = cdCapsuleR(O);
+                    } else if (cdIsEgg(O)) {
+                        // Sphere ↔ egg: the same swept-radius segment probe the
+                        // narrowphase (coinGenerateContacts) de-penetrates with.
+                        float yA = O.hullRef.x, yB = O.shapeExtents.z;
+                        float t = clamp((lp.y - yA) / max(yB - yA, 1e-6), 0.0, 1.0);
+                        closestLocal = float3(0.0, mix(yA, yB, t), 0.0);
+                        extraR = cdEggRadiusAt(O, t);
                     } else {
                         closestLocal = cdClosestInShapeLocal(O, lp);
                     }
                     minDepth = rs + extraR - length(lp - closestLocal);
                 }
                 if (minDepth <= 0.0) separated = true;
-            } else if (cdIsCapsule(ci) || cdIsCapsule(cj)) {
-                // Capsule-involved pair — the same probe math the constraint
-                // narrowphase de-penetrates with (bounding-cylinder SAT here would
-                // over-report a capsule resting beside anything: a false positive).
-                if (cdIsCapsule(ci) && cdIsCapsule(cj)) {
-                    float3 a0, a1, b0, b1;
-                    cdCapsuleSegment(ci, a0, a1);
-                    cdCapsuleSegment(cj, b0, b1);
+            } else if (cdIsSwept(ci) || cdIsSwept(cj)) {
+                // Swept-involved pair (capsule or egg) — the same probe math the
+                // constraint narrowphase de-penetrates with (bounding-cylinder SAT
+                // here would over-report a capsule/egg resting beside anything: a
+                // false positive).
+                if (cdIsSwept(ci) && cdIsSwept(cj)) {
+                    float3 a0, a1, b0, b1; float rI0, rI1, rJ0, rJ1;
+                    cdSweptSegment(ci, a0, a1, rI0, rI1);
+                    cdSweptSegment(cj, b0, b1, rJ0, rJ1);
                     float3 c1, c2; cdClosestSegSeg(a0, a1, b0, b1, c1, c2);
-                    minDepth = (cdCapsuleR(ci) + cdCapsuleR(cj)) - length(c1 - c2);
+                    minDepth = (cdSweptRadiusNear(a0, a1, rI0, rI1, c1)
+                              + cdSweptRadiusNear(b0, b1, rJ0, rJ1, c2)) - length(c1 - c2);
                 } else {
-                    bool iCap = cdIsCapsule(ci);
+                    bool iCap = cdIsSwept(ci);
                     CoinBody C = iCap ? ci : cj;
                     CoinBody O = iCap ? cj : ci;
-                    float rc = cdCapsuleR(C);
-                    float3 s0, s1; cdCapsuleSegment(C, s0, s1);
+                    float3 s0, s1; float r0, r1;
+                    cdSweptSegment(C, s0, s1, r0, r1);
                     float3 co2 = O.posInvMass.xyz; float4 qo2 = O.orient;
                     minDepth = -1e30;
                     for (int p = 0; p < 3; ++p) {
-                        float3 s = mix(s0, s1, float(p) * 0.5);
+                        float tS = float(p) * 0.5;
+                        float3 s = mix(s0, s1, tS);
+                        float rc = mix(r0, r1, tS);
                         float3 lp = cdQuatRotateInv(qo2, s - co2);
                         float3 cl = cdClosestInShapeLocal(O, lp);
                         float dl = length(lp - cl);
@@ -2218,27 +2300,36 @@ kernel void coinGenerateContacts(
                 if (!cdGJKEPA(ci, cj, hullVerts, hullRanges, n, depth)) continue;
                 if (depth <= 0.0) continue;
                 // n points from j(B) toward i(A) — cdEmitContact's convention.
-                bool capsuleInvolved = cdIsCapsule(ci) || cdIsCapsule(cj);
+                bool capsuleInvolved = cdIsCapsule(ci) || cdIsCapsule(cj)
+                                    || cdIsEgg(ci)     || cdIsEgg(cj);
 
-                // Capsule↔hull: 2-point manifold (both segment stations vs the
-                // hull's near-face support point along the EPA normal), so a
-                // capsule lying across a hull face/edge rests level instead of
-                // teetering on the single-point EPA contact.
+                // Capsule/egg↔hull: 2-point manifold (both segment stations vs
+                // the hull's near-face support point along the EPA normal), so a
+                // capsule/egg lying across a hull face/edge rests level instead
+                // of teetering on the single-point EPA contact. An egg's two
+                // stations carry their own radii (fat end / tip end).
                 if (capsuleInvolved) {
-                    bool idIsCapsule = cdIsCapsule(ci);
+                    bool idIsCapsule = cdIsCapsule(ci) || cdIsEgg(ci);
                     CoinBody capBody = idIsCapsule ? ci : cj;
                     float3 nCapWard = idIsCapsule ? n : -n;   // hull → capsule
-                    float capR = cdCapsuleR(capBody);
-                    float3 s0, s1; cdCapsuleSegment(capBody, s0, s1);
+                    float3 s0, s1; float r0, r1;
+                    if (cdIsEgg(capBody)) {
+                        cdEggSegment(capBody, s0, s1);
+                        r0 = cdEggRFat(capBody); r1 = cdEggRTip(capBody);
+                    } else {
+                        cdCapsuleSegment(capBody, s0, s1);
+                        r0 = cdCapsuleR(capBody); r1 = r0;
+                    }
                     CoinBody hullBody = idIsCapsule ? cj : ci;
                     float3 hullSupport = cdSupport(hullBody, nCapWard, hullVerts, hullRanges);
                     float planeOffset = dot(nCapWard, hullSupport);
                     float3 stations[2] = { s0, s1 };
+                    float  stationR[2] = { r0, r1 };
                     int emitted = 0;
                     for (int p = 0; p < 2; ++p) {
-                        float pen = (planeOffset + capR) - dot(nCapWard, stations[p]);
+                        float pen = (planeOffset + stationR[p]) - dot(nCapWard, stations[p]);
                         if (pen > -spec) {
-                            float3 cp = stations[p] - capR * nCapWard;
+                            float3 cp = stations[p] - stationR[p] * nCapWard;
                             cdEmitContact(contacts, contactCount, maxContacts, id, j, uint(p), 0u, n, cp, xi, xj, pen);
                             emitted++;
                         }
@@ -2362,13 +2453,23 @@ kernel void coinGenerateContacts(
                 CoinBody O = iSphere ? cj : ci;
                 float3 lp = cdQuatRotateInv(qo, cs - co);
                 float3 closestLocal;
-                float extraR = 0.0;      // the other shape's own surface radius (capsule)
+                float extraR = 0.0;      // the other shape's own surface radius (capsule/egg)
                 if (cdIsCapsule(O)) {
                     // Sphere ↔ capsule: closest point on the capsule's SEGMENT, then
                     // the capsule's radius joins the sphere's in the gap test.
                     float hlO = cdCapsuleHL(O);
                     closestLocal = float3(0.0, clamp(lp.y, -hlO, hlO), 0.0);
                     extraR = cdCapsuleR(O);
+                } else if (cdIsEgg(O)) {
+                    // Sphere ↔ egg: closest point on the egg's centre SEGMENT
+                    // (fat-sphere centre → tip-sphere centre, both offset from the
+                    // COM), with the swept radius at that parameter. The lerped
+                    // radius slightly underestimates the flank by the taper's sag —
+                    // millimetres at egg scale, recovered by the solver's slop.
+                    float yA = O.hullRef.x, yB = O.shapeExtents.z;
+                    float t = clamp((lp.y - yA) / max(yB - yA, 1e-6), 0.0, 1.0);
+                    closestLocal = float3(0.0, mix(yA, yB, t), 0.0);
+                    extraR = cdEggRadiusAt(O, t);
                 } else {
                     closestLocal = cdClosestInShapeLocal(O, lp);
                 }
@@ -2383,24 +2484,27 @@ kernel void coinGenerateContacts(
                 continue;
             }
 
-            // ── Capsule-involved pair (constraint path gets the EXACT capsule) ──
-            // A capsule is a segment + radius, so every contact reduces to sphere
-            // probes: the true seg-seg closest pair plus the two END probes for the
-            // parallel-rest manifold (capsule↔capsule), or 3 probe centres along
-            // the segment vs the other shape's closest-point map (capsule↔box/disc).
-            if (cdIsCapsule(ci) || cdIsCapsule(cj)) {
-                if (cdIsCapsule(ci) && cdIsCapsule(cj)) {
-                    float rI = cdCapsuleR(ci), rJ = cdCapsuleR(cj);
-                    float3 a0, a1, b0, b1;
-                    cdCapsuleSegment(ci, a0, a1);
-                    cdCapsuleSegment(cj, b0, b1);
+            // ── Swept-involved pair (capsule OR egg — the constraint path gets the
+            // EXACT swept shape). A swept body is a segment + [varying] radius, so
+            // every contact reduces to sphere probes: the true seg-seg closest pair
+            // plus the two END probes for the parallel-rest manifold (swept↔swept),
+            // or 3 probe centres along the segment vs the other shape's
+            // closest-point map (swept↔box/disc). A capsule is the constant-radius
+            // special case — its maths here are bit-identical to the old branch.
+            if (cdIsSwept(ci) || cdIsSwept(cj)) {
+                if (cdIsSwept(ci) && cdIsSwept(cj)) {
+                    float3 a0, a1, b0, b1; float rI0, rI1, rJ0, rJ1;
+                    cdSweptSegment(ci, a0, a1, rI0, rI1);
+                    cdSweptSegment(cj, b0, b1, rJ0, rJ1);
                     float3 cps[3]; float3 cqs[3];
                     float3 c1, c2; cdClosestSegSeg(a0, a1, b0, b1, c1, c2);
                     cps[0] = c1; cqs[0] = c2;                              // true closest pair
                     cps[1] = a0; cqs[1] = cdClosestOnSegment(b0, b1, a0);  // end probes: the
                     cps[2] = a1; cqs[2] = cdClosestOnSegment(b0, b1, a1);  // parallel-rest manifold
                     for (int k = 0; k < 3; ++k) {
-                        if (k > 0 && length(cps[k] - cps[0]) < 0.5 * rI) continue;   // dedupe vs main
+                        if (k > 0 && length(cps[k] - cps[0]) < 0.5 * rI0) continue;   // dedupe vs main
+                        float rI = cdSweptRadiusNear(a0, a1, rI0, rI1, cps[k]);
+                        float rJ = cdSweptRadiusNear(b0, b1, rJ0, rJ1, cqs[k]);
                         float3 dS = cps[k] - cqs[k];
                         float dl = length(dS);
                         float pen = rI + rJ - dl;
@@ -2412,14 +2516,16 @@ kernel void coinGenerateContacts(
                     }
                     continue;
                 }
-                bool iCap = cdIsCapsule(ci);
-                CoinBody C = iCap ? ci : cj;      // the capsule
-                CoinBody O = iCap ? cj : ci;      // the box / disc
-                float rc = cdCapsuleR(C);
-                float3 s0, s1; cdCapsuleSegment(C, s0, s1);
+                bool iSw = cdIsSwept(ci);
+                CoinBody C = iSw ? ci : cj;      // the swept body
+                CoinBody O = iSw ? cj : ci;      // the box / disc
+                float3 s0, s1; float r0, r1;
+                cdSweptSegment(C, s0, s1, r0, r1);
                 float3 co = O.posInvMass.xyz; float4 qo = O.orient;
                 for (int k = 0; k < 3; ++k) {
-                    float3 s = mix(s0, s1, float(k) * 0.5);          // end, mid, end
+                    float tS = float(k) * 0.5;                       // end, mid, end
+                    float3 s = mix(s0, s1, tS);
+                    float rc = mix(r0, r1, tS);                      // the probe's own radius
                     float3 lp = cdQuatRotateInv(qo, s - co);
                     float3 cl = cdClosestInShapeLocal(O, lp);
                     float3 dL = lp - cl;
@@ -2444,7 +2550,7 @@ kernel void coinGenerateContacts(
                         }
                         nOut = n2; pen = d2 + rc; cp = s;
                     }
-                    float3 nBtoA = iCap ? nOut : -nOut;              // toward A (thread's body i)
+                    float3 nBtoA = iSw ? nOut : -nOut;               // toward A (thread's body i)
                     cdEmitContact(contacts, contactCount, maxContacts, id, j, uint(k), 0u, nBtoA, cp, xi, xj, pen);
                 }
                 continue;
@@ -2536,16 +2642,20 @@ kernel void coinGenerateContacts(
     }
 
     // ── Static / kinematic colliders (planes, boxes, pusher) ──────────────────
-    // A CAPSULE resolves against every static as sphere probes at 3 segment
-    // stations (both ends + mid, radius r) — the exact round-cap surface, not the
-    // bounding cylinder's hard rim (which is what the generic feature-point path
-    // would test). Probes are precomputed once here.
-    bool iCapsule = cdIsCapsule(ci);
-    float capR = iCapsule ? cdCapsuleR(ci) : 0.0;
+    // A CAPSULE or EGG resolves against every static as sphere probes at 3
+    // segment stations (both ends + mid, each with its own swept radius) — the
+    // exact round surface, not the bounding cylinder's hard rim (which is what
+    // the generic feature-point path would test). For an egg the end radii
+    // differ (fat end vs tip); against a PLANE the two end probes are exact.
+    // Probes are precomputed once here.
+    bool iCapsule = cdIsSwept(ci);
     float3 capP[3];
+    float capRs[3] = { 0.0, 0.0, 0.0 };
     if (iCapsule) {
-        float3 s0, s1; cdCapsuleSegment(ci, s0, s1);
-        capP[0] = s0; capP[1] = 0.5 * (s0 + s1); capP[2] = s1;
+        float3 s0, s1; float r0, r1;
+        cdSweptSegment(ci, s0, s1, r0, r1);
+        capP[0] = s0;  capP[1] = 0.5 * (s0 + s1); capP[2] = s1;
+        capRs[0] = r0; capRs[1] = 0.5 * (r0 + r1); capRs[2] = r1;
     }
     // A HULL body probes statics with its true vertices (≤32), radius 0 — the
     // same point logic as the disc/box feature points, but on the real shape.
@@ -2563,11 +2673,12 @@ kernel void coinGenerateContacts(
                 float pen = (d + Ri) - dot(n, xi);
                 if (pen > -spec) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, 0u, k, n, xi - Ri*n, xi, xi, pen);
             } else if (iCapsule) {
-                // Both END probes (skip mid: coplanar with the ends, adds nothing) —
-                // the 2-point manifold that holds a side-lying capsule level.
+                // Both END probes (skip mid: the swept surface's plane distance is
+                // linear along the axis, so the mid station is never the deepest) —
+                // the 2-point manifold that holds a side-lying capsule/egg level.
                 for (int p = 0; p < 3; p += 2) {
-                    float pen = (d + capR) - dot(n, capP[p]);
-                    if (pen > -spec) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, capP[p] - capR*n, xi, xi, pen);
+                    float pen = (d + capRs[p]) - dot(n, capP[p]);
+                    if (pen > -spec) cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, capP[p] - capRs[p]*n, xi, xi, pen);
                 }
             } else {
                 // Gather the touching feature points, then keep only a reduced manifold
@@ -2622,7 +2733,7 @@ kernel void coinGenerateContacts(
                     float dl = length(dL);
                     float3 n; float pen; float3 cp;
                     if (dl > 1e-6) {
-                        pen = capR - dl;
+                        pen = capRs[p] - dl;
                         if (pen <= -spec) continue;
                         n = dL / dl; cp = ctr + cl;
                     } else {                              // probe centre inside the box
@@ -2630,7 +2741,7 @@ kernel void coinGenerateContacts(
                         if (dist.x < dist.y && dist.x < dist.z) { n = float3(sign(lp.x),0,0); push = dist.x; }
                         else if (dist.y < dist.z)               { n = float3(0,sign(lp.y),0); push = dist.y; }
                         else                                    { n = float3(0,0,sign(lp.z)); push = dist.z; }
-                        pen = push + capR; cp = capP[p];
+                        pen = push + capRs[p]; cp = capP[p];
                     }
                     if (oneWay && n.y < 0.5) continue;
                     cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, cp, xi, xi, pen);
@@ -2720,7 +2831,7 @@ kernel void coinGenerateContacts(
                     cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, 0u, k, n, xi - Ri*n, xi, xi, pen);
                 }
             } else if (iCapsule) {
-                // Capsule vs OBB: the 3 segment probes in the box's local frame.
+                // Capsule/egg vs OBB: the 3 segment probes in the box's local frame.
                 for (int p = 0; p < 3; ++p) {
                     float3 lp = cdQuatRotateInv(q, capP[p] - ctr);
                     float3 cl = clamp(lp, -he, he);
@@ -2728,7 +2839,7 @@ kernel void coinGenerateContacts(
                     float dl = length(dL);
                     float3 nL; float pen; float3 cp;
                     if (dl > 1e-6) {
-                        pen = capR - dl;
+                        pen = capRs[p] - dl;
                         if (pen <= -spec) continue;
                         nL = dL / dl; cp = ctr + cdQuatRotate(q, cl);
                     } else {
@@ -2736,7 +2847,7 @@ kernel void coinGenerateContacts(
                         if (dd.x < dd.y && dd.x < dd.z) { nL = float3(sign(lp.x),0,0); push = dd.x; }
                         else if (dd.y < dd.z)           { nL = float3(0,sign(lp.y),0); push = dd.y; }
                         else                            { nL = float3(0,0,sign(lp.z)); push = dd.z; }
-                        pen = push + capR; cp = capP[p];
+                        pen = push + capRs[p]; cp = capP[p];
                     }
                     float3 n = cdQuatRotate(q, nL);
                     cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(p), k, n, cp, xi, xi, pen);
@@ -2791,8 +2902,8 @@ kernel void coinGenerateContacts(
             bool sphereLike = cdIsSphere(ci) || iCapsule;
             int nProbes = iCapsule ? 3 : (cdIsSphere(ci) ? 1 : nFP);
             for (int p = 0; p < nProbes; ++p) {
-                float3 s  = sphereLike ? (iCapsule ? capP[p] : xi) : CD_PROBE(p);
-                float  rs = sphereLike ? (iCapsule ? capR    : Ri) : 0.0;
+                float3 s  = sphereLike ? (iCapsule ? capP[p]  : xi) : CD_PROBE(p);
+                float  rs = sphereLike ? (iCapsule ? capRs[p] : Ri) : 0.0;
                 float3 d = s - ctr;
                 float along = dot(d, ax);
                 if (along < -halfLen || along > halfLen) continue;   // outside this segment's length
@@ -2828,8 +2939,8 @@ kernel void coinGenerateContacts(
             bool sphereLike = cdIsSphere(ci) || iCapsule;
             int nProbes = iCapsule ? 3 : (cdIsSphere(ci) ? 1 : nFP);
             for (int p = 0; p < nProbes; ++p) {
-                float3 s  = sphereLike ? (iCapsule ? capP[p] : xi) : CD_PROBE(p);
-                float  rs = sphereLike ? (iCapsule ? capR    : Ri) : (iHull ? 0.0 : Ri);
+                float3 s  = sphereLike ? (iCapsule ? capP[p]  : xi) : CD_PROBE(p);
+                float  rs = sphereLike ? (iCapsule ? capRs[p] : Ri) : (iHull ? 0.0 : Ri);
                 float  ry = sphereLike ? rs : (iHull ? 0.0 : hi);
                 if (abs(s.x - cc2.x) < he2.x + rs &&
                     s.y > cc2.y - (he2.y + ry) && s.y < cc2.y + (he2.y + ry) &&

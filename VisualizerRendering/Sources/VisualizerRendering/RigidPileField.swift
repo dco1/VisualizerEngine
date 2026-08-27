@@ -14,6 +14,7 @@ import simd
 ///   • `dropSphere` radius == half-thickness (marble / ball / pellet)
 ///   • `dropRod`    elongated capped cylinder, half-length ≫ radius (peg / rod / log)
 ///   • `dropBox`    oriented box, three half-extents (die / crate / brick / block)
+///   • `dropEgg`    smooth ovoid, two swept sphere radii (egg — constraint solver only)
 ///
 /// — and they all share ONE pile, colliding with each other (box–box, box–disc,
 /// disc–disc) and with the static environment. Each drop takes a `type` tag, so a
@@ -249,6 +250,27 @@ public final class RigidPileField {
                         type: UInt32 = 0) -> BodyID? {
         solver.spawnBox(at: position, halfExtents: halfExtents, velocity: velocity,
                         orient: orient, tumble: tumble, mass: mass, type: type)
+    }
+
+    /// Drop an OVOID (egg): the smooth convex hull of a FAT sphere
+    /// (`fatRadius`, toward local −Y) and a TIP sphere (`tipRadius`, toward
+    /// local +Y) with centres `centerDistance` apart. It rolls on its flank,
+    /// circles toward its fat end, and settles with the real egg wobble — the
+    /// solid's true COM/inertia are integrated at spawn. Requires the
+    /// constraint solver (`Config.useConstraintSolver = true`), like hulls.
+    /// `friction`/`restitution` override the pile's globals for this body.
+    @discardableResult
+    public func dropEgg(at position: SIMD3<Float>,
+                        fatRadius: Float, tipRadius: Float, centerDistance: Float,
+                        velocity: SIMD3<Float> = .zero,
+                        orient: SIMD4<Float> = SIMD4(0, 0, 0, 1),
+                        tumble: SIMD3<Float> = .zero, mass: Float = 1,
+                        friction: Float? = nil, restitution: Float? = nil,
+                        type: UInt32 = 0) -> BodyID? {
+        solver.spawnEgg(at: position, fatRadius: fatRadius, tipRadius: tipRadius,
+                        centerDistance: centerDistance, velocity: velocity,
+                        orient: orient, tumble: tumble, mass: mass,
+                        friction: friction, restitution: restitution, type: type)
     }
 
     /// Recycle a body's slot (it left the frame / dropped out a gap). Handle invalid after.

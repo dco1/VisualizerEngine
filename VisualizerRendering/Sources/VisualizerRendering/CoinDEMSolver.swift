@@ -40,14 +40,16 @@ public struct CoinBody {
     public var prevOrient: SIMD4<Float>   // orientation at substep start (for deriving ω)
     public var angVel:     SIMD4<Float>   // xyz = angular velocity (world, rad/s), w = support flag
     // Shape: w = tag (0 = disc / capped cylinder, the default; 1 = box; 2 =
-    // sphere; 3 = capsule; 4 = convex hull). For a box, xyz = the three
-    // half-extents; sphere, x = radius; capsule, x = segment half-length.
+    // sphere; 3 = capsule; 4 = convex hull; 5 = ovoid/egg). For a box, xyz =
+    // the three half-extents; sphere, x = radius; capsule, x = segment
+    // half-length; ovoid, x = fat radius, y = tip radius, z = tip-centre offset.
     // Appended so every existing field keeps its offset — existing kernels and
     // CPU readbacks are byte-identical for discs.
     public var shapeExtents: SIMD4<Float>
-    // Convex hull only (tag 4): x = registered hull index (as float), yzw = the
-    // per-unit-mass INVERSE inertia diagonal in the hull's principal frame
-    // (I⁻¹ = invMass · yzw). Zero for every other shape.
+    // Convex hull (tag 4): x = registered hull index (as float). Ovoid (tag 5):
+    // x = fat-sphere centre offset from the COM. Both: yzw = the per-unit-mass
+    // INVERSE inertia diagonal in the principal frame (I⁻¹ = invMass · yzw).
+    // Zero for every other shape.
     public var hullRef: SIMD4<Float>
 
     public init(position: SIMD3<Float>,
@@ -1134,6 +1136,123 @@ public final class CoinDEMSolver: PenetrationProbing {
         sleepTimerBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
         highWater = max(highWater, slot + 1)
         return slot
+    }
+
+    /// Activate an OVOID (egg) body — the convex hull of two spheres on the
+    /// local +Y axis: the FAT sphere (radius `fatRadius`, toward −Y) and the
+    /// TIP sphere (radius `tipRadius`, toward +Y) with centres `centerDistance`
+    /// apart, joined by the tangent-cone flank. Smooth everywhere, so it rolls
+    /// and wobbles like a real egg — no facets. The exact solid-of-revolution
+    /// COM and inertia are integrated here at spawn, so the body's position is
+    /// its true (fat-end-biased) centre of mass and the settle-to-the-fat-end
+    /// wobble is real physics. Constraint path only (like hulls): against a
+    /// plane the two end-sphere probes are exact; everything else resolves via
+    /// swept-radius segment probes + GJK/EPA support.
+    @discardableResult
+    public func spawnEgg(at position: SIMD3<Float>,
+                         fatRadius: Float,
+                         tipRadius: Float,
+                         centerDistance: Float,
+                         velocity: SIMD3<Float> = .zero,
+                         orient: SIMD4<Float> = SIMD4(0, 0, 0, 1),
+                         tumble: SIMD3<Float> = .zero,
+                         mass: Float = 1,
+                         friction: Float? = nil,
+                         restitution: Float? = nil,
+                         type: UInt32 = 0) -> Int? {
+        assert(solverMode == .constraint,
+               "spawnEgg requires solverMode == .constraint (legacy has no ovoid narrowphase)")
+        guard fatRadius > 1e-4, tipRadius > 1e-4, centerDistance >= 0 else { return nil }
+        let slot: Int
+        if let reused = freeSlots.popLast() {
+            slot = reused
+        } else if nextSlot < maxCoins {
+            slot = nextSlot; nextSlot += 1
+        } else {
+            return nil
+        }
+        // COM + per-unit-mass inertia of the swept-cone solid, memoised per
+        // (fatRadius, tipRadius, centerDistance) — a rain of identical eggs
+        // integrates once.
+        let props = Self.eggProperties(fatRadius: fatRadius, tipRadius: tipRadius,
+                                       centerDistance: centerDistance)
+        let ptr = coinBuffer.buffer.contents().bindMemory(to: CoinBody.self, capacity: maxCoins)
+        let invMass: Float = mass > 1e-6 ? 1.0 / mass : 1.0
+        ptr[slot] = CoinBody(position: position, invMass: invMass, velocity: velocity,
+                             orient: orient, angVel: tumble,
+                             shapeExtents: SIMD4(fatRadius, tipRadius, props.yTip, 5),  // w = 5 → ovoid
+                             hullRef: SIMD4(props.yFat,
+                                            props.invInertiaK.x, props.invInertiaK.y, props.invInertiaK.z))
+        // Bounding radius rides prevPos.w (broadphase reach), the full half-height
+        // rides vel.w (floor backstop + reach), mirroring the capsule convention.
+        let maxExtent = max(abs(props.yFat) + fatRadius, abs(props.yTip) + tipRadius)
+        ptr[slot].prevPos.w = maxExtent
+        ptr[slot].vel.w     = maxExtent
+        setMaterial(slot, friction: friction, restitution: restitution)
+        bodyTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = type
+        linkBuffer.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)[slot] = SIMD2(-1, 0)
+        // A reused slot must not inherit the previous body's sleep state.
+        asleepBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
+        sleepTimerBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
+        highWater = max(highWater, slot + 1)
+        return slot
+    }
+
+    /// COM offset + per-unit-mass inverse inertia of the ovoid solid. Sphere
+    /// centres pre-integration sit at y = 0 (fat) and y = `centerDistance`
+    /// (tip); the returned yFat/yTip are those centres re-expressed relative to
+    /// the integrated COM (the body origin the solver simulates around).
+    /// Numeric disc-stack integration over the true swept-union profile — exact
+    /// to sampling, no closed-form composite approximation to get subtly wrong.
+    struct EggBodyProperties {
+        var yFat: Float          // fat-sphere centre offset from COM (< 0)
+        var yTip: Float          // tip-sphere centre offset from COM (> 0)
+        var invInertiaK: SIMD3<Float>   // per-unit-mass inverse inertia diagonal
+    }
+    private static var eggPropsCache: [SIMD3<Float>: EggBodyProperties] = [:]
+    static func eggProperties(fatRadius r1: Float, tipRadius r2: Float,
+                              centerDistance d: Float) -> EggBodyProperties {
+        let key = SIMD3(r1, r2, d)
+        if let hit = eggPropsCache[key] { return hit }
+        // Cross-section radius of the swept union at height y: the max over the
+        // sphere family c(t) = t·d, r(t) = mix(r1,r2,t). 256 slices × 96 sweep
+        // samples is exact to ~1e-4 of the size — far inside DEM tolerance.
+        let yMin = Double(-r1), yMax = Double(d + r2)
+        let nY = 256, nT = 96
+        var v = 0.0, vy = 0.0                       // Σ r²·dy, Σ y·r²·dy (π cancels)
+        var slices = [Double](repeating: 0, count: nY)   // r² per slice
+        var ys     = [Double](repeating: 0, count: nY)
+        let dy = (yMax - yMin) / Double(nY)
+        for i in 0..<nY {
+            let y = yMin + (Double(i) + 0.5) * dy
+            var r2max = 0.0
+            for k in 0...nT {
+                let t = Double(k) / Double(nT)
+                let rt = Double(r1) + (Double(r2) - Double(r1)) * t
+                let dyc = y - t * Double(d)
+                let rr = rt * rt - dyc * dyc
+                if rr > r2max { r2max = rr }
+            }
+            slices[i] = r2max; ys[i] = y
+            v += r2max; vy += y * r2max
+        }
+        let yc = v > 1e-12 ? vy / v : 0.0
+        // Disc-stack inertia per unit mass: dI_axis = dm·(r²/2), dI_diam = dm·(r²/4 + z²).
+        var iAxis = 0.0, iDiam = 0.0
+        for i in 0..<nY {
+            let z = ys[i] - yc
+            iAxis += slices[i] * (slices[i] * 0.5)
+            iDiam += slices[i] * (slices[i] * 0.25 + z * z)
+        }
+        let norm = max(v, 1e-12)
+        let props = EggBodyProperties(
+            yFat: Float(0.0 - yc),
+            yTip: Float(Double(d) - yc),
+            invInertiaK: SIMD3(Float(norm / max(iDiam, 1e-12)),
+                               Float(norm / max(iAxis, 1e-12)),
+                               Float(norm / max(iDiam, 1e-12))))
+        eggPropsCache[key] = props
+        return props
     }
 
     // ── Convex hulls (constraint path) ────────────────────────────────────────
