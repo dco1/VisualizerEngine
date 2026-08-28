@@ -1238,6 +1238,53 @@ public final class IlluminatoramaRenderer {
     /// The cull mode a shadow pass starts in, so the first group does not have to correct it.
     private var shadowInitialCullMode: MTLCullMode { shadowStoresFrontFaces ? .back : .front }
 
+    // MARK: - The substrate (a surface other surfaces are laid flush ON)
+
+    /// Mesh kinds that are **substrate** — the ground a street, a driveway or a court line is
+    /// laid flush on, whose separation from them is millimetres of deliberate lift rather than
+    /// real space. These are biased AWAY from the camera so that anything resting on them wins
+    /// the depth test at any distance.
+    ///
+    /// **Why the substrate recedes instead of the decal advancing.** Both close the same gap,
+    /// and the gap is real: the camera projects into a NON-reversed `depth32Float` buffer where
+    /// the smallest resolvable separation grows with the square of the distance —
+    /// `≈ ulp(1.0) · z² / zNear`, which at `zNear = 0.05` is 0.5 mm at 20 m but **7.6 mm at
+    /// 80 m and 17 mm at 120 m**. Any fixed lift therefore has a range past which the surface
+    /// underneath starts winning pixels and the decal dithers into it. Measured in Daydream
+    /// Home, 2026-08-28: a street with a 10 mm lift is clean to ~90 m and eaten by dirt beyond.
+    ///
+    /// Pushing the DECAL forward closes it too, but it spends the whole bias in the direction
+    /// where something legitimately sits above the decal — a pavement stands on a 150 mm kerb,
+    /// and a bias big enough to fix the road at 150 m is big enough to lift the road over that
+    /// kerb. Pushing the SUBSTRATE back spends it in the direction where nothing is: there is,
+    /// by definition, nothing under the ground. So the bias can be generous without inverting
+    /// anything, and every surface laid on the ground is fixed at once rather than one by one.
+    ///
+    /// Empty by default — a host that declares no substrate gets byte-identical frames.
+    public var substrateMeshKinds: Set<MeshKind> = []
+
+    /// How far the substrate is pushed away from the camera, in depth-buffer ULPs (positive =
+    /// further, since this buffer is not reversed).
+    ///
+    /// **Why 32.** Swept on Daydream Home's flat-lot street at a fixed camera, measuring the
+    /// share of two windows lying wholly ON the roadway — one a few tens of metres out, one
+    /// past where a 10 mm lift stops resolving — that read as bare ground rather than asphalt:
+    ///
+    /// | bias | near roadway eaten | far roadway eaten |
+    /// |---|---|---|
+    /// | 0 | 0.06 | **0.77** |
+    /// | 16 | 0.00 | 0.00 |
+    /// | 64 | 0.00 | 0.00 |
+    /// | 128 | 0.00 | 0.00 |
+    ///
+    /// 16 already clears it completely; 32 is one doubling of margin for scenes whose substrate
+    /// sits at a different depth range. It is not pushed higher for free: the G-buffer depth is
+    /// what SSAO and contact shadows sample, and a bias is a real error in that texture — 32
+    /// ULPs is ~1.5 cm of world-equivalent depth error on ground 20 m away and ~38 cm at 100 m,
+    /// which is under the AO radius near the camera and irrelevant at the far end, where ground
+    /// is a handful of pixels. Doubling again would start eating into the near figure.
+    public var substrateDepthBias: Float = 32
+
     /// PCF kernel radius in shadow-map texels: 0 = single tap, 1 = 3×3, 2 = 5×5.
     public var shadowPcfRadius: UInt32 = 1
     /// How far from the camera the outermost cascade extends, in metres. Past
@@ -9825,6 +9872,7 @@ public final class IlluminatoramaRenderer {
         // Track which pipeline is bound to avoid redundant state switches when the
         // groups are all ordinary meshes (the common case).
         var prevVertsBound = false
+        var substrateBiased = false
         for group in meshGroups {
             // Superquadric impostor box kinds are drawn by the impostor pipeline
             // below; RT-proxy kinds exist only in the TLAS; shadow-only kinds are
@@ -9838,6 +9886,14 @@ public final class IlluminatoramaRenderer {
             // camera; the fragment shader flips the normal for back faces.
             let want: MTLCullMode = mesh.doubleSided ? .none : .back
             if cull != want { cull = want; enc.setCullMode(want) }
+            // The substrate takes a depth-buffer bias so a millimetre of lift on top of it keeps
+            // winning at any distance (see `substrateMeshKinds`). Tracked like `cull` — one
+            // state change per run of groups, not per group.
+            let wantBias = substrateMeshKinds.contains(group.kind)
+            if wantBias != substrateBiased {
+                substrateBiased = wantBias
+                enc.setDepthBias(wantBias ? substrateDepthBias : 0, slopeScale: 0, clamp: 0)
+            }
             let off = instStride * group.start
             // Issue #65 — deforming GPU meshes draw with the kUsePrevVerts pipeline
             // and bind their per-vertex prev positions at buffer(5); every other
@@ -9882,6 +9938,8 @@ public final class IlluminatoramaRenderer {
         // the fragment ray-traces the analytic surface, writing the G-buffer +
         // analytic depth + analytic motion vectors. The param buffer is bound at
         // the same per-group offset as the instance buffer (grouped-order aligned).
+        if substrateBiased { substrateBiased = false; enc.setDepthBias(0, slopeScale: 0, clamp: 0) }
+
         if let sqPipe = superquadricImpostorPipeline, !impostorMeshKinds.isEmpty {
             enc.setRenderPipelineState(sqPipe)
             if cull != .front { cull = .front; enc.setCullMode(.front) }
