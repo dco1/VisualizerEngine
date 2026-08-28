@@ -254,7 +254,12 @@ public final class CoinDEMSolver: PenetrationProbing {
     private let integratePipeline:  MTLComputePipelineState
     private let cellClearPipeline:  MTLComputePipelineState
     private let cellCountPipeline:  MTLComputePipelineState
-    private let scanPipeline:       MTLComputePipelineState
+    // Hierarchical cell-offset scan (block sums ∥ → short serial block scan →
+    // offsets apply ∥) — the serial whole-grid scan tripped the GPU watchdog on
+    // house-scale grids (see CoinDEM.metal § cell-offset prefix sum).
+    private let blockSumsPipeline:  MTLComputePipelineState
+    private let blockScanPipeline:  MTLComputePipelineState
+    private let offsetsApplyPipeline: MTLComputePipelineState
     private let scatterPipeline:    MTLComputePipelineState
     private let contactPipeline:    MTLComputePipelineState
     private let applyPipeline:      MTLComputePipelineState
@@ -337,6 +342,10 @@ public final class CoinDEMSolver: PenetrationProbing {
     private let coinDeltaBuffer: MTLBuffer         // private — per-coin Jacobi delta
     private let cellCounts: MTLBuffer              // private
     private let cellOffsets: MTLBuffer             // private
+    /// Per-block partial sums for the hierarchical cell-offset scan (one uint per
+    /// CD_SCAN_BLOCK=1024 cells).
+    private let cellBlockSums: MTLBuffer           // private
+    private var numScanBlocks: Int { (numCells + 1023) / 1024 }
     private let sortedIndices: MTLBuffer           // private
     private let uniformBuffer: MTLBuffer
     // Diagnostic readback for coinMeasurePenetration: [0]=maxDepth µm, [1]=pairCount.
@@ -558,7 +567,8 @@ public final class CoinDEMSolver: PenetrationProbing {
     // ── Init ──────────────────────────────────────────────────────────────────
 
     struct Pipelines {
-        let integrate, cellClear, cellCount, scan, scatter: MTLComputePipelineState
+        let integrate, cellClear, cellCount, scatter: MTLComputePipelineState
+        let blockSums, blockScan, offsetsApply: MTLComputePipelineState
         let contact, apply, finalize, orient, transform: MTLComputePipelineState
         let joint: MTLComputePipelineState
         let measure: MTLComputePipelineState   // coinMeasurePenetration (diagnostic)
@@ -583,7 +593,9 @@ public final class CoinDEMSolver: PenetrationProbing {
             let p0 = resolve("coinIntegrate"),
             let p1 = resolve("coinCellClear"),
             let p2 = resolve("coinCellCount"),
-            let p3 = resolve("coinCellOffsetsScan"),
+            let pS1 = resolve("coinCellBlockSums"),
+            let pS2 = resolve("coinCellBlockScan"),
+            let pS3 = resolve("coinCellOffsetsApply"),
             let p4 = resolve("coinScatter"),
             let p5 = resolve("coinContactSolve"),
             let p6 = resolve("coinApplyDelta"),
@@ -623,7 +635,8 @@ public final class CoinDEMSolver: PenetrationProbing {
             let p32 = resolve("coinJointSolveCS"),
             let p33 = resolve("coinIslandUnionJoints")
         else { return nil }
-        return Pipelines(integrate: p0, cellClear: p1, cellCount: p2, scan: p3, scatter: p4,
+        return Pipelines(integrate: p0, cellClear: p1, cellCount: p2, scatter: p4,
+                         blockSums: pS1, blockScan: pS2, offsetsApply: pS3,
                          contact: p5, apply: p6, finalize: p7, orient: p8, transform: p9, joint: p10,
                          measure: p11, generate: p12, clearBody: p13, buildBody: p14, colorRound: p15,
                          colorInit: p34, colorWriteback: p35, clearContactCount: p41,
@@ -677,7 +690,7 @@ public final class CoinDEMSolver: PenetrationProbing {
           boundsMin: SIMD3<Float>,
           boundsMax: SIMD3<Float>) {
         let p0 = pipelines.integrate, p1 = pipelines.cellClear, p2 = pipelines.cellCount
-        let p3 = pipelines.scan, p4 = pipelines.scatter, p5 = pipelines.contact
+        let p4 = pipelines.scatter, p5 = pipelines.contact
         let p6 = pipelines.apply, p7 = pipelines.finalize, p8 = pipelines.orient
         let p9 = pipelines.transform, p10 = pipelines.joint, p11 = pipelines.measure
         let p12 = pipelines.generate
@@ -721,6 +734,8 @@ public final class CoinDEMSolver: PenetrationProbing {
                                         options: .storageModePrivate),
             let offsets = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * (cellCount + 1),
                                          options: .storageModePrivate),
+            let blockSums = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * ((cellCount + 1023) / 1024 + 1),
+                                           options: .storageModePrivate),
             let sorted = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * maxCoins,
                                         options: .storageModePrivate),
             let btype = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * maxCoins,
@@ -798,7 +813,9 @@ public final class CoinDEMSolver: PenetrationProbing {
         self.integratePipeline = p0
         self.cellClearPipeline = p1
         self.cellCountPipeline = p2
-        self.scanPipeline = p3
+        self.blockSumsPipeline = pipelines.blockSums
+        self.blockScanPipeline = pipelines.blockScan
+        self.offsetsApplyPipeline = pipelines.offsetsApply
         self.scatterPipeline = p4
         self.contactPipeline = p5
         self.applyPipeline = p6
@@ -847,6 +864,8 @@ public final class CoinDEMSolver: PenetrationProbing {
         self.coinDeltaBuffer = delta
         self.cellCounts = counts
         self.cellOffsets = offsets
+        blockSums.label = "Coin.cellBlockSums"
+        self.cellBlockSums = blockSums
         self.sortedIndices = sorted
         penResult.label = "Coin.penResult"
         penThresh.label = "Coin.penThreshold"
@@ -1718,6 +1737,30 @@ public final class CoinDEMSolver: PenetrationProbing {
         }
     }
 
+    /// Encode the hierarchical cell-offset scan (block sums ∥ → serial scan over
+    /// BLOCKS only → per-block apply ∥). One call replaces the old single-thread
+    /// whole-grid scan, whose cost was O(cells) on one GPU lane — seconds per
+    /// substep on a house-scale grid, and the cause of the 2026-08-27 GPU
+    /// watchdog timeouts. Contract unchanged: exclusive prefix sum + grand total
+    /// in `cellOffsets[numCells]`, `cellCounts` zeroed for the scatter cursor.
+    private func encodeCellScan(_ cb: MTLCommandBuffer, label: String) {
+        dispatch(cb, blockSumsPipeline, threads: numScanBlocks, label: "\(label).blockSums") { enc in
+            enc.setBuffer(self.cellCounts, offset: 0, index: 0)
+            enc.setBuffer(self.cellBlockSums, offset: 0, index: 1)
+            enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
+        }
+        dispatch(cb, blockScanPipeline, threads: 1, label: "\(label).blockScan") { enc in
+            enc.setBuffer(self.cellBlockSums, offset: 0, index: 0)
+            enc.setBuffer(self.uniformBuffer, offset: 0, index: 1)
+        }
+        dispatch(cb, offsetsApplyPipeline, threads: numScanBlocks, label: "\(label).apply") { enc in
+            enc.setBuffer(self.cellCounts, offset: 0, index: 0)
+            enc.setBuffer(self.cellOffsets, offset: 0, index: 1)
+            enc.setBuffer(self.cellBlockSums, offset: 0, index: 2)
+            enc.setBuffer(self.uniformBuffer, offset: 0, index: 3)
+        }
+    }
+
     private func encodeSubstep(_ cb: MTLCommandBuffer, coinCount: Int) {
         // 1. integrate (predict COM)
         dispatch(cb, integratePipeline, threads: coinCount, label: "Coin.integrate") { enc in
@@ -1733,11 +1776,7 @@ public final class CoinDEMSolver: PenetrationProbing {
             enc.setBuffer(self.cellCounts, offset: 0, index: 1)
             enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
         }
-        dispatch(cb, scanPipeline, threads: 1, label: "Coin.scan") { enc in
-            enc.setBuffer(self.cellCounts, offset: 0, index: 0)
-            enc.setBuffer(self.cellOffsets, offset: 0, index: 1)
-            enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
-        }
+        encodeCellScan(cb, label: "Coin.scan")
         dispatch(cb, scatterPipeline, threads: coinCount, label: "Coin.scatter") { enc in
             enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
             enc.setBuffer(self.cellCounts, offset: 0, index: 1)
@@ -1987,11 +2026,7 @@ public final class CoinDEMSolver: PenetrationProbing {
             enc.setBuffer(self.cellCounts, offset: 0, index: 1)
             enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
         }
-        dispatch(cb, scanPipeline, threads: 1, label: "Coin.measure.scan") { enc in
-            enc.setBuffer(self.cellCounts, offset: 0, index: 0)
-            enc.setBuffer(self.cellOffsets, offset: 0, index: 1)
-            enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
-        }
+        encodeCellScan(cb, label: "Coin.measure.scan")
         dispatch(cb, scatterPipeline, threads: coinCount, label: "Coin.measure.scatter") { enc in
             enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
             enc.setBuffer(self.cellCounts, offset: 0, index: 1)
@@ -2036,11 +2071,7 @@ public final class CoinDEMSolver: PenetrationProbing {
             enc.setBuffer(self.cellCounts, offset: 0, index: 1)
             enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
         }
-        dispatch(cb, scanPipeline, threads: 1, label: "Coin.cs.scan") { enc in
-            enc.setBuffer(self.cellCounts, offset: 0, index: 0)
-            enc.setBuffer(self.cellOffsets, offset: 0, index: 1)
-            enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
-        }
+        encodeCellScan(cb, label: "Coin.cs.scan")
         dispatch(cb, scatterPipeline, threads: coinCount, label: "Coin.cs.scatter") { enc in
             enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
             enc.setBuffer(self.cellCounts, offset: 0, index: 1)

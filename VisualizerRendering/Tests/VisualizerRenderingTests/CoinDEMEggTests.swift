@@ -159,6 +159,47 @@ final class CoinDEMEggTests: XCTestCase {
         XCTAssertLessThan(r.maxY, 0.4, "the heap stays in the bin, not launched")
     }
 
+    /// HOUSE-SCALE GRID TIMING GATE — the GPU-watchdog class as a number.
+    /// A lot-sized volume at egg-diameter cells (~2.4 M cells — the exact
+    /// configuration Daydream's egg rain built for 4000 Sunset) must encode a
+    /// frame in MILLISECONDS. The original single-thread `coinCellOffsetsScan`
+    /// walked every cell serially per substep: whole seconds per command
+    /// buffer, `kIOGPUCommandBufferCallbackErrorTimeout`, negative FPS. The
+    /// hierarchical scan holds ~5–15 ms here; the 150 ms bound is ~10× slack
+    /// for slow hosts while still failing the seconds-long serial class.
+    func testHouseScaleGridFrameStaysUnderWatchdogClass() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
+        let engine = SimEngine(device: device)
+        let lib = try Self.makeLibrary(device)
+        var cfg = RigidPileField.Config(maxBodies: 160, bodyScale: 0.087,
+                                        bounds: (SIMD3(-20, -2, -20), SIMD3(20, 10, 20)))
+        cfg.floorY = 0
+        cfg.useConstraintSolver = true
+        guard let field = RigidPileField(engine: engine, library: lib, config: cfg,
+                                         colliders: [RigidPileField.floor(y: 0)]),
+              let queue = device.makeCommandQueue()  // gpu-ok: test harness queue
+        else { throw XCTSkip("field/queue init failed") }
+        print("HOUSE_GRID cells=\(field.solver.gridCellCount)")
+        XCTAssertGreaterThan(field.solver.gridCellCount, 1_500_000,
+                             "the fixture must actually be a house-scale grid")
+        var seed: UInt64 = 0x505
+        func rnd() -> Float { seed = seed &* 6364136223846793005 &+ 1; return Float(seed >> 40) / Float(1 << 24) }
+        for _ in 0..<120 {
+            field.dropEgg(at: SIMD3((rnd() - 0.5) * 30, 4 + rnd() * 5, (rnd() - 0.5) * 30),
+                          fatRadius: Self.rFat, tipRadius: Self.rTip, centerDistance: Self.dCtr,
+                          tumble: SIMD3(rnd() * 4, rnd() * 4, rnd() * 4))
+        }
+        step(field, queue, frames: 5)                       // warm-up (pipelines, first contacts)
+        let t0 = CFAbsoluteTimeGetCurrent()
+        let frames = 30
+        step(field, queue, frames: frames)                  // waits per frame — true GPU time
+        let meanMs = (CFAbsoluteTimeGetCurrent() - t0) / Double(frames) * 1000
+        print("HOUSE_GRID meanFrame=\(String(format: "%.1f", meanMs)) ms")
+        XCTAssertLessThan(meanMs, 150,
+            "a house-scale grid frame must stay in the milliseconds — the serial whole-grid "
+            + "scan class measures SECONDS here and trips the GPU watchdog in the app")
+    }
+
     /// Eggs coexist with the other shapes in ONE mixed pile — the swept-pair
     /// generalization must not regress capsules, and egg↔sphere / egg↔box /
     /// egg↔capsule contacts all resolve.

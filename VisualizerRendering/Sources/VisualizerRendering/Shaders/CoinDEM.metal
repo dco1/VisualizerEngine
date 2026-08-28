@@ -564,21 +564,68 @@ kernel void coinCellCount(
     atomic_fetch_add_explicit(&cellCounts[cell], 1u, memory_order_relaxed);
 }
 
-kernel void coinCellOffsetsScan(
-    device uint*           cellCounts  [[ buffer(0) ]],
-    device uint*           cellOffsets [[ buffer(1) ]],
-    constant CoinUniforms& u           [[ buffer(2) ]],
+// ── Cell-offset prefix sum — HIERARCHICAL, not serial ─────────────────────────
+// The original coinCellOffsetsScan was one GPU thread walking EVERY cell. At bin
+// scale (thousands of cells) that was invisible; at HOUSE scale (Daydream's egg
+// rain: a lot-sized volume ⇒ millions of cells) the single latency-bound lane
+// took whole seconds per substep and tripped the GPU watchdog
+// (kIOGPUCommandBufferCallbackErrorTimeout — measured, 2026-08-27). Three-phase
+// scan instead: parallel per-block sums, ONE short serial pass over the block
+// sums (cells/1024 iterations — thousands, not millions), parallel per-block
+// offset apply. Same output contract as before: cellOffsets is the exclusive
+// prefix sum with the grand total in cellOffsets[totalCells], and cellCounts is
+// zeroed for reuse as coinScatter's write cursor.
+constant uint CD_SCAN_BLOCK = 1024u;
+
+kernel void coinCellBlockSums(
+    device const uint*     cellCounts [[ buffer(0) ]],
+    device uint*           blockSums  [[ buffer(1) ]],
+    constant CoinUniforms& u          [[ buffer(2) ]],
+    uint gid [[ thread_position_in_grid ]])
+{
+    uint total = u.gridResX * u.gridResY * u.gridResZ;
+    uint start = gid * CD_SCAN_BLOCK;
+    if (start >= total) return;
+    uint end = min(start + CD_SCAN_BLOCK, total);
+    uint s = 0;
+    for (uint i = start; i < end; ++i) s += cellCounts[i];
+    blockSums[gid] = s;
+}
+
+kernel void coinCellBlockScan(
+    device uint*           blockSums [[ buffer(0) ]],
+    constant CoinUniforms& u         [[ buffer(1) ]],
     uint gid [[ thread_position_in_grid ]])
 {
     if (gid != 0) return;
     uint total = u.gridResX * u.gridResY * u.gridResZ;
+    uint blocks = (total + CD_SCAN_BLOCK - 1u) / CD_SCAN_BLOCK;
     uint sum = 0;
-    for (uint i = 0; i < total; ++i) {
-        cellOffsets[i] = sum;
-        sum += cellCounts[i];
+    for (uint b = 0; b < blocks; ++b) {
+        uint t = blockSums[b];
+        blockSums[b] = sum;
+        sum += t;
+    }
+}
+
+kernel void coinCellOffsetsApply(
+    device uint*           cellCounts  [[ buffer(0) ]],
+    device uint*           cellOffsets [[ buffer(1) ]],
+    device const uint*     blockSums   [[ buffer(2) ]],
+    constant CoinUniforms& u           [[ buffer(3) ]],
+    uint gid [[ thread_position_in_grid ]])
+{
+    uint total = u.gridResX * u.gridResY * u.gridResZ;
+    uint start = gid * CD_SCAN_BLOCK;
+    if (start >= total) return;
+    uint end = min(start + CD_SCAN_BLOCK, total);
+    uint run = blockSums[gid];
+    for (uint i = start; i < end; ++i) {
+        cellOffsets[i] = run;
+        run += cellCounts[i];
         cellCounts[i] = 0;   // reused as write cursor by coinScatter
     }
-    cellOffsets[total] = sum;
+    if (end == total) cellOffsets[total] = run;   // the tail block owns the grand total
 }
 
 kernel void coinScatter(
