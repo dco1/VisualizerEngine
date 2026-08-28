@@ -505,6 +505,26 @@ public struct IlluminatoramaFrameUniforms {
     public var interiorRoomGain7: SIMD4<Float> = .one
     public var interiorRoomGainMeta: SIMD4<Float> = .zero   // x = enabled
 
+    // ── Photographic finish: highlight chroma roll-off + split tone ──────────
+    /// Fades chroma out as a pixel approaches white. ACES desaturates toward white
+    /// on its own, but `tonemapSaturation` is a FLAT `mix(luma, colour, S)` — it
+    /// pushes that chroma straight back out, which is how a lamp-lit wooden wall
+    /// clips to saturated yellow instead of a pale warm white. 0 (default) ⇒ the
+    /// tonemap branch never runs ⇒ byte-identical for every scene that never opts in.
+    public var highlightChromaRolloff: Float = 0
+    /// Split-tone temperature of the SHADOW end, in Kelvin, through the same
+    /// `whiteBalanceGain` curve the global white balance uses (luma-normalized, so it
+    /// tints without dimming) under a low-luma mask. 6500 (default) = gain (1,1,1) =
+    /// exact no-op. Above 6500 cools the shadows — the archviz separation that gives
+    /// warm practicals something to read against.
+    public var shadowTemperatureK: Float = 6500
+    /// Split-tone temperature of the HIGHLIGHT end. 6500 (default) = exact no-op.
+    /// Pairs with `highlightChromaRolloff`: roll the scene's own chroma off as it
+    /// approaches white, then put back a controlled amount of warmth.
+    /// ONE new 16-byte cluster (stride 1536 → 1552); mirror of the Metal `FrameUniforms`.
+    public var highlightTemperatureK: Float = 6500
+    public var _padPhotoFinish: Float = 0
+
     /// Fill the eight gain vectors from a flat 32-entry table, and stamp the enable.
     public mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
         let p = InteriorRoomGains.pack(gains, enabled: enabled)

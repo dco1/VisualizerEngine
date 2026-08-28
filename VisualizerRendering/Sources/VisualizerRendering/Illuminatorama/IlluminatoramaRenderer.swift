@@ -1358,6 +1358,31 @@ public final class IlluminatoramaRenderer {
     public var highlights: Float = 1.0
     /// Contrast about mid-grey 0.18, ~0.7–1.3. 1.0 = no-op. Post-tonemap curve.
     public var contrast: Float = 1.0
+
+    // ── Photographic finish (the two things a flat saturation multiply undoes) ──
+    /// **Highlight chroma roll-off** — how much a pixel's chroma fades as it
+    /// approaches white, 0…1. 0 = OFF (default) → an exact shader no-op.
+    ///
+    /// ACES already desaturates toward white; `tonemapSaturation` then pushes that
+    /// chroma back out with a `mix(luma, colour, S)` that is FLAT in luminance, so
+    /// the two fight and the bright end keeps full saturation. That is what makes a
+    /// lamp-lit wooden wall or a sunlit render clip to a saturated block of colour
+    /// rather than to the pale warm white a camera gives. This restores the roll-off
+    /// WITHOUT giving up the midtone chroma the saturation multiplier is there for.
+    public var highlightChromaRolloff: Float = 0
+    /// **Split tone, shadow end** — colour temperature (Kelvin) applied to the low-luma
+    /// end through the same `whiteBalanceGain` curve as the global white balance
+    /// (luma-normalized: it tints, it does not dim). 6500 = neutral (default) → an
+    /// exact no-op. ABOVE 6500 cools the shadows, which is what gives warm practical
+    /// lights something to contrast against instead of every tone sitting in one
+    /// warm universe.
+    public var shadowTemperatureK: Float = 6500
+    /// **Split tone, highlight end** — the same, masked to the high-luma end.
+    /// 6500 = neutral (default) → an exact no-op. Below 6500 keeps highlights warm;
+    /// pair it with `highlightChromaRolloff` for the photographic combination —
+    /// the scene's own chroma rolls off toward white, and a controlled amount of
+    /// warmth goes back in.
+    public var highlightTemperatureK: Float = 6500
     /// Opt-in hex-stochastic anti-tiling strength [0,1]. **Default 0 = OFF**, which
     /// is a hard no-op: the G-buffer shader short-circuits every textured sample to a
     /// single plain read, so scenes that leave this at 0 render byte-for-byte
@@ -12045,6 +12070,12 @@ public final class IlluminatoramaRenderer {
         // Scotopic (Purkinje) night desaturation. 0 (default) ⇒ the tonemap branch
         // never runs ⇒ byte-identical; hosts fade it in with their night blend.
         u.scotopicDesaturation = max(0, scotopicDesaturation)
+        // Photographic finish — highlight chroma roll-off + split tone. 0 / 6500 /
+        // 6500 (the defaults) make every branch an exact no-op, so Visualizer and any
+        // scene that never opts in is byte-identical.
+        u.highlightChromaRolloff = max(0, min(1, highlightChromaRolloff))
+        u.shadowTemperatureK = max(1000, min(20000, shadowTemperatureK))
+        u.highlightTemperatureK = max(1000, min(20000, highlightTemperatureK))
         // Interior day-light separation. Mask 0 (default) ⇒ the kernel's factors stay
         // exactly 1.0 ⇒ byte-identical for every scene that never opts in.
         u.interiorMask = interiorLayerMask

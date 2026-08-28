@@ -428,6 +428,28 @@ struct FrameUniforms {
     // IlluminatoramaFrameUniforms.interiorRoomGain0…7 + interiorRoomGainMeta.
     float4   interiorRoomGain[8];   // 32 room gains, bit b at [b >> 2][b & 3]
     float4   interiorRoomGainMeta;  // x = enabled (0 = off); yzw unused
+    // ── Photographic finish: highlight chroma roll-off + split tone ──────────
+    // Two things a real camera does that a flat post-tonemap saturation multiply
+    // undoes, applied at the very end of the tone chain in the display (0..1)
+    // domain.
+    //
+    // `highlightChromaRolloff` fades chroma out as a pixel approaches white.
+    // ACES already desaturates toward white, but `tonemapSaturation`'s
+    // `mix(luma, colour, S)` is FLAT in luminance, so it pushes that chroma
+    // straight back out — which is why a lamp-lit wooden wall clips to saturated
+    // yellow instead of a pale warm white. 0 (default) ⇒ the branch never runs.
+    //
+    // `shadowTemperatureK` / `highlightTemperatureK` are a split tone: the same
+    // `whiteBalanceGain` curve the global white balance uses, applied through a
+    // luma mask so the two ends of the scale can sit at different temperatures
+    // (the classic cool-shadow / warm-highlight separation). 6500 on both
+    // (default) ⇒ both gains are exactly (1,1,1) and the branch never runs.
+    // ONE new 16-byte cluster (stride 1536 → 1552); mirror of the Swift
+    // IlluminatoramaFrameUniforms.
+    float    highlightChromaRolloff;  // 0 = off
+    float    shadowTemperatureK;      // 6500 = no-op
+    float    highlightTemperatureK;   // 6500 = no-op
+    float    _padPhotoFinish;
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift

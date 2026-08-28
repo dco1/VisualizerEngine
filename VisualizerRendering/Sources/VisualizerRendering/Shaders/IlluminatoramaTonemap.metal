@@ -769,6 +769,38 @@ fragment float4 illumi_tonemap_fs(
     // = 1.0) make this an exact no-op.
     mapped = saturate(toneCurve(mapped, frame.contrast, frame.shadows, frame.highlights));
 
+    // ── Photographic finish: highlight chroma roll-off ────────────────────────
+    // A camera's brightest values lose colour on the way to white — dye layers and
+    // sensor channels clip in turn, so a hot warm surface arrives as pale cream, not
+    // as saturated yellow. ACES gives us that for free, and then the FLAT
+    // `tonemapSaturation` multiply above takes it straight back out (it lerps away
+    // from luma by the same factor at 0.95 as at 0.2). Roll the chroma back off, but
+    // only at the top of the scale, so the midtone chroma that multiply exists for
+    // survives. 0 (DEFAULT) ⇒ the branch never runs ⇒ byte-identical.
+    if (frame.highlightChromaRolloff > 0.0) {
+        float hl = dot(mapped, float3(0.2126, 0.7152, 0.0722));
+        // Weight starts at mid-grey and reaches full at white, so a correctly-exposed
+        // midtone is untouched and only the shoulder loses colour.
+        float w = smoothstep(0.45, 1.0, hl) * frame.highlightChromaRolloff;
+        mapped = max(mix(mapped, float3(hl), w), 0.0);
+    }
+    // ── Photographic finish: split tone (shadow / highlight temperature) ──────
+    // Two temperatures on one image, masked by luma. Real interiors read as
+    // photographs partly because their shadows are lit by a DIFFERENT illuminant
+    // from their highlights (skylight in the shadow, tungsten in the pool), and a
+    // renderer whose whole frame rides one white balance has no way to say that.
+    // Reuses `whiteBalanceGain` — the same curve as the global control, normalized to
+    // unit luma, so this shifts hue without changing exposure. 6500/6500 (DEFAULTS)
+    // ⇒ both gains are exactly (1,1,1) ⇒ the branch never runs ⇒ byte-identical.
+    if (frame.shadowTemperatureK != 6500.0 || frame.highlightTemperatureK != 6500.0) {
+        float sl = dot(mapped, float3(0.2126, 0.7152, 0.0722));
+        float shadowW = 1.0 - smoothstep(0.0, 0.5, sl);
+        float highW   = smoothstep(0.5, 1.0, sl);
+        float3 g = mix(float3(1.0), whiteBalanceGain(frame.shadowTemperatureK), shadowW)
+                 * mix(float3(1.0), whiteBalanceGain(frame.highlightTemperatureK), highW);
+        mapped = saturate(mapped * g);
+    }
+
     // ── Axial chromatic aberration ("purple fringing") ────────────────────────
     // Longitudinal CA: a real lens focuses wavelengths at slightly different
     // depths, so high-contrast edges grow a coloured halo — classically violet on
