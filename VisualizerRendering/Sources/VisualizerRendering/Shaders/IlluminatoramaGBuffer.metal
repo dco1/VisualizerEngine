@@ -458,6 +458,10 @@ fragment GBufferOut illumi_fs(
     // .color)) actually paints the fragment. SceneKit convention is
     // multiplicative: vertex colour and material diffuse compose.
     albedo *= in.vertexColor.rgb;
+    // Per-INSTANCE macro tone (the MACRO tier — a slight achromatic per-object lighten/darken so
+    // two pieces wearing the same material id don't read as the same pixels twice). Identity (1)
+    // by default ⇒ an exact no-op for every instance and host that never opts in.
+    albedo *= inst.macroTone;
 
     float metallic = inst.metallic;
     if (inst.metallicTextureSlice >= 0) {
@@ -501,6 +505,10 @@ fragment GBufferOut illumi_fs(
         // surface between them. Survives mip filtering (see the sample site above).
         roughness = saturate(roughness + inst.detailRoughnessStrength * (1.0 - detailOcc));
     }
+
+    // Per-INSTANCE macro roughness drift — the MACRO tier's companion to `macroTint`: a
+    // slightly more/less worn surface per object. 0 by default ⇒ an exact no-op.
+    roughness = saturate(roughness + inst.macroRoughnessDelta);
 
     // ── World-space wood knots: the branch, drawn on top of the wood it grew through ──────
     // Placed after roughness so both channels are in hand, and expressed as a modification of

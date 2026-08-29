@@ -667,12 +667,22 @@ struct Instance {
     //   z = darkness of the core against the wood it grew through, [0,1]
     //   w = fraction of lattice cells that carry a knot
     float4   woodKnots;
+    // ── Per-INSTANCE (per-object) macro material variation ────────────────────────
+    // NEW 16-byte cluster (offsets 288-303): two floats + 8 bytes pad, stride 288 -> 304.
+    // Two placed pieces wearing the SAME material id share one atlas slice and one mesh, so
+    // without a per-instance channel they render the identical texels ("two nightstands are
+    // the same pixels twice"). macroTone is an ACHROMATIC multiplier on the FINAL albedo (post
+    // atlas + vertex colour); macroRoughnessDelta adds to the resolved roughness. Both identity
+    // (1 / 0) by default, so a host that never opts in — every Visualizer scene — is
+    // byte-identical.
+    float    macroTone;
+    float    macroRoughnessDelta;
 };
 
 // The Swift mirror (`IlluminatoramaInstance._assertStride240`) has always asserted this
 // side of the contract; this is the other side, and it costs a compile. A Swift field
 // added without its Metal twin used to be caught only by a wrong-looking render.
-static_assert(sizeof(Instance) == 288, "Instance must match IlluminatoramaInstance (288 bytes)");
+static_assert(sizeof(Instance) == 304, "Instance must match IlluminatoramaInstance (304 bytes)");
 
 struct Vertex {
     float3 position;

@@ -988,6 +988,27 @@ public struct IlluminatoramaInstance {
     ///   w = fraction of lattice cells that carry a knot
     public var woodKnots: SIMD4<Float> = .zero
 
+    // ── Per-INSTANCE (per-object) macro material variation ─────────────────────
+    // NEW 16-byte cluster (offsets 288-303): two floats + 8 bytes pad, stride 288 -> 304.
+    //
+    // The MACRO tier of the material system. Two placed pieces that wear the SAME baked
+    // material id share ONE atlas slice and ONE registered mesh, so without a per-instance
+    // channel they render the identical texels through the identical UVs — "two nightstands
+    // are the same pixels twice". The meso/micro bands (grain, pores, detail relief) live in
+    // the baked texture and so are shared too; only a per-INSTANCE term can break the
+    // object-to-object repeat.
+    //
+    // `macroTone` is an ACHROMATIC multiplier on the FINAL albedo (AFTER the atlas sample and
+    // the per-vertex colour), so it works whether the material is textured or flat and shifts
+    // the piece LIGHTER/DARKER without ever changing hue (a hue shift would read as a different
+    // finish, not the same finish cut from a different board). `macroRoughnessDelta` is added
+    // to the resolved roughness. Both identity by default — 1 and 0 — so Visualizer and every
+    // instance that never opts in is byte-identical. Hosts seed these off the element's own
+    // stable id (never `hashValue`, which reseeds per process), so the variation is document
+    // state: stable across save/load and identical in the app and in every headless capture.
+    public var macroTone: Float = 1
+    public var macroRoughnessDelta: Float = 0
+
     public init(
         modelMatrix: simd_float4x4,
         albedo: SIMD3<Float> = SIMD3(0.8, 0.8, 0.8),
@@ -1023,7 +1044,7 @@ public struct IlluminatoramaInstance {
     /// Compile-time guard: Swift and Metal structs must agree on 272 bytes.
     /// If this fires, either a Swift field was added without the matching Metal
     /// field (or vice versa), or alignment changed unexpectedly.
-    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 288, "IlluminatoramaInstance stride must be 288") }()
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 304, "IlluminatoramaInstance stride must be 304") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //
