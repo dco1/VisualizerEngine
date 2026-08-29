@@ -1674,16 +1674,18 @@ public final class IlluminatoramaRenderer {
     /// The shipping default for ``dfgUseIBLGeometryRemap``. Named so the decision is
     /// greppable and reversible in one line.
     ///
-    /// **`false` — the HISTORICAL, SHIPPING behaviour** (`k = (roughness+1)²/8`), i.e. the
-    /// LUT every frame both apps have ever rendered was baked with. It stays the default
-    /// deliberately: S1.6 measured the corrected bake but did NOT adopt it.
+    /// **`true` — the CORRECTED split-sum bake** (`k = α/2`, the geometry remap the IBL
+    /// integral actually needs), adopted 2026-08-28 on Danny's ruling (DH-0366, answered
+    /// 2026-08-25: *"Yes, switch to the corrected formula"*). Before this it was `false` —
+    /// the historical `k = (roughness+1)²/8` bake that under-reported the lobe's directional
+    /// albedo and darkened specular IBL on every polished surface, worst at low roughness /
+    /// grazing angles (grazing `Ess` 0.536 → 0.967). The gain lands on dielectrics — marble
+    /// +53.9 %, concrete +55.4 %, matte-black +25.4 % in isolated specular IBL — not metals
+    /// (chrome +2.4 %, invisible; S1.3b multi-scatter already saturates bright metals).
     ///
-    /// **Flipping this to `true` is a LOOK CHANGE, not a bug fix landing.** It brightens
-    /// specular IBL on every polished surface — metals, marble, gloss, glazing — in BOTH
-    /// Daydream Home and Visualizer, at once, with no per-app opt-out. That is Danny's call
-    /// to make and it has not been made; until it is, the corrected arm is reachable for
-    /// measurement only (set ``dfgUseIBLGeometryRemap`` directly, or `VIZ_ILLUMI_DFG_IBL_K=1`),
-    /// which is what lets one binary render both arms side by side.
+    /// **This is a LOOK CHANGE across BOTH host apps at once**, no per-app opt-out — set
+    /// `false` (or `VIZ_ILLUMI_DFG_IBL_K=0`) to render the historical arm for an A/B. The
+    /// exterior measurements below are the record Danny ruled on.
     ///
     /// **Both host apps have now measured an exterior, and they agree on the verdict while
     /// disagreeing on the mechanism — which is worth knowing before anyone re-opens this.**
@@ -1707,9 +1709,10 @@ public final class IlluminatoramaRenderer {
     /// all. **The mover is foliage.** A leaf card is a big rough dielectric, which is exactly
     /// what this remap lifts, and looked at 2× the crown picks up a cool blue-grey sky sheen
     /// and loses its green. That IS Visualizer's veiling glare, arriving through the trees
-    /// instead of the grass. **Recommendation unchanged: do not flip it.** Published
+    /// instead of the grass. The S1.6 recommendation was "do not flip it"; Danny overruled
+    /// it 2026-08-28 (DH-0366) in favour of the physically-correct bake. Published
     /// `s16-dfg-exterior`, `s16-dfg-canopy`.
-    public nonisolated static let dfgIBLGeometryRemapDefault = false
+    public nonisolated static let dfgIBLGeometryRemapDefault = true
 
     /// The baked split-sum DFG LUT (RG16F, `x` = F0 scale, `y` = bias, keyed on
     /// (NdotV, roughness) over (0,1]). Exposed read-only so a gate can measure the
