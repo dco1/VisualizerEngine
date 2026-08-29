@@ -36,6 +36,22 @@ public struct TextureAudit: Equatable, Sendable {
     /// brightness, so a legitimately dark material (velvet) isn't penalized for the
     /// small absolute luma spread that darkness alone imposes.
     public var lumaMean: Double
+    /// **Albedo↔roughness structural correlation (DH-0460).** Signed Pearson correlation
+    /// of the HIGH-PASSED albedo-luma and roughness fields — the two channels' *structure*,
+    /// with the broad independent drifts (board tone, `linen`'s low-frequency roughness
+    /// patches) removed by `structuralHighPassLevels` of box low-pass first.
+    ///
+    /// **Why this exists.** `roughnessStdDev` already fails a FLAT roughness map, but a map that
+    /// varies by its own low-frequency noise field passes it while still reading as "the same
+    /// varnished plastic everywhere": in a real material the same physical structure that draws
+    /// the albedo (oak's earlywood pore band, paint's roller texture) also draws the specular
+    /// response, so the highlight has the surface's grain in it. `|corr|` near 0 means the two
+    /// channels share no structure; a value toward ±1 means the grain that is visible in the
+    /// colour is also visible in the reflection. The SIGN is physical and not judged — oak's
+    /// dark latewood is also its rougher band (negative), a pore both darkens and roughens.
+    ///
+    /// 0 when either high-passed channel is effectively flat (no structure to correlate).
+    public var albedoRoughnessCorr: Double = 0
     /// The material family being audited. Carried because two of the tells are DIELECTRIC
     /// SURFACE tells, not universal ones — see `flatnessIsCorrect`. Defaulted so every existing
     /// construction site keeps compiling.
@@ -48,6 +64,17 @@ public struct TextureAudit: Equatable, Sendable {
     public static let seamCeiling     = 3.0     // above → the wrap reads as a seam
     public static let normalTolerance = 1e-3
     public static let grainFloor      = 0.5     // below → grain direction is incoherent
+    /// Box low-pass octaves removed before the albedo↔roughness correlation is taken, so the
+    /// metric sees only the shared STRUCTURE band (grain/weave/tooth) and not the broad,
+    /// legitimately-independent drifts (board tone, a cushion's low-frequency roughness patches).
+    /// 3 removes everything coarser than 2³ = 8 texels; the grain and weave bands survive.
+    public static let structuralHighPassLevels = 3
+    /// **|corr| a category that MUST share structure has to clear.** Below → the roughness map
+    /// is drawn from its own noise field, decoupled from the grain that draws the colour
+    /// (DH-0460). Deliberately modest: even a real wood only puts a fraction of its grain into
+    /// the finish, so this catches "roughness is a totally separate field", not "roughness could
+    /// track the grain harder". Tuned against the shipped library (see `MaterialCorrelationTests`).
+    public static let correlationFloor = 0.15
 
     /// **The one family for which "dead flat, single colour" is CORRECT.** A mirror is silvered
     /// plate: uniform roughness and uniform albedo are what make it a mirror, and the only way to
@@ -87,6 +114,29 @@ public struct TextureAudit: Equatable, Sendable {
         flatnessIsCorrect || category == .paint || category == .metal
     }
 
+    /// **The families for which the colour's structure MUST drive the finish's structure**
+    /// (DH-0460). A grained solid — wood and its laminate print — has one physical structure
+    /// (the growth ring, the pore band) that produces both channels; roughness drawn from an
+    /// independent field is the defect this catches. Everything else is left exempt for now, not
+    /// because its roughness *should* be decoupled but because whether it does is a per-generator
+    /// judgement the ranking is meant to settle first (paint's roller tooth, plaster's trowel,
+    /// fabric's weave are the filed follow-ups) — the gate binds only where the physics is
+    /// unambiguous, exactly as `flatColorIsCorrect` scopes the tone tell. Flat/near-flat
+    /// materials (mirror, glass, a legitimately smooth metal) have no structure to correlate and
+    /// are covered by `correlationIsMeasurable`.
+    public var expectsCorrelatedRoughness: Bool {
+        category == .wood || category == .laminate
+    }
+    /// True only when BOTH channels actually carry high-passed structure — otherwise |corr| is
+    /// undefined (0) and must not be read as a decoupling failure. `audit` reports 0 in that case.
+    public var correlationIsMeasurable: Bool { abs(albedoRoughnessCorr) > 1e-9 }
+    /// A grained material whose finish structure is decoupled from its colour structure (tell —
+    /// DH-0460). Scoped to `expectsCorrelatedRoughness`; measured, not assumed.
+    public var roughnessDecoupled: Bool {
+        expectsCorrelatedRoughness && correlationIsMeasurable
+            && abs(albedoRoughnessCorr) < Self.correlationFloor
+    }
+
     public var roughnessIsFlat: Bool { !flatnessIsCorrect && roughnessStdDev < Self.roughnessFloor }
     /// Dead flat single color, judged on the coefficient of variation (brightness-fair).
     public var isFlatColor: Bool {
@@ -97,7 +147,7 @@ public struct TextureAudit: Equatable, Sendable {
 
     public var isPlausible: Bool {
         albedoOutOfRange == 0 && !roughnessIsFlat && !isFlatColor && !isSeamy
-            && normalsAreUnit && !missingGrain && lobesInRange
+            && normalsAreUnit && !missingGrain && lobesInRange && !roughnessDecoupled
     }
 
     @inlinable static func luma(_ c: Vec3) -> Double { 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z }
@@ -165,11 +215,65 @@ public struct TextureAudit: Equatable, Sendable {
         let missingGrain = (expectsGrain && !hasGrain) || (hasGrain && coherence < Self.grainFloor)
         let lobesInRange = (0...1).contains(ch.clearcoat) && (0...1).contains(ch.sheen)
 
+        // albedo↔roughness structural correlation (DH-0460): high-pass both channels to the
+        // shared structure band, then take their signed Pearson correlation.
+        let hpLuma = highPass(lumaField, size: n, levels: structuralHighPassLevels)
+        let hpRough = highPass(ch.roughness, size: n, levels: structuralHighPassLevels)
+        let corr = pearson(hpLuma, hpRough)
+
         return TextureAudit(size: n, albedoOutOfRange: outOfRange, roughnessStdDev: roughSD,
                             macroContrast: macroSD, seamScoreX: seam(horizontal: true),
                             seamScoreY: seam(horizontal: false), normalUnitError: normErr,
                             expectsGrain: expectsGrain, grainCoherence: coherence,
                             missingGrain: missingGrain, lobesInRange: lobesInRange,
-                            lumaMean: lumaMean, category: ch.category)
+                            lumaMean: lumaMean, albedoRoughnessCorr: corr,
+                            category: ch.category)
+    }
+
+    /// The high-frequency residual of a square toroidal field: `field − upsample(box-decimate
+    /// `levels` times)`, i.e. everything FINER than `2^levels` texels. Same 2×2 box-decimation
+    /// as `MaterialScaleAudit.octaveVariances`, so the two auditors band the field identically.
+    static func highPass(_ field: [Double], size: Int, levels: Int) -> [Double] {
+        guard size > 1, field.count == size * size, levels > 0 else { return field }
+        var cur = field
+        var n = size
+        var lv = 0
+        while n > 1 && lv < levels {
+            let half = n / 2
+            var down = [Double](repeating: 0, count: half * half)
+            for y in 0..<half {
+                for x in 0..<half {
+                    let a = cur[(2 * y) * n + 2 * x], b = cur[(2 * y) * n + 2 * x + 1]
+                    let c = cur[(2 * y + 1) * n + 2 * x], d = cur[(2 * y + 1) * n + 2 * x + 1]
+                    down[y * half + x] = (a + b + c + d) * 0.25
+                }
+            }
+            cur = down
+            n = half
+            lv += 1
+        }
+        // Nearest-upsample the low-pass back to full resolution (block replicate) and subtract.
+        let scale = size / n
+        var out = [Double](repeating: 0, count: size * size)
+        for y in 0..<size {
+            for x in 0..<size {
+                out[y * size + x] = field[y * size + x] - cur[(y / scale) * n + (x / scale)]
+            }
+        }
+        return out
+    }
+
+    /// Signed Pearson correlation of two equal-length fields; 0 when either is flat.
+    static func pearson(_ a: [Double], _ b: [Double]) -> Double {
+        guard a.count == b.count, a.count > 1 else { return 0 }
+        let cnt = Double(a.count)
+        let ma = a.reduce(0, +) / cnt, mb = b.reduce(0, +) / cnt
+        var cov = 0.0, va = 0.0, vb = 0.0
+        for i in a.indices {
+            let da = a[i] - ma, db = b[i] - mb
+            cov += da * db; va += da * da; vb += db * db
+        }
+        guard va > 1e-18, vb > 1e-18 else { return 0 }
+        return cov / (va * vb).squareRoot()
     }
 }
