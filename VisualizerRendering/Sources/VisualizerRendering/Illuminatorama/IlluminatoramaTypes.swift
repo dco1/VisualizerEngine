@@ -1009,6 +1009,20 @@ public struct IlluminatoramaInstance {
     public var macroTone: Float = 1
     public var macroRoughnessDelta: Float = 0
 
+    /// **Per-INSTANCE UV phase** (DH-0475) — a translation, in tile-UV units, added to the UV that
+    /// every MATERIAL sample reads (the same `matUV` the wood-knot warp displaces), so two placed
+    /// pieces that share ONE baked slice and ONE mesh don't show the same GRAIN figure in the same
+    /// place. `macroTone`/`macroRoughnessDelta` shift a twin lighter/darker or rougher; this shifts
+    /// WHICH part of the tiling material it's cut from — the same finish, a different board.
+    ///
+    /// It rides in the 8 bytes that were trailing padding, so the struct stride is UNCHANGED (304)
+    /// and `.zero` (the default) is an exact shader no-op: every non-opting instance — every
+    /// Visualizer scene — is byte-identical. Only translation, never rotation: furniture wood grain
+    /// is directional, so an offset relocates the figure while keeping the grain running along the
+    /// board, whereas a rotation would twist it off-axis and read as a defect. Because the material
+    /// tiles seamlessly under the hardware `repeat` sampler, any offset is seam-free.
+    public var uvPhase: SIMD2<Float> = .zero
+
     public init(
         modelMatrix: simd_float4x4,
         albedo: SIMD3<Float> = SIMD3(0.8, 0.8, 0.8),

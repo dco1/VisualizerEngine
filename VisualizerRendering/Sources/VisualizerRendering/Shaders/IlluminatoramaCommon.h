@@ -677,6 +677,11 @@ struct Instance {
     // byte-identical.
     float    macroTone;
     float    macroRoughnessDelta;
+    // DH-0475 — per-INSTANCE UV phase (translation, tile-UV units) added into `matUV` so two
+    // pieces sharing one slice + one mesh don't show the same GRAIN figure in the same place.
+    // Fills the 8 bytes that were trailing pad, so stride stays 304; `float2(0)` is an exact
+    // no-op (identical to every existing scene). Mirrors `IlluminatoramaInstance.uvPhase`.
+    float2   uvPhase;
 };
 
 // The Swift mirror (`IlluminatoramaInstance._assertStride240`) has always asserted this

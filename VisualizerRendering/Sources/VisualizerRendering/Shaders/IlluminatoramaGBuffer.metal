@@ -320,8 +320,16 @@ fragment GBufferOut illumi_fs(
     //
     // `in.uv` itself is kept for the things that must NOT move with the warp: the plank-cell
     // hash (a board index cannot slide), the soil marker, and the derivatives.
+    //
+    // DH-0475 — `inst.uvPhase` is a per-INSTANCE translation (tile-UV units) folded into the SAME
+    // `matUV` seam: two pieces that share one baked slice and one mesh sample the tiling material
+    // at different phases, so identical wood twins don't show the same grain figure in the same
+    // place. `float2(0)` — the default and every non-opting instance — leaves `matUV == in.uv`.
+    // It rides on `matUV` (not `in.uv`), so it moves the figure without sliding the plank-cell
+    // grid or the soil marker; the derivatives above are taken from the un-phased `in.uv`, which
+    // is correct because a constant offset has zero screen-space derivative.
     WoodKnotSample knot = sampleWoodKnots(in.uv, inst.woodKnots, inst.patternCells);
-    float2 matUV = in.uv + knot.warp;
+    float2 matUV = in.uv + knot.warp + inst.uvPhase;
 
     // Phase 4.5 — tangent-space normal-map sampling. The atlas is the
     // same `bgra8Unorm` non-colour atlas as metallic/roughness; the
