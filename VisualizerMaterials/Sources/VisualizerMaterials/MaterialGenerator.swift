@@ -2715,8 +2715,21 @@ public enum MaterialGenerator {
         return ch
     }
 
+    /// The colourway a bare `matteBlack()` bakes — the near-neutral powder-coat black, luma 0.10
+    /// with the historical faint-warm tint (×0.98 green, ×0.96 blue). Declared once so the
+    /// registry's `matte-black` default and the generator's default `color:` cannot drift apart.
+    public static let matteBlackDefaultColor = Vec3(0.10, 0.098, 0.096)
+
     /// Matte black — powder-coat / anodized finish. Deep absorptive, micro-textured.
-    public static func matteBlack(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 117) -> MaterialChannels {
+    ///
+    /// `color` is a **colourway** (DH-0470): it drives the albedo ONLY. A powder coat's life is
+    /// its orange-peel tooth and its roughness field, and those are the SAME finish whatever the
+    /// pigment — a white, bronze or sage powder-coat is cast and cured exactly like the black one.
+    /// So the roughness field and the cast micro-relief below are identical for every colour, and
+    /// only the albedo follows `color`. Bare `matteBlack()` bakes the historical black bit-for-bit
+    /// (`matteBlackDefaultColor` is the old `Vec3(luma, luma*0.98, luma*0.96)` mean).
+    public static func matteBlack(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 117,
+                                  color: Vec3 = MaterialGenerator.matteBlackDefaultColor) -> MaterialChannels {
         var ch = MaterialChannels(size: size, category: .metal)
         let sh = seed
         for y in 0..<size {
@@ -2740,12 +2753,15 @@ public enum MaterialGenerator {
                 //
                 // Same treatment as `paint`: the variance moves OUT of tone and stays in
                 // roughness (untouched below, ±0.22 micro / ±0.10 coat) and in the relief
-                // normal. Centred on 0.10 — the exact mean of the old range — so the
-                // material's overall darkness is unchanged; the residual ±0.15 % is a
-                // whisper that keeps the bake off a mathematically dead flat fill without
-                // being visible (well under one 8-bit code value at this luminance).
-                let luma = clampBand(0.10 + (micro - 0.5) * 0.002 + (coat - 0.5) * 0.001)
-                ch.albedo[ch.idx(x, y)] = Vec3(luma, luma * 0.98, luma * 0.96)
+                // normal. The residual ±0.15 % tone whisper keeps the bake off a
+                // mathematically dead flat fill without being visible (well under one 8-bit
+                // code value at the black's luminance). It is applied MULTIPLICATIVELY so it
+                // scales with the chosen colourway rather than being a fixed black offset —
+                // a white powder-coat gets the same ±1.5 % relative whisper, not a ±0.0015
+                // one that would vanish against a 0.85 base. At the default black this is the
+                // historical `0.10 + micro*0.002 + coat*0.001`.
+                let toneVar = (micro - 0.5) * 0.002 + (coat - 0.5) * 0.001
+                ch.albedo[ch.idx(x, y)] = clampBand(color * (1.0 + toneVar / 0.10))
                 ch.roughness[ch.idx(x, y)] = clamp01(0.68 + (micro - 0.5) * 0.22
                     + (coat - 0.5) * 0.10)
                 ch.height[ch.idx(x, y)] = clamp01(0.50 + (micro - 0.5) * 0.10)
