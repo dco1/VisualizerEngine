@@ -1000,7 +1000,9 @@ fragment GBufferOut illumi_fs(
     // a solid per-instance colour, exactly like Drop+'s flat diffuse.
     // Drop+'s clearcoat (0.55 / cc-rough 0.18) has no Illuminatorama analog;
     // the 0.18 glossy floor of the roughness mottle approximates the glaze.
-    if (in.vertexColor.a > 0.6 && in.vertexColor.a < 0.9) {
+    // Lower bound raised 0.6 → 0.66 to leave the (0.60, 0.66] sub-band to the lamp
+    // shade fabric (DH-0458), which must NOT pick up the sausage wet-glaze look.
+    if (in.vertexColor.a > 0.66 && in.vertexColor.a < 0.9) {
         // Build a CONTINUOUS tangent frame from the surface normal.
         // Previous version used a hard branch on abs(n.y): as a horizontal frank's
         // normal swept around the tube it crossed the 0.9 threshold, snapping the
@@ -1096,7 +1098,14 @@ fragment GBufferOut illumi_fs(
     // clearcoat glaze lobe. Every foliage test is `w < 0.5` and the matRough
     // cap below is `< 0.5h`, so 0.75 behaves as ordinary opaque geometry
     // everywhere except the clearcoat branch.
-    if (in.vertexColor.a > 0.6 && in.vertexColor.a < 0.9) foliageFlag = 0.75h;
+    if (in.vertexColor.a > 0.66 && in.vertexColor.a < 0.9) foliageFlag = 0.75h;
+    // Lamp-shade fabric flag (DH-0458): colour alpha in (0.60, 0.66] → 0.62h. Carved
+    // from the casing band's low end (raised to >0.66 above), so a paper/linen drum
+    // shade is tagged for thin-sheet transmission WITHOUT the sausage clearcoat or the
+    // plush fuzz. 0.62 is not < 0.5 (roughness cap left alone) and outside every other
+    // band; the deferred lighting pass reads 0.60h<w<0.66h to add the fabric back-light.
+    // No-op for every other scene (no other mesh ships colour alpha in this band).
+    if (in.vertexColor.a > 0.60 && in.vertexColor.a <= 0.66) foliageFlag = 0.62h;
     // Plush flag (Teddy Bear Press): colour alpha ≈ 0.55 (band 0.5–0.6) → 0.55h.
     // 0.55 is not < 0.5 (so the foliage roughness cap below leaves plush's high
     // roughness alone) and not in (0.6,0.9) (so it skips the casing clearcoat); the

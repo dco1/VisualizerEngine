@@ -319,6 +319,14 @@ public final class IlluminatoramaRenderer {
     /// `FrameUniforms.plushSheen/plushTransmission`.
     public var plushSheen: Float = 0
     public var plushTransmission: Float = 0
+    /// Lamp-shade fabric translucency strength (DH-0458). 0 = OFF (default) → the
+    /// shade thin-sheet transmission branch is skipped entirely. A paper/linen drum
+    /// shade is a thin translucent sheet; this drives the back-lit transmission that
+    /// lets external light (a sunset through the glazing, the room behind the shade)
+    /// scatter through the fabric rather than landing flat on an opaque cone. Only
+    /// the shade-flagged mesh (`normalRoughness.w` ≈ 0.62) reads it. Mirrors the
+    /// deferred `FrameUniforms.shadeTransmission`.
+    public var shadeTransmission: Float = 0
     public var exposure: Float = 1.0
     public var bloomThreshold: Float = 1.0
     public var bloomIntensity: Float = 0.6
@@ -12076,6 +12084,10 @@ public final class IlluminatoramaRenderer {
             plushSheen: max(0, plushSheen),
             plushTransmission: max(0, plushTransmission)
         )
+        // DH-0458 — lamp-shade fabric translucency. Written into the former `_padPhase3`
+        // slot (default 0 in the memberwise init above), so a host that never sets it —
+        // every Visualizer scene — ships a byte-identical uniform blob.
+        u.shadeTransmission = max(0, shadeTransmission)
         // C1 — sun ownership, enforced here rather than left to the host. With
         // `rtSunOwnership == .rayTraced` the RT lighting pass computes the sun
         // (soft disc shadows), so the deferred directional + its cascades MUST go

@@ -66,8 +66,17 @@ public struct IlluminatoramaFrameUniforms {
     /// 0 disables IBL (lighting kernel falls back to hemispheric ambient,
     /// sky pixels still come from the equirect texture).
     public var iblEnabled: UInt32
-    /// Padding so the struct stride closes on a 16-byte boundary.
-    public var _padPhase3: Float = 0
+    /// Lamp-shade fabric translucency strength (DH-0458). 0 = OFF (the default for
+    /// every scene) → the shade thin-sheet transmission branch in the lighting
+    /// kernel is an EXACT no-op unless a host sets it. A paper/linen drum shade is
+    /// a thin translucent sheet: this drives the back-lit transmission that lets the
+    /// sunset (or the room behind the shade) scatter THROUGH the fabric instead of
+    /// landing flat on an opaque cone. Shade fragments are flagged in
+    /// `normalRoughness.w` (≈0.62 — a scene tags its shade vertices with colour
+    /// alpha in (0.60, 0.66]). Repurposes the former `_padPhase3` pad — same 4
+    /// bytes at the same offset, so the struct stride is unchanged. Mirrors
+    /// `shadeTransmission` in the Metal `FrameUniforms`.
+    public var shadeTransmission: Float = 0
     // ── Phase 2.5: Cascaded shadow maps ──────────────────────────────
     /// Per-cascade light-space view-projection matrices. Three cascades
     /// declared individually rather than as a 3-tuple/array so the layout

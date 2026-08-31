@@ -1043,6 +1043,29 @@ kernel void illumi_lighting(
         transmission  = min(t, albedo * frame.directionalLightColor * visibility);
     }
 
+    // ── Lamp-shade fabric translucency (DH-0458) ────────────────────────────
+    // Shade pixels carry ≈0.62 in normalRoughness.w (0.60 < w < 0.66). A paper /
+    // linen drum shade is a THIN translucent sheet: light landing on its FAR face —
+    // the sunset through the glazed wall, or the room behind it — scatters through
+    // and lifts the near face, so the shade reads as lit fabric instead of an opaque
+    // pale cone (the DH-0458 dusk complaint). Same energy-clamped thin-sheet
+    // machinery as the leaf / plush terms, tuned for paper: MORE diffuse than the
+    // bear (a shade is smoother-scattering, so less forward spike) and only faintly
+    // warm. The internal bulb's own glow is a SEPARATE self-emission (the N5
+    // `LampShadeEmissionMap`, gated by nightness) — this term is the EXTERNAL half,
+    // which is why it is driven by the sun, not by a point light. Driven by
+    // `frame.shadeTransmission` (0 ⇒ skipped); no Visualizer scene ships the tag OR
+    // sets the scalar, so it is an exact no-op there. Mirrors the leaf gate so it
+    // never fires forward-lit.
+    if (nrH.a > 0.60h && nrH.a < 0.66h && frame.shadeTransmission > 0.0) {
+        float back    = saturate(dot(-N, Ld));                     // light on the FAR face
+        float backlit = smoothstep(0.02, 0.45, dot(V, -Ld));       // viewing toward the light
+        float through = back * backlit * (0.60 + 0.40 * saturate(dot(V, -Ld)));
+        float3 warm   = frame.directionalLightColor * float3(1.03, 1.00, 0.95);  // faintly warm through paper
+        float3 t      = albedo * warm * through * visibility * frame.shadeTransmission;
+        transmission  = min(t, albedo * frame.directionalLightColor * visibility);
+    }
+
     float3 pointSum = float3(0.0);
     float3 spotSum  = float3(0.0);
 
@@ -1626,7 +1649,10 @@ kernel void illumi_lighting(
     // fixed-F0 dielectric GGX on the sun + a tight prefiltered-IBL sample,
     // weighted by Drop+'s 0.55 coat strength. No-op for every other scene.
     float3 hotdogCC = float3(0.0);
-    if (nrH.a > 0.6h && nrH.a < 0.9h) {
+    // Lower bound 0.6h → 0.66h: the (0.60, 0.66) sub-band belongs to the lamp-shade
+    // fabric (DH-0458), which must not pick up the wet-glaze clearcoat. Casing still
+    // carries exactly 0.75h, so this is a no-op for the frank.
+    if (nrH.a > 0.66h && nrH.a < 0.9h) {
         const float ccRough    = 0.18;
         const float ccF0       = 0.04;
         const float ccStrength = 0.55;

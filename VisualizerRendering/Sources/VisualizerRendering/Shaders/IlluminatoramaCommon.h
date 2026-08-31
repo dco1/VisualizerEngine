@@ -85,7 +85,13 @@ struct FrameUniforms {
     float    iblIntensity;
     uint     iblPrefilteredMipCount;
     uint     iblEnabled;
-    float    _padPhase3;
+    // Lamp-shade fabric translucency strength (DH-0458). 0 = OFF (default) → the
+    // shade thin-sheet transmission branch in illumi_lighting_fs is an EXACT no-op
+    // for every scene; only a shade mesh tagged with colour alpha in (0.60, 0.66]
+    // (→ normalRoughness.w ≈ 0.62) reads it. Repurposes the former `_padPhase3`
+    // pad — same 4 bytes at the same offset, so stride is unchanged. Field-for-
+    // field mirror of the Swift IlluminatoramaFrameUniforms.shadeTransmission.
+    float    shadeTransmission;
     // Phase 2.5 — Cascaded shadow maps for the directional sun light. Three
     // cascades; each has its own light-space view-projection matrix. The
     // lighting kernel picks a cascade per pixel from view-space Z and does a
