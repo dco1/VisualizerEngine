@@ -1650,6 +1650,23 @@ public final class IlluminatoramaRenderer {
     /// converge as hysteresis builds up the indirect term.
     public var ddgiTwoBounceEnabled: Bool = false
 
+    /// **S3.2 Ultra — trace the probe field against the REAL TLAS.** The
+    /// analytic trace only intersects box/sphere/ground primitives, so a
+    /// `.custom`-mesh host stands in coarse `ddgiProxyInstances`. With this on
+    /// (and a TLAS live — `rtTLASActive`), `illumi_ddgi_trace_tlas` fills the
+    /// SAME ray buffer from the instance acceleration structure instead: real
+    /// occlusion (window holes admit light, furniture shades the floor), mean
+    /// albedo + emission at hits, and a sun shadow ray per hit. Falls back to
+    /// the analytic kernel any frame the TLAS is not available, and the settle
+    /// gate re-arms on the flip so the field re-converges rather than mixing
+    /// lanes. Default OFF — hosts opt in from a quality tier.
+    public var ddgiRTTraceEnabled: Bool = false
+
+    /// Whether the TLAS trace kernel compiled on this device — shaders build at
+    /// run time here, so a silent fallback to the analytic lane would otherwise
+    /// be indistinguishable from Ultra working. Gates assert this, not the knob.
+    public var ddgiRTTraceSupported: Bool { ddgiTraceTLASPipeline != nil }
+
     /// **Non-rendered DDGI proxy channel.** DDGI's trace kernel can only
     /// intersect the analytic primitives it understands — box / sphere / ground
     /// (`MeshKind` 0/1/2). A host whose real scene is all `.custom` meshes (a
@@ -2801,6 +2818,10 @@ public final class IlluminatoramaRenderer {
     private let ddgiTracePipeline: MTLComputePipelineState
     private let ddgiUpdateIrrPipeline: MTLComputePipelineState
     private let ddgiUpdateDepthPipeline: MTLComputePipelineState
+    /// S3.2 Ultra — the TLAS-backed trace variant. Optional: a device or
+    /// metallib without it degrades to the analytic kernel, never fails init.
+    private lazy var ddgiTraceTLASPipeline: MTLComputePipelineState? =
+        engine.pipelineCache.pipelineState(name: "illumi_ddgi_trace_tlas", device: device)
 
     // ── Hardware ray tracing state ───────────────────────────────────
     /// Mirror of `RTUniforms` in IlluminatoramaRT.metal.
@@ -10137,7 +10158,9 @@ public final class IlluminatoramaRenderer {
         var irradianceScale: Float;            var enabled: UInt32          // 64
         var irrTileSize: UInt32;               var depthTileSize: UInt32    // 72
         var instanceCount: UInt32;             var twoBounceEnabled: UInt32 // 80
-        var emitterCount: UInt32 = 0; var _pad2: UInt32 = 0                 // 88..92
+        // `rayMask` repurposes the former `_pad2` (S3.2 Ultra): the TLAS
+        // transport-ray mask for `illumi_ddgi_trace_tlas`; 0 on the analytic path.
+        var emitterCount: UInt32 = 0; var rayMask: UInt32 = 0               // 88..92
         // stride: 96 bytes
     }
 
@@ -10253,8 +10276,19 @@ public final class IlluminatoramaRenderer {
         mix(ddgiProbeSpacing); mixI(max(1, ddgiRaysPerProbe))
         mix(ddgiHysteresis); mix(ddgiIrradianceScale)
         mixI(ddgiTwoBounceEnabled ? 1 : 0)
+        // S3.2 Ultra — the lane itself is an input: flipping between the TLAS
+        // and analytic kernels (knob or TLAS availability) must re-arm the
+        // settle gate so the field re-converges instead of freezing mid-mix.
+        mixI(ddgiRTTraceUsable ? 1 : 0)
         for e in emitterLights { mix3(e.position); mix3(e.color); mix(e.radius) }
         return h
+    }
+
+    /// True when this frame's DDGI trace can run against the real TLAS.
+    private var ddgiRTTraceUsable: Bool {
+        ddgiRTTraceEnabled && rtTLASActive && rtTLAS != nil
+            && rtInstanceDataBuffer != nil && rtObjNormalBuffer != nil
+            && ddgiTraceTLASPipeline != nil
     }
 
     private func encodeDDGIFrame(_ cb: MTLCommandBuffer) {
@@ -10313,6 +10347,12 @@ public final class IlluminatoramaRenderer {
             if let light = f.ddgiLight { emitterLights.append(light) }
         }
         u.emitterCount = UInt32(emitterLights.count)
+        // S3.2 Ultra — transport mask for the TLAS trace: opaque + invisible
+        // occluder, the same mask GI rays carry (a probe ray must stop at the
+        // lighting-only ceiling slabs or interiors flood with sky). 0 on the
+        // analytic lane, where the kernel never reads it.
+        let rtTrace = ddgiRTTraceUsable
+        u.rayMask = rtTrace ? Self.rtTransportRayMask : 0
 
         memcpy(ddgiUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaDDGIUniforms>.stride)
 
@@ -10418,7 +10458,29 @@ public final class IlluminatoramaRenderer {
         // for the second-bounce lookup; the update kernels below write to
         // the CURRENT-frame atlases. With ping-pong these are distinct
         // textures so the read-then-write within one encoder doesn't alias.
-        enc.setComputePipelineState(ddgiTracePipeline)
+        //
+        // S3.2 Ultra — when the TLAS lane is usable this dispatches
+        // `illumi_ddgi_trace_tlas` instead: same ray pattern, same uniforms,
+        // same DDGIRayRecord output, but hits come from the real acceleration
+        // structure (buffers 4–6). The update kernels below cannot tell the
+        // difference; `ddgiScalarInputHash` mixes the lane so a flip re-settles.
+        let tracePipeline: MTLComputePipelineState
+        if rtTrace, let tlasPipeline = ddgiTraceTLASPipeline,
+           let tlas = rtTLAS, let rtInst = rtInstanceDataBuffer, let objN = rtObjNormalBuffer {
+            tracePipeline = tlasPipeline
+            enc.setComputePipelineState(tlasPipeline)
+            enc.setAccelerationStructure(tlas, bufferIndex: 4)
+            enc.setBuffer(rtInst, offset: 0, index: 5)
+            enc.setBuffer(objN,   offset: 0, index: 6)
+            // The TLAS references the BLASes, which reference the mesh
+            // vertex/index buffers — all must be resident for the intersector.
+            for blas in rtBLASList { enc.useResource(blas, usage: .read) }
+            for blas in rtCurveBLASList { enc.useResource(blas, usage: .read) }
+            for buf in rtResidentBuffers { enc.useResource(buf, usage: .read) }
+        } else {
+            tracePipeline = ddgiTracePipeline
+            enc.setComputePipelineState(ddgiTracePipeline)
+        }
         enc.setBuffer(rayBuf,              offset: 0, index: 0)
         enc.setBuffer(ddgiUniformBuffer,   offset: 0, index: 1)
         enc.setBuffer(instBuf,             offset: 0, index: 2)
@@ -10426,7 +10488,7 @@ public final class IlluminatoramaRenderer {
         enc.setTexture(sky,         index: 0)
         enc.setTexture(irrAtlasPrv, index: 1)
         enc.setTexture(depAtlasPrv, index: 2)
-        let tgwT = ddgiTracePipeline.threadExecutionWidth
+        let tgwT = tracePipeline.threadExecutionWidth
         enc.dispatchThreadgroups(
             MTLSize(width: (raysPerProbe + tgwT - 1) / tgwT, height: probeCount, depth: 1),
             threadsPerThreadgroup: MTLSize(width: tgwT, height: 1, depth: 1))

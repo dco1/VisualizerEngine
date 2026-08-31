@@ -50,7 +50,13 @@ struct DDGIUniforms {
     // radiance. Requires ping-pong of both atlases on the host side.
     uint     twoBounceEnabled;
     uint     emitterCount;            // entries in DDGIPointEmitter[] bound at buffer(3)
-    uint     _pad2;
+    // S3.2 Ultra — TLAS transport-ray mask for `illumi_ddgi_trace_tlas` (0x01
+    // opaque | 0x04 invisible occluder — the lighting-only ceiling over a
+    // roofless dollhouse MUST stop a probe ray or interiors flood with sky).
+    // Repurposes the former `_pad2` — same 4 bytes, same offset, stride
+    // unchanged. The analytic trace kernel never reads it; hosts on the
+    // analytic path leave it 0.
+    uint     rayMask;
     // Total: 96 bytes, stride 96.
 };
 
