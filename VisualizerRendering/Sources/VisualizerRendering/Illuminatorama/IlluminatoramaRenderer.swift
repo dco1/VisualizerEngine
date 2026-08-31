@@ -1642,6 +1642,54 @@ public final class IlluminatoramaRenderer {
     /// converge as hysteresis builds up the indirect term.
     public var ddgiTwoBounceEnabled: Bool = false
 
+    /// **Non-rendered DDGI proxy channel.** DDGI's trace kernel can only
+    /// intersect the analytic primitives it understands — box / sphere / ground
+    /// (`MeshKind` 0/1/2). A host whose real scene is all `.custom` meshes (a
+    /// house of walls, floors, furniture ⇒ every mesh is meshKind 3, silently
+    /// skipped) therefore has NOTHING for probes to bounce off. These proxies fix
+    /// that WITHOUT drawing anything: each is an ordinary `InstanceRef` (its
+    /// `modelMatrix` places/scales the unit primitive, its material feeds the
+    /// probe's Lambertian re-emission) that is appended to the DDGI trace's
+    /// instance buffer but never enters the raster / G-buffer / RT passes. A
+    /// house feeds coarse box proxies for its walls, floor and ceiling so the
+    /// probe field sees the room's enclosure (occlusion for the Chebyshev depth
+    /// test, colour for diffuse bleed). Empty by default — a scene that already
+    /// registers analytic primitives on the render list (Visualizer's DDGI demo)
+    /// is unaffected.
+    public var ddgiProxyInstances: [InstanceRef] = [] {
+        didSet { ddgiProxiesDirty = true }
+    }
+
+    /// **View-independent settle budget for the DDGI trace (S3.2).** The probe
+    /// field is world-space and camera-independent, so a camera-only orbit does
+    /// not change it — re-tracing every frame during an orbit recomputes an
+    /// identical field and is the per-frame cost that makes a heavy scene stutter.
+    /// When positive, the trace + the two atlas-update kernels run only while the
+    /// field is settling (this many frames after any probe-field input changes —
+    /// geometry moved, sun rotated, proxies rebuilt) and are skipped once it has
+    /// converged; the last atlas is reused. **0 (default) ⇒ trace every frame**,
+    /// bit-identical to the pre-gate renderer, so no existing scene is affected.
+    /// A host with EMA hysteresis `h` wants roughly `3–5 / (1 - h)` frames here
+    /// (≈100–150 at the 0.97 default) to let the exponential average settle.
+    /// See `DDGIConvergenceGate`.
+    public var ddgiConvergenceFrames: Int = 0
+
+    /// Whether `encodeDDGIFrame` actually ran the trace on the most recent frame
+    /// (true) or reused the converged atlas (false). Test/instrument observable —
+    /// a perf gate asserts that orbiting N settled frames traces 0 of them. Always
+    /// true while `ddgiConvergenceFrames == 0`.
+    public private(set) var ddgiDidTraceLastFrame: Bool = false
+
+    /// The settle-gate state (pure value; see `DDGIConvergenceGate`).
+    private var ddgiConvergenceGate = DDGIConvergenceGate()
+    /// Set whenever `ddgiProxyInstances` is reassigned; cleared once the proxies
+    /// have been packed into the trace instance buffer. Forces a re-arm + repack.
+    private var ddgiProxiesDirty = false
+    /// Monotonic counter bumped on any frame the render/proxy geometry was
+    /// unstable, folded into the settle-gate hash so a moving wall re-traces while
+    /// a still orbit does not.
+    private var ddgiGeometryEpoch: UInt64 = 0
+
     // ── Phase 3.2 split-sum DFG LUT ──────────────────────────────────
     /// Toggle the pre-integrated DFG LUT for the F0-weighted IBL specular
     /// response. Off = Lagarde's roughness-Schlick approximation (Phase 3.0
@@ -8167,6 +8215,11 @@ public final class IlluminatoramaRenderer {
         ssrNeedsFirstFrame  = true
         rtGINeedsFirstFrame = true
 
+        // S3.2 — a document swap throws away accumulated frames; force the DDGI
+        // settle gate to re-trace next frame even if the new scene happens to hash
+        // identically to the old one, so a stale converged atlas is never reused.
+        ddgiConvergenceGate.reset()
+
         // Auto-exposure EMA — re-seed the GPU ExposureState buffer to the exact
         // cold-start values written once in the constructor:
         //   [prevTargetLogLum = -2.0, smoothedExposure = 1.0,
@@ -10171,6 +10224,31 @@ public final class IlluminatoramaRenderer {
         ddgiInstanceDataCapacity = newCap
     }
 
+    /// FNV-1a digest of every DDGI probe-field input EXCEPT the instance / proxy
+    /// geometry (folded in separately via `ddgiGeometryEpoch`). A change re-arms the
+    /// settle gate — the sun rotating, the grid moving, an emitter lighting up, a
+    /// ray/hysteresis knob turned. NOT hashed: the sky texture's *contents* (an
+    /// in-place re-bake keeps the same object); a time-of-day change that alters the
+    /// sky also rotates `directionalLightDirection`, which IS hashed, so the common
+    /// case re-arms anyway.
+    private func ddgiScalarInputHash(
+        emitterLights: [(position: SIMD3<Float>, color: SIMD3<Float>, radius: Float)]
+    ) -> UInt64 {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        func mix(_ f: Float) { h = (h ^ UInt64(f.bitPattern)) &* 0x0000_0100_0000_01b3 }
+        func mix3(_ v: SIMD3<Float>) { mix(v.x); mix(v.y); mix(v.z) }
+        func mixI(_ i: Int) { h = (h ^ UInt64(bitPattern: Int64(i))) &* 0x0000_0100_0000_01b3 }
+        mix3(simd_normalize(directionalLightDirection))
+        mix3(directionalLightColor)
+        mix3(ddgiGridOrigin)
+        mixI(ddgiGridDims.x); mixI(ddgiGridDims.y); mixI(ddgiGridDims.z)
+        mix(ddgiProbeSpacing); mixI(max(1, ddgiRaysPerProbe))
+        mix(ddgiHysteresis); mix(ddgiIrradianceScale)
+        mixI(ddgiTwoBounceEnabled ? 1 : 0)
+        for e in emitterLights { mix3(e.position); mix3(e.color); mix(e.radius) }
+        return h
+    }
+
     private func encodeDDGIFrame(_ cb: MTLCommandBuffer) {
         // Phase 3.3 — toggle the ping-pong at the *start* of the DDGI frame
         // (not the end) so accessor semantics stay obvious through the
@@ -10184,7 +10262,17 @@ public final class IlluminatoramaRenderer {
         //   Previous = A (both still empty). Trace reads zero, so two-
         //   bounce contributes zero this frame; one-bounce direct works
         //   normally. Subsequent frames carry real data.
-        ddgiUseAtlasA.toggle()
+        //
+        // S3.2 — the ping-pong toggle MOVED below the settle gate: a frame the
+        // gate skips must NOT toggle, or `ddgiIrradianceCurrent` would flip to the
+        // atlas we did not write and the lighting pass would read a half-stale
+        // field. Only a frame that actually traces advances the ping-pong.
+
+        // S3.2 — the trace intersects the render instances (analytic subset) PLUS
+        // the host's non-rendered proxy boxes (a house's walls/floor/ceiling). The
+        // uniform instance count, the buffer capacity and the pack loop all cover
+        // both.
+        let totalDDGIInstances = instances.count + ddgiProxyInstances.count
 
         // Write the DDGIUniforms buffer regardless of the enabled flag —
         // the lighting kernel always binds it (enabled=0 makes the lookup a no-op).
@@ -10204,7 +10292,7 @@ public final class IlluminatoramaRenderer {
             enabled:              ddgiEnabled ? 1 : 0,
             irrTileSize:          UInt32(Self.ddgiIrrTileSize),
             depthTileSize:        UInt32(Self.ddgiDepthTileSize),
-            instanceCount:        UInt32(instances.count),
+            instanceCount:        UInt32(totalDDGIInstances),
             twoBounceEnabled:     (ddgiEnabled && ddgiTwoBounceEnabled) ? 1 : 0
         )
 
@@ -10220,7 +10308,27 @@ public final class IlluminatoramaRenderer {
 
         memcpy(ddgiUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaDDGIUniforms>.stride)
 
-        guard ddgiEnabled, !instances.isEmpty else { return }
+        guard ddgiEnabled, totalDDGIInstances > 0 else { return }
+
+        // ── S3.2 view-independent settle gate ────────────────────────────
+        // The probe field is world-space; a camera-only orbit does not change it,
+        // so re-tracing every frame during an orbit is pure waste. Re-arm the
+        // trace only when a probe-field INPUT actually moves: geometry (folded via
+        // a monotonic epoch bumped on any unstable-content frame), proxies, the
+        // directional light, the grid, the ray/hysteresis knobs, or the emitters.
+        // With `ddgiConvergenceFrames == 0` (every scene but Daydream's house) the
+        // gate always traces — pre-S3.2 behaviour, bit-identical.
+        if instanceStableFrames == 0 || ddgiProxiesDirty { ddgiGeometryEpoch &+= 1 }
+        let scalarHash = ddgiScalarInputHash(emitterLights: emitterLights)
+        let inputHash = ddgiGeometryEpoch &* 0x100000001b3 ^ scalarHash
+        let trace = ddgiConvergenceGate.shouldTrace(
+            inputHash: inputHash, convergenceFrames: ddgiConvergenceFrames)
+        ddgiDidTraceLastFrame = trace
+        // A skipped frame reuses the converged atlas the lighting pass already
+        // reads (`ddgiIrradianceCurrent`, untouched since the last traced frame).
+        guard trace else { return }
+
+        ddgiUseAtlasA.toggle()
         ensureDDGIResources()
         guard let irrAtlas    = ddgiIrradianceCurrent,
               let depAtlas    = ddgiDepthCurrent,
@@ -10251,15 +10359,18 @@ public final class IlluminatoramaRenderer {
         // PERF (static-scene skip): this loop pays a general 4×4 inverse per instance
         // per frame — with stable content the packed buffer already holds exactly this
         // data, so repack only when the content generation moved (or on first use).
-        ensureDDGIInstanceDataBuffer(count: instances.count)
+        ensureDDGIInstanceDataBuffer(count: totalDDGIInstances)
         guard let instBuf = ddgiInstanceDataBuffer else { return }
-        if instanceStableFrames == 0 || ddgiPackedInstanceCount != instances.count {
+        if instanceStableFrames == 0 || ddgiPackedInstanceCount != totalDDGIInstances
+            || ddgiProxiesDirty {
             let instPtr = instBuf.contents().bindMemory(
-                to: DDGIGPUInstanceData.self, capacity: instances.count)
-            for (i, ref) in instances.enumerated() {
+                to: DDGIGPUInstanceData.self, capacity: totalDDGIInstances)
+            // Render instances first (analytic subset intersects; meshKind 3 is
+            // skipped in-shader), then the non-rendered proxy boxes appended.
+            var i = 0
+            for ref in instances {
                 // Phase 2.6 — meshKind=3 is "custom mesh, no analytic intersection";
                 // the trace kernel skips intersection on anything not in {0,1,2}.
-                let kind: UInt32 = ref.meshKind.gpuMeshKind
                 instPtr[i] = DDGIGPUInstanceData(
                     invModelMatrix: ref.data.modelMatrix.inverse,
                     normalMatrix:   ref.data.normalMatrix,
@@ -10267,10 +10378,24 @@ public final class IlluminatoramaRenderer {
                     metallic:       ref.data.metallic,
                     emission:       ref.data.emission,
                     roughness:      ref.data.roughness,
-                    meshKind:       kind
+                    meshKind:       ref.meshKind.gpuMeshKind
                 )
+                i += 1
             }
-            ddgiPackedInstanceCount = instances.count
+            for ref in ddgiProxyInstances {
+                instPtr[i] = DDGIGPUInstanceData(
+                    invModelMatrix: ref.data.modelMatrix.inverse,
+                    normalMatrix:   ref.data.normalMatrix,
+                    albedo:         ref.data.albedo,
+                    metallic:       ref.data.metallic,
+                    emission:       ref.data.emission,
+                    roughness:      ref.data.roughness,
+                    meshKind:       ref.meshKind.gpuMeshKind
+                )
+                i += 1
+            }
+            ddgiPackedInstanceCount = totalDDGIInstances
+            ddgiProxiesDirty = false
         }
 
         let probeCount   = ddgiGridDims.x * ddgiGridDims.y * ddgiGridDims.z
