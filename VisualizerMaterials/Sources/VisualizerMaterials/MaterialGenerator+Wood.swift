@@ -430,9 +430,34 @@ extension MaterialGenerator {
         let seams = params.hasSeams(on: tiling)
         var recipe = seams ? params.species.recipe : params.species.recipe.sealed
         if !params.knots { recipe.knotsPerSquareMeter = 0 }
-        return woodGrain(size: size, planks: planks, seed: params.species.seed,
-                         recipe: recipe, runMeters: params.run(on: tiling),
-                         category: .wood, seams: seams, endJoints: seams)
+        var ch = woodGrain(size: size, planks: planks, seed: params.species.seed,
+                           recipe: recipe, runMeters: params.run(on: tiling),
+                           category: .wood, seams: seams, endJoints: seams)
+
+        // DH-0456 — a PANELLED WALL is one seamless veneer slice tiled across a metres-wide
+        // plane, so on a 4 m wall the cathedral figure prints ~4× at the 1 m panel pitch and the
+        // eye reads a single printed sheet. A panel has no seam groove to hide a per-tile tone
+        // step, which is why it opts out of the plank de-repeat — but a per-PANEL tone offset is
+        // the honest "these are different veneer panels" break, and it is what Danny asked for
+        // (2026-08-30: "add tiling break without geometry — just per-panel variation").
+        //
+        // **`(1, 0)` is CORRECT here, not the 2 m checkerboard the general warning is about.**
+        // That warning (`MaterialChannels.patternCells`) is for tile/plank materials whose UV
+        // tile is ~2 m and holds MANY physical units: a per-UV-tile hash there paints a coarse
+        // checkerboard because the tile is not a unit. A panel's UV tile IS one unit — the run is
+        // `targetRunMeters` (1 m), one panel — so `floor(uv·1)` indexes each physical panel across
+        // the whole wall, exactly like a plank's `floor(uv·planks)` indexes each board.
+        //
+        // Adjustable-ONLY: this is the wall / room-floor / ceiling convert path
+        // (`SurfaceTiling.isAdjustable`). A PREBAKED furniture-veneer face — a drawer front, a
+        // stair tread — is a single continuous board and stays continuous (the same reason it
+        // takes the `sealed` recipe): its slice never spans enough repeats to tile, and a tone
+        // step across a cabinet face would be a defect, not a panel joint.
+        if params.layout == .panel, tiling.isAdjustable {
+            ch.patternCells = Vec2(1, 0)
+            ch.patternJitter = 0.06
+        }
+        return ch
     }
 
     /// Oak at an explicit plank count and run — the direct handle on the shared engine, for

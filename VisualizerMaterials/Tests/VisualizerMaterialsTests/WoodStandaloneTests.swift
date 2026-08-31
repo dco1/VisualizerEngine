@@ -42,4 +42,44 @@ final class WoodStandaloneTests: XCTestCase {
         XCTAssertGreaterThan(ch.patternCells.x, 0, "boards must declare their plank count")
         XCTAssertEqual(ch.patternCells.y, 0, "boards run unbroken down v — that axis is bonded")
     }
+
+    /// DH-0456 — a wood PANEL on an ADJUSTABLE (wall/floor/ceiling) surface declares a per-panel
+    /// tone de-repeat so a metres-wide wall does not stamp one veneer figure across itself; the
+    /// same panel PREBAKED on a furniture face stays a single continuous board.
+    func testPanelWallGetsPerPanelDeRepeatButFurnitureVeneerStaysContinuous() {
+        let wall = MaterialGenerator.wood(size: 128,
+                                          params: WoodParams(species: .oak, layout: .panel),
+                                          tiling: .baked(2.0))
+        XCTAssertEqual(wall.patternCells, Vec2(1, 0),
+                       "a panel's UV tile IS one panel — one cell per repeat re-tones each panel")
+        XCTAssertGreaterThan(wall.patternJitter, 0, "the panel wall must actually vary")
+
+        let veneer = MaterialGenerator.wood(size: 128,
+                                            params: WoodParams(species: .oak, layout: .panel),
+                                            tiling: .prebaked(1.0))
+        XCTAssertEqual(veneer.patternCells, .zero,
+                       "a prebaked furniture veneer face is one continuous board — no cells")
+        XCTAssertEqual(veneer.patternJitter, 0)
+    }
+
+    /// The repeat census scores the DH-0456 defect as a number: a coherent panel wall wide enough
+    /// to tile several times must break its period, and the break must be measurable.
+    func testRepeatCensusFlagsAnUnbrokenStampAndCreditsTheDeRepeat() {
+        let panel = MaterialGenerator.wood(size: 128,
+                                           params: WoodParams(species: .oak, layout: .panel),
+                                           tiling: .baked(2.0))
+        let broken = MaterialRepeatCensus.audit(panel, runMeters: 1.0, surfaceWidthMeters: 4.0)
+        XCTAssertGreaterThan(broken.repeatsAcross, MaterialRepeatCensus.visibleRepeatCount)
+        XCTAssertFalse(broken.readsAsStampedRepeat, "the panel wall declares a de-repeat")
+        XCTAssertGreaterThan(broken.periodRepeatResidual, 0,
+                             "the per-panel tone step must be a real, measurable break")
+
+        // A coherent slice with NO de-repeat declared is the defect, and the census must catch it.
+        var flat = panel
+        flat.patternCells = .zero
+        flat.patternJitter = 0
+        let stamped = MaterialRepeatCensus.audit(flat, runMeters: 1.0, surfaceWidthMeters: 4.0)
+        XCTAssertTrue(stamped.readsAsStampedRepeat, "an unbroken coherent stamp must fail closed")
+        XCTAssertEqual(stamped.periodRepeatResidual, 0, "nothing breaks the period")
+    }
 }
