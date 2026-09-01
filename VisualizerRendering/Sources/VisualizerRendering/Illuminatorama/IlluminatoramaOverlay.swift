@@ -420,8 +420,6 @@ public final class IlluminatoramaOverlay {
         renderer.taaEnabled = s.taaEnabled
         renderer.taaHistoryBlend = Float(s.taaHistoryBlend)
         renderer.taaJitterPixels = Float(s.taaJitterPixels)
-        renderer.ssaoDenoiseEnabled = s.denoiserEnabled
-        renderer.ssrDenoiseEnabled = s.denoiserEnabled
         renderer.debandDitherEnabled = s.debandDitherEnabled
 
         // IBL

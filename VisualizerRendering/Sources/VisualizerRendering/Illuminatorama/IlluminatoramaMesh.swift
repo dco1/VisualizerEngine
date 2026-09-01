@@ -67,6 +67,35 @@ public final class IlluminatoramaMesh {
     /// default-off flag that only genuinely open geometry opts into.
     public var shadowCastsBothFaces: Bool = false
 
+    /// Object-space AABB, computed once from the vertex buffer and cached.
+    ///
+    /// Diagnostic-path only (the geometry auditors) — nothing per-frame reads
+    /// this, so the one-time CPU walk over shared vertex memory is not the
+    /// `snapshot() → CPU array` antipattern; there is no GPU round-trip and no
+    /// rebuild, it just measures memory the CPU already has mapped.
+    private var cachedBounds: (min: SIMD3<Float>, max: SIMD3<Float>)??
+    public func localBounds() -> (min: SIMD3<Float>, max: SIMD3<Float>)? {
+        if let c = cachedBounds { return c }
+        // A private-storage buffer has no CPU mapping to read; report "unknown"
+        // rather than reading garbage.
+        guard vertexBuffer.storageMode != .private, vertexCount > 0 else {
+            cachedBounds = .some(nil); return nil
+        }
+        let p = vertexBuffer.contents().bindMemory(to: IlluminatoramaVertex.self,
+                                                   capacity: vertexCount)
+        var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var hi = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        for i in 0..<vertexCount {
+            let v = p[i].position
+            guard v.x.isFinite, v.y.isFinite, v.z.isFinite else { continue }
+            lo = simd_min(lo, v); hi = simd_max(hi, v)
+        }
+        guard lo.x <= hi.x else { cachedBounds = .some(nil); return nil }
+        let r = (min: lo, max: hi)
+        cachedBounds = .some(r)
+        return r
+    }
+
     public init(device: MTLDevice, vertices: [IlluminatoramaVertex], indices: [UInt16]) {
         guard let vb = device.makeBuffer(
             bytes: vertices,

@@ -154,7 +154,7 @@ kernel void illumi_ssr_temporal(
 
     float3 current = float3(ssrRaw.read(gid).rgb);
 
-    if (frame.ssrDenoiseEnabled == 0u || frame.ssrIsFirstFrame != 0u) {
+    if (frame.ssrTemporalEnabled == 0u || frame.ssrIsFirstFrame != 0u) {
         sampleCount.write(half4(0.0h), gid);
         outSSR.write(half4(half3(current), 1.0h), gid);
         return;

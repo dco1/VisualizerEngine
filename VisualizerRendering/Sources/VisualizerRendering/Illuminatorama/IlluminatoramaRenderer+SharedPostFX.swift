@@ -61,12 +61,35 @@ public extension IlluminatoramaRenderer {
     /// Deliberately still NOT handled — each scene curates these itself:
     ///   • `exposure` / `autoExposureEnabled` — House fixes its own; Room/Lab pass
     ///     the shared value through. There's no single correct policy.
-    ///   • SSAO / SSR / TAA / DDGI / shadows / IBL / internal render-scale — some
-    ///     scenes own a subset (Room's RT path drives SSR/shadows/IBL; Lab installs
-    ///     a custom DDGI probe grid).
+    ///   • SSAO / SSR *intensity + radius*, TAA, DDGI, shadows, IBL, internal
+    ///     render-scale — some scenes own a subset (Room's RT path drives
+    ///     SSR/shadows/IBL; Lab installs a custom DDGI probe grid). Note the
+    ///     SSAO/SSR **denoise** flags are NOT in this list: no scene art-directs
+    ///     them, so they went universal — see `applySharedDenoiser`.
     func applySharedPostFX(_ s: IlluminatoramaSharedSettings = .shared) {
         bloomThreshold = Float(s.bloomThreshold)
         bloomIntensity = Float(s.bloomIntensity)
         applySharedLensFX(s)
+    }
+
+    /// The panel's **denoiser** flags — AO spatial filter and the AO/SSR temporal
+    /// history — mapped onto the renderer's independent gates.
+    ///
+    /// Universal, like the lens cluster above: `render()` calls this every frame
+    /// (gated by `appliesSharedDenoiser`), so every Illuminatorama scene inherits
+    /// the panel with zero per-scene code. That is deliberate. Before the split
+    /// these two flags were hand-copied out of `IlluminatoramaSharedSettings` by
+    /// ELEVEN scene controllers — so changing the shape of the setting meant
+    /// editing eleven files, and any scene whose author forgot the two lines
+    /// silently ignored the panel. No scene art-directs its denoise; the ones that
+    /// tune the RT-side denoisers do it through `svgfEnabled` /
+    /// `rtGITemporalEnabled`, which are untouched here.
+    ///
+    /// SSR has no spatial stage, so `denoiserSpatialEnabled` is AO-only and the
+    /// SSR gate follows the temporal flag alone.
+    func applySharedDenoiser(_ s: IlluminatoramaSharedSettings = .shared) {
+        ssaoSpatialEnabled  = s.denoiserSpatialEnabled
+        ssaoTemporalEnabled = s.denoiserTemporalEnabled
+        ssrTemporalEnabled  = s.denoiserTemporalEnabled
     }
 }

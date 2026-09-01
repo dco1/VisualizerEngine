@@ -99,8 +99,47 @@ public final class IlluminatoramaSharedSettings {
     public var taaHistoryBlend: Double = 0.05
     public var taaJitterPixels: Double = 0.0
 
-    // ── Spatiotemporal denoiser + deband dither ───────────────────────
-    public var denoiserEnabled: Bool = true
+    // ── Denoiser (spatial + temporal) + deband dither ─────────────────
+    //
+    // ONE knob used to gate BOTH halves of the AO/SSR denoise chain, which meant
+    // you could not keep the good half. They are now separate, because they fail
+    // in completely different ways — see `denoiserTemporalEnabled`.
+
+    /// **Edge-aware SPATIAL filter on the AO buffer.** A depth/normal-weighted
+    /// blur over the half-res AO — purely intra-frame, so it cannot ghost. This is
+    /// what stops raw 16-sample SSAO reading as grain. ON by default; there is no
+    /// reason to turn it off except to see what the raw AO looks like.
+    ///
+    /// (SSR has no spatial stage — its chain is gather → temporal → composite — so
+    /// this knob is AO-only. Turning the temporal off drops SSR to the raw gather.)
+    public var denoiserSpatialEnabled: Bool = true
+
+    /// **Velocity-reprojected TEMPORAL history for AO + SSR.** Accumulates up to
+    /// 32 frames, which is a large quality win on a still camera and a *smear* on
+    /// anything that moves.
+    ///
+    /// OFF by default, and the reason is structural rather than a tuning miss: the
+    /// reprojection uses the velocity of the pixel it is AT, but AO and SSR are
+    /// functions of a pixel's NEIGHBOURHOOD. A moving ball's contact darkening
+    /// lands on a *static* floor, whose screen velocity is zero — so the history
+    /// reprojects onto itself and last frame's occlusion lingers, trailing behind
+    /// the mover. Both rejection guards miss it: the disocclusion term reads that
+    /// same zero receiver velocity, and the 3×3 ±1.5σ clamp has a σ floor of 0.03,
+    /// so a ghost within ±0.045 of the local mean survives indefinitely. Nothing
+    /// in either kernel rejects history when the OCCLUDER moved.
+    ///
+    /// Opt in from the Illuminatorama settings panel (⌘⇧L) for static or
+    /// slow-camera scenes. See also `taaEnabled`, off for the same class of reason.
+    public var denoiserTemporalEnabled: Bool = false
+
+    /// Compatibility shim for the pre-split single knob. Reads true if either half
+    /// is on; writing sets BOTH (preserving the old all-or-nothing behaviour for a
+    /// host that has not been updated).
+    @available(*, deprecated, message: "Split — use denoiserSpatialEnabled (default on) and denoiserTemporalEnabled (default off).")
+    public var denoiserEnabled: Bool {
+        get { denoiserSpatialEnabled || denoiserTemporalEnabled }
+        set { denoiserSpatialEnabled = newValue; denoiserTemporalEnabled = newValue }
+    }
     public var debandDitherEnabled: Bool = true
     /// Temporal accumulation of the RT diffuse (1-bounce GI) term before its
     /// spatial denoise — velocity-reprojected exponential history that keeps the
@@ -213,7 +252,8 @@ public final class IlluminatoramaSharedSettings {
         taaEnabled = \(taaEnabled)
         taaHistoryBlend = \(fmt(taaHistoryBlend))
         taaJitterPixels = \(fmt(taaJitterPixels))
-        denoiserEnabled = \(denoiserEnabled)
+        denoiserSpatialEnabled = \(denoiserSpatialEnabled)
+        denoiserTemporalEnabled = \(denoiserTemporalEnabled)
         debandDitherEnabled = \(debandDitherEnabled)
         rtGITemporalEnabled = \(rtGITemporalEnabled)
         rtGITemporalBlend = \(fmt(rtGITemporalBlend))

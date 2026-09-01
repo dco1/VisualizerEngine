@@ -1346,20 +1346,66 @@ public final class IlluminatoramaRenderer {
     /// fade this in with their night blend.
     public var scotopicDesaturation: Float = 0
 
-    // ── Phase 4.39 spatiotemporal denoiser knobs ────────────────────
-    /// Enable the SSAO bilateral spatial filter + temporal accumulation.
-    /// When on, AO converges from 16 samples to hundreds over time;
-    /// turning off falls back to raw single-tap SSAO (noisier).
-    public var ssaoDenoiseEnabled: Bool = true
+    // ── Phase 4.39 denoiser knobs — SPATIAL and TEMPORAL are separate ───
+    //
+    // These were one flag each (`ssaoDenoiseEnabled` / `ssrDenoiseEnabled`), which
+    // made the only way to stop the temporal half's ghosting a fallback to RAW AO.
+    // They fail differently and are now gated independently. The compatibility
+    // shims below keep pre-split hosts compiling and behaving as they did.
+
+    /// **Edge-aware SPATIAL filter on the half-res AO** (depth/normal-weighted
+    /// blur). Intra-frame, so it cannot ghost — this is the half that makes raw
+    /// 16-sample SSAO stop reading as grain. Default ON.
+    ///
+    /// Note the pass is still ENCODED when `ssaoTemporalEnabled` is on, because
+    /// the temporal kernel reads `aoFilteredTexture` as its input; with this flag
+    /// off the kernel passes the raw AO through instead of filtering it. See
+    /// `ssaoSpatialRuns`.
+    public var ssaoSpatialEnabled: Bool = true
+    /// **Velocity-reprojected TEMPORAL accumulation of the AO** (up to 32 frames).
+    /// Default OFF: the reprojection uses the velocity of the pixel it is AT, but
+    /// AO is a function of that pixel's NEIGHBOURHOOD — a mover's contact darkening
+    /// lands on a static receiver whose velocity is zero, so the history reprojects
+    /// onto itself and trails behind the mover. Neither guard catches it (the
+    /// disocclusion term reads the same zero velocity; the 3×3 ±1.5σ clamp has a
+    /// σ floor of 0.03). Fine for a static or slow camera; opt in per scene.
+    public var ssaoTemporalEnabled: Bool = false
     /// History retention weight for SSAO temporal (0 = all current, 1 = frozen).
     /// 0.90 gives ~10-frame effective sample count with fast transient recovery.
     public var ssaoTemporalBlend: Float = 0.90
-    /// Enable the SSR temporal accumulation pass. Dramatically reduces shimmer
-    /// on rough/medium surfaces. Off = raw single-sample gather goes straight
-    /// to composite.
-    public var ssrDenoiseEnabled: Bool = true
+    /// **Velocity-reprojected TEMPORAL accumulation of the SSR gather.** Kills
+    /// shimmer on rough/medium surfaces; smears a reflection of anything that moves
+    /// across a static reflector, for the same structural reason as the AO twin.
+    /// Default OFF. Off = raw single-sample gather goes straight to composite.
+    ///
+    /// SSR has NO spatial stage (gather → temporal → composite), so there is no
+    /// `ssrSpatialEnabled` to pair with this.
+    public var ssrTemporalEnabled: Bool = false
     /// History retention weight for SSR temporal. 0.85 balances lag vs noise.
     public var ssrTemporalBlend: Float = 0.85
+    /// True when the AO spatial pass must be ENCODED — either because it was asked
+    /// for, or because the temporal pass needs `aoFilteredTexture` as its input.
+    private var ssaoSpatialRuns: Bool { ssaoSpatialEnabled || ssaoTemporalEnabled }
+    /// Compatibility shim for the pre-split single AO knob. Reads true if either
+    /// half is on; writing sets BOTH, preserving old all-or-nothing behaviour.
+    @available(*, deprecated, message: "Split — use ssaoSpatialEnabled (default on) and ssaoTemporalEnabled (default off).")
+    public var ssaoDenoiseEnabled: Bool {
+        get { ssaoSpatialEnabled || ssaoTemporalEnabled }
+        set { ssaoSpatialEnabled = newValue; ssaoTemporalEnabled = newValue }
+    }
+    /// Compatibility shim for the pre-split SSR knob. SSR's chain is temporal-only,
+    /// so this is a straight alias of `ssrTemporalEnabled`.
+    @available(*, deprecated, message: "Renamed — SSR's denoise is temporal-only; use ssrTemporalEnabled.")
+    public var ssrDenoiseEnabled: Bool {
+        get { ssrTemporalEnabled }
+        set { ssrTemporalEnabled = newValue }
+    }
+    /// When true (default), `render()` applies the panel's denoiser flags every
+    /// frame, so every Illuminatorama scene — including future ones — inherits them
+    /// with zero per-scene wiring (the same policy as `appliesSharedLensFX`, and
+    /// the thing that stops 11 controllers each hand-copying the two flags). A
+    /// scene that must art-direct its own denoise sets this false.
+    public var appliesSharedDenoiser: Bool = true
     /// Apply the triangular-PDF debanding dither in the tonemap before the
     /// 8-bit store. On = smooth gradients; off = raw 8-bit quantisation
     /// (exposes contour banding). Exposed for live A/B of gradient banding.
@@ -1471,7 +1517,9 @@ public final class IlluminatoramaRenderer {
             // the pipeline is actually running at. Assigning a property inside
             // its own `didSet` does not re-enter the observer, so this cannot
             // recurse — and the resize below still runs, using `clamped`.
-            let clamped = min(Self.maxInternalRenderScale,
+            let ceiling = min(Self.maxInternalRenderScale,
+                              Self.canvasBudget.maxInternalRenderScale ?? Self.maxInternalRenderScale)
+            let clamped = min(ceiling,
                               max(Self.minInternalRenderScale, internalRenderScale))
             if clamped != internalRenderScale { internalRenderScale = clamped }
             // `oldValue` is always already clamped (this observer maintains that
@@ -1506,6 +1554,67 @@ public final class IlluminatoramaRenderer {
     public nonisolated static let maxInternalRenderScale: Float = 4.0
     public nonisolated static var internalRenderScaleRange: ClosedRange<Float> {
         minInternalRenderScale...maxInternalRenderScale
+    }
+
+    // ── Canvas budget ────────────────────────────────────────────────
+
+    /// A hard ceiling on how big a canvas this process is allowed to render,
+    /// honoured **at construction** rather than applied afterwards.
+    ///
+    /// Scenes ship a *fixed* canvas chosen on the machine they were authored on
+    /// (`renderWidth`/`renderHeight`, often 2880×1620) and some pin their own
+    /// SSAA on top. A host running on a much smaller GPU — the Apple TV app is
+    /// the motivating case — can shrink a scene after `make()` returns via
+    /// `IlluminatoramaCanvasScalable.setCanvasScale`, but by then the targets
+    /// for the FULL canvas have already been allocated: at the documented ~194
+    /// bytes per internal pixel, a 2880×1620 canvas at SSAA 1.3 is ~1.5 GB
+    /// asked for in one breath. A host with a per-process memory limit is dead
+    /// before it can trim anything.
+    ///
+    /// So the ceiling lives here, where every path that sizes a target already
+    /// funnels through: `init`, `resize`, and the `internalRenderScale`
+    /// observer. Aspect ratio is always preserved — a clamped canvas is the
+    /// same framing at lower resolution, never a crop.
+    ///
+    /// **Default is unlimited, so this changes nothing unless a host opts in.**
+    /// Set it once at launch, before the first renderer is constructed; setting
+    /// it later only affects renderers built or resized after the fact.
+    public struct CanvasBudget: Sendable, Equatable {
+        /// Widest output canvas allowed, in pixels. `nil` = unlimited.
+        public var maxOutputWidth: Int?
+        /// Highest `internalRenderScale` allowed. `nil` = the usual 4.0 ceiling.
+        public var maxInternalRenderScale: Float?
+
+        public init(maxOutputWidth: Int? = nil, maxInternalRenderScale: Float? = nil) {
+            self.maxOutputWidth = maxOutputWidth
+            self.maxInternalRenderScale = maxInternalRenderScale
+        }
+
+        /// The unconstrained default — what every host gets unless it opts in.
+        public static let unlimited = CanvasBudget()
+    }
+
+    /// Process-wide canvas ceiling. See `CanvasBudget`.
+    public static var canvasBudget: CanvasBudget = .unlimited
+
+    /// Apply `canvasBudget` to one (output size, SSAA) pair.
+    ///
+    /// Returns the sizes actually allowed. Width is clamped first and the height
+    /// follows from the ORIGINAL aspect (not from the clamped width's rounding),
+    /// so repeated clamping is stable and framing is preserved exactly.
+    static func budgeted(outputW: Int, outputH: Int,
+                         scale: Float) -> (w: Int, h: Int, scale: Float) {
+        var w = max(1, outputW)
+        var h = max(1, outputH)
+        let budget = canvasBudget
+        if let maxW = budget.maxOutputWidth, w > maxW, maxW > 0 {
+            let aspect = Double(w) / Double(max(1, h))
+            w = max(2, (maxW / 2) * 2)
+            h = max(2, (Int((Double(w) / aspect).rounded()) / 2) * 2)
+        }
+        var s = scale
+        if let maxS = budget.maxInternalRenderScale { s = min(s, maxS) }
+        return (w, h, s)
     }
 
     // ── Phase 3 IBL knobs ────────────────────────────────────────────
@@ -2484,10 +2593,16 @@ public final class IlluminatoramaRenderer {
         // not be allocated (correctness over the saving — `encodeSSAOPass` runs
         // the real passes in that case too).
         if !ssaoActive, let neutral = aoNeutralTexture { return neutral }
-        return ssaoDenoiseEnabled ? currentAOHistoryTexture : aoTexture
+        // Three-way, not two: before the split, "denoise off" fell all the way back
+        // to the RAW AO, so escaping the temporal half also cost the spatial filter.
+        // `aoFilteredTexture` is the spatial-only result and is the right source
+        // whenever the spatial pass ran and the temporal one did not.
+        if ssaoTemporalEnabled { return currentAOHistoryTexture }
+        if ssaoSpatialRuns     { return aoFilteredTexture }
+        return aoTexture
     }
     private var ssrDenoisedTexture: MTLTexture {
-        ssrDenoiseEnabled ? currentSSRHistoryTexture : ssrRawTexture
+        ssrTemporalEnabled ? currentSSRHistoryTexture : ssrRawTexture
     }
 
     private let gbufferPipeline: MTLRenderPipelineState
@@ -3624,9 +3739,22 @@ public final class IlluminatoramaRenderer {
         // `self.internalRenderScale` before its memberwise default applies, so
         // read the SAME static the property's default expression reads — one
         // source, no literal to keep in sync.
-        let initialScale = Self.defaultInternalRenderScale
-        self.outputWidth  = max(1, width)
-        self.outputHeight = max(1, height)
+        //
+        // The process-wide `canvasBudget` is applied HERE, before a single
+        // target is allocated — a host that can't afford the scene's authored
+        // canvas must never allocate it, not shrink it afterwards. Unlimited by
+        // default, so this is a no-op for hosts that haven't opted in.
+        let budgeted = Self.budgeted(outputW: width, outputH: height,
+                                     scale: Self.defaultInternalRenderScale)
+        let initialScale = budgeted.scale
+        self.outputWidth  = budgeted.w
+        self.outputHeight = budgeted.h
+        // Must stay HERE, while `self` is still being initialised (`width` /
+        // `height` / `camera` are not assigned yet): in that phase Swift does
+        // not run property observers, so this records the budgeted scale
+        // WITHOUT the `didSet` calling `resize` on a half-built renderer. Moving
+        // it below the last stored-property assignment would do exactly that.
+        self.internalRenderScale = initialScale
         let (iw, ih) = Self.internalDims(outputW: self.outputWidth,
                                           outputH: self.outputHeight,
                                           scale: initialScale)
@@ -4706,6 +4834,29 @@ public final class IlluminatoramaRenderer {
     // path, so a single attach is all the wiring needed per geometry.
 
     @discardableResult
+    /// Object-space AABB of a registered mesh, or `nil` if it cannot be read.
+    /// Diagnostic path — see `IlluminatoramaMesh.localBounds()`.
+    public func meshLocalBounds(_ kind: MeshKind) -> (min: SIMD3<Float>, max: SIMD3<Float>)? {
+        meshes[kind]?.localBounds()
+    }
+
+    /// Six world-space face patches per instance, ready for
+    /// `ZFightDetector.audit(_:requireSameFacing: true)`.
+    ///
+    /// This is the piece that was missing for native Illuminatorama scenes: the
+    /// geometry auditors take `[SurfacePatch]`, and until now the only producer
+    /// walked `SCNNode`s — which a native scene does not have. See
+    /// `IlluminatoramaSurfaceAudit` for why it emits faces rather than objects.
+    public func auditSurfacePatches(_ instances: [InstanceRef],
+                                    name: ((Int, InstanceRef) -> String)? = nil) -> [SurfacePatch] {
+        IlluminatoramaSurfaceAudit.facePatches(
+            instances: instances.map { (kind: $0.meshKind,
+                                        model: $0.data.modelMatrix,
+                                        normalMatrix: $0.data.normalMatrix) },
+            bounds: { [weak self] kind in self?.meshLocalBounds(kind) },
+            name: { i in name?(i, instances[i]) ?? "\(instances[i].meshKind)#\(i)" })
+    }
+
     public func registerMesh(_ mesh: IlluminatoramaMesh) -> IlluminatoramaMeshHandle {
         let kind = MeshKind.custom("gpuMesh#\(UUID().uuidString)")
         meshes[kind] = mesh
@@ -7973,10 +8124,16 @@ public final class IlluminatoramaRenderer {
     /// and edge-bleed errors at every one of them, and keeps the full 1.6 GB
     /// resident even in draft mode.)
     public func resize(width: Int, height: Int) {
-        let outW = max(1, width)
-        let outH = max(1, height)
+        // Same ceiling as `init` — a host that asks for more than `canvasBudget`
+        // allows (a canvas-scale slider, an SSAA write) gets the largest canvas
+        // it is allowed to have, at the requested aspect.
+        let budgeted = Self.budgeted(outputW: width, outputH: height,
+                                     scale: internalRenderScale)
+        let outW = budgeted.w
+        let outH = budgeted.h
+        if budgeted.scale != internalRenderScale { internalRenderScale = budgeted.scale }
         let (inW, inH) = Self.internalDims(outputW: outW, outputH: outH,
-                                            scale: internalRenderScale)
+                                            scale: budgeted.scale)
         guard outW != self.outputWidth || outH != self.outputHeight ||
               inW  != self.width       || inH  != self.height else { return }
         let outputDimsChanged = (outW != self.outputWidth || outH != self.outputHeight)
@@ -8221,15 +8378,15 @@ public final class IlluminatoramaRenderer {
         // Track enable-transitions so a re-enable re-primes each temporal history.
         if taaEnabled && !previousTaaEnabled { taaNeedsFirstFrame = true }
         previousTaaEnabled = taaEnabled
-        if ssaoDenoiseEnabled && !previousSsaoEnabled { aoNeedsFirstFrame  = true }
-        previousSsaoEnabled = ssaoDenoiseEnabled
+        if ssaoTemporalEnabled && !previousSsaoEnabled { aoNeedsFirstFrame  = true }
+        previousSsaoEnabled = ssaoTemporalEnabled
         // SSAO is skipped entirely while `ssaoIntensity <= 0` (the chain gate
         // below), so its temporal history goes stale during the off period —
         // re-prime it when intensity comes back, exactly as SSR does.
         if ssaoActive && !previousSSAOIntensityActive { aoNeedsFirstFrame = true }
         previousSSAOIntensityActive = ssaoActive
-        if ssrDenoiseEnabled  && !previousSsrEnabled  { ssrNeedsFirstFrame = true }
-        previousSsrEnabled  = ssrDenoiseEnabled
+        if ssrTemporalEnabled && !previousSsrEnabled  { ssrNeedsFirstFrame = true }
+        previousSsrEnabled  = ssrTemporalEnabled
         // SSR is skipped entirely while `ssrIntensity <= 0` (see the gather/temporal/
         // composite gate below), so its temporal history goes stale during the off
         // period — re-prime it when intensity comes back.
@@ -8246,6 +8403,7 @@ public final class IlluminatoramaRenderer {
         // via `applySharedPostFX`.) Targets are set before `uploadFrameUniforms`
         // below, which eases toward them.
         if appliesSharedLensFX { applySharedLensFX(); applySharedColorGrade() }
+        if appliesSharedDenoiser { applySharedDenoiser() }
         // Ping-pong the instance buffer FIRST: after this swap,
         // currentInstanceBuffer is what was previousInstanceBuffer last frame
         // (so uploadInstances overwrites it with this frame's data), and
@@ -8598,14 +8756,14 @@ public final class IlluminatoramaRenderer {
         // first-frame flag — otherwise the ping-pong would keep advancing over
         // two buffers nothing is writing, and a later re-enable would blend
         // against arbitrarily old occlusion. Same contract as the SSR chain.
-        if ssaoDenoiseEnabled && ssaoChainEncodes {
+        if ssaoTemporalEnabled && ssaoChainEncodes {
             aoNeedsFirstFrame = false
             aoHistoryToggle.toggle()
         }
         // Only when SSR actually RAN this frame (intensity > 0): while it's
         // skipped, the history must neither toggle nor clear its first-frame
         // flag, so a later re-enable re-primes from a clean slate.
-        if ssrDenoiseEnabled && ssrIntensity > 0 {
+        if ssrTemporalEnabled && ssrIntensity > 0 {
             ssrNeedsFirstFrame = false
             ssrHistoryToggle.toggle()
         }
@@ -10286,7 +10444,7 @@ public final class IlluminatoramaRenderer {
     }
 
     private func encodeSSAOSpatialFilter(_ cb: MTLCommandBuffer) {
-        guard ssaoDenoiseEnabled, ssaoChainEncodes else { return }
+        guard ssaoSpatialRuns, ssaoChainEncodes else { return }
         let halfW = max(1, width / 2)
         let halfH = max(1, height / 2)
         guard let enc = timedComputeEncoder(cb, "ssao.spatial") else { return }
@@ -10302,7 +10460,7 @@ public final class IlluminatoramaRenderer {
     }
 
     private func encodeSSAOTemporalPass(_ cb: MTLCommandBuffer) {
-        guard ssaoDenoiseEnabled, ssaoChainEncodes else { return }
+        guard ssaoTemporalEnabled, ssaoChainEncodes else { return }
         let halfW = max(1, width / 2)
         let halfH = max(1, height / 2)
         guard let enc = timedComputeEncoder(cb, "ssao.temporal") else { return }
@@ -10528,7 +10686,7 @@ public final class IlluminatoramaRenderer {
     }
 
     private func encodeSSRTemporalPass(_ cb: MTLCommandBuffer) {
-        guard ssrDenoiseEnabled else { return }
+        guard ssrTemporalEnabled else { return }
         guard let enc = timedComputeEncoder(cb, "ssr.temporal") else { return }
         enc.label = "Illuminatorama.ssr.temporal"
         enc.setComputePipelineState(ssrTemporalPipeline)
@@ -11849,9 +12007,9 @@ public final class IlluminatoramaRenderer {
             autoExposureHalfLife: autoExposureHalfLife,
             debugTerm: debugTerm.rawValue,
             iblDiffuseDesaturation: iblDiffuseDesaturation,
-            ssaoDenoiseEnabled: ssaoDenoiseEnabled ? 1 : 0,
+            ssaoSpatialEnabled: ssaoSpatialEnabled ? 1 : 0,
             ssaoTemporalBlend: ssaoTemporalBlend,
-            ssrDenoiseEnabled: ssrDenoiseEnabled ? 1 : 0,
+            ssrTemporalEnabled: ssrTemporalEnabled ? 1 : 0,
             ssrTemporalBlend: ssrTemporalBlend,
             ssaoIsFirstFrame: aoNeedsFirstFrame ? 1 : 0,
             ssrIsFirstFrame: ssrNeedsFirstFrame ? 1 : 0,

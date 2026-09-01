@@ -180,7 +180,7 @@ kernel void illumi_ssao_spatial(
     uint halfH = outAO.get_height();
     if (gid.x >= halfW || gid.y >= halfH) return;
 
-    if (frame.ssaoDenoiseEnabled == 0u || frame.ssaoIntensity <= 0.0) {
+    if (frame.ssaoSpatialEnabled == 0u || frame.ssaoIntensity <= 0.0) {
         outAO.write(rawAO.read(gid), gid);
         return;
     }
@@ -263,8 +263,11 @@ kernel void illumi_ssao_temporal(
 
     float current = float(filteredAO.read(gid).r);
 
-    // Reset sample count and pass through on first frame or when disabled.
-    if (frame.ssaoDenoiseEnabled == 0u || frame.ssaoIsFirstFrame != 0u) {
+    // Reset sample count and pass through on the first frame. There is no
+    // "disabled" arm any more: this kernel is only dispatched when
+    // `IlluminatoramaRenderer.ssaoTemporalEnabled` is true, so the CPU gate is the
+    // single authority and a second uniform would only be able to disagree with it.
+    if (frame.ssaoIsFirstFrame != 0u) {
         sampleCount.write(half4(0.0h), gid);
         outAO.write(half4(half(current)), gid);
         return;

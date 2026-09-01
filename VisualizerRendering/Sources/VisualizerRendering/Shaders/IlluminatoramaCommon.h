@@ -148,9 +148,9 @@ struct FrameUniforms {
     // Phase 4.39: AAA spatiotemporal denoiser knobs. Two 16-byte clusters
     // that grow the struct by 32 bytes past the 12-byte implicit padding gap
     // left by iblDiffuseDesaturation (matches the Swift-side comment).
-    uint     ssaoDenoiseEnabled;    // gates SSAO bilateral + temporal passes
+    uint     ssaoSpatialEnabled;    // 1 = spatial kernel filters, 0 = passes raw through
     float    ssaoTemporalBlend;     // AO history blend (high = more stable)
-    uint     ssrDenoiseEnabled;     // gates SSR temporal accumulation
+    uint     ssrTemporalEnabled;    // gates SSR temporal accumulation (no spatial stage exists)
     float    ssrTemporalBlend;      // SSR history blend
     uint     ssaoIsFirstFrame;      // 1 = no valid AO history yet
     uint     ssrIsFirstFrame;       // 1 = no valid SSR history yet
@@ -635,12 +635,21 @@ struct Instance {
     //   z = darkness of the core against the wood it grew through, [0,1]
     //   w = fraction of lattice cells that carry a knot
     float4   woodKnots;
+
+    // ── Animated UV DOMAIN WARP (see `warpUV` in IlluminatoramaGBuffer.metal) ──
+    // NEW 16-byte cluster (offsets 288-303): stride 288 -> 304.
+    //
+    //   x = amplitude in UV units (0 = disabled — the default, and an exact no-op)
+    //   y = spatial frequency: wobbles across one UV unit
+    //   z = temporal speed in radians/second
+    //   w = target: 0 = emission only, 1 = albedo + emission
+    float4   uvWarp;
 };
 
 // The Swift mirror (`IlluminatoramaInstance._assertStride240`) has always asserted this
 // side of the contract; this is the other side, and it costs a compile. A Swift field
 // added without its Metal twin used to be caught only by a wrong-looking render.
-static_assert(sizeof(Instance) == 288, "Instance must match IlluminatoramaInstance (288 bytes)");
+static_assert(sizeof(Instance) == 304, "Instance must match IlluminatoramaInstance (304 bytes)");
 
 struct Vertex {
     float3 position;

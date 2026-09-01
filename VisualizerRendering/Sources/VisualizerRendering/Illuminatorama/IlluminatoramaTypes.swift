@@ -179,13 +179,20 @@ public struct IlluminatoramaFrameUniforms {
     // boundary) left. Together these two clusters (4+4+4+4 / 4+4+4+4)
     // each fill a 16-byte slot, so the struct stride jumps by 32 bytes —
     // the compiler would have padded 28 bytes anyway; we reclaim them.
-    /// 1 enables the SSAO bilateral spatial filter + temporal accumulation.
-    public var ssaoDenoiseEnabled: UInt32 = 1
+    /// 1 = the SSAO spatial kernel filters; 0 = it passes the raw AO through.
+    /// (Renamed from `ssaoDenoiseEnabled` when spatial and temporal were split —
+    /// same type, same slot, so the struct stride is unchanged. The temporal pass
+    /// no longer needs a uniform: it is gated entirely CPU-side by
+    /// `IlluminatoramaRenderer.ssaoTemporalEnabled`, which decides whether the
+    /// dispatch is encoded at all.)
+    public var ssaoSpatialEnabled: UInt32 = 1
     /// History blend weight for the SSAO temporal pass: 0 = always current,
     /// 1 = frozen history. Typical: 0.90.
     public var ssaoTemporalBlend: Float = 0.90
     /// 1 enables SSR temporal accumulation (separate from the HDR TAA pass).
-    public var ssrDenoiseEnabled: UInt32 = 1
+    /// Renamed from `ssrDenoiseEnabled`: SSR's chain is temporal-only, so the old
+    /// name implied a spatial stage that never existed. Same type, same slot.
+    public var ssrTemporalEnabled: UInt32 = 1
     /// History blend weight for the SSR temporal pass. Typical: 0.85.
     public var ssrTemporalBlend: Float = 0.85
     /// 1 on the first frame after enable/resize — SSAO temporal skips history.
@@ -957,6 +964,27 @@ public struct IlluminatoramaInstance {
     ///   w = fraction of lattice cells that carry a knot
     public var woodKnots: SIMD4<Float> = .zero
 
+    // ── Animated UV DOMAIN WARP (per instance) ────────────────────────────────
+    // NEW 16-byte cluster (offsets 288-303): stride 288 → 304.
+    //
+    // Offsets the UV the material is sampled at, as a smooth function of the UV
+    // itself and of time — a domain warp, not a scroll. A scroll translates the
+    // whole map rigidly; warping the DOMAIN makes the pattern breathe and
+    // wobble in place, which is what "the emission slowly morphs" asks for.
+    //
+    // The alternative in a host without this is to cross-dissolve two pre-baked
+    // variants, which can only ever swap between states it baked in advance.
+    // A warp is continuous and costs no atlas slices.
+    //
+    // Applied ONLY where it is asked for, and `x = 0` is an exact no-op, so
+    // every existing instance is untouched.
+    //
+    //   x = amplitude in UV units (0 = disabled — the default)
+    //   y = spatial frequency: how many wobbles across one UV unit
+    //   z = temporal speed in radians/second
+    //   w = target: 0 = emission only · 1 = albedo + emission
+    public var uvWarp: SIMD4<Float> = .zero
+
     public init(
         modelMatrix: simd_float4x4,
         albedo: SIMD3<Float> = SIMD3(0.8, 0.8, 0.8),
@@ -992,7 +1020,7 @@ public struct IlluminatoramaInstance {
     /// Compile-time guard: Swift and Metal structs must agree on 272 bytes.
     /// If this fires, either a Swift field was added without the matching Metal
     /// field (or vice versa), or alignment changed unexpectedly.
-    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 288, "IlluminatoramaInstance stride must be 288") }()
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 304, "IlluminatoramaInstance stride must be 304") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //

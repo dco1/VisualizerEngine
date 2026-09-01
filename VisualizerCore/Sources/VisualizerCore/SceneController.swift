@@ -98,6 +98,17 @@ public protocol SceneController: AnyObject {
     /// tracks here so kinks are caught as an exact location. Defaults to `[]`.
     func splinePolylines() -> [SplinePolyline]
 
+    /// World-space surface patches for the z-fight check, for scenes the
+    /// SceneKit node walk cannot see.
+    ///
+    /// `SceneAudit` builds its patch list by walking `SCNNode`s. A native
+    /// Illuminatorama scene has no node tree — its geometry is an instance array
+    /// bound straight to the GPU — so the walk returns nothing and the audit
+    /// reports a clean scene it never looked at. A native controller overrides
+    /// this and returns `renderer.auditSurfacePatches(staticInstances)`.
+    /// Defaults to `[]`, which keeps every SceneKit scene on the node walk.
+    func auditSurfacePatches() -> [SurfacePatch]
+
     // ── FPS reporting ────────────────────────────────────────────────
     /// Set by `AppModel` after load. The controller calls it every ~0.5 s
     /// with its measured tick rate (Hz) so the toolbar can display the real
@@ -215,4 +226,39 @@ public extension SceneController {
     func captureHeroSettled(size: SIMD2<Int>) -> MTLTexture? { nil }
     func penetrationProbers() -> [any PenetrationProbing] { [] }
     func splinePolylines() -> [SplinePolyline] { [] }
+    func auditSurfacePatches() -> [SurfacePatch] { [] }
 }
+
+// MARK: - tvOS: settings panel placeholder
+
+#if os(tvOS)
+/// Apple TV v1 ships no per-scene settings panel: tvOS SwiftUI has no `Slider`
+/// / `Stepper` / `ColorPicker`, and the shared `LabeledSlider` /
+/// `OrbitCameraSection` / `SettingsExportSection` controls are macOS-only
+/// (excluded above). Scene packages wrap their `…SettingsView` file and the
+/// controller's `makeSettingsView` in `#if !os(tvOS)`; this default then
+/// witnesses the requirement with a blurb-only view, so the tvOS app still
+/// has something to show for "about this scene". A scene whose settings UI
+/// does compile on tvOS keeps its own `makeSettingsView` — the concrete
+/// implementation wins over this default.
+public extension SceneController {
+    func makeSettingsView(blurb: String) -> AnyView {
+        AnyView(SceneBlurbView(blurb: blurb))
+    }
+}
+
+/// The tvOS stand-in settings view: just the scene's blurb.
+public struct SceneBlurbView: View {
+    public let blurb: String
+    public init(blurb: String) { self.blurb = blurb }
+    public var body: some View {
+        ScrollView {
+            Text(blurb)
+                .font(.body)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding()
+        }
+    }
+}
+#endif

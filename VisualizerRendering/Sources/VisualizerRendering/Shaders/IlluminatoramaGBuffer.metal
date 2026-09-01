@@ -8,6 +8,32 @@
 #include "IlluminatoramaMaterial.h"
 using namespace metal;
 
+// ── Animated UV DOMAIN WARP ───────────────────────────────────────────────────
+//
+// Offsets the sampling UV as a smooth function of the UV itself and of time.
+// A SCROLL translates a map rigidly and reads as the whole pattern sliding; a
+// DOMAIN warp moves the sample POINT instead, so the pattern breathes and
+// wobbles in place while staying where it is. That is the difference between a
+// window grid drifting sideways and one that slowly morphs.
+//
+// Two octaves, the second at an irrational-ish frequency and speed ratio to the
+// first so they never phase-lock into an obvious repeating pulse. Each axis is
+// driven by the OPPOSITE one (x by uv.y, y by uv.x), which makes it shear and
+// swirl rather than merely breathe in and out.
+//
+// `w.x <= 0` returns the UV untouched — the default for every instance, so this
+// is an exact no-op everywhere it is not asked for.
+static inline float2 warpUV(float2 uv, float4 w, float t) {
+    if (w.x <= 0.0f) return uv;
+    const float f = w.y;
+    const float s = w.z * t;
+    float2 d = float2(sin(uv.y * f + s),
+                      cos(uv.x * f * 1.13f - s * 0.87f));
+    d += 0.5f * float2(sin(uv.y * f * 2.31f - s * 1.71f),
+                       cos(uv.x * f * 1.87f + s * 1.29f));
+    return uv + d * w.x;
+}
+
 // TEMP DIAGNOSTIC (forest-tex session): set to 1 to flat-colour Forest wood by
 // species marker (oak=red birch=white maple=blue log=green cap=yellow). REVERT
 // to 0 before counting any fix; this is a marker-contract probe only.
@@ -322,6 +348,10 @@ fragment GBufferOut illumi_fs(
     // hash (a board index cannot slide), the soil marker, and the derivatives.
     WoodKnotSample knot = sampleWoodKnots(in.uv, inst.woodKnots, inst.patternCells);
     float2 matUV = in.uv + knot.warp;
+    // `uvWarp.w >= 0.5` extends the animated domain warp to the MATERIAL maps
+    // (albedo/roughness/normal) as well as emission. Default 0 = emission only,
+    // which is the common case: a glow that morphs on a surface that does not.
+    if (inst.uvWarp.w >= 0.5f) matUV = warpUV(matUV, inst.uvWarp, frame.time);
 
     // Phase 4.5 — tangent-space normal-map sampling. The atlas is the
     // same `bgra8Unorm` non-colour atlas as metallic/roughness; the
@@ -1125,7 +1155,9 @@ fragment GBufferOut illumi_fs(
     // albedo atlas means the bake gets linear RGB directly.
     float3 emission = inst.emission;
     if (inst.emissionTextureSlice >= 0) {
-        float4 tx = sampleAtlasAspect(albedoAtlas, texSampler, in.uv,
+        // Domain-warped sampling UV. Exact no-op when `uvWarp.x == 0`.
+        float2 emUV = warpUV(in.uv, inst.uvWarp, frame.time);
+        float4 tx = sampleAtlasAspect(albedoAtlas, texSampler, emUV,
                                       uint(inst.emissionTextureSlice), albedoUVScale, duvdx, duvdy);
         // Phase 4.27b — scale the emission texture by the material's
         // `emission.intensity` so a texture-driven glow reads at its tuned
