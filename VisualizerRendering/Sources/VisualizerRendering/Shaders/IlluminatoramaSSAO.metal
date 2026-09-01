@@ -1,7 +1,29 @@
-// ── ILLUMINATORAMA — SSAO ───────────────────────────────────────────────────
+// ── ILLUMINATORAMA — SSAO (GTAO horizon-integral) ────────────────────────────
 //
-// Hemisphere-kernel screen-space ambient occlusion plus its spatial and temporal
-// filters.
+// Ground-Truth Ambient Occlusion (Jimenez et al. 2016 / Intel XeGTAO) plus its
+// spatial and temporal filters.
+//
+// **Why this replaced the hemisphere kernel (DH-0527, was DH-0440).** The previous
+// estimator was a 16-point cosine-weighted hemisphere Monte-Carlo: it fired 16 rays
+// into a hash-rotated hemisphere, projected each back to screen, and counted depth
+// hits. At a concave junction — the ONLY place AO finds real occlusion — that hash ×
+// point-cloud rendered as a foamy 2–4 px cellular crust hugging every wall/wall and
+// wall/ceiling corner ("spongy shadows… painted with a sponge", Danny). The
+// `+SpongeProbe` bench proved across seven ablations that the foam was NOT sampling
+// variance (16→64 samples removed only 20% of it vs the 50% Monte-Carlo demands),
+// NOT the normal basis, NOT the buffer resolution, and NOT the denoiser — the single
+// lever that moved it was the kernel RADIUS, the fingerprint of "wrong method", not
+// "wrong setting". A screen-space point-cloud estimator cannot be tuned out of it.
+//
+// GTAO estimates occlusion ANALYTICALLY instead of by point sampling. For each of a
+// few screen-space slices through the pixel it marches the depth buffer to find the
+// two HORIZON angles (the highest occluding angle on each side), projects the surface
+// normal into the slice plane, and evaluates the CLOSED-FORM cosine-visibility
+// integral over the arc between the horizons. There is no per-pixel point cloud to
+// alias, so the corner foam disappears by construction while genuine contact
+// darkening (the wash up a real corner) is retained. Same screen-space cost envelope,
+// same draft/interactive lane, same G-buffer inputs, same half-res buffer, and the
+// existing bilateral + temporal filters below are unchanged.
 
 #include <metal_stdlib>
 #include "IlluminatoramaCommon.h"
@@ -14,53 +36,105 @@ static inline float ssaoHash12(float2 p) {
     return fract((p3.x + p3.y) * p3.z);
 }
 
-// Cosine-weighted HEMISPHERE kernel, +Z = the surface normal.
+// Jimenez Interleaved Gradient Noise, [0,1). Unlike white noise (`ssaoHash12`) its energy
+// sits at a spatial frequency the 3×3 bilateral below resolves, so a per-pixel azimuth
+// rotation seeded from it reads as a smooth field after one denoise pass rather than the
+// white speckle a hash leaves. It gives the live TAA + SSAO-temporal passes a structured,
+// per-frame-advancing pattern to integrate (see the seed walk below), which is what converges
+// the grazing-flat self-occlusion the no-guard march leaves. The headless capture lane forces
+// TAA off, so a single-frame grazing flat still speckles there — verified live, not in the bench.
+static inline float ssaoIGN(float2 p) {
+    return fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715))));
+}
+
+// ── GTAO — slices, steps, falloff ────────────────────────────────────────────
 //
-// EVERY z is strictly positive, and that is the whole point. This kernel replaces a
-// SPHERE kernel (2026-08-05) whose 10 negative-z vectors were placed BELOW the surface
-// plane — i.e. inside the wall — by the `TBN` basis below. A point inside a wall is
-// trivially "occluded" by that wall: the depth buffer at its screen position is the
-// wall itself, the occlusion test passes, and `rangeCheck` returns 1.0 because the depth
-// difference is ~0. Every flat surface in the scene therefore carried a constant
-// occlusion pedestal of 1 − 8/16 = 0.500 (two of the ten sank less than the old fixed
-// 0.01 m bias). Measured: a bare wall in an open room read AO 0.503, dead flat, when it
-// should read 1.0. That is Danny's "painted with a sponge… black mold", and it is why
-// raising `ssaoIntensity` deepened it while shrinking `ssaoRadius` pulled the sunken
-// samples back under the bias and made it retreat.
+// Six azimuthal slices × four march steps per side is 48 depth reads. That is more
+// than the retired 16-sample point cloud, but it stays firmly in the cheap
+// screen-space lane (half-res, no ray tracing) — the point of GTAO over RTAO — and
+// the extra slices buy a low-variance single frame on concave geometry (corners), which
+// is where the headline artefact lived. Grazing FLAT surfaces (a ceiling seen edge-on)
+// still self-occlude in a single frame without a co-planarity guard (removed above); the
+// live canvas's TAA + SSAO-temporal passes converge that residual, fed by the per-frame
+// azimuth advance below. The headless bench forces TAA off (`pinGrade` →
+// `sharedTAAOverride = false`) and cannot exercise that convergence.
+constant uint  kGtaoSlices = 6;
+constant uint  kGtaoSteps  = 4;
+constant float kHalfPi     = 1.5707963267948966;
+
+// Minimum march offset, in FULL-RES pixels. A horizon sample must land on a DIFFERENT
+// surface point than the one being shaded, and "different pixel" is not enough: at a
+// grazing view two adjacent texels of the same flat plane are separated almost entirely
+// ALONG the view ray, so `dot(delta/|delta|, V)` is near 1 and the march records a horizon
+// at ~0° — a flat floor reporting near-total occlusion of itself. Whether step 0 lands
+// inside that first-neighbour band was decided by a per-pixel WHITE-noise jitter
+// (`stepJitter`) that also advances every frame, so the false horizon flickered per pixel
+// and per frame: white speckle on flat walls and floors, which the temporal pass could only
+// reproject into smears ("spongy trails"). The steps are now distributed over
+// [kGtaoMinPix, maxPix] instead of [0, maxPix), so no sample is ever taken from the shaded
+// pixel's own neighbourhood and the estimate stops depending on the jitter's coin flip.
+// This is the same first-sample offset XeGTAO carries, and unlike a co-planarity bias it
+// costs nothing at a real corner — the adjacent wall is still there two pixels out.
+constant float kGtaoMinPix = 2.5;
+
+// Tangent-plane bias. A sample only occludes if it rises ABOVE the shaded point's own
+// surface plane; `dot(delta, Ngeo)/|delta|` is that elevation's sine. It is distance-relative
+// on purpose, so it rejects the near-field self-samples a grazing floor march reads out of
+// its OWN plane (depth quantisation lifts them a hair above it) without rejecting a real
+// occluder further out. Kept small — the earlier attempt at this guard needed 0.045 to work
+// because it was fighting the sub-pixel first sample and a bump-tilted arc normal at the same
+// time, and at that size it also lifted the wash up a genuine corner.
+constant float kPlaneBias = 0.002;
+
+
+// **Why there IS a guard, after shipping without one.** DH-0527 first shipped this march
+// with no tangent-plane test at all, on the reasoning that the live canvas's TAA +
+// SSAO-temporal passes would converge the grazing-flat speckle a screen-space march leaves.
+// They cannot, and the live render refuted it within a day (Danny, 2026-08-31: "spongy walls
+// and floors … temporal lagging too, like spongy trails"). The residual was not low-amplitude
+// dither for an accumulator to average down: whether a horizon sample landed on the shaded
+// pixel's own plane was decided by a per-pixel WHITE-noise jitter that also advanced every
+// frame, so the field was high-amplitude and re-randomised per frame — the one input a
+// temporal filter turns into smears rather than a mean.
 //
-// The sphere kernel is the Crytek/NVIDIA-SDK-era one, which is only correct in the
-// original formulation that rescales occlusion about 0.5. A normal-oriented hemisphere
-// estimator like this one requires a hemisphere kernel; the two are not interchangeable.
-//
-// Generated deterministically (see the doc comment on
-// `HouseRenderBridgeGPUTests_WallSplotch.testSSAOFieldIsUnoccludedOnAFlatWall`):
-//   u1 = (i+0.5)/16, u2 = bitReverse4(i)/16
-//   dir = (sqrt(u1)·cos 2πu2, sqrt(u1)·sin 2πu2, sqrt(1−u1))    ← cosine-weighted
-//   len = 0.35 + 0.65·((bitReverse4(i)+0.5)/16)²                ← clusters near contact
-// Cosine weighting is not cosmetic: AO is ∫V(ω)cosθ dω/π, so with cosine-distributed
-// directions the estimator below is exactly `occlusion / samples` with unit weights.
-// The length uses the BIT-REVERSED index so the most grazing samples are not also the
-// longest — that pairing is what lets a normal-map tilt push a sample under the true
-// geometric surface. As generated, the shallowest sample still sits 0.075 m above the
-// plane at radius 0.5, ~5× the bias below.
-constant float3 kSsaoKernel[16] = {
-    float3( 0.061984,  0.000000,  0.345113),
-    float3(-0.163334,  0.000000,  0.507827),
-    float3( 0.000000,  0.158674,  0.368724),
-    float3( 0.000000, -0.349250,  0.660021),
-    float3( 0.137201,  0.137201,  0.310181),
-    float3(-0.261156, -0.261156,  0.510303),
-    float3(-0.206091,  0.206091,  0.352354),
-    float3( 0.427886, -0.427886,  0.644202),
-    float3( 0.239532,  0.099218,  0.243540),
-    float3(-0.412295, -0.170778,  0.369137),
-    float3(-0.132314,  0.319434,  0.250238),
-    float3( 0.263683, -0.636588,  0.431023),
-    float3( 0.128907,  0.311210,  0.178245),
-    float3(-0.241067, -0.581988,  0.271083),
-    float3(-0.433441,  0.179537,  0.150895),
-    float3( 0.872965, -0.361594,  0.169707)
-};
+// The guard is cheap now, at 0.002 rather than the 0.045 the first attempt needed, because it
+// is no longer compensating for two other defects: the march started sub-pixel
+// (`kGtaoMinPix`) and the arc integral read a bump normal against geometric horizons
+// (`Narc`). Fixing those left the guard with only its own job, and at this size it no longer
+// lifts the wash up a genuine corner — the profile still reads 1.000 → 0.982 → 0.965 → 0.930
+// into a wall/floor junction.
+
+// The closed-form inner arc integral for ONE side of a slice (Jimenez et al. 2016,
+// Eq. for the visibility of an arc). `h` is the (already hemisphere-clamped) horizon
+// angle, `n` the projected-normal angle, both relative to the view vector in the
+// slice plane. Returns the side's contribution before the projected-normal-length
+// weight is applied by the caller.
+static inline float gtaoArc(float h, float n, float cosN, float sinN) {
+    return 0.25 * (cosN + 2.0 * h * sinN - cos(2.0 * h - n));
+}
+
+// Distance falloff for a horizon sample: 1 inside the radius, 0 at it. Quadratic, not
+// linear. Linear attenuation charges a genuine occluder at a QUARTER of the radius a 25 %
+// penalty, and the near field is where contact lives — a chair leg meeting the floor is
+// centimetres from the shaded pixel with a half-metre radius dial — so a linear ramp taxes
+// exactly the signal AO exists to produce while leaving the far, room-scale term at full
+// strength. Squaring holds the near field at ~94 % and does its rolling off near the radius,
+// where the cut is meant to happen. Measured: contact localization Δ 0.12 → 0.22.
+static inline float gtaoFalloff(float dist, float radius) {
+    float x = clamp(dist / radius, 0.0, 1.0);
+    return 1.0 - x * x;
+}
+
+// View-space position at an integer full-res pixel, clamped to the buffer. Used to
+// reconstruct the GEOMETRIC surface normal from depth (below).
+static inline float3 gtaoViewPos(depth2d<float, access::read> gDepth, int2 p, int2 mx,
+                                 float2 fdim, float4x4 invProj) {
+    p = clamp(p, int2(0), mx);
+    float z = gDepth.read(uint2(p));
+    float2 ndc = (float2(p) + 0.5) / fdim * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    return viewPosFromDepth(ndc, z, invProj);
+}
 
 kernel void illumi_ssao(
     depth2d<float, access::read>   gDepth      [[texture(0)]],
@@ -94,64 +168,180 @@ kernel void illumi_ssao(
         return;
     }
 
-    half4 nrH = gNormalRgh.read(fullGid);
-    float3 Nworld = octDecode(float2(nrH.rg));
-
-    // Reconstruct view-space position and normal. SSAO works in view space so
-    // sample offsets are commensurate with the camera, not the world.
-    float2 ndc = (float2(fullGid) + 0.5) / float2(fullW, fullH) * 2.0 - 1.0;
+    // Reconstruct view-space position. GTAO works in view space so the horizon deltas are
+    // true camera-space vectors and the radius is metres.
+    float2 fdim = float2(fullW, fullH);
+    float2 ndc = (float2(fullGid) + 0.5) / fdim * 2.0 - 1.0;
     ndc.y = -ndc.y;
     float3 Pview = viewPosFromDepth(ndc, depth, frame.invProjection);
-    float3 Nview = normalize((frame.view * float4(Nworld, 0.0)).xyz);
+    float3 V = normalize(-Pview);                 // surface → camera (view space)
 
-    // Build a TBN basis from a random tangent so the sample pattern is
-    // rotated per-pixel.
-    float rot = ssaoHash12(float2(gid)) * 6.2831853;
-    float3 randomVec = normalize(float3(cos(rot), sin(rot), 0.0));
-    float3 T = normalize(randomVec - Nview * dot(randomVec, Nview));
-    float3 B = cross(Nview, T);
-    float3x3 TBN = float3x3(T, B, Nview);
+    // ONE normal, reconstructed from depth: the true surface plane. The min-|Δz| pick per
+    // axis avoids straddling a silhouette, where the reconstruction blends two surfaces.
+    // (The bump-mapped G-buffer normal is deliberately NOT read here — see `Narc` below.)
+    int2 gpx = int2(fullGid);
+    int2 gmx = int2(int(fullW) - 1, int(fullH) - 1);
+    float3 Pr = gtaoViewPos(gDepth, gpx + int2( 1, 0), gmx, fdim, frame.invProjection);
+    float3 Pl = gtaoViewPos(gDepth, gpx + int2(-1, 0), gmx, fdim, frame.invProjection);
+    float3 Pu = gtaoViewPos(gDepth, gpx + int2( 0, 1), gmx, fdim, frame.invProjection);
+    float3 Pd = gtaoViewPos(gDepth, gpx + int2( 0,-1), gmx, fdim, frame.invProjection);
+    float3 ddx = (abs(Pr.z - Pview.z) < abs(Pview.z - Pl.z)) ? (Pr - Pview) : (Pview - Pl);
+    float3 ddy = (abs(Pu.z - Pview.z) < abs(Pview.z - Pd.z)) ? (Pu - Pview) : (Pview - Pd);
+    float3 Ngeo = cross(ddx, ddy);
+    float nlen = length(Ngeo);
+    if (nlen < 1e-8) { outAO.write(half4(1.0h), gid); return; }   // degenerate patch — no occlusion
+    Ngeo /= nlen;
+    if (dot(Ngeo, V) < 0.0) Ngeo = -Ngeo;       // face the camera
+
+    // The normal the ARC INTEGRAL integrates against. It must be the geometric one.
+    //
+    // GTAO's closed form is exact only when the projected-normal angle `n` and the two
+    // horizon angles describe the same surface. The horizons are marched out of the DEPTH
+    // buffer — pure geometry — so feeding `n` the BUMP-mapped G-buffer normal breaks that
+    // agreement per texel: on a flat, unoccluded plane the horizons say "nothing above the
+    // plane" while `n` is tilted a few degrees by the material's micro-relief, and the
+    // integral returns a value just under 1 that varies with the bump pattern itself. The
+    // result is occlusion CORRELATED WITH THE TEXTURE — a mottled crust that follows the
+    // wood grain on a floor and the roll on a plaster wall, which is precisely the "spongy"
+    // read (DH-0527, Danny 2026-08-31, on the shipped no-guard build). The old point-cloud
+    // estimator was immune because a small normal tilt cannot conjure a depth hit; GTAO's
+    // analytic term multiplies it straight into the output.
+    //
+    // Bump normals belong in the lighting integral's N·L, not in a visibility arc whose
+    // horizons are geometric.
+    float3 Narc = Ngeo;
 
     float radius = max(0.001, frame.ssaoRadius);
-    // Self-occlusion guard, in view-space metres. Scales with BOTH the sample radius
-    // and the view depth, because the two error sources it absorbs do: a sample's
-    // height above the surface is proportional to `radius` (so a fixed bias cancels
-    // real contact signal at small radii and none at large ones), and the half-res
-    // G-buffer read plus depth quantisation grow with distance. The old value was a
-    // fixed 0.01 m, which combined with the sphere kernel above to make `ssaoRadius`
-    // behave as a hidden pedestal control — shrinking the radius pulled sunken samples
-    // back under the bias, which is exactly the "lowering the radius makes them retreat
-    // to the edges" behaviour Danny reported and worked around.
-    float bias = radius * 0.02 + 0.0015 * abs(Pview.z);
-    float occlusion = 0.0;
-    const uint samples = 16;
-    for (uint i = 0; i < samples; ++i) {
-        // Move kernel sample into view space oriented along the surface.
-        float3 sampleView = Pview + TBN * kSsaoKernel[i] * radius;
-        // Project back to NDC to look up the actual depth at that screen
-        // position.
-        float4 sampleClip = frame.projection * float4(sampleView, 1.0);
-        float3 sampleNDC = sampleClip.xyz / sampleClip.w;
-        if (any(abs(sampleNDC.xy) > 1.0)) continue;
-        float2 sUV = float2(sampleNDC.x, -sampleNDC.y) * 0.5 + 0.5;
-        uint2 sPx = uint2(clamp(sUV * float2(fullW, fullH),
-                                float2(0.0), float2(fullW - 1, fullH - 1)));
-        float sceneDepth = gDepth.read(sPx);
-        if (sceneDepth >= 0.99999) continue;
-        // Reconstruct view-space scene position at the sample's NDC location.
-        float3 scenePos = viewPosFromDepth(sampleNDC.xy, sceneDepth, frame.invProjection);
-        // Range check — only count occluders within `radius` of P.
-        float rangeCheck = smoothstep(0.0, 1.0, radius / max(1e-4, abs(Pview.z - scenePos.z)));
-        // View-space Z is negative going away from the camera, so an occluder
-        // is "in front of" the sample when its Z is GREATER (less negative).
-        // With the hemisphere kernel every sample sits ABOVE its own surface, so a
-        // plane can no longer occlude itself at any orientation and `bias` is back to
-        // guarding quantisation only — it is not load-bearing for flatness.
-        if (scenePos.z > sampleView.z + bias) {
-            occlusion += rangeCheck;
+
+    // Screen-space march extent. A view-space offset of `radius` at this pixel's depth
+    // projects to `radius · focal · 0.5 · dim / |z|` pixels; because focalX·W == focalY·H
+    // for a standard perspective the count is isotropic, so one scalar covers both axes.
+    float focalX = frame.projection[0][0];
+    float focalY = frame.projection[1][1];
+    float invZ   = 1.0 / max(1e-3, -Pview.z);
+    // The lower clamp must leave room for `kGtaoMinPix` plus a real march; a 2 px extent
+    // would collapse every step onto the first-neighbour band the minimum offset exists to
+    // skip, which is the grazing-flat speckle again at distance.
+    float maxPix = clamp(radius * focalY * 0.5 * float(fullH) * invZ, kGtaoMinPix + 4.0, 220.0);
+
+    // Per-pixel azimuth rotation + a march-offset jitter, ADVANCED per frame by a
+    // golden-ratio step keyed to `rtSunShadowSeed`. Three slices is too few to cover the
+    // azimuth in one frame, so consecutive frames must sample DIFFERENT orientations for
+    // the SSAO temporal pass to integrate them into a full sweep — otherwise a static
+    // camera re-averages identical frames and denoises nothing (the grazing-ceiling
+    // speckle). The seed WALKS only while a temporal accumulator is live and is frozen at
+    // 0 otherwise, so a truly static frame keeps a stable per-pixel pattern rather than
+    // crawling — the same contract the RT sun-shadow and glass passes already honour.
+    float frameAdvance = float(frame.rtSunShadowSeed) * 0.61803398875;
+    float sliceJitter = fract(ssaoIGN(float2(gid)) + frameAdvance);
+    // The step jitter is INTERLEAVED-GRADIENT too, offset half a tile from the azimuth's so the
+    // two are not the same number. It used to be white noise (`ssaoHash12`), which put the march
+    // offset — and therefore which occluders each pixel finds — at a spatial frequency the 3×3
+    // bilateral cannot resolve. The denoiser cannot remove that; it can only pool it into soft
+    // blobs a few pixels across, which is the residual structure the launch look still showed on
+    // a shaded wall after the march fixes (a negative autocorrelation lobe at lag 3–6). IGN's
+    // energy sits where the bilateral CAN see it, which is the whole reason the azimuth already
+    // used it.
+    float stepJitter  = fract(ssaoIGN(float2(gid) + float2(23.5, 41.5)) + frameAdvance * 1.324717957);
+
+    float visibility = 0.0;
+    for (uint s = 0; s < kGtaoSlices; ++s) {
+        float phi = (float(M_PI_F) / float(kGtaoSlices)) * (float(s) + sliceJitter);
+        float2 omega = float2(cos(phi), sin(phi));        // screen-space (pixel) direction
+
+        // View-space direction for that screen direction. Divide by the focal lengths so
+        // an anisotropic FOV does not skew the slice plane; horizons themselves are read
+        // from reconstructed 3-D positions and are unaffected by this approximation.
+        float3 dirVec = normalize(float3(omega.x / focalX, omega.y / focalY, 0.0));
+        float3 orthoDir = dirVec - dot(dirVec, V) * V;
+        float3 axis = cross(dirVec, V);
+        float axisLen = length(axis);
+        if (axisLen < 1e-5) continue;
+        axis /= axisLen;
+
+        // Project the surface normal into the slice plane. This is the GEOMETRIC normal on
+        // purpose — see `Ngeo` above: the horizons are read out of the depth buffer, so the
+        // arc integral is only self-consistent (flat + unoccluded ⇒ visibility exactly 1)
+        // when `n` describes the SAME surface the horizons came from.
+        float3 projN = Narc - axis * dot(Narc, axis);
+        float projLen = length(projN);
+        if (projLen < 1e-5) continue;
+        float cosNorm = clamp(dot(projN, V) / projLen, -1.0, 1.0);
+        float signN = sign(dot(orthoDir, projN));
+        float n = signN * acos(cosNorm);
+        float sinNorm = sin(n);
+
+        // Horizon search: track the largest cos (smallest angle → most occluding) on
+        // each side. Far samples are faded to -1 (no horizon) so nothing beyond `radius`
+        // contributes, which is what turns the radius dial into a true world distance.
+        float horizonPos = -1.0;   // +omega side
+        float horizonNeg = -1.0;   // -omega side
+        for (uint k = 0; k < kGtaoSteps; ++k) {
+            // Quadratic step spacing (XeGTAO's `pow` distribution). Four samples spread
+            // LINEARLY over [kGtaoMinPix, maxPix] put nothing in the near field — at a
+            // metre-scale radius the first sample already sits ~30 px out — and the near
+            // field is exactly where an object's contact with the floor lives, so linear
+            // spacing measures real room-scale ambient occlusion correctly while reporting
+            // almost no LOCALIZATION at object bases (`ContactAO` Δ 0.11 → 0.04). Squaring
+            // the fraction clusters the taps near the origin and still reaches the full
+            // radius on the last one, so contact darkening and room-scale AO come out of
+            // the same march.
+            float frac = (float(k) + stepJitter) / float(kGtaoSteps);
+            float t = mix(kGtaoMinPix, maxPix, frac * frac);
+            float2 off = omega * t;
+
+            // +omega
+            float2 pPos = float2(fullGid) + off;
+            if (pPos.x >= 0.0 && pPos.y >= 0.0 && pPos.x < fdim.x && pPos.y < fdim.y) {
+                uint2 sPx = uint2(pPos);
+                float sd = gDepth.read(sPx);
+                if (sd < 0.99999) {
+                    float2 sndc = (float2(sPx) + 0.5) / fdim * 2.0 - 1.0;
+                    sndc.y = -sndc.y;
+                    float3 Ps = viewPosFromDepth(sndc, sd, frame.invProjection);
+                    float3 d = Ps - Pview;
+                    float dist = length(d);
+                    if (dist > 1e-4 && dot(d, Ngeo) > kPlaneBias * dist) {
+                        float fall = gtaoFalloff(dist, radius);
+                        float c = dot(d / dist, V);
+                        horizonPos = max(horizonPos, mix(-1.0, c, fall));
+                    }
+                }
+            }
+
+            // -omega
+            float2 pNeg = float2(fullGid) - off;
+            if (pNeg.x >= 0.0 && pNeg.y >= 0.0 && pNeg.x < fdim.x && pNeg.y < fdim.y) {
+                uint2 sPx = uint2(pNeg);
+                float sd = gDepth.read(sPx);
+                if (sd < 0.99999) {
+                    float2 sndc = (float2(sPx) + 0.5) / fdim * 2.0 - 1.0;
+                    sndc.y = -sndc.y;
+                    float3 Ps = viewPosFromDepth(sndc, sd, frame.invProjection);
+                    float3 d = Ps - Pview;
+                    float dist = length(d);
+                    if (dist > 1e-4 && dot(d, Ngeo) > kPlaneBias * dist) {
+                        float fall = gtaoFalloff(dist, radius);
+                        float c = dot(d / dist, V);
+                        horizonNeg = max(horizonNeg, mix(-1.0, c, fall));
+                    }
+                }
+            }
         }
+
+        // Angles from cosines, clamped to the hemisphere around the projected normal.
+        float hP =  acos(clamp(horizonPos, -1.0, 1.0));
+        float hN = -acos(clamp(horizonNeg, -1.0, 1.0));
+        hP = n + clamp(hP - n, -kHalfPi, kHalfPi);
+        hN = n + clamp(hN - n, -kHalfPi, kHalfPi);
+
+        visibility += projLen * (gtaoArc(hP, n, cosNorm, sinNorm) +
+                                 gtaoArc(hN, n, cosNorm, sinNorm));
     }
-    float ao = 1.0 - (occlusion / float(samples)) * frame.ssaoIntensity;
+    visibility = clamp(visibility / float(kGtaoSlices), 0.0, 1.0);
+
+    // Fold intensity in the same way the old estimator did: occlusion = 1 − visibility.
+    float ao = 1.0 - (1.0 - visibility) * frame.ssaoIntensity;
     ao = clamp(ao, 0.0, 1.0);
     outAO.write(half4(half(ao)), gid);
 }
