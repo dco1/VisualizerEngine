@@ -666,3 +666,96 @@ kernel void illumi_rt_lighting_tlas(
     outHDR.write(half4(prev.rgb + half3(reflection), prev.a), gid);
     rtDiffuse.write(half4(half3(direct + indirect), 1.0h), gid);
 }
+
+// ── RAY-TRACED AMBIENT OCCLUSION (RTAO) — photo/export lane (DH-0528) ─────────
+//
+// Tier 2 of DH-0440's AO research, greenlit by Danny. The screen-space GTAO march
+// (`illumi_ssao`) draws a foamy crust at wall/ceiling junctions because it estimates
+// occlusion from the DEPTH buffer, which only knows the front-most surface — at a
+// concave junction there is no geometry behind the front face to sample, so the
+// horizon integral fills a noisy, half-res, per-pixel-rotated point cloud. RTAO
+// answers the same question against the REAL geometry: short cosine-weighted
+// hemisphere rays cast at the TLAS the RT sun-shadow / reflection passes already
+// build. The occlusion radius is a TRUE world-space distance (the ray
+// `max_distance`), which is what dissolves the DH-0441 fork — one physically
+// meaningful metre grounds a sofa foot AND stays tight at a drywall junction,
+// where the single screen-space band width could only do one.
+//
+// It is a DROP-IN raw-AO producer: it writes the same half-res AO texture
+// `illumi_ssao` does, in the same `1.0 = unoccluded` contract, so the existing
+// bilateral + temporal denoiser and the lighting kernel's AO read consume it
+// unchanged. Cosine-importance sampling makes the estimator simply the fraction of
+// occluded rays (the cosine weight is folded into the sample distribution), matching
+// GTAO's final `ao = 1 - occlusion·intensity`. Per-frame jitter (`frameSeed`) is the
+// same contract GTAO and the RT sun-shadow pass honour, so the photo lane's 32-frame
+// temporal accumulator integrates the Monte-Carlo noise out.
+//
+// PHOTO/EXPORT LANE ONLY. The per-frame ray budget is Monte-Carlo and only the
+// still's accumulator converges it; an interactive frame would show ray banding.
+// The renderer gates the dispatch on `rtaoActive` (photo lane + a live TLAS); a
+// frame with no TLAS yet falls back to GTAO.
+struct RTAOUniforms {
+    float4x4 invViewProjection;   // depth → world position
+    float     radius;             // occlusion reach, WORLD metres (ray max_distance)
+    float     intensity;          // 0..1 AO strength (matches ssaoIntensity semantics)
+    uint      rayCount;           // cosine-hemisphere rays per pixel per frame
+    uint      frameSeed;          // per-frame jitter walk (0 = frozen)
+    float     rayTMin;            // self-intersection guard, world metres
+    uint      transportRayMask;   // 0x01 opaque | 0x04 invisible occluder (glass excluded)
+    uint      fullWidth;          // full-res G-buffer dims (AO is half-res)
+    uint      fullHeight;
+};
+
+kernel void illumi_rtao_tlas(
+    depth2d<float, access::read>      gDepth   [[texture(0)]],   // full-res
+    texture2d<half,  access::read>    gNormal  [[texture(1)]],   // full-res oct-normal.xy
+    texture2d<half,  access::write>   outAO    [[texture(2)]],   // half-res AO out
+    instance_acceleration_structure   accel    [[buffer(0)]],
+    constant RTAOUniforms&            u        [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint outW = outAO.get_width();
+    uint outH = outAO.get_height();
+    if (gid.x >= outW || gid.y >= outH) return;
+
+    // Disabled ⇒ neutral 1.0, so the lighting kernel reads unconditionally.
+    if (u.intensity <= 0.0) { outAO.write(half4(1.0h), gid); return; }
+
+    // Half-res gid → full-res G-buffer texel (2×2 top-left; matches illumi_ssao).
+    uint fullW = u.fullWidth, fullH = u.fullHeight;
+    uint2 fullGid = min(gid * 2, uint2(fullW - 1, fullH - 1));
+
+    float depth = gDepth.read(fullGid);
+    if (depth >= 0.99999) { outAO.write(half4(1.0h), gid); return; }   // sky — no surface
+
+    float2 ndc = (float2(fullGid) + 0.5) / float2(fullW, fullH) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    float3 P = worldPosFromDepth(ndc, depth, u.invViewProjection);
+    float3 N = octDecode(float2(gNormal.read(fullGid).rg));
+    float3 Pofs = P + N * max(u.rayTMin, 1e-3);
+
+    // Triangle-only traversal against the instance AS. NO curve assume block — foliage
+    // (curve geometry) is not a near-field contact occluder, and omitting it keeps this
+    // kernel free of the kRTCurvesEnabled function constant (one un-specialized pipeline).
+    intersector<triangle_data, instancing, curve_data> isect;
+    isect.set_triangle_cull_mode(triangle_cull_mode::none);
+    isect.accept_any_intersection(true);   // occlusion-only
+
+    uint seed = pcgHash(gid.x + gid.y * outW + u.frameSeed * 9781u);
+    uint rays = max(1u, u.rayCount);
+    float radius = max(1e-3, u.radius);
+    uint hits = 0u;
+    for (uint i = 0; i < rays; ++i) {
+        ray r;
+        r.origin = Pofs;
+        r.direction = cosineSample(N, rnd(seed), rnd(seed));
+        r.min_distance = max(u.rayTMin, 1e-3);
+        r.max_distance = radius;   // world-space reach — beyond this is not an occluder
+        if (isect.intersect(r, accel, u.transportRayMask).type != intersection_type::none) hits++;
+    }
+    // Cosine weighting is in the sampling, so the occlusion estimate is just the hit
+    // fraction; visibility = 1 − occlusion. Same final form as illumi_ssao's `ao`.
+    float occlusion = float(hits) / float(rays);
+    float ao = 1.0 - occlusion * u.intensity;
+    outAO.write(half4(half(clamp(ao, 0.0, 1.0))), gid);
+}
