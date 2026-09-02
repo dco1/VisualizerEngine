@@ -871,6 +871,77 @@ public enum MaterialGenerator {
               patina: Vec3(0.30, 0.36, 0.28))      // dusky brown-green tarnish
     }
 
+    /// **Corten (weathering steel)** — the rust-patina metal a modern garden planter / edging
+    /// wears (DH-0124). A `.metal` (so it renders metallic, and the tone tell is correctly
+    /// lifted — a metal's albedo is its reflectance), but a MATTE one: the whole look is the
+    /// oxide, so roughness sits high (0.55–0.85) and drifts spatially. The weathering is
+    /// authored VERTICALLY — rain washes the oxide down the face in streaks — so the drift is
+    /// v-directional (`v * 24`, integer for a seamless wrap), with darker rain-runs and the odd
+    /// brighter fresh-oxide bloom. Isotropic (no grain tangent): the streaks are tone, not a
+    /// brushed grain the engine should stretch a highlight along.
+    public static func corten(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 211,
+                              base: Vec3 = Vec3(0.44, 0.23, 0.13),      // warm rust orange-brown
+                              bloom: Vec3 = Vec3(0.58, 0.36, 0.21),     // lighter fresh-oxide flush
+                              runoff: Vec3 = Vec3(0.24, 0.13, 0.09)     // dark rain-streak stain
+    ) -> MaterialChannels {
+        var ch = MaterialChannels(size: size, category: .metal)
+        for y in 0..<size {
+            for x in 0..<size {
+                let u = Double(x) / Double(size), v = Double(y) / Double(size)
+                // Broad blotchy patina + vertical rain-runs + fine pit mottle.
+                let patch  = Noise.fbmTiled(u, v, baseCells: 3, octaves: 4, seed: seed)
+                let streak = Noise.fbmTiled(u, v * 24.0, baseCells: 4, octaves: 3, seed: seed ^ 0x5C)
+                let grit   = Noise.fbmTiled(u, v, baseCells: 30, octaves: 2, seed: seed ^ 0x2B)
+                let run    = pow(streak, 3) * 0.6                        // dark vertical runoff, sparse
+                let flush  = pow(patch, 4) * 0.5                          // bright fresh-oxide bloom
+                var c = mix(base * (0.90 + 0.18 * patch), bloom, flush)
+                c = mix(c, runoff, run)
+                ch.albedo[ch.idx(x, y)] = clampBand(c)
+                // Matte oxide: rough everywhere, roughest in the runoff, a touch smoother at a bloom.
+                ch.roughness[ch.idx(x, y)] = clamp01(0.60 + 0.20 * run + 0.10 * grit
+                    - 0.08 * flush + (patch - 0.5) * 0.10)
+                ch.height[ch.idx(x, y)] = clamp01(0.5 + (grit - 0.5) * 0.5 - run * 0.15)
+            }
+        }
+        ch.clearcoat = 0.0                          // no lacquer — bare weathered oxide
+        ch.deriveNormals(strength: 2.5)
+        addMicroDetail(&ch, seed: seed ^ 0xF3, baseCells: 84, octaves: 2, strength: 0.85)   // oxide tooth
+        return ch
+    }
+
+    /// **Terracotta (unglazed fired clay)** — the warm earthenware a classic garden planter is
+    /// thrown from (DH-0124). Categorised `.stone` (a fired-earth dielectric that belongs with
+    /// the natural-mineral surfaces and de-repeats stochastically), never glazed: matte, no
+    /// clearcoat, an orange-red body mottled by uneven firing with the odd darker scorch and a
+    /// scatter of tiny surface pinholes (the air pockets a low-fire clay always shows). The
+    /// mottle carries the macro albedo variation the dielectric tone tell requires.
+    public static func terracotta(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 223,
+                                  base: Vec3 = Vec3(0.60, 0.31, 0.20)) -> MaterialChannels {
+        var ch = MaterialChannels(size: size, category: .stone)
+        let scorch = Vec3(0.44, 0.22, 0.14)          // darker over-fired blush
+        let light  = Vec3(0.70, 0.42, 0.29)          // lighter under-fired flush
+        for y in 0..<size {
+            for x in 0..<size {
+                let u = Double(x) / Double(size), v = Double(y) / Double(size)
+                let fire = Noise.fbmTiled(u, v, baseCells: 3, octaves: 5, seed: seed)          // firing mottle
+                let blush = pow(Noise.fbmTiled(u, v, baseCells: 4, octaves: 4, seed: seed ^ 0x31), 2.5) * 0.7
+                let pit = Noise.voronoiTiled(u, v, cells: 22, jitter: 0.9, seed: seed ^ 0x6D)
+                let hole = 1 - smoothstep(0.0, 0.030, pit.f1)                                   // 1 inside a pinhole
+                var c = mix(base * (0.88 + 0.20 * fire), light, blush)
+                c = mix(c, scorch, pow(1 - fire, 3) * 0.5)
+                c = c * (1 - 0.35 * hole)                                                       // pinholes read darker
+                ch.albedo[ch.idx(x, y)] = clampBand(c)
+                ch.roughness[ch.idx(x, y)] = clamp01(0.70 + 0.10 * fire + 0.12 * hole
+                    + (Noise.fbmTiled(u, v, baseCells: 26, octaves: 2, seed: seed ^ 0x4E) - 0.5) * 0.08)
+                ch.height[ch.idx(x, y)] = clamp01(0.55 + (fire - 0.5) * 0.3 - 0.5 * hole)
+            }
+        }
+        ch.clearcoat = 0.0                          // unglazed — no gloss
+        ch.deriveNormals(strength: 2.5)
+        addMicroDetail(&ch, seed: seed ^ 0xE7, baseCells: 88, octaves: 2, strength: 0.80)   // clay grain tooth
+        return ch
+    }
+
     /// Velvet — the **sheen** lobe (§3) made the whole point: a *dark* base with a
     /// strong retroreflective grazing sheen and a fine woven nap normal. Sheen, not
     /// roughness, carries the look, so the channels stay matte and dark while the
