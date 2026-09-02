@@ -1650,6 +1650,30 @@ public final class IlluminatoramaRenderer {
     /// converge as hysteresis builds up the indirect term.
     public var ddgiTwoBounceEnabled: Bool = false
 
+    /// **Compile the `illumi_lighting` feature variant BLOCKING instead of async.**
+    ///
+    /// The per-frame path (`currentLightingPipeline`) normally compiles a
+    /// newly-needed function-constant variant in the BACKGROUND and runs the
+    /// init-time uber-variant meanwhile (WWDC23 #10127 lever 2), so a live host
+    /// never hitches when a feature flag first toggles. The completion handler
+    /// lands the compiled variant via `Task { @MainActor }`, which needs the main
+    /// runloop to spin.
+    ///
+    /// A headless `@MainActor` capture harness that renders in a tight synchronous
+    /// `render(blocking:)` loop STARVES that hop — the main actor never yields, so
+    /// the specialized variant never lands and every frame silently runs the
+    /// init-time uber-variant. The uber-variant is built with the flags present at
+    /// init (DDGI off), so a harness that flips `ddgiEnabled` on and settles a
+    /// still measures a lane whose DDGI path never ran (DH-0552 — the vacuous DDGI
+    /// gates). Same trap for any flag that differs from init.
+    ///
+    /// Set this in such a lane to compile the needed variant BLOCKING (the same
+    /// choice the RT-sun variant makes for its settled/photo lane): the frame then
+    /// actually runs the specialized path. Leave OFF for any live/vsync host —
+    /// blocking a frame on a fresh compile is exactly the hitch the async path
+    /// exists to avoid. Default OFF.
+    public var blockingLightingCompile: Bool = false
+
     /// **S3.2 Ultra — trace the probe field against the REAL TLAS.** The
     /// analytic trace only intersects box/sphere/ground primitives, so a
     /// `.custom`-mesh host stands in coarse `ddgiProxyInstances`. With this on
@@ -10672,6 +10696,19 @@ public final class IlluminatoramaRenderer {
             ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
             ddgi: ddgiEnabled, ddgiIrrCache: ddgiIrrCacheEnabled,
             rtSunShadow: rtSun)
+        // Headless/settled lane (no runloop to land the async completion — a
+        // @MainActor render loop starves the MainActor hop): compile the variant
+        // BLOCKING so the frame actually runs the specialized path instead of the
+        // init-time uber fallback. DH-0552.
+        if blockingLightingCompile {
+            if let built = engine.pipelineCache.pipelineState(
+                name: "illumi_lighting", device: device, constants: cv, variantKey: key) {
+                lastLightingFlags = bits
+                lastLightingPipeline = built
+                return built
+            }
+            return lightingPipeline
+        }
         // Non-blocking: ready variant → memoise + use it; still compiling → run
         // the uber-variant this frame and re-check next frame (no memo).
         if let ready = engine.pipelineCache.pipelineStateAsync(
