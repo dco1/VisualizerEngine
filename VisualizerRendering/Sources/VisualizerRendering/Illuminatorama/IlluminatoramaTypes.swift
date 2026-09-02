@@ -329,7 +329,14 @@ public struct IlluminatoramaFrameUniforms {
     /// opaque pixel as SSS-flagged so the effect can be render-verified without
     /// re-tagging a mesh. 0 in normal use → only the [0.90,0.98] flag band scatters.
     public var sssDebugForceAll: Float = 0
-    public var _padSSS1: Float = 0
+    /// Foliage-wind motion-vector delta, seconds (DH-0492). The G-buffer samples the
+    /// PREVIOUS frame's `applyTreeWind` at `time − windPrevDelta` so a swaying canopy/blade
+    /// writes a real screen-space velocity TAA can reproject (killing the sub-pixel crawl).
+    /// 0 (the default) = previous sampled at the SAME time ⇒ the pre-DH-0492 no-op, so every
+    /// scene that never sets it and every settled/frozen capture stays byte-identical.
+    /// Repurposes the former `_padSSS1` slot — same offset, stride unchanged. Mirror of the
+    /// Metal `FrameUniforms.windPrevDelta`.
+    public var windPrevDelta: Float = 0
     public var _padSSS2: Float = 0
     // Phase 9 — film-stock LUT colour grade. Blends the 3D-LUT-graded result with
     // the ACES-tonemapped result. 0 = LUT fully bypassed (identity), 1 = full grade.

@@ -148,12 +148,16 @@ vertex VSOut illumi_vs(
     // longer be swung by the gust. `v.tangent.x` then selects WHICH vertices of a
     // vegetation mesh bend and by how much, which is all it was ever able to mean.
     //
-    // Same time for current + previous below: during a settled headless capture time is
-    // frozen so the pose is static (no TAA smear); in the live app the per-frame delta is
-    // tiny (gentle wind), matching the other deforming-geometry scenes. `windScale` is
-    // static per instance, so both arms read `inst` — taking it off `prevInst` would spike
-    // the motion vector on the frame a draw first opts in.
+    // Current uses `frame.time`; the PREVIOUS position (below) uses `frame.time − windPrevDelta`
+    // so the gust contributes a real screen-space velocity TAA can reproject (DH-0492) — without
+    // it the sub-pixel canopy/blade edges crawled between pixels instead of reading as a
+    // continuous bend. `windPrevDelta` is 0 for a SETTLED capture (its clock does not advance
+    // between accumulation frames) ⇒ prevWindTime == frame.time ⇒ the static pose is unchanged,
+    // byte-for-byte; it is the real per-frame clock delta only on the live, advancing canvas.
+    // `windScale` is static per instance, so both arms read `inst` — taking it off `prevInst`
+    // would spike the motion vector on the frame a draw first opts in.
     float windStrength = frame._padPhase2A * inst.windScale;
+    float prevWindTime = frame.time - frame.windPrevDelta;
     worldP.xyz = applyTreeWind(worldP.xyz, v.tangent, frame.time,
                                windStrength, frame._padPhase2B);
     float3 worldN = (inst.normalMatrix * float4(v.normal, 0.0)).xyz;
@@ -168,7 +172,7 @@ vertex VSOut illumi_vs(
         prevObjP = float3(prevPositions[vid]);
     }
     float4 prevWorldP = prevInst.modelMatrix * float4(prevObjP, 1.0);
-    prevWorldP.xyz = applyTreeWind(prevWorldP.xyz, v.tangent, frame.time,
+    prevWorldP.xyz = applyTreeWind(prevWorldP.xyz, v.tangent, prevWindTime,
                                    windStrength, frame._padPhase2B);
     // Phase 4.5 — transform the object-space tangent into world. Using
     // `modelMatrix` (not normalMatrix) because a tangent is along the

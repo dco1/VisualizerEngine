@@ -500,6 +500,16 @@ public final class IlluminatoramaRenderer {
     /// symptom** — check the instance, not this value.
     public var treeWindStrength: Float = 0
     public var treeWindHeading: Float = 0
+    /// Foliage-wind motion-vector delta, in **seconds** — the simulated time elapsed between
+    /// this frame and the previous one (DH-0492). The G-buffer samples the previous frame's
+    /// `applyTreeWind` at `time − windPreviousDelta`, so a swaying canopy/blade writes a real
+    /// screen-space velocity TAA can reproject instead of crawling between pixels. Leave it at
+    /// 0 (the default) and the previous position is sampled at the SAME time as the current —
+    /// the pre-DH-0492 no-op, so every scene that never sets it, and every settled capture
+    /// (whose clock does not advance between accumulation frames), is byte-identical. The host
+    /// feeds it the real per-frame clock delta ONLY on the live, advancing canvas; a frozen
+    /// capture must leave it 0 (its previous == current time) to stay still.
+    public var windPreviousDelta: Float = 0
 
     // ── Highlight outline (feathered halo around selected / hovered objects) ──
     /// When true, every box in `highlightMaskInstances` receives a feathered halo
@@ -12206,6 +12216,11 @@ public final class IlluminatoramaRenderer {
         // shader's applyTreeWind early-returns), so every other scene is unaffected.
         u._padPhase2A = treeWindStrength
         u._padPhase2B = treeWindHeading
+        // Foliage-wind motion vector (DH-0492): the previous-frame wind is sampled at
+        // `time − windPrevDelta` so a swaying canopy writes a real velocity TAA can track.
+        // 0 (default) → previous sampled at the same time → exact no-op for every scene that
+        // never sets it and every settled capture (clock frozen ⇒ delta 0).
+        u.windPrevDelta = max(0, windPreviousDelta)
         // Chromatic aberration: tonemap CA strength (repurposes the former
         // _padPlush0 slot). 0 → exact no-op (the tonemap branch is gated on it).
         // Eased value (see advancePostFXEasing) so slider drags glide.

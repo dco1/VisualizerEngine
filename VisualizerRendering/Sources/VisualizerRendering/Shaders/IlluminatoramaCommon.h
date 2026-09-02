@@ -260,7 +260,17 @@ struct FrameUniforms {
     float    sssTintG;      // per-channel scatter-distance scale (G)
     float    sssTintB;      // per-channel scatter-distance scale (B)
     float    sssDebugForceAll;  // 1 = treat every opaque pixel as SSS (headless verify)
-    float    _padSSS1;
+    // Foliage-wind motion-vector delta (DH-0492). The vegetation gust in `applyTreeWind`
+    // is a pure function of `frame.time`, so with the previous-frame position sampled at the
+    // SAME time the wind contributed ~0 to the screen-space velocity buffer — TAA could not
+    // reproject the swaying sub-pixel canopy/blade edges and they crawled/shimmered between
+    // pixels instead of reading as a continuous bend. `illumi_vs` now samples the PREVIOUS
+    // frame's wind at `frame.time − windPrevDelta`, so a moving canopy writes a real motion
+    // vector TAA can track. 0 = same-time (the pre-DH-0492 behaviour, an EXACT no-op) — every
+    // scene that never sets it, and every SETTLED capture (whose clock does not advance
+    // between accumulation frames), ships a byte-identical velocity buffer. Repurposes the
+    // former `_padSSS1` slot — same 4 bytes at the same offset, stride unchanged.
+    float    windPrevDelta;
     float    _padSSS2;
     // Phase 9 — film-stock LUT blend strength. 0 = bypass, 1 = full grade.
     // NEW 16-byte cluster (stride 1088 → 1104). Three float pads fill.
