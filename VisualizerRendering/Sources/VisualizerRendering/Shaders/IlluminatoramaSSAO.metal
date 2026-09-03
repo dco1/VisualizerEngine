@@ -47,6 +47,7 @@ static inline float ssaoIGN(float2 p) {
     return fract(52.9829189 * fract(dot(p, float2(0.06711056, 0.00583715))));
 }
 
+
 // ── GTAO — slices, steps, falloff ────────────────────────────────────────────
 //
 // Six azimuthal slices × four march steps per side is 48 depth reads. That is more
@@ -85,6 +86,35 @@ constant float kGtaoMinPix = 2.5;
 // because it was fighting the sub-pixel first sample and a bump-tilted arc normal at the same
 // time, and at that size it also lifted the wash up a genuine corner.
 constant float kPlaneBias = 0.002;
+/// Top of the ramp: a tap is a FULL occluder once it stands this far off the shaded pixel's
+/// tangent plane, relative to its distance. Between `kPlaneBias` and here it fades in.
+constant float kPlaneBiasFull = 0.020;
+
+/// **The tangent-plane guard as a RAMP, not a coin flip (DH-0599).**
+///
+/// The guard exists because a screen-space march on a flat surface keeps finding the surface
+/// itself; DH-0527 added it as a hard test, `dot(d, Ngeo) > kPlaneBias * dist`, and it did stop
+/// the grazing-flat speckle. But on a large flat plane that quantity is a knife edge — every tap
+/// lies very nearly IN the plane, so `dot(d, Ngeo)` hovers around zero and what actually decides
+/// it is depth quantisation and the truncation of the tap to an integer texel. Both of those are
+/// functions of DEPTH, so the decision flips along lines of constant depth and the AO term prints
+/// contour bands across any receding floor.
+///
+/// Measured on the launch document's oak floor at a 34° camera: the raw (pre-denoise) AO carried
+/// a row-collapsed residual of 7.62 code values on a level of 62 — 12.3 % — and the 3×3 bilateral
+/// only pulled that to 1.62, which is the visible banding. Ablating `ssaoIntensity` alone took it
+/// to 0.14, so 91 % of the floor's banding was this term. It is invariant to the azimuth/step
+/// jitter, to `ssaoRadius`, and to the material maps, and it gets WORSE with more march steps
+/// (1.70 at 12 steps vs 1.62 at 4) — every extra tap is another coin flip. That set of
+/// invariances is what identifies a hard threshold rather than under-sampling or noise.
+///
+/// A ramp keeps the guard's purpose — a tap lying in the plane contributes nothing — while making
+/// the transition continuous, so there is no depth at which a tap pops in. Real occluders sit far
+/// off the plane and reach weight 1 well inside the band, so contact darkening and room-scale AO
+/// are unchanged.
+static inline float gtaoPlaneWeight(float3 d, float3 Ngeo, float dist) {
+    return smoothstep(kPlaneBias * dist, kPlaneBiasFull * dist, dot(d, Ngeo));
+}
 
 
 // **Why there IS a guard, after shipping without one.** DH-0527 first shipped this march
@@ -301,8 +331,8 @@ kernel void illumi_ssao(
                     float3 Ps = viewPosFromDepth(sndc, sd, frame.invProjection);
                     float3 d = Ps - Pview;
                     float dist = length(d);
-                    if (dist > 1e-4 && dot(d, Ngeo) > kPlaneBias * dist) {
-                        float fall = gtaoFalloff(dist, radius);
+                    if (dist > 1e-4) {
+                        float fall = gtaoFalloff(dist, radius) * gtaoPlaneWeight(d, Ngeo, dist);
                         float c = dot(d / dist, V);
                         horizonPos = max(horizonPos, mix(-1.0, c, fall));
                     }
@@ -320,8 +350,8 @@ kernel void illumi_ssao(
                     float3 Ps = viewPosFromDepth(sndc, sd, frame.invProjection);
                     float3 d = Ps - Pview;
                     float dist = length(d);
-                    if (dist > 1e-4 && dot(d, Ngeo) > kPlaneBias * dist) {
-                        float fall = gtaoFalloff(dist, radius);
+                    if (dist > 1e-4) {
+                        float fall = gtaoFalloff(dist, radius) * gtaoPlaneWeight(d, Ngeo, dist);
                         float c = dot(d / dist, V);
                         horizonNeg = max(horizonNeg, mix(-1.0, c, fall));
                     }
