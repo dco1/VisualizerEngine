@@ -181,6 +181,12 @@ public final class VolumetricCloudRenderer {
         /// daytime cumulus where even the shadow side is well-lit by sky
         /// bounce. Drop to ~0.55 for moody / pre-storm clouds.
         public var ambient: Float = 0.95
+        /// Desaturates the cloud underside's sky-ambient fill toward a neutral,
+        /// luminance-preserving grey. 0 = the physical blue sky-ambient (a thin
+        /// deck reads correctly; a thick opaque deck reads as "deeper blue sky"
+        /// from below). 1 = grey — an overcast deck reads as overcast (DH-0585).
+        /// Only the overcast preset drives this up; other decks stay at 0.
+        public var cloudAmbientGrey: Float = 0
 
         // ── Wind ─────────────────────────────────────────────
         /// XZ unit direction the wind blows from -> to. Will be normalised.
@@ -779,7 +785,7 @@ struct SkyUniforms {
         self.cameraPos   = SIMD4<Float>(params.cameraPos, 0)
         self.sunDir      = SIMD4<Float>(sun, 0)
         self.sunColor    = SIMD4<Float>(params.sunColor, params.sunIntensity)
-        self.skyZenith   = SIMD4<Float>(params.skyZenith, 0)
+        self.skyZenith   = SIMD4<Float>(params.skyZenith, params.cloudAmbientGrey)
         self.skyHorizon  = SIMD4<Float>(params.skyHorizon, params.hazePower)
         self.groundColor = SIMD4<Float>(params.groundColor, params.groundBlend)
         self.cloudSlab   = SIMD4<Float>(params.cloudBaseY,

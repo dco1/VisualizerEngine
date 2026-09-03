@@ -64,7 +64,9 @@ struct SkyUniforms {
     float4 sunColor;             // xyz = HDR colour, w = disk intensity scalar
 
     // ── Sky gradient ────────────────────────────────────────────────
-    float4 skyZenith;            // xyz = colour at the zenith, w = unused
+    float4 skyZenith;            // xyz = colour at the zenith, w = cloudAmbientGrey
+                                 //   (0 = cloud underside lit by blue sky-ambient,
+                                 //    1 = neutral overcast grey — DH-0585)
     float4 skyHorizon;           // xyz = colour at the horizon, w = haze power (1..8)
     float4 groundColor;          // xyz = colour for rays pointing down, w = horizon blend
 
@@ -1250,7 +1252,15 @@ kernel void volSkyRender(
                 moonContrib = kMoonTint * moonGain * lit * powder;
             }
 
-            float3 ambientContrib = u.skyZenith.xyz * ambient;
+            // Cloud underside ambient fill. skyZenith is a saturated daytime
+            // BLUE, so a thick opaque deck lit only by this reads as "deeper
+            // blue sky" from below, not overcast. skyZenith.w (cloudAmbientGrey)
+            // desaturates the fill toward a luminance-preserving neutral grey so
+            // an overcast deck reads grey (DH-0585); 0 = the legacy blue fill.
+            float  ambGrey = clamp(u.skyZenith.w, 0.0f, 1.0f);
+            float  ambLum  = dot(u.skyZenith.xyz, float3(0.2126f, 0.7152f, 0.0722f));
+            float3 ambCol  = mix(u.skyZenith.xyz, float3(ambLum), ambGrey);
+            float3 ambientContrib = ambCol * ambient;
 
             // Fireworks: single-scattered radiance from the ray's culled
             // light list. Bursts below the slab glow the cloud base from
@@ -1501,7 +1511,15 @@ kernel void illumi_cloud_inview(
                     : exp(-odM * absK) * phaseM;
                 moonContrib = kMoonTint * moonGain * lit * powder;
             }
-            float3 ambientContrib = u.skyZenith.xyz * ambient;
+            // Cloud underside ambient fill. skyZenith is a saturated daytime
+            // BLUE, so a thick opaque deck lit only by this reads as "deeper
+            // blue sky" from below, not overcast. skyZenith.w (cloudAmbientGrey)
+            // desaturates the fill toward a luminance-preserving neutral grey so
+            // an overcast deck reads grey (DH-0585); 0 = the legacy blue fill.
+            float  ambGrey = clamp(u.skyZenith.w, 0.0f, 1.0f);
+            float  ambLum  = dot(u.skyZenith.xyz, float3(0.2126f, 0.7152f, 0.0722f));
+            float3 ambCol  = mix(u.skyZenith.xyz, float3(ambLum), ambGrey);
+            float3 ambientContrib = ambCol * ambient;
             float3 burstContrib = float3(0.0f);
             for (uint li = 0u; li < rayLightCount; ++li) {
                 float3 toL  = rayLights[li].positionIntensity.xyz - pos;
