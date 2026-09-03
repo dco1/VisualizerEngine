@@ -1173,8 +1173,14 @@ fragment GBufferOut illumi_fs(
     }
     // Phase 7 — pack clearcoat (≥0) OR cloth sheen (<0) into emission.alpha (was always 1.0,
     // unused). A surface is polished OR cloth, never both, so one channel carries either: > 0 =
-    // polished/lacquered second GGX lobe; < 0 = velvet/wool grazing-Fresnel sheen (strength = -a).
-    o.emission        = half4(half3(emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -inst.sheen));
+    // polished/lacquered second GGX lobe; < 0 = velvet/wool grazing-Fresnel sheen.
+    // DH-0081 — the sheen value folds the roughness BAND into its integer part and the STRENGTH
+    // into its fraction: `-(band + strength)`. Band 0 (default 0.30 nap) makes this `-strength`,
+    // byte-for-byte the pre-band encoding, so every non-opting material is unchanged.
+    float sheenAlpha = (inst.sheen > 0.0f)
+        ? float(clothSheenBandForRoughness(inst.sheenRoughness)) + min(inst.sheen, 0.98f)
+        : 0.0f;
+    o.emission        = half4(half3(emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -sheenAlpha));
     // Screen-space motion vector. NDC.y is up, UV.y is down → Y is flipped.
     // The result is (currentUV - previousUV), so history reprojection in the
     // TAA kernel is `historyUV = currentUV - velocity`.

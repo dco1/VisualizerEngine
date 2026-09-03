@@ -24,6 +24,15 @@ public struct MaterialChannels: Equatable, Sendable {
     /// globally (§3). 0 = lobe absent.
     public var clearcoat: Double = 0
     public var sheen: Double = 0
+    /// **Per-material cloth-sheen ROUGHNESS** (DH-0081) — the width of the sheen nap, distinct
+    /// from `sheen` (its strength). Low = a crisp, tight grazing highlight (sateen, silk); high =
+    /// a broad, soft glow (velvet, wool bouclé). `0.30` is the library-wide default the lobe
+    /// shipped with as one constant, so a material that leaves it alone renders exactly as before.
+    /// The engine snaps this to the nearest of a few curated bands and folds the band into the
+    /// same sign-multiplexed emission.alpha channel that carries `sheen` (see
+    /// `clothSheenRoughnessForBand` in IlluminatoramaCommon.h) — inert (band 0) unless a material
+    /// picks a non-default nap. Only meaningful where `sheen > 0`.
+    public var sheenRoughness: Double = 0.30
     /// High-frequency (close-range) detail normal map — pores, weave, grain.
     /// Sampled at `detailNormalUVScale × uv` (shader-side) and blended over the
     /// macro normal via partial-derivative add. `nil` = no detail layer.

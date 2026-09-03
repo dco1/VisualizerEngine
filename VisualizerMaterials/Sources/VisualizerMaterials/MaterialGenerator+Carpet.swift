@@ -135,6 +135,8 @@ extension MaterialGenerator {
         }
 
         ch.sheen = gloss
+        ch.sheenRoughness = 0.45                     // upright pile → a broad, soft grazing sheen
+                                                     // (DH-0081; broader than a flat weave)
         // Strong relief from the pile field — the tufts stand up; the normal should read them.
         ch.deriveNormals(strength: 6)
         // Fine sub-fibre fuzz (the pile at grazing range) as the detail band. A carpet is matte,

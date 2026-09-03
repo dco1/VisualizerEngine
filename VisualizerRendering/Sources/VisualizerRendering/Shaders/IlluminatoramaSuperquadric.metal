@@ -225,7 +225,12 @@ fragment SQImpostorFSOut illumi_superquadric_impostor_fs(
              ? 2.0h + half(clamp(-inst.anisotropy, 0.0f, 1.0f))
              : 1.0h + half(inst.anisotropy);
     o.normalRoughness = half4(half(oct.x), half(oct.y), half(inst.roughness), sqW);
-    o.emission        = half4(half3(inst.emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -inst.sheen));
+    // DH-0081 — same sheen encoding the mesh G-buffer uses: fold the roughness band into the
+    // integer part, strength into the fraction. Band 0 (default nap) packs `-sheen` unchanged.
+    float sqSheenAlpha = (inst.sheen > 0.0f)
+        ? float(clothSheenBandForRoughness(inst.sheenRoughness)) + min(inst.sheen, 0.98f)
+        : 0.0f;
+    o.emission        = half4(half3(inst.emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -sqSheenAlpha));
     o.velocity        = half2(velUV);
     o.layer           = inst.layer;   // light-layer bitfield (default 0xFFFFFFFF)
     o.depth           = curClip.z / curClip.w;   // Metal NDC z ∈ [0,1]

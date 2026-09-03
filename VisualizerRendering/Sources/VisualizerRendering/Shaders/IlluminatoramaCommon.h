@@ -698,12 +698,45 @@ struct Instance {
     // Fills the 8 bytes that were trailing pad, so stride stays 304; `float2(0)` is an exact
     // no-op (identical to every existing scene). Mirrors `IlluminatoramaInstance.uvPhase`.
     float2   uvPhase;
+    // DH-0081 — per-material cloth-sheen ROUGHNESS (the nap WIDTH; sibling of `sheen`, its
+    // strength). NEW 16-byte cluster (offsets 304-319): stride 304 -> 320. The G-buffer snaps it
+    // to a band and folds the band into the integer part of the sign-multiplexed `sheen`
+    // emission.alpha (see clothSheenBandForRoughness); band 0 (default 0.30) packs `-sheen` exactly
+    // as before, so a host that never sets it — every Visualizer scene — is byte-identical.
+    // Mirrors `IlluminatoramaInstance.sheenRoughness`.
+    float    sheenRoughness;
 };
 
 // The Swift mirror (`IlluminatoramaInstance._assertStride240`) has always asserted this
 // side of the contract; this is the other side, and it costs a compile. A Swift field
 // added without its Metal twin used to be caught only by a wrong-looking render.
-static_assert(sizeof(Instance) == 304, "Instance must match IlluminatoramaInstance (304 bytes)");
+static_assert(sizeof(Instance) == 320, "Instance must match IlluminatoramaInstance (320 bytes)");
+
+// ── Cloth sheen roughness bands (DH-0081) ─────────────────────────────────────────────────
+// The sheen lobe's roughness is carried per-material by folding a small BAND index into the
+// INTEGER part of the (negative) sheen magnitude packed in `emission.alpha`, leaving the
+// FRACTION for sheen strength: `emission.alpha = -(band + strength)`. Band 0 is the historical
+// single constant (0.30), so a material that keeps the default nap packs `-strength` exactly as
+// it did before this existed — byte-for-byte. Four curated bands span crisp pile → broad fuzz; a
+// material's continuous `sheenRoughness` snaps to the nearest at pack time. Both directions live
+// here (this header is included by the G-buffer packer AND the lighting unpacker) so the band
+// table has ONE definition.
+inline float clothSheenRoughnessForBand(int band) {
+    switch (band) {
+        case 1:  return 0.18f;   // crisp / tight nap (sateen, silk)
+        case 2:  return 0.45f;   // broad soft nap (velvet, carpet pile)
+        case 3:  return 0.60f;   // very broad fuzz (wool bouclé, chenille)
+        default: return 0.30f;   // default — linen / general plain-weave upholstery
+    }
+}
+inline int clothSheenBandForRoughness(float r) {
+    // Nearest band. 0.30 (band 0) is listed first so a default-nap material snaps to it and
+    // packs identically to the pre-band encoding. Keep in sync with the switch above.
+    float bands[4] = { 0.30f, 0.18f, 0.45f, 0.60f };
+    int best = 0; float bestD = fabs(r - bands[0]);
+    for (int i = 1; i < 4; ++i) { float d = fabs(r - bands[i]); if (d < bestD) { bestD = d; best = i; } }
+    return best;
+}
 
 struct Vertex {
     float3 position;

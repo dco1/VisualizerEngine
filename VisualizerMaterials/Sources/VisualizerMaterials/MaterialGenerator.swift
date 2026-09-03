@@ -963,6 +963,8 @@ public enum MaterialGenerator {
             }
         }
         ch.sheen = 0.85                            // velvet is sheen-dominated
+        ch.sheenRoughness = 0.45                    // dense cut pile → a BROAD, soft grazing glow
+                                                    // (DH-0081; was the 0.30 library default)
         ch.deriveNormals(strength: 2)
         // Very fine sub-thread nap so the pile catches grazing light as fuzz, not plastic.
         addMicroDetail(&ch, seed: seed ^ 0xB3, baseCells: 120, strength: 0.40)
@@ -1000,6 +1002,8 @@ public enum MaterialGenerator {
         // what "medium" means here. `MaterialTextureTests.testEveryUncoatedFabricCarriesSheen`
         // now iterates the registry, so no future fabric can lose it silently.
         ch.sheen = 0.45
+        ch.sheenRoughness = 0.60                    // chunky looped bouclé → the broadest, fuzziest
+                                                    // nap of the fabric set (DH-0081)
         ch.deriveNormals(strength: 4)
         // Soft fibrous fuzz over the chunky loops — the between-loop wool haze at close range.
         addMicroDetail(&ch, seed: seed ^ 0xB4, baseCells: 60, strength: 0.70)
@@ -2770,6 +2774,10 @@ public enum MaterialGenerator {
         // velvet grade so it reads as matte upholstery, not satin: the fabric character is carried
         // mostly by the albedo weave + roughness variation, with sheen as the finishing soft glow.
         ch.sheen = 0.30
+        // Nap width kept at the library DEFAULT (0.30) on purpose: a flat plain weave has a
+        // medium, unremarkable sheen breadth, and this is the fabric the cloth-sheen render gate
+        // measures — leaving it default keeps that frame byte-identical (DH-0081).
+        ch.sheenRoughness = 0.30
         ch.grainTangent = [Vec2](repeating: Vec2(1, 0), count: size * size)
         ch.deriveNormals(strength: 0.1)            // near-flat — the weave is only a hint, so a
                                                    // grazing back cushion stays even soft cloth,

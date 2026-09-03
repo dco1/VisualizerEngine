@@ -309,10 +309,11 @@ static inline float clothSheenV(float NdotV, float NdotL) {
     return 1.0 / max(4.0 * (NdotL + NdotV - NdotL * NdotV), 1e-5);
 }
 
-/// One fixed sheen roughness for the whole library. The strength already arrives per material
-/// (packed as a negative `emission.alpha`); a per-material sheen ROUGHNESS would need a second
-/// instance field, and the instance stride is not this change's to move. 0.30 is a soft,
-/// broad nap — right for linen and wool, and velvet's much higher STRENGTH is what separates it.
+/// The DEFAULT sheen roughness (band 0). Per-material nap width now arrives folded into the
+/// negative `emission.alpha` alongside strength (DH-0081 — see `clothSheenRoughnessForBand`), so a
+/// material that keeps this default decodes 0.30 and is byte-identical to when this was the single
+/// library-wide constant. It remains the fallback for the `brdf` default argument and for the
+/// non-cloth unpack path. 0.30 is a soft, broad nap — a sensible neutral for a plain-weave cloth.
 constant float kClothSheenRoughness = 0.30;
 
 /// Fibre-tip colour: cloth sheen is scattered by the pale tips of the nap, not by the dyed
@@ -343,7 +344,8 @@ static inline float clothSheenEnvAlbedo(float NdotV) {
 static inline float3 brdf(
     float3 N, float3 V, float3 L, float3 albedo, float metallic, float roughness, float3 lightColor,
     float anisotropy = 0.0, float3 grainT = float3(0.0),
-    float sheenStrength = 0.0, thread float3 *sheenOut = nullptr
+    float sheenStrength = 0.0, thread float3 *sheenOut = nullptr,
+    float sheenRoughness = kClothSheenRoughness
 ) {
     float3 H = normalize(V + L);
     float NdotL = saturate(dot(N, L));
@@ -378,7 +380,7 @@ static inline float3 brdf(
     // `brdf` has always returned; a surface with no cloth sheen therefore cannot move by a bit.
     if (!(sheenStrength > 0.0)) return (diff + spec) * lightColor * NdotL;
 
-    float  Ds = clothSheenD(kClothSheenRoughness, NdotH);
+    float  Ds = clothSheenD(sheenRoughness, NdotH);
     float  Vs = clothSheenV(NdotV, NdotL);
     float3 sheen = clothSheenColor(albedo) * (sheenStrength * Ds * Vs);
     if (sheenOut != nullptr) *sheenOut += sheen * lightColor * NdotL;
@@ -883,7 +885,17 @@ kernel void illumi_lighting(
     // of the 2026-08-09 re-siting: it used to be read at the very bottom of this kernel, after
     // the point and spot loops had already closed, so a lamp-lit sofa received no sheen at all.
     // 0 for every non-cloth surface, and `brdf` early-outs exactly on 0.
-    float  sheenStrength = (emH.a < -0.001h) ? float(-emH.a) : 0.0;
+    // DH-0081 — the negative alpha carries BOTH the strength (fraction) and the roughness BAND
+    // (integer part): `-(band + strength)`. Band 0 is the historical 0.30 nap, so a default-nap
+    // material decodes strength = -a and roughness = 0.30, exactly as before the band existed.
+    float  sheenStrength  = 0.0;
+    float  sheenRoughness = kClothSheenRoughness;
+    if (emH.a < -0.001h) {
+        float m    = float(-emH.a);
+        int   band = int(floor(m + 1e-3f));
+        sheenStrength  = m - float(band);
+        sheenRoughness = clothSheenRoughnessForBand(band);
+    }
     // Sheen-only accumulator for `DebugTerm.clothSheen` (17). Every `brdf` call below is handed
     // `&clothSheen`, so the term can still be isolated even though it is no longer a separable
     // bolt-on. Untouched (and dead-stripped) when nothing in the scene is cloth.
@@ -987,7 +999,7 @@ kernel void illumi_lighting(
     float3 directSunSheen = float3(0.0);
     float3 directSun = brdf(N, V, Ld, albedo, metallic, roughness,
                             frame.directionalLightColor, aniso, grainT,
-                            sheenStrength, &directSunSheen) * visibility;
+                            sheenStrength, &directSunSheen, sheenRoughness) * visibility;
     clothSheen += directSunSheen * visibility;
     if (isSSS) sssDiffuse += brdfDiffuse(N, V, Ld, albedo, metallic,
                                          frame.directionalLightColor) * visibility;
@@ -1140,7 +1152,7 @@ kernel void illumi_lighting(
         }
         if (visibility <= 0.0) continue;
         pointSum += brdf(N, V, L, albedo, metallic, roughness, pl.color * atten * visibility,
-                         0.0, float3(0.0), sheenStrength, &clothSheen);
+                         0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness);
         if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic,
                                              pl.color * atten * visibility);
     }
@@ -1212,7 +1224,7 @@ kernel void illumi_lighting(
         if (visibility <= 0.0) continue;
         spotSum += brdf(N, V, L, albedo, metallic, roughness,
                         sl.color * atten * visibility,
-                        0.0, float3(0.0), sheenStrength, &clothSheen);
+                        0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness);
         if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic,
                                              sl.color * atten * visibility);
     }
@@ -1241,7 +1253,7 @@ kernel void illumi_lighting(
     for (uint i = 0; i < frame.directionalLightCount; ++i) {
         DirectionalLight dl = extraDirectionals[i];
         dirFillSum += brdf(N, V, dl.dir, albedo, metallic, roughness, dl.color,
-                           0.0, float3(0.0), sheenStrength, &clothSheen);
+                           0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness);
         if (isSSS) sssDiffuse += brdfDiffuse(N, V, dl.dir, albedo, metallic, dl.color);
     }
 

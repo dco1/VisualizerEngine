@@ -1039,6 +1039,16 @@ public struct IlluminatoramaInstance {
     /// tiles seamlessly under the hardware `repeat` sampler, any offset is seam-free.
     public var uvPhase: SIMD2<Float> = .zero
 
+    /// **Per-material cloth-sheen ROUGHNESS** (DH-0081) — the WIDTH of the sheen nap, the sibling of
+    /// `sheen` (its strength). Low = a crisp grazing highlight (sateen); high = a broad soft glow
+    /// (velvet, wool). `0.30` (the default) is the single constant the lobe shipped with, so an
+    /// instance that never sets it — every Visualizer scene, every non-cloth surface — renders
+    /// exactly as before. The G-buffer snaps it to the nearest of a few curated bands and folds the
+    /// band into the INTEGER part of the sign-multiplexed `sheen` emission.alpha channel (band 0 ⇒
+    /// the value packs `-sheen` byte-for-byte as it did before this existed). Only read where
+    /// `sheen > 0`. NEW 16-byte cluster (offsets 304-319): stride 304 → 320.
+    public var sheenRoughness: Float = 0.30
+
     public init(
         modelMatrix: simd_float4x4,
         albedo: SIMD3<Float> = SIMD3(0.8, 0.8, 0.8),
@@ -1071,10 +1081,10 @@ public struct IlluminatoramaInstance {
         self.normalMatrix = Self.normalMatrix(from: m)
     }
 
-    /// Compile-time guard: Swift and Metal structs must agree on 272 bytes.
+    /// Compile-time guard: Swift and Metal structs must agree on 320 bytes.
     /// If this fires, either a Swift field was added without the matching Metal
     /// field (or vice versa), or alignment changed unexpectedly.
-    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 304, "IlluminatoramaInstance stride must be 304") }()
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 320, "IlluminatoramaInstance stride must be 320") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //
