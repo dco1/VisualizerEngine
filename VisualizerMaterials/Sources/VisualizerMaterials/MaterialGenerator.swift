@@ -1742,6 +1742,30 @@ public enum MaterialGenerator {
               litterPalette: (Vec3(0.26, 0.18, 0.10), Vec3(0.50, 0.35, 0.17)))
     }
 
+    /// **Garden mulch — a bed of shredded bark chips over dark planting soil.** The regional
+    /// base-ground a garden plot wears (DH-0575). Built on the same `earth` construction as
+    /// `forestFloor` — an organic mat lying ON broken earth — but the overlay is BARK, not fallen
+    /// leaves, and that changes three things: the chips are warmer and redder (fresh shredded
+    /// hardwood/cedar, not a year of mixed rotted leaf), their tone spread is TIGHTER (a bagged
+    /// mulch is close to one colour where a forest floor is every autumn shade at once), and the
+    /// coverage runs near-closed (a fresh mulch bed hides the soil). The earth beneath is a dark,
+    /// damp PLANTING bed — potting soil under the chips, not sun-baked open-yard loam — so where
+    /// the chips thin it reads as shadow, not as a bald dirt patch.
+    ///
+    /// The spatially-varying roughness comes for free from `earth`: damp hollows level smoother,
+    /// grit/fines roughen, so `TextureAudit`'s roughness-SD tell is cleared the same way `dirt`
+    /// and `forestFloor` clear it. Outdoor-grade, no clearcoat, `.ground` category.
+    public static func mulch(size: Int = MaterialGenerator.bakeSize,
+                             seed: UInt64 = 157) -> MaterialChannels {
+        earth(size: size, seed: seed, damp: 0.5,
+              palette: EarthPalette(dry: Vec3(0.26, 0.17, 0.11),
+                                    damp: Vec3(0.13, 0.085, 0.055),
+                                    grit: Vec3(0.30, 0.24, 0.19),
+                                    roughness: 0.90),
+              litter: 0.92,
+              litterPalette: (Vec3(0.34, 0.17, 0.10), Vec3(0.50, 0.28, 0.15)))
+    }
+
     /// Phase 8 — tree BARK for the yard trunk/branches. Warm grey-brown with the canonical
     /// bark tells: near-vertical furrows (stretched fbm along the tile's V axis = the trunk's
     /// vertical), a knotty macro mottle (lighter ridges / darker fissures), and a matte, very
