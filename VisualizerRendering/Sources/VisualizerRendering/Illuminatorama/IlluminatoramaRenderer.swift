@@ -8916,7 +8916,17 @@ public final class IlluminatoramaRenderer {
     // the lighting kernel can read from any slice without UB.
 
     private func encodeShadowPasses(_ cb: MTLCommandBuffer) {
-        guard shadowsEnabled else { return }
+        // Even with the sun cascades OFF we still open (and therefore `.clear`) every
+        // depth slice to 1.0 and issue no draws — a fully-lit map. Returning early
+        // instead (`guard shadowsEnabled else { return }`) left the last ENABLED frame's
+        // depths resident in the array, and the lighting kernel gates shadowing on the
+        // `kLightingShadowEnabled` FUNCTION CONSTANT alone (`frame.shadowEnabled` is a
+        // dead uniform). The init-time uber lighting variant — the one that runs for the
+        // frames the shadow-OFF specialization is still compiling in the background — is
+        // built with that constant true, so it kept sampling the stale cascade map and
+        // printed the previous frame's shadows with the toggle already off. A cleared
+        // slice (depth == 1.0) compares as "lit" everywhere, so no consumer can resurrect
+        // a shadow regardless of which lighting variant is live. (DH-0619)
         for cascade in 0..<Self.cascadeCount {
             let pass = MTLRenderPassDescriptor()
             pass.depthAttachment.texture = shadowMap
@@ -8927,6 +8937,8 @@ public final class IlluminatoramaRenderer {
 
             guard let enc = timedRenderEncoder(cb, pass, "shadow.sunCascades") else { continue }
             enc.label = "Illuminatorama.shadow.c\(cascade)"
+            // Disabled → the clear above already made this a fully-lit slice; no draws.
+            guard shadowsEnabled else { enc.endEncoding(); continue }
             enc.setRenderPipelineState(shadowPipeline)
             enc.setDepthStencilState(depthState)
             // Front-face cull keeps the shadow projection biased on the
