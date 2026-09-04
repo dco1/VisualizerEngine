@@ -531,8 +531,8 @@ public struct IlluminatoramaFrameUniforms {
     /// Split-tone temperature of the SHADOW end, in Kelvin, through the same
     /// `whiteBalanceGain` curve the global white balance uses (luma-normalized, so it
     /// tints without dimming) under a low-luma mask. 6500 (default) = gain (1,1,1) =
-    /// exact no-op. Above 6500 cools the shadows — the archviz separation that gives
-    /// warm practicals something to read against.
+    /// exact no-op. Below 6500 cools the shadows (photo convention, DH-0453) — the
+    /// archviz separation that gives warm practicals something to read against.
     public var shadowTemperatureK: Float = 6500
     /// Split-tone temperature of the HIGHLIGHT end. 6500 (default) = exact no-op.
     /// Pairs with `highlightChromaRolloff`: roll the scene's own chroma off as it

@@ -1363,8 +1363,10 @@ public final class IlluminatoramaRenderer {
     public var tonemapSaturation: Float = 1.10
     // ── Tonemap colour-grade (white-balance / tint / contrast / shadows / highlights) ──
     /// White-balance colour temperature in Kelvin (~2000–10000). 6500 = neutral
-    /// (channel gain (1,1,1) → exact no-op). Lower = warmer, higher = cooler.
-    /// Applied as a linear-HDR channel multiply BEFORE exposure + ACES.
+    /// (channel gain (1,1,1) → exact no-op). Photo-tool convention (DH-0453):
+    /// higher K = warmer, lower K = cooler — the inverse of the physical blackbody
+    /// sign, matching Lightroom/in-camera WB dials. Applied as a linear-HDR channel
+    /// multiply BEFORE exposure + ACES.
     public var whiteBalanceK: Float = 6500
     /// Green↔magenta tint on [-1, 1]. 0 = no-op; >0 magenta, <0 green. Luma-
     /// preserving channel gain applied pre-tonemap alongside white-balance.
@@ -1391,12 +1393,12 @@ public final class IlluminatoramaRenderer {
     /// **Split tone, shadow end** — colour temperature (Kelvin) applied to the low-luma
     /// end through the same `whiteBalanceGain` curve as the global white balance
     /// (luma-normalized: it tints, it does not dim). 6500 = neutral (default) → an
-    /// exact no-op. ABOVE 6500 cools the shadows, which is what gives warm practical
-    /// lights something to contrast against instead of every tone sitting in one
-    /// warm universe.
+    /// exact no-op. BELOW 6500 cools the shadows (photo convention, DH-0453), which
+    /// is what gives warm practical lights something to contrast against instead of
+    /// every tone sitting in one warm universe.
     public var shadowTemperatureK: Float = 6500
     /// **Split tone, highlight end** — the same, masked to the high-luma end.
-    /// 6500 = neutral (default) → an exact no-op. Below 6500 keeps highlights warm;
+    /// 6500 = neutral (default) → an exact no-op. Above 6500 keeps highlights warm;
     /// pair it with `highlightChromaRolloff` for the photographic combination —
     /// the scene's own chroma rolls off toward white, and a controlled amount of
     /// warmth goes back in.

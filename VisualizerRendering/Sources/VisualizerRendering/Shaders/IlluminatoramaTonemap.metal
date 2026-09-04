@@ -233,18 +233,21 @@ static inline float3 aces(float3 x) {
 
 // ── Color-grade: white-balance gain from a Kelvin temperature ───────────────
 // Maps a correlated colour temperature (~2000–10000 K) to a normalized linear
-// RGB channel gain that, when MULTIPLIED into a neutral scene, warms it (low K)
-// or cools it (high K). 6500 K → (1,1,1) exactly (no-op default). We use a
+// RGB channel gain that, when MULTIPLIED into a neutral scene, warms it (HIGH K)
+// or cools it (LOW K). 6500 K → (1,1,1) exactly (no-op default). We use a
 // cheap polynomial approximation of the daylight locus' channel response
 // rather than a full Planckian/CIE conversion — it only has to read tasteful
 // across the slider, not be colorimetrically exact. Normalized so the green
 // channel (and the luma) stays ≈1, i.e. the grade tints rather than dims.
 static inline float3 whiteBalanceGain(float kelvin) {
-    // Reference is 6500 K (D65). Below → push red, pull blue (warm); above →
-    // push blue, pull red (cool). A smooth, monotonic curve in 1000s-of-K.
-    float t = (kelvin - 6500.0) / 6500.0;        // 0 at D65; ~-0.69 at 2000 K; ~+0.54 at 10000 K
-    float r = 1.0 - 0.45 * t;                    // warmer (low K) → more red
-    float b = 1.0 + 0.55 * t;                    // warmer (low K) → less blue
+    // Photo-tool convention (Lightroom / in-camera WB dial), NOT the physical
+    // blackbody sign: HIGHER K warms the image, LOWER K cools it — the way every
+    // WB-correction control a photographer knows runs (drag toward the low number
+    // to cool, toward the high number to warm). 6500 K = D65 = no-op. A smooth,
+    // monotonic curve in 1000s-of-K. See DH-0453.
+    float t = (6500.0 - kelvin) / 6500.0;        // 0 at D65; ~+0.69 at 2000 K; ~-0.54 at 10000 K
+    float r = 1.0 - 0.45 * t;                    // warmer (high K) → more red
+    float b = 1.0 + 0.55 * t;                    // warmer (high K) → less blue
     float g = 1.0 - 0.04 * t * t;                // slight green dip away from D65
     float3 gain = float3(max(r, 0.0), max(g, 0.0), max(b, 0.0));
     // Renormalize to unit luma so the white-balance only shifts hue, not exposure.
