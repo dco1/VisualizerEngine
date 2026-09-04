@@ -1116,6 +1116,17 @@ fragment GBufferOut illumi_fs(
     // deferred lighting pass reads 0.5h<w<0.6h to add the fur sheen + SSS. No-op for
     // every other scene (no other mesh ships colour alpha in this band).
     if (in.vertexColor.a >= 0.5 && in.vertexColor.a <= 0.6) foliageFlag = 0.55h;
+    // Screen-space SSS flag (issue #65 / DH-0138): colour alpha ∈ [0.90,0.98] → 0.95h,
+    // for skin / wax / marble / food. This is the rung the lighting pass's SSS band
+    // (`nrH.a > 0.90h && nrH.a < 0.99h`) and every comment in Common.h / Types /
+    // Lighting already assumed existed — without it a 0.95-alpha mesh fell through to
+    // the 1.0h opaque tag and was reclassified as anisotropy, so SSS was unreachable
+    // outside the headless `sssDebugForceAll` escape. 0.95h lands BELOW 1.0h, so the
+    // `wTag >= 1.0h` anisotropy branch does NOT fire on it (it forgoes anisotropy, as
+    // plush/casing already do); 0.95 is not < 0.5h so the foliage roughness cap is left
+    // alone. No-op for every scene that ships opaque alpha 1.0, and dead unless the
+    // scene opts in via `frame.sssStrength > 0`.
+    if (in.vertexColor.a >= 0.9 && in.vertexColor.a <= 0.98) foliageFlag = 0.95h;
     // Waxy-leaf sheen (#58): a real leaf cuticle is markedly smoother than the
     // matte moss / bark / stone around it, so a single soup roughness reads
     // every surface as the same dry matte and leaves never catch a glint.
