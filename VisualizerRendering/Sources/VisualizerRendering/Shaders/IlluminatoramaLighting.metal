@@ -124,7 +124,8 @@ static inline float cascadeVisibility(
     float3 worldPos,
     float3 N,
     float  slope,
-    uint   cascade
+    uint   cascade,
+    uint   pcfRadius
 ) {
     // Slope-scaled depth bias — surfaces nearly parallel to the light direction
     // need more bias to avoid acne, but biasing too much causes peter-panning.
@@ -149,16 +150,49 @@ static inline float cascadeVisibility(
     float3 row0 = float3(cascadeVP[0][0], cascadeVP[1][0], cascadeVP[2][0]);
     float  radius = 1.0 / max(length(row0), 1e-6);
     float  texelWorld = 2.0 * radius / float(shadowMap.get_width());
-    // Widen mildly on grazing incidence (where acne is worst) but stay bounded
-    // — 1–3 texels, never the runaway depth bias produced.
-    // Reduced from (1.0 + 2.0*slope) — front-face culling (second-depth) is the primary acne
-    // defence, so a smaller normal offset keeps acne away while the contact shadow stays tight
-    // (the larger offset peter-panned shadows off object bases). Also capped so an outer-cascade
-    // texel can't produce a runaway world push.
-    float3 biasedPos = worldPos + N * min(texelWorld * (0.4 + 0.8 * slope), 0.006);
+    // How far the sample must be pushed is set by TWO things, and the old factor
+    // `(0.4 + 0.8 * slope)` — a 0.4…1.2 ramp, then clamped to an absolute 6 mm — carried
+    // only a weak version of one of them.
+    //
+    // One texel of the map spans `texelWorld` across the receiver, and the depth stored for
+    // it is the surface's depth at the texel CENTRE. So the depth error a receiver sees is
+    // its own depth gradient across that texel — and for a surface lying at angle θ to the
+    // light, that gradient is `texelWorld * tan(θ)`. The tangent is the whole story: it is 0
+    // for a surface facing the light and diverges as the surface turns edge-on. At the
+    // 6.8° golden-hour sun this app opens with, the ground sits at θ ≈ 83° to the sun, so
+    // tan(θ) ≈ 8.4 — the old ramp topped out at 1.2, seven times short, and the 6 mm clamp
+    // then removed even that. A 6 mm push along the normal converts to 6 mm × NdotL = 0.7 mm
+    // of depth at this angle, against a quantisation error of ~60 mm.
+    //
+    // So the ground shadowed ITSELF across the whole cascade — measured on the launch
+    // document as **17.4 % of the sun lost** by open ground merely for being inside the
+    // cascade's box, with the box's rim drawn on the yard as a hard-edged polygon (DH-0617;
+    // Danny: "a workable space in the canvas is showing a darker space"). PCF was hiding part
+    // of it — with `shadowPcfRadius 0` the same measurement reads 22.3 %, which is the tell
+    // that it is acne and not a shadow.
+    //
+    // Scaling by tan(θ) fixes the term rather than the symptom, and it is self-limiting where
+    // it matters: a surface facing the light gets ~0.4 texels exactly as before, so nothing
+    // that was tuned against head-on geometry moves — the wall-foot seal and the contact
+    // shadows are untouched. The cap stays TEXEL-relative (the quantity the error is actually
+    // made of) instead of an absolute distance, with a generous absolute backstop so a 200 m
+    // context cascade cannot push a sample by metres.
+    // …and the push has to clear the PCF KERNEL, not just the centre tap. Every tap compares
+    // the SAME biased depth against a texel up to `pcfRadius` away, and each texel of that
+    // reach is another `texelWorld * tan(θ)` of the receiver's own recession. So the offset
+    // that makes the centre tap safe still leaves the outer taps landing on the receiver —
+    // which is why a first cut of this fix measured clean in the mid field and still drew the
+    // cascade box's rim and corners across the far ground, where the outer cascade's texel is
+    // coarsest (Danny, on siterect-baseline-smd20.png: "i am still seeing the edges and
+    // corners of the polygon at the top of the image").
+    float  ndotl    = clamp(1.0 - slope, 0.0, 1.0);
+    float  tanTheta = sqrt(saturate(1.0 - ndotl * ndotl)) / max(ndotl, 0.02);
+    float  pcfReach = 1.0 + float(min(pcfRadius, 2u));   // centre tap + the kernel's reach
+    float3 biasedPos = worldPos
+                     + N * min(texelWorld * clamp(tanTheta, 0.4, 12.0) * pcfReach, 0.25);
 
     return sampleCascade(shadowMap, shadowSampler, biasedPos,
-                         cascadeVP, cascade, bias, frame.shadowPcfRadius);
+                         cascadeVP, cascade, bias, pcfRadius);
 }
 
 // ── S1.4 — cascade-split blending ────────────────────────────────────────────
@@ -176,7 +210,14 @@ static inline float cascadeVisibility(
 // that have a successor (cascade 2 has none), and far less than 10 % of a typical
 // frame's pixels. Outside the band `t == 0` and this is bit-identical to the hard
 // select, so nothing but the seam moves.
-constant float kCascadeBlendFraction = 0.10;
+// RAISED 0.10 → 0.30 when the normal offset gained its grazing-angle term. The offset is
+// texel-relative and each cascade owns a different texel, so the sample displacement now JUMPS
+// at a split — ~10 cm between the outer two here — and a shadow edge crossing one kinked by
+// 9.66 px against an 8.0 px bar (`testCascadeSplitDoesNotKinkAShadowEdgeCrossingIt`). Widening
+// the band spreads that step into a gradient across three times the depth. The cost is the one
+// the constant already documents — a second cascade tap for pixels inside the band — now paid
+// over 30 % of a cascade's depth range rather than 10 %.
+constant float kCascadeBlendFraction = 0.30;
 
 static inline float sunVisibility(
     depth2d_array<float, access::sample> shadowMap,
@@ -195,7 +236,8 @@ static inline float sunVisibility(
     uint cascade = pickCascade(viewDist, splits);
     float slope = clamp(1.0 - NdotL, 0.0, 1.0);
 
-    float v = cascadeVisibility(shadowMap, shadowSampler, frame, worldPos, N, slope, cascade);
+    float v = cascadeVisibility(shadowMap, shadowSampler, frame, worldPos, N, slope, cascade,
+                                frame.shadowPcfRadius);
 
     // Inside the last `kCascadeBlendFraction` of this cascade's range, fade into the
     // next one. `cascade == 2` is the outermost, so it has nothing to fade into (its
@@ -208,7 +250,8 @@ static inline float sunVisibility(
         float t = (band > 1e-4) ? saturate((viewDist - (farZ - band)) / band) : 0.0;
         if (t > 0.0) {
             float vNext = cascadeVisibility(shadowMap, shadowSampler, frame,
-                                            worldPos, N, slope, cascade + 1u);
+                                            worldPos, N, slope, cascade + 1u,
+                                            frame.shadowPcfRadius);
             v = mix(v, vNext, t);
         }
     }
