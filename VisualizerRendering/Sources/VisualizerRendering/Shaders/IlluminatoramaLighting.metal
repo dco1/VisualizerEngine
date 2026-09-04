@@ -729,14 +729,37 @@ static inline float illumiContactShadow(
     float3                       viewPos,    // fragment position, view space
     float3                       LviewN,     // normalized view-space dir TOWARD the light
     uint2                        dims,       // depth-buffer (width, height)
+    uint2                        originPx,   // THIS fragment's own pixel (the kernel's gid)
     float                        lengthWS,   // march reach, world units
     uint                         steps,
     float                        thickness,  // occluder depth window, world units
     float                        ndotl       // surface NdotL toward the sun
 ) {
-    // Back-facing or grazing-to-sun fragments are already unlit by NdotL and
-    // self-occlude trivially — skip them to avoid contact-shadow acne.
-    if (ndotl <= 0.02 || steps == 0u || lengthWS <= 0.0) return 0.0;
+    if (steps == 0u || lengthWS <= 0.0) return 0.0;
+
+    // ── The ray has to climb clear of the window it is tested against ────────────────
+    //
+    // Marching toward the light lifts the ray off its own receiver at a rate of `ndotl`
+    // (the sine of the angle between the light and the surface), so over the whole reach it
+    // gains `lengthWS * ndotl` of height — and it is accepted as "occluded" by anything
+    // sitting within `thickness` of it. When that climb is SMALLER than the window, the ray
+    // never leaves its own receiver's acceptance band: the surface it was launched from
+    // qualifies as its own occluder for the entire march, and every fragment reports a hit.
+    //
+    // This is not a tuning threshold; it is the condition under which the test can return an
+    // answer at all. At the shipping 5 cm / 20 mm the ray clears the window once the light is
+    // ~24° off the surface, and below ~12° there is nothing to read. That regime is not one
+    // the feature was ever serving: a contact shadow at grazing light is a long CAST shadow,
+    // which the cascades draw, and what the march produced there instead was a full-strength
+    // false positive across open ground (Daydream Home's default document — an empty flat
+    // plane at golden hour — lost 70 % of its direct sun to it, DH-0611).
+    //
+    // The old guard here was `ndotl <= 0.02`, which is the same intent at an unprincipled
+    // constant: 1.1° off the surface, two orders of magnitude below where the march actually
+    // stops meaning anything. Fading rather than stepping keeps the sun's passage through the
+    // threshold over a day from drawing an edge of its own.
+    float climbFade = smoothstep(0.5, 1.0, (lengthWS * ndotl) / max(thickness, 1e-5));
+    if (climbFade <= 0.0) return 0.0;
 
     // Screen-extent guard — see the block comment above. Project the march's two
     // endpoints and fade out when the whole reach is sub-texel, where the depth
@@ -764,6 +787,34 @@ static inline float illumiContactShadow(
         float2 uv  = ndc.xy * float2(0.5, -0.5) + 0.5;
         if (any(uv < float2(0.0)) || any(uv > float2(1.0))) break;  // ray left the screen
         uint2  px  = min(uint2(uv * float2(dims)), dims - 1u);
+        // ── The step has to LEAVE this fragment's own pixel to mean anything ─────────
+        //
+        // The depth read below is a POINT read at integer pixel granularity, so while the
+        // ray is still inside the pixel it started in, `gDepth.read(px)` returns THIS
+        // fragment's own depth — the ray is being compared against the very surface it was
+        // launched from. `diff` is then just how far the ray has travelled into the scene
+        // along the light direction, which for the first step is `bias + lengthWS/steps`
+        // (6.7 mm at the shipping 5 cm / 12 steps) and lands squarely inside the acceptance
+        // window `(bias, bias + thickness)` = (2.5 mm, 22.5 mm). Every such fragment reports
+        // a first-step hit at full weight, i.e. `occ == 1`.
+        //
+        // The `extentFade` guard above does NOT cover this: it validates the extent of the
+        // WHOLE march, and a march can span 2+ pixels — passing that test at full strength —
+        // while each of its 12 steps advances only ~0.2 px and never leaves the origin texel.
+        // Total extent and per-step extent are different quantities, and the comparison that
+        // has to be resolvable is the per-step one.
+        //
+        // Measured on Daydream Home's default document (an EMPTY flat dirt plane at golden
+        // hour, sun 6.8° above the horizon and near the view axis — the geometry that
+        // foreshortens the march hardest): the ground lost 70 % of its direct sun beyond
+        // ~9 m, as a hard-edged dark band whose edge sat at a constant ~2.5 px of march
+        // extent across an 8× reach sweep. There is nothing in that scene to cast a shadow.
+        //
+        // Skipping costs no real occlusion: a fragment IS the visible surface at its own
+        // pixel, so the depth stored there can only ever be its own. When every step is
+        // skipped the march returns 0 — which is the honest answer for a march that cannot
+        // resolve anything, and the same contract the extent guard already established.
+        if (all(px == originPx)) continue;
         float  sceneDepth = gDepth.read(px);
         if (sceneDepth >= 0.99999) continue;                        // sky — no occluder
 
@@ -776,7 +827,7 @@ static inline float illumiContactShadow(
             // Densest at the contact, and scaled by how much of a pixel the march
             // actually spans — a hit found by a barely-resolved march is worth
             // proportionally less than one found by a fully-resolved one.
-            return (1.0 - float(i) / float(steps)) * extentFade;
+            return (1.0 - float(i) / float(steps)) * extentFade * climbFade;
         }
     }
     return 0.0;
@@ -958,7 +1009,7 @@ kernel void illumi_lighting(
         float3 viewPos = (frame.view * float4(worldPos, 1.0)).xyz;
         float3 LviewN  = normalize((frame.view * float4(Ld, 0.0)).xyz);
         float  occ = illumiContactShadow(gDepth, frame, viewPos, LviewN,
-                                         uint2(w, h),
+                                         uint2(w, h), gid,
                                          frame.contactShadowLength,
                                          frame.contactShadowSteps,
                                          frame.contactShadowThickness,
