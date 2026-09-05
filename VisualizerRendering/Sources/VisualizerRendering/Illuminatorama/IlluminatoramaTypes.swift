@@ -623,10 +623,26 @@ public struct IlluminatoramaAreaLight {
     public var _pad1: Float = 0
     public var color: SIMD3<Float>           // pre-multiplied intensity
     public var radius: Float                 // distance-falloff range (metres)
+    /// DH-0601 — portal VISIBILITY shadow. World → light-space NDC for the depth map
+    /// rendered from the portal centre into the shared spot-shadow atlas. Computed by the
+    /// renderer each frame (`updateSpotShadows`) from `(center, ex, ey, radius)`; identity
+    /// until a slice is assigned. Mirrors `IlluminatoramaSpotLight.shadowMatrix`.
+    public var shadowMatrix: simd_float4x4 = matrix_identity_float4x4
+    /// Slice into the shared `spotShadowAtlas`. `< 0` ⇒ no map this frame; the light
+    /// contributes as fully visible (the exact pre-DH-0601 path — so an area light that
+    /// never opts in is byte-identical). Set by the renderer.
+    public var shadowSliceIndex: Int32 = -1
+    /// 1 ⇒ this area light may claim a shadow-atlas slice (a window portal). 0 ⇒ it never
+    /// does — a diffuse cove/softbox that should not occlude (Visualizer, light strips).
+    /// Default 0, so every existing caller is unchanged. Mirrors `IlluminatoramaPointLight
+    /// .castsShadow`.
+    public var castsShadow: Int32 = 0
+    public var _pad2: Float = 0
+    public var _pad3: Float = 0
 
     public init(center: SIMD3<Float>, ex: SIMD3<Float>, ey: SIMD3<Float>,
                 color: SIMD3<Float>, radius: Float, twoSided: Bool = false,
-                layerMask: UInt32 = 0xFFFF_FFFF) {
+                layerMask: UInt32 = 0xFFFF_FFFF, castsShadow: Bool = false) {
         self.center = center
         self.ex = ex
         self.ey = ey
@@ -634,6 +650,7 @@ public struct IlluminatoramaAreaLight {
         self.radius = radius
         self.twoSided = twoSided ? 1 : 0
         self.layerMask = layerMask
+        self.castsShadow = castsShadow ? 1 : 0
     }
 }
 
@@ -751,6 +768,18 @@ public struct IlluminatoramaSpotLight {
     /// 2026-08-15 tree: blob/surround 0.740 with the slice, 1.014 without). One lamp had it and
     /// the other did not, decided by nothing but which one inherited the spare.
     public var castsShadow: Int32 = 1
+    /// **Bit flag OR-ed into `castsShadow` (DH-0631): the host asserts that no GPU-fed geometry can
+    /// enter this cone's frustum.** Shadow maps are light-space, so a parked scene could reuse
+    /// them — but the reuse was gated on the WHOLE scene being CPU-visible (no compute-fed or
+    /// GPU-written geometry), and a yard's grass field is always live, so every document with a
+    /// lawn re-rasterised all its spot slices every frame into a byte-identical atlas. A cone
+    /// that sits INSIDE a room (Daydream masks such lights to their room's layer, so they cannot
+    /// light an exterior pixel at all) can never have a blade of grass between it and anything it
+    /// lights; the host says so with this bit, and `encodeSpotShadowPasses` then reuses that
+    /// slice while the CPU-visible scene holds. The bit keeps `castsShadow` non-zero, so every
+    /// `!= 0` test still reads "casts"; a host must not set it on a cone with `castsShadow == 0`.
+    /// Exterior cones (a deck lamp, a sconce over the lawn) leave it clear and re-render as before.
+    public static let castsShadowIgnoresGPUGeometry: Int32 = 2
     /// Source-size term for the near-field falloff (was `_padSpot2`; reinterpreted, so the
     /// struct stride is unchanged — 176). Same rule as `IlluminatoramaPointLight.softRadius`:
     /// the lighting kernel attenuates by `1/(d² + softRadius²)`, so a cone from a finite-size

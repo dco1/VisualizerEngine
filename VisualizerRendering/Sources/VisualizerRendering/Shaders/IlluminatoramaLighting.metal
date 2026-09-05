@@ -1336,12 +1336,50 @@ kernel void illumi_lighting(
     float3 areaSum = float3(0.0);
     bool areaLTC = frame.areaLTCEnabled != 0u;
     for (uint i = 0; i < frame.areaLightCount; ++i) {
-        // Light-layer mask — same rule as point/spot. An area light has no shadow map
-        // and no visibility term, so the mask is its ONLY containment (a window portal
-        // without it lights the yard through the back of its own wall).
-        if ((areaLights[i].layerMask & fragLayer) == 0u) continue;
-        areaSum += evalAreaLight(areaLights[i], worldPos, N, V, albedo, metallic, roughness,
-                                 ltcMat, ltcMag, areaLTC);
+        AreaLight al = areaLights[i];
+        // Light-layer mask — same rule as point/spot. For an UNSHADOWED area light (a
+        // diffuse cove/softbox, shadowSliceIndex < 0) the mask is its only containment
+        // (a window portal without it lights the yard through the back of its own wall).
+        if ((al.layerMask & fragLayer) == 0u) continue;
+        // DH-0601 — portal VISIBILITY term. A window portal by day is the room's dominant
+        // source; without occlusion nothing indoors casts a shadow. When the host assigned
+        // this light a slice of the SHARED spot-shadow atlas, project the fragment into the
+        // portal's light space and PCF-compare — identical machinery to the spot path — and
+        // modulate the whole LTC/MRP contribution by the result. shadowSliceIndex < 0 (every
+        // cove strip, every Visibility softbox) skips this entirely and is byte-identical.
+        float visibility = 1.0;
+        if (al.shadowSliceIndex >= 0) {
+            float4 lsPos = al.shadowMatrix * float4(worldPos, 1.0);
+            if (lsPos.w > 0.0) {
+                float2 lsNDC = lsPos.xy / lsPos.w;
+                float  lsZ   = lsPos.z  / lsPos.w;
+                float2 shadowUV = float2(lsNDC.x * 0.5 + 0.5, -lsNDC.y * 0.5 + 0.5);
+                // Out-of-frustum fragments stay fully lit: a single perspective from the
+                // portal centre cannot cover the light's whole emitting hemisphere, and the
+                // LTC form factor already tapers the grazing edges the map misses.
+                bool inFrustum = lsZ > 0.0 && lsZ < 1.0
+                              && shadowUV.x >= 0.0 && shadowUV.x <= 1.0
+                              && shadowUV.y >= 0.0 && shadowUV.y <= 1.0;
+                if (inFrustum) {
+                    float ref = lsZ - frame.spotShadowBias;   // shared atlas ⇒ shared bias
+                    float wtx = 1.0 / 512.0;
+                    float sum = 0.0;
+                    for (int oy = -1; oy <= 1; ++oy) {
+                        for (int ox = -1; ox <= 1; ++ox) {
+                            sum += spotShadowAtlas.sample_compare(
+                                spotShadowSampler,
+                                shadowUV + float2(float(ox), float(oy)) * wtx,
+                                uint(al.shadowSliceIndex),
+                                ref);
+                        }
+                    }
+                    visibility = sum * (1.0 / 9.0);
+                }
+            }
+        }
+        if (visibility <= 0.0) continue;
+        areaSum += visibility * evalAreaLight(al, worldPos, N, V, albedo, metallic, roughness,
+                                              ltcMat, ltcMag, areaLTC);
     }
 
     // Secondary directional lights (#60 task 5) — fill / back lights that a

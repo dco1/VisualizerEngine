@@ -511,12 +511,24 @@ struct AreaLight {
     float3 center;   float twoSided;   // twoSided: 1 = emit both faces, 0 = front only
     // Light-layer mask (was `_pad0` — same 4 bytes, stride unchanged; same rule as
     // PointLight/SpotLight). Default 0xFFFFFFFF ⇒ affects every fragment,
-    // byte-identical to the pre-mask behaviour. This is what CONTAINS a window
-    // portal: an unmasked area light has no visibility term and no shadow map, so
-    // without it a portal lights the yard through the back of its own wall.
+    // byte-identical to the pre-mask behaviour. This is one of TWO containments of a
+    // window portal (see shadowMatrix below): an unmasked area light lights the yard
+    // through the back of its own wall.
     float3 ex;       uint layerMask;   // half-width edge vector (world) + mask
     float3 ey;       float _pad1;      // half-height edge vector (world)
     float3 color;    float radius;     // premultiplied color + distance-falloff range
+    // DH-0601 — portal VISIBILITY shadow (a window portal by day is the room's dominant
+    // source; without occlusion nothing indoors casts a shadow). One depth map rendered
+    // from the portal centre into the SHARED spotShadowAtlas, sampled here purely as a
+    // visibility term while LTC/MRP keeps doing the shading. Same machinery as SpotLight:
+    // shadowMatrix maps world → light-space NDC; shadowSliceIndex is the atlas page (< 0 ⇒
+    // no map, fully visible — the exact pre-change path, so every AreaLight that never opts
+    // in (Visualizer softboxes) is byte-identical). castsShadow is host-side only (1 ⇒ may
+    // claim a slice); the kernel branches on shadowSliceIndex.
+    float4x4 shadowMatrix;
+    int      shadowSliceIndex;
+    int      castsShadow;
+    float    _pad2; float _pad3;       // close on a 16-byte boundary (stride 144)
 };
 
 // A daylight aperture (S3.5 Stage D) — a glazed opening reduced to what the interior

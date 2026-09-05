@@ -225,10 +225,16 @@ public final class IlluminatoramaRenderer {
     /// Spot-shadow skip signature: the atlas slices currently hold depth maps
     /// rendered with exactly these light matrices (and the stable content).
     private var lastSpotShadowMats: [simd_float4x4] = []
-    /// Which `spotLights` index owns each shadow-atlas slice, in slice order. Set by
-    /// `updateSpotShadows`; `encodeSpotShadowPasses` renders through it. A slice is no longer
-    /// a light's array index — see `IlluminatoramaSpotLight.castsShadow`.
-    private var spotShadowSliceOwners: [Int] = []
+    /// Who owns each shadow-atlas slice, in slice order (DH-0601 — the atlas is shared by
+    /// spot cones AND window-portal area lights). Set by `updateSpotShadows`;
+    /// `encodeSpotShadowPasses` renders through it. A slice is no longer a light's array
+    /// index — see `IlluminatoramaSpotLight.castsShadow`.
+    private enum ShadowOwner { case spot(Int); case area(Int) }
+    /// One caster per atlas slice, in slice order. `matrix` is the light-space VP the depth
+    /// pass rasterises with; `reuseBit` = the DH-0631 "no GPU-fed geometry can enter this
+    /// frustum" assertion; `owner` maps back to the light so a trimmed slice can be reset.
+    private struct ShadowCaster { var matrix: simd_float4x4; var reuseBit: Bool; var owner: ShadowOwner }
+    private var spotShadowCasters: [ShadowCaster] = []
     /// Point-shadow skip signature: (position, radius) per cube-holding light in
     /// enumeration order + the cube-page assignment vector. Any ranking change,
     /// light move, or radius change breaks equality → re-render.
@@ -249,6 +255,16 @@ public final class IlluminatoramaRenderer {
         instanceShapeStableFrames >= 1 && !contentHasSway
             && gpuRepackTasks.isEmpty && onEncodeGPUInstances == nil
     }
+    /// The same, minus the GPU-fed-geometry terms (DH-0631): every CPU-visible instance held and
+    /// nothing sways. A spot slice whose owner carries
+    /// `IlluminatoramaSpotLight.castsShadowIgnoresGPUGeometry` may be reused under this weaker
+    /// condition — the host has asserted that the live GPU geometry cannot enter that cone.
+    private var sceneStaticExceptGPUGeometry: Bool {
+        instanceShapeStableFrames >= 1 && !contentHasSway
+    }
+    /// A/B lever for the per-slice reuse above (default on). Off = every slice re-renders whenever
+    /// GPU-fed geometry is live, the pre-DH-0631 behaviour.
+    public var spotShadowGPUGeometryOptOutEnabled: Bool = true
 
     /// Opt-in GPU-resident instance hook (additive — nil for every scene that
     /// doesn't set it, so behaviour is byte-for-byte unchanged elsewhere).
@@ -9201,14 +9217,32 @@ public final class IlluminatoramaRenderer {
         //
         // Every spot starts unshadowed so a light that loses (or never wanted) a slice cannot
         // sample a stale one — the same reset `updatePointShadows` does.
-        spotShadowSliceOwners.removeAll(keepingCapacity: true)
+        spotShadowCasters.removeAll(keepingCapacity: true)
         for i in 0..<spotLights.count { spotLights[i].shadowSliceIndex = -1 }
+        for i in 0..<areaLights.count { areaLights[i].shadowSliceIndex = -1 }
         guard enabled else { return }
+        // DH-0601 — window portals (area lights) claim slices FIRST. Daylight is the room's
+        // dominant daytime source, so it outranks a fixture cone when the atlas is tight; at
+        // night there are no portals (dayFrac 0 ⇒ none emitted), so every slice still goes to
+        // fixtures. `windowDaylightMode != .portals` scenes never set `castsShadow`, so this
+        // loop is a no-op for them (and for Visualizer softboxes).
+        for i in 0..<areaLights.count {
+            guard areaLights[i].castsShadow != 0 else { continue }
+            guard spotShadowCasters.count < capacity else { break }
+            let slice = spotShadowCasters.count
+            areaLights[i].shadowSliceIndex = Int32(slice)
+            let m = areaShadowMatrix(areaLights[i])
+            areaLights[i].shadowMatrix = m
+            // A portal faces INTO the room and its frustum is capped at the portal range —
+            // the exterior lawn (the only GPU-fed geometry) can never enter it, so the slice
+            // is reusable while the CPU-visible scene holds (same argument as an interior cone,
+            // DH-0631).
+            spotShadowCasters.append(ShadowCaster(matrix: m, reuseBit: true, owner: .area(i)))
+        }
         for i in 0..<spotLights.count {
             guard spotLights[i].castsShadow != 0 else { continue }
-            guard spotShadowSliceOwners.count < capacity else { break }
-            let slice = spotShadowSliceOwners.count
-            spotShadowSliceOwners.append(i)
+            guard spotShadowCasters.count < capacity else { break }
+            let slice = spotShadowCasters.count
             spotLights[i].shadowSliceIndex = Int32(slice)
             // Light view: apex at spot.position, looking down the spot's
             // direction (which already points the way light travels).
@@ -9243,14 +9277,42 @@ public final class IlluminatoramaRenderer {
             let near = max(0.005, far * 0.002)
             let proj = Self.perspectiveRH(fovY: fovY, aspect: 1.0, near: near, far: far)
             spotLights[i].shadowMatrix = proj * lightView
+            let reuse = spotLights[i].castsShadow & IlluminatoramaSpotLight.castsShadowIgnoresGPUGeometry != 0
+            spotShadowCasters.append(ShadowCaster(matrix: spotLights[i].shadowMatrix,
+                                                  reuseBit: reuse, owner: .spot(i)))
         }
-        ensureSpotShadowAtlas(casting: spotShadowSliceOwners.count)
+        ensureSpotShadowAtlas(casting: spotShadowCasters.count)
         // If the reallocation could not happen, no slice index may point past the atlas —
-        // trim the surplus back to unshadowed (the same state a spot past the cap is in).
-        while spotShadowSliceOwners.count > spotShadowAtlasCapacity {
-            let i = spotShadowSliceOwners.removeLast()
-            spotLights[i].shadowSliceIndex = -1
+        // trim the surplus back to unshadowed (the same state a caster past the cap is in).
+        while spotShadowCasters.count > spotShadowAtlasCapacity {
+            switch spotShadowCasters.removeLast().owner {
+            case .spot(let i): spotLights[i].shadowSliceIndex = -1
+            case .area(let i): areaLights[i].shadowSliceIndex = -1
+            }
         }
+    }
+
+    /// DH-0601 — the light-space view-projection for a window portal's VISIBILITY shadow map.
+    /// A single perspective from the portal centre looking along its inward emitting normal
+    /// (`normalize(cross(ex, ey))`), wide enough to frame the room the portal lights. It cannot
+    /// cover the full emitting hemisphere — the LTC eval still lights the grazing edges — but a
+    /// receiver outside the frustum reads as fully visible (the same fallback the spot path
+    /// takes), and the near/mid room where objects actually stand is well inside it. Near/far
+    /// follow the spot convention against the same 512² depth atlas.
+    private func areaShadowMatrix(_ al: IlluminatoramaAreaLight) -> simd_float4x4 {
+        var nL = simd_cross(al.ex, al.ey)
+        let len = simd_length(nL)
+        guard len > 1e-6 else { return matrix_identity_float4x4 }
+        nL /= len
+        let upHint: SIMD3<Float> = abs(nL.y) < 0.95 ? SIMD3(0, 1, 0) : SIMD3(0, 0, 1)
+        let lightView = Self.lookAtRH(eye: al.center, target: al.center + nL, up: upHint)
+        let far  = max(0.5, al.radius)
+        let near = max(0.005, far * 0.002)
+        // ~150° — wide enough to reach the near-window floor and flanking walls without the
+        // grazing-edge precision loss of a full 170°.
+        let fovY: Float = 2.62
+        let proj = Self.perspectiveRH(fovY: fovY, aspect: 1.0, near: near, far: far)
+        return proj * lightView
     }
 
     /// DH-0134 — size the spot-shadow atlas to the host's request, lazily.
@@ -9291,18 +9353,24 @@ public final class IlluminatoramaRenderer {
     /// spots are present, or when the host hasn't pushed any instances
     /// (no occluders → no shadow data needed).
     private func encodeSpotShadowPasses(_ cb: MTLCommandBuffer) {
-        guard spotShadowsEnabled, !spotShadowSliceOwners.isEmpty, !instances.isEmpty else { return }
-        let count = spotShadowSliceOwners.count
+        guard spotShadowsEnabled, !spotShadowCasters.isEmpty, !instances.isEmpty else { return }
+        let count = spotShadowCasters.count
         // PERF (static-scene skip): spot shadow maps are LIGHT-space — a camera
         // orbit re-rendered every slice (up to 8 full scene depth passes) into
         // byte-identical maps every frame. When the scene content held (see
         // `sceneStaticForShadows`) and every slice's light matrix is unchanged,
         // the atlas already contains exactly these maps — reuse them.
-        let mats = spotShadowSliceOwners.map { spotLights[$0].shadowMatrix }
+        let mats = spotShadowCasters.map { $0.matrix }
         if sceneStaticForShadows && mats == lastSpotShadowMats {
             staticSkipStats.spotShadowPassesSkipped += count
             return
         }
+        // DH-0631 — per-slice reuse when the ONLY thing keeping the scene from "static" is live
+        // GPU-fed geometry (the lawn): a slice whose owner asserts that geometry cannot enter its
+        // cone still holds a valid map from the last time it was rendered with this same matrix.
+        // Slices without the assertion (exterior cones) re-render as before.
+        let perSliceReuse = spotShadowGPUGeometryOptOutEnabled
+            && sceneStaticExceptGPUGeometry && mats == lastSpotShadowMats
         lastSpotShadowMats = mats
         // Pass descriptors + labels are cached per slice (they never change after
         // the atlas exists) — this loop used to allocate a fresh descriptor and
@@ -9319,6 +9387,10 @@ public final class IlluminatoramaRenderer {
             spotShadowPassLabels.append("Illuminatorama.spotShadow.s\(slice)")
         }
         for slice in 0..<count {
+            if perSliceReuse, spotShadowCasters[slice].reuseBit {
+                staticSkipStats.spotShadowPassesSkipped += 1
+                continue
+            }
             guard let enc = timedRenderEncoder(cb, spotShadowPassDescs[slice], "shadow.spot") else { continue }
             enc.label = spotShadowPassLabels[slice]
             enc.setRenderPipelineState(shadowPipeline)
@@ -9330,7 +9402,7 @@ public final class IlluminatoramaRenderer {
             enc.setFrontFacing(.counterClockwise)
             applyShadowRasterBias(enc)
 
-            var lightVP = spotLights[spotShadowSliceOwners[slice]].shadowMatrix
+            var lightVP = spotShadowCasters[slice].matrix
             enc.setVertexBytes(&lightVP,
                                length: MemoryLayout<simd_float4x4>.stride,
                                index: 3)
