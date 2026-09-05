@@ -718,12 +718,39 @@ struct Instance {
     // stride stays 320; `float2(0)` is an exact no-op. x = band cells per UV unit (0 = off), y = ±
     // tone amplitude. Mirrors `IlluminatoramaInstance.carpetMacro`.
     float2   carpetMacro;
+    // DH-0478 — per-texel grain-direction map slice (non-colour atlas; RG = cos 2θ, sin 2θ from the
+    // material U axis). < 0 = none. Read ONLY by the kExtendedGBuffer fragment variant, which writes
+    // the world-space grain angle into `GBufferOut.material.gb`. NEW 16-byte cluster (offsets
+    // 320-335): stride 320 -> 336. Mirrors `IlluminatoramaInstance.grainTangentTextureSlice`.
+    int      grainTangentTextureSlice;
+    int      _padGrain0;
+    int      _padGrain1;
+    int      _padGrain2;
 };
 
 // The Swift mirror (`IlluminatoramaInstance._assertStride240`) has always asserted this
 // side of the contract; this is the other side, and it costs a compile. A Swift field
 // added without its Metal twin used to be caught only by a wrong-looking render.
-static_assert(sizeof(Instance) == 320, "Instance must match IlluminatoramaInstance (320 bytes)");
+static_assert(sizeof(Instance) == 336, "Instance must match IlluminatoramaInstance (336 bytes)");
+
+// ── Anisotropy base tangent (DH-0478) ─────────────────────────────────────────────────────
+// The in-plane direction the grain lobe measures its stretch along when a material has no
+// per-texel grain map: horizontal in the face (or plan-X on a near-horizontal face), or its
+// in-plane perpendicular when the instance asks for VERTICAL grain. ONE definition, used by the
+// lighting kernel (as the grain tangent itself, and as the reference a per-texel angle is
+// decoded against) and by the photo-lane G-buffer (as the reference that angle is ENCODED
+// against) — so the two ends of `material.gb` cannot drift apart.
+static inline float3 anisoBaseTangent(float3 N, bool grainVertical) {
+    float3 up = float3(0.0, 1.0, 0.0);
+    if (abs(dot(N, up)) > 0.95) {
+        // Near-horizontal face (an appliance TOP): "vertical" has no meaning in the ground
+        // plane, so fall back to the plan axes — horizontal = plan-X, vertical = plan-Z.
+        float3 planX = normalize(float3(1.0, 0.0, 0.0) - N * N.x);
+        return grainVertical ? normalize(cross(N, planX)) : planX;
+    }
+    float3 horiz = normalize(cross(N, up));                    // in-plane, horizontal
+    return grainVertical ? normalize(cross(N, horiz)) : horiz; // in-plane, up-aligned (vertical)
+}
 
 // ── Cloth sheen roughness bands (DH-0081) ─────────────────────────────────────────────────
 // The sheen lobe's roughness is carried per-material by folding a small BAND index into the

@@ -1215,10 +1215,34 @@ fragment GBufferOut illumi_fs(
         : 0.0f;
     o.emission        = half4(half3(emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -sheenAlpha));
     if (kExtendedGBuffer) {
-        // DH-0140 slice 1 — per-material clearcoat roughness rides the sixth target. The
-        // transmission (.r) and grain-tangent (.gb) lanes are reserved and written 0 until
-        // their payloads land, so their readers stay on the live-lane path.
-        o.material = half4(0.0h, 0.0h, 0.0h, half(inst.clearcoat > 0.0 ? inst.clearcoatRoughness : 0.0));
+        // DH-0478 — per-texel grain DIRECTION for the anisotropy lobe. The material's map holds
+        // (cos 2θ, sin 2θ), θ from its U axis in tangent space; here it becomes a world-space angle
+        // φ against the SAME base tangent the lighting kernel builds (`anisoBaseTangent`, on the
+        // normal this fragment writes), and is stored doubled again — (cos 2φ, sin 2φ) in .gb — so
+        // it is sign-agnostic and wrap-free. Raw (0,0) is "no per-texel grain": it decodes to a
+        // vector of length √2, off the unit circle, and the kernel keeps its base tangent.
+        float2 grainEnc = float2(0.0);
+        if (wTag > 1.001h && inst.grainTangentTextureSlice >= 0 &&
+            length_squared(in.worldTangent.xyz) > 1e-4) {
+            float4 gs = sampleAtlasHex(nonColorAtlas, texSampler, matUV,
+                                       uint(inst.grainTangentTextureSlice), nonColorUVScale,
+                                       nonColorSliceMean,
+                                       frame.antiTilingStrength * inst.antiTilingScale, duvdx, duvdy);
+            float2 d2 = gs.xy * 2.0 - 1.0;
+            float theta = 0.5 * atan2(d2.y, d2.x);
+            float3 nGeo = normalize(in.worldNormal);
+            float3 T = normalize(in.worldTangent.xyz);
+            float3 B = cross(nGeo, T) * in.worldTangent.w;
+            float3 Gw = normalize(cos(theta) * T + sin(theta) * B);
+            float3 baseT = anisoBaseTangent(n, inst.anisotropy < 0.0f);
+            float3 baseB = normalize(cross(n, baseT));
+            float phi = atan2(dot(Gw, baseB), dot(Gw, baseT));
+            grainEnc = float2(cos(2.0 * phi), sin(2.0 * phi)) * 0.5 + 0.5;
+        }
+        // .r transmission/alpha is reserved (DH-0140 slice 3) and written 0 until it lands.
+        // .a per-material clearcoat roughness (slice 1); 0 = "not written" → the kernel's 0.08.
+        o.material = half4(0.0h, half(grainEnc.x), half(grainEnc.y),
+                           half(inst.clearcoat > 0.0 ? inst.clearcoatRoughness : 0.0));
     }
     // Screen-space motion vector. NDC.y is up, UV.y is down → Y is flipped.
     // The result is (currentUV - previousUV), so history reprojection in the

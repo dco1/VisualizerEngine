@@ -1066,6 +1066,17 @@ public struct IlluminatoramaInstance {
     /// Mirrors `Instance.carpetMacro` in `IlluminatoramaCommon.h`.
     public var carpetMacro: SIMD2<Float> = .zero
 
+    /// DH-0478 — slice index (non-colour atlas) of the per-texel grain-direction map, encoded as
+    /// (cos 2θ, sin 2θ) in RG, θ from the material's U axis. `< 0` = none: the anisotropy lobe keeps
+    /// its per-instance axis. Read ONLY by the photo-lane G-buffer variant (`kExtendedGBuffer`),
+    /// which re-expresses it as a world-space angle in `material.gb` for the lighting kernel. NEW
+    /// 16-byte cluster (offsets 320-335): stride 320 → 336. Every host that never sets it — every
+    /// Visualizer scene — is byte-identical (the field is never read on the live lane).
+    public var grainTangentTextureSlice: Int32 = -1
+    public var _padGrain0: Int32 = 0
+    public var _padGrain1: Int32 = 0
+    public var _padGrain2: Int32 = 0
+
     public init(
         modelMatrix: simd_float4x4,
         albedo: SIMD3<Float> = SIMD3(0.8, 0.8, 0.8),
@@ -1098,10 +1109,10 @@ public struct IlluminatoramaInstance {
         self.normalMatrix = Self.normalMatrix(from: m)
     }
 
-    /// Compile-time guard: Swift and Metal structs must agree on 320 bytes.
+    /// Compile-time guard: Swift and Metal structs must agree on 336 bytes.
     /// If this fires, either a Swift field was added without the matching Metal
     /// field (or vice versa), or alignment changed unexpectedly.
-    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 320, "IlluminatoramaInstance stride must be 320") }()
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 336, "IlluminatoramaInstance stride must be 336") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //

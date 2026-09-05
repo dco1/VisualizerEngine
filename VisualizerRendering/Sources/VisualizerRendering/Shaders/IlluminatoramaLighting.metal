@@ -1078,16 +1078,21 @@ kernel void illumi_lighting(
     else                     { aniso = 0.0;                 grainVertical = false; }
     float3 grainT = float3(0.0);
     if (aniso > 0.001) {
-        float3 up = float3(0.0, 1.0, 0.0);
-        if (abs(dot(N, up)) > 0.95) {
-            // Near-horizontal face (an appliance TOP): "vertical" has no meaning in the ground
-            // plane, so fall back to the plan axes — horizontal = plan-X (unchanged), vertical = plan-Z.
-            float3 planX = normalize(float3(1.0, 0.0, 0.0) - N * N.x);
-            grainT = grainVertical ? normalize(cross(N, planX)) : planX;
-        } else {
-            float3 horiz = normalize(cross(N, up));                 // in-plane, horizontal
-            grainT = grainVertical ? normalize(cross(N, horiz))    // in-plane, up-aligned (vertical)
-                                   : horiz;
+        // The per-instance axis (shared definition — IlluminatoramaCommon.h).
+        grainT = anisoBaseTangent(N, grainVertical);
+        if (frame.extendedGBuffer != 0.0) {
+            // DH-0478 — the still carries the material's OWN grain direction per texel: `material.gb`
+            // is (cos 2φ, sin 2φ) of the angle from the base tangent above, doubled so it is
+            // sign-agnostic and wrap-free. A texel the pass never wrote (raw 0) decodes to length
+            // √2, off the unit circle, and keeps the base tangent — every ungrained or legacy
+            // pixel is pixel-identical to the live lane.
+            float2 e = float2(gMaterial.read(gid).gb) * 2.0 - 1.0;
+            float l2 = dot(e, e);
+            if (l2 > 0.5 && l2 < 1.5) {
+                float phi = 0.5 * atan2(e.y, e.x);
+                float3 baseB = normalize(cross(N, grainT));
+                grainT = normalize(cos(phi) * grainT + sin(phi) * baseB);
+            }
         }
     }
     // NOTE the sheen accounting: `directSun` is scaled by `visibility` AFTER the call, so the
