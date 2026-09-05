@@ -1320,10 +1320,35 @@ public final class IlluminatoramaRenderer {
     /// Constant depth bias subtracted from the spot light-space depth
     /// before the PCF compare. Combats acne on lit surfaces.
     public var spotShadowBias: Float = 0.0005
-    /// Up to this many spots in the `spotLights` array get a shadow map
-    /// each frame. Bounded by `spotShadowAtlas`'s slice count. Spots
-    /// beyond this index render as direct-only (no shadow modulation).
-    public var spotShadowMaxCount: Int { spotShadowAtlasCapacity }
+    /// Up to this many shadow-CASTING spots in the `spotLights` array get a shadow map each
+    /// frame; the rest render as direct-only (no shadow modulation). This is the host's
+    /// `spotShadowCapacityRequest` — the atlas grows to meet it lazily (`ensureSpotShadowAtlas`),
+    /// so it is the CAP, not the allocation; the allocation is `spotShadowAtlasSliceCount`.
+    public var spotShadowMaxCount: Int { spotShadowCapacityRequest }
+    /// **How many spot cones may carry a shadow map (DH-0134).** Default 8 — the shipped live
+    /// footprint (8 × 512² × 4 B = 8 MiB), byte-identical for every host that never sets it.
+    /// A still has no vsync budget, so a host's photo/export lane asks for
+    /// `spotShadowCapacityHardMax` and every casting cone in the scene is shadowed; the live lane
+    /// asks for the default again on the way out. The atlas reallocates only when a caster
+    /// actually needs a slice it does not have, and shrinks back when the request drops, so
+    /// nothing is paid up front and nothing lingers (~1 MiB per slice). Clamped to
+    /// `1...spotShadowCapacityHardMax`.
+    public var spotShadowCapacityRequest: Int = IlluminatoramaRenderer.spotShadowCapacityDefault {
+        didSet {
+            let clamped = min(max(1, spotShadowCapacityRequest), Self.spotShadowCapacityHardMax)
+            if clamped != spotShadowCapacityRequest { spotShadowCapacityRequest = clamped }
+        }
+    }
+    /// The live-lane allocation every host gets without asking. Mirrored by hosts that ration
+    /// slices on the CPU (Daydream Home's `ShadowSlotBudget.engineSpotShadowCapacity`).
+    public static let spotShadowCapacityDefault = 8
+    /// The most slices the atlas will ever hold. Metal allows 2048 array slices, but each one
+    /// is a full-scene depth pass per frame (~0.5 ms) plus 1 MiB, so "no limit" still needs an
+    /// implementation cap; 64 cones is far past any house's fixture count.
+    public static let spotShadowCapacityHardMax = 64
+    /// Slices currently ALLOCATED in the spot-shadow atlas — `spotShadowCapacityDefault` until a
+    /// host asks for more and a caster needs it. Diagnostics / gates; the cap is `spotShadowMaxCount`.
+    public var spotShadowAtlasSliceCount: Int { spotShadowAtlasCapacity }
 
     // ── Point-light cubemap shadows (opt-in, additive) ────────────────
     /// Master enable for the point-light depth-cubemap shadow pass. Default
@@ -2206,8 +2231,10 @@ public final class IlluminatoramaRenderer {
     /// Last frame's G-buffer depth, blit-copied from `depthTexture` at the end of
     /// each frame and read by the TAA resolve for disocclusion rejection (so a
     /// fast mover that vacated a pixel onto a similar-luma surface doesn't trail —
-    /// the case neighbourhood-clamp alone can't catch). Standalone, not pooled;
-    /// safe to read-then-overwrite in place under `maxFramesInFlight == 1`.
+    /// the case neighbourhood-clamp alone can't catch). Standalone, not pooled: the
+    /// copy is a GPU blit on the frame's own command buffer, and command buffers on
+    /// one queue execute in order, so it is ordered against the next frame's G-buffer
+    /// regardless of the in-flight pool depth.
     private var previousDepthTexture: MTLTexture
     private var hdrTexture: MTLTexture
     // Phase 2 — half-res visibility map from SSAO, fed to the lighting pass.
@@ -2341,10 +2368,13 @@ public final class IlluminatoramaRenderer {
     private var cascadeVPs: [simd_float4x4] = Array(repeating: matrix_identity_float4x4, count: 3)
 
     // Phase 4.10 — depth atlas for spot light shadow maps. One slice per
-    // shadowed spot. 8 slices × 512² × 4-byte depth = 8 MB. Fixed at
-    // allocation time; `spotShadowMaxCount` reads from this capacity.
-    private let spotShadowAtlas: MTLTexture
-    private let spotShadowAtlasCapacity: Int = 8
+    // shadowed spot. 8 slices × 512² × 4-byte depth = 8 MB at rest. NOT fixed any more
+    // (DH-0134): `ensureSpotShadowAtlas` reallocates toward the host's
+    // `spotShadowCapacityRequest` when a caster needs a slice it does not have, and shrinks
+    // back when the request drops. Every binding reads the var at encode time, and the
+    // cached per-slice pass descriptors are dropped on reallocation.
+    private var spotShadowAtlas: MTLTexture
+    private var spotShadowAtlasCapacity: Int = IlluminatoramaRenderer.spotShadowCapacityDefault
     private let spotShadowMapResolution: Int = 512
     private var cascadeSplitsView: SIMD4<Float> = .zero
 
@@ -2988,8 +3018,10 @@ public final class IlluminatoramaRenderer {
     // (`surfIncrementalReady`) and is a no-op on chart/soup/static scenes (a fully
     // static frame diffs to zero moved instances → zero re-framing), so enabling it
     // by default only helps animated TLAS scenes. `VIZ_SURFCACHE_INCREMENTAL=0` is
-    // the kill-switch. SAFE only while `maxFramesInFlight == 1` (the in-place
-    // `surfCardBuffer` rewrite races a ≥2 pool — ping-pong the card buffer first).
+    // the kill-switch. The default lane re-frames on the GPU, on this frame's command
+    // buffer (hazard-tracked); the CPU fallback rewrites `surfCardBuffer` in place and
+    // first waits for the in-flight frame (`awaitInFlightFrameBeforeCPUCacheWrite`,
+    // DH-0537 #1) — the pool is 2, so an unguarded in-place write would race.
     public var surfaceCacheIncremental: Bool = true
     // Phase 5 / B1 — cache-domain à-trous denoiser. Spatially filters the radiance
     // atlas (same-card-guarded, variance-guided) before the GI/reflection consumers
@@ -3003,7 +3035,7 @@ public final class IlluminatoramaRenderer {
     private let surfAtrousPipeline: MTLComputePipelineState?
     // Phase 5 / A (streaming) — residency feedback. When on, the GI/reflection
     // cache hits mark `cardRequested[card]=1`; the host drains the buffer the NEXT
-    // frame (maxFramesInFlight==1) to log the per-frame WORKING SET size — the data
+    // frame (after waiting for the in-flight one) to log the per-frame WORKING SET size — the data
     // that sizes the atlas budget and that A1's residency pass will key off. Plain
     // instrumentation for now (no behavior change). `VIZ_ILLUMI_SURFCACHE_FEEDBACK=1`.
     public var surfaceCacheFeedback: Bool =
@@ -3023,7 +3055,7 @@ public final class IlluminatoramaRenderer {
     // SLOTS (= A0's bake-time resident-card rects) based on the `cardRequested`
     // working set: a sampled-but-non-resident card is promoted into a slot freed by
     // an unsampled resident card. Mutates `texelCard` + `cardRect` + `dirty` in place
-    // (safe under maxFramesInFlight==1, same class as the incremental writes) — NO
+    // (after `awaitInFlightFrameBeforeCPUCacheWrite`, same class as the incremental writes) — NO
     // kernel addressing change (the kernels still read texel→card / card→rect, and
     // A0's zero-rect-⇒-fallback path already handles a non-resident card).
     // `VIZ_ILLUMI_SURFCACHE_STREAM=1` (implies feedback). Default off.
@@ -3117,10 +3149,21 @@ public final class IlluminatoramaRenderer {
     }
     private var surfGPUDiffDeformDispatches: [SurfDeformDispatch] = []
     /// 4×uint written by the kernels via relaxed atomics ([0] moved instances,
-    /// [1] dirtied cards, [2] deformed instances, [3] spare), read + zeroed by
-    /// the CPU the NEXT frame (safe under `maxFramesInFlight == 1`) for the
-    /// `recordSurfCacheStats` sidecar.
-    private var surfGPUDiffStatsBuffer: MTLBuffer?
+    /// [1] dirtied cards, [2] deformed instances, [3] spare), read + zeroed by the CPU
+    /// for the `recordSurfCacheStats` sidecar. RING-buffered (DH-0537 #1): with
+    /// `maxFramesInFlight == 2` the previous frame's kernel can still be incrementing while
+    /// this frame's CPU reads and zeroes, so one buffer was a read-during-write race. A slot
+    /// is reused every `maxFramesInFlight` frames, and the in-flight semaphore guarantees the
+    /// frame that last wrote it has COMPLETED before this frame's encode begins.
+    private var surfGPUDiffStatsRing: [MTLBuffer] = []
+    /// The most recently committed FRAME command buffer (DH-0537 #1). The opt-in / kill-switch
+    /// CPU paths that rewrite GPU-read buffers in place (`surfCardBuffer`, `surfCardDirtyBuffer`,
+    /// `texelCard`, `cardRect`, `cardRequested`) wait on it first — see
+    /// `awaitInFlightFrameBeforeCPUCacheWrite`.
+    private var lastCommittedFrameCB: MTLCommandBuffer?
+    private var surfGPUDiffStatsBuffer: MTLBuffer? {
+        surfGPUDiffStatsRing.isEmpty ? nil : surfGPUDiffStatsRing[frameRingIndex % surfGPUDiffStatsRing.count]
+    }
     /// Swift mirror of the Metal `SCReframeUniforms` (32 B, passed via setBytes).
     private struct SCReframeUniforms {
         var count: UInt32; var cardCount: UInt32; var instanceCount: UInt32; var epsilon: Float
@@ -4185,10 +4228,15 @@ public final class IlluminatoramaRenderer {
         // dependency; nil leaves curves rigid (no per-frame re-displace).
         self.curveWindDisplacePipeline =
             cache.pipelineState(name: "illumi_curve_wind_displace", device: device)
-        surfGPUDiffStatsBuffer = device.makeBuffer(
-            length: MemoryLayout<UInt32>.stride * 4, options: .storageModeShared)
-        surfGPUDiffStatsBuffer?.label = "Illuminatorama.surfcache.gpuDiffStats"
-        if let sb = surfGPUDiffStatsBuffer { memset(sb.contents(), 0, sb.length) }
+        var statsRing: [MTLBuffer] = []
+        for slot in 0..<IlluminatoramaRenderer.maxFramesInFlight {
+            guard let b = device.makeBuffer(length: MemoryLayout<UInt32>.stride * 4,
+                                            options: .storageModeShared) else { continue }
+            b.label = "Illuminatorama.surfcache.gpuDiffStats.\(slot)"
+            memset(b.contents(), 0, b.length)
+            statsRing.append(b)
+        }
+        surfGPUDiffStatsRing = statsRing
 
         // ── Instanced-RT (TLAS) pipeline ─────────────────────────────
         // Same constant-declaring caveat as the surfcache TLAS kernel above:
@@ -6054,10 +6102,10 @@ public final class IlluminatoramaRenderer {
     /// `surfCardBuffer` straight from the solver's live position buffer). The
     /// CPU loop below remains only as the `VIZ_SURFCACHE_GPU_DIFF=0` fallback.
     ///
-    /// `surfCardBuffer` is written in place (not ping-ponged) — SAFE only because
-    /// `maxFramesInFlight == 1` (the previous frame's GPU read has completed
-    /// before this CPU write begins). If that pool is ever raised to ≥2, ping-pong
-    /// the card buffer or this becomes a read-during-write hazard.
+    /// `surfCardBuffer` is written in place (not ping-ponged). On the default GPU lane that
+    /// is a kernel on this frame's command buffer, ordered by hazard tracking; on the CPU
+    /// fallback it is a host write that first waits for the in-flight frame
+    /// (`awaitInFlightFrameBeforeCPUCacheWrite`, DH-0537 #1) — the pool is 2.
     ///
     /// **#60 item 1 + Phase D — GPU-side transform diff.** Both dynamic sources
     /// now run as compute kernels on the frame's command buffer: RIGID movers
@@ -6123,6 +6171,8 @@ public final class IlluminatoramaRenderer {
         let curPtr = currentInstanceBuffer.contents().bindMemory(to: IlluminatoramaInstance.self, capacity: total)
         let prevPtr = previousInstanceBuffer.contents().bindMemory(to: IlluminatoramaInstance.self, capacity: total)
 
+        // CPU fallback: it rewrites the card + dirty buffers the in-flight frame may be reading.
+        awaitInFlightFrameBeforeCPUCacheWrite()
         // Clear last frame's dirty flags; cards that stop moving revert to EMA.
         memset(dirtyBuf.contents(), 0, dirtyBuf.length)
         let dirty = dirtyBuf.contents().bindMemory(to: UInt32.self, capacity: surfCardCount)
@@ -6207,6 +6257,7 @@ public final class IlluminatoramaRenderer {
                                                          dirtyBuf: MTLBuffer, cardBuf: MTLBuffer) {
         // Charts are rigid-mover only — the deforming per-card path doesn't apply.
         guard surfaceCacheIncremental else { return }
+        awaitInFlightFrameBeforeCPUCacheWrite()   // in-place card/dirty rewrite below
         let total = instances.count
         guard chart.instCardLo.count == total, chart.instCardHi.count == total,
               chart.objectFrame.count == surfCardCount else { return }
@@ -6308,7 +6359,7 @@ public final class IlluminatoramaRenderer {
         surfGPUDiffObjVertsBuffer = vb
         surfGPUDiffDeformIdxBuffer = ib
         surfGPUDiffTriCount = triCount
-        if let sb = surfGPUDiffStatsBuffer { memset(sb.contents(), 0, sb.length) }
+        for sb in surfGPUDiffStatsRing { memset(sb.contents(), 0, sb.length) }
     }
 
     /// Chart-path GPU-diff maps (#60 item 1): per-card owner instance (−1 =
@@ -6335,7 +6386,7 @@ public final class IlluminatoramaRenderer {
         fb.label = "Illuminatorama.surfcache.gpuDiff.cardFrame"
         surfGPUDiffChartOwnerBuffer = ob
         surfGPUDiffChartFrameBuffer = fb
-        if let sb = surfGPUDiffStatsBuffer { memset(sb.contents(), 0, sb.length) }
+        for sb in surfGPUDiffStatsRing { memset(sb.contents(), 0, sb.length) }
     }
 
     /// Phase D + #60 item 1 — the full GPU per-triangle dynamic-card pass.
@@ -6420,9 +6471,23 @@ public final class IlluminatoramaRenderer {
     /// Encode the GPU-side moved-set detection + re-frame (#60 item 1). One
     /// dispatch; the surface-cache update kernel later in the same command
     /// buffer reads the re-framed cards + dirty flags (hazard tracking orders
-    /// the two). Also drains LAST frame's atomic stats into the diagnostic
-    /// sidecar — safe to read on the CPU here because `maxFramesInFlight == 1`
-    /// guarantees that command buffer has completed.
+    /// the two). Also drains this ring slot's atomic stats into the diagnostic
+    /// sidecar — the slot was last written `maxFramesInFlight` frames ago, and the
+    /// in-flight semaphore guarantees that frame has completed (DH-0537 #1).
+    /// DH-0537 #1 — before a CPU write into a buffer the PREVIOUS frame's GPU passes may still
+    /// be reading. Under `maxFramesInFlight == 2` that frame can be executing while this frame's
+    /// CPU encode runs, so an in-place rewrite of `surfCardBuffer` / `surfCardDirtyBuffer` /
+    /// `texelCard` / `cardRect` / `cardRequested` was a read-during-write hazard (the comments
+    /// said "SAFE only while maxFramesInFlight == 1", and the pool had been 2 for a long time).
+    /// Waiting drains the pipeline for that one frame, so only the paths that touch GPU-owned
+    /// memory from the CPU pay it: the `VIZ_SURFCACHE_GPU_DIFF=0` fallback loops, the chart
+    /// CPU re-frame, streaming residency and the feedback drain. The default GPU-diff lane
+    /// writes those buffers from kernels on THIS frame's command buffer, which hazard
+    /// tracking orders, and never calls this.
+    private func awaitInFlightFrameBeforeCPUCacheWrite() {
+        lastCommittedFrameCB?.waitUntilCompleted()   // gpu-ok: opt-in CPU cache paths only, never the default per-frame lane
+    }
+
     private func encodeGPUDiffReframe(_ cb: MTLCommandBuffer,
                                       pipeline: MTLComputePipelineState,
                                       threadCount: Int,
@@ -6617,7 +6682,7 @@ public final class IlluminatoramaRenderer {
     /// the cache update (so the update relights this frame's resident set) and AFTER
     /// the incremental re-frame (so a promoted card's dirty flag isn't clobbered by
     /// the rigid-mover pass). Reads the PREVIOUS frame's `cardRequested` working set
-    /// (safe under maxFramesInFlight==1), promotes sampled-but-non-resident cards into
+    /// (after waiting for the in-flight frame), promotes sampled-but-non-resident cards into
     /// slots freed by unsampled residents, and rewrites `texelCard` / `cardRect` /
     /// `dirty` in place. No kernel change — A0's zero-rect fallback already covers a
     /// card the instant it's demoted. Logs the structural success metric
@@ -6631,6 +6696,7 @@ public final class IlluminatoramaRenderer {
               let rectBuf = surfCardRectBuffer,
               let texelBuf = surfTexelCardBuffer,
               let dirtyBuf = surfCardDirtyBuffer else { return }
+        awaitInFlightFrameBeforeCPUCacheWrite()   // reads cardRequested, rewrites texelCard/cardRect/dirty
         let req = reqBuf.contents().bindMemory(to: UInt32.self, capacity: surfCardCount)
         // A2 — refresh per-card heat from this frame's working set (sampled → full,
         // else cool by one). Done before demotability so a just-sampled card is hot.
@@ -7416,6 +7482,7 @@ public final class IlluminatoramaRenderer {
         var indices: [UInt32] = [];        indices.reserveCapacity(expandedTris * 3)
         var triAlbedo: [SIMD3<Float>] = []; triAlbedo.reserveCapacity(expandedTris)
         var triNormal: [SIMD3<Float>] = []; triNormal.reserveCapacity(expandedTris)
+        var triEmission: [SIMD3<Float>] = []; triEmission.reserveCapacity(expandedTris)
         var soupBase = [UInt32](repeating: 0, count: total)
         // #60 item 1 + Phase D — GPU-diff maps, accumulated in lockstep with the
         // appended soup triangles (so global triangle order matches exactly,
@@ -7471,6 +7538,13 @@ public final class IlluminatoramaRenderer {
                 soupBase[i] = UInt32(indices.count / 3)
                 let model = instPtr[i].modelMatrix
                 let albedo = instPtr[i].albedo
+                // DH-0537 (2) — a card carries its emitter's glow into the bounce. Both card
+                // bakers accepted `triangleEmission` and neither call site passed it, so a lit
+                // lamp shade contributed nothing to cached bounce light and a room lit by its own
+                // fixtures bounced as if they were dark. Solid emission already folds intensity
+                // in; a textured emitter has no mean here, exactly as `albedo` stands in for a
+                // textured albedo.
+                let emission = instPtr[i].emission
                 let base = UInt32(positions.count)
                 for p in soup.positions {
                     let w = model * SIMD4<Float>(p, 1)
@@ -7502,7 +7576,7 @@ public final class IlluminatoramaRenderer {
                     var n = simd_cross(w1 - w0, w2 - w0)
                     let len = simd_length(n)
                     n = len > 1e-8 ? n / len : SIMD3<Float>(0, 1, 0)
-                    triNormal.append(n); triAlbedo.append(albedo)
+                    triNormal.append(n); triAlbedo.append(albedo); triEmission.append(emission)
                     // Phase D parity: with the freeze override the CPU path never
                     // re-frames a deforming kind (its object soup is empty there),
                     // so mark its triangles sentinel — never re-framed, dirty=0.
@@ -7541,7 +7615,8 @@ public final class IlluminatoramaRenderer {
         if useCharts {
             let g = Self.makeCoplanarChartCards(
                 positions: positions, indices: indices,
-                triangleAlbedo: triAlbedo, triangleNormal: triNormal)
+                triangleAlbedo: triAlbedo, triangleNormal: triNormal,
+                triangleEmission: triEmission)
             // Adaptive per-chart tile size: a chart's tile scales with its world
             // extent, shelf-packed, so big walls get more texels than small facets
             // and the atlas stays efficient across the chart-size spread.
@@ -7618,6 +7693,7 @@ public final class IlluminatoramaRenderer {
             let g = Self.makePerTriangleSurfaceCards(
                 positions: positions, indices: indices,
                 triangleAlbedo: triAlbedo, triangleNormal: triNormal,
+                triangleEmission: triEmission,
                 blockStarts: soupBase.map { Int($0) })
             setSurfaceCacheCards(cards: g.cards, triCard: g.triCard,
                                  triUVa: g.triUVa, triUVc: g.triUVc,
@@ -7813,6 +7889,7 @@ public final class IlluminatoramaRenderer {
         u.surfFeedbackEnabled = needFeedback ? 1 : 0
         if surfaceCacheFeedback, !surfaceCacheStreaming,
            let rb = surfCardRequestedBuffer, surfCardCount > 0 {
+            awaitInFlightFrameBeforeCPUCacheWrite()   // the in-flight RT pass may still be marking cards
             let p = rb.contents().bindMemory(to: UInt32.self, capacity: surfCardCount)
             var requested = 0
             for i in 0..<surfCardCount where p[i] != 0 { requested += 1 }
@@ -8691,9 +8768,9 @@ public final class IlluminatoramaRenderer {
         encodeTAAResolve(cb)
         // Stash this frame's depth as next frame's "previous" for the resolve's
         // disocclusion test. The resolve above already consumed last frame's
-        // copy. In-place copy is safe under maxFramesInFlight==1 — this command
-        // buffer fully completes before the next frame's G-buffer overwrites
-        // `depthTexture`. Skipped when TAA is off (nothing reads it); the
+        // copy. The in-place copy is a GPU blit on this command buffer, and buffers on
+        // one queue execute in order, so it lands before the next frame's G-buffer pass
+        // overwrites `depthTexture` whatever the in-flight pool depth. Skipped when TAA is off (nothing reads it); the
         // enable-transition's taaNeedsFirstFrame covers the first re-enabled frame.
         if taaEnabled, let blit = cb.makeBlitCommandEncoder() {
             blit.copy(from: depthTexture, to: previousDepthTexture)
@@ -8759,6 +8836,7 @@ public final class IlluminatoramaRenderer {
             // scenes stay responsive. Converges back to 2 when frames get light again.
             sync.frameCompletedAdaptive(gpuMs: gpuMs, semaphore: sem)
         }
+        lastCommittedFrameCB = cb
         cb.commit()
 
         // CAPTURE CONTRACT (see `blocking` on this method). A snapshot caller must be
@@ -9090,7 +9168,7 @@ public final class IlluminatoramaRenderer {
     /// (so the cone fully fits into NDC), near = small fixed bias, far =
     /// the spot's `radius`. Aspect 1.0 (square shadow map).
     private func updateSpotShadows() {
-        let capacity = spotShadowAtlasCapacity
+        let capacity = spotShadowCapacityRequest
         let enabled = spotShadowsEnabled
         // Slices go to the shadow-CASTING spots, compacted — not to array indices. A spot with
         // `castsShadow == 0` is skipped and, crucially, does not consume the slice it would
@@ -9144,6 +9222,46 @@ public final class IlluminatoramaRenderer {
             let proj = Self.perspectiveRH(fovY: fovY, aspect: 1.0, near: near, far: far)
             spotLights[i].shadowMatrix = proj * lightView
         }
+        ensureSpotShadowAtlas(casting: spotShadowSliceOwners.count)
+        // If the reallocation could not happen, no slice index may point past the atlas —
+        // trim the surplus back to unshadowed (the same state a spot past the cap is in).
+        while spotShadowSliceOwners.count > spotShadowAtlasCapacity {
+            let i = spotShadowSliceOwners.removeLast()
+            spotLights[i].shadowSliceIndex = -1
+        }
+    }
+
+    /// DH-0134 — size the spot-shadow atlas to the host's request, lazily.
+    ///
+    /// Grows only when a CASTER needs a slice the atlas does not have (never on the request
+    /// alone, so a host that asks for 64 and has three lamps still pays for 8), in whole
+    /// 8-slice steps so a scene gaining lights one at a time does not reallocate per light,
+    /// and never past the request. Shrinks back to the shipped 8-slice footprint when the
+    /// request drops below the allocation — the host left its photo lane. A failed
+    /// reallocation keeps the old atlas; the caller trims slice indices to what exists.
+    private func ensureSpotShadowAtlas(casting: Int) {
+        let request = spotShadowCapacityRequest
+        let floor = Self.spotShadowCapacityDefault
+        var want = spotShadowAtlasCapacity
+        if casting > want { want = min(request, ((casting + 7) / 8) * 8) }
+        if request < want && want > floor { want = max(floor, request) }
+        guard want != spotShadowAtlasCapacity else { return }
+        let fresh: MTLTexture
+        do {
+            fresh = try Self.makeSpotShadowAtlas(device: device,
+                                                 resolution: spotShadowMapResolution,
+                                                 capacity: want)
+        } catch {
+            Self.log.error("spot-shadow atlas reallocation to \(want) slices failed: \(error.localizedDescription); keeping \(self.spotShadowAtlasCapacity)")
+            return
+        }
+        spotShadowAtlas = fresh
+        spotShadowAtlasCapacity = want
+        // The cached pass descriptors point at the OLD texture, and the static-scene skip
+        // would otherwise believe the (empty) new atlas already holds this frame's maps.
+        spotShadowPassDescs.removeAll()
+        spotShadowPassLabels.removeAll()
+        lastSpotShadowMats.removeAll()
     }
 
     /// Render the depth-only pass for each shadowed spot into its slice
