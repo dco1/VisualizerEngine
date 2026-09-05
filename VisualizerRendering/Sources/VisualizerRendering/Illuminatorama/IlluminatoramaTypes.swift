@@ -1049,6 +1049,16 @@ public struct IlluminatoramaInstance {
     /// `sheen > 0`. NEW 16-byte cluster (offsets 304-319): stride 304 → 320.
     public var sheenRoughness: Float = 0.30
 
+    /// **Carpet pile-lay tone bands** (DH-0472) — a low-frequency achromatic value field the
+    /// G-buffer draws on the UNWRAPPED uv (`sampleCarpetMacro` in `IlluminatoramaMaterial.h`), the
+    /// metre-scale nap variation a ~0.30 m carpet tile physically cannot carry. Rides in the 8 bytes
+    /// of trailing pad after `sheenRoughness` (a float2 aligns to offset 312), so the struct stride
+    /// stays 320 and `.zero` — the default and every non-carpet instance — is an exact shader no-op.
+    ///   x = band lattice cells per UV unit (0 = disabled)
+    ///   y = ± tone amplitude
+    /// Mirrors `Instance.carpetMacro` in `IlluminatoramaCommon.h`.
+    public var carpetMacro: SIMD2<Float> = .zero
+
     public init(
         modelMatrix: simd_float4x4,
         albedo: SIMD3<Float> = SIMD3(0.8, 0.8, 0.8),

@@ -553,6 +553,15 @@ fragment GBufferOut illumi_fs(
         }
     }
 
+    // ── Carpet pile-lay tone bands (DH-0472) ──────────────────────────────────
+    // A low-frequency achromatic value field on the UNWRAPPED uv — the metre-scale nap variation a
+    // ~0.30 m carpet tile physically cannot carry (its in-tile drift repeats every 0.30 m and then
+    // dissolves under the hex de-repeat, so at room distance the rug reads as one flat tone). Drawn
+    // here, on `in.uv`, so it never repeats at the tile period — the wood-knot mechanism, one scale
+    // up. `carpetMacro.x == 0` (the default, every other material) makes `sampleCarpetMacro` return
+    // 1.0, so this is an exact no-op for every existing scene and surface.
+    albedo *= sampleCarpetMacro(in.uv, inst.carpetMacro);
+
     // ── Procedural soil material (#58 #11/#12/#13) ───────────────────────────
     // Ground vertices pack soil data into uv as a NEGATIVE-x marker
     // (uv.x = -(roughness + 0.01), uv.y = wetness). Real UVs are never negative

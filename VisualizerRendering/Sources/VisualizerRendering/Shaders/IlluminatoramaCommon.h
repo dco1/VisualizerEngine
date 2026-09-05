@@ -705,6 +705,13 @@ struct Instance {
     // as before, so a host that never sets it — every Visualizer scene — is byte-identical.
     // Mirrors `IlluminatoramaInstance.sheenRoughness`.
     float    sheenRoughness;
+    // DH-0472 — carpet pile-lay tone bands. A low-frequency achromatic value field drawn on the
+    // UNWRAPPED uv (`sampleCarpetMacro` in IlluminatoramaMaterial.h) — the metre-scale nap variation
+    // a ~0.30 m carpet tile can't carry (an in-tile term repeats every 0.30 m and dissolves under the
+    // hex de-repeat). Fills the trailing pad after `sheenRoughness` (float2 aligns to offset 312), so
+    // stride stays 320; `float2(0)` is an exact no-op. x = band cells per UV unit (0 = off), y = ±
+    // tone amplitude. Mirrors `IlluminatoramaInstance.carpetMacro`.
+    float2   carpetMacro;
 };
 
 // The Swift mirror (`IlluminatoramaInstance._assertStride240`) has always asserted this

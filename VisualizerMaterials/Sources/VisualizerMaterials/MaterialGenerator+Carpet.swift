@@ -64,10 +64,13 @@ extension MaterialGenerator {
         let gloss: Double             // sheen strength — cloth grazing lobe
         let napJitter: Double         // per-tuft deviation from the laid direction (radians)
         let reliefStrength: Double    // detail-band pile fuzz
+        let macroStrength: Double     // pile-lay tone band amplitude (DH-0472) — how strongly the
+                                      // nap swells lighter/darker as it turns. Deep cut pile shows
+                                      // it most; a flatweave has almost no standing pile to lay.
         switch pile {
-        case .cutPile:   gauge = 120; crownPower = 0.55; gloss = 0.50; napJitter = 0.22; reliefStrength = 0.85
-        case .loop:      gauge = 150; crownPower = 0.85; gloss = 0.62; napJitter = 0.16; reliefStrength = 0.70
-        case .flatweave: gauge = 180; crownPower = 1.10; gloss = 0.30; napJitter = 0.10; reliefStrength = 0.55
+        case .cutPile:   gauge = 120; crownPower = 0.55; gloss = 0.50; napJitter = 0.22; reliefStrength = 0.85; macroStrength = 0.10
+        case .loop:      gauge = 150; crownPower = 0.85; gloss = 0.62; napJitter = 0.16; reliefStrength = 0.70; macroStrength = 0.07
+        case .flatweave: gauge = 180; crownPower = 1.10; gloss = 0.30; napJitter = 0.10; reliefStrength = 0.55; macroStrength = 0.04
         }
 
         // The nap: a dominant lay direction plus a small per-tuft wobble. Coherent (the whole
@@ -143,6 +146,14 @@ extension MaterialGenerator {
         // so the diffuse-visible occlusion companion is what actually reads (detail normals are a
         // specular-band effect on a matte dielectric — see setDetailRelief).
         addMicroDetail(&ch, seed: sh ^ 0xC7, baseCells: 96, octaves: 2, strength: reliefStrength)
+
+        // Pile-lay tone bands (DH-0472). The metre-scale nap variation the ~0.30 m tile can't carry:
+        // the in-tile `drift` above repeats every tile and dissolves under the hex de-repeat, so at
+        // room distance the rug is one even tone. This declares a low-frequency value field the
+        // renderer draws on the rug's UNWRAPPED uv (`sampleCarpetMacro`), which never repeats at the
+        // tile period — the same shape of change as the wood-knot path. ~0.85 m bands read as the
+        // broad "shading" a real broadloom shows even brand-new.
+        ch.carpetMacro = CarpetMacroField(bandMeters: 0.85, strength: macroStrength)
         return ch
     }
 }

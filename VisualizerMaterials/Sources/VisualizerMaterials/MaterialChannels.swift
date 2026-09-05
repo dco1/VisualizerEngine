@@ -84,6 +84,22 @@ public struct MaterialChannels: Equatable, Sendable {
     /// the only layer that knows the surface's period.
     public var knots: WoodKnotField? = nil
 
+    /// **A carpet's metre-scale pile-lay tone bands this material asks the RENDERER to draw**
+    /// — nil for everything that is not a pile carpet (DH-0472).
+    ///
+    /// Same reason as `knots`, one scale up: a carpet's dominant large-scale tell is that the pile
+    /// physically LIES one way and shifts value where the nap turns — broad soft tonal bands metres
+    /// across, true even of a brand-new unworn rug. That field cannot live in the bake: the carpet
+    /// tile is ~0.30 m (the gauge its tufts need), so any low-frequency term authored inside it
+    /// repeats every 0.30 m and then dissolves under the hex de-repeat (`.carpet` is stochastic).
+    /// The rug then reads as one even tone at room distance — the defect DH-0472 records.
+    ///
+    /// So it is declared, not baked: evaluated per pixel on the UNWRAPPED uv (`sampleCarpetMacro`),
+    /// which counts up across the whole rug and never repeats at the tile period — the exact shape
+    /// of the wood-knot path. Physical, in metres; the render layer converts to the surface's UV
+    /// units, because that is the only layer that knows the surface's period.
+    public var carpetMacro: CarpetMacroField? = nil
+
     public var patternCells: Vec2 = .zero
     /// Half-amplitude of the per-cell tone jitter (0.04 ⇒ ±4 %). 0 = exact shader no-op.
     /// Real tile/plank batch variation lives around 3–6 %; the generator owns the number.
@@ -325,5 +341,23 @@ public struct WoodKnotField: Equatable, Hashable, Sendable, Codable {
     /// Fraction of lattice cells that carry a knot — what the shader takes.
     public var cellDensity: Double {
         Swift.min(1, perSquareMeter * Self.cellMeters * Self.cellMeters)
+    }
+}
+
+/// **A carpet's pile-lay tone bands** (DH-0472), in real-world units. See `MaterialChannels.carpetMacro`.
+///
+/// This is the metre-scale nap variation a 0.30 m carpet tile physically cannot carry. The renderer
+/// draws it as a low-frequency achromatic value field on the rug's UNWRAPPED uv (`sampleCarpetMacro`),
+/// so it never repeats at the tile period — the wood-knot mechanism, one scale up.
+public struct CarpetMacroField: Equatable, Hashable, Sendable, Codable {
+    /// Characteristic band size, metres — the spacing between one nap-toward and the next nap-away
+    /// tonal swell. Real broadloom shows ~0.6–1.2 m "shading"; the generator owns the number.
+    public var bandMeters: Double
+    /// Half-amplitude of the multiplicative tone swing (0.10 ⇒ ±10 %). 0 = an exact shader no-op.
+    public var strength: Double
+
+    public init(bandMeters: Double, strength: Double) {
+        self.bandMeters = Swift.max(0.05, bandMeters)
+        self.strength = strength.clamped(to: 0...0.5)
     }
 }
