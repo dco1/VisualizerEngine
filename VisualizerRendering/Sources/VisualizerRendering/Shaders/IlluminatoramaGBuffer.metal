@@ -226,7 +226,7 @@ struct GBufferOut {
     // 0xFFFFFFFF everywhere ⇒ every light passes the mask ⇒ byte-identical.
     uint  layer            [[color(4)]];
     // DH-0140 — photo-lane material payload (RGBA16F), present only when kExtendedGBuffer:
-    //   .r  transmission / alpha (reserved: canopy translucency, woven mesh — 0 = opaque)
+    //   .r  thin-sheet translucency (DH-0140 slice 3: milky canopy, woven shade — 0 = opaque)
     //   .gb per-texel grain tangent (reserved: DH-0478 — 0,0 = use the per-instance axis)
     //   .a  clearcoat GGX roughness (DH-0478; 0 = "not written" → the lighting kernel's 0.08)
     // A pipeline that does not write this target (impostors, any legacy PSO) leaves the clear
@@ -1239,9 +1239,10 @@ fragment GBufferOut illumi_fs(
             float phi = atan2(dot(Gw, baseB), dot(Gw, baseT));
             grainEnc = float2(cos(2.0 * phi), sin(2.0 * phi)) * 0.5 + 0.5;
         }
-        // .r transmission/alpha is reserved (DH-0140 slice 3) and written 0 until it lands.
+        // .r thin-sheet translucency (slice 3): the kernel adds the light reaching the FAR face
+        //    times this fraction; 0 = opaque, the live-lane behaviour.
         // .a per-material clearcoat roughness (slice 1); 0 = "not written" → the kernel's 0.08.
-        o.material = half4(0.0h, half(grainEnc.x), half(grainEnc.y),
+        o.material = half4(half(saturate(inst.thinTransmission)), half(grainEnc.x), half(grainEnc.y),
                            half(inst.clearcoat > 0.0 ? inst.clearcoatRoughness : 0.0));
     }
     // Screen-space motion vector. NDC.y is up, UV.y is down → Y is flipped.

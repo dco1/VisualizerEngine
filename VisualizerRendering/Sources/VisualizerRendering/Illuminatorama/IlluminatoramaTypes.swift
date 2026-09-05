@@ -1073,7 +1073,12 @@ public struct IlluminatoramaInstance {
     /// 16-byte cluster (offsets 320-335): stride 320 → 336. Every host that never sets it — every
     /// Visualizer scene — is byte-identical (the field is never read on the live lane).
     public var grainTangentTextureSlice: Int32 = -1
-    public var _padGrain0: Int32 = 0
+    /// DH-0140 slice 3 — thin-sheet translucency [0,1]: the fraction of light reaching the FAR face
+    /// that comes through diffusely (milky polycarbonate ≈ 0.5, a woven shade ≈ 0.3). Honoured only
+    /// in the still (the photo-lane G-buffer carries it in `material.r`; the lighting kernel adds
+    /// `albedo × transmitted incident × t`); the live canvas renders the sheet opaque as it always
+    /// has. 0 = opaque — the default, and byte-identical for every host that never sets it.
+    public var thinTransmission: Float = 0
     public var _padGrain1: Int32 = 0
     public var _padGrain2: Int32 = 0
 

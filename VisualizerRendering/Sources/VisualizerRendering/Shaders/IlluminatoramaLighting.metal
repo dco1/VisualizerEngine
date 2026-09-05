@@ -1398,6 +1398,30 @@ kernel void illumi_lighting(
                      * mix(1.0, roomBandGain, saturate(frame.interiorIrrUp.w));
         interiorBandW = saturate(frame.interiorIrrUp.w);
     }
+
+    // ── DH-0140 slice 3 — thin-sheet TRANSLUCENCY for ordinary geometry (photo lane only) ──
+    // A milky polycarbonate canopy or a woven shade is a thin diffusing sheet: a fraction of the
+    // light that reaches its FAR face comes through and lights the near face — which is why a
+    // real canopy GLOWS with sky under daylight instead of reading as a grey lid. The live G-buffer
+    // has no channel for that fraction, so the live canvas renders the sheet opaque; the still
+    // carries it in `material.r` (kExtendedGBuffer). Incident on the far face: the sun when it is
+    // behind the sheet, through the same cascade visibility (a panel's underside sits in its own
+    // top face's shadow, so this is mostly the SKY's job), plus the sky's hemispherical irradiance
+    // from the back side — the same convolved cube the diffuse IBL reads, sampled with −N, with
+    // the same interior dimming. Energy: never more than arrives (albedo ≤ 1, t ≤ 1). Only the
+    // ordinary-opaque class (the leaf, plush and shade classes have their own thin-sheet terms).
+    if (frame.extendedGBuffer != 0.0 && nrH.a >= 1.0h) {
+        float tt = saturate(float(gMaterial.read(gid).r));
+        if (tt > 0.001) {
+            float back = saturate(dot(-N, Ld));
+            float3 incident = frame.directionalLightColor * back * visibility;
+            if (kLightingIBLEnabled) {
+                constexpr sampler ttSampler(filter::linear, mip_filter::linear);
+                incident += float3(irradianceCube.sample(ttSampler, -N).rgb) * frame.iblIntensity * interiorIBLK;
+            }
+            transmission += albedo * incident * tt;
+        }
+    }
     // The DIFFUSE lobe's interior factor. As the host's irradiance bands take over
     // (w → 1) it folds to exactly 1.0: the bands already carry the up/side/down
     // weighting the `interiorIBLUp/Side` scalars faked, and scaling them again would

@@ -723,7 +723,11 @@ struct Instance {
     // the world-space grain angle into `GBufferOut.material.gb`. NEW 16-byte cluster (offsets
     // 320-335): stride 320 -> 336. Mirrors `IlluminatoramaInstance.grainTangentTextureSlice`.
     int      grainTangentTextureSlice;
-    int      _padGrain0;
+    // DH-0140 slice 3 — thin-sheet TRANSLUCENCY [0,1]: the fraction of the light reaching the FAR
+    // face that comes through diffusely (milky polycarbonate ≈ 0.5). Read ONLY by the
+    // kExtendedGBuffer fragment (→ `material.r`); the live lane renders the sheet opaque as before.
+    // 0 (default) = opaque. Mirrors `IlluminatoramaInstance.thinTransmission`.
+    float    thinTransmission;
     int      _padGrain1;
     int      _padGrain2;
 };
