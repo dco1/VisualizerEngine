@@ -23,6 +23,12 @@ public struct MaterialChannels: Equatable, Sendable {
     /// cloth has (velvet = dark base + strong sheen). Branch per material — never 0
     /// globally (§3). 0 = lobe absent.
     public var clearcoat: Double = 0
+    /// **Per-material clearcoat ROUGHNESS** (DH-0140 / DH-0478) — the width of the polished lobe,
+    /// distinct from `clearcoat` (its strength). 0.08 is the one constant the lighting kernel used
+    /// for every clearcoated material, so a material that leaves it alone renders exactly as
+    /// before. Honoured only in the still (the photo-lane G-buffer target carries it per pixel);
+    /// the live canvas keeps the constant. Only meaningful where `clearcoat > 0`.
+    public var clearcoatRoughness: Double = 0.08
     public var sheen: Double = 0
     /// **Per-material cloth-sheen ROUGHNESS** (DH-0081) — the width of the sheen nap, distinct
     /// from `sheen` (its strength). Low = a crisp, tight grazing highlight (sateen, silk); high =

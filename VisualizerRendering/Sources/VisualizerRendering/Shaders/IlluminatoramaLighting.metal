@@ -880,6 +880,9 @@ kernel void illumi_lighting(
     texture2d<half,  access::read>          gAlbedoMet      [[texture(0)]],
     texture2d<half,  access::read>          gNormalRgh      [[texture(1)]],
     texture2d<half,  access::read>          gEmission       [[texture(2)]],
+    // DH-0140 — the photo-lane sixth G-buffer target (see `GBufferOut.material`). Read ONLY
+    // when `frame.extendedGBuffer != 0`; the host binds any texture otherwise.
+    texture2d<half,  access::read>          gMaterial       [[texture(21)]],
     depth2d<float,   access::read>          gDepth          [[texture(3)]],
     texture2d<half,  access::write>         outHDR          [[texture(4)]],
     texture2d<half,  access::read>          aoTex           [[texture(5)]],
@@ -1707,7 +1710,15 @@ kernel void illumi_lighting(
     float3 clearcoat = float3(0.0);
     float houseCC = float(emH.a);
     if (houseCC > 0.001f) {
-        const float ccRough = 0.08;    // tight polish (terrazzo/marble)
+        float ccRough = 0.08;          // tight polish (terrazzo/marble) — the live lane's constant
+        if (frame.extendedGBuffer != 0.0) {
+            // DH-0140 slice 1 — the still reads the material's OWN clearcoat roughness from the
+            // sixth G-buffer target. 0 means the texel was never written (an impostor, a legacy
+            // pipeline) and keeps the constant, so the default still is pixel-for-pixel the live
+            // picture; only a material that asked for a different polish changes.
+            float ccr = float(gMaterial.read(gid).a);
+            if (ccr > 0.0) ccRough = ccr;
+        }
         const float ccF0    = 0.04;    // dielectric IOR 1.5
         float ccNdotV = saturate(dot(N, V));
         if (NdotL_sun > 0.0) {

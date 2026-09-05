@@ -64,6 +64,12 @@ static inline float3 applyTreeWind(float3 wp, float4 windAttr, float time,
 // cases compose: a rigid GPU mesh has prevPos == currPos so velocity falls back
 // to the matrix delta, exactly as before.
 constant bool kUsePrevVerts [[function_constant(10)]];
+// DH-0140 — the PHOTO-LANE G-buffer variant writes a sixth target, `GBufferOut.material`.
+// The live canvas compiles this false and its output struct is the five targets it always
+// was; the still compiles it true. This is the carrier Danny asked for (2026-08-31): quality
+// that "would cost every pixel of every frame" is built for the highest-quality preset and
+// Photo Export only, and the interactive path pays nothing.
+constant bool kExtendedGBuffer [[function_constant(11)]];
 
 // ── Drag/impact sway (generic rigid secondary motion) ────────────────────────
 // The non-foliage sibling of applyTreeWind: a placed object the host is dragging
@@ -219,6 +225,13 @@ struct GBufferOut {
     // a scene that never sets a layer (all instances default 0xFFFFFFFF) writes
     // 0xFFFFFFFF everywhere ⇒ every light passes the mask ⇒ byte-identical.
     uint  layer            [[color(4)]];
+    // DH-0140 — photo-lane material payload (RGBA16F), present only when kExtendedGBuffer:
+    //   .r  transmission / alpha (reserved: canopy translucency, woven mesh — 0 = opaque)
+    //   .gb per-texel grain tangent (reserved: DH-0478 — 0,0 = use the per-instance axis)
+    //   .a  clearcoat GGX roughness (DH-0478; 0 = "not written" → the lighting kernel's 0.08)
+    // A pipeline that does not write this target (impostors, any legacy PSO) leaves the clear
+    // value, and every reader treats 0 as "fall back to the live-lane behaviour".
+    half4 material         [[color(5), function_constant(kExtendedGBuffer)]];
 };
 
 // ── Shadow depth pass (Phase 2.5) ────────────────────────────────────────────
@@ -1201,6 +1214,12 @@ fragment GBufferOut illumi_fs(
         ? float(clothSheenBandForRoughness(inst.sheenRoughness)) + min(inst.sheen, 0.98f)
         : 0.0f;
     o.emission        = half4(half3(emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -sheenAlpha));
+    if (kExtendedGBuffer) {
+        // DH-0140 slice 1 — per-material clearcoat roughness rides the sixth target. The
+        // transmission (.r) and grain-tangent (.gb) lanes are reserved and written 0 until
+        // their payloads land, so their readers stay on the live-lane path.
+        o.material = half4(0.0h, 0.0h, 0.0h, half(inst.clearcoat > 0.0 ? inst.clearcoatRoughness : 0.0));
+    }
     // Screen-space motion vector. NDC.y is up, UV.y is down → Y is flipped.
     // The result is (currentUV - previousUV), so history reprojection in the
     // TAA kernel is `historyUV = currentUV - velocity`.

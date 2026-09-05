@@ -61,7 +61,11 @@ struct FrameUniforms {
     // not a fog effect.
     float    aerialPerspectiveDensity;   // was _padCamera
     float3   directionalLightDir;
-    float    _padDir;
+    // DH-0140 — 1.0 when THIS frame's G-buffer pass wrote the extended sixth target
+    // (`GBufferOut.material`, color(5)) and the lighting kernel may read `gMaterial`;
+    // 0.0 (every host that never opts in) keeps the 5-target lighting byte-identical.
+    // Repurposes the former `_padDir` slot — same 4 bytes, same offset, stride unchanged.
+    float    extendedGBuffer;            // was _padDir
     float3   directionalLightColor;
     float    _padColor;
     float3   ambientColor;
@@ -562,7 +566,9 @@ struct Instance {
     // 12-byte padding gap between metallic (offset 144) and emission (offset 160);
     // stride stays 208. Default 0 = off (no change to existing materials).
     float    clearcoat;              // [0,1] lobe strength
-    float    clearcoatRoughness;     // GGX roughness for the clearcoat layer
+    float    clearcoatRoughness;     // GGX roughness for the clearcoat layer — read by the
+                                     // lighting kernel ONLY through the photo-lane G-buffer
+                                     // target (DH-0140); the live lane keeps its 0.08 constant
     float    sheen;                  // Phase 7b — cloth sheen strength [0,1] (was _padClearcoat)
     float3   emission;
     float    roughness;

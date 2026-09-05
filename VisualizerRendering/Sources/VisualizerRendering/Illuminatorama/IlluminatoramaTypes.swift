@@ -30,7 +30,10 @@ public struct IlluminatoramaFrameUniforms {
     /// `_padCamera` pad — see the Metal twin in IlluminatoramaCommon.h for the contract.
     public var aerialPerspectiveDensity: Float = 0
     public var directionalLightDir: SIMD3<Float>      // world-space, toward light
-    public var _padDir: Float = 0
+    /// DH-0140 — 1 when this frame's G-buffer pass wrote the extended sixth target and the
+    /// lighting kernel may read it; 0 keeps the 5-target lighting byte-identical. Set by the
+    /// renderer from `extendedGBufferEnabled`, never by a host. Repurposes `_padDir`.
+    public var extendedGBuffer: Float = 0
     public var directionalLightColor: SIMD3<Float>    // pre-multiplied intensity
     public var _padColor: Float = 0
     public var ambientColor: SIMD3<Float>
@@ -784,7 +787,11 @@ public struct IlluminatoramaInstance {
     // padding gap between `metallic` and `emission` (offsets 148-159); stride
     // stays 208. Default 0 = no clearcoat (no change to existing materials).
     public var clearcoat: Float = 0          // lobe strength [0, 1]
-    public var clearcoatRoughness: Float = 0.10  // GGX alpha^2 for clearcoat
+    /// GGX roughness of the clearcoat lobe. 0.08 IS the constant the lighting kernel used for
+    /// every material until DH-0140, so the default renders exactly as before; a material that
+    /// sets its own value is honoured only where the photo-lane G-buffer target carries it
+    /// (`IlluminatoramaRenderer.extendedGBufferEnabled`) — the live lane keeps the constant.
+    public var clearcoatRoughness: Float = 0.08
     // Phase 7b — cloth sheen lobe strength [0,1] (velvet/wool/linen). Repurposes the former
     // `_padClearcoat` slot (same offset 156, stride stays 208). Packed as a NEGATIVE
     // emission.alpha in the G-buffer (a surface is polished OR cloth, never both).

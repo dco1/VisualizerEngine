@@ -1350,6 +1350,20 @@ public final class IlluminatoramaRenderer {
     /// host asks for more and a caster needs it. Diagnostics / gates; the cap is `spotShadowMaxCount`.
     public var spotShadowAtlasSliceCount: Int { spotShadowAtlasCapacity }
 
+    /// **The photo-lane G-buffer (DH-0140).** When true the G-buffer pass runs the six-target
+    /// pipeline variant and writes `GBufferOut.material` — a per-pixel material payload the
+    /// five-target live pass has no room for (its one spare scalar is a discrete class tag), and
+    /// the lighting kernel reads it. The sixth target and its two pipeline variants are
+    /// allocated / compiled on FIRST use and dropped on resize, so a host that never sets this —
+    /// every Visualizer scene, Daydream's live canvas — is byte-identical and pays nothing.
+    /// Payloads so far: per-material clearcoat roughness (slice 1). Reserved lanes:
+    /// transmission/alpha, per-texel grain tangent (DH-0478). A host's photo / export lane sets
+    /// this for the still and clears it on the way out.
+    public var extendedGBufferEnabled: Bool = false
+    /// True while THIS frame's G-buffer pass wrote the sixth target — the flag AND the target
+    /// allocation both succeeded. Diagnostics / gates.
+    public private(set) var extendedGBufferActive: Bool = false
+
     // ── Point-light cubemap shadows (opt-in, additive) ────────────────
     /// Master enable for the point-light depth-cubemap shadow pass. Default
     /// OFF — no shadow textures are allocated, no depth is rendered, and the
@@ -2227,6 +2241,9 @@ public final class IlluminatoramaRenderer {
     private var gbufferAlbedoMet: MTLTexture
     private var gbufferNormalRgh: MTLTexture
     private var gbufferEmission: MTLTexture
+    /// DH-0140 — the photo-lane sixth G-buffer target (`GBufferOut.material`, RGBA16F). nil until
+    /// `extendedGBufferEnabled` first asks for it; dropped by `resize`.
+    private var gbufferMaterial: MTLTexture?
     private var depthTexture: MTLTexture
     /// Last frame's G-buffer depth, blit-copied from `depthTexture` at the end of
     /// each frame and read by the TAA resolve for disocclusion rejection (so a
@@ -2710,6 +2727,10 @@ public final class IlluminatoramaRenderer {
     /// per-vertex positions from buffer(5) and writes a real motion vector. Every
     /// other draw keeps `gbufferPipeline` (kUsePrevVerts = false), unchanged.
     private let gbufferPipelinePrevVerts: MTLRenderPipelineState
+    /// DH-0140 — the six-target variants (kExtendedGBuffer = true), compiled on first use so the
+    /// live app never pays the fragment compile for a lane it may never enter.
+    private var gbufferPipelineExt: MTLRenderPipelineState?
+    private var gbufferPipelinePrevVertsExt: MTLRenderPipelineState?
     private let shadowPipeline: MTLRenderPipelineState
     private let depthState: MTLDepthStencilState
     private let lightingPipeline: MTLComputePipelineState
@@ -3883,7 +3904,7 @@ public final class IlluminatoramaRenderer {
         vsBaseConsts.setConstantValue(&userPrevVertsFalse, type: .bool, index: 10)
         pdesc.vertexFunction = try library.makeFunction(name: "illumi_vs",
                                                         constantValues: vsBaseConsts)
-        pdesc.fragmentFunction = library.makeFunction(name: "illumi_fs")
+        pdesc.fragmentFunction = try Self.makeGBufferFragment(library: library, extended: false)
         pdesc.colorAttachments[0].pixelFormat = .rgba16Float
         pdesc.colorAttachments[1].pixelFormat = .rgba16Float
         pdesc.colorAttachments[2].pixelFormat = .rgba16Float
@@ -8260,6 +8281,7 @@ public final class IlluminatoramaRenderer {
             self.rtDiffuseTexture    = t.rtDiffuse
             self.velocityTexture     = t.velocity
             self.gbufferLayer        = t.layer
+            self.gbufferMaterial     = nil          // DH-0140 — re-made at the new size on first use
             self.historyA            = t.historyA
             self.historyB            = t.historyB
             self.taaResolvedTexture  = t.taaResolved
@@ -10056,6 +10078,11 @@ public final class IlluminatoramaRenderer {
     }
 
     private func encodeGBufferPass(_ cb: MTLCommandBuffer) {
+        // DH-0140 — the lane was decided when this frame's uniforms were written; pick the
+        // matching pipelines once. The extended variants exist whenever `extendedGBufferActive`.
+        let extended = extendedGBufferActive
+        let basePipe: MTLRenderPipelineState = (extended ? gbufferPipelineExt : nil) ?? gbufferPipeline
+        let prevPipe: MTLRenderPipelineState = (extended ? gbufferPipelinePrevVertsExt : nil) ?? gbufferPipelinePrevVerts
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = gbufferAlbedoMet
         pass.colorAttachments[0].loadAction = .clear
@@ -10084,6 +10111,14 @@ public final class IlluminatoramaRenderer {
         pass.colorAttachments[4].loadAction = .clear
         pass.colorAttachments[4].storeAction = .store
         pass.colorAttachments[4].clearColor = MTLClearColor(red: Double(UInt32.max), green: 0, blue: 0, alpha: 0)
+        if extended, let material = gbufferMaterial {
+            // Clear to 0 = "not written": impostors and any legacy pipeline that draws into this
+            // pass without declaring color(5) leave the clear value, and every reader falls back.
+            pass.colorAttachments[5].texture = material
+            pass.colorAttachments[5].loadAction = .clear
+            pass.colorAttachments[5].storeAction = .store
+            pass.colorAttachments[5].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        }
         pass.depthAttachment.texture = depthTexture
         pass.depthAttachment.loadAction = .clear
         pass.depthAttachment.storeAction = .store
@@ -10091,7 +10126,7 @@ public final class IlluminatoramaRenderer {
 
         guard let enc = timedRenderEncoder(cb, pass, "gbuffer") else { return }
         enc.label = "Illuminatorama.gbuffer"
-        enc.setRenderPipelineState(gbufferPipeline)
+        enc.setRenderPipelineState(basePipe)
         enc.setDepthStencilState(depthState)
         enc.setFrontFacing(.counterClockwise)
         // Cull mode is a PER-MESH decision here (a two-sided mesh draws `.none`),
@@ -10176,10 +10211,10 @@ public final class IlluminatoramaRenderer {
             // group uses the base pipeline (which declares no buffer(5)).
             let prevPos = prevPosByKind[group.kind]
             if prevPos != nil {
-                if !prevVertsBound { enc.setRenderPipelineState(gbufferPipelinePrevVerts) }
+                if !prevVertsBound { enc.setRenderPipelineState(prevPipe) }
                 prevVertsBound = true
             } else if prevVertsBound {
-                enc.setRenderPipelineState(gbufferPipeline)
+                enc.setRenderPipelineState(basePipe)
                 prevVertsBound = false
             }
             enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
@@ -10943,6 +10978,9 @@ public final class IlluminatoramaRenderer {
         // it when frame.sssStrength > 0, so non-SSS scenes leave it idle).
         // (index 20: 18/19 went to gLayer/pointShadowAtlas in the merge.)
         enc.setTexture(sssDiffuseTexture, index: 20)
+        // DH-0140 — the kernel reads this only when frame.extendedGBuffer != 0; any texture
+        // satisfies the binding otherwise.
+        enc.setTexture((extendedGBufferActive ? gbufferMaterial : nil) ?? gbufferEmission, index: 21)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
         enc.setBuffer(pointLightBuffer, offset: 0, index: 1)
         enc.setBuffer(ddgiUniformBuffer, offset: 0, index: 2)
@@ -12517,6 +12555,11 @@ public final class IlluminatoramaRenderer {
             }
         }
         lastLensFlareParams = u.lensFlareParams
+        // DH-0140 — decide the G-buffer lane for THIS frame here, before any pass encodes, so the
+        // pass that writes the sixth target and the kernel that reads it agree by construction.
+        extendedGBufferActive = extendedGBufferEnabled && ensureExtendedGBufferResources()
+        if !extendedGBufferEnabled, gbufferMaterial != nil { gbufferMaterial = nil }   // the lane left: give the memory back
+        u.extendedGBuffer = extendedGBufferActive ? 1 : 0
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
 
@@ -12921,6 +12964,70 @@ public final class IlluminatoramaRenderer {
         }
         t.label = "Illuminatorama.shadowMap"
         return t
+    }
+
+    /// `illumi_fs` specialised for one lane (DH-0140): `extended` selects the six-target output
+    /// struct. The fragment carries a function constant now, so it can no longer be made by name alone.
+    private static func makeGBufferFragment(library: MTLLibrary, extended: Bool) throws -> MTLFunction {
+        let c = MTLFunctionConstantValues()
+        var ext = extended
+        c.setConstantValue(&ext, type: .bool, index: 11)
+        return try library.makeFunction(name: "illumi_fs", constantValues: c)
+    }
+
+    /// DH-0140 — build one six-target G-buffer pipeline variant. Same attachments as the live PSO
+    /// plus color(5) RGBA16F for `GBufferOut.material`.
+    private static func makeExtendedGBufferPipeline(device: MTLDevice, library: MTLLibrary,
+                                                    prevVerts: Bool) throws -> MTLRenderPipelineState {
+        let d = MTLRenderPipelineDescriptor()
+        d.label = prevVerts ? "Illuminatorama.gbuffer.prevVerts.ext" : "Illuminatorama.gbuffer.ext"
+        let vsC = MTLFunctionConstantValues()
+        var pv = prevVerts
+        vsC.setConstantValue(&pv, type: .bool, index: 10)
+        d.vertexFunction = try library.makeFunction(name: "illumi_vs", constantValues: vsC)
+        d.fragmentFunction = try makeGBufferFragment(library: library, extended: true)
+        d.colorAttachments[0].pixelFormat = .rgba16Float
+        d.colorAttachments[1].pixelFormat = .rgba16Float
+        d.colorAttachments[2].pixelFormat = .rgba16Float
+        d.colorAttachments[3].pixelFormat = .rg16Float
+        d.colorAttachments[4].pixelFormat = .r32Uint
+        d.colorAttachments[5].pixelFormat = .rgba16Float
+        d.depthAttachmentPixelFormat = .depth32Float
+        return try device.makeRenderPipelineState(descriptor: d)
+    }
+
+    /// DH-0140 — make the sixth target and the two extended pipelines exist for this frame, at the
+    /// current internal size. Returns false (logged) if Metal refuses, in which case the frame runs
+    /// the five-target pass and the lighting kernel stays on its live-lane constants.
+    private func ensureExtendedGBufferResources() -> Bool {
+        if gbufferPipelineExt == nil || gbufferPipelinePrevVertsExt == nil {
+            guard let library = engine.library else {
+                Self.log.error("extended G-buffer: no shader library — staying on the 5-target pass")
+                return false
+            }
+            do {
+                gbufferPipelineExt = try Self.makeExtendedGBufferPipeline(device: device, library: library, prevVerts: false)
+                gbufferPipelinePrevVertsExt = try Self.makeExtendedGBufferPipeline(device: device, library: library, prevVerts: true)
+            } catch {
+                Self.log.error("extended G-buffer: pipeline compile failed: \(error.localizedDescription) — staying on the 5-target pass")
+                return false
+            }
+        }
+        if let t = gbufferMaterial, t.width == width, t.height == height { return true }
+        let d = MTLTextureDescriptor()
+        d.textureType = .type2D
+        d.pixelFormat = .rgba16Float
+        d.width = width
+        d.height = height
+        d.usage = [.renderTarget, .shaderRead]
+        d.storageMode = .private
+        guard let t = device.makeTexture(descriptor: d) else {
+            Self.log.error("extended G-buffer: material target allocation failed at \(self.width)×\(self.height)")
+            return false
+        }
+        t.label = "Illuminatorama.gbuffer.material"
+        gbufferMaterial = t
+        return true
     }
 
     /// Phase 4.10 — depth atlas for spot light shadows. Same format /
