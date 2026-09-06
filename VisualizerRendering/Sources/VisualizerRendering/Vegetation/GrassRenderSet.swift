@@ -63,11 +63,30 @@ public final class GrassRenderSet: VegetationRenderSet {
     /// Set to make the field respond to `step`'s wind argument. Nil keeps the constant breeze.
     public var windResponse: WindResponse?
 
+    /// The field's XPBD solver. Readable because a host's own gates reach for it — Daydream
+    /// Home's yard-wind A/B zeroes `windAmp` to render a still arm, and its leak gate holds a
+    /// `weak` reference to prove a rebuild released the previous field. *Tuning* still belongs in
+    /// `Tuning` / `retune` so there is one place to read what a field is set to.
+    public let solver: PBDFieldSolver
+    /// The GPU ribbon expander, readable for the same reason as `solver`.
+    public let ribbon: GrassRibbonRenderer
+
+    /// The vertex layout a field of this shape will have — two ribbon vertices per particle,
+    /// which is `GrassRibbonRenderer`'s layout.
+    ///
+    /// A host that builds its own per-vertex colour buffer needs the layout *before* the set
+    /// exists, because the ribbon that reports it is constructed inside `init`. Same numbers as
+    /// `ribbon.vertexLayout` on the built field.
+    public static func vertexLayout(bladeCount: Int, particlesPerChain: Int)
+        -> (vertexCount: Int, bladeCount: Int, particlesPerBlade: Int) {
+        (vertexCount: bladeCount * particlesPerChain * 2,
+         bladeCount: bladeCount,
+         particlesPerBlade: particlesPerChain)
+    }
+
     // MARK: - Private
 
     private let engine: SimEngine
-    private let solver: PBDFieldSolver
-    private let ribbon: GrassRibbonRenderer
     private let colorBuffer: MTLBuffer?
     private weak var renderer: IlluminatoramaRenderer?
     private var tuning: Tuning

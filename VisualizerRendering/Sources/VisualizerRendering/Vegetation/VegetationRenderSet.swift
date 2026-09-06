@@ -56,42 +56,24 @@ public protocol VegetationRenderSet: AnyObject {
     func teardown()
 }
 
-/// Holds the live vegetation systems and fans one `step` out to all of them.
-///
-/// **Honest note on its current weight:** Daydream Home has exactly one system that steps — grass.
-/// Its trees are static CPU bakes with no per-frame work at all, and Visualizer's Forest superseded
-/// the `LeafField` path the original architecture note assumed both apps drove. So today this
-/// umbrella fans out to one member, and on its own that would be a single-consumer abstraction not
-/// worth having.
-///
-/// It earns its place on the *other* side: it is what makes adding the second system a change to
-/// nothing but the system itself. A host's frame loop calls `step` once and never grows a second
-/// `if solver != nil` branch — which is the shape the per-system glue kept re-growing in both apps.
-/// Keep it thin; if it ever needs to know what KIND of system it holds, that is the tell that
-/// something belongs on the protocol instead.
-@MainActor
-public final class VegetationScene {
-
-    public private(set) var sets: [any VegetationRenderSet] = []
-
-    public init() {}
-
-    public func add(_ set: any VegetationRenderSet) { sets.append(set) }
-
-    /// Remove one system and tear it down. Identity comparison — a host holds its own reference.
-    public func remove(_ set: any VegetationRenderSet) {
-        sets.removeAll { $0 === set }
-        set.teardown()
-    }
-
-    /// Advance every live system.
-    public func step(dt: Float, wind: VegetationWind, camera: SIMD3<Float>) {
-        for set in sets { set.step(dt: dt, wind: wind, camera: camera) }
-    }
-
-    /// Tear every system down and empty the scene. For a document swap.
-    public func teardown() {
-        for set in sets { set.teardown() }
-        sets.removeAll()
-    }
-}
+// MARK: - On the absence of a `VegetationScene` umbrella
+//
+// The 2026-06 architecture note (docs/VEGETATION_SHARED_ARCHITECTURE.md) specified an umbrella
+// holding `[VegetationRenderSet]` and fanning one `step(dt:wind:camera:)` out to all of them, so a
+// host's per-frame residue collapses to one call. It is deliberately NOT here, and this note is so
+// nobody adds it back without the second system that would justify it.
+//
+// **There is only one system that steps.** Daydream Home's trees are static CPU bakes with no
+// per-frame work at all, and Visualizer's Forest superseded the `LeafField` path that note assumed
+// both apps drove — so the umbrella would fan out to exactly one member. TREES_TECH_SCOPE §4a warns
+// against precisely that ("without inventing a single-consumer abstraction"), and it was written
+// about this very lift.
+//
+// **And it would not be free.** A scene holding its sets strongly makes a SECOND owner of a live
+// GPU field, and `HouseRenderBridgeGPUTests_Hero.testWhoRetainsThePreviousGrassField` exists
+// because stranding the previous field on rebuild is a real, measured failure mode here. Paying
+// that risk to wrap a one-element array is a bad trade today.
+//
+// Add it when a second system actually steps — a swaying canopy, a terrain cover. At that point the
+// host's frame loop is about to grow its second `if solver != nil` branch, which is the moment the
+// umbrella starts earning its keep.

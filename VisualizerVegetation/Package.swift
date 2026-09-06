@@ -17,8 +17,8 @@ import PackageDescription
 // underneath a package whose defining property is not having them. So the CPU geometry
 // lives here, at the VisualizerMaterials floor, reachable from BOTH the headless core
 // and the Metal renderer. The per-frame Metal lifecycle (`VegetationRenderSet`,
-// `VegetationScene`) does live in `VisualizerRendering/Vegetation/`, where it belongs —
-// the split is by "needs a GPU", not by subject.
+// `GrassRenderSet`) lives in `VisualizerRendering/Vegetation/`, where it belongs — the
+// split is by "needs a GPU", not by subject.
 //
 // Same platform-floor rule, and for the same reason, as VisualizerMaterials: macOS 14,
 // one below the rest of the engine, because a dependency cannot raise its dependent's
