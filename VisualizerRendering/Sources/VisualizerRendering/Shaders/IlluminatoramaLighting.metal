@@ -323,6 +323,59 @@ static inline float rtSunSoftVisibility(
     return 1.0 - float(hits) / float(rays);
 }
 
+// ── S4.3 — ray-traced PORTAL visibility (same variant, same TLAS) ─────────────
+//
+// A window portal's PCF map is one 150° perspective from the portal centre: a
+// receiver outside that frustum — a niche beside the window, the wall the
+// portal sits in — reads fully lit, and a 512² page over 150° blurs a shelf's
+// shadow to nothing. This traces `rtAreaShadowRayCount` rays toward jittered
+// points on the emitting rectangle instead: exact in every direction, and the
+// penumbra is the portal's real angular size. Same ray mask as the sun (opaque
+// + invisible occluder; glass excluded), same per-pixel/per-frame seeding, so a
+// still's accumulator converges it exactly as it converges the sun's cone.
+static inline float rtAreaVisibility(
+    instance_acceleration_structure accel,
+    constant FrameUniforms&         frame,
+    AreaLight                       al,
+    float3 worldPos,
+    float3 N,
+    uint2  gid,
+    uint   lightIndex
+) {
+    uint rays = clamp(frame.rtAreaShadowRayCount, 1u, 8u);
+    uint seed = pcgHash(gid.x + gid.y * 9781u + frame.rtSunShadowSeed * 6151u
+                        + (lightIndex + 1u) * 7919u);
+    float3 toCenter = al.center - worldPos;
+    float  ndl  = dot(N, toCenter);
+    float3 offN = (ndl >= 0.0) ? N : -N;
+    float3 origin = worldPos + offN * 2e-3;
+
+    intersector<triangle_data, instancing> isect;
+    isect.set_triangle_cull_mode(triangle_cull_mode::none);
+    isect.accept_any_intersection(true);
+
+    uint hits = 0u;
+    for (uint s = 0u; s < rays; ++s) {
+        float u = rnd(seed) * 2.0 - 1.0;
+        float v = rnd(seed) * 2.0 - 1.0;
+        float3 target = al.center + al.ex * u + al.ey * v;
+        float3 d = target - origin;
+        float  len = length(d);
+        if (len < 1e-4) continue;
+        ray sr;
+        sr.origin = origin;
+        sr.direction = d / len;
+        sr.min_distance = 2e-3;
+        // Stop just short of the portal plane so the pane and its own casing never
+        // count as occluders of the light they carry.
+        sr.max_distance = max(2e-3, len - 0.02);
+        if (isect.intersect(sr, accel, kRTSunShadowRayMask).type != intersection_type::none) {
+            hits++;
+        }
+    }
+    return 1.0 - float(hits) / float(rays);
+}
+
 // ── Cloth sheen (Phase 7b, re-sited 2026-08-09) ──────────────────────────────────
 //
 // A woven fabric is not a rough dielectric with a GGX highlight. Its surface is a forest of
@@ -1348,7 +1401,13 @@ kernel void illumi_lighting(
         // modulate the whole LTC/MRP contribution by the result. shadowSliceIndex < 0 (every
         // cove strip, every Visibility softbox) skips this entirely and is byte-identical.
         float visibility = 1.0;
-        if (al.shadowSliceIndex >= 0) {
+        // S4.3 — in the RT-sun variant with portal rays requested, the traced answer
+        // REPLACES the PCF map for every light that asked for a shadow (function-constant
+        // gated, so the non-RT variant is untouched; ray count 0 keeps the map path).
+        if (kLightingRTSunShadow && kLightingShadowEnabled
+            && frame.rtAreaShadowRayCount > 0u && al.shadowSliceIndex >= 0) {
+            visibility = rtAreaVisibility(rtSunAccel, frame, al, worldPos, N, gid, i);
+        } else if (al.shadowSliceIndex >= 0) {
             float4 lsPos = al.shadowMatrix * float4(worldPos, 1.0);
             if (lsPos.w > 0.0) {
                 float2 lsNDC = lsPos.xy / lsPos.w;

@@ -503,7 +503,9 @@ public struct IlluminatoramaFrameUniforms {
     public var rtSunShadowSeed: UInt32 = 0
     public var rtSunShadowAngle: Float = 0
     public var rtSunShadowRayCount: UInt32 = 0
-    public var _padRTSunShadow: Float = 0
+    /// S4.3 — ray-traced portal visibility (see `rtAreaShadowRays`). Occupies the former
+    /// `_padRTSunShadow` slot, so the stride is unchanged. 0 ⇒ the PCF slice path, byte-identical.
+    public var rtAreaShadowRayCount: UInt32 = 0
     /// Per-room interior band LEVEL (S3.5 Stage E). One gain per light-layer bit —
     /// the same 32-bit room identity `interiorMask` and `PointLight.layerMask` use —
     /// packed 4 to a vector, so a fragment's bits resolve to how much daylight ITS

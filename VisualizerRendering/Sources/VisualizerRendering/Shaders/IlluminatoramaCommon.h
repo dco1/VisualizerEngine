@@ -432,7 +432,11 @@ struct FrameUniforms {
     uint     rtSunShadowSeed;      // per-frame RNG decorrelation (0 = frozen)
     float    rtSunShadowAngle;     // sun angular radius, radians (cone half-angle)
     uint     rtSunShadowRayCount;  // shadow rays per pixel, host-clamped 1…8
-    float    _padRTSunShadow;
+    // S4.3 — ray-traced PORTAL visibility (the same kLightingRTSunShadow variant and
+    // TLAS): shadow rays per pixel toward a jittered point on each shadow-casting
+    // area light, replacing that light's single-perspective PCF map. 0 (the default,
+    // and the former padding slot — same 4 bytes) keeps the PCF path byte-identical.
+    uint     rtAreaShadowRayCount;
     // ── Per-room interior band LEVEL (S3.5 Stage E) ──────────────────────────
     // The bands above are ONE environment for the whole frame, pegged to the host's
     // ambient fill — so a room walled in glass and a windowless closet rendered the

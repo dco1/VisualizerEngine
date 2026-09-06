@@ -708,6 +708,16 @@ public final class IlluminatoramaRenderer {
     /// Strength of the one-bounce indirect contribution.
     public var rtGIStrength: Float = 1.0
     public var rtShadowRays: Int = 4
+    /// **S4.3 — ray-traced PORTAL (area-light) visibility, in the same deferred-kernel variant
+    /// as the soft sun shadows.** When > 0 and `rtSunSoftShadowsEnabled` is live, every
+    /// shadow-casting area light (`shadowSliceIndex >= 0` — a host's window portals) has its
+    /// single-perspective 512² PCF map REPLACED by this many shadow rays per pixel toward
+    /// jittered points on the emitting rectangle, traced against the TLAS. Exact in every
+    /// direction (a 150° perspective from the portal centre cannot see a niche beside the
+    /// window), and a penumbra that scales with the portal's real size — the daytime interior
+    /// shadow a room's dominant source has to cast. Per-frame Monte-Carlo like the sun rays,
+    /// so it belongs to a still that accumulates. 0 (default) keeps the PCF path byte-identical.
+    public var rtAreaShadowRays: Int = 0
     public var rtGIRays: Int = 4
     /// Soft sun specular strength on the RT direct term.
     public var rtSpecStrength: Float = 0.25
@@ -12666,6 +12676,7 @@ public final class IlluminatoramaRenderer {
         u.rtSunShadowSeed = taaEnabled ? taaFrameIndex : 0
         u.rtSunShadowAngle = max(0.0005, rtSunSoftnessRad)
         u.rtSunShadowRayCount = UInt32(max(1, min(8, rtShadowRays)))
+        u.rtAreaShadowRayCount = rtSunSoftShadowsEnabled ? UInt32(max(0, min(8, rtAreaShadowRays))) : 0
         // Analytic night sky. All-zero defaults keep the kernel's sky branch an
         // exact no-op; hosts fade the brightnesses with nightBlend themselves.
         u.nightSkyParams = SIMD4(max(0, nightSkyStarBrightness),
