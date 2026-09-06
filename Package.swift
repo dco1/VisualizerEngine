@@ -16,6 +16,7 @@ let package = Package(
         .library(name: "VisualizerCore", targets: ["VisualizerCore"]),
         .library(name: "VisualizerMaterials", targets: ["VisualizerMaterials"]),
         .library(name: "VisualizerRendering", targets: ["VisualizerRendering"]),
+        .library(name: "VisualizerVegetation", targets: ["VisualizerVegetation"]),
         .library(name: "VisualizerHumans", targets: ["VisualizerHumans"]),
     ],
     targets: [
@@ -43,6 +44,23 @@ let package = Package(
             name: "VisualizerMaterialsTests",
             dependencies: ["VisualizerMaterials"],
             path: "VisualizerMaterials/Tests/VisualizerMaterialsTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // The shared CPU-side botanical construction engine — one leaf/petal/frond/needle/pad
+        // constructor every species is described against. Depends only on VisualizerMaterials so
+        // the headless `DaydreamCore` can consume it; see VisualizerVegetation/Package.swift for
+        // why it is not a directory inside VisualizerRendering. As with VisualizerMaterials, this
+        // umbrella omits that manifest's `-O`-in-Debug `unsafeFlags`.
+        .target(
+            name: "VisualizerVegetation",
+            dependencies: ["VisualizerMaterials"],
+            path: "VisualizerVegetation/Sources/VisualizerVegetation",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "VisualizerVegetationTests",
+            dependencies: ["VisualizerVegetation"],
+            path: "VisualizerVegetation/Tests/VisualizerVegetationTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(
