@@ -1689,6 +1689,19 @@ kernel void illumi_lighting(
             specularIBL = specEnv * F;
         }
 
+        // ── Foliage: no broad sky reflection ─────────────────────────────────
+        // Foliage is flagged in normalRoughness.w < 0.5 (the same flag the thin-sheet
+        // TRANSMISSION branch above and the GBuffer roughness cap consult). A matte leaf
+        // (roughness ~0.82, dielectric F0 = 0.04) still returns the split-sum ENVIRONMENT
+        // reflection `specEnv·(F0·dfg.x + dfg.y)`, and the `dfg.y` bias term is non-trivial
+        // at high roughness — so a skyward-facing leaf card MIRRORS the blue daytime sky.
+        // Leaf cards are rolled a full ±π in emitLeaves (physically-correct random
+        // orientation), so ~⅓ of every crown faces skyward and the whole canopy carries a
+        // uniform blue/lavender specular stipple (DH-0646 / DH-0629 signal 2). A leaf's real
+        // specular is the SUN (the direct term), not a broad sky reflection — so damp the
+        // environment lobe hard on foliage. Byte-identical for every non-foliage pixel.
+        if (nrH.a < 0.5h) specularIBL *= 0.12;
+
         // ── S1.3a — specular occlusion ───────────────────────────────────────
         // `ao` is a DIFFUSE visibility estimate: it answers "how much of the whole
         // hemisphere can this point see?", which is the right question for a

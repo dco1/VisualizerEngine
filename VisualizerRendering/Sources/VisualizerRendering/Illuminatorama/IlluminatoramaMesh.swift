@@ -67,6 +67,28 @@ public final class IlluminatoramaMesh {
     /// default-off flag that only genuinely open geometry opts into.
     public var shadowCastsBothFaces: Bool = false
 
+    /// Object-space bounding sphere (centre, radius), computed ONCE from the vertex buffer on first
+    /// ask (DH-0637). nil when the buffer is `.private` (GPU-only vertices) — callers must then
+    /// treat the mesh as unbounded. Used by the spot-shadow reuse to ask "can this swaying
+    /// instance swing through that cone?"; nothing else reads it.
+    public var boundingSphere: (center: SIMD3<Float>, radius: Float)? {
+        if let cached = cachedBoundingSphere { return cached }
+        guard vertexBuffer.storageMode != .private, vertexCount > 0 else { return nil }
+        let stride = MemoryLayout<IlluminatoramaVertex>.stride
+        let base = vertexBuffer.contents()
+        var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var hi = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        for v in 0..<vertexCount {
+            let p = base.load(fromByteOffset: v * stride, as: SIMD3<Float>.self)
+            lo = simd_min(lo, p); hi = simd_max(hi, p)
+        }
+        let c = (lo + hi) * 0.5
+        let sphere = (center: c, radius: simd_length(hi - c))
+        cachedBoundingSphere = sphere
+        return sphere
+    }
+    private var cachedBoundingSphere: (center: SIMD3<Float>, radius: Float)?
+
     public init(device: MTLDevice, vertices: [IlluminatoramaVertex], indices: [UInt16]) {
         guard let vb = device.makeBuffer(
             bytes: vertices,

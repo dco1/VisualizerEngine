@@ -266,6 +266,54 @@ public final class IlluminatoramaRenderer {
     /// GPU-fed geometry is live, the pre-DH-0631 behaviour.
     public var spotShadowGPUGeometryOptOutEnabled: Bool = true
 
+    /// World-space spheres that bound every SWAYING instance's whole swing (DH-0637): the mesh's
+    /// bounding sphere under the instance's matrix, grown by the pendulum's reach (amplitude ×
+    /// diameter, an upper bound on how far a top-pivot pendant's foot travels) and its jostle.
+    /// Rebuilt with `contentHasSway`, i.e. only when the instance SHAPE changed — never per frame.
+    /// A swaying instance whose mesh has no CPU-readable vertices contributes an unbounded entry
+    /// (`radius = .infinity`), which blocks every cone, the old behaviour.
+    private var swayingSpheres: [(center: SIMD3<Float>, radius: Float)] = []
+    private func rebuildSwayingSpheres() {
+        swayingSpheres.removeAll(keepingCapacity: true)
+        guard contentHasSway else { return }
+        for ref in instances where ref.data.swayMode == 2 {
+            let m = ref.data.modelMatrix
+            guard let mesh = meshes[ref.meshKind], let local = mesh.boundingSphere else {
+                swayingSpheres.append((SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z), .infinity))
+                continue
+            }
+            let c4 = m * SIMD4<Float>(local.center, 1)
+            let scale = max(simd_length(SIMD3(m.columns.0.x, m.columns.0.y, m.columns.0.z)),
+                            simd_length(SIMD3(m.columns.1.x, m.columns.1.y, m.columns.1.z)),
+                            simd_length(SIMD3(m.columns.2.x, m.columns.2.y, m.columns.2.z)))
+            let r = local.radius * scale
+            let swing = abs(ref.data.swayLean) * 2 * r + abs(ref.data.swayJostle)
+            swayingSpheres.append((SIMD3(c4.x, c4.y, c4.z), r + swing))
+        }
+    }
+
+    /// Does any swaying instance's swing-sphere intersect this spot's shadow frustum (the cone
+    /// `updateSpotShadows` fits the map to: outer half-angle × 1.1, out to `radius`)? A slice whose
+    /// cone none of them can enter still holds a valid map while everything CPU-visible holds.
+    private func swayingGeometryCanEnter(_ spot: IlluminatoramaSpotLight) -> Bool {
+        guard !swayingSpheres.isEmpty else { return false }
+        let apex = spot.position
+        let axis = simd_normalize(spot.direction)
+        let half = min(1.475, acos(min(0.9999, max(0.01, spot.outerCone))) * 1.1)
+        let cosT = cos(half), sinT = sin(half)
+        let range = max(0.5, spot.radius)
+        for s in swayingSpheres {
+            if s.radius == .infinity { return true }
+            let v = s.center - apex
+            let along = simd_dot(v, axis)
+            if along > range + s.radius || along < -s.radius { continue }
+            let perp = simd_length(v - axis * along)
+            // Signed distance from the cone's surface (negative inside the cone).
+            if perp * cosT - along * sinT <= s.radius { return true }
+        }
+        return false
+    }
+
     /// Opt-in GPU-resident instance hook (additive — nil for every scene that
     /// doesn't set it, so behaviour is byte-for-byte unchanged elsewhere).
     ///
@@ -8601,6 +8649,7 @@ public final class IlluminatoramaRenderer {
             instanceStableFrames = 0
             lastUploadedInstances = instances   // COW reference, no deep copy
             contentHasSway = instances.contains { $0.data.swayMode == 2 }
+            rebuildSwayingSpheres()
         }
         if glassNow.count == lastGlassFlat.count,
            zip(glassNow, lastGlassFlat).allSatisfy({ $0.kind == $1.kind && $0.insts == $1.insts }) {
@@ -9365,12 +9414,15 @@ public final class IlluminatoramaRenderer {
             staticSkipStats.spotShadowPassesSkipped += count
             return
         }
-        // DH-0631 — per-slice reuse when the ONLY thing keeping the scene from "static" is live
-        // GPU-fed geometry (the lawn): a slice whose owner asserts that geometry cannot enter its
-        // cone still holds a valid map from the last time it was rendered with this same matrix.
-        // Slices without the assertion (exterior cones) re-render as before.
-        let perSliceReuse = spotShadowGPUGeometryOptOutEnabled
-            && sceneStaticExceptGPUGeometry && mats == lastSpotShadowMats
+        // DH-0631 / DH-0637 — per-slice reuse when the only things keeping the scene from "static"
+        // are live GPU-fed geometry (the lawn) and/or swaying pendants. A slice still holds a valid
+        // map from the last time it was rendered with this same matrix if (a) every CPU-visible
+        // instance held, (b) either no GPU geometry is live or the owner asserts none can enter its
+        // cone, and (c) no swaying instance's swing-sphere intersects its cone. Slices that fail
+        // (b) or (c) — exterior cones, the can above a swinging pendant — re-render as before.
+        let gpuGeometryLive = !gpuRepackTasks.isEmpty || onEncodeGPUInstances != nil
+        let perSliceBase = spotShadowGPUGeometryOptOutEnabled
+            && instanceShapeStableFrames >= 1 && mats == lastSpotShadowMats
         lastSpotShadowMats = mats
         // Pass descriptors + labels are cached per slice (they never change after
         // the atlas exists) — this loop used to allocate a fresh descriptor and
@@ -9387,9 +9439,21 @@ public final class IlluminatoramaRenderer {
             spotShadowPassLabels.append("Illuminatorama.spotShadow.s\(slice)")
         }
         for slice in 0..<count {
-            if perSliceReuse, spotShadowCasters[slice].reuseBit {
-                staticSkipStats.spotShadowPassesSkipped += 1
-                continue
+            if perSliceBase {
+                // (b) GPU geometry: none live, or the owner asserted none can enter its frustum.
+                // (c) Sway (DH-0637): no swaying instance's swing-sphere intersects a spot's cone; an
+                //     area-light slice has no cone to test, so it re-renders while anything sways.
+                let caster = spotShadowCasters[slice]
+                let gpuOK = !gpuGeometryLive || caster.reuseBit
+                let swayOK: Bool
+                switch caster.owner {
+                case .spot(let li): swayOK = !swayingGeometryCanEnter(spotLights[li])
+                case .area:         swayOK = swayingSpheres.isEmpty
+                }
+                if gpuOK && swayOK {
+                    staticSkipStats.spotShadowPassesSkipped += 1
+                    continue
+                }
             }
             guard let enc = timedRenderEncoder(cb, spotShadowPassDescs[slice], "shadow.spot") else { continue }
             enc.label = spotShadowPassLabels[slice]
