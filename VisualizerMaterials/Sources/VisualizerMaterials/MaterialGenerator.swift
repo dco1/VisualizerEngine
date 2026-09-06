@@ -1222,23 +1222,76 @@ public enum MaterialGenerator {
         return ch
     }
 
-    /// Clipped **boxwood** hedge foliage — a dense mass of small waxy leaves read at close
-    /// range, NOT turf. The hedge placeable used the `grass` tile as a stand-in, but grass is
-    /// soil-gapped vertical blades: it reads as lawn stood on end, never as a trimmed shrub.
-    /// Boxwood is the opposite surface — a continuous canopy of overlapping oval leaves with
-    /// dark recesses between the sprays, deep green shading to lighter yellow-green where fresh
-    /// growth catches the sun, and a faint waxy leaf sheen. All structure is a Worley leaf
-    /// lattice + tiled fbm undulation, so it is fully stochastic and tileable — no coherent
-    /// period to band in a wide yard shot — and `.ground` category (yard-only + the hex
-    /// de-repeat, exactly like `grass`).
+    /// The per-species knobs over the ONE clipped-hedge foliage generator (`hedgeFoliage`).
+    /// Species-based hedges (DH-0123): a real boxwood, privet and holly are the same *surface
+    /// kind* — a dense stochastic Worley leaf lattice — but differ in leaf colour, leaf/spray
+    /// scale, how much bright new growth flushes, and how waxy (glossy) the lamina reads. Only
+    /// these knobs vary; the noise structure is shared so all three tile seamlessly and pass the
+    /// same `TextureAudit`. Phase A is BROADLEAF only — needled conifers (yew, arborvitae) need
+    /// geometric needle cards (Phase B), not a material tint.
+    public struct HedgeFoliageParams: Sendable {
+        /// Deep shaded-lamina leaf green, and the lighter tint of sun-lit fresh growth.
+        public var deep: Vec3
+        public var fresh: Vec3
+        /// Voronoi cell counts — the broad leaf-spray scale and the fine individual-leaf scale.
+        /// Fewer cells → larger leaves (privet); more → smaller, denser leaves (holly).
+        public var coarseCells: Int
+        public var fineCells: Int
+        /// Multiplier on the fresh-growth fraction: 1 = boxwood's yellow-green flush, <1 keeps a
+        /// species uniformly dark (holly), >1 flushes brighter (privet).
+        public var newGrowth: Double
+        /// Base roughness of the leaf face — lower is glossier/waxier.
+        public var roughnessBase: Double
+        /// Clearcoat leaf sheen — the waxy highlight, not a wet gloss.
+        public var clearcoat: Double
+
+        public init(deep: Vec3, fresh: Vec3, coarseCells: Int = 11, fineCells: Int = 22,
+                    newGrowth: Double = 1.0, roughnessBase: Double = 0.52, clearcoat: Double = 0.08) {
+            self.deep = deep; self.fresh = fresh
+            self.coarseCells = coarseCells; self.fineCells = fineCells
+            self.newGrowth = newGrowth; self.roughnessBase = roughnessBase; self.clearcoat = clearcoat
+        }
+
+        /// Clipped **boxwood** — deep green, small waxy leaves, a modest yellow-green new-growth
+        /// flush. The shipped default (DH-0122); these values reproduce the original `boxwood`
+        /// generator exactly, so the boxwood material is byte-identical to before DH-0123.
+        public static let boxwood = HedgeFoliageParams(
+            deep: Vec3(0.045, 0.115, 0.040), fresh: Vec3(0.150, 0.250, 0.075),
+            coarseCells: 11, fineCells: 22, newGrowth: 1.0, roughnessBase: 0.52, clearcoat: 0.08)
+
+        /// **Privet** (Ligustrum) — a brighter, more open mid-green with LARGER oval leaves and a
+        /// vigorous bright new-growth flush; glossier than boxwood. PROVISIONAL (DH-0123 Phase A):
+        /// tuned from reference, to be judged on the published hero capture, not frozen here.
+        public static let privet = HedgeFoliageParams(
+            deep: Vec3(0.055, 0.140, 0.050), fresh: Vec3(0.175, 0.300, 0.095),
+            coarseCells: 8, fineCells: 16, newGrowth: 1.35, roughnessBase: 0.46, clearcoat: 0.12)
+
+        /// **Holly** (Ilex) — very dark blue-green, small dense spiny leaves, almost no bright
+        /// flush (it stays uniformly dark), and a hard waxy gloss. PROVISIONAL (DH-0123 Phase A):
+        /// tuned from reference, to be judged on the published hero capture, not frozen here.
+        public static let holly = HedgeFoliageParams(
+            deep: Vec3(0.028, 0.082, 0.046), fresh: Vec3(0.068, 0.145, 0.072),
+            coarseCells: 13, fineCells: 28, newGrowth: 0.35, roughnessBase: 0.40, clearcoat: 0.17)
+    }
+
+    /// Clipped **hedge foliage** — a dense mass of small waxy leaves read at close range, NOT
+    /// turf. The hedge placeable used the `grass` tile as a stand-in, but grass is soil-gapped
+    /// vertical blades: it reads as lawn stood on end, never as a trimmed shrub. A clipped hedge
+    /// is the opposite surface — a continuous canopy of overlapping oval leaves with dark recesses
+    /// between the sprays, deep green shading to a lighter tint where fresh growth catches the
+    /// sun, and a faint waxy leaf sheen. All structure is a Worley leaf lattice + tiled fbm
+    /// undulation, so it is fully stochastic and tileable — no coherent period to band in a wide
+    /// yard shot — and `.ground` category (yard-only + the hex de-repeat, exactly like `grass`).
     ///
     /// The leaf relief lives ENTIRELY in the material (the hedge mesh is a clipped box, no
     /// per-leaf geometry), so this is a `.needsMicroRelief` surface — it ships a detail normal.
-    public static func boxwood(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 47) -> MaterialChannels {
+    /// Species differ only through `HedgeFoliageParams` (DH-0123).
+    public static func hedgeFoliage(_ p: HedgeFoliageParams,
+                                    size: Int = MaterialGenerator.bakeSize,
+                                    seed: UInt64 = 47) -> MaterialChannels {
         var ch = MaterialChannels(size: size, category: .ground)
-        // Deep boxwood green, and the lighter yellow-green of freshly clipped new growth.
-        let deep  = Vec3(0.045, 0.115, 0.040)
-        let fresh = Vec3(0.150, 0.250, 0.075)
+        let deep  = p.deep
+        let fresh = p.fresh
         for y in 0..<size {
             for x in 0..<size {
                 let u = Double(x) / Double(size), v = Double(y) / Double(size)
@@ -1252,8 +1305,8 @@ public enum MaterialGenerator {
                 let wv = v + 0.05 * (Noise.fbmTiled(u, v, baseCells: 5, octaves: 2, seed: seed ^ 0x3C4D) - 0.5)
                 // TWO leaf scales so cluster size varies (a single scale is what makes a mosaic):
                 // broad sprays + the fine individual leaves within them.
-                let coarse = Noise.voronoiTiled(wu, wv, cells: 11, jitter: 0.95, seed: seed ^ 0x5C2D)
-                let fine   = Noise.voronoiTiled(wu, wv, cells: 22, jitter: 0.95, seed: seed ^ 0x77E9)
+                let coarse = Noise.voronoiTiled(wu, wv, cells: p.coarseCells, jitter: 0.95, seed: seed ^ 0x5C2D)
+                let fine   = Noise.voronoiTiled(wu, wv, cells: p.fineCells, jitter: 0.95, seed: seed ^ 0x77E9)
                 let dome  = clamp01(1.0 - fine.f1 * 1.4)                    // 1 at a leaf centre
                 let broad = clamp01(1.0 - coarse.f1 * 1.2)                  // 1 at a spray centre
                 // Per-leaf tint, biased toward its broad cluster so whole sprays vary together.
@@ -1261,10 +1314,10 @@ public enum MaterialGenerator {
                 // Within-leaf micro tonal variation (waxy highlight vs. shaded lamina).
                 let micro = Noise.fbmTiled(u * 6.0, v * 6.0, baseCells: 8, octaves: 2, seed: seed ^ 0x91A3)
 
-                // A fraction of leaves are fresh yellow-green new growth, biased toward the
-                // sun-lit sprays; the rest stay deep green.
-                let freshFrac = clamp01((leafT - 0.50) * 1.6) * clamp01(0.4 + spray)
-                var col = mix(deep, fresh, freshFrac)
+                // A fraction of leaves are fresh new growth, biased toward the sun-lit sprays; the
+                // rest stay deep green. `newGrowth` scales how much a species flushes.
+                let freshFrac = clamp01((leafT - 0.50) * 1.6) * clamp01(0.4 + spray) * p.newGrowth
+                var col = mix(deep, fresh, clamp01(freshFrac))
                 // BROKEN gap: the leaf-edge outline only darkens where a micro-noise agrees, so
                 // the shadow between leaves reads as intermittent pockets, not a crackle net.
                 let edge = 1.0 - smoothstep(0.0, 0.10, fine.f2 - fine.f1)
@@ -1275,7 +1328,7 @@ public enum MaterialGenerator {
 
                 // Waxy leaf faces read semi-glossy; the shaded recesses go matte. The spatial
                 // swing carries the roughness-std TextureAudit tell.
-                ch.roughness[ch.idx(x, y)] = clamp01(0.52 + 0.30 * shade + 0.08 * (micro - 0.5))
+                ch.roughness[ch.idx(x, y)] = clamp01(p.roughnessBase + 0.30 * shade + 0.08 * (micro - 0.5))
 
                 // Leaf clusters stand proud, recesses sink — the macro relief that reads as
                 // many small overlapping leaves once deriveNormals runs.
@@ -1283,12 +1336,30 @@ public enum MaterialGenerator {
                                                   + 0.14 * spray - 0.22 * pocket)
             }
         }
-        ch.clearcoat = 0.08          // faint waxy leaf sheen — not a wet gloss
+        ch.clearcoat = p.clearcoat   // faint waxy leaf sheen — not a wet gloss
         ch.deriveNormals(strength: 2.6)
         // Fine leaf-lamina tooth (the macro leaves are in the height field above; this is the
         // sub-leaf grain that stops the canopy reading plastic at a grazing angle).
         addMicroDetail(&ch, seed: seed ^ 0xB6, baseCells: 110, strength: 0.40)
         return ch
+    }
+
+    /// Clipped **boxwood** hedge foliage — the shipped default (DH-0122). Delegates to the shared
+    /// `hedgeFoliage` generator with the boxwood species knobs; byte-identical to the pre-DH-0123
+    /// implementation.
+    public static func boxwood(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 47) -> MaterialChannels {
+        hedgeFoliage(.boxwood, size: size, seed: seed)
+    }
+
+    /// Clipped **privet** hedge foliage — a brighter, larger-leaved broadleaf species (DH-0123).
+    public static func privet(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 47) -> MaterialChannels {
+        hedgeFoliage(.privet, size: size, seed: seed)
+    }
+
+    /// Clipped **holly** hedge foliage — a very dark, small-leaved, hard-waxy broadleaf species
+    /// (DH-0123).
+    public static func holly(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 47) -> MaterialChannels {
+        hedgeFoliage(.holly, size: size, seed: seed)
     }
 
     /// Asphalt road surface: near-black base aging to worn gray; Voronoi aggregate pitting;
