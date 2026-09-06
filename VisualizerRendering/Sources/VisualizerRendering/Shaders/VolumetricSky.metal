@@ -1352,10 +1352,20 @@ kernel void volSkyRender(
 // (volSkyRender, above) is UNTOUCHED and still drives every other scene + the
 // IBL environment. See issue #61.
 //
-// v1 scope: no scene-depth clip — the only opt-in scene (FireworksUltra) has no
-// opaque G-buffer geometry (sky + additive particles), so every visible pixel is
-// a sky/cloud pixel and the in-view result simply REPLACES it. A depth-clipped
-// "composite over geometry" generalisation is a v2 concern (noted in #61).
+// v2 — DEPTH-CLIPPED. This kernel overwrites the pixel it runs on (`outTex` is
+// write-only, so it cannot blend), and every one of its early-outs writes the
+// atmosphere colour. v1 dispatched over the WHOLE frame on the strength of its
+// one opt-in scene (FireworksUltra) having no opaque G-buffer geometry — so in
+// any scene that DOES have geometry it painted sky straight over the building.
+// A house scene hid that fact well enough to be missed twice: below the horizon
+// the kernel returns the host's `groundColor` fill, which an architectural host
+// calibrates against its own lawn, so the lawn survived the overwrite looking
+// almost right and only the building was destroyed.
+//
+// So the pass now takes the scene depth and writes ONLY where there is no
+// geometry (cleared depth), leaving every opaque pixel exactly as the deferred
+// pass shaded it. `depth >= 0.99999 ⇒ sky` is the same test the RT composite
+// uses (IlluminatoramaRT.metal), against the same 1.0 clear.
 
 struct CloudInViewUniforms {
     float4x4 invViewProjection;  // host clip → world (jittered VP inverse)
@@ -1365,6 +1375,9 @@ struct CloudInViewUniforms {
 kernel void illumi_cloud_inview(
     texture2d<float, access::write>  outTex      [[texture(0)]],
     texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    // Scene depth — the v2 clip. Cleared to 1.0, so anything below that is
+    // opaque geometry this pass must not touch.
+    depth2d<float,   access::read>   gDepth      [[texture(2)]],
     constant SkyUniforms &u                      [[buffer(0)]],
     constant CloudInViewUniforms &cv             [[buffer(1)]],
     device const VSBurstLight* burstLights       [[buffer(2)]],
@@ -1373,6 +1386,8 @@ kernel void illumi_cloud_inview(
     uint W = outTex.get_width();
     uint H = outTex.get_height();
     if (gid.x >= W || gid.y >= H) return;
+    // Opaque geometry owns this pixel — leave the deferred composite alone.
+    if (gDepth.read(gid) < 0.99999f) return;
 
     // ── Reconstruct the world-space camera ray (the ONLY difference vs the
     // equirect kernel). NDC: x,y ∈ [-1,1] with +Y up (texture row 0 = top), z = 1

@@ -11541,6 +11541,9 @@ public final class IlluminatoramaRenderer {
         enc.setComputePipelineState(pipeline)
         enc.setTexture(hdrCompositeTexture, index: 0)
         enc.setTexture(noise, index: 1)
+        // v2 depth clip — the kernel writes only where this says there is no
+        // geometry, so the deck can no longer paint over the building.
+        enc.setTexture(depthTexture, index: 2)
         enc.setBuffer(skyU, offset: 0, index: 0)
         enc.setBuffer(cloudInViewUniformBuffer, offset: 0, index: 1)
         enc.setBuffer(lights, offset: 0, index: 2)
