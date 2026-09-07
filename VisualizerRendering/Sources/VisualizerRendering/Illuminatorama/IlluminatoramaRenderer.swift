@@ -718,6 +718,48 @@ public final class IlluminatoramaRenderer {
     /// shadow a room's dominant source has to cast. Per-frame Monte-Carlo like the sun rays,
     /// so it belongs to a still that accumulates. 0 (default) keeps the PCF path byte-identical.
     public var rtAreaShadowRays: Int = 0
+    /// **S4.4 — a STILL may build the extracted-scene TLAS under the glass-arm caps.** The
+    /// live-RT caps (128 mesh groups / 150 k triangles) exist because a live loop's first
+    /// rebuild of a heavy scene never returns; a still that accumulates pays that rebuild
+    /// once, off the vsync budget, so it can carry the same 512-group / 1.2 M-triangle
+    /// ceiling the glass-only arm already trusts. A furnished document (200+ groups) is
+    /// exactly what the live caps auto-disable RT GI on — which is why the shipped photo
+    /// export never had bounce. Default `false`: every live host is byte-identical.
+    public var rtStillCapsRelaxed: Bool = false
+
+    // ── RTAO — ray-traced ambient occlusion on the near field (DH-0528) ────────────────
+    /// When true AND a TLAS is live, the AO pass traces `rtaoRays` cosine-weighted hemisphere
+    /// rays per half-res texel against the real geometry (`illumi_rtao_tlas`) instead of the
+    /// screen-space GTAO march, writing the same raw AO texture into the same bilateral +
+    /// temporal chain. The reach is a TRUE world-space distance, so one metre grounds a sofa
+    /// foot and stays tight at a drywall junction. Per-frame Monte-Carlo: meant for a still
+    /// that accumulates. Falls back to GTAO on any frame without a TLAS (`rtaoDidRunLastFrame`
+    /// is the record). Default `false`: byte-identical for every host that never opts in.
+    public var rtaoEnabled: Bool = false
+    /// 0…1 AO strength, the `ssaoIntensity` contract.
+    public var rtaoIntensity: Float = 1.0
+    /// Occlusion reach in world metres (the ray `max_distance`).
+    public var rtaoRadius: Float = 0.5
+    /// Cosine-hemisphere rays per half-res texel per frame (clamped 1…32).
+    public var rtaoRays: Int = 8
+    /// Whether the LAST encoded AO pass was the traced one — a gate's proof that RTAO fired
+    /// rather than silently falling back to the screen-space march.
+    public private(set) var rtaoDidRunLastFrame: Bool = false
+    /// Mirror of the Metal `RTAOUniforms` (IlluminatoramaRTInstanced.metal) — field for field.
+    private struct RTAOUniforms {
+        var invViewProjection: simd_float4x4
+        var radius: Float
+        var intensity: Float
+        var rayCount: UInt32
+        var frameSeed: UInt32
+        var rayTMin: Float
+        var transportRayMask: UInt32
+        var fullWidth: UInt32
+        var fullHeight: UInt32
+    }
+    private var rtaoActive: Bool {
+        rtaoEnabled && rtaoIntensity > 0 && rtTLASSupported && rtTLASActive && rtTLAS != nil
+    }
     public var rtGIRays: Int = 4
     /// Soft sun specular strength on the RT direct term.
     public var rtSpecStrength: Float = 0.25
@@ -2814,6 +2856,7 @@ public final class IlluminatoramaRenderer {
     private let prefilterBakePipeline: MTLComputePipelineState
     private let dfgBakePipeline: MTLComputePipelineState
     private let ssaoSpatialPipeline: MTLComputePipelineState
+    private let rtaoPipeline: MTLComputePipelineState?   // nil on non-RT hardware (never dispatched there)
     private let ssaoTemporalPipeline: MTLComputePipelineState
     private let ssrTemporalPipeline: MTLComputePipelineState
     private let ssrCompositePipeline: MTLComputePipelineState
@@ -4102,7 +4145,7 @@ public final class IlluminatoramaRenderer {
             "illumi_irradiance_bake",
             "illumi_mesh_build_adjacency", "illumi_mesh_synth", "illumi_particles_step",
             "illumi_prefilter_bake", "illumi_repack_pos_norm", "illumi_rt_denoise",
-            "illumi_rt_gi_temporal", "illumi_ssao", "illumi_ssao_spatial",
+            "illumi_rt_gi_temporal", "illumi_rtao_tlas", "illumi_ssao", "illumi_ssao_spatial",
             "illumi_ssao_temporal", "illumi_ssr_composite", "illumi_ssr_gather",
             "illumi_ssr_temporal", "illumi_surfcache_atrous",
             "illumi_surfcache_reframe_chart",
@@ -4214,6 +4257,9 @@ public final class IlluminatoramaRenderer {
         }
         self.lightingPipeline = lighting
         self.ssaoPipeline = ssao
+        // RTAO (DH-0528) — a TLAS kernel; on hardware without ray-tracing support the pipeline
+        // simply never compiles and `rtaoActive` (which needs a live TLAS) keeps it undispatched.
+        self.rtaoPipeline = cache.pipelineState(name: "illumi_rtao_tlas", device: device)
         self.ssaoSpatialPipeline  = ssaoSpatial
         self.ssaoTemporalPipeline = ssaoTemporal
         self.ssrGatherPipeline    = ssrGather
@@ -6964,15 +7010,18 @@ public final class IlluminatoramaRenderer {
         // only the glass fragments, so it carries a much higher triangle ceiling than
         // the per-pixel RT-lighting path — an interior with a lawn otherwise trips the
         // strict cap and its windows silently drop to the flat fallback.
-        let triCap = extractedRT ? Self.rtMaxTrianglesForLiveRT
-                                 : Self.rtMaxTrianglesForGlassOnlyRT
+        // S4.4 — a still under `rtStillCapsRelaxed` takes the glass-arm ceilings even on the
+        // extracted-RT path (see the flag's note); the live loop keeps the strict pair.
+        let strictLive = extractedRT && !rtStillCapsRelaxed
+        let triCap = strictLive ? Self.rtMaxTrianglesForLiveRT
+                                : Self.rtMaxTrianglesForGlassOnlyRT
         // …and the same asymmetry on the mesh-GROUP axis. A furnished architectural
         // document carries 200+ distinct geometries (one group per wall edge / room floor /
         // millwork sub-part), so the live-RT 128 turned AAA glass off scene-wide on every
         // real document. See `rtMaxMeshGroupsForGlassOnlyRT` for the measured ladder.
         let groupCap = rtMeshGroupCapOverride
-            ?? (extractedRT ? Self.rtMaxMeshGroupsForLiveRT
-                            : Self.rtMaxMeshGroupsForGlassOnlyRT)
+            ?? (strictLive ? Self.rtMaxMeshGroupsForLiveRT
+                           : Self.rtMaxMeshGroupsForGlassOnlyRT)
         // O(1) caps first, triangle sum only if they pass. This ordering matters
         // now that the guard re-evaluates every frame instead of latching: a
         // scene that busts the mesh-group cap (thousands of groups) would
@@ -6998,7 +7047,7 @@ public final class IlluminatoramaRenderer {
                 (\(instances.count) instances, \(meshGroups.count) mesh groups, \
                 \(tris) tris; caps \
                 \(Self.rtMaxInstancesForLiveRT)/\(groupCap)/\(triCap) — \
-                \(extractedRT ? "live-RT" : "glass-only") path)
+                \(strictLive ? "live-RT" : (extractedRT ? "still-RT" : "glass-only")) path)
                 """)
             return
         }
@@ -10902,6 +10951,36 @@ public final class IlluminatoramaRenderer {
         if !ssaoActive, ensureNeutralAOTexture(cb) { return }
         let halfW = max(1, width / 2)
         let halfH = max(1, height / 2)
+        // RTAO (DH-0528): with a live TLAS and the host opted in, trace the near field against
+        // the real geometry into the SAME raw AO texture, so the bilateral + temporal chain and
+        // the lighting kernel's read are untouched. A frame without a TLAS (frame 1, a tripped
+        // guard) falls back to the screen-space march below, and says so.
+        if rtaoActive, let tlas = rtTLAS, let pipeline = rtaoPipeline,
+           let enc = timedComputeEncoder(cb, "rtao") {
+            enc.label = "Illuminatorama.rtao"
+            enc.setComputePipelineState(pipeline)
+            enc.setTexture(depthTexture, index: 0)
+            enc.setTexture(gbufferNormalRgh, index: 1)
+            enc.setTexture(aoTexture, index: 2)
+            enc.setAccelerationStructure(tlas, bufferIndex: 0)
+            let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
+            var u = RTAOUniforms(invViewProjection: fu.invViewProjection,
+                                 radius: max(0.02, rtaoRadius),
+                                 intensity: max(0, min(1, rtaoIntensity)),
+                                 rayCount: UInt32(max(1, min(32, rtaoRays))),
+                                 // Same seed contract as every other traced term: walk only
+                                 // while an accumulator can average it, else freeze.
+                                 frameSeed: taaEnabled ? rtInstFrameSeed : 0,
+                                 rayTMin: 0.004,
+                                 transportRayMask: 0x01 | 0x04,
+                                 fullWidth: UInt32(width), fullHeight: UInt32(height))
+            enc.setBytes(&u, length: MemoryLayout<RTAOUniforms>.stride, index: 1)
+            dispatch(enc, pipeline: pipeline, width: halfW, height: halfH)
+            enc.endEncoding()
+            rtaoDidRunLastFrame = true
+            return
+        }
+        rtaoDidRunLastFrame = false
         guard let enc = timedComputeEncoder(cb, "ssao") else { return }
         enc.label = "Illuminatorama.ssao"
         enc.setComputePipelineState(ssaoPipeline)
