@@ -68,8 +68,8 @@ extension MaterialGenerator {
                                       // nap swells lighter/darker as it turns. Deep cut pile shows
                                       // it most; a flatweave has almost no standing pile to lay.
         switch pile {
-        case .cutPile:   gauge = 120; crownPower = 0.55; gloss = 0.50; napJitter = 0.22; reliefStrength = 0.85; macroStrength = 0.10
-        case .loop:      gauge = 150; crownPower = 0.85; gloss = 0.62; napJitter = 0.16; reliefStrength = 0.70; macroStrength = 0.07
+        case .cutPile:   gauge = 120; crownPower = 0.55; gloss = 0.50; napJitter = 0.22; reliefStrength = 0.85; macroStrength = 0.14
+        case .loop:      gauge = 150; crownPower = 0.85; gloss = 0.62; napJitter = 0.16; reliefStrength = 0.70; macroStrength = 0.10
         case .flatweave: gauge = 180; crownPower = 1.10; gloss = 0.30; napJitter = 0.10; reliefStrength = 0.55; macroStrength = 0.04
         }
 
@@ -124,7 +124,14 @@ extension MaterialGenerator {
                                1.0 + (Double((tuft.cellId >> 24) & 0xFF) / 255.0 - 0.5) * 0.06)
                 // Broad drift for large-scale life (subtle — the hex de-repeat scrambles it,
                 // and it must not print a 0.30 m lattice on the rug).
-                let drift = 0.94 + 0.10 * Noise.fbmTiled(u, v, baseCells: 2, octaves: 3, seed: sh ^ 0x77)
+                // Two octaves of mottle, ±9 % at ~15 cm and ±4 % at ~5 cm. A broadloom at room
+                // distance is not one even tone: the pile lies unevenly, the dye takes unevenly,
+                // and a photograph of it (the gallery's sage) is blotchy at hand-span scale. The
+                // hex de-repeat averages three rotated copies, which knocks a baked drift down by
+                // ~√3, so the authored amplitude sits above what should survive on the floor;
+                // the previous ±5 % single band averaged to nothing and the floor read as CGI.
+                let drift = 0.91 + 0.18 * Noise.fbmTiled(u, v, baseCells: 2, octaves: 3, seed: sh ^ 0x77)
+                    + 0.08 * (Noise.fbmTiled(u, v, baseCells: 6, octaves: 2, seed: sh ^ 0x99) - 0.5)
                 // Pile self-shadow: darker in the gap, where light doesn't reach the backing.
                 let shade = 0.62 + 0.38 * (crown * 0.6 + gap * 0.4)
                 let a = base * yarn * drift * shade
