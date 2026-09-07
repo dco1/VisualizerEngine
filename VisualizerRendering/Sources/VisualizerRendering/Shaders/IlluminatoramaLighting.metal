@@ -281,6 +281,9 @@ static inline float sunVisibility(
 // against the doctrine). So the slab stays an occluder here; the residual −19
 // is flagged as a Danny look-call in known-issues § S4.1.
 constant uint kRTSunShadowRayMask = 0x01 | 0x04;
+// Below this unshadowed luminance (HDR, pre-exposure) a portal's visibility is not traced —
+// the light's whole contribution is under a rounding error of the frame's exposure range.
+constant float kRTAreaShadowSkipLuma = 0.002;
 
 static inline float rtSunSoftVisibility(
     instance_acceleration_structure accel,
@@ -1404,9 +1407,23 @@ kernel void illumi_lighting(
         // S4.3 — in the RT-sun variant with portal rays requested, the traced answer
         // REPLACES the PCF map for every light that asked for a shadow (function-constant
         // gated, so the non-RT variant is untouched; ray count 0 keeps the map path).
+        //
+        // COST (S4.5): the rays are the still's single most expensive term — nine portals ×
+        // three rays was 27 any-hit traversals per pixel per frame (measured: 8.8 s a frame at
+        // 24 MP). Two cuts, neither visible: (1) evaluate the UNSHADOWED contribution first
+        // and skip the rays where it is below `rtAreaShadowSkipLuma` — a portal behind the
+        // fragment or far down the hall lights it by a rounding error, and a rounding error
+        // needs no visibility; (2) the host now asks for one ray per portal per frame, since
+        // the still's accumulator supplies the other 30–90.
         if (kLightingRTSunShadow && kLightingShadowEnabled
             && frame.rtAreaShadowRayCount > 0u && al.shadowSliceIndex >= 0) {
+            float3 unshadowed = evalAreaLight(al, worldPos, N, V, albedo, metallic, roughness,
+                                              ltcMat, ltcMag, areaLTC);
+            float lum = dot(unshadowed, float3(0.2126, 0.7152, 0.0722));
+            if (lum <= kRTAreaShadowSkipLuma) { areaSum += unshadowed; continue; }
             visibility = rtAreaVisibility(rtSunAccel, frame, al, worldPos, N, gid, i);
+            areaSum += visibility * unshadowed;
+            continue;
         } else if (al.shadowSliceIndex >= 0) {
             float4 lsPos = al.shadowMatrix * float4(worldPos, 1.0);
             if (lsPos.w > 0.0) {

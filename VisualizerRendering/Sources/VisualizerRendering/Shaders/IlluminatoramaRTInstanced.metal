@@ -741,14 +741,24 @@ kernel void illumi_rtao_tlas(
     isect.set_triangle_cull_mode(triangle_cull_mode::none);
     isect.accept_any_intersection(true);   // occlusion-only
 
+    // STRATIFIED, not white: the i-th ray takes the i-th point of the R2 low-discrepancy
+    // sequence, rotated per pixel (Cranley–Patterson) by a hash and walked per frame by the
+    // seed. White noise at 8–12 rays left a crust the bilateral could not clean (the DH-0528
+    // gate measured 1.15 in-band against GTAO's 0.47); a stratified estimator's error falls as
+    // ~1/N rather than 1/√N, and the per-pixel rotation keeps neighbouring texels decorrelated
+    // so the spatial filter still averages independent estimates.
     uint seed = pcgHash(gid.x + gid.y * outW + u.frameSeed * 9781u);
+    float2 cp = float2(rnd(seed), rnd(seed));                 // per-pixel/per-frame rotation
     uint rays = max(1u, u.rayCount);
     float radius = max(1e-3, u.radius);
     uint hits = 0u;
+    const float g = 1.32471795724474602596;                    // plastic constant (R2)
+    const float a1 = 1.0 / g, a2 = 1.0 / (g * g);
     for (uint i = 0; i < rays; ++i) {
+        float2 q = fract(cp + float2(a1, a2) * float(i + 1));
         ray r;
         r.origin = Pofs;
-        r.direction = cosineSample(N, rnd(seed), rnd(seed));
+        r.direction = cosineSample(N, q.x, q.y);
         r.min_distance = max(u.rayTMin, 1e-3);
         r.max_distance = radius;   // world-space reach — beyond this is not an occluder
         if (isect.intersect(r, accel, u.transportRayMask).type != intersection_type::none) hits++;

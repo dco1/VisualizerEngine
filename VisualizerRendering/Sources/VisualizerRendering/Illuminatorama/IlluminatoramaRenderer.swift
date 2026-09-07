@@ -3689,6 +3689,14 @@ public final class IlluminatoramaRenderer {
     private var curveDbgPrinted = false   // VIZ_CURVE_DEBUG one-shot
     private let rtInstUniformBuffer: MTLBuffer
     private var rtInstFrameSeed: UInt32 = 0
+    /// RTAO's own per-dispatch seed. It rotates EVERY frame, TAA or not: the AO temporal
+    /// accumulator (`encodeSSAOTemporalPass`) exists to converge a per-frame estimator, and a
+    /// seed frozen at 0 hands it the same 32-ray realisation every frame — 42 settled frames
+    /// averaged to one sample. Measured on the DH-0528 gate (raw lane, TAA off): frozen seed
+    /// 0.861 in-band crust against GTAO's 0.474; the march is deterministic and spatially
+    /// blurred, the rays were one unconverged draw. `rtInstFrameSeed` is not reused because it
+    /// only advances when an RT lighting or glass pass encodes, which the raw lane may not.
+    private var rtaoFrameSeed: UInt32 = 0
     /// True after a successful TLAS (re)build/refit this frame — the RT pass
     /// then traces the instance AS instead of the primitive-AS soup.
     private var rtTLASActive: Bool = false
@@ -10970,13 +10978,14 @@ public final class IlluminatoramaRenderer {
                                  rayCount: UInt32(max(1, min(32, rtaoRays))),
                                  // Same seed contract as every other traced term: walk only
                                  // while an accumulator can average it, else freeze.
-                                 frameSeed: taaEnabled ? rtInstFrameSeed : 0,
+                                 frameSeed: rtaoFrameSeed,
                                  rayTMin: 0.004,
                                  transportRayMask: 0x01 | 0x04,
                                  fullWidth: UInt32(width), fullHeight: UInt32(height))
             enc.setBytes(&u, length: MemoryLayout<RTAOUniforms>.stride, index: 1)
             dispatch(enc, pipeline: pipeline, width: halfW, height: halfH)
             enc.endEncoding()
+            rtaoFrameSeed &+= 1
             rtaoDidRunLastFrame = true
             return
         }

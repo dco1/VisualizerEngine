@@ -29,7 +29,7 @@ import Foundation
 /// Parameterised by `CarpetPile` so cut-pile / loop (berber) / flatweave can differ in tuft
 /// shape, gloss and jitter without a second generator. The library ships cut-pile as the
 /// default "Carpet"; the others are reachable through the same entry.
-public enum CarpetPile: Equatable, Sendable {
+public enum CarpetPile: String, Equatable, Hashable, Sendable, Codable, CaseIterable {
     /// Dense upright cut yarn — the soft, matte broadloom a bedroom rug is. The default.
     case cutPile
     /// Uncut looped yarn (berber) — rounder crowns, a touch glossier, tighter gauge.
