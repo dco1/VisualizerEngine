@@ -2508,7 +2508,27 @@ public final class IlluminatoramaRenderer {
     // cached per-slice pass descriptors are dropped on reallocation.
     private var spotShadowAtlas: MTLTexture
     private var spotShadowAtlasCapacity: Int = IlluminatoramaRenderer.spotShadowCapacityDefault
-    private let spotShadowMapResolution: Int = 512
+    /// Per-slice resolution of the spot/area shadow atlas.
+    ///
+    /// **This is the number that decides whether a chair leg has a shadow.** A slice covers a
+    /// whole cone's footprint, so at 512² a pendant lighting ~4 m of floor gets ~7.8 mm per texel
+    /// — and a 20 mm furniture leg is 2.5 texels wide, which the 3×3 PCF then averages down to
+    /// nothing. The seat above it (~400 mm, 50 texels) casts cleanly, so the object appears to
+    /// hover: a shadow blob with no legs reaching it. Daydream Home reported this for months as
+    /// "there are no contact shadows" (DH-0601/0441/0640/0709).
+    ///
+    /// Settable so the host can spend memory where its scenes need it: cost is
+    /// `resolution² × 4 bytes × capacity` (512/8 = 8 MB, 1024/8 = 34 MB, 2048/8 = 134 MB), plus
+    /// a depth pass per slice — which the static-scene skip already elides on a settled camera.
+    /// Clamped to a power of two in [256, 4096]; reallocates the atlas on change.
+    public var spotShadowMapResolution: Int = 512 {
+        didSet {
+            let want = min(4096, max(256, spotShadowMapResolution))
+            if want != spotShadowMapResolution { spotShadowMapResolution = want; return }
+            guard want != oldValue else { return }
+            reallocateSpotShadowAtlas(resolution: want, capacity: spotShadowAtlasCapacity)
+        }
+    }
     private var cascadeSplitsView: SIMD4<Float> = .zero
 
     // ── Point-light cubemap shadows (lazy — allocated on first enable) ─────────
@@ -9446,17 +9466,24 @@ public final class IlluminatoramaRenderer {
         if casting > want { want = min(request, ((casting + 7) / 8) * 8) }
         if request < want && want > floor { want = max(floor, request) }
         guard want != spotShadowAtlasCapacity else { return }
+        reallocateSpotShadowAtlas(resolution: spotShadowMapResolution, capacity: want)
+    }
+
+    /// Rebuild the spot/area shadow atlas at `resolution` × `capacity`, and drop every cache that
+    /// points at the old texture. The ONE place the atlas is replaced, so a resolution change and
+    /// a capacity change cannot forget different halves of the invalidation.
+    private func reallocateSpotShadowAtlas(resolution: Int, capacity: Int) {
         let fresh: MTLTexture
         do {
             fresh = try Self.makeSpotShadowAtlas(device: device,
-                                                 resolution: spotShadowMapResolution,
-                                                 capacity: want)
+                                                 resolution: resolution,
+                                                 capacity: capacity)
         } catch {
-            Self.log.error("spot-shadow atlas reallocation to \(want) slices failed: \(error.localizedDescription); keeping \(self.spotShadowAtlasCapacity)")
+            Self.log.error("spot-shadow atlas reallocation to \(capacity) slices at \(resolution)² failed: \(error.localizedDescription); keeping \(self.spotShadowAtlasCapacity)")
             return
         }
         spotShadowAtlas = fresh
-        spotShadowAtlasCapacity = want
+        spotShadowAtlasCapacity = capacity
         // The cached pass descriptors point at the OLD texture, and the static-scene skip
         // would otherwise believe the (empty) new atlas already holds this frame's maps.
         spotShadowPassDescs.removeAll()

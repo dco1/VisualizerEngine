@@ -1365,7 +1365,11 @@ kernel void illumi_lighting(
                 // 3×3 PCF using hardware bilinear compare. Each
                 // `sample_compare` returns the linear-filtered fraction
                 // of taps that pass; summing 9 gives a smooth penumbra.
-                float w = 1.0 / 512.0; // shadow map texel size
+                // Texel size read from the ATLAS, not assumed. The two used to be independent
+                // constants; a resolution change on the Swift side would have left this PCF
+                // sampling a stale footprint (3 texels of a 512 map at 2048 = a 4x-too-wide
+                // blur), which is silent — the shadow just gets softer.
+                float w = 1.0 / float(spotShadowAtlas.get_width());
                 float sum = 0.0;
                 for (int oy = -1; oy <= 1; ++oy) {
                     for (int ox = -1; ox <= 1; ++ox) {
@@ -1438,7 +1442,7 @@ kernel void illumi_lighting(
                               && shadowUV.y >= 0.0 && shadowUV.y <= 1.0;
                 if (inFrustum) {
                     float ref = lsZ - frame.spotShadowBias;   // shared atlas ⇒ shared bias
-                    float wtx = 1.0 / 512.0;
+                    float wtx = 1.0 / float(spotShadowAtlas.get_width());   // see the spot PCF above
                     float sum = 0.0;
                     for (int oy = -1; oy <= 1; ++oy) {
                         for (int ox = -1; ox <= 1; ++ox) {
