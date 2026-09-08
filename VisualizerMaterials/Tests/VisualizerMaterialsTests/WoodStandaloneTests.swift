@@ -83,3 +83,49 @@ final class WoodStandaloneTests: XCTestCase {
         XCTAssertEqual(stamped.periodRepeatResidual, 0, "nothing breaks the period")
     }
 }
+
+/// `WoodParams.figure` — flat-sawn cathedral vs quarter-sawn straight grain. The knob must
+/// persist (tolerant decode), change the bake, and leave the figure DEFAULT flat-sawn so a
+/// document written before it existed keeps its arches.
+final class WoodFigureTests: XCTestCase {
+    func testFigureRoundTripsAndDefaultsFlatSawn() throws {
+        let q = WoodParams(species: .cherry, layout: .panel, knots: false, figure: .quarterSawn)
+        let data = try JSONEncoder().encode(q)
+        XCTAssertEqual(try JSONDecoder().decode(WoodParams.self, from: data).figure, .quarterSawn)
+        // A pre-figure document: no key → the default.
+        let legacy = Data(#"{"species":"cherry","layout":"panel","boardWidthInches":12,"knots":false}"#.utf8)
+        XCTAssertEqual(try JSONDecoder().decode(WoodParams.self, from: legacy).figure, .flatSawn)
+    }
+    func testFlatSawnAndQuarterSawnBakeDifferentFaces() {
+        let flat = MaterialGenerator.wood(size: 128, params: WoodParams(species: .cherry, layout: .panel, knots: false, figure: .flatSawn))
+        let quarter = MaterialGenerator.wood(size: 128, params: WoodParams(species: .cherry, layout: .panel, knots: false, figure: .quarterSawn))
+        var diff = 0.0
+        for i in 0 ..< flat.albedo.count {
+            let a = flat.albedo[i], b = quarter.albedo[i]
+            diff += abs(a.x - b.x) + abs(a.y - b.y) + abs(a.z - b.z)
+        }
+        diff /= Double(flat.albedo.count)
+        XCTAssertGreaterThan(diff, 0.01, "the figure knob must move the bake (mean |Δalbedo| \(diff))")
+    }
+    func testGumFlecksAreNotOnALattice() {
+        // Cherry's flecks used to sit one per fbm base cell — the same (u, v) offsets in every
+        // cell, a drilled-in-rows door. Measure: the fleck mask's row-profile (fraction of dark
+        // texels per row) must not repeat at the old cell period. With scattered flecks the
+        // correlation between the profile and itself shifted by a quarter-tile is weak.
+        let ch = MaterialGenerator.wood(size: 256, params: WoodParams(species: .cherry, layout: .panel, knots: false))
+        let n = 256
+        var rowDark = [Double](repeating: 0, count: n)
+        var lum = [Double](repeating: 0, count: n * n)
+        for i in 0 ..< n * n { let a = ch.albedo[i]; lum[i] = 0.2126 * a.x + 0.7152 * a.y + 0.0722 * a.z }
+        let mean = lum.reduce(0, +) / Double(n * n)
+        for y in 0 ..< n { for x in 0 ..< n where lum[y * n + x] < mean * 0.72 { rowDark[y] += 1 } }
+        let m = rowDark.reduce(0, +) / Double(n)
+        func corr(_ shift: Int) -> Double {
+            var num = 0.0, den = 0.0
+            for y in 0 ..< n { let a = rowDark[y] - m, b = rowDark[(y + shift) % n] - m; num += a * b; den += a * a }
+            return den > 0 ? num / den : 0
+        }
+        // The old lattice had 4 base cells per tile along v → a period of n/4 rows.
+        XCTAssertLessThan(corr(n / 4), 0.5, "fleck rows repeat at the old quarter-tile period (corr \(corr(n / 4)))")
+    }
+}

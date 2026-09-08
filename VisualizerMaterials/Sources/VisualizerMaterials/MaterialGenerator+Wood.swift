@@ -92,6 +92,35 @@ public enum WoodLayout: String, CaseIterable, Codable, Sendable, Identifiable {
 /// the same inversion tile and terrazzo use, and for the same reason (see `targetRunMeters`).
 /// The flooring oak used to hardcode `planks: 16`, which is only "5 inches" if the surface
 /// happens to tile at exactly 2 m; now the board is 5″ because 5″ is what it says.
+/// **How the board was sawn from the log** — the figure the grain draws on the face.
+///
+/// Flat-sawn (plain-sawn) cuts tangent to the rings, so the face shows the CATHEDRAL: the arches
+/// that a cherry cabinet door or a fir window frame is chosen for. Quarter-sawn cuts through the
+/// pith, so the rings meet the face nearly edge-on and read as straight, tight lines — and in a
+/// ray-fleck wood (oak) the medullary rays are exposed as the silvery cross-grain fleck. Until
+/// this existed every panel was baked at a little over half the species' arch (a "veneer is
+/// straighter" rule in `WoodRecipe.sealed`), so a cherry door came out as fine straight grain
+/// while the photograph it was matched against showed full arches (2026-09-07).
+public enum WoodFigure: String, CaseIterable, Codable, Sendable, Identifiable {
+    /// Cathedral arches — the species' full flat-sawn figure.
+    case flatSawn
+    /// Straight, tight grain; ray fleck where the species has it.
+    case quarterSawn
+    public var id: String { rawValue }
+    public var displayName: String {
+        switch self {
+        case .flatSawn:    return "Flat-sawn"
+        case .quarterSawn: return "Quarter-sawn"
+        }
+    }
+    public var summary: String {
+        switch self {
+        case .flatSawn:    return "Cathedral arches across the face."
+        case .quarterSawn: return "Straight, tight grain; ray fleck on oak."
+        }
+    }
+}
+
 public struct WoodParams: Equatable, Hashable, Sendable, Codable {
     public var species: WoodSpecies
     public var layout: WoodLayout
@@ -101,15 +130,19 @@ public struct WoodParams: Equatable, Hashable, Sendable, Codable {
     /// vertical-grain stock is graded, expensive and rare, and its absence is one of the things
     /// that reads as "printed" rather than "sawn". Off gives select/clear grade.
     public var knots: Bool
+    /// Flat-sawn cathedral or quarter-sawn straight grain — see `WoodFigure`.
+    public var figure: WoodFigure
 
     public init(species: WoodSpecies = .oak,
                 layout: WoodLayout = .boards,
                 boardWidthInches: Double = 5.0,
-                knots: Bool = true) {
+                knots: Bool = true,
+                figure: WoodFigure = .flatSawn) {
         self.species = species
         self.layout = layout
         self.boardWidthInches = Swift.max(2, Swift.min(12, boardWidthInches))
         self.knots = knots
+        self.figure = figure
     }
 
     /// Tolerant decode — a document written before a field existed still loads.
@@ -120,7 +153,8 @@ public struct WoodParams: Equatable, Hashable, Sendable, Codable {
                   layout: try d.decodeIfPresent(WoodLayout.self, forKey: .layout) ?? def.layout,
                   boardWidthInches: try d.decodeIfPresent(Double.self, forKey: .boardWidthInches)
                       ?? def.boardWidthInches,
-                  knots: try d.decodeIfPresent(Bool.self, forKey: .knots) ?? def.knots)
+                  knots: try d.decodeIfPresent(Bool.self, forKey: .knots) ?? def.knots,
+                  figure: try d.decodeIfPresent(WoodFigure.self, forKey: .figure) ?? def.figure)
     }
 
     public var boardWidthMeters: Double { boardWidthInches * 0.0254 }
@@ -255,7 +289,7 @@ struct WoodRecipe: Sendable {
     static let blackCherry = WoodRecipe(
         earlywood: Vec3(0.310, 0.105, 0.055),
         latewood:  Vec3(0.245, 0.079, 0.040),
-        ringsPerMeter: 135, ringJitter: 0.35, latewoodSharpness: 1.8, distort: 0.18,
+        ringsPerMeter: 135, ringJitter: 0.35, latewoodSharpness: 1.8, distort: 0.45,   // flat-sawn cherry's cathedral (was 0.18 — read as quarter-sawn)
         pore: 0.18, ray: 0.10, gum: 0.55,
         // Cherry throws small tight PIN knots rather than oak's round ones.
         knotsPerSquareMeter: 0.35, knotRadius: 0.015, knotDarkness: 0.62,
@@ -352,10 +386,8 @@ struct WoodRecipe: Sendable {
         r.relief *= 0.45
         r.microStrength *= 0.35
         r.clearcoat = Swift.max(clearcoat, 0.14)
-        // Case goods are plain- or quarter-sliced, which is a straighter figure than the
-        // flat-sawn floor board the same tree gives. Left at flooring strength, a 1 m panel spans
-        // several rings of cathedral swing and a table top reads as rotary-cut burl.
-        r.distort *= 0.55
+        // The figure (cathedral vs straight) is `WoodParams.figure`'s call, applied in `wood()`;
+        // a fixed ×0.55 here used to make every panel read as quarter-sawn regardless.
         // Case-good veneer is SELECTED stock — a knot on a drawer front is a reject, which is
         // also why the UI does not offer the knot control for a panel.
         r.knotsPerSquareMeter = 0
@@ -430,6 +462,10 @@ extension MaterialGenerator {
         let seams = params.hasSeams(on: tiling)
         var recipe = seams ? params.species.recipe : params.species.recipe.sealed
         if !params.knots { recipe.knotsPerSquareMeter = 0 }
+        if params.figure == .quarterSawn {
+            recipe.distort *= 0.12          // rings edge-on: the arch collapses to straight lines
+            recipe.ray *= 2.5               // …and the medullary rays are exposed as fleck
+        }
         var ch = woodGrain(size: size, planks: planks, seed: params.species.seed,
                            recipe: recipe, runMeters: params.run(on: tiling),
                            category: .wood, seams: seams, endJoints: seams)
@@ -624,10 +660,32 @@ extension MaterialGenerator {
 
                 // ── Gum pockets / pith flecks: small dark specks, slightly drawn out along the
                 // grain. Cherry's signature; zero on the woods that don't have them. ──
-                let gum = r.gum > 0
-                    ? smoothstep(0.70, 0.84, Noise.fbmTiled(u * 20, v * 8, baseCells: 4,
-                                                            octaves: 2, seed: seed ^ 0x6B)) * r.gum
-                    : 0
+                // SCATTERED, not a lattice: a thresholded tiled fbm puts one blob at the centre
+                // of each base cell, and a cabinet door read as drilled in rows (2026-09-07).
+                // Each fleck is a short streak ALONG the grain (v), placed at a jittered point of
+                // a cell grid that is tight across the grain and long along it; ~12 % of cells
+                // carry one — real flecks are sparse, millimetre-scale, and only a shade darker. Wraps with the tile because the cell counts divide it.
+                var gum = 0.0
+                if r.gum > 0 {
+                    let gcu = 40, gcv = 14
+                    let cu = u * Double(gcu), cv = v * Double(gcv)
+                    let iu = Int(cu.rounded(.down)), iv = Int(cv.rounded(.down))
+                    for dj in -1 ... 1 {
+                        for di in -1 ... 1 {
+                            let ci = ((iu + di) % gcu + gcu) % gcu, cj = ((iv + dj) % gcv + gcv) % gcv
+                            let h = Noise.hash2(ci, cj, seed ^ 0x6B)
+                            guard Noise.unit(h) < 0.12 else { continue }   // sparse: a fleck every ~8 cells
+                            let jx = Noise.unit(Noise.hash2(ci, cj, seed ^ 0x6C))
+                            let jy = Noise.unit(Noise.hash2(ci, cj, seed ^ 0x6D))
+                            let len = Noise.unit(Noise.hash2(ci, cj, seed ^ 0x6E))
+                            let dx = (cu - (Double(iu + di) + jx)) / 0.09              // ~2 mm across
+                            let dy = (cv - (Double(iv + dj) + jy)) / (0.08 + 0.12 * len) // 6–14 mm along
+                            let d = (dx * dx + dy * dy).squareRoot()
+                            gum = Swift.max(gum, 1 - smoothstep(0.55, 1.0, d))
+                        }
+                    }
+                    gum *= r.gum
+                }
 
                 // ── Plank side seam: a thin recessed groove at each board edge. ──
                 let edgeU = min(bx, 1 - bx)
@@ -656,7 +714,7 @@ extension MaterialGenerator {
                 col = col * (1 - 0.05 * pore)                                     // pores darken
                 col = col * (1 - 0.30 * seam) * (1 - 0.22 * joint)                // grooves darken
                 col = col * (1 + 0.07 * fleck)                                    // rays lighten
-                col = col * (1 - 0.55 * gum)                                      // gum darkens
+                col = col * (1 - 0.30 * gum)                                      // gum darkens (a fleck is a tint, not a hole)
                 ch.albedo[ch.idx(x, y)] = clampBand(col)
 
                 // ── Roughness. Narrow on purpose (see `WoodRecipe.roughBase`): the finish is
