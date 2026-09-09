@@ -62,7 +62,7 @@ public struct MaterialRepeatCensus: Equatable, Sendable {
     /// the app's `RenderBridgeMaterialTests`) and `PatternCellsTests`. A repeat of one of these is a
     /// landmark.
     public static let coherentCategories: Set<MaterialCategory> =
-        [.tile, .wallpaper, .brick, .wood, .laminate, .fabric]
+        [.tile, .wallpaper, .brick, .wood, .laminate, .fabric, .ceramic]
 
     /// The surface tiles often enough that an unbroken repeat is visible.
     public var tilesVisibly: Bool { isCoherent && repeatsAcross > Self.visibleRepeatCount }

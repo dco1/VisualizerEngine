@@ -528,7 +528,9 @@ public enum MaterialGenerator {
     /// flat-roughness tell; albedo carries enough macro contrast to clear the flat-colour tell.
     public static func stoneware(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 151,
                                  body: Vec3 = Vec3(0.90, 0.89, 0.86)) -> MaterialChannels {
-        var ch = MaterialChannels(size: size, category: .tile)
+        // `.ceramic`, not `.tile`: this is a fired clay BODY with no grid on it. Filing it with
+        // unit masonry is what put a grout-less tableware glaze in the floor and wall pickers.
+        var ch = MaterialChannels(size: size, category: .ceramic)
         let sh = seed
         for y in 0..<size {
             for x in 0..<size {
@@ -586,7 +588,9 @@ public enum MaterialGenerator {
     /// three TASTE DIALS above.
     public static func ceramic(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 197,
                                body: Vec3 = MaterialGenerator.ceramicAlbedo) -> MaterialChannels {
-        var ch = MaterialChannels(size: size, category: .tile)
+        // `.ceramic`, not `.tile` — see `stoneware`. Both families are COHERENT for anti-tiling,
+        // so the pixels and the hex-blend decision are unchanged; only the filing is honest now.
+        var ch = MaterialChannels(size: size, category: .ceramic)
         let sh = seed
         for y in 0..<size {
             for x in 0..<size {

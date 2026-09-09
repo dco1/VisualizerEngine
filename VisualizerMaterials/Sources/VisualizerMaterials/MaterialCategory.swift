@@ -14,6 +14,14 @@ public enum MaterialCategory: String, Sendable, Equatable, Codable, CaseIterable
     case paint, plaster, wallpaper
     case wood, laminate
     case tile, stone, terrazzo, concrete, brick
+    /// **Glazed / bisque-fired clay** — a thrown or slip-cast ceramic BODY, not a tiled surface.
+    /// Its own family rather than `.tile` (which is unit masonry: a grid of pieces in grout) or
+    /// `.stone` (a quarried mineral): the thing that makes a pot look like a pot is a poured coat
+    /// over a clay body plus the rings of the wheel, and neither sibling has any of that. It is
+    /// also the reason the family is COHERENT for anti-tiling — those rings are a regular
+    /// directional period, and the hex de-repeat overlays offset copies of one into moiré, the
+    /// same trade `.fabric`'s weave makes.
+    case ceramic
     case carpet, fabric, leather
     case metal, glass, mirror
     /// Yard / site surfaces — grass, asphalt, sidewalk, pavers, soil.
