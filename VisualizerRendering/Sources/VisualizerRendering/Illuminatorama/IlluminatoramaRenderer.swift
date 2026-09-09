@@ -935,16 +935,30 @@ public final class IlluminatoramaRenderer {
     public var surfCacheAlpha: Float = 0.1
 
     // ── Depth of field ───────────────────────────────────────────────
-    /// Gather DOF on the resolved HDR before bloom. Off = sharp everywhere.
+    /// Lens-accurate DOF on the resolved HDR before bloom. Off = sharp everywhere.
     public var dofEnabled: Bool = false
     /// Focus plane distance from the camera, in metres.
     public var dofFocusDistance: Float = 3.0
-    /// Aperture multiplier on the circle of confusion (bigger = shallower).
-    public var dofAperture: Float = 1.0
-    /// Maximum blur radius in pixels (internal resolution) at full CoC.
-    public var dofMaxRadius: Float = 14.0
-    /// View-space distance from the focus plane at which the CoC saturates.
-    public var dofFocusRange: Float = 4.0
+    /// **The whole lens, as one number.** The circle-of-confusion DIAMETER in pixels
+    /// per unit of `|z − z_f| / z`, which is the thin-lens relation with everything
+    /// that does not vary per pixel — focal length, f-number, focus distance, sensor
+    /// size, buffer height — already folded in. The host computes it (in Daydream
+    /// Home, `ThinLens.cocCoefficientPixels`); the renderer never re-derives optics.
+    ///
+    /// Because the host scales it by the buffer height, the defocus is automatically
+    /// the same fraction of the frame at every render scale and export size.
+    public var dofCoCCoefficient: Float = 0
+    /// Clamp on the CoC radius in pixels. A performance and sanity bound on the
+    /// gather's reach, not part of the optics — leave it generous.
+    public var dofMaxRadius: Float = 32.0
+    /// Iris blade count. `0` (or < 3) is a perfectly circular aperture; 5–9 are the
+    /// common real values, and give bokeh balls their polygonal edge.
+    public var dofBlades: Int = 0
+    /// Orientation of the blade polygon, in radians.
+    public var dofBladeRotation: Float = 0
+    /// Optical vignetting, 0…1 — how hard the lens barrel clips the aperture toward
+    /// the frame corners, turning bokeh discs into cat's-eye lemons. 0 = none.
+    public var dofCatsEye: Float = 0
 
     // ── Volumetric light shaft (god-rays) ────────────────────────────
     /// Single-scatter ray-march of the sun through hazy air, making the beam
@@ -3319,6 +3333,19 @@ public final class IlluminatoramaRenderer {
     /// `texelCard`, `cardRect`, `cardRequested`) wait on it first — see
     /// `awaitInFlightFrameBeforeCPUCacheWrite`.
     private var lastCommittedFrameCB: MTLCommandBuffer?
+
+    /// **The awaited-frame handshake** — armed by `renderAwaited()`, consumed by
+    /// `awaitCommittedFrame()`. See `renderAwaited()` for why a second completion path
+    /// exists at all; these two properties are the whole of its state.
+    ///
+    /// `armAwaitedFrame` is read-and-cleared at the TOP of `render`, so every exit path of
+    /// that function — including the empty-scene and dropped-frame early returns — leaves it
+    /// disarmed and a later plain `render(blocking:)` cannot inherit it.
+    private var armAwaitedFrame = false
+    /// The signal the next `awaitCommittedFrame()` waits on, or nil when the frame it would
+    /// have described never reached the GPU (an early return above). Nil is therefore
+    /// "nothing to wait for", not an error.
+    private var pendingFrameCompletion: FrameCompletionSignal?
     private var surfGPUDiffStatsBuffer: MTLBuffer? {
         surfGPUDiffStatsRing.isEmpty ? nil : surfGPUDiffStatsRing[frameRingIndex % surfGPUDiffStatsRing.count]
     }
@@ -3852,11 +3879,20 @@ public final class IlluminatoramaRenderer {
     // ── Depth-of-field state ─────────────────────────────────────────
     private struct DOFParams {
         var invProjection: simd_float4x4
-        var focusDist: Float; var aperture: Float; var maxRadius: Float; var focusRange: Float
-        var width: UInt32; var height: UInt32; var _p0: Float = 0; var _p1: Float = 0
+        var focusDist: Float; var cocCoefficient: Float; var maxRadius: Float
+        var blades: Float; var bladeRotation: Float; var catsEye: Float
+        var width: UInt32; var height: UInt32
+        var tileW: UInt32; var tileH: UInt32; var tileSize: UInt32; var _pad0: Float = 0
     }
+    /// Tile size for the max-CoC reduction. Must match nothing in the shader but the
+    /// value passed in `DOFParams.tileSize` — the kernel reads it from there.
+    private static let dofTileSize = 16
     private let dofPipeline: MTLComputePipelineState?
+    private let dofTilePipeline: MTLComputePipelineState?
+    private let dofDilatePipeline: MTLComputePipelineState?
     private var dofOutputTexture: MTLTexture?
+    private var dofTileTexture: MTLTexture?
+    private var dofTileDilatedTexture: MTLTexture?
 
     // ── Volumetric shaft state ───────────────────────────────────────
     private struct VolUniforms {
@@ -4425,11 +4461,21 @@ public final class IlluminatoramaRenderer {
         self.rtInstUniformBuffer = riUB
         timing.mark("RT + surfcache + TLAS pipelines (specialized)")
 
-        // ── Depth-of-field pipeline ──────────────────────────────────
+        // ── Depth-of-field pipelines ─────────────────────────────────
         if let dofFn = library.makeFunction(name: "illumi_dof") {
             self.dofPipeline = try? device.makeComputePipelineState(function: dofFn) // gpu-ok: one-time init, optional DoF pipeline
         } else {
             self.dofPipeline = nil
+        }
+        if let dofTileFn = library.makeFunction(name: "illumi_dof_tile") {
+            self.dofTilePipeline = try? device.makeComputePipelineState(function: dofTileFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            self.dofTilePipeline = nil
+        }
+        if let dofDilateFn = library.makeFunction(name: "illumi_dof_dilate") {
+            self.dofDilatePipeline = try? device.makeComputePipelineState(function: dofDilateFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            self.dofDilatePipeline = nil
         }
 
         // ── Volumetric shaft pipeline ────────────────────────────────
@@ -8609,6 +8655,13 @@ public final class IlluminatoramaRenderer {
     /// fixed Timer cadence, and to skip re-presenting a stale `outputTexture`.
     @discardableResult
     public func render(blocking: Bool = false) -> Bool {
+        // Read-and-CLEAR the awaited-frame arming here, before any early return, so no exit
+        // path can leave it set for the next caller (see `renderAwaited()`). A nil
+        // `pendingFrameCompletion` is what an early return leaves behind, and
+        // `awaitCommittedFrame()` reads that as "nothing to wait for".
+        let awaited = armAwaitedFrame
+        armAwaitedFrame = false
+        if awaited { pendingFrameCompletion = nil }
         // Fail LOUD on a boot-relative animation clock. `time` is a Float used as a phase by
         // every GPU oscillator, so a large absolute value quantises all of them (see `time`'s
         // doc and `RenderClock`). This is the check that would have caught the defect on the
@@ -8984,6 +9037,11 @@ public final class IlluminatoramaRenderer {
         let meter = gpuMeter
         let pt = passTimer
         let errPath = ProcessInfo.processInfo.environment["VIZ_ILLUMI_CBERROR_PATH"]
+        // The awaited-frame signal, if `renderAwaited()` armed one. It must be created and
+        // installed HERE — `addCompletedHandler` is only legal before `commit()`, so a caller
+        // cannot decide to wait asynchronously after the fact.
+        let completion: FrameCompletionSignal? = awaited ? FrameCompletionSignal() : nil
+        pendingFrameCompletion = completion
         cb.addCompletedHandler { buf in
             meter.record(buf)
             let gpuMs = (buf.gpuEndTime - buf.gpuStartTime) * 1000.0
@@ -9009,6 +9067,10 @@ public final class IlluminatoramaRenderer {
             // permit, shrinking the effective in-flight depth from 2 to 1 so heavy RT
             // scenes stay responsive. Converges back to 2 when frames get light again.
             sync.frameCompletedAdaptive(gpuMs: gpuMs, semaphore: sem)
+            // LAST, and after `markCompleted` above: an awaiter resumes into
+            // `promoteCompletedBuffer()`, which can only find this frame once `writeIdx` is
+            // published. Same ordering `waitUntilCompleted()` gives the blocking path.
+            completion?.signal()
         }
         lastCommittedFrameCB = cb
         cb.commit()
@@ -9022,7 +9084,10 @@ public final class IlluminatoramaRenderer {
         // returns only after the completion handler above has run, so `markCompleted`
         // has already published `writeIdx` and the promote below always finds it.
         // Live rendering (`blocking == false`) is untouched and stays pipelined.
-        if blocking {
+        // `awaited` keeps the never-drop half of the contract (the semaphore wait above) and
+        // moves ONLY the CPU stall: `awaitCommittedFrame()` performs the same wait-then-promote
+        // from a suspension instead of from `__psynch_cvwait` on the caller's thread.
+        if blocking && !awaited {
             cb.waitUntilCompleted()
             promoteCompletedBuffer()
         }
@@ -9062,6 +9127,53 @@ public final class IlluminatoramaRenderer {
             irrCacheToggle.toggle()
         }
         return true
+    }
+
+    /// **A `blocking` frame whose CPU wait is a suspension instead of a stall.** Commit the
+    /// frame under the full capture contract — never dropped, promoted before the caller
+    /// reads `outputTexture` — but return as soon as it is *committed*, leaving the
+    /// wait-and-promote to `awaitCommittedFrame()`.
+    ///
+    /// WHY. `render(blocking: true)` ends in `cb.waitUntilCompleted()`, which parks the
+    /// CALLING thread in `__psynch_cvwait` until the GPU is done. For a headless harness that
+    /// is exactly right — there is nothing else for that thread to do. For an interactive
+    /// host settling a still on the main thread it is not: a 4-second ray-traced frame is
+    /// 4 seconds in which the run loop does not iterate, so the window does not repaint, the
+    /// cursor does not track and a progress indicator does not move. Rendering one frame per
+    /// `await` does not help by itself — the thread is still inside the wait for all but the
+    /// microseconds between frames. The wait itself has to move.
+    ///
+    /// Pair it strictly:
+    /// ```swift
+    /// _ = renderer.renderAwaited()
+    /// await renderer.awaitCommittedFrame()   // outputTexture is now THIS frame
+    /// ```
+    /// Between the two calls the frame is in flight and `outputTexture` still holds the
+    /// PREVIOUS one, so a reader that skips the await gets a frame behind — the same trap
+    /// `blocking: false` has always had, and the reason the blocking path exists.
+    ///
+    /// Not a replacement for `render(blocking:)`: a synchronous caller (every `swift test`
+    /// capture, every GPU gate) has no suspension point to spend and should keep using it.
+    @discardableResult
+    public func renderAwaited() -> Bool {
+        armAwaitedFrame = true
+        return render(blocking: true)
+    }
+
+    /// Wait for the frame `renderAwaited()` committed, then promote it — the second half of
+    /// that call's capture contract, performed from a suspension so the caller's thread stays
+    /// in its run loop while the GPU works.
+    ///
+    /// Safe to call when nothing is pending (no armed render, or one that returned early on an
+    /// empty scene): it promotes and returns, which is precisely what the blocking path leaves
+    /// behind in those cases. Awaiting the same frame twice is likewise a no-op rather than a
+    /// hang — the signal is consumed on the first await.
+    public func awaitCommittedFrame() async {
+        if let signal = pendingFrameCompletion {
+            pendingFrameCompletion = nil
+            await signal.wait()
+        }
+        promoteCompletedBuffer()
     }
 
     // ── Presented-buffer pool helpers ─────────────────────────────────────────
@@ -11839,12 +11951,19 @@ public final class IlluminatoramaRenderer {
         (dofApplied ? dofOutputTexture : nil) ?? displaySource
     }
 
-    /// Gather depth-of-field on the resolved HDR. Runs after the exposure
+    /// Lens-accurate depth-of-field on the resolved HDR. Runs after the exposure
     /// estimate and before bloom; writes a private DOF texture that bloom +
-    /// tonemap then read. No-op unless `dofEnabled` and the pipeline exists.
+    /// tonemap then read. No-op unless `dofEnabled` and the pipelines exist.
+    ///
+    /// Three dispatches: a max-|CoC| reduction per 16×16 tile, a dilate of that map by the
+    /// gather's own reach, then the gather — which reads one dilated texel to learn how far it
+    /// must look to find a NEAR-field neighbour whose confusion disc covers it, and to skip
+    /// whole tiles that are in focus. See `IlluminatoramaDOF.metal` for the optics.
     private func encodeDOFPass(_ cb: MTLCommandBuffer) {
         dofApplied = false
-        guard dofEnabled, let pipeline = dofPipeline else { return }
+        guard dofEnabled, dofCoCCoefficient > 0,
+              let pipeline = dofPipeline, let tilePipeline = dofTilePipeline,
+              let dilatePipeline = dofDilatePipeline else { return }
         // Lazily (re)allocate the DOF target to the current internal size.
         if dofOutputTexture == nil
             || dofOutputTexture?.width != width || dofOutputTexture?.height != height {
@@ -11857,19 +11976,60 @@ public final class IlluminatoramaRenderer {
             dofOutputTexture = device.makeTexture(descriptor: d)
             dofOutputTexture?.label = "Illuminatorama.dof"
         }
-        guard let out = dofOutputTexture else { return }
+        let tile = Self.dofTileSize
+        let tileW = max(1, (width + tile - 1) / tile), tileH = max(1, (height + tile - 1) / tile)
+        if dofTileTexture == nil
+            || dofTileTexture?.width != tileW || dofTileTexture?.height != tileH {
+            let d = MTLTextureDescriptor()
+            d.textureType = .type2D
+            d.pixelFormat = .r32Float
+            d.width = tileW; d.height = tileH
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            dofTileTexture = device.makeTexture(descriptor: d)
+            dofTileTexture?.label = "Illuminatorama.dof.cocTiles"
+            dofTileDilatedTexture = device.makeTexture(descriptor: d)
+            dofTileDilatedTexture?.label = "Illuminatorama.dof.cocTilesDilated"
+        }
+        guard let out = dofOutputTexture, let tiles = dofTileTexture,
+              let dilated = dofTileDilatedTexture else { return }
         let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
         var p = DOFParams(
             invProjection: fu.invProjection,
-            focusDist: max(0.05, dofFocusDistance), aperture: max(0, dofAperture),
-            maxRadius: max(0, dofMaxRadius), focusRange: max(0.05, dofFocusRange),
-            width: UInt32(width), height: UInt32(height))
+            focusDist: max(0.05, dofFocusDistance),
+            cocCoefficient: max(0, dofCoCCoefficient),
+            maxRadius: max(1, dofMaxRadius),
+            blades: dofBlades >= 3 ? Float(dofBlades) : 0,
+            bladeRotation: dofBladeRotation,
+            catsEye: max(0, min(1, dofCatsEye)),
+            width: UInt32(width), height: UInt32(height),
+            tileW: UInt32(tileW), tileH: UInt32(tileH), tileSize: UInt32(tile))
+        guard let tileEnc = timedComputeEncoder(cb, "dof.tiles") else { return }
+        tileEnc.label = "Illuminatorama.dof.tiles"
+        tileEnc.setComputePipelineState(tilePipeline)
+        tileEnc.setTexture(depthTexture, index: 0)
+        tileEnc.setTexture(tiles, index: 1)
+        tileEnc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
+        dispatch(tileEnc, pipeline: tilePipeline, width: tileW, height: tileH)
+        tileEnc.endEncoding()
+
+        // Spread each tile's max by the gather's reach, so the gather itself reads one texel.
+        guard let dilEnc = timedComputeEncoder(cb, "dof.dilate") else { return }
+        dilEnc.label = "Illuminatorama.dof.dilate"
+        dilEnc.setComputePipelineState(dilatePipeline)
+        dilEnc.setTexture(tiles, index: 0)
+        dilEnc.setTexture(dilated, index: 1)
+        dilEnc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
+        dispatch(dilEnc, pipeline: dilatePipeline, width: tileW, height: tileH)
+        dilEnc.endEncoding()
+
         guard let enc = timedComputeEncoder(cb, "dof") else { return }
         enc.label = "Illuminatorama.dof"
         enc.setComputePipelineState(pipeline)
         enc.setTexture(displaySource, index: 0)
         enc.setTexture(depthTexture, index: 1)
         enc.setTexture(out, index: 2)
+        enc.setTexture(dilated, index: 3)
         enc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
         dispatch(enc, pipeline: pipeline, width: width, height: height)
         enc.endEncoding()
@@ -13713,6 +13873,50 @@ private final class IlluminatoramaGPUMeter: @unchecked Sendable {
                           avg, n, p50, p95, p99, minMs, maxMs)
         lock.unlock()
         if let d = line.data(using: .utf8) { try? d.write(to: URL(fileURLWithPath: path)) }
+    }
+}
+
+/// A one-shot "the GPU finished this frame" latch that an `async` caller can await.
+///
+/// Exists because the two ends of the handshake live on different threads and neither can be
+/// moved: `MTLCommandBuffer.addCompletedHandler` fires on a Metal-owned background thread, and
+/// the awaiter is main-actor code inside `awaitCommittedFrame()`. A `DispatchSemaphore` would
+/// bridge them only by blocking a cooperative-pool thread, which is the stall this whole path
+/// exists to remove.
+///
+/// Latched rather than gated: `signal()` may land BEFORE anyone awaits (a fast frame finishing
+/// while the caller is still unwinding the commit), so `wait()` on an already-signalled latch
+/// must return immediately instead of parking forever. Both calls are idempotent — a second
+/// `signal()` is dropped and the continuation is resumed exactly once.
+final class FrameCompletionSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    /// Called from the GPU completion handler. Resumes the awaiter OUTSIDE the lock —
+    /// a continuation resume can run arbitrary code, and doing that under the lock would
+    /// re-enter it if that code touched this latch again.
+    func signal() {
+        lock.lock()
+        if completed { lock.unlock(); return }
+        completed = true
+        let waiter = continuation
+        continuation = nil
+        lock.unlock()
+        waiter?.resume()
+    }
+
+    func wait() async {
+        await withCheckedContinuation { (k: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if completed {
+                lock.unlock()
+                k.resume()          // already finished — never park
+            } else {
+                continuation = k
+                lock.unlock()
+            }
+        }
     }
 }
 
