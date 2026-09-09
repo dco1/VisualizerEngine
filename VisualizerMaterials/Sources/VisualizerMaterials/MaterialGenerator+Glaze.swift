@@ -34,6 +34,29 @@ extension MaterialGenerator {
     /// the aged one is drawing the thing anybody would recognise.
     public static let glazeCrazeStain = Vec3(0.34, 0.29, 0.24)
 
+    /// **Iron-speck size and spacing**, in metres. A speck is DRAWN AT A CELL CENTRE — see the
+    /// generator's `fleck` term for the expression that took two tries to get right.
+    ///
+    /// 4 mm is coarser than life and it is the smallest honest speck this bake can hold. Real
+    /// iron speckle in a stoneware body is 0.5–2 mm; at the 1 m vessel run a 512² texel is
+    /// 1.95 mm, so anything under ~4 mm is below the two-texel Nyquist floor and cannot be drawn
+    /// at all — the same wall `MaterialGenerator.paint`'s orange peel hit before its repeat came
+    /// down. Drawing it anyway would produce a sub-texel shimmer, not a finer speck.
+    public static let glazeSpeckSize = 0.0044
+    public static let glazeSpeckSpacing = 0.0156
+
+    /// **Crazing cell size and hairline width**, in metres. A real crazed glaze is a mesh of
+    /// ~1 cm cells separated by lines you can barely see; the first cut drew 3.3 cm cells with
+    /// 8 mm lines and the pot came out looking like giraffe skin.
+    ///
+    /// The width then went the other way and hit the SAME two-texel floor `glazeSpeckSize` is
+    /// pinned to — at 2.8 mm the line is 1.4 texels and the network breaks into disconnected
+    /// dots (measured: its largest connected component held 0.4 % of the marked texels, against
+    /// the > 55 % a network must hold). 4 mm is the thinnest line this bake can draw as a LINE.
+    /// Real crazing is finer than this and cannot be, for the same Nyquist reason.
+    public static let glazeCrazeCell = 0.0172
+    public static let glazeCrazeWidth = 0.0040
+
     /// **Throwing-ring pitch, in metres** — the spiral rib a potter's fingers leave climbing the
     /// wall of a pot. 10 mm is a fast confident pull; 4–6 mm is a slow one.
     ///
@@ -126,7 +149,16 @@ extension MaterialGenerator {
         // bake stays toroidal (the same constraint `marbleBeddingStretch` is an integer for).
         let rings = max(1, Int((glazeNominalRun / glazeThrowingRingPitch).rounded()))
         let ringAmp = glazeRingAmplitude * f.throwRelief
-        let crazeWidth = 0.23      // cell-index units ⇒ ~2 texels of hairline, see `voronoiTiled`
+
+        // Voronoi distances come back in **cell-index units**, so every physical size above has
+        // to be converted by its own lattice's cell count — a metre figure handed straight to
+        // `smoothstep` is off by that count, which is how the crazing ended up 8 mm wide.
+        let speckCells = max(2, Int((glazeNominalRun / glazeSpeckSpacing).rounded()))
+        let speckRadius = (glazeSpeckSize / 2) / glazeNominalRun * Double(speckCells)
+        let crazeCells = max(2, Int((glazeNominalRun / glazeCrazeCell).rounded()))
+        // `f2 − f1` ≈ twice the distance to the boundary, so a half-width in distance is a
+        // full width in this quantity.
+        let crazeHalfWidth = (glazeCrazeWidth / 2) / glazeNominalRun * Double(crazeCells) * 2
 
         for y in 0..<size {
             for x in 0..<size {
@@ -156,10 +188,23 @@ extension MaterialGenerator {
 
                 // 4 — the recipe's character. Both are the BODY asserting itself through the
                 // coat, which is why they are sampled once and used in albedo and roughness alike.
-                let spk = Noise.voronoiTiled(u, v, cells: 46, jitter: 0.9, seed: sh ^ 0x2C)
-                let fleck = pow(max(0, 1 - (spk.f2 - spk.f1) * 5), 8) * f.speckle
-                let crz = Noise.voronoiTiled(u, v, cells: 30, jitter: 0.85, seed: sh ^ 0x5F)
-                let craze = (1 - smoothstep(0, crazeWidth, crz.f2 - crz.f1)) * f.crackle
+                //
+                // **A speck is `f1`, a crack is `f2 − f1`, and mixing them up draws the wrong
+                // thing.** `voronoiTiled` returns the distances to the two nearest feature points.
+                // `f2 − f1` is SMALL where the sample is equidistant from both — i.e. on a cell
+                // BOUNDARY — so it draws a NETWORK. `f1` is small at a feature point itself, so
+                // that is what draws a blob at a cell CENTRE.
+                //
+                // This started as a copy of `stoneware`'s `pow(max(0, 1 − (f2 − f1)·5), 8)`,
+                // labelled there as "rare dark specks". It is not: it is a faint vein network,
+                // and at stoneware's 0.10 amplitude nobody ever caught it. At the speckled
+                // finish's 1.0 it drew a second crackle web over the first, and `reactive`
+                // (speckle 0.35, crackle 0) rendered visibly CRAZED — a finish showing a feature
+                // its recipe says it does not have (measured on the real frame, 2026-09-09).
+                let spk = Noise.voronoiTiled(u, v, cells: speckCells, jitter: 0.9, seed: sh ^ 0x2C)
+                let fleck = (1 - smoothstep(0, speckRadius, spk.f1)) * f.speckle
+                let crz = Noise.voronoiTiled(u, v, cells: crazeCells, jitter: 0.85, seed: sh ^ 0x5F)
+                let craze = (1 - smoothstep(0, crazeHalfWidth, crz.f2 - crz.f1)) * f.crackle
 
                 // ── albedo ──
                 // A thin coat is washed out — lighter AND less saturated, because there is less
@@ -176,7 +221,7 @@ extension MaterialGenerator {
                 let cover = f.isGlazed ? clamp01(1 - f.bodyBreak * (1 - t)) : 0
                 var c = mix(bodyHere, glaze, cover)
                 c = mix(c, glazeIronSpeck, fleck * 0.85)
-                c = mix(c, glazeCrazeStain, craze * 0.45)
+                c = mix(c, glazeCrazeStain, craze * 0.30)
                 ch.albedo[ch.idx(x, y)] = clampBand(c)
 
                 // ── roughness ──
@@ -189,7 +234,7 @@ extension MaterialGenerator {
                     r += (0.5 - t) * 0.16
                     r -= rib * 0.045 * f.throwRelief
                 }
-                r += fleck * 0.30 + craze * 0.22 + peel * 0.10
+                r += fleck * 0.30 + craze * 0.14 + peel * 0.10
                 ch.roughness[ch.idx(x, y)] = clamp01(r)
 
                 // ── height ──
@@ -198,7 +243,7 @@ extension MaterialGenerator {
                 // swell of an uneven coat plus the two incised features.
                 ch.height[ch.idx(x, y)] = clamp01(0.5 + rib * ringAmp
                                                   + (t - 0.62) * 0.10
-                                                  - craze * 0.06 - fleck * 0.04)
+                                                  - craze * 0.035 - fleck * 0.04)
             }
         }
 
