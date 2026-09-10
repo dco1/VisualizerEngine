@@ -390,35 +390,77 @@ public final class IlluminatoramaMesh {
         // → default white (no-op multiply at shading time).
         let colors  = floatColors(from: geometry.sources(for: .color).first)
 
-        // Build per-vertex IlluminatoramaVertex. If we synthesise normals
-        // we'll fill them in after we have the index buffer.
-        var verts: [IlluminatoramaVertex] = []
-        verts.reserveCapacity(positions.count)
-        let needsSynthNormals = (normals == nil)
-        let normalArray = normals ?? Array(repeating: SIMD3<Float>(0, 1, 0),
-                                            count: positions.count)
-        let uvArray     = uvs     ?? Array(repeating: SIMD2<Float>(0, 0),
-                                            count: positions.count)
-        let colorArray  = colors  ?? Array(repeating: SIMD4<Float>(1, 1, 1, 1),
-                                            count: positions.count)
-        let uvCount = uvArray.count
-        let normalCount = normalArray.count
-        let colorCount = colorArray.count
-        for i in 0..<positions.count {
-            let n = i < normalCount ? normalArray[i] : SIMD3<Float>(0, 1, 0)
-            let uv = i < uvCount ? uvArray[i] : SIMD2<Float>(0, 0)
-            let c  = i < colorCount ? colorArray[i] : SIMD4<Float>(1, 1, 1, 1)
-            verts.append(IlluminatoramaVertex(position: positions[i],
+        // DH-0742 — detect SceneKit's "split-vertex" element layout. When a
+        // geometry's sources have DIFFERENT `vectorCount`s (the common USD/
+        // Blender-import case: position is vertex-varying/shared, while normal
+        // is authored FACEVARYING — one value per TRIANGLE CORNER, for a hard
+        // edge), SceneKit widens each corner's index entry to one index PER
+        // DISTINCT vectorCount group, interleaved per corner — [posIndex,
+        // cornerIndex, posIndex, cornerIndex, …] — instead of the single shared
+        // index every hand-built/procedural mesh in this engine has always had.
+        // Reading that as one flat index stream (this code did, before this
+        // fix) pairs arbitrary position indices with what are actually
+        // per-corner counters, wiring triangles to essentially random vertices.
+        // A real `.usdz` side table (Blender export, DH-0742) rendered as a
+        // shredded, torn mess because of exactly this — verified against the
+        // raw USD stage (`usdcat`) and SceneKit's own reported index buffer:
+        // `elementData.count / bytesPerIndex` was 2× `primitiveCount * 3`, and
+        // de-interleaving it by 2 recovered the real per-face-vertex indices
+        // (matching the USD file's own `faceVertexIndices` exactly) alongside a
+        // trivial 0…N corner counter (matching the facevarying normal count).
+        // Detected purely by entry-count arithmetic — no SceneKit SPI needed.
+        let cornerCount = element.primitiveCount * 3
+        let indexEntryWidth = element.bytesPerIndex
+        let totalIndexEntries = indexEntryWidth > 0 ? element.data.count / indexEntryWidth : 0
+        let streamsPerCorner = (cornerCount > 0 && totalIndexEntries > 0
+                                 && totalIndexEntries % cornerCount == 0)
+            ? totalIndexEntries / cornerCount : 1
+
+        let verts: [IlluminatoramaVertex]
+        let needsSynthNormals: Bool
+        let rawIndex: (data: Data, count: Int, type: MTLIndexType)?
+
+        if streamsPerCorner > 1,
+           let expanded = expandSplitVertexElement(
+               element: element, cornerCount: cornerCount, streamsPerCorner: streamsPerCorner,
+               positions: positions, normals: normals, uvs: uvs, colors: colors,
+               geometryLabel: "\(type(of: geometry))") {
+            verts = expanded.verts
+            needsSynthNormals = expanded.needsSynthNormals
+            rawIndex = (expanded.indexData, expanded.indexCount, .uint32)
+        } else {
+            // The overwhelmingly common case: one shared index per corner.
+            // Build per-vertex IlluminatoramaVertex. If we synthesise normals
+            // we'll fill them in after we have the index buffer.
+            var v: [IlluminatoramaVertex] = []
+            v.reserveCapacity(positions.count)
+            needsSynthNormals = (normals == nil)
+            let normalArray = normals ?? Array(repeating: SIMD3<Float>(0, 1, 0),
+                                                count: positions.count)
+            let uvArray     = uvs     ?? Array(repeating: SIMD2<Float>(0, 0),
+                                                count: positions.count)
+            let colorArray  = colors  ?? Array(repeating: SIMD4<Float>(1, 1, 1, 1),
+                                                count: positions.count)
+            let uvCount = uvArray.count
+            let normalCount = normalArray.count
+            let colorCount = colorArray.count
+            for i in 0..<positions.count {
+                let n = i < normalCount ? normalArray[i] : SIMD3<Float>(0, 1, 0)
+                let uv = i < uvCount ? uvArray[i] : SIMD2<Float>(0, 0)
+                let c  = i < colorCount ? colorArray[i] : SIMD4<Float>(1, 1, 1, 1)
+                v.append(IlluminatoramaVertex(position: positions[i],
                                                normal: n,
                                                uv: uv,
                                                color: c))
+            }
+            verts = v
+            // Read indices into a `Data` blob in whatever format the renderer
+            // will dispatch. SceneKit elements can be 1/2/4 bytes per index;
+            // promote 1-byte → 2-byte (no MTLIndexType.uint8) and keep 2/4
+            // verbatim.
+            rawIndex = readIndexData(element: element)
         }
-
-        // Read indices into a `Data` blob in whatever format the renderer
-        // will dispatch. SceneKit elements can be 1/2/4 bytes per index;
-        // promote 1-byte → 2-byte (no MTLIndexType.uint8) and keep 2/4
-        // verbatim.
-        guard let raw = readIndexData(element: element) else {
+        guard let raw = rawIndex else {
             log.debug("SCNGeometry \(type(of: geometry)) has unsupported index width (\(element.bytesPerIndex) bytes)")
             return nil
         }
@@ -674,6 +716,90 @@ public final class IlluminatoramaMesh {
     }
 
     // ── Index conversion ──────────────────────────────────────────────────────
+
+    /// DH-0742 — expand a "split-vertex" element (see the call site's comment) into a
+    /// flat per-corner vertex list plus a trivial sequential index buffer. `streamsPerCorner`
+    /// interleaved index values per triangle corner are de-interleaved into that many
+    /// candidate streams; each attribute source (position/normal/uv/color) is matched to
+    /// whichever stream its OWN values validly index into (every value `< source.count`),
+    /// preferring the tightest fit so a smaller source's range can't be mismatched onto a
+    /// wider stream that happens to also cover it. Returns `nil` only if no stream fits the
+    /// position source — the one attribute every mesh must have.
+    private static func expandSplitVertexElement(
+        element: SCNGeometryElement, cornerCount: Int, streamsPerCorner: Int,
+        positions: [SIMD3<Float>], normals: [SIMD3<Float>]?, uvs: [SIMD2<Float>]?,
+        colors: [SIMD4<Float>]?, geometryLabel: String
+    ) -> (verts: [IlluminatoramaVertex], needsSynthNormals: Bool,
+          indexData: Data, indexCount: Int)? {
+        let bpi = element.bytesPerIndex
+        let totalEntries = cornerCount * streamsPerCorner
+        var raw: [UInt32] = []
+        raw.reserveCapacity(totalEntries)
+        element.data.withUnsafeBytes { buf in
+            switch bpi {
+            case 1:
+                let p = buf.bindMemory(to: UInt8.self)
+                guard p.count >= totalEntries else { return }
+                for i in 0..<totalEntries { raw.append(UInt32(p[i])) }
+            case 2:
+                let p = buf.bindMemory(to: UInt16.self)
+                guard p.count >= totalEntries else { return }
+                for i in 0..<totalEntries { raw.append(UInt32(p[i])) }
+            case 4:
+                let p = buf.bindMemory(to: UInt32.self)
+                guard p.count >= totalEntries else { return }
+                for i in 0..<totalEntries { raw.append(p[i]) }
+            default:
+                break
+            }
+        }
+        guard raw.count == totalEntries else {
+            log.debug("Illuminatorama mesh \(geometryLabel): split-vertex element — couldn't read \(totalEntries) index entries at \(bpi) bytes each; skipping")
+            return nil
+        }
+
+        // De-interleave into `streamsPerCorner` per-corner arrays.
+        var streams = Array(repeating: [UInt32](repeating: 0, count: cornerCount), count: streamsPerCorner)
+        for k in 0..<cornerCount {
+            for s in 0..<streamsPerCorner { streams[s][k] = raw[k * streamsPerCorner + s] }
+        }
+
+        // Tightest fit = the stream whose max value is CLOSEST to (but still under) the
+        // source's own count — i.e. the LARGEST valid max, not the smallest. A smaller
+        // source's index range (e.g. position, welded to fewer unique points) can be
+        // coincidentally in-range for a larger source's slot too (every value < count still
+        // passes the bounds check), so picking the smallest max would wrongly prefer the
+        // narrower stream and under-utilize the wider source it doesn't actually belong to.
+        func bestStream(for count: Int) -> Int? {
+            var best: Int? = nil
+            var bestMax: Int = -1
+            for (s, values) in streams.enumerated() {
+                guard let m = values.max(), Int(m) < count else { continue }
+                if Int(m) > bestMax { bestMax = Int(m); best = s }
+            }
+            return best
+        }
+        guard let posStream = bestStream(for: positions.count) else {
+            log.debug("Illuminatorama mesh \(geometryLabel): split-vertex element — no index stream fits the position source (count \(positions.count)); skipping")
+            return nil
+        }
+        let normalStream = normals.flatMap { bestStream(for: $0.count) }
+        let uvStream = uvs.flatMap { bestStream(for: $0.count) }
+        let colorStream = colors.flatMap { bestStream(for: $0.count) }
+
+        var verts: [IlluminatoramaVertex] = []
+        verts.reserveCapacity(cornerCount)
+        for k in 0..<cornerCount {
+            let p = positions[Int(streams[posStream][k])]
+            let n = normalStream.map { normals![Int(streams[$0][k])] } ?? SIMD3<Float>(0, 1, 0)
+            let uv = uvStream.map { uvs![Int(streams[$0][k])] } ?? SIMD2<Float>(0, 0)
+            let c = colorStream.map { colors![Int(streams[$0][k])] } ?? SIMD4<Float>(1, 1, 1, 1)
+            verts.append(IlluminatoramaVertex(position: p, normal: n, uv: uv, color: c))
+        }
+        let indexArray: [UInt32] = (0..<cornerCount).map { UInt32($0) }
+        let indexData = indexArray.withUnsafeBufferPointer { Data(buffer: $0) }
+        return (verts, normals == nil, indexData, cornerCount)
+    }
 
     /// Pull the raw index `Data` blob out of an `SCNGeometryElement`, promote
     /// 1-byte indices to 2-byte (Metal has no `MTLIndexType.uint8`), and
