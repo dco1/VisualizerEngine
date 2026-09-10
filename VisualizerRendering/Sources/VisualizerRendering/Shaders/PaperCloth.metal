@@ -495,7 +495,16 @@ struct PaperHashUniforms {
     // against each other — a pile of folds HOLDS instead of slithering apart.
     // 0 disables (paper pages slide).
     float stickDisp;
-    float _pad;
+    // Separation between particles of DIFFERENT sheets. Distinct from `radius`
+    // because they are distinct physical quantities that happen to share a kernel:
+    // `radius` is how far a sheet is kept from ITSELF, and its ceiling is the
+    // sheet's own two-cell spacing (past that the sheet inflates); this is how far
+    // two STACKED LAYERS are held apart, and its floor is the sum of their half
+    // thicknesses (under that their skinned shells interleave). Conflating them is
+    // unsatisfiable whenever a thick layer is finely sampled — a folded throw on a
+    // duvet needed 2·18 mm of layer separation and could tolerate only 2·9 mm of
+    // self separation. 0 means "same as radius" (every caller before this).
+    float layerRadius;
 };
 
 static int3 paperCellCoord(float3 p, float cs) { return int3(floor(p / cs)); }
@@ -571,6 +580,8 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
     int  x = int(local % u.gridW), y = int(local / u.gridW);
 
     float minDist = 2.0 * u.radius;
+    // 0 keeps the historical behaviour: one radius for everything.
+    float layerDist = (u.layerRadius > 0.0) ? 2.0 * u.layerRadius : minDist;
     float3 delta  = float3(0.0);
     float3 nbrVel = float3(0.0);   // summed Δpos of contacting neighbours (velocity·dt)
     int    hits   = 0;
@@ -609,15 +620,17 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
             // into stiff wings (Daydream Home DH-0415). Distant same-sheet
             // particles only ever come within radius when the cloth genuinely
             // folds onto itself, which is exactly the contact we want.
-            if (j / u.verticesPerSheet == sheet) {
+            bool sameSheet = (j / u.verticesPerSheet == sheet);
+            if (sameSheet) {
                 uint lj = j - sheet * u.verticesPerSheet;
                 int jx = int(lj % u.gridW), jy = int(lj / u.gridW);
                 if (uint(max(abs(jx - x), abs(jy - y))) <= u.skipRadius) continue;
             }
+            float md = sameSheet ? minDist : layerDist;
             float3 d = pos - S[j].positionAndInvMass.xyz;
             float dist = length(d);
-            if (dist < minDist && dist > 1e-6) {
-                delta += (d / dist) * ((minDist - dist) * 0.5);
+            if (dist < md && dist > 1e-6) {
+                delta += (d / dist) * ((md - dist) * 0.5);
                 nbrVel += S[j].positionAndInvMass.xyz - S[j].prevPositionAndPad.xyz;
                 hits++;
             }

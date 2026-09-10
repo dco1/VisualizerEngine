@@ -121,6 +121,20 @@ public final class PaperClothSolver {
     /// neighbouring pair sat permanently in contact and the sheet inflated like a balloon and
     /// curled its edges upward (Daydream Home, 2026-08-21). See `recommendedSelfRadius`.
     public var selfRadius: Float = 0.006
+    /// How far apart particles of DIFFERENT sheets are held, when that is not the same question
+    /// as how far a sheet is held from itself.
+    ///
+    /// `selfRadius` has a CEILING — a sheet whose particles two cells apart are closer than
+    /// `2·selfRadius` inflates itself — and layer separation has a FLOOR: two stacked cloths need
+    /// their mid-planes at least the sum of their half-thicknesses apart or their skinned shells
+    /// interleave. One number cannot satisfy both once a thick layer is finely sampled, which is
+    /// what a folded throw co-solved on a duvet's grid is: it needed 2 × 18 mm between layers and
+    /// could tolerate only 2 × 9 mm within itself, and the render showed the two cloths as a
+    /// mottled patchwork of each other.
+    ///
+    /// `nil` (the default) means "use `selfRadius`", which is what every caller did before this
+    /// existed.
+    public var interLayerRadius: Float?
     /// Spatial-hash cell size — set ≥ 2·radius so the 27-cell stencil covers 2·radius
     /// (≈ 2× rest edge keeps buckets small for perf).
     public var selfCellSize: Float = 0.024
@@ -853,7 +867,8 @@ public final class PaperClothSolver {
             skipRadius: 1, legacy: legacyPushout ? 1 : 0,
             // Layers stick below the same threshold as obstacle contact — one
             // notion of "at rest" for the whole cloth.
-            stickDisp: stickSpeed * fixedDt)
+            stickDisp: stickSpeed * fixedDt,
+            layerRadius: legacyPushout ? 0 : (interLayerRadius ?? 0))
     }
 
     private func encodeSubstep(to cb: MTLCommandBuffer, dt: Float) {
@@ -1366,5 +1381,5 @@ struct PaperHashUniforms {
     var skipRadius: UInt32
     var legacy: UInt32 = 0
     var stickDisp: Float = 0
-    var _pad: Float = 0
+    var layerRadius: Float = 0
 }
