@@ -89,7 +89,7 @@ public struct PBDCollider {
     public var b:    SIMD4<Float>   // xyz = secondary point / extents, w = radius
     public var meta: SIMD4<UInt32>  // x = ownerID, yzw = reserved
 
-    public enum Kind: UInt32 { case sphere = 0, capsule = 1, box = 2 }
+    public enum Kind: UInt32 { case sphere = 0, capsule = 1, box = 2, sdfVolume = 3 }
 
     public init(a: SIMD4<Float>, b: SIMD4<Float>, ownerID: UInt32) {
         self.a = a; self.b = b
@@ -123,6 +123,24 @@ public struct PBDCollider {
             b: SIMD4(halfExtents.x, halfExtents.y, halfExtents.z, 0),
             ownerID: ownerID
         )
+    }
+
+    /// A SIGNED DISTANCE VOLUME — collide with a real mesh rather than a primitive standing in
+    /// for it. `origin` is voxel (0,0,0)'s centre, `cell` the spacing, `dims` the voxel counts; the
+    /// values themselves live in one buffer on the solver (`PaperClothSolver.setSDFVolume`).
+    ///
+    /// **Cloth only.** `PaperCloth.metal` samples it. The shared rigid-body shader (`PBD.metal`)
+    /// reads any kind it does not know as a box, so handing one of these to `PBDSolver` would make
+    /// it collide with a box of half-extents `(cell, 0, 0)`. Grid dims ride in `meta.yzw`, which
+    /// every other kind leaves zero.
+    public static func sdfVolume(origin: SIMD3<Float>, cell: Float, dims: SIMD3<UInt32>,
+                                 ownerID: UInt32 = .max) -> PBDCollider {
+        var c = PBDCollider(
+            a: SIMD4(origin.x, origin.y, origin.z, Float(bitPattern: Kind.sdfVolume.rawValue)),
+            b: SIMD4(cell, 0, 0, 0),
+            ownerID: ownerID)
+        c.meta = SIMD4(ownerID, dims.x, dims.y, dims.z)
+        return c
     }
 }
 

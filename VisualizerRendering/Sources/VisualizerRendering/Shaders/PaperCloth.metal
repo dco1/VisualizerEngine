@@ -334,10 +334,40 @@ static float3 paperClosestOnSegment(float3 p, float3 a, float3 b) {
 }
 
 // Distance to (inflated) collider surface + outward normal at `p`.
+static float paperSdfAt(device const float* sdf, uint nx, uint ny, uint i, uint j, uint k) {
+    return sdf[(k * ny + j) * nx + i];
+}
+
 static float paperColliderDistance(float3 p, PBDCollider col, float inflate,
-                                   thread float3& n) {
+                                   thread float3& n, device const float* sdf) {
     uint  kind   = as_type<uint>(col.a.w);
     float radius = col.b.w + inflate;
+    if (kind == 3u) {                       // SDF volume — the DRAWN geometry, not a stand-in
+        // Trilinear sample, and the interpolant's OWN gradient as the push direction, so the
+        // direction a node is moved agrees with the distance it was measured to be inside.
+        // Matches `SignedDistanceGrid.sample` in DaydreamCore term for term.
+        uint nx = col.meta.y, ny = col.meta.z, nz = col.meta.w;
+        float3 g  = (p - col.a.xyz) / col.b.x;
+        float3 hi = float3(float(nx - 1u), float(ny - 1u), float(nz - 1u));
+        if (nx < 2u || ny < 2u || nz < 2u || any(g < 0.0) || any(g > hi)) {
+            n = float3(0, 1, 0); return 1e3;                 // off the grid: nothing to touch
+        }
+        uint i = min(uint(g.x), nx - 2u), j = min(uint(g.y), ny - 2u), k = min(uint(g.z), nz - 2u);
+        float3 t = g - float3(float(i), float(j), float(k));
+        float c000 = paperSdfAt(sdf, nx, ny, i,     j,     k    ), c100 = paperSdfAt(sdf, nx, ny, i + 1, j,     k    );
+        float c010 = paperSdfAt(sdf, nx, ny, i,     j + 1, k    ), c110 = paperSdfAt(sdf, nx, ny, i + 1, j + 1, k    );
+        float c001 = paperSdfAt(sdf, nx, ny, i,     j,     k + 1), c101 = paperSdfAt(sdf, nx, ny, i + 1, j,     k + 1);
+        float c011 = paperSdfAt(sdf, nx, ny, i,     j + 1, k + 1), c111 = paperSdfAt(sdf, nx, ny, i + 1, j + 1, k + 1);
+        float c00 = mix(c000, c100, t.x), c10 = mix(c010, c110, t.x);
+        float c01 = mix(c001, c101, t.x), c11 = mix(c011, c111, t.x);
+        float c0  = mix(c00, c10, t.y),   c1  = mix(c01, c11, t.y);
+        float3 grad = float3(mix(mix(c100 - c000, c110 - c010, t.y), mix(c101 - c001, c111 - c011, t.y), t.z),
+                             mix(c10 - c00, c11 - c01, t.z),
+                             c1 - c0);
+        float gl = length(grad);
+        n = (gl > 1e-8) ? grad / gl : float3(0, 1, 0);
+        return mix(c0, c1, t.z) - radius;
+    }
     if (kind == 2u) {                       // box
         float3 d  = p - col.a.xyz;
         float3 he = col.b.xyz;
@@ -382,6 +412,7 @@ kernel void paperClothSDFCollide(
     device PBDParticle*                 particles [[ buffer(0) ]],
     device const PBDCollider*           colliders [[ buffer(1) ]],
     constant PaperClothCollideUniforms& u         [[ buffer(2) ]],
+    device const float*                 sdf       [[ buffer(3) ]],   // the SDF volume, if any
     uint id [[ thread_position_in_grid ]]
 ) {
     if (id >= u.particleCount) return;
@@ -394,7 +425,7 @@ kernel void paperClothSDFCollide(
     float3 cn = float3(0, 1, 0);
     for (uint c = 0u; c < u.colliderCount; ++c) {
         float3 n;
-        float d = paperColliderDistance(pos, colliders[c], u.selfRadius, n);
+        float d = paperColliderDistance(pos, colliders[c], u.selfRadius, n, sdf);
         if (d < 0.0) {
             float disp = min(-d * u.stiffness, u.maxPush);
             pos  += n * disp;
@@ -418,6 +449,7 @@ kernel void paperStaticFriction(
     device const PBDCollider*  colliders [[ buffer(1) ]],
     constant PaperStickUniforms& u       [[ buffer(2) ]],
     device float4*             anchors   [[ buffer(3) ]],  // xyz anchor, w: 1 = armed
+    device const float*        sdf       [[ buffer(4) ]],  // the SDF volume, if any
     uint id [[ thread_position_in_grid ]]
 ) {
     if (id >= u.particleCount) return;
@@ -431,7 +463,7 @@ kernel void paperStaticFriction(
     float3 bestN = float3(0, 1, 0);
     for (uint c = 0u; c < u.colliderCount; ++c) {
         float3 n;
-        float  d = paperColliderDistance(pos, colliders[c], u.selfRadius, n);
+        float  d = paperColliderDistance(pos, colliders[c], u.selfRadius, n, sdf);
         if (d < bestD) { bestD = d; bestN = n; }
     }
     bool contact = bestD <= u.contactBand;
@@ -652,7 +684,16 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
         } else {
             corr = delta / float(hits);            // mean non-penetration position
             float cl = length(corr);
-            if (cl > u.radius) corr *= u.radius / cl;   // clamp to one radius / pass
+            // Clamp to one radius / pass — the LARGER of the two radii this kernel enforces. It
+            // clamped to `u.radius` (the same-sheet radius) alone, which was right while there was
+            // one radius; once `layerRadius` held stacked layers apart across a band of
+            // 2·layerRadius, a node deep in that band could still only be pushed back one SELF
+            // radius per pass. On Daydream Home's bed that is ~5 mm against a 20 mm band, while a
+            // throw landing on the duvet falls further than that per pass — so it never stopped,
+            // and 68-72 % of it ended up under the duvet (DH-0741). With `layerRadius` unset the
+            // clamp is `u.radius` exactly as before, so every other scene is unchanged.
+            float clampR = (u.layerRadius > 0.0) ? max(u.radius, u.layerRadius) : u.radius;
+            if (cl > clampR) corr *= clampR / cl;
         }
         P[id].positionAndInvMass.xyz = pos + corr;
         P[id].prevPositionAndPad.xyz = pi.prevPositionAndPad.xyz + corr * 0.5;  // bleed off inward velocity

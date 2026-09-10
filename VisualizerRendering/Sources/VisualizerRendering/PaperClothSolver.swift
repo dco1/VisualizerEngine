@@ -68,6 +68,11 @@ public final class PaperClothSolver {
     public let constraintBuffer: SimBuffer<PBDConstraint>
     private let colliderBuffer: SimBuffer<PBDCollider>
     private var colliderCount: Int = 0
+    /// Values for the one `PBDCollider.sdfVolume` this solver may hold. Both collide kernels bind
+    /// SOMETHING at the volume's index whether or not one is set, so an empty solver binds a dummy.
+    private var sdfVolumeBuffer: MTLBuffer?
+    private lazy var sdfDummyBuffer: MTLBuffer = device.makeBuffer(length: 16, options: .storageModeShared)!
+    private var sdfBinding: MTLBuffer { sdfVolumeBuffer ?? sdfDummyBuffer }
     private let lambdaBuffer:  MTLBuffer
     // Dihedral (cloth) bend — its own constraint type, λ buffer and uniforms.
     // Empty unless `configureSheets(dihedralCompliance:)` is given a value, so
@@ -93,6 +98,16 @@ public final class PaperClothSolver {
     private let hashUniformBuffer: MTLBuffer      // PaperHashUniforms
     private let selfSnapshotBuffer: MTLBuffer     // frozen copy read by paperSelfCollide
     public var selfCollisionEnabled: Bool = true
+    /// Run one more collider pass AFTER the per-frame self-collision, so a rigid collider always has
+    /// the final say on where a node ends up.
+    ///
+    /// Self-collision moves nodes too — one layer settling onto another pushes the lower one DOWN —
+    /// and it runs after the last substep's collide pass, so anything it pushes into a collider
+    /// stays there for whatever reads the particles next. Measured on Daydream Home's bed: duvet
+    /// nodes the collider should hold 5 mm off the drawn mattress read +0.8-1.8 mm under the
+    /// pillows, close enough for flat triangles to chord through the mattress's curved edge.
+    /// Off by default so every existing scene stays byte-identical.
+    public var collidersWinOverSelfCollision: Bool = false
     /// DEBUG A/B (VIZ_PAPER_LEGACY=1): reproduce the old summed/unclamped self-
     /// collision pushout + the old oversized radius, to measure the blowup the
     /// fix removes. Off in normal use.
@@ -269,8 +284,11 @@ public final class PaperClothSolver {
         let M = gridW * gridH
         let maxParticles = maxSheets * M
         // Upper bound on constraints per sheet: stretch (~2/vert) + shear
-        // (~2/vert) + skip-one bend (~2/vert) ≈ 6 per vertex.
-        let perSheet = gridW * gridH * 6
+        // (~2/vert) + skip-one bend (~2/vert) ≈ 6 per vertex, plus room for one
+        // envelope truss (a `Strut` costs ~5 per vertex across the PAIR — one
+        // upright and four diagonals — so ~2.5 per sheet, rounded to 3, which
+        // also leaves the old bound its slack rather than trimming it to 6).
+        let perSheet = gridW * gridH * 9
         let maxConstraints = maxSheets * perSheet
         let lambdaBytes = MemoryLayout<Float>.stride * max(maxConstraints, 1)
         // Dihedral hinges: one per quad (the shared "/" diagonal) + one per
@@ -384,11 +402,88 @@ public final class PaperClothSolver {
         /// Pin row 0 (the col-0..W-1 edge at the origin) in place — a hanging
         /// cloth. `false` = fully free (blown by wind).
         public var pinFirstRow: Bool
+        /// Per-node displacement along the sheet's own normal (`down × right`), row-major over
+        /// `gridW × gridH`. Empty (the default) lays the sheet out flat, as it always did.
+        ///
+        /// This exists so an ENVELOPE can be BUILT in its rest shape instead of snapped into it.
+        /// A stuffed bag's skins are not parallel planes — they meet at the seam — and laying them
+        /// out flat and letting a near-rigid seam close them on the first step injects the whole
+        /// violation as energy: measured, the pillows left the bed entirely and settled with
+        /// 1.4-2.7 m between their skins. It also makes the truss honest, because the diagonal
+        /// rest lengths are measured off the initial layout: with a flat layout they would encode
+        /// the shape of a bag that has never been stuffed.
+        public var nodeLift: [Float]
 
         public init(origin: SIMD3<Float>, right: SIMD3<Float>, down: SIMD3<Float>,
-                    sizeW: Float, sizeH: Float, pinFirstRow: Bool = false) {
+                    sizeW: Float, sizeH: Float, pinFirstRow: Bool = false,
+                    nodeLift: [Float] = []) {
             self.origin = origin; self.right = right; self.down = down
             self.sizeW = sizeW; self.sizeH = sizeH; self.pinFirstRow = pinFirstRow
+            self.nodeLift = nodeLift
+        }
+    }
+
+    /// TWO SHEETS SEWN INTO ONE STUFFED ENVELOPE — a pillow, a cushion, a duvet with baffles.
+    ///
+    /// A closed cloth bag under gravity collapses flat: nothing inside it pushes back. Real
+    /// bedding does not solve that with a pressure vessel, it solves it with STUFFING, and
+    /// stuffing is mechanically a field of soft compression springs between the two skins —
+    /// literally how baffle-box down construction is built. So that is what this is: one
+    /// distance constraint per grid cell between the corresponding particles of two sheets,
+    /// with a per-cell rest length (the envelope's loft profile) and a compliance (how soft
+    /// the filling is).
+    ///
+    /// It buys the thing a placed box can never have: the envelope SQUASHES where it is
+    /// loaded. A pillow set down on a mattress flattens against it and rises at its free
+    /// edge; one leaning on a headboard is compressed along the lean. None of that is
+    /// authored — it is what the struts do when one skin is pushed and the other is not.
+    ///
+    /// Colouring is free. Every strut touches exactly one particle of each sheet, and a sheet
+    /// belongs to at most one envelope, so no two struts in the family share a particle and
+    /// the whole family dispatches as ONE colour group.
+    public struct Strut {
+        /// The two sheets, by index into the `configureSheets` specs. Both must be the same
+        /// grid (they always are — the solver has one grid) and laid out in correspondence.
+        public var sheetA: Int, sheetB: Int
+        /// Rest distance between corresponding particles, row-major over `gridW × gridH`.
+        /// A seam is a cell whose rest length is ~0; the loft is the interior.
+        public var restLengths: [Float]
+        /// How soft each upright is, row-major over the same grid — NOT one number.
+        ///
+        /// A pillow is soft in the middle and SEWN at the edge, and those are different by orders
+        /// of magnitude. Given one compliance for the whole field, the value that makes the
+        /// stuffing yield also makes the seam yield, and a soft seam cannot pull the border closed
+        /// against the skins' own (stiff) in-plane constraints: the edge simply stays open at full
+        /// loft. Measured on the second bake — every node sat at its nominal loft including the
+        /// border ring, and the pillows rendered as rectangular prisms with flat vertical walls,
+        /// which is what both a person and the vision judge called out first.
+        ///
+        /// Closing the seam with a stiff constraint is also the honest model of how a pillow is
+        /// made: the panels are cut to a flat plan, and stuffing them pulls the perimeter IN, so
+        /// the finished bag is smaller in plan than its panels and bulges between the seams.
+        public var compliances: [Float]
+        /// How the filling resists SHEAR — the two skins sliding across each other.
+        ///
+        /// This is not a refinement, it is the difference between a pillow and a rag. A field of
+        /// distance constraints fixes how far apart the skins are and says NOTHING about which
+        /// way; the envelope is then a lattice of free hinges and it pancakes sideways under its
+        /// own weight, exactly like a parallelogram collapsing, while every strut stays happily
+        /// at its rest length. Measured on the first bake: the pillows read a healthy 180 mm of
+        /// "loft" and rendered as flat rags with a knot of bunched skin at the headboard — the
+        /// 180 mm was two skins 180 mm apart HORIZONTALLY.
+        ///
+        /// The fix is a truss. Four more families of diagonals — each skin's node to its
+        /// neighbour's opposite number, in ±x and ±y — triangulate every cell of the lattice, and
+        /// a triangulated lattice cannot shear without stretching something. Stuffing does the
+        /// same job in a real pillow: it is a solid that resists distortion, not a gas that only
+        /// resists compression.
+        public var shearCompliance: Float
+
+        public init(sheetA: Int, sheetB: Int, restLengths: [Float],
+                    compliances: [Float], shearCompliance: Float) {
+            self.sheetA = sheetA; self.sheetB = sheetB
+            self.restLengths = restLengths
+            self.compliances = compliances; self.shearCompliance = shearCompliance
         }
     }
 
@@ -422,7 +517,8 @@ public final class PaperClothSolver {
                                 restSlack: Float = 0,
                                 restSlackWavelength: Float = 0.4,
                                 restSlackSeed: UInt64 = 0x0DD5_EED0,
-                                restSlackNucleation: Float = 1.0) {
+                                restSlackNucleation: Float = 1.0,
+                                struts: [Strut] = []) {
         precondition(specs.count <= maxSheets, "configureSheets: \(specs.count) > maxSheets \(maxSheets)")
         let W = gridW, H = gridH, M = W * H
         sheetCount = specs.count
@@ -462,11 +558,15 @@ public final class PaperClothSolver {
         for spec in specs {
             let r = simd_normalize(spec.right)
             let d = simd_normalize(spec.down)
+            let n = simd_normalize(simd_cross(d, r))
+            precondition(spec.nodeLift.isEmpty || spec.nodeLift.count == M,
+                         "SheetSpec.nodeLift must be empty or gridW*gridH (\(M))")
             for y in 0..<H {
                 for x in 0..<W {
                     let fx = W > 1 ? Float(x) / Float(W - 1) : 0
                     let fy = H > 1 ? Float(y) / Float(H - 1) : 0
-                    let p = spec.origin + r * (spec.sizeW * fx) + d * (spec.sizeH * fy)
+                    var p = spec.origin + r * (spec.sizeW * fx) + d * (spec.sizeH * fy)
+                    if !spec.nodeLift.isEmpty { p += n * spec.nodeLift[y * W + x] }
                     let pinned = spec.pinFirstRow && y == 0
                     var particle = PBDParticle(position: p, invMass: pinned ? 0 : 1)
                     particle.prevPositionAndPad = SIMD4(p, 0)
@@ -551,6 +651,58 @@ public final class PaperClothSolver {
                 }
             }
         }
+        // ── Envelope struts (stuffing) ──
+        //
+        // FIVE groups, and every one of them is internally disjoint, so none needs colouring:
+        // the uprights (each particle used once), and the four diagonal families that triangulate
+        // the lattice. A diagonal family maps top(x,y) to bot(x±1,y) or bot(x,y±1) — one-to-one
+        // within the family, so no two of its constraints ever share a particle either.
+        //
+        // Diagonal rest lengths are MEASURED off the initial layout rather than derived from the
+        // loft and the cell size. The skins are laid out flat and parallel at t = 0, so the
+        // distance between two corresponding-ish nodes then IS the rest length of an undistorted
+        // envelope — and taking it from the geometry keeps it right when the loft profile varies
+        // across the bag, which it always does (it tapers to the seam).
+        if !struts.isEmpty {
+            var upright: [PBDConstraint] = []
+            var diagonals: [[PBDConstraint]] = Array(repeating: [], count: 4)
+            for st in struts {
+                precondition(st.restLengths.count == M && st.compliances.count == M,
+                             "Strut profiles must be gridW*gridH (\(M)), got \(st.restLengths.count)/\(st.compliances.count)")
+                precondition(st.sheetA < specs.count && st.sheetB < specs.count,
+                             "Strut sheet index out of range")
+                for y in 0..<H {
+                    for x in 0..<W {
+                        upright.append(PBDConstraint(i: gi(st.sheetA, x, y), j: gi(st.sheetB, x, y),
+                                                     restLength: st.restLengths[y * W + x],
+                                                     compliance: st.compliances[y * W + x]))
+                    }
+                }
+                func diagonal(_ family: Int, _ ax: Int, _ ay: Int, _ bx: Int, _ by: Int) {
+                    let a = gi(st.sheetA, ax, ay), b = gi(st.sheetB, bx, by)
+                    diagonals[family].append(
+                        PBDConstraint(i: a, j: b,
+                                      restLength: simd_length(particles[Int(b)].position
+                                                              - particles[Int(a)].position),
+                                      compliance: st.shearCompliance))
+                }
+                for y in 0..<H {
+                    for x in 0..<(W - 1) {
+                        diagonal(0, x, y, x + 1, y)
+                        diagonal(1, x + 1, y, x, y)
+                    }
+                }
+                for y in 0..<(H - 1) {
+                    for x in 0..<W {
+                        diagonal(2, x, y, x, y + 1)
+                        diagonal(3, x, y + 1, x, y)
+                    }
+                }
+            }
+            groups.append(upright)
+            groups += diagonals
+        }
+
         var all = [PBDConstraint](); all.reserveCapacity(groups.reduce(0) { $0 + $1.count })
         groupStart.removeAll(keepingCapacity: true)
         groupCount.removeAll(keepingCapacity: true)
@@ -725,6 +877,11 @@ public final class PaperClothSolver {
         // Inter-sheet (and self) collision — once per frame after the substeps.
         if selfCollisionEnabled, !killSelf, particleBuffer.count > 0 {
             encodeSelfCollide(cb)
+            // …and, when asked, the RIGID colliders get the last word. See
+            // `collidersWinOverSelfCollision`.
+            if collidersWinOverSelfCollision, colliderCount > 0, !killSDF {
+                encodeClothCollide(cb)
+            }
         }
         // Pack the deformed grid into the render buffers once per frame.
         encodeMeshPack(cb)
@@ -962,8 +1119,18 @@ public final class PaperClothSolver {
             pendingAnchorArm = false
             encodePass(cb, pipeline: stickPipeline,
                        buffers: [particleBuffer.buffer, colliderBuffer.buffer, stickUniformBuffer,
-                                 anchorBuffer],
+                                 anchorBuffer, sdfBinding],
                        count: particleBuffer.count, label: "PaperCloth.stick")
+        }
+    }
+
+    /// Upload the signed distances for the one `PBDCollider.sdfVolume` this solver may hold — the
+    /// way to collide cloth with a real mesh rather than primitives standing in for it. Laid out
+    /// x fastest, then y, then z, as `PBDCollider.sdfVolume`'s `dims` describe. Empty clears it.
+    public func setSDFVolume(_ values: [Float]) {
+        guard !values.isEmpty else { sdfVolumeBuffer = nil; return }
+        sdfVolumeBuffer = values.withUnsafeBytes { raw in
+            device.makeBuffer(bytes: raw.baseAddress!, length: raw.count, options: .storageModeShared)
         }
     }
 
@@ -1251,7 +1418,8 @@ public final class PaperClothSolver {
             selfRadius: clothThickness,
             friction: collideFriction)
         encodePass(cb, pipeline: clothCollidePipeline,
-                   buffers: [particleBuffer.buffer, colliderBuffer.buffer, clothCollideUniformBuffer],
+                   buffers: [particleBuffer.buffer, colliderBuffer.buffer, clothCollideUniformBuffer,
+                             sdfBinding],
                    count: particleBuffer.count, label: "PaperCloth.sdf")
     }
 
