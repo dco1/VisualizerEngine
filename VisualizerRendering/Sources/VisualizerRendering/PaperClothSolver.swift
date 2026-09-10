@@ -245,6 +245,20 @@ public final class PaperClothSolver {
     /// `dihedralCreepRate` per solver visit. Elastic-only bending gives every fold the
     /// same radius, which reads as rubber; creasing is what puts a crisp ridge on a
     /// waterfall fold. Defaults keep it OFF (elastic only) for every existing caller.
+    /// CHECKERBOARD the quad diagonals: quad (x,y) splits along "/" when x+y is even and "\"
+    /// when it is odd, instead of "/" everywhere. Read by `configureSheets` (hinges + render
+    /// triangulation), so set it BEFORE configuring.
+    ///
+    /// A lattice split one way everywhere is CHIRAL: a triangle mesh folds cleanly only along its
+    /// edges, so a fold running along "/" is one crease while its mirror image along "\" has to
+    /// zig-zag across every quad. A cloth hung over a box has one diagonal fold per corner, and the
+    /// four corners' folds run in both directions — so two corners fold crisply and the other two
+    /// fight the lattice. Measured on a bed's duvet: the two foot corners of one symmetric solve
+    /// settled differently (one clean, the other folded back into a knot with its tip jutting
+    /// 17 cm sideways), with nothing else on the bed. Alternating makes the lattice mirror-
+    /// symmetric. Off by default so existing scenes keep their exact settle.
+    public var alternatingDiagonals = false
+
     public var dihedralYieldAngle: Float = .pi
     public var dihedralCreepRate: Float = 0
     private let fixedDt: Float = 1.0 / 120.0
@@ -291,7 +305,7 @@ public final class PaperClothSolver {
         let perSheet = gridW * gridH * 9
         let maxConstraints = maxSheets * perSheet
         let lambdaBytes = MemoryLayout<Float>.stride * max(maxConstraints, 1)
-        // Dihedral hinges: one per quad (the shared "/" diagonal) + one per
+        // Dihedral hinges: one per quad (its diagonal) + one per
         // interior grid edge (both axes) < 3 per vertex.
         let maxBendConstraints = maxSheets * gridW * gridH * 3
         let bendLambdaBytes = MemoryLayout<Float>.stride * max(maxBendConstraints, 1)
@@ -719,7 +733,8 @@ public final class PaperClothSolver {
         //
         // One hinge per triangle pair of the render triangulation (see
         // buildIndexBuffer: quad (x,y) splits along the "/" diagonal
-        // (x,y+1)–(x+1,y)). Three families, each graph-coloured so no two
+        // (x,y+1)–(x+1,y), or — with `alternatingDiagonals` — along "\" on the
+        // odd squares of a checkerboard). Three families, each graph-coloured so no two
         // hinges in a dispatch share a particle:
         //   D — the quad's own diagonal.        Stencil 2×2   → 4 colours (x%2, y%2).
         //   V — interior vertical grid edges.   Stencil 3×2   → 6 colours (x%3, y%2).
@@ -733,20 +748,31 @@ public final class PaperClothSolver {
             }
             var bendGroups: [[PaperBendConstraint]] = Array(repeating: [], count: 16)
             for s in 0..<specs.count {
+                // Which way quad (x,y) is split — see `alternatingDiagonals`. Every wing below is
+                // the third vertex of the TRIANGLE that holds the hinge's edge, so it follows the
+                // split of the quad it lies in. The stencils do not grow (a wing never leaves its
+                // quad), so the colouring below is unchanged.
+                let alt = alternatingDiagonals
+                func back(_ x: Int, _ y: Int) -> Bool { alt && (x + y) % 2 == 1 }
                 for y in 0..<(H - 1) {
                     for x in 0..<(W - 1) {
-                        // D: shared "/" diagonal; wings are the quad's other corners.
-                        bendGroups[(x % 2) + 2 * (y % 2)].append(
-                            hinge(gi(s, x + 1, y), gi(s, x, y + 1), gi(s, x, y), gi(s, x + 1, y + 1)))
+                        // D: the quad's own diagonal; wings are its other two corners.
+                        bendGroups[(x % 2) + 2 * (y % 2)].append(back(x, y)
+                            ? hinge(gi(s, x, y), gi(s, x + 1, y + 1), gi(s, x, y + 1), gi(s, x + 1, y))
+                            : hinge(gi(s, x + 1, y), gi(s, x, y + 1), gi(s, x, y), gi(s, x + 1, y + 1)))
                         // V: edge (x,y)–(x,y+1) between quads (x-1,y) and (x,y).
                         if x >= 1 {
+                            let right = back(x, y) ? gi(s, x + 1, y + 1) : gi(s, x + 1, y)
+                            let left = back(x - 1, y) ? gi(s, x - 1, y) : gi(s, x - 1, y + 1)
                             bendGroups[4 + (x % 3) + 3 * (y % 2)].append(
-                                hinge(gi(s, x, y), gi(s, x, y + 1), gi(s, x + 1, y), gi(s, x - 1, y + 1)))
+                                hinge(gi(s, x, y), gi(s, x, y + 1), right, left))
                         }
                         // H: edge (x,y)–(x+1,y) between quads (x,y-1) and (x,y).
                         if y >= 1 {
+                            let below = back(x, y) ? gi(s, x + 1, y + 1) : gi(s, x, y + 1)
+                            let above = back(x, y - 1) ? gi(s, x, y - 1) : gi(s, x + 1, y - 1)
                             bendGroups[10 + (x % 2) + 2 * (y % 3)].append(
-                                hinge(gi(s, x, y), gi(s, x + 1, y), gi(s, x, y + 1), gi(s, x + 1, y - 1)))
+                                hinge(gi(s, x, y), gi(s, x + 1, y), below, above))
                         }
                     }
                 }
@@ -799,7 +825,11 @@ public final class PaperClothSolver {
                 let i10 = UInt32(y * W + x + 1)
                 let i01 = UInt32((y + 1) * W + x)
                 let i11 = UInt32((y + 1) * W + x + 1)
-                idx.append(contentsOf: [i00, i01, i10, i10, i01, i11])
+                if alternatingDiagonals && (x + y) % 2 == 1 {
+                    idx.append(contentsOf: [i00, i01, i11, i00, i11, i10])   // "\" split, same winding
+                } else {
+                    idx.append(contentsOf: [i00, i01, i10, i10, i01, i11])   // "/" split
+                }
             }
         }
         indexCount = idx.count
