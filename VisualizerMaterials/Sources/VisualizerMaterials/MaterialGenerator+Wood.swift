@@ -17,7 +17,11 @@ import Foundation
 /// the scattered gum fleck rather than the pore), and pine is not a hardwood at all — a conifer
 /// has no vessels to be porous WITH, so it has neither an open pore nor a ray fleck, and what
 /// identifies it instead is the violent density step from its pale earlywood to its hard dark
-/// latewood, and its knots.
+/// latewood, and its knots. Acacia is diffuse-to-semi-ring-porous like cherry, but its tell is
+/// neither pore nor gum — it's the wood itself: interlocked, wavy-grained growth throws a bolder,
+/// more irregular figure than a temperate hardwood, and a fast, uneven growth rate pairs pale
+/// honey sapwood against deep chocolate heartwood streaks in the SAME board, not just board to
+/// board.
 public enum WoodSpecies: String, CaseIterable, Codable, Sendable, Identifiable {
     /// American white oak — the hardwood floor.
     case oak
@@ -25,6 +29,8 @@ public enum WoodSpecies: String, CaseIterable, Codable, Sendable, Identifiable {
     case cherry
     /// Eastern white / southern yellow pine — the knotty softwood.
     case pine
+    /// Acacia — the wavy-grained, honey-to-chocolate live-edge wood.
+    case acacia
 
     public var id: String { rawValue }
 
@@ -33,6 +39,7 @@ public enum WoodSpecies: String, CaseIterable, Codable, Sendable, Identifiable {
         case .oak:    return "Oak"
         case .cherry: return "Cherry"
         case .pine:   return "Pine"
+        case .acacia: return "Acacia"
         }
     }
 
@@ -42,6 +49,7 @@ public enum WoodSpecies: String, CaseIterable, Codable, Sendable, Identifiable {
         case .oak:    return "Ring-porous — cathedral figure, open pore channels, honey brown."
         case .cherry: return "Diffuse-porous — fine closed grain, warm red-brown, gum flecks."
         case .pine:   return "Softwood — pale cream, hard dark latewood bands, knotty."
+        case .acacia: return "Interlocked, wavy grain — honey sapwood against chocolate streaks."
         }
     }
 
@@ -52,6 +60,7 @@ public enum WoodSpecies: String, CaseIterable, Codable, Sendable, Identifiable {
         case .oak:    return 3
         case .cherry: return 23
         case .pine:   return 41
+        case .acacia: return 59
         }
     }
 
@@ -60,6 +69,7 @@ public enum WoodSpecies: String, CaseIterable, Codable, Sendable, Identifiable {
         case .oak:    return .whiteOak
         case .cherry: return .blackCherry
         case .pine:   return .knottyPine
+        case .acacia: return .acacia
         }
     }
 }
@@ -359,6 +369,40 @@ struct WoodRecipe: Sendable {
         roughBase: 0.44, roughSpread: 0.12, clearcoat: 0.07,
         relief: 1.5,
         microCells: 30, microAspect: 4, microStrength: 0.18)
+
+    /// **Acacia, oiled.** The live-edge slab wood — a fast-grown, interlocked-grain tropical
+    /// hardwood, and its anatomy is genuinely different from the temperate species above, not
+    /// just darker or lighter:
+    ///
+    /// * **Board tone is the loudest in the library.** Acacia's heartwood/sapwood contrast is
+    ///   dramatic and shows up WITHIN a single slab, not only board to board — the same log can
+    ///   carry pale honey next to near-chocolate. `boardTone` is set well past oak's (0.11) and
+    ///   pine's (0.14) to carry that.
+    /// * **Interlocked grain reads as a bolder, more irregular figure — but the raw `distort`
+    ///   number is NOT comparable across species, exactly the trap the pine recipe's own note
+    ///   warns about**: the cathedral swing is `distort × 12 × 1.6 / (ringsPerMeter ×
+    ///   boardMeters)`, so the same `distort` buys more swing on a wood with fewer, wider rings.
+    ///   Acacia's rings are wider than oak's (see below), so `distort` here is LOWER than oak's
+    ///   0.30 on paper while landing at a bolder swing (~0.50, matching cherry's real cathedral)
+    ///   than oak's 0.43 — bold figure comes from the swing, not from typing a bigger number.
+    /// * **Semi-ring-porous, so it takes both dials down from oak's ring-porous extreme**: real
+    ///   pore channels (`pore`) but softer than oak, plus a scatter of the same dark mineral
+    ///   deposits ring-porous hardwoods throw (`gum` — same field cherry's gum flecks use, just
+    ///   less saturated).
+    /// * **A fast-grown plantation wood puts on wide, irregular rings** — `ringsPerMeter` below
+    ///   oak, `ringJitter` above it.
+    /// * **Furniture, not flooring — it takes an oiled/lacquered finish** with more sheen than
+    ///   oak's satin floor coat, so `clearcoat` sits closer to cherry's cabinet finish.
+    static let acacia = WoodRecipe(
+        earlywood: Vec3(0.56, 0.35, 0.17),
+        latewood:  Vec3(0.28, 0.15, 0.070),
+        ringsPerMeter: 78, ringJitter: 0.80, latewoodSharpness: 2.0, distort: 0.26,
+        pore: 0.55, ray: 0.15, gum: 0.20,
+        knotsPerSquareMeter: 0.35, knotRadius: 0.017, knotDarkness: 0.62,
+        boardTone: 0.20, jointDensity: 0.35,
+        roughBase: 0.32, roughSpread: 0.09, clearcoat: 0.15,
+        relief: 1.5,
+        microCells: 20, microAspect: 6, microStrength: 0.42)
 
     /// **Hard maple**, for the butcher-block counter's laminations. Not a picker species — a
     /// counter is not a finish you choose a tree for — but the same anatomy table, so it can't
