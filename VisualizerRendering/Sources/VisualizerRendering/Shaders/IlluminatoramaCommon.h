@@ -474,6 +474,17 @@ struct FrameUniforms {
     float    shadowTemperatureK;      // 6500 = no-op
     float    highlightTemperatureK;   // 6500 = no-op
     float    _padPhotoFinish;
+    // DH-0715 — live-lane look-match: a cheap HDR-domain approximation of the
+    // photo lane's RT bounce-GI + RTAO passes, for hosts that can't afford the
+    // real thing live (see `IlluminatoramaTonemap.metal`'s use of these). Applied
+    // BEFORE white-balance/exposure/ACES/grade — see that file for why. 0 (the
+    // default) ⇒ the branch never runs ⇒ byte-identical for every scene that
+    // never opts in. ONE new 16-byte cluster (stride 1552 → 1568); mirror of
+    // the Swift IlluminatoramaFrameUniforms.
+    float    liveLookMatchStrength;   // 0 = off (master enable/blend)
+    float    liveLookGIDarken;        // multiplier the fake-bounce term mixes toward, <1
+    float    liveLookGIWarmth;        // 0..1 blend toward the fake-bounce warm tilt
+    float    liveLookAODarken;        // multiplier the fake-AO term mixes toward, <1
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift

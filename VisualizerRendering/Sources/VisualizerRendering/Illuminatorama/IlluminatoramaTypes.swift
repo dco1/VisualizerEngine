@@ -545,6 +545,13 @@ public struct IlluminatoramaFrameUniforms {
     /// ONE new 16-byte cluster (stride 1536 → 1552); mirror of the Metal `FrameUniforms`.
     public var highlightTemperatureK: Float = 6500
     public var _padPhotoFinish: Float = 0
+    // DH-0715 — live-lane look-match (see `IlluminatoramaTonemap.metal`). 0
+    // (default) ⇒ byte-identical for every scene that never opts in. ONE new
+    // 16-byte cluster (stride 1552 → 1568); mirror of the Metal `FrameUniforms`.
+    public var liveLookMatchStrength: Float = 0
+    public var liveLookGIDarken: Float = 0
+    public var liveLookGIWarmth: Float = 0
+    public var liveLookAODarken: Float = 0
 
     /// Fill the eight gain vectors from a flat 32-entry table, and stamp the enable.
     public mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {

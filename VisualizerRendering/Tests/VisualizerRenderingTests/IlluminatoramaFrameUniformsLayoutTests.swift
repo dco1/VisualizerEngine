@@ -30,13 +30,14 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
     /// `interiorRoomGain[8]` + `interiorRoomGainMeta`, NINE clusters: 32 gains packed four
     /// to a vector, one per light-layer bit, plus the enable word); 1536 → 1552 with the
     /// photographic-finish cluster (`highlightChromaRolloff` + the split-tone shadow /
-    /// highlight temperatures + a pad).
+    /// highlight temperatures + a pad); 1552 → 1568 with the DH-0715 live-lane look-match
+    /// cluster (`liveLookMatchStrength/GIDarken/GIWarmth/AODarken`).
     /// Verified against Metal by compiling a scratch kernel carrying
-    /// `static_assert(sizeof(FrameUniforms) == 1552)`, which holds while the same assert at
-    /// 1536 fails — i.e. the assert is live, not a tautology. (`offsetof` is not available
+    /// `static_assert(sizeof(FrameUniforms) == 1568)`, which holds while the same assert at
+    /// 1552 fails — i.e. the assert is live, not a tautology. (`offsetof` is not available
     /// in Metal; the tail offsets below are the Swift-side half of the check, and the fields
     /// are APPENDED, so stride pins them.)
-    private static let metalStride = 1552
+    private static let metalStride = 1568
 
     func testFrameUniformsStrideMatchesMetal() {
         XCTAssertEqual(MemoryLayout<IlluminatoramaFrameUniforms>.stride,
@@ -86,6 +87,12 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
         assertOffset(\.highlightChromaRolloff, 1536, "highlightChromaRolloff")
         assertOffset(\.shadowTemperatureK,     1540, "shadowTemperatureK")
         assertOffset(\.highlightTemperatureK,  1544, "highlightTemperatureK")
+        // DH-0715 — live-lane look-match: four scalars in ONE 16-byte cluster, so the
+        // offsets pin the packing the way the other appended clusters' do.
+        assertOffset(\.liveLookMatchStrength, 1552, "liveLookMatchStrength")
+        assertOffset(\.liveLookGIDarken,      1556, "liveLookGIDarken")
+        assertOffset(\.liveLookGIWarmth,      1560, "liveLookGIWarmth")
+        assertOffset(\.liveLookAODarken,      1564, "liveLookAODarken")
     }
 
     /// The packing the shader's `gains[b >> 2][b & 3]` assumes, held on the Swift side that

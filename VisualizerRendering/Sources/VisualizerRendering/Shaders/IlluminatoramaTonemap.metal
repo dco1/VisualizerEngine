@@ -717,6 +717,52 @@ fragment float4 illumi_tonemap_fs(
             mixed += flare * gain;
         }
     }
+
+    // ── DH-0715: live-lane look-match ──────────────────────────────────────────
+    // Cheap approximation of the photo lane's RT bounce-GI + RTAO passes for
+    // hosts that can't afford them live (Daydream Home measured +17–155% frame
+    // time for live RTAO alone, scaling with the ray count needed to look
+    // clean — see DH-0715/DH-0709). Applied HERE, in the HDR domain, BEFORE
+    // white-balance/exposure/ACES/the post-tonemap grade below — deliberately,
+    // so this reads as just more (or less) linear light and gets reshaped by
+    // whatever Visuals settings a scene has (exposure, white balance, contrast,
+    // shadows/highlights, saturation, split-tone) exactly the way real bounce
+    // light would, instead of this term overriding or double-applying on top
+    // of those controls. `liveLookMatchStrength` is 0 (default) for every
+    // scene that never opts in, and the host zeroes it whenever a still is
+    // being captured — the export always sees the real RT terms, never this.
+    if (frame.liveLookMatchStrength > 0.0) {
+        float lum = dot(mixed, float3(0.2126, 0.7152, 0.0722));
+        // GI's share. Measured (DH-0715): the still's real bounce pass reads
+        // DARKER at the SAME exposure, not brighter — ACES's shoulder
+        // compresses the wider dynamic range the bounce adds — and warmer,
+        // across essentially the WHOLE frame (a broad tonal shift, not just the
+        // deep shadows), a little more so in shadow/mid tones than in the very
+        // brightest pixels (bounce fills dark corners; it adds less to what's
+        // already lit). The 0.55 floor is load-bearing: a mask that fully
+        // vanishes toward highlights can't reach the measured (largely uniform)
+        // luma/warmth shift no matter how extreme `liveLookGIDarken` /
+        // `liveLookGIWarmth` go — calibration against DH-0715's target frame
+        // is what set this floor, not a physical derivation.
+        float giMask = frame.liveLookMatchStrength
+                     * mix(0.55, 1.0, 1.0 - smoothstep(0.0, 1.5, lum));
+        mixed *= mix(1.0, max(frame.liveLookGIDarken, 0.0), giMask);
+        // Warmth is a GAIN spread (not a blend toward a fixed tilt) so its strength scales
+        // continuously with `liveLookGIWarmth` rather than saturating once fully blended —
+        // calibration against DH-0715's target needed the R/B separation to go well past
+        // what a fixed small tilt could reach at blend 1.0.
+        float3 warmGain = float3(1.0 + 0.15 * frame.liveLookGIWarmth, 1.0,
+                                 1.0 - 0.15 * frame.liveLookGIWarmth);
+        mixed = mix(mixed, mixed * warmGain, giMask);
+        // RTAO's share: extra darkening keyed by the EXISTING AO visibility
+        // buffer (already bound below for the debug view; 1 = unoccluded) —
+        // shaped by real occlusion geometry, not a flat screen-wide tint.
+        constexpr sampler llmAO(filter::linear, address::clamp_to_edge, coord::normalized);
+        float occ = 1.0 - float(inAO.sample(llmAO, in.uv).r);
+        float aoMask = frame.liveLookMatchStrength * occ;
+        mixed *= mix(1.0, max(frame.liveLookAODarken, 0.0), aoMask);
+    }
+
     // Phase 4.21 — read the GPU-computed smoothed exposure from the
     // auto-exposure buffer when the host has the feature on; otherwise
     // fall back to the static scalar in FrameUniforms. The estimator

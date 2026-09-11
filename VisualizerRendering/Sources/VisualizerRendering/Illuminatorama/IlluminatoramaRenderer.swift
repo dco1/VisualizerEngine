@@ -1572,6 +1572,37 @@ public final class IlluminatoramaRenderer {
     /// the scene's own chroma rolls off toward white, and a controlled amount of
     /// warmth goes back in.
     public var highlightTemperatureK: Float = 6500
+
+    // ── DH-0715: live-lane look-match ─────────────────────────────────────────
+    /// Master enable/blend [0,1] for the live-lane approximation of the still's
+    /// RT bounce-GI + RTAO passes (`illumi_tonemap_fs`, applied in the HDR
+    /// domain BEFORE white-balance/exposure/ACES/grade — see that file for why
+    /// that ordering is what makes this compose with whatever Visuals settings
+    /// a scene has, rather than fighting them). 0 (default) = exact no-op. Hosts
+    /// gate this live-lane-only — a still keeps the real RT terms.
+    public var liveLookMatchStrength: Float = 0
+    /// Multiplier the fake-bounce term mixes toward in shadow/mid tones, <1.
+    /// The still's real GI reads DARKER at the same exposure (ACES's shoulder
+    /// compresses the wider dynamic range bounce adds), not brighter.
+    /// Calibrated 2026-09-11 against the DH-0715 media-console target frame
+    /// (`HouseRenderBridgeGPUTests_ExposureParity.testLiveLookMatchCalibrationSweep`):
+    /// closes ~80% of the measured live/photo luma gap. The residual (chroma
+    /// overshoots the target by ~12%, the shadow warm-shift closes ~45% of its
+    /// gap) is the honest limit of a global post-process standing in for a
+    /// spatially-varying RT simulation — see the sweep's printed table for the
+    /// full before/after.
+    public var liveLookGIDarken: Float = 0.44
+    /// Strength of the fake-bounce warm gain spread (push red up / blue down),
+    /// clamped [0, 4] — NOT a 0..1 blend fraction: it scales the tilt's own
+    /// magnitude continuously, since calibration against DH-0715's target
+    /// needed more R/B separation than a fixed tilt saturating at a 0..1 blend
+    /// could reach. Approximates bounced light picking up the room's own warm
+    /// materials.
+    public var liveLookGIWarmth: Float = 1.0
+    /// Multiplier the fake-AO term mixes toward, keyed by the EXISTING AO
+    /// visibility buffer (`inAO`) rather than a flat screen tint — extra
+    /// contact darkening approximating RTAO, riding on real occlusion geometry.
+    public var liveLookAODarken: Float = 0.70
     /// Opt-in hex-stochastic anti-tiling strength [0,1]. **Default 0 = OFF**, which
     /// is a hard no-op: the G-buffer shader short-circuits every textured sample to a
     /// single plain read, so scenes that leave this at 0 render byte-for-byte
@@ -12924,6 +12955,11 @@ public final class IlluminatoramaRenderer {
         u.highlightChromaRolloff = max(0, min(1, highlightChromaRolloff))
         u.shadowTemperatureK = max(1000, min(20000, shadowTemperatureK))
         u.highlightTemperatureK = max(1000, min(20000, highlightTemperatureK))
+        // DH-0715 — live-lane look-match. Strength 0 (default) ⇒ byte-identical.
+        u.liveLookMatchStrength = max(0, min(1, liveLookMatchStrength))
+        u.liveLookGIDarken = liveLookGIDarken
+        u.liveLookGIWarmth = max(0, min(4, liveLookGIWarmth))
+        u.liveLookAODarken = liveLookAODarken
         // Interior day-light separation. Mask 0 (default) ⇒ the kernel's factors stay
         // exactly 1.0 ⇒ byte-identical for every scene that never opts in.
         u.interiorMask = interiorLayerMask
