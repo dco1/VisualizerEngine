@@ -291,10 +291,26 @@ public final class IlluminatoramaMesh {
     //   • If a normal source is missing, normals are computed by averaging
     //     per-triangle face normals around each vertex (cheap; gives smooth
     //     shading on welded meshes, faceted shading on unwelded ones).
-    //   • Texture-coordinate source is optional — `(0, 0)` is used as a
-    //     stand-in. UVs only show up in the renderer today as a passthrough
-    //     to the fragment shader (which doesn't sample textures yet), so a
-    //     missing UV is harmless.
+    //   • Texture-coordinate source is optional. A missing texcoord source
+    //     used to fall back to a bare `(0, 0)` for every vertex on the
+    //     reasoning that "the renderer doesn't sample textures yet" — no
+    //     longer true (the material system samples real albedo/roughness/
+    //     normal textures at `in.uv`), and a single shared UV meant a
+    //     textured material sampled ONE texel for the whole mesh: a wood
+    //     grain, a tile pattern, anything with real texture variation
+    //     rendered as a flat, uniform colour (Danny, 2026-09-10, an
+    //     imported custom object with a wood finish showing no grain at
+    //     all). `triplanarUV(position:normal:)` synthesises a box-projected
+    //     UV instead — one texture repeat per metre, the SAME "prebaked at
+    //     1 m" convention every instanced placeable's own procedurally-
+    //     generated mesh already bakes (`ElementUVScale.furnitureSlice` /
+    //     `SurfaceTiling.prebaked(1.0)`), so a custom object tiles a wood/
+    //     tile/stone material at the same real-world scale a piece of
+    //     built-in furniture does. It is a hard per-vertex box projection,
+    //     not blended triplanar sampling — visible seams at the projection's
+    //     axis boundaries are the honest cost of a real per-pixel texture
+    //     where the source file authored none, and a strict improvement
+    //     over one flat colour.
     //   • Multi-element geometries collapse to their FIRST element. This
     //     means a multi-material `SCNGeometry` only renders its first
     //     submesh's material — workable for the common case where a node
@@ -437,16 +453,21 @@ public final class IlluminatoramaMesh {
             needsSynthNormals = (normals == nil)
             let normalArray = normals ?? Array(repeating: SIMD3<Float>(0, 1, 0),
                                                 count: positions.count)
-            let uvArray     = uvs     ?? Array(repeating: SIMD2<Float>(0, 0),
-                                                count: positions.count)
+            // No texcoord source at all: synthesise a box-projected UV from each vertex's own
+            // position + normal rather than stamping the same (0,0) on every vertex — see the
+            // header comment above this method. A *short* per-vertex source (uvs.count <
+            // positions.count) is left to fall back to (0,0) below as before; that is a rarer,
+            // differently-shaped defect (a malformed source) this fix isn't aimed at.
+            let uvArray     = uvs
             let colorArray  = colors  ?? Array(repeating: SIMD4<Float>(1, 1, 1, 1),
                                                 count: positions.count)
-            let uvCount = uvArray.count
+            let uvCount = uvArray?.count ?? 0
             let normalCount = normalArray.count
             let colorCount = colorArray.count
             for i in 0..<positions.count {
                 let n = i < normalCount ? normalArray[i] : SIMD3<Float>(0, 1, 0)
-                let uv = i < uvCount ? uvArray[i] : SIMD2<Float>(0, 0)
+                let uv = uvArray == nil ? triplanarUV(position: positions[i], normal: n)
+                    : (i < uvCount ? uvArray![i] : SIMD2<Float>(0, 0))
                 let c  = i < colorCount ? colorArray[i] : SIMD4<Float>(1, 1, 1, 1)
                 v.append(IlluminatoramaVertex(position: positions[i],
                                                normal: n,
@@ -715,6 +736,26 @@ public final class IlluminatoramaMesh {
         return out.count == count ? out : nil
     }
 
+    /// A box-projected UV for one vertex with no authored texcoord: pick the plane orthogonal to
+    /// the DOMINANT axis of `normal` and use the other two position components, directly in the
+    /// mesh's own local-space metres. That matches — deliberately, with no extra scale factor —
+    /// the "one texture repeat per metre" convention every instanced placeable's own procedurally-
+    /// generated mesh already bakes its UV at (`ElementUVScale.furnitureSlice`, `SurfaceTiling
+    /// .prebaked(1.0)`): a custom object with no UV of its own now tiles a picked material at the
+    /// same real-world scale a piece of built-in furniture does, rather than at an arbitrary one.
+    ///
+    /// This is a hard per-vertex projection, not blended triplanar sampling: two faces meeting
+    /// across a dominant-axis boundary can show a seam in the texture, same as it would with any
+    /// single-sample box projection. That is the honest cost of a real per-pixel texture on a
+    /// surface the source file never gave a UV unwrap — strictly better than the flat, textureless
+    /// colour every vertex sharing `(0, 0)` produced before.
+    private static func triplanarUV(position p: SIMD3<Float>, normal n: SIMD3<Float>) -> SIMD2<Float> {
+        let a = simd_abs(n)
+        if a.x >= a.y, a.x >= a.z { return SIMD2(p.z, p.y) }   // dominant ±X: project onto ZY
+        if a.y >= a.x, a.y >= a.z { return SIMD2(p.x, p.z) }   // dominant ±Y: project onto XZ
+        return SIMD2(p.x, p.y)                                  // dominant ±Z: project onto XY
+    }
+
     // ── Index conversion ──────────────────────────────────────────────────────
 
     /// DH-0742 — expand a "split-vertex" element (see the call site's comment) into a
@@ -792,7 +833,9 @@ public final class IlluminatoramaMesh {
         for k in 0..<cornerCount {
             let p = positions[Int(streams[posStream][k])]
             let n = normalStream.map { normals![Int(streams[$0][k])] } ?? SIMD3<Float>(0, 1, 0)
-            let uv = uvStream.map { uvs![Int(streams[$0][k])] } ?? SIMD2<Float>(0, 0)
+            // No texcoord stream at all: same box-projected fallback as the shared-index path
+            // above, not a shared (0,0) — see the header comment on `from(scnGeometry:...)`.
+            let uv = uvStream.map { uvs![Int(streams[$0][k])] } ?? triplanarUV(position: p, normal: n)
             let c = colorStream.map { colors![Int(streams[$0][k])] } ?? SIMD4<Float>(1, 1, 1, 1)
             verts.append(IlluminatoramaVertex(position: p, normal: n, uv: uv, color: c))
         }
