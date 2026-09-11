@@ -1584,25 +1584,38 @@ public final class IlluminatoramaRenderer {
     /// Multiplier the fake-bounce term mixes toward in shadow/mid tones, <1.
     /// The still's real GI reads DARKER at the same exposure (ACES's shoulder
     /// compresses the wider dynamic range bounce adds), not brighter.
-    /// Calibrated 2026-09-11 against the DH-0715 media-console target frame
-    /// (`HouseRenderBridgeGPUTests_ExposureParity.testLiveLookMatchCalibrationSweep`):
-    /// closes ~80% of the measured live/photo luma gap. The residual (chroma
-    /// overshoots the target by ~12%, the shadow warm-shift closes ~45% of its
-    /// gap) is the honest limit of a global post-process standing in for a
-    /// spatially-varying RT simulation — see the sweep's printed table for the
-    /// full before/after.
-    public var liveLookGIDarken: Float = 0.44
+    ///
+    /// **Calibrated 2026-09-11, TWICE.** First against one media-console frame
+    /// alone (0.44) — validated against 3 real Views × 4 `RenderStyle` presets
+    /// (12 combos) and found to close anywhere from 101% to 1668% of the
+    /// measured gap depending on scene/preset, because a flat constant has no
+    /// way to know how big the real gap actually is. `illumi_tonemap_fs` then
+    /// gained two adaptive normalizers (`gradeNorm` off `tonemapSaturation`,
+    /// `sceneNorm` off the auto-exposure EMA) so the term scales with the
+    /// scene and the Visuals dials instead of applying a fixed push, and this
+    /// is the REFIT against that shader (`HouseRenderBridgeGPUTests
+    /// _LiveLookMatchMatrix.testLiveLookMatchMultiSceneCalibration`, a 4-scene
+    /// joint fit spanning both saturation extremes and two very different
+    /// brightness profiles): total squared error 15.08 (no correction at all)
+    /// → 6.15 at this value, a real interior minimum (error rises again past
+    /// it in both directions), not a boundary artifact.
+    public var liveLookGIDarken: Float = 0.15
     /// Strength of the fake-bounce warm gain spread (push red up / blue down),
     /// clamped [0, 4] — NOT a 0..1 blend fraction: it scales the tilt's own
-    /// magnitude continuously, since calibration against DH-0715's target
-    /// needed more R/B separation than a fixed tilt saturating at a 0..1 blend
-    /// could reach. Approximates bounced light picking up the room's own warm
-    /// materials.
-    public var liveLookGIWarmth: Float = 1.0
+    /// magnitude continuously. **0 after the 2026-09-11 multi-scene refit**: the
+    /// joint fit across 4 scenes never preferred a nonzero value — the darken
+    /// term's own interaction with the existing post-ACES saturation lerp
+    /// already carries the chroma match, and adding an explicit R/B tilt on
+    /// top only overshot it. Left as a live lever (not deleted) in case a
+    /// future fit over more scenes finds it earns its keep after all.
+    public var liveLookGIWarmth: Float = 0.0
     /// Multiplier the fake-AO term mixes toward, keyed by the EXISTING AO
     /// visibility buffer (`inAO`) rather than a flat screen tint — extra
-    /// contact darkening approximating RTAO, riding on real occlusion geometry.
-    public var liveLookAODarken: Float = 0.70
+    /// contact darkening approximating RTAO, riding on real occlusion
+    /// geometry. Refit 2026-09-11 alongside `liveLookGIDarken` (see there) —
+    /// the error surface was nearly flat over [0.40, 0.70] here, so this
+    /// sits in the middle of that range rather than at the exact minimum.
+    public var liveLookAODarken: Float = 0.50
     /// Opt-in hex-stochastic anti-tiling strength [0,1]. **Default 0 = OFF**, which
     /// is a hard no-op: the G-buffer shader short-circuits every textured sample to a
     /// single plain read, so scenes that leave this at 0 render byte-for-byte

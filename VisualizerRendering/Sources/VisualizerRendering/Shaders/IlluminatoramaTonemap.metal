@@ -733,6 +733,39 @@ fragment float4 illumi_tonemap_fs(
     // being captured — the export always sees the real RT terms, never this.
     if (frame.liveLookMatchStrength > 0.0) {
         float lum = dot(mixed, float3(0.2126, 0.7152, 0.0722));
+
+        // ── Two adaptive normalizers, so a FIXED calibration doesn't ship as a flat
+        // constant (DH-0715, validated 2026-09-11 across 3 real Views × 4 Visuals
+        // presets — a constant closed anywhere from 101% to 1668% of the measured
+        // gap depending on scene and preset, including one scene/preset pair where
+        // the real gap was near zero and the constant still darkened it). Both read
+        // FrameUniforms fields already flowing into this exact shader — no new
+        // plumbing, no new pass.
+        //
+        // 1. GRADE normalizer — a preset's OWN saturation already does some of this
+        //    term's job, and `tonemapSaturation` re-amplifies whatever chroma this
+        //    term injects (the post-ACES saturation lerp above), so a punchier
+        //    preset (Cinematic 1.35, Dreamy 1.20) was compounding on top of an
+        //    already-strong grade while Moody (0.80, the one preset that landed
+        //    near 100% at the flat constant) barely got amplified at all. 0.80 is
+        //    Moody's own saturation — the fixed point where this normalizer is a
+        //    no-op, because that is the one preset the flat constant already fit.
+        float gradeNorm = clamp(0.80 / max(frame.tonemapSaturation, 0.3), 0.3, 1.6);
+
+        // 2. SCENE normalizer — how much light is actually IN this shot to bounce.
+        //    The auto-exposure system already computes exactly that signal: a
+        //    naturally bright room needs little gain (`smoothedExposure` low) and
+        //    has plenty of light for GI to redistribute; a naturally dim room needs
+        //    a big gain and has little to bounce. Reading it here (rather than
+        //    deriving a new frame-mean) is why this costs nothing extra — the
+        //    estimator kernel already ran this frame. Falls back to a no-op (1.0)
+        //    when auto-exposure is off, matching the read used below for `exposure`.
+        float sceneBrightness = (frame.autoExposureEnabled != 0u)
+                                ? expoState.smoothedExposure : 1.0;
+        float sceneNorm = clamp(1.0 / max(sceneBrightness, 0.15), 0.3, 2.2);
+
+        float adapt = gradeNorm * sceneNorm;
+
         // GI's share. Measured (DH-0715): the still's real bounce pass reads
         // DARKER at the SAME exposure, not brighter — ACES's shoulder
         // compresses the wider dynamic range the bounce adds — and warmer,
@@ -744,7 +777,7 @@ fragment float4 illumi_tonemap_fs(
         // luma/warmth shift no matter how extreme `liveLookGIDarken` /
         // `liveLookGIWarmth` go — calibration against DH-0715's target frame
         // is what set this floor, not a physical derivation.
-        float giMask = frame.liveLookMatchStrength
+        float giMask = frame.liveLookMatchStrength * adapt
                      * mix(0.55, 1.0, 1.0 - smoothstep(0.0, 1.5, lum));
         mixed *= mix(1.0, max(frame.liveLookGIDarken, 0.0), giMask);
         // Warmth is a GAIN spread (not a blend toward a fixed tilt) so its strength scales
@@ -756,10 +789,12 @@ fragment float4 illumi_tonemap_fs(
         mixed = mix(mixed, mixed * warmGain, giMask);
         // RTAO's share: extra darkening keyed by the EXISTING AO visibility
         // buffer (already bound below for the debug view; 1 = unoccluded) —
-        // shaped by real occlusion geometry, not a flat screen-wide tint.
+        // shaped by real occlusion geometry, not a flat screen-wide tint. Gets the
+        // same two normalizers: less contact grounding to fake in a scene/grade
+        // that already reads rich, more where it reads flat.
         constexpr sampler llmAO(filter::linear, address::clamp_to_edge, coord::normalized);
         float occ = 1.0 - float(inAO.sample(llmAO, in.uv).r);
-        float aoMask = frame.liveLookMatchStrength * occ;
+        float aoMask = frame.liveLookMatchStrength * adapt * occ;
         mixed *= mix(1.0, max(frame.liveLookAODarken, 0.0), aoMask);
     }
 
