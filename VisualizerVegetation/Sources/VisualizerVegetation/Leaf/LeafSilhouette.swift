@@ -168,10 +168,19 @@ extension LeafSilhouette {
     /// A big SIMPLE entire leaf, violin/obovate: narrow base, a gentle waist, then the broadest
     /// point high on the blade rounding over to a blunt tip. NO lobes or teeth — the fiddle-leaf
     /// fig's whole read is one large glossy sheet.
+    ///
+    /// The "gentle waist" this doc promised was never actually IN the curve: the old control
+    /// points (0.10,0.30)→(0.26,0.40)→(0.42,0.40) only widen then plateau — u never dips, so
+    /// there's no pinch for `(0.60, 0.60)`'s later widen to read AGAINST. A realism pass caught
+    /// this as a real, consistent complaint ("generic oval, lacks the waisted violin shape") across
+    /// every run, independent of colour/material/lighting changes — this is the actual geometric
+    /// fix for it. `(0.40, 0.30)` now sits BELOW its neighbours on both sides (`0.26→0.38` up,
+    /// `0.58→0.34` back down before the real flare), a genuine pinch, and the broad shoulder moved
+    /// later/wider (`0.80, 0.72`) so the leaf's iconic top-heavy flare reads more dramatically.
     public static let fiddleLeafFig = LeafSilhouette(
         name: "fiddleLeafFig",
-        hero: [(0.00, 0.00), (0.10, 0.30), (0.26, 0.40), (0.42, 0.40),
-               (0.60, 0.60), (0.78, 0.66), (0.92, 0.46), (1.00, 0.00)])
+        hero: [(0.00, 0.00), (0.12, 0.26), (0.26, 0.38), (0.40, 0.30),
+               (0.58, 0.34), (0.68, 0.55), (0.80, 0.72), (0.93, 0.48), (1.00, 0.00)])
 
     /// A broad blade cut by a few DEEP ROUNDED marginal splits — the stylized stand-in for the
     /// monstera's signature fenestration. The lobes ride high (~0.85) and the sinuses cut back to

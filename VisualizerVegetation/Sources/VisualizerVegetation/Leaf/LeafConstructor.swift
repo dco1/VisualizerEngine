@@ -81,13 +81,24 @@ public enum LeafConstructor {
     ///     drooping leaf reads as a solid 3D form beside the furniture instead of a paper cutout,
     ///     and it costs no extra triangles: it repositions the stations that already exist.
     ///   - winding: see `Winding`.
+    ///   - waveAmplitude: a gentle undulating RIPPLE on the margin — the width at each station is
+    ///     modulated by `1 + waveAmplitude·sin(v·waveFrequency·2π + wavePhase)`, applied identically
+    ///     to both sides so the leaf pinches/bulges symmetrically about the midrib rather than
+    ///     scalloping unevenly. `0` (the default) reproduces the old razor-straight margin exactly.
+    ///     A big SIMPLE entire leaf (fiddle-leaf fig) reads as die-cut plastic without this; keep it
+    ///     small (~0.05-0.10) — this is a ripple, not the lobed/serrated read `margin`'s own control
+    ///     points already carry, and a large value re-creates the DH-0628 "shard" look this
+    ///     constructor was built to kill.
     public static func emitBlade<Sink: LeafCardSink>(
         into sink: inout Sink,
         placement: Placement<Sink.Scalar>,
         margin: [LeafSilhouette.Control],
         fold: Sink.Scalar,
         curl: Sink.Scalar = 0,
-        winding: Winding
+        winding: Winding,
+        waveAmplitude: Sink.Scalar = 0,
+        waveFrequency: Double = 3.0,
+        wavePhase: Double = 0
     ) {
         guard margin.count >= 2 else { return }
 
@@ -106,12 +117,15 @@ public enum LeafConstructor {
                             v: v, u: 0, side: 0)
         }
         func edge(_ v: S, _ u: S, side: S) -> LeafStripVertex<S> {
+            let ripple = waveAmplitude == 0 ? S(1)
+                : S(1) + waveAmplitude * S(sin(Double(v) * waveFrequency * 2 * .pi + wavePhase))
+            let wu = u * ripple
             let p = base
                 + placement.yAxis * (h * v)
-                + placement.xAxis * (side * u * hw)
-                + bent * (u * hw * fold)
+                + placement.xAxis * (side * wu * hw)
+                + bent * (wu * hw * fold)
                 + droop(v)
-            return LeafStripVertex(position: p, v: v, u: u, side: side)
+            return LeafStripVertex(position: p, v: v, u: wu, side: side)
         }
 
         for side in [S(1), S(-1)] {
@@ -165,12 +179,16 @@ public enum LeafConstructor {
         subdivisions: Int = 1,
         fold: Sink.Scalar = Sink.Scalar(LeafConstructor.defaultFold),
         curl: Sink.Scalar = 0,
-        winding: Winding
+        winding: Winding,
+        waveAmplitude: Sink.Scalar = 0,
+        waveFrequency: Double = 3.0,
+        wavePhase: Double = 0
     ) {
         emitBlade(into: &sink,
                   placement: placement,
                   margin: silhouette.margin(tier: tier, subdivisions: subdivisions),
-                  fold: fold, curl: curl, winding: winding)
+                  fold: fold, curl: curl, winding: winding,
+                  waveAmplitude: waveAmplitude, waveFrequency: waveFrequency, wavePhase: wavePhase)
     }
 }
 
