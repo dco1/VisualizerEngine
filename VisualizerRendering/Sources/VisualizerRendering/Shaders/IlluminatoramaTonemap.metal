@@ -777,7 +777,32 @@ fragment float4 illumi_tonemap_fs(
         // luma/warmth shift no matter how extreme `liveLookGIDarken` /
         // `liveLookGIWarmth` go — calibration against DH-0715's target frame
         // is what set this floor, not a physical derivation.
-        float giMask = frame.liveLookMatchStrength * adapt
+        //
+        // `blownGuard` is a SEPARATE, much higher-range cutoff from the 0…1.5 shape above,
+        // and it is load-bearing for a different reason: `HouseRenderBridgeGPUTests
+        // _BloomProfile` caught the 0.55 floor applying to a directly-EMISSIVE, deliberately
+        // blown lamp shade too — this term approximates INDIRECT bounce, which is a small
+        // addition on top of already-intense direct/emissive light, not a discount on the
+        // source itself.
+        //
+        // A first cut thresholded raw pre-exposure `lum` and still failed that gate — this
+        // fixture blows its lamp out through EXPOSURE, not through an extreme raw HDR
+        // magnitude, so "is this pixel headed for white" cannot be judged before exposure is
+        // even applied. `exposedLum` estimates the value ACES will actually see (lum ×
+        // whatever this frame's exposure is, auto or manual — same read `sceneNorm` already
+        // uses, so no new cost), and the guard is keyed to THAT instead: ACES's shoulder
+        // starts compressing meaningfully around 1.0 (the 18%-grey reference) and a source
+        // pushing several stops past it is unambiguously headed for a clip regardless of
+        // scene/grade, which is the scale-invariant version of "is this blown".
+        float exposedLum = lum * sceneBrightness * frame.exposure;
+        // Empirically re-tuned against `HouseRenderBridgeGPUTests_BloomProfile`: a
+        // blownGuard(1.2, 3.0) diagnostic came back byte-identical to blownGuard=0 — the
+        // deliberately-blown lamp's own `exposedLum` sits BELOW 1.2, not above 3.0, so that
+        // range never engaged at all. `frame.bloomThreshold` (the actual "is this blown"
+        // dial every preset ships, 0.7–1.2) is the right scale to anchor to instead of a
+        // guessed multiple of the 18%-grey reference.
+        float blownGuard = 1.0 - smoothstep(0.5 * frame.bloomThreshold, 1.0 * frame.bloomThreshold, exposedLum);
+        float giMask = frame.liveLookMatchStrength * adapt * blownGuard
                      * mix(0.55, 1.0, 1.0 - smoothstep(0.0, 1.5, lum));
         mixed *= mix(1.0, max(frame.liveLookGIDarken, 0.0), giMask);
         // Warmth is a GAIN spread (not a blend toward a fixed tilt) so its strength scales
@@ -794,7 +819,7 @@ fragment float4 illumi_tonemap_fs(
         // that already reads rich, more where it reads flat.
         constexpr sampler llmAO(filter::linear, address::clamp_to_edge, coord::normalized);
         float occ = 1.0 - float(inAO.sample(llmAO, in.uv).r);
-        float aoMask = frame.liveLookMatchStrength * adapt * occ;
+        float aoMask = frame.liveLookMatchStrength * adapt * blownGuard * occ;
         mixed *= mix(1.0, max(frame.liveLookAODarken, 0.0), aoMask);
     }
 
