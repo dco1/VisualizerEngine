@@ -177,10 +177,20 @@ extension LeafSilhouette {
     /// fix for it. `(0.40, 0.30)` now sits BELOW its neighbours on both sides (`0.26→0.38` up,
     /// `0.58→0.34` back down before the real flare), a genuine pinch, and the broad shoulder moved
     /// later/wider (`0.80, 0.72`) so the leaf's iconic top-heavy flare reads more dramatically.
+    ///
+    /// The shoulder-to-tip run originally dropped `0.80→0.93` in ONE step (swing `-0.24`) then
+    /// `0.93→1.00` in another (`-0.48`, the universal tip taper) — two aggressive pull-ins back to
+    /// back read as a sharp beak, not the soft rounded-over tip of a real fiddle-leaf-fig blade
+    /// (the same "spiky, not lobed" mechanism the monstera fix above documents: a swing this size
+    /// still turns a real corner AT the control point no matter how much subdivision smooths the
+    /// path between two of them). Splitting it into `0.80→0.87→0.93` (swings `-0.10`/`-0.14`, both
+    /// inside the ~0.12-0.20 range that reads rounded) gives the tip one more station to round
+    /// through before the expected final taper to the point.
     public static let fiddleLeafFig = LeafSilhouette(
         name: "fiddleLeafFig",
         hero: [(0.00, 0.00), (0.12, 0.26), (0.26, 0.38), (0.40, 0.30),
-               (0.58, 0.34), (0.68, 0.55), (0.80, 0.72), (0.93, 0.48), (1.00, 0.00)])
+               (0.58, 0.34), (0.68, 0.55), (0.80, 0.72), (0.87, 0.62),
+               (0.93, 0.48), (1.00, 0.00)])
 
     /// A broad blade with a few gentle rounded lobes — the stylized stand-in for the monstera's
     /// signature fenestration.
