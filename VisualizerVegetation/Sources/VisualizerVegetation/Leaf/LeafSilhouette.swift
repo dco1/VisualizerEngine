@@ -182,15 +182,22 @@ extension LeafSilhouette {
         hero: [(0.00, 0.00), (0.12, 0.26), (0.26, 0.38), (0.40, 0.30),
                (0.58, 0.34), (0.68, 0.55), (0.80, 0.72), (0.93, 0.48), (1.00, 0.00)])
 
-    /// A broad blade cut by a few DEEP ROUNDED marginal splits — the stylized stand-in for the
-    /// monstera's signature fenestration. The lobes ride high (~0.85) and the sinuses cut back to
-    /// ~0.38 (deep, but the blade stays connected — a split, not a serration), so after smoothing
-    /// it reads as a big lobed tropical leaf, not a spiky maple.
+    /// A broad blade with a few gentle rounded lobes — the stylized stand-in for the monstera's
+    /// signature fenestration.
+    ///
+    /// The PREVIOUS curve swung u by 0.44-0.48 between adjacent control points (0.86 → 0.42 → 0.88
+    /// → 0.40 → 0.82 → 0.40) — Catmull-Rom subdivision smooths the PATH between two points, but it
+    /// threads THROUGH every control point, so a swing that sharp still turns a genuine corner AT
+    /// each one; "smoothing" the segments between two spikes doesn't blunt the spikes themselves.
+    /// The result rendered as a spiky star/urchin, not a lobed tropical leaf, confirmed both by a
+    /// realism pass and by direct visual inspection (DH-0775). Halving the swing to ~0.12-0.20 per
+    /// step is what actually reads as ROUNDED lobes with shallow scalloped valleys between them —
+    /// still a wavy, lobed margin (not a plain oval), just without the sharp reversal at each peak.
     public static let monstera = LeafSilhouette(
         name: "monstera",
-        hero: [(0.00, 0.00), (0.08, 0.58), (0.20, 0.86), (0.32, 0.42),
-               (0.44, 0.88), (0.56, 0.40), (0.68, 0.82), (0.80, 0.40),
-               (0.91, 0.56), (1.00, 0.00)])
+        hero: [(0.00, 0.00), (0.10, 0.52), (0.22, 0.68), (0.34, 0.56),
+               (0.46, 0.74), (0.58, 0.58), (0.70, 0.66), (0.82, 0.50),
+               (0.92, 0.32), (1.00, 0.00)])
 
     /// A short, fat, very rounded fleshy paddle (jade / echeveria): widens fast to a broad rounded
     /// middle, then rounds over to a blunt tip. Entire margin.
