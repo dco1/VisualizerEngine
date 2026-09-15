@@ -927,12 +927,20 @@ public final class IlluminatoramaRenderer {
     // read this CACHED radiance at their hit (multi-bounce, accumulated over
     // frames) instead of re-shading sun-only — richer indirect + cheaper hits.
     // Requires `rtEnabled` (shares the AS). No-op without cards or RT support.
-    public var surfaceCacheEnabled: Bool = false
+    public var surfaceCacheEnabled: Bool = false {
+        // DH-0622 — turning the cache on over an existing atlas must not read light from whenever it
+        // was last updated (a second export after the sun moved): warm it fresh, like a new bake.
+        didSet { if surfaceCacheEnabled && !oldValue { surfCacheWarmPending = max(0, surfaceCacheWarmIterations) } }
+    }
     /// Indirect rays per atlas texel in the update pass (multi-bounce gather).
     public var surfCacheIndirectRays: Int = 4
     /// Temporal EMA blend for the cache update — fraction of the new radiance
     /// folded in each frame. Lower = smoother/slower convergence.
     public var surfCacheAlpha: Float = 0.1
+    /// Extra α = 1 cache updates run on the frame after cards bake or the cache turns on (DH-0622),
+    /// so a still that switches the cache on starts from a filled atlas instead of an empty one —
+    /// each update carries the light one bounce further. 0 (default) = none.
+    public var surfaceCacheWarmIterations: Int = 0
 
     // ── Depth of field ───────────────────────────────────────────────
     /// Lens-accurate DOF on the resolved HDR before bloom. Off = sharp everywhere.
@@ -3453,6 +3461,12 @@ public final class IlluminatoramaRenderer {
     private var surfAtlasW: Int = 1
     private var surfAtlasH: Int = 1
     private var surfFrameSeed: UInt32 = 0
+    /// The (TLAS topology, triangle budget) the cards were last baked — or skipped — for. Lets a
+    /// host turn the cache on over an already-built TLAS and get cards on the next frame, without
+    /// an over-budget scene re-attempting the bake every frame (DH-0622).
+    private var surfCacheBakeKey: Int?
+    /// Warm-up updates still owed by the latest bake or enable (DH-0622) — see `surfaceCacheWarmIterations`.
+    private var surfCacheWarmPending = 0
     /// The atlas the lighting/RT pass should READ this frame (current). Set by
     /// `encodeSurfaceCacheUpdate` after the ping-pong swap.
     private var surfCacheCurrentAtlas: MTLTexture? { surfUseAtlasA ? surfAtlasA : surfAtlasB }
@@ -3930,12 +3944,16 @@ public final class IlluminatoramaRenderer {
     /// used to gate live RT — so it gets its own cap. Past it the TLAS still
     /// runs (RT lighting intact); only the cache read is skipped.
     ///
-    /// `VIZ_ILLUMI_SURFCACHE_MAXTRIS` overrides it — an instrument, not a shipped setting, like
-    /// `VIZ_ILLUMI_RT_GROUPCAP`. The Debug Tester is ~90 k triangles, so without it a cache A/B
-    /// there compares two identical frames (DH-0622 measured exactly that: 0 cached hits).
-    private static let surfaceCacheMaxTrianglesTLAS: Int =
+    /// A host that turns the cache on for a real scene raises it: a furnished house is well past
+    /// 60 000 (4000 Sunset ~154 k), where the cache is skipped and the frame is identical to cache
+    /// off. Read at each TLAS topology build, so set it before the build that should bake cards.
+    /// `VIZ_ILLUMI_SURFCACHE_MAXTRIS` overrides the default — an instrument, like
+    /// `VIZ_ILLUMI_RT_GROUPCAP` (DH-0622 measured 0 cached hits on the ~90 k Debug Tester without it).
+    public var surfaceCacheMaxTriangles: Int =
         ProcessInfo.processInfo.environment["VIZ_ILLUMI_SURFCACHE_MAXTRIS"].flatMap { Int($0) } ?? 60_000
-    private static let surfaceCachePerTriTileSize: Int = 6
+    /// Atlas texels per side of a per-triangle card tile, read at each card bake. A large triangle's
+    /// texels span tens of cm at 6, which is what DH-0849 (light along junctions) is being A/B'd against.
+    public var surfaceCachePerTriangleTileSize: Int = 6
 
     /// Reset the RT auto-disable guard. Called on every scene attach (via
     /// `IlluminatoramaOverlay.setExtractedSceneRT`) so a freshly-shown scene
@@ -6365,6 +6383,7 @@ public final class IlluminatoramaRenderer {
         surfIndirectAtlasB = device.makeTexture(descriptor: texDesc)
         surfIndirectAtlasA?.label = "Illuminatorama.surfcache.indirectA"
         surfIndirectAtlasB?.label = "Illuminatorama.surfcache.indirectB"
+        surfCacheWarmPending = max(0, surfaceCacheWarmIterations)   // fresh textures are empty
         // Phase 5 / B1 — denoiser output (same descriptor; not ping-ponged). nil on
         // alloc failure just leaves consumers on the raw atlas (the filter no-ops).
         surfAtlasDenoised = device.makeTexture(descriptor: texDesc)
@@ -6928,28 +6947,16 @@ public final class IlluminatoramaRenderer {
         // re-frames every frame). Both require the per-triangle CPU maps.
         let incremental = (surfaceCacheIncremental || surfHasDeformingCards) && surfIncrementalReady
 
-        // Ping-pong swap at the START (mirrors DDGI): Current is what we write
-        // AND what the RT pass reads after we return; Previous is the bounce
-        // source. First frame after (re)alloc both are empty → indirect = 0.
-        surfUseAtlasA.toggle()
-        guard let curAtlas = surfCacheCurrentAtlas,
-              let prevAtlas = surfCachePreviousAtlas,
-              let curIndirect = surfCacheCurrentIndirectAtlas,
-              let prevIndirect = surfCachePreviousIndirectAtlas else { return }
+        // DH-0622 — WARM-UP. A freshly baked (or freshly enabled) atlas holds no light, and every
+        // bounce builds on the previous update's atlas, so at the normal blend a still's first frames
+        // carry almost none of the multi-bounce light — measured cold on 4000 Sunset: +2.7 % after one
+        // 32-frame export against a ~+22 % level-off. So the frame after a bake or an enable runs
+        // `surfaceCacheWarmIterations` extra updates at α = 1 first: each carries the light one bounce
+        // further, and the normal update then resumes smoothing from a filled atlas.
+        let warm = surfCacheWarmPending
+        surfCacheWarmPending = 0
 
-        surfFrameSeed &+= 1
-        var u = SurfCacheUniforms(
-            sunDir: SIMD4(simd_normalize(rtSunDirection), 0),
-            sunColor: SIMD4(rtSunColor, 0),
-            skyAmbient: SIMD4(ambientColor, 0),
-            atlasW: UInt32(surfAtlasW), atlasH: UInt32(surfAtlasH),
-            tileSize: UInt32(surfActiveTileSize), tilesPerRow: UInt32(surfTilesPerRow),
-            cardCount: UInt32(surfCardCount), triangleCount: UInt32(rtTriangleCount),
-            indirectRays: UInt32(max(1, min(16, surfCacheIndirectRays))),
-            frameSeed: surfFrameSeed,
-            alpha: max(0.02, min(1.0, surfCacheAlpha)), rayTMin: 0.004, maxDist: 60.0,
-            incrementalEnabled: incremental ? 1 : 0)
-        // DH-0653 — atlas reuse counter: report the previous frame's, arm this one's.
+        // DH-0653 — atlas reuse counter: report the previous frame's, arm this frame's final update.
         var atlasStats: MTLBuffer? = nil
         if Self.surfCacheStatsRequested {
             surfAtlasStatsBuffer = surfCounterBuffer(surfAtlasStatsBuffer, slots: 2,
@@ -6960,58 +6967,87 @@ public final class IlluminatoramaRenderer {
                     Self.recordSurfCacheStats(line)
                 }
                 atlasStats = sb
-                u.statsEnabled = 1
             }
         }
-        memcpy(surfCacheUniformBuffer.contents(), &u, MemoryLayout<SurfCacheUniforms>.stride)
 
-        guard let enc = timedComputeEncoder(cb, "surfcacheUpdate") else { return }
-        enc.label = "Illuminatorama.surfcache"
-        enc.setComputePipelineState(pipeline)
-        enc.setTexture(curAtlas, index: 0)
-        enc.setTexture(prevAtlas, index: 1)   // read access
-        enc.setTexture(prevAtlas, index: 2)   // sample access
-        enc.setTexture(equirectSky ?? dummySkyTexture, index: 3)
-        enc.setTexture(curIndirect, index: 4)    // DH-0622 — write: the indirect-only EMA
-        enc.setTexture(prevIndirect, index: 5)   // read
-        enc.setAccelerationStructure(accel, bufferIndex: 0)
-        enc.setBuffer(cards, offset: 0, index: 1)
-        enc.setBuffer(tc, offset: 0, index: 2)
-        enc.setBuffer(ta, offset: 0, index: 3)
-        enc.setBuffer(tcc, offset: 0, index: 4)
-        enc.setBuffer(surfCacheUniformBuffer, offset: 0, index: 5)
-        enc.setBuffer(crect, offset: 0, index: 6)
-        enc.setBuffer(txcard, offset: 0, index: 7)
-        enc.setBuffer(cdirty, offset: 0, index: 8)
-        // DH-0653 counters (buffer 10, both variants). Dummy = the dirty buffer, which
-        // the kernel never adds to while `statsEnabled` is 0.
-        enc.setBuffer(atlasStats ?? cdirty, offset: 0, index: 10)
-        if useTLAS {
-            // TLAS hit → global soup tri via soupTriBase[instance_id]+primitive_id.
-            // The TLAS references the BLASes, which reference the mesh vertex/index
-            // buffers (and the curve BLASes the pooled curve buffers) — all must
-            // be resident for the intersector.
-            enc.setBuffer(rtSoupTriBaseBuffer, offset: 0, index: 9)
-            for blas in rtBLASList { enc.useResource(blas, usage: .read) }
-            for blas in rtCurveBLASList { enc.useResource(blas, usage: .read) }
-            for buf in rtResidentBuffers { enc.useResource(buf, usage: .read) }
-        } else if let vb = rtVertexBuffer, let ib = rtIndexBuffer {
-            // Curve-only primitive AS at buffer(9) — the SOUP kernel's slot (the
-            // TLAS variant uses 9 for soupTriBase; different pipeline). Dummy =
-            // the triangle `accel` for the base (curve-free) variant.
-            enc.setAccelerationStructure((rtSoupCurvesActive ? rtSoupCurveAccel : nil) ?? accel, bufferIndex: 9)
-            enc.useResource(vb, usage: .read)
-            enc.useResource(ib, usage: .read)
-            // Curve AS + pool buffers the soup curve trace references (#60 item 7 incr. 2).
-            if rtSoupCurvesActive {
-                if let ca = rtSoupCurveAccel { enc.useResource(ca, usage: .read) }
-                if let p = rtSoupCurvePoolPoints { enc.useResource(p, usage: .read) }
-                if let r = rtSoupCurveRadii { enc.useResource(r, usage: .read) }
-                if let s = rtSoupCurveSegments { enc.useResource(s, usage: .read) }
+        for pass in 0...warm {
+            let warming = pass < warm
+            // Ping-pong swap at the START (mirrors DDGI): Current is what we write
+            // AND what the RT pass reads after we return; Previous is the bounce
+            // source. First frame after (re)alloc both are empty → indirect = 0.
+            surfUseAtlasA.toggle()
+            guard let curAtlas = surfCacheCurrentAtlas,
+                  let prevAtlas = surfCachePreviousAtlas,
+                  let curIndirect = surfCacheCurrentIndirectAtlas,
+                  let prevIndirect = surfCachePreviousIndirectAtlas else { return }
+
+            surfFrameSeed &+= 1
+            var u = SurfCacheUniforms(
+                sunDir: SIMD4(simd_normalize(rtSunDirection), 0),
+                sunColor: SIMD4(rtSunColor, 0),
+                skyAmbient: SIMD4(ambientColor, 0),
+                atlasW: UInt32(surfAtlasW), atlasH: UInt32(surfAtlasH),
+                tileSize: UInt32(surfActiveTileSize), tilesPerRow: UInt32(surfTilesPerRow),
+                cardCount: UInt32(surfCardCount), triangleCount: UInt32(rtTriangleCount),
+                indirectRays: UInt32(max(1, min(16, surfCacheIndirectRays))),
+                frameSeed: surfFrameSeed,
+                alpha: warming ? 1.0 : max(0.02, min(1.0, surfCacheAlpha)), rayTMin: 0.004, maxDist: 60.0,
+                incrementalEnabled: incremental ? 1 : 0)
+            if !warming, atlasStats != nil { u.statsEnabled = 1 }
+            memcpy(surfCacheUniformBuffer.contents(), &u, MemoryLayout<SurfCacheUniforms>.stride)
+
+            // Warm passes go untimed: the per-pass GPU timer holds 48 passes a frame.
+            guard let enc = warming ? cb.makeComputeCommandEncoder() : timedComputeEncoder(cb, "surfcacheUpdate")
+            else { return }
+            enc.label = warming ? "Illuminatorama.surfcache.warm" : "Illuminatorama.surfcache"
+            enc.setComputePipelineState(pipeline)
+            enc.setTexture(curAtlas, index: 0)
+            enc.setTexture(prevAtlas, index: 1)   // read access
+            enc.setTexture(prevAtlas, index: 2)   // sample access
+            enc.setTexture(equirectSky ?? dummySkyTexture, index: 3)
+            enc.setTexture(curIndirect, index: 4)    // DH-0622 — write: the indirect-only EMA
+            enc.setTexture(prevIndirect, index: 5)   // read
+            enc.setAccelerationStructure(accel, bufferIndex: 0)
+            enc.setBuffer(cards, offset: 0, index: 1)
+            enc.setBuffer(tc, offset: 0, index: 2)
+            enc.setBuffer(ta, offset: 0, index: 3)
+            enc.setBuffer(tcc, offset: 0, index: 4)
+            // Bytes per pass, not the shared uniform buffer: a buffer is read when the command buffer
+            // EXECUTES, so every pass encoded into this frame would see the last pass's α and seed.
+            enc.setBytes(&u, length: MemoryLayout<SurfCacheUniforms>.stride, index: 5)
+            enc.setBuffer(crect, offset: 0, index: 6)
+            enc.setBuffer(txcard, offset: 0, index: 7)
+            enc.setBuffer(cdirty, offset: 0, index: 8)
+            // DH-0653 counters (buffer 10, both variants). Dummy = the dirty buffer, which
+            // the kernel never adds to while `statsEnabled` is 0.
+            enc.setBuffer(atlasStats ?? cdirty, offset: 0, index: 10)
+            if useTLAS {
+                // TLAS hit → global soup tri via soupTriBase[instance_id]+primitive_id.
+                // The TLAS references the BLASes, which reference the mesh vertex/index
+                // buffers (and the curve BLASes the pooled curve buffers) — all must
+                // be resident for the intersector.
+                enc.setBuffer(rtSoupTriBaseBuffer, offset: 0, index: 9)
+                for blas in rtBLASList { enc.useResource(blas, usage: .read) }
+                for blas in rtCurveBLASList { enc.useResource(blas, usage: .read) }
+                for buf in rtResidentBuffers { enc.useResource(buf, usage: .read) }
+            } else if let vb = rtVertexBuffer, let ib = rtIndexBuffer {
+                // Curve-only primitive AS at buffer(9) — the SOUP kernel's slot (the
+                // TLAS variant uses 9 for soupTriBase; different pipeline). Dummy =
+                // the triangle `accel` for the base (curve-free) variant.
+                enc.setAccelerationStructure((rtSoupCurvesActive ? rtSoupCurveAccel : nil) ?? accel, bufferIndex: 9)
+                enc.useResource(vb, usage: .read)
+                enc.useResource(ib, usage: .read)
+                // Curve AS + pool buffers the soup curve trace references (#60 item 7 incr. 2).
+                if rtSoupCurvesActive {
+                    if let ca = rtSoupCurveAccel { enc.useResource(ca, usage: .read) }
+                    if let p = rtSoupCurvePoolPoints { enc.useResource(p, usage: .read) }
+                    if let r = rtSoupCurveRadii { enc.useResource(r, usage: .read) }
+                    if let s = rtSoupCurveSegments { enc.useResource(s, usage: .read) }
+                }
             }
+            dispatch(enc, pipeline: pipeline, width: surfAtlasW, height: surfAtlasH)
+            enc.endEncoding()
         }
-        dispatch(enc, pipeline: pipeline, width: surfAtlasW, height: surfAtlasH)
-        enc.endEncoding()
     }
 
     // Phase 5 / B1 — cache-domain à-trous denoiser. Mirror of the Metal
@@ -7319,6 +7355,15 @@ public final class IlluminatoramaRenderer {
             rtTLASTopologyHash = topo
         } else {
             rtConsecutiveRebuilds = 0   // stable topology this frame → reset
+            // DH-0622 — cards otherwise bake only in `rebuildRTAccel`, i.e. on a topology change,
+            // and turning the cache on is not one: a host that enables it over a live TLAS (a still
+            // switching it on at capture) would refit forever and never get a card. Bake once per
+            // (topology, budget); a scene over budget records its skip and does not retry.
+            let surfBakeKey = (topo &* 31 &+ surfaceCacheMaxTriangles) &* 31 &+ surfaceCachePerTriangleTileSize
+            if surfaceCacheEnabled, surfCacheBakeKey != surfBakeKey {
+                buildGroupedSurfaceSoup(total: instances.count)
+                surfCacheBakeKey = surfBakeKey
+            }
             // PERF (static-scene skip): the TLAS is world-space — a camera-only
             // frame refit it into a byte-identical AS while rewriting every
             // instance descriptor on the CPU first. When the opaque instances
@@ -7828,7 +7873,10 @@ public final class IlluminatoramaRenderer {
         // cache-UPDATE pass traces. Runs only on topology change (not per refit),
         // so an animated scene's moved geometry reads bounded-stale cache — lighting
         // still animates via the TLAS refit. Skipped (TLAS unaffected) past the cap.
-        if surfaceCacheEnabled { buildGroupedSurfaceSoup(total: total) }
+        if surfaceCacheEnabled {
+            buildGroupedSurfaceSoup(total: total)
+            surfCacheBakeKey = (rtTopologyHash() &* 31 &+ surfaceCacheMaxTriangles) &* 31 &+ surfaceCachePerTriangleTileSize
+        }
     }
 
     /// Build the grouped-order world-space soup + per-triangle cards + the
@@ -7842,9 +7890,9 @@ public final class IlluminatoramaRenderer {
         // Cost gate: the instance-expanded triangle count, not the per-mesh count.
         var expandedTris = 0
         for g in meshGroups { if let m = meshes[g.kind] { expandedTris += g.count * (m.indexCount / 3) } }
-        guard expandedTris > 0, expandedTris <= Self.surfaceCacheMaxTrianglesTLAS else {
-            if expandedTris > Self.surfaceCacheMaxTrianglesTLAS {
-                Self.log.notice("Surface cache (TLAS) skipped: \(expandedTris) tris > cap \(Self.surfaceCacheMaxTrianglesTLAS)")
+        guard expandedTris > 0, expandedTris <= surfaceCacheMaxTriangles else {
+            if expandedTris > surfaceCacheMaxTriangles {
+                Self.log.notice("Surface cache (TLAS) skipped: \(expandedTris) tris > cap \(self.surfaceCacheMaxTriangles)")
             }
             // Leave the cache off for this scene; the kernel gates on the uniform.
             surfCardCount = 0; rtSoupTriBaseBuffer = nil; rtSoupTriBaseCount = 0
@@ -8070,7 +8118,7 @@ public final class IlluminatoramaRenderer {
                 blockStarts: soupBase.map { Int($0) })
             setSurfaceCacheCards(cards: g.cards, triCard: g.triCard,
                                  triUVa: g.triUVa, triUVc: g.triUVc,
-                                 tileSize: Self.surfaceCachePerTriTileSize)
+                                 tileSize: surfaceCachePerTriangleTileSize)
             // #60 item 6 — invariance guard (DEBUG). The fold bakes ONE per-mesh UV
             // table into the shared BLAS; that's only correct if every instance block
             // of a mesh got the same frame-A/B layout above. Verify the first block of
