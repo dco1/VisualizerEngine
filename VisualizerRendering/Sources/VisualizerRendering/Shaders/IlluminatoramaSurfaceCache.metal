@@ -70,7 +70,10 @@ struct SurfCacheUniforms {
     // [0] (EMA-blended with its history — REUSED) or [1] (α = 1, history discarded —
     // REFRESHED). Set only while `VIZ_ILLUMI_SURFCACHE_STATS_PATH` is, so the
     // atomic add costs nothing in a normal frame.
-    uint   statsEnabled; uint _scPad0; uint _scPad1; uint _scPad2;
+    uint   statsEnabled;
+    // DH-0849 — 1 ⇒ an indirect ray that lands on the BACK of a card (the hit triangle's
+    // winding normal faces along the ray) brings back no light; see `sc_backFaceHit`.
+    uint   backFaceGuard; uint _scPad1; uint _scPad2;
 };
 
 // ── shared helpers (kept local; Metal has no cross-file linkage) ──────────────
@@ -180,6 +183,26 @@ static inline float3 sampleSurfCache(
     float3 albedo   = useB ? sc.albedoB.xyz   : sc.albedo.xyz;
     float3 emission = useB ? sc.emissionB.xyz : sc.emission.xyz;
     return albedo * irr + emission;
+}
+
+// DH-0849 — did an indirect ray strike the BACK of the hit triangle's card? A card stores the
+// irradiance arriving on its FRONT (winding-normal) side, and `sampleSurfCache` hands that back
+// whichever side the ray hit. A texel that can see a card's back is one the room cannot see —
+// a wall band inside the closed plenum above a ceiling deck, a sole below the floor — and reading
+// the deck's room-side light there lit those hidden bands, which GI hits at the crease then read
+// as a bright line. Frame pick is `sampleSurfCache`'s: frame B iff packed and the hit's reference
+// uvA is B's (1,1). Card normals are winding-derived (the soup's cross product, and the re-frame
+// kernels'), so this is the triangle's geometric side, not a shading normal.
+static inline bool sc_backFaceHit(uint prim, float3 dir,
+                                  const device SurfCard* cards,
+                                  const device uint*   triCard,
+                                  const device float4* triUVa)
+{
+    SurfCard sc = cards[triCard[prim]];
+    float4 a = triUVa[prim];
+    bool useB = sc.normal.w > 0.5 && (a.x + a.y > 1.0);
+    float3 n = useB ? sc.normalB.xyz : sc.normal.xyz;
+    return dot(n, dir) > 0.0;
 }
 
 // ── update kernel ────────────────────────────────────────────────────────────
@@ -306,6 +329,8 @@ kernel void illumi_surfcache_update(
         if (res.type == intersection_type::triangle) {
             uint prim = res.primitive_id;
             if (prim >= u.triangleCount) continue;
+            // DH-0849 — a back-face hit is occluded: no light, still one ray of the average.
+            if (u.backFaceGuard != 0u && sc_backFaceHit(prim, dir, cards, triCard, triUVa)) continue;
             indirect += sampleSurfCache(prevAtlasS, prim,
                                         res.triangle_barycentric_coord,
                                         cards, triCard, triUVa, triUVc,
@@ -461,6 +486,8 @@ kernel void illumi_surfcache_update_tlas(
         if (res.type == intersection_type::triangle) {
             uint prim = soupTriBase[res.instance_id] + res.primitive_id;
             if (prim >= u.triangleCount) continue;
+            // DH-0849 — kept line-for-line with the soup variant.
+            if (u.backFaceGuard != 0u && sc_backFaceHit(prim, dir, cards, triCard, triUVa)) continue;
             indirect += sampleSurfCache(prevAtlasS, prim,
                                         res.triangle_barycentric_coord,
                                         cards, triCard, triUVa, triUVc,

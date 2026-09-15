@@ -941,6 +941,12 @@ public final class IlluminatoramaRenderer {
     /// so a still that switches the cache on starts from a filled atlas instead of an empty one —
     /// each update carries the light one bounce further. 0 (default) = none.
     public var surfaceCacheWarmIterations: Int = 0
+    /// DH-0849 — an indirect ray in the cache update that strikes the BACK of a card (its triangle's
+    /// winding normal faces along the ray) brings back no light instead of that card's front-side
+    /// irradiance. Without it, wall bands hidden inside a closed plenum (above a ceiling deck, below a
+    /// floor) read the deck's room-side light off its back and glow, and GI hits at the crease pick
+    /// that up as a bright line. Changing it takes effect on the next update (the EMA re-converges).
+    public var surfaceCacheBackFaceGuard: Bool = true
 
     // ── Depth of field ───────────────────────────────────────────────
     /// Lens-accurate DOF on the resolved HDR before bloom. Off = sharp everywhere.
@@ -3216,8 +3222,8 @@ public final class IlluminatoramaRenderer {
         var atlasW: UInt32; var atlasH: UInt32; var tileSize: UInt32; var tilesPerRow: UInt32
         var cardCount: UInt32; var triangleCount: UInt32; var indirectRays: UInt32; var frameSeed: UInt32
         var alpha: Float; var rayTMin: Float; var maxDist: Float; var incrementalEnabled: UInt32 = 0
-        // DH-0653 — atlas reuse counter gate (+ pad to the Metal stride).
-        var statsEnabled: UInt32 = 0; var _scPad0: UInt32 = 0; var _scPad1: UInt32 = 0; var _scPad2: UInt32 = 0
+        // DH-0653 — atlas reuse counter gate; DH-0849 — back-face guard (+ pad to the Metal stride).
+        var statsEnabled: UInt32 = 0; var backFaceGuard: UInt32 = 0; var _scPad1: UInt32 = 0; var _scPad2: UInt32 = 0
     }
     private let surfCachePipeline: MTLComputePipelineState?
     /// §3 endpoint — TLAS-traced cache-update (traces the per-frame-refit instance
@@ -6994,6 +7000,7 @@ public final class IlluminatoramaRenderer {
                 alpha: warming ? 1.0 : max(0.02, min(1.0, surfCacheAlpha)), rayTMin: 0.004, maxDist: 60.0,
                 incrementalEnabled: incremental ? 1 : 0)
             if !warming, atlasStats != nil { u.statsEnabled = 1 }
+            u.backFaceGuard = surfaceCacheBackFaceGuard ? 1 : 0
             memcpy(surfCacheUniformBuffer.contents(), &u, MemoryLayout<SurfCacheUniforms>.stride)
 
             // Warm passes go untimed: the per-pass GPU timer holds 48 passes a frame.
