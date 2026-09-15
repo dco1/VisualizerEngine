@@ -213,7 +213,7 @@ static inline float filmFbm(float3 p) {
 }
 
 // `hitWorldNormal`, `secondaryLayerBits`, the textured-albedo tap
-// (`secondaryAlbedo` + `secondaryAtlasSample`) and `sampleSurfCacheRT` are shared —
+// (`secondaryAlbedo` + `secondaryAtlasSample`) and `sampleSurfCacheIndirectRT` are shared —
 // see IlluminatoramaSecondary.h. The albedo tap in particular is the term that
 // stopped the world behind a pane reading as flat slabs, and it is now the SAME
 // code the deferred reflection path runs.
@@ -392,24 +392,25 @@ static float3 shadeOpaqueHit(thread intersector<triangle_data, instancing>& isec
     SecondaryShadeParams p = glassSecondaryParams(u);
     float3 hitN = hitWorldNormal(iid, prim, st.sec.insts, st.sec.objNormal);
     if (dot(hitN, rd) > 0.0) hitN = -hitN;             // face the incoming ray
-    // Surface-cache-when-available: a resident card returns full multi-bounce L_out.
-    if (u.surfCacheEnabled != 0) {
-        uint gp = st.soupTriBase[iid] + prim;
-        uint hitCard = (gp < u.surfTriCount) ? st.triCard[gp] : 0xFFFFFFFFu;
-        bool resident = (hitCard != 0xFFFFFFFFu) && (st.surfCardRect[hitCard].z > 0.0);
-        if (resident) {
-            return sampleSurfCacheRT(surfAtlas, gp, bary, st.surfCards, st.triCard,
-                                     st.triUVa, st.triUVc, res.primitive_data,
-                                     st.surfCardRect, u.surfAtlasW, u.surfAtlasH);
-        }
-        if (hitCard != 0xFFFFFFFFu) {
-            return secondaryCardFallback(st.surfCards[hitCard], hitN,
-                                         secondaryLayerBits(iid, st.sec.insts), p, irrCube);
-        }
-    }
     SecondaryHit h;
     h.P = hitP; h.N = hitN; h.bary = bary;
     h.instanceID = iid; h.primitiveID = prim;
+    // DH-0622 — a surface-cache card supplies only the hit's multi-bounce indirect term; the
+    // hit is shaded by the one secondary shader either way. A non-resident card (budget
+    // streaming zeroed its rect) takes the fill estimate of the same light instead.
+    if (u.surfCacheEnabled != 0) {
+        uint gp = st.soupTriBase[iid] + prim;
+        uint hitCard = (gp < u.surfTriCount) ? st.triCard[gp] : 0xFFFFFFFFu;
+        if (hitCard != 0xFFFFFFFFu) {
+            float3 irr = (st.surfCardRect[hitCard].z > 0.0)
+                ? sampleSurfCacheIndirectRT(surfAtlas, gp, bary, st.triCard, st.triUVa, st.triUVc,
+                                            res.primitive_data, st.surfCardRect, u.surfAtlasW, u.surfAtlasH)
+                : secondaryIndirectFill(hitN, secondaryLayerBits(iid, st.sec.insts), p, irrCube);
+            float3 cacheTerm;
+            return shadeSecondarySurface(isect, accel, h, p, st.sec, irrCube, albedoAtlas, seed,
+                                         true, irr, cacheTerm);
+        }
+    }
     return shadeSecondarySurface(isect, accel, h, p, st.sec, irrCube, albedoAtlas, seed);
 }
 

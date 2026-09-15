@@ -8,17 +8,20 @@ using namespace raytracing;
 // A Lumen-style on-surface lit-radiance cache. Each static RT "card" (a planar
 // parallelogram — the room's floor / walls / ceiling / window jambs) owns a
 // tile in a ping-pong radiance atlas. Once per frame the update kernel re-lights
-// every atlas texel and EMA-blends it into the current atlas; the RT GI +
-// reflection rays then READ this cached radiance at their hit point instead of
-// re-shading sun-only. Two wins:
+// every atlas texel and EMA-blends it into the current atlas.
 //
 //   • Multi-bounce — the update's indirect term samples the PREVIOUS frame's
 //     atlas at its own ray hits, so light bounces accumulate frame over frame
 //     (direct sun on the floor this frame → indirect on the wall next frame →
 //     indirect on the ceiling the frame after …).
-//   • Cheaper hits — a GI/reflection ray hit becomes one atlas read instead of
-//     a re-shade + shadow ray; the shadow work is done once per atlas texel and
-//     amortised across every ray that lands on that surface.
+//   • Two atlases (DH-0622). The FULL atlas (direct + indirect) is what that
+//     feedback reads — a bounce needs the hit's whole outgoing radiance. The
+//     INDIRECT atlas (the same EMA of the indirect term alone) is what the RT GI,
+//     reflection and glass hits read: each hit is still shaded by the one
+//     secondary shader (textured albedo, sun + shadow ray, local lights, emission)
+//     and the cache adds only the multi-bounce term that shader lacks. A cached hit
+//     is RICHER than a re-shade, not cheaper — handing consumers the full atlas
+//     made a cached hit drop every point/spot light and texture instead.
 //
 // The cache is COARSE on purpose (low-res per-card tiles) — it only feeds
 // INDIRECT light (GI bounces + reflections of distant surfaces); primary
@@ -28,7 +31,7 @@ using namespace raytracing;
 // STRUCT / SAMPLER DUPLICATION: the `SurfCard` array is OWNED here (only the
 // update kernel reads card frames). The consumers — IlluminatoramaRT.metal and
 // IlluminatoramaRTInstanced.metal — carry only the per-triangle card-UV layout +
-// a `sampleSurfCacheRT()` copy that reads `triCard`/`triUVa`/`triUVc` + the
+// an atlas-sampler copy that reads `triCard`/`triUVa`/`triUVc` + the
 // atlas. Because a hit's barycentric→UV routes to the correct half of a packed
 // tile, the samplers are AGNOSTIC to the A/B split and don't change for P3 — but
 // keep the UV-layout + atlas-indexing math in lockstep across all three files,
@@ -204,6 +207,8 @@ kernel void illumi_surfcache_update(
     // cards beneath). Bound to `accel` as a harmless dummy for the base variant.
     primitive_acceleration_structure  curveAccel  [[buffer(9)]],
     device atomic_uint*               atlasStats  [[buffer(10)]],  // DH-0653: [0] reused, [1] refreshed (gated)
+    texture2d<float, access::write>   outIndirect   [[texture(4)]],   // DH-0622: what the consumers read
+    texture2d<float, access::read>    prevIndirectR [[texture(5)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.atlasW || gid.y >= u.atlasH) return;
@@ -332,6 +337,12 @@ kernel void illumi_surfcache_update(
     float newL = sc_luminance(newIrr);
     float outM2 = mix(prevTexel.a, newL * newL, alpha);
     outAtlas.write(float4(outIrr, outM2), gid);
+    // DH-0622 — the indirect term alone, same α (a dirty card resets both in lockstep), with
+    // its OWN luminance² in .a, so the consumer-side denoiser keys off the variance of the
+    // term the consumers actually read.
+    float4 prevInd = prevIndirectR.read(gid);
+    float indL = sc_luminance(indirect);
+    outIndirect.write(float4(mix(prevInd.rgb, indirect, alpha), mix(prevInd.a, indL * indL, alpha)), gid);
 }
 
 // ── update kernel — TLAS-traced variant (§3 endpoint) ─────────────────────────
@@ -367,6 +378,8 @@ kernel void illumi_surfcache_update_tlas(
     const device uint*                cardDirty   [[buffer(8)]],
     const device uint*                soupTriBase [[buffer(9)]],   // TLAS (inst,prim) → global soup tri
     device atomic_uint*               atlasStats  [[buffer(10)]],  // DH-0653: [0] reused, [1] refreshed (gated)
+    texture2d<float, access::write>   outIndirect   [[texture(4)]],   // DH-0622: what the consumers read
+    texture2d<float, access::read>    prevIndirectR [[texture(5)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.atlasW || gid.y >= u.atlasH) return;
@@ -472,6 +485,12 @@ kernel void illumi_surfcache_update_tlas(
     float newL = sc_luminance(newIrr);
     float outM2 = mix(prevTexel.a, newL * newL, alpha);
     outAtlas.write(float4(outIrr, outM2), gid);
+    // DH-0622 — the indirect term alone, same α (a dirty card resets both in lockstep), with
+    // its OWN luminance² in .a, so the consumer-side denoiser keys off the variance of the
+    // term the consumers actually read.
+    float4 prevInd = prevIndirectR.read(gid);
+    float indL = sc_luminance(indirect);
+    outIndirect.write(float4(mix(prevInd.rgb, indirect, alpha), mix(prevInd.a, indL * indL, alpha)), gid);
 }
 
 // ── Phase 5 / B1: cache-domain à-trous denoiser ──────────────────────────────

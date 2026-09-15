@@ -247,14 +247,15 @@ static inline float3 secondaryEmission(uint iid, const device RTInstanceData* in
 
 // ── Surface cache ────────────────────────────────────────────────────────────
 
-/// Outgoing radiance at a cached triangle hit: the atlas stores albedo-free
-/// IRRADIANCE, so reconstruct L_out = albedo·irr + emission from the card (a card
-/// seam is then not amplified by the albedo multiply). `primData` is the hit's
-/// `res.primitive_data`: non-null ⇒ the BLAS carries baked per-mesh card UVs
+/// The accumulated INDIRECT irradiance at a cached triangle hit (DH-0622): the
+/// multi-bounce term alone — albedo-free, no direct sun, no emission. Read from the
+/// indirect atlas, never the full one: the hit itself is shaded by
+/// `shadeSecondarySurface`, which takes this as its indirect term, so a cached and an
+/// uncached hit are one shading model differing only by that term. `primData` is the
+/// hit's `res.primitive_data`: non-null ⇒ the BLAS carries baked per-mesh card UVs
 /// (#60 item 6) and the `triUVa`/`triUVc` dependent loads (32 B/hit) are skipped.
-static inline float3 sampleSurfCacheRT(
+static inline float3 sampleSurfCacheIndirectRT(
     texture2d<float, access::sample> atlas, uint prim, float2 bary,
-    const device SurfCard* cards,
     const device uint* triCard, const device float4* triUVa, const device float4* triUVc,
     const device void* primData, const device float4* cardRect, uint atlasW, uint atlasH)
 {
@@ -274,13 +275,7 @@ static inline float3 sampleSurfCacheRT(
     uv = clamp(uv, inset, 1.0 - inset);
     float2 px = rect.xy + uv * rect.zw;
     constexpr sampler samp(filter::linear, address::clamp_to_edge);
-    float3 irr = atlas.sample(samp, px / float2(atlasW, atlasH)).rgb;
-    SurfCard sc = cards[card];
-    // Frame-B membership: frame A has uvA=(0,0) (sum 0), frame B has uvA=(1,1) (sum 2).
-    bool useB = sc.normal.w > 0.5 && (uvA.x + uvA.y > 1.0);
-    float3 albedo   = useB ? sc.albedoB.xyz   : sc.albedo.xyz;
-    float3 emission = useB ? sc.emissionB.xyz : sc.emission.xyz;
-    return albedo * irr + emission;
+    return atlas.sample(samp, px / float2(atlasW, atlasH)).rgb;
 }
 
 // ── What the shading needs, in one place per call site ───────────────────────
@@ -491,18 +486,6 @@ static inline float3 secondaryIndirectFill(float3 hitN, uint hitLayerBits,
     return irr + mix(p.skyAmbient * 0.4, p.skyAmbient, upness) * ambK;
 }
 
-/// Outgoing radiance of a surface-cache card that is KNOWN but not resident
-/// (budget streaming zeroed its atlas rect, so reading the atlas would sample
-/// (0,0)). Emission + the card's albedo under the same indirect fill a re-shade
-/// would get — never black, and never the exterior-strength flat ambient the
-/// deferred path used to substitute here.
-static inline float3 secondaryCardFallback(SurfCard card, float3 hitN, uint hitLayerBits,
-                                           SecondaryShadeParams p,
-                                           texturecube<float, access::sample> irrCube)
-{
-    return card.emission.xyz + card.albedo.xyz * secondaryIndirectFill(hitN, hitLayerBits, p, irrCube);
-}
-
 // ── Local lights ─────────────────────────────────────────────────────────────
 
 /// Local point + spot lights at a secondary hit — the same falloff and cone math
@@ -597,9 +580,12 @@ static inline float secondarySunVisibility(thread Isect& isect,
 /// zeroing the corresponding `SecondaryShadeParams` fields rather than by keeping a
 /// second copy of the body. That is the whole point of this function.
 ///
-/// Callers that have a resident surface-cache card should prefer it
-/// (`sampleSurfCacheRT` returns full multi-bounce radiance for one atlas read);
-/// this is the re-shade for everything the cache does not cover.
+/// A hit on a surface-cache card is shaded by THIS body too (DH-0622) — `cached` true,
+/// `cacheIndirect` the card's traced multi-bounce irradiance, which takes the place of
+/// the indirect fill (sky IBL + ambient): both estimate the same arriving light, and the
+/// traced one is the better estimate. Everything else — textured albedo, local lights,
+/// the sun and its shadow ray, emission — is evaluated exactly as for an uncached hit.
+/// `cacheTerm` receives `albedo · cacheIndirect`, the cache's share alone (debug term 8).
 template <typename Isect>
 static inline float3 shadeSecondarySurface(thread Isect& isect,
                                            instance_acceleration_structure accel,
@@ -608,12 +594,15 @@ static inline float3 shadeSecondarySurface(thread Isect& isect,
                                            SecondaryScene sc,
                                            texturecube<float, access::sample> irrCube,
                                            texture2d_array<float, access::sample> albedoAtlas,
-                                           thread uint& seed)
+                                           thread uint& seed,
+                                           bool cached, float3 cacheIndirect,
+                                           thread float3& cacheTerm)
 {
     uint layerBits = secondaryLayerBits(h.instanceID, sc.insts);
     float3 A = secondaryAlbedo(h, p, sc, albedoAtlas);
     float3 rad = secondaryEmission(h.instanceID, sc.insts);
-    rad += A * secondaryIndirectFill(h.N, layerBits, p, irrCube);
+    cacheTerm = cached ? A * cacheIndirect : float3(0.0);
+    rad += cached ? cacheTerm : A * secondaryIndirectFill(h.N, layerBits, p, irrCube);
     rad += A * secondaryLocalLightFill(h.P, h.N, layerBits, p, sc);
     float3 Ld = normalize(p.sunDir);
     float nl = saturate(dot(h.N, Ld));
@@ -630,4 +619,20 @@ static inline float3 shadeSecondarySurface(thread Isect& isect,
         rad += A * (1.0 / M_PI_F) * p.sunColor * nl * vis;
     }
     return rad;
+}
+
+/// An uncached hit — the body above with no cache term.
+template <typename Isect>
+static inline float3 shadeSecondarySurface(thread Isect& isect,
+                                           instance_acceleration_structure accel,
+                                           SecondaryHit h,
+                                           SecondaryShadeParams p,
+                                           SecondaryScene sc,
+                                           texturecube<float, access::sample> irrCube,
+                                           texture2d_array<float, access::sample> albedoAtlas,
+                                           thread uint& seed)
+{
+    float3 cacheTerm;
+    return shadeSecondarySurface(isect, accel, h, p, sc, irrCube, albedoAtlas, seed,
+                                 false, float3(0.0), cacheTerm);
 }

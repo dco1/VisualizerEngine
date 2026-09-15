@@ -3430,10 +3430,15 @@ public final class IlluminatoramaRenderer {
         ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_DEFORM_CARDS"] == "1"
     private var surfAtlasA: MTLTexture?
     private var surfAtlasB: MTLTexture?
+    /// DH-0622 — the INDIRECT term alone, ping-ponged in lockstep with the full atlas. The
+    /// full atlas (direct + indirect) is only the update kernel's multi-bounce feedback; every
+    /// consumer (GI, reflection, glass) shades its hit itself and reads only this.
+    private var surfIndirectAtlasA: MTLTexture?
+    private var surfIndirectAtlasB: MTLTexture?
     // Phase 5 / B1 — cache-domain denoiser output. NOT ping-ponged: recomputed
-    // each frame from the just-updated current atlas (display-only; the EMA
-    // feedback keeps reading the raw atlas). Bound to the GI/reflection consumers
-    // in place of the current atlas when `surfaceCacheDenoise` is on.
+    // each frame from the just-updated current INDIRECT atlas (display-only; the EMA
+    // feedback keeps reading the raw atlases). Bound to the GI/reflection consumers
+    // in place of the current indirect atlas when `surfaceCacheDenoise` is on.
     private var surfAtlasDenoised: MTLTexture?
     private var surfUseAtlasA: Bool = true
     private let surfCacheUniformBuffer: MTLBuffer
@@ -3452,11 +3457,14 @@ public final class IlluminatoramaRenderer {
     /// `encodeSurfaceCacheUpdate` after the ping-pong swap.
     private var surfCacheCurrentAtlas: MTLTexture? { surfUseAtlasA ? surfAtlasA : surfAtlasB }
     private var surfCachePreviousAtlas: MTLTexture? { surfUseAtlasA ? surfAtlasB : surfAtlasA }
+    private var surfCacheCurrentIndirectAtlas: MTLTexture? { surfUseAtlasA ? surfIndirectAtlasA : surfIndirectAtlasB }
+    private var surfCachePreviousIndirectAtlas: MTLTexture? { surfUseAtlasA ? surfIndirectAtlasB : surfIndirectAtlasA }
     /// Phase 5 / B1 — the atlas the GI/reflection CONSUMERS read: the denoised
     /// copy when the cache-domain filter is on (and allocated), else the raw
-    /// current atlas. The update kernel's feedback always reads the raw atlas.
+    /// current INDIRECT atlas (DH-0622). The update kernel's feedback always reads
+    /// the raw full atlas.
     private var surfConsumerAtlas: MTLTexture? {
-        (surfaceCacheDenoise ? surfAtlasDenoised : nil) ?? surfCacheCurrentAtlas
+        (surfaceCacheDenoise ? surfAtlasDenoised : nil) ?? surfCacheCurrentIndirectAtlas
     }
 
     // ── TLAS — instanced RT for animated extracted scenes ────────────
@@ -3921,7 +3929,12 @@ public final class IlluminatoramaRenderer {
     /// Σ group.count · meshTris), which can dwarf the per-mesh `estTriangles`
     /// used to gate live RT — so it gets its own cap. Past it the TLAS still
     /// runs (RT lighting intact); only the cache read is skipped.
-    private static let surfaceCacheMaxTrianglesTLAS: Int = 60_000
+    ///
+    /// `VIZ_ILLUMI_SURFCACHE_MAXTRIS` overrides it — an instrument, not a shipped setting, like
+    /// `VIZ_ILLUMI_RT_GROUPCAP`. The Debug Tester is ~90 k triangles, so without it a cache A/B
+    /// there compares two identical frames (DH-0622 measured exactly that: 0 cached hits).
+    private static let surfaceCacheMaxTrianglesTLAS: Int =
+        ProcessInfo.processInfo.environment["VIZ_ILLUMI_SURFCACHE_MAXTRIS"].flatMap { Int($0) } ?? 60_000
     private static let surfaceCachePerTriTileSize: Int = 6
 
     /// Reset the RT auto-disable guard. Called on every scene attach (via
@@ -5536,10 +5549,8 @@ public final class IlluminatoramaRenderer {
         func group(_ o: Int) -> String {
             "cached=\(c[o]) fallback=\(c[o + 1]) noCard=\(c[o + 2]) reshade=\(c[o + 3])"
         }
-        // A cached hit skips the re-shade's one hard sun shadow ray (when N·L > 0), so
-        // `cached` is the upper bound on shadow rays DH-0622's compose would bring back.
         return "hits: cacheHitRate=\(rate)% cached=\(cached) of \(total) surface hits"
-            + " gi[\(group(0))] refl[\(group(4))] sunRaysSkippedMax=\(cached)"
+            + " gi[\(group(0))] refl[\(group(4))]"
     }
 
     /// `atlas:` sidecar line — texels temporally reused vs recomputed from scratch.
@@ -6349,6 +6360,11 @@ public final class IlluminatoramaRenderer {
         surfGPUDiffDeformIdxBuffer = nil; surfGPUDiffDeformDispatches = []
         surfAtlasA = atlasA
         surfAtlasB = atlasB
+        // DH-0622 — nil on alloc failure leaves the update (and every consumer) off.
+        surfIndirectAtlasA = device.makeTexture(descriptor: texDesc)
+        surfIndirectAtlasB = device.makeTexture(descriptor: texDesc)
+        surfIndirectAtlasA?.label = "Illuminatorama.surfcache.indirectA"
+        surfIndirectAtlasB?.label = "Illuminatorama.surfcache.indirectB"
         // Phase 5 / B1 — denoiser output (same descriptor; not ping-ponged). nil on
         // alloc failure just leaves consumers on the raw atlas (the filter no-ops).
         surfAtlasDenoised = device.makeTexture(descriptor: texDesc)
@@ -6917,7 +6933,9 @@ public final class IlluminatoramaRenderer {
         // source. First frame after (re)alloc both are empty → indirect = 0.
         surfUseAtlasA.toggle()
         guard let curAtlas = surfCacheCurrentAtlas,
-              let prevAtlas = surfCachePreviousAtlas else { return }
+              let prevAtlas = surfCachePreviousAtlas,
+              let curIndirect = surfCacheCurrentIndirectAtlas,
+              let prevIndirect = surfCachePreviousIndirectAtlas else { return }
 
         surfFrameSeed &+= 1
         var u = SurfCacheUniforms(
@@ -6954,6 +6972,8 @@ public final class IlluminatoramaRenderer {
         enc.setTexture(prevAtlas, index: 1)   // read access
         enc.setTexture(prevAtlas, index: 2)   // sample access
         enc.setTexture(equirectSky ?? dummySkyTexture, index: 3)
+        enc.setTexture(curIndirect, index: 4)    // DH-0622 — write: the indirect-only EMA
+        enc.setTexture(prevIndirect, index: 5)   // read
         enc.setAccelerationStructure(accel, bufferIndex: 0)
         enc.setBuffer(cards, offset: 0, index: 1)
         enc.setBuffer(tc, offset: 0, index: 2)
@@ -7010,7 +7030,7 @@ public final class IlluminatoramaRenderer {
     private func encodeSurfaceCacheDenoise(_ cb: MTLCommandBuffer) {
         guard surfaceCacheDenoise,
               let pipeline = surfAtrousPipeline,
-              let src = surfCacheCurrentAtlas,
+              let src = surfCacheCurrentIndirectAtlas,
               let dst = surfAtlasDenoised,
               let txcard = surfTexelCardBuffer,
               surfCardCount > 0 else { return }
@@ -8218,7 +8238,7 @@ public final class IlluminatoramaRenderer {
         // are all live this topology. The kernel gates every atlas read on this.
         let cacheOn = surfCacheActive && surfCardCount > 0
             && rtSoupTriBaseBuffer != nil && surfTriCardBuffer != nil
-            && surfCacheCurrentAtlas != nil
+            && surfConsumerAtlas != nil
             && rtSoupTriBaseCount == instances.count   // base buffer matches this topology
         if cacheOn {
             u.surfCacheEnabled = 1
@@ -10358,7 +10378,7 @@ public final class IlluminatoramaRenderer {
         // refraction/reflection hit reads the cached multi-bounce radiance when on.
         let cacheOn = useRT && surfCacheActive && surfCardCount > 0
             && rtSoupTriBaseBuffer != nil && surfTriCardBuffer != nil
-            && surfCacheCurrentAtlas != nil
+            && surfConsumerAtlas != nil
             && rtSoupTriBaseCount == instances.count
         var u = IlluminatoramaGlassRTUniforms()
         u.cameraWorldPos = fu.cameraWorldPos
