@@ -1118,6 +1118,15 @@ public final class IlluminatoramaRenderer {
         /// the sun and `frame.ambientColor` alone — so a lamp-lit sofa received exactly zero
         /// sheen and read as plaster. A night-with-lamps frame MUST show fabric here.
         case clothSheen = 17
+        /// **Chart-assignment overlay** (DH-0653): REPLACES the composite with one hashed
+        /// colour per surface-cache CARD at each pixel's own (primary) surface — the chart
+        /// decomposition `VIZ_SURFCACHE_CHARTS` builds, made visible, so merge quality and
+        /// residual GI seams are read off topology instead of eyeballed off the composite.
+        /// A non-resident card keeps its hue at near-black; near-black grey = no card.
+        /// Wired in `illumi_rt_lighting_tlas` like 8/9, so it needs RT + the surface cache
+        /// (a TLAS scene). The per-frame hit/miss numbers that go with it are in the
+        /// `VIZ_ILLUMI_SURFCACHE_STATS_PATH` sidecar (`hits:` / `atlas:` lines).
+        case surfaceCacheCharts = 18
     }
     public var debugTerm: DebugTerm = .normal
     /// Tracked by the renderer each frame (set from the host's
@@ -3199,6 +3208,8 @@ public final class IlluminatoramaRenderer {
         var atlasW: UInt32; var atlasH: UInt32; var tileSize: UInt32; var tilesPerRow: UInt32
         var cardCount: UInt32; var triangleCount: UInt32; var indirectRays: UInt32; var frameSeed: UInt32
         var alpha: Float; var rayTMin: Float; var maxDist: Float; var incrementalEnabled: UInt32 = 0
+        // DH-0653 — atlas reuse counter gate (+ pad to the Metal stride).
+        var statsEnabled: UInt32 = 0; var _scPad0: UInt32 = 0; var _scPad1: UInt32 = 0; var _scPad2: UInt32 = 0
     }
     private let surfCachePipeline: MTLComputePipelineState?
     /// §3 endpoint — TLAS-traced cache-update (traces the per-frame-refit instance
@@ -3508,7 +3519,8 @@ public final class IlluminatoramaRenderer {
         // 0x01 opaque | 0x04 invisible occluder.
         var directSunEnabled: UInt32 = 0
         var transportRayMask: UInt32 = 0x05
-        var _padIrr0: UInt32 = 0; var _padIrr1: UInt32 = 0; var _padIrr2: UInt32 = 0
+        // DH-0653 — hit/miss counter gate + chart overlay (were _padIrr0/_padIrr1).
+        var surfStatsEnabled: UInt32 = 0; var debugSurfCacheCharts: UInt32 = 0; var _padIrr2: UInt32 = 0
         // Interior irradiance bands — mirror of the Metal RTInstUniforms tail.
         var interiorIrrUp: SIMD4<Float> = .zero
         var interiorIrrSide: SIMD4<Float> = .zero
@@ -5476,6 +5488,68 @@ public final class IlluminatoramaRenderer {
         else { try? data.write(to: URL(fileURLWithPath: p)) }
     }
 
+    // ── DH-0653: surface-cache hit/miss + atlas reuse counters ────────────────
+    //
+    // Two atomic counter buffers the kernels add to only while the stats sidecar is
+    // set: `surfHitStatsBuffer` (8 slots, `illumi_rt_lighting_tlas` — what each GI /
+    // reflection triangle hit was served by) and `surfAtlasStatsBuffer` (2 slots, the
+    // update kernel — texels EMA-reused vs refreshed at α = 1). Each is drained at the
+    // NEXT frame's encode, after the in-flight frame completes, and written as one
+    // `hits:` / `atlas:` line. The DH-0622 trade ("cheaper than re-shade" → "richer
+    // than re-shade") is the `cached` share of the `hits:` line.
+    private var surfHitStatsBuffer: MTLBuffer?
+    private var surfAtlasStatsBuffer: MTLBuffer?
+
+    /// The counters run exactly when the sidecar they report to exists. Read per frame
+    /// (not cached) so a test can scope it with `setenv`/`unsetenv`.
+    private static var surfCacheStatsRequested: Bool {
+        ProcessInfo.processInfo.environment["VIZ_ILLUMI_SURFCACHE_STATS_PATH"] != nil
+    }
+
+    /// Allocate (zeroed) on first use; nil only on allocation failure (counters then no-op).
+    private func surfCounterBuffer(_ existing: MTLBuffer?, slots: Int, label: String) -> MTLBuffer? {
+        if let existing { return existing }
+        let b = device.makeBuffer(length: MemoryLayout<UInt32>.stride * slots, options: .storageModeShared)
+        b?.label = label
+        if let b { memset(b.contents(), 0, b.length) }
+        return b
+    }
+
+    /// Read + zero a counter buffer. Opt-in diagnostic lane only, so it may wait for the
+    /// in-flight frame whose kernel is still adding (the feedback drain does the same).
+    private func drainSurfCounters(_ b: MTLBuffer, slots: Int) -> [UInt32] {
+        awaitInFlightFrameBeforeCPUCacheWrite()
+        let p = b.contents().bindMemory(to: UInt32.self, capacity: slots)
+        let counts = (0..<slots).map { p[$0] }
+        memset(b.contents(), 0, MemoryLayout<UInt32>.stride * slots)
+        return counts
+    }
+
+    /// `hits:` sidecar line from the 8 hit slots (GI 0–3, reflection 4–7, each
+    /// cached / fallback / noCard / reshade). nil when the frame made no surface hit.
+    nonisolated static func surfCacheHitLine(_ c: [UInt32]) -> String? {
+        guard c.count >= 8 else { return nil }
+        let total = c.prefix(8).reduce(0) { $0 + Int($1) }
+        guard total > 0 else { return nil }
+        let cached = Int(c[0]) + Int(c[4])
+        let rate = String(format: "%.1f", Double(cached) / Double(total) * 100)
+        func group(_ o: Int) -> String {
+            "cached=\(c[o]) fallback=\(c[o + 1]) noCard=\(c[o + 2]) reshade=\(c[o + 3])"
+        }
+        // A cached hit skips the re-shade's one hard sun shadow ray (when N·L > 0), so
+        // `cached` is the upper bound on shadow rays DH-0622's compose would bring back.
+        return "hits: cacheHitRate=\(rate)% cached=\(cached) of \(total) surface hits"
+            + " gi[\(group(0))] refl[\(group(4))] sunRaysSkippedMax=\(cached)"
+    }
+
+    /// `atlas:` sidecar line — texels temporally reused vs recomputed from scratch.
+    nonisolated static func surfCacheAtlasLine(reused: UInt32, refreshed: UInt32) -> String? {
+        let total = Int(reused) + Int(refreshed)
+        guard total > 0 else { return nil }
+        let rate = String(format: "%.1f", Double(reused) / Double(total) * 100)
+        return "atlas: reuseRate=\(rate)% reused=\(reused) refreshed=\(refreshed) of \(total) texels"
+    }
+
     public func setRTGeometry(positions: [SIMD3<Float>],
                               indices: [UInt32],
                               triangleAlbedo: [SIMD3<Float>],
@@ -6857,6 +6931,20 @@ public final class IlluminatoramaRenderer {
             frameSeed: surfFrameSeed,
             alpha: max(0.02, min(1.0, surfCacheAlpha)), rayTMin: 0.004, maxDist: 60.0,
             incrementalEnabled: incremental ? 1 : 0)
+        // DH-0653 — atlas reuse counter: report the previous frame's, arm this one's.
+        var atlasStats: MTLBuffer? = nil
+        if Self.surfCacheStatsRequested {
+            surfAtlasStatsBuffer = surfCounterBuffer(surfAtlasStatsBuffer, slots: 2,
+                                                     label: "Illuminatorama.surfcache.atlasStats")
+            if let sb = surfAtlasStatsBuffer {
+                let c = drainSurfCounters(sb, slots: 2)
+                if let line = Self.surfCacheAtlasLine(reused: c[0], refreshed: c[1]) {
+                    Self.recordSurfCacheStats(line)
+                }
+                atlasStats = sb
+                u.statsEnabled = 1
+            }
+        }
         memcpy(surfCacheUniformBuffer.contents(), &u, MemoryLayout<SurfCacheUniforms>.stride)
 
         guard let enc = timedComputeEncoder(cb, "surfcacheUpdate") else { return }
@@ -6875,6 +6963,9 @@ public final class IlluminatoramaRenderer {
         enc.setBuffer(crect, offset: 0, index: 6)
         enc.setBuffer(txcard, offset: 0, index: 7)
         enc.setBuffer(cdirty, offset: 0, index: 8)
+        // DH-0653 counters (buffer 10, both variants). Dummy = the dirty buffer, which
+        // the kernel never adds to while `statsEnabled` is 0.
+        enc.setBuffer(atlasStats ?? cdirty, offset: 0, index: 10)
         if useTLAS {
             // TLAS hit → global soup tri via soupTriBase[instance_id]+primitive_id.
             // The TLAS references the BLASes, which reference the mesh vertex/index
@@ -8200,6 +8291,22 @@ public final class IlluminatoramaRenderer {
         // slabs that are real to light and never drawn. Camera-visible rays
         // (reflections here, refraction in the glass pass) deliberately don't.
         u.transportRayMask = Self.rtTransportRayMask
+        // DH-0653 — chart-assignment overlay + hit/miss counters. The counters run with
+        // the cache OFF too: their `reshade` column is the baseline a cache-on run's
+        // `cached` column is compared against.
+        u.debugSurfCacheCharts = (debugTerm == .surfaceCacheCharts) ? 1 : 0
+        var hitStats: MTLBuffer? = nil
+        if Self.surfCacheStatsRequested {
+            surfHitStatsBuffer = surfCounterBuffer(surfHitStatsBuffer, slots: 8,
+                                                   label: "Illuminatorama.surfcache.hitStats")
+            if let sb = surfHitStatsBuffer {
+                if let line = Self.surfCacheHitLine(drainSurfCounters(sb, slots: 8)) {
+                    Self.recordSurfCacheStats(line)
+                }
+                hitStats = sb
+                u.surfStatsEnabled = 1
+            }
+        }
         memcpy(rtInstUniformBuffer.contents(), &u, MemoryLayout<RTInstUniforms>.stride)
 
         guard let enc = timedComputeEncoder(cb, "rtLightingTLAS") else { return }
@@ -8248,6 +8355,9 @@ public final class IlluminatoramaRenderer {
         // path does. Before this the TLAS kernel composited it inline, which is
         // why both denoisers sat in the soup-only `else` branch doing nothing.
         enc.setTexture(rtDiffuseTexture, index: 8)
+        // DH-0653 hit/miss counters (buffer 19). Dummy = instData, never added to while
+        // `surfStatsEnabled` is 0.
+        enc.setBuffer(hitStats ?? instData, offset: 0, index: 19)
         // The TLAS references the BLASes, which reference the mesh vertex/index
         // buffers (and the curve BLASes the pooled curve buffers) — all must be
         // resident for the intersector.

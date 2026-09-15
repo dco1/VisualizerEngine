@@ -63,6 +63,11 @@ struct SurfCacheUniforms {
     uint   atlasW;   uint atlasH;   uint tileSize;  uint tilesPerRow;
     uint   cardCount; uint triangleCount; uint indirectRays; uint frameSeed;
     float  alpha;    float rayTMin; float maxDist;  uint incrementalEnabled;
+    // DH-0653 — atlas reuse counter. 1 ⇒ each texel adds itself to `atlasStats`
+    // [0] (EMA-blended with its history — REUSED) or [1] (α = 1, history discarded —
+    // REFRESHED). Set only while `VIZ_ILLUMI_SURFCACHE_STATS_PATH` is, so the
+    // atomic add costs nothing in a normal frame.
+    uint   statsEnabled; uint _scPad0; uint _scPad1; uint _scPad2;
 };
 
 // ── shared helpers (kept local; Metal has no cross-file linkage) ──────────────
@@ -198,6 +203,7 @@ kernel void illumi_surfcache_update(
     // kSCCurvesEnabled, traced alongside `accel` as an occluder (canopy darkens the
     // cards beneath). Bound to `accel` as a harmless dummy for the base variant.
     primitive_acceleration_structure  curveAccel  [[buffer(9)]],
+    device atomic_uint*               atlasStats  [[buffer(10)]],  // DH-0653: [0] reused, [1] refreshed (gated)
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.atlasW || gid.y >= u.atlasH) return;
@@ -315,6 +321,8 @@ kernel void illumi_surfcache_update(
     // cards keep their small α and their accumulated multi-bounce irradiance.
     float alpha = clamp(u.alpha, 0.02, 1.0);
     if (u.incrementalEnabled != 0u && cardDirty[card] != 0u) alpha = 1.0;
+    if (u.statsEnabled != 0u)
+        atomic_fetch_add_explicit(&atlasStats[alpha >= 1.0 ? 1u : 0u], 1u, memory_order_relaxed);
     float4 prevTexel = prevAtlasR.read(gid);
     float3 outIrr = mix(prevTexel.rgb, newIrr, alpha);
     // B0 — EMA the per-texel luminance² into .w alongside the radiance, so
@@ -358,6 +366,7 @@ kernel void illumi_surfcache_update_tlas(
     const device uint*                texelCard   [[buffer(7)]],
     const device uint*                cardDirty   [[buffer(8)]],
     const device uint*                soupTriBase [[buffer(9)]],   // TLAS (inst,prim) → global soup tri
+    device atomic_uint*               atlasStats  [[buffer(10)]],  // DH-0653: [0] reused, [1] refreshed (gated)
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.atlasW || gid.y >= u.atlasH) return;
@@ -455,6 +464,8 @@ kernel void illumi_surfcache_update_tlas(
 
     float alpha = clamp(u.alpha, 0.02, 1.0);
     if (u.incrementalEnabled != 0u && cardDirty[card] != 0u) alpha = 1.0;
+    if (u.statsEnabled != 0u)   // DH-0653 — kept line-for-line with the soup variant
+        atomic_fetch_add_explicit(&atlasStats[alpha >= 1.0 ? 1u : 0u], 1u, memory_order_relaxed);
     float4 prevTexel = prevAtlasR.read(gid);
     float3 outIrr = mix(prevTexel.rgb, newIrr, alpha);
     // B0 — luminance² EMA in .w (see the soup variant above; kept line-for-line).

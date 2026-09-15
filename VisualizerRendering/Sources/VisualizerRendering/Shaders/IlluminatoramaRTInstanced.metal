@@ -105,7 +105,13 @@ struct RTInstUniforms {
     // below) deliberately do NOT carry 0x04 — an undrawn slab must not appear in
     // the picture. Host default 0x05.
     uint  transportRayMask;
-    uint  _padIrr0; uint _padIrr1; uint _padIrr2;   // align the float4 cluster below
+    // ── DH-0653 surface-cache instruments (were _padIrr0/_padIrr1 — same bytes) ──
+    // `surfStatsEnabled` 1 ⇒ every GI / reflection TRIANGLE hit adds itself to
+    // `surfHitStats` (buffer 19): [0..3] GI cached / fallback / noCard / reshade,
+    // [4..7] the same for reflections. Set only while the stats sidecar is.
+    // `debugSurfCacheCharts` 1 ⇒ DebugTerm.surfaceCacheCharts: REPLACE the composite
+    // with the PRIMARY surface's card, one hashed colour per card.
+    uint  surfStatsEnabled; uint debugSurfCacheCharts; uint _padIrr2;   // align the float4 cluster below
     // ── Interior irradiance bands (mirror of FrameUniforms.interiorIrr*) ─────
     // A GI bounce or reflection landing on an interior ceiling must see the
     // FLOOR's bounce, not the outdoor cube's lawn — same fix, same values, as
@@ -202,6 +208,28 @@ static inline float sampleSurfCacheVarRT(
     float4 t = atlas.sample(samp, px / float2(atlasW, atlasH));
     float mu = dot(t.rgb, float3(0.2126, 0.7152, 0.0722));
     return max(0.0, t.a - mu * mu);   // E[L²] − μ²
+}
+
+// DH-0653 — hit/miss counter slots in `surfHitStats` (GI slots; reflection = +4).
+#define SURF_STAT_CACHED   0u   // resident card → one atlas read, no re-shade
+#define SURF_STAT_FALLBACK 1u   // known card, not resident → secondaryCardFallback
+#define SURF_STAT_NOCARD   2u   // cache on, triangle has no card → contributes nothing
+#define SURF_STAT_RESHADE  3u   // cache off → shadeSecondarySurface (sun shadow ray etc.)
+static inline void surfStat(device atomic_uint* s, uint enabled, uint slot) {
+    if (enabled != 0u) atomic_fetch_add_explicit(&s[slot], 1u, memory_order_relaxed);
+}
+
+// DH-0653 — chart-assignment overlay colour. One stable hashed hue per card index,
+// so two neighbouring cards differ in hue AND brightness and a coplanar chart reads
+// as one flat patch. A NON-resident card (budget streaming) keeps its hue but drops
+// to near-black, so residency is visible on the same picture.
+static inline float3 surfChartColour(uint card, bool resident) {
+    uint h = pcgHash(card * 2654435761u + 0x9E3779B9u);
+    float hue = float(h & 0xFFFFu) / 65535.0;
+    float sat = 0.55 + 0.40 * float((h >> 16) & 0xFFu) / 255.0;
+    float val = (resident ? 0.50 : 0.08) + (resident ? 0.45 : 0.04) * float((h >> 24) & 0xFFu) / 255.0;
+    float3 k = saturate(abs(fract(hue + float3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0);
+    return val * mix(float3(1.0), k, sat);
 }
 
 // The RNG (`pcgHash`/`rnd`), the sampling bases (`onb`/`cosineSample`/`coneSample`)
@@ -316,6 +344,7 @@ kernel void illumi_rt_lighting_tlas(
     // THIS texture, and nothing was writing it. With this app's TAA also off,
     // 4 GI rays reached the screen raw — the "dark noisy blotches".
     texture2d<half, access::write>        rtDiffuse   [[texture(8)]],
+    device atomic_uint*                   surfHitStats [[buffer(19)]],  // DH-0653 hit/miss counters (gated)
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -361,6 +390,36 @@ kernel void illumi_rt_lighting_tlas(
     sec.pointLights = pointLights; sec.spotLights = spotLights;
     SecondaryShadeParams secFull   = fullRadianceParams(u);   // reflections + cache fallbacks
     SecondaryShadeParams secBounce = giBounceParams(u);       // GI bounces (no sky double-count)
+
+    // ── DH-0653: chart-assignment overlay (DebugTerm.surfaceCacheCharts) ─────
+    // Terms 8/9 show what the SECONDARY rays read; this shows the PRIMARY surface's
+    // own card, so the chart decomposition (`VIZ_SURFCACHE_CHARTS`) and any residual
+    // seam are seen directly instead of eyeballed off the composite. The G-buffer
+    // stores no triangle id, so the pixel's surface is re-found with one short ray
+    // that brackets the depth-reconstructed point (5 cm either side, opaque mask —
+    // the drawn surface, never an invisible occluder or glass). Near-black grey = no
+    // card here (cache off / skipped for this scene, a curve, a miss).
+    if (u.debugSurfCacheCharts != 0) {
+        float3 chart = float3(0.02);
+        if (u.surfCacheEnabled != 0) {
+            float3 toP = P - u.cameraWorldPos;
+            float dist = length(toP);
+            float3 dir = toP / max(dist, 1e-6);
+            float bracket = min(0.05, 0.5 * dist);
+            isect.accept_any_intersection(false);
+            ray pr; pr.origin = P - dir * bracket; pr.direction = dir;
+            pr.min_distance = 0.0; pr.max_distance = 2.0 * bracket + 1e-3;
+            auto pres = isect.intersect(pr, accel, 0x01u);
+            if (pres.type == intersection_type::triangle) {
+                uint gp = soupTriBase[pres.instance_id] + pres.primitive_id;
+                uint card = (gp < u.surfTriCount) ? triCard[gp] : 0xFFFFFFFFu;
+                if (card != 0xFFFFFFFFu) chart = surfChartColour(card, surfCardRect[card].z > 0.0);
+            }
+        }
+        outHDR.write(half4(half3(chart), outHDR.read(gid).a), gid);
+        rtDiffuse.write(half4(0.0h), gid);   // isolation view owns the pixel; add nothing
+        return;
+    }
 
     // ── Direct sun (soft shadows) ─────────────────────────────────
     //
@@ -423,6 +482,7 @@ kernel void illumi_rt_lighting_tlas(
                     // non-resident ⇒ emission + ambient fallback (never black).
                     bool resident = (hitCard != 0xFFFFFFFFu) && (surfCardRect[hitCard].z > 0.0);
                     if (resident) {
+                        surfStat(surfHitStats, u.surfStatsEnabled, SURF_STAT_CACHED);
                         indirect += sampleSurfCacheRT(surfAtlas, gp,
                             res.triangle_barycentric_coord, surfCards, triCard, triUVa, triUVc,
                             res.primitive_data, surfCardRect, u.surfAtlasW, u.surfAtlasH);
@@ -444,6 +504,9 @@ kernel void illumi_rt_lighting_tlas(
                         indirect += secondaryCardFallback(
                             surfCards[hitCard], cN,
                             secondaryLayerBits(res.instance_id, insts), secFull, irrCube);
+                        surfStat(surfHitStats, u.surfStatsEnabled, SURF_STAT_FALLBACK);
+                    } else {
+                        surfStat(surfHitStats, u.surfStatsEnabled, SURF_STAT_NOCARD);
                     }
                     continue;
                 }
@@ -458,6 +521,7 @@ kernel void illumi_rt_lighting_tlas(
                 if (dot(h.N, dir) > 0.0) h.N = -h.N;      // face the incoming ray
                 h.bary = res.triangle_barycentric_coord;
                 h.instanceID = res.instance_id; h.primitiveID = res.primitive_id;
+                surfStat(surfHitStats, u.surfStatsEnabled, SURF_STAT_RESHADE);
                 indirect += shadeSecondarySurface(isect, accel, h, secBounce, sec,
                                                   irrCube, albedoAtlas, seed);
             } else if (kRTCurvesEnabled && res.type == intersection_type::curve) {
@@ -595,6 +659,7 @@ kernel void illumi_rt_lighting_tlas(
                 // non-resident ⇒ emission + ambient fallback (never black).
                 bool resident = (hitCard != 0xFFFFFFFFu) && (surfCardRect[hitCard].z > 0.0);
                 if (resident) {
+                    surfStat(surfHitStats, u.surfStatsEnabled, 4u + SURF_STAT_CACHED);
                     acc += sampleSurfCacheRT(surfAtlas, gp,
                         res.triangle_barycentric_coord, surfCards, triCard, triUVa, triUVc,
                             res.primitive_data, surfCardRect, u.surfAtlasW, u.surfAtlasH);
@@ -611,6 +676,9 @@ kernel void illumi_rt_lighting_tlas(
                     acc += secondaryCardFallback(
                         surfCards[hitCard], cN,
                         secondaryLayerBits(res.instance_id, insts), secFull, irrCube);
+                    surfStat(surfHitStats, u.surfStatsEnabled, 4u + SURF_STAT_FALLBACK);
+                } else {
+                    surfStat(surfHitStats, u.surfStatsEnabled, 4u + SURF_STAT_NOCARD);
                 }
                 continue;
             }
@@ -625,6 +693,7 @@ kernel void illumi_rt_lighting_tlas(
             if (dot(h.N, dir) > 0.0) h.N = -h.N;          // face the incoming ray
             h.bary = res.triangle_barycentric_coord;
             h.instanceID = res.instance_id; h.primitiveID = res.primitive_id;
+            surfStat(surfHitStats, u.surfStatsEnabled, 4u + SURF_STAT_RESHADE);
             acc += shadeSecondarySurface(isect, accel, h, secFull, sec,
                                          irrCube, albedoAtlas, seed);
         }
