@@ -170,6 +170,12 @@ struct SkyUniforms {
     //     nightMoonDisk) sets this to 0 so the dome doesn't double-draw a
     //     blurry low-res copy underneath the crisp one. z,w reserved.
     float4 cloudExtra2;
+
+    // ── Flat studio background (opt-in) ──────────────────────────────
+    // Bypasses the ENTIRE dome (atmosphere, sun, clouds, stars/moon) with a flat,
+    // direction-independent colour when enabled — see `volSkyRender`'s first branch.
+    // xyz = colour (linear HDR), w = enable flag (>0.5 = on).
+    float4 studioParams;
 };
 
 // The cloud kernel reads the noise volume's tile size from its own width
@@ -551,9 +557,8 @@ inline float3 atmosphereColor(float3 rayDir, constant SkyUniforms &u) {
 //     (altitude × view-zenith), a multiple-scattering table, and a per-frame
 //     sky-view LUT, then the per-pixel sky is a couple of texture fetches + the
 //     phase function. Faster per-pixel than O'Neil AND more accurate (it adds
-//     multiple scattering — which is what gives a real twilight its blue
-//     zenith, the thing our single-scatter march gets greenish because it has
-//     no ozone term). The catch: it's a whole subsystem (extra kernels, LUT
+//     multiple scattering, which the single-scatter march above lacks; ozone
+//     absorption is already in the march). The catch: it's a whole subsystem (extra kernels, LUT
 //     textures, parameterisation) for what is currently one baked dome. This is
 //     the right answer if many scenes want a live, cheap, physically-correct
 //     sky — revisit if Nishita becomes the default across scenes.
@@ -571,8 +576,8 @@ constant float  kMieG        = 0.76;     // Mie anisotropy (forward bias)
 // Ozone absorption β (m⁻¹), Chappuis band — pure absorption, no scattering. The
 // green/red-heavy cross-section (Hillaire 2020) is what gives a real twilight its
 // BLUE zenith: over the long grazing sun-ray path at sunset ozone eats the green
-// and red, leaving blue. Without it our single-scatter march reads greenish/olive
-// at the twilight zenith (the documented no-ozone limitation).
+// and red, leaving blue. Without it a single-scatter march reads greenish/olive
+// at the twilight zenith.
 constant float3 kBetaO       = float3(0.650e-6, 1.881e-6, 0.085e-6);
 constant float  kOzoneCenter = 25000.0;  // m — ozone layer peak altitude
 constant float  kOzoneWidth  = 15000.0;  // m — tent half-width (density → 0 by ~10/40 km)
@@ -1032,6 +1037,15 @@ kernel void volSkyRender(
     uint W = outTex.get_width();
     uint H = outTex.get_height();
     if (gid.x >= W || gid.y >= H) return;
+
+    // Flat studio background — bypass atmosphere/sun/clouds/stars entirely and write one
+    // constant colour to every texel. Feeds BOTH the visible dome and the small IBL bake
+    // (same kernel, two dispatch resolutions — see `VolumetricCloudRenderer.render(params:)`),
+    // so this flattens ambient lighting too, not just what the camera sees behind the scene.
+    if (u.studioParams.w > 0.5f) {
+        outTex.write(float4(u.studioParams.xyz, 1.0f), gid);
+        return;
+    }
 
     // Equirect: u in [0, 2π), v in [+π/2, -π/2] so the texture's top row maps
     // to looking straight up. SceneKit wraps an equirect background such that
