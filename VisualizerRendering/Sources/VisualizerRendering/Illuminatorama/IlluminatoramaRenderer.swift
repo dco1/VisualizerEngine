@@ -707,6 +707,14 @@ public final class IlluminatoramaRenderer {
     public var rtSunSoftShadowsEnabled: Bool = false
     /// Strength of the one-bounce indirect contribution.
     public var rtGIStrength: Float = 1.0
+    /// Cone-sampled shadow rays per pixel per frame for `rtSunSoftShadowsEnabled`'s traced
+    /// sun visibility, host-clamped (`rtSunShadowRayCount`'s write, below) and shader-clamped
+    /// (`rtSunSoftVisibility`, IlluminatoramaLighting.metal) to 1…32. DH-0856 measured this
+    /// alone does not close the gap to the cascade shadow map's edge quality at any practical
+    /// budget — the Monte-Carlo estimator's noise floor drops sharply from 1 to 4 rays, then
+    /// only slowly (single-digit percent per doubling) from 4 to 32, so raising the shipped
+    /// default costs real per-frame GPU time for little further gain. Default 4, matching the
+    /// budget every existing host already renders at.
     public var rtShadowRays: Int = 4
     /// **S4.3 — ray-traced PORTAL (area-light) visibility, in the same deferred-kernel variant
     /// as the soft sun shadows.** When > 0 and `rtSunSoftShadowsEnabled` is live, every
@@ -13184,7 +13192,14 @@ public final class IlluminatoramaRenderer {
         // cone-sampling noise into speckle that crawls on a perfectly static frame.
         u.rtSunShadowSeed = taaEnabled ? taaFrameIndex : 0
         u.rtSunShadowAngle = max(0.0005, rtSunSoftnessRad)
-        u.rtSunShadowRayCount = UInt32(max(1, min(8, rtShadowRays)))
+        // DH-0856 — clamp raised 8 -> 32: at the photo lane's fixed 32-frame settle budget,
+        // 8 cone-sampled rays/frame left the traced penumbra's Monte-Carlo noise (edge
+        // residual std ~5.2px on the "Primary Bedroom, Facing North" repro) far short of the
+        // cascade-map default's analytic PCF (~1.6px) — measured directly, not assumed. Raising
+        // the cap costs real per-frame GPU time (linear in ray count) but nothing else; the
+        // shader-side clamp in `rtSunSoftVisibility` (IlluminatoramaLighting.metal) moved with
+        // it so a value above 8 is not silently re-clamped one level down.
+        u.rtSunShadowRayCount = UInt32(max(1, min(32, rtShadowRays)))
         u.rtAreaShadowRayCount = rtSunSoftShadowsEnabled ? UInt32(max(0, min(8, rtAreaShadowRays))) : 0
         // Analytic night sky. All-zero defaults keep the kernel's sky branch an
         // exact no-op; hosts fade the brightnesses with nightBlend themselves.

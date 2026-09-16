@@ -293,7 +293,9 @@ static inline float rtSunSoftVisibility(
     float3 Ld,
     uint2  gid
 ) {
-    uint rays = clamp(frame.rtSunShadowRayCount, 1u, 8u);
+    // DH-0856 — raised 8 -> 32 alongside the host-side clamp (IlluminatoramaRenderer.swift)
+    // so a caller asking for more rays isn't silently re-clamped back down here.
+    uint rays = clamp(frame.rtSunShadowRayCount, 1u, 32u);
     // Same seeding shape as the glass pass (pixel-decorrelated, frame-walked by
     // `rtSunShadowSeed` — which the host freezes at 0 when nothing accumulates).
     uint seed = pcgHash(gid.x + gid.y * 9781u + frame.rtSunShadowSeed * 6151u);
