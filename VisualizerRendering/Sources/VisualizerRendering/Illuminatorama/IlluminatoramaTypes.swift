@@ -345,8 +345,13 @@ public struct IlluminatoramaFrameUniforms {
     // the ACES-tonemapped result. 0 = LUT fully bypassed (identity), 1 = full grade.
     // NEW 16-byte cluster (stride 1088 → 1104). Three float pads fill the cluster.
     public var filmLUTStrength: Float = 0
-    public var _padFilmLUT0: Float = 0
-    public var _padFilmLUT1: Float = 0
+    /// DH-0441 — outer radius (metres) of the WIDE AO ring: a second GTAO march whose
+    /// occluders are weighted to the annulus beyond `ssaoRadius`. Repurposes the former
+    /// `_padFilmLUT0` slot — same offset, stride unchanged. Mirrors the Metal `FrameUniforms`.
+    public var ssaoFarRadius: Float = 0.5
+    /// DH-0441 — strength of the wide AO ring. 0 = OFF (the default) → the ring is never
+    /// marched and the AO field is byte-identical. Repurposes the former `_padFilmLUT1` slot.
+    public var ssaoFarIntensity: Float = 0
     public var _padFilmLUT2: Float = 0
     // ── Tonemap colour-grade ─────────────────────────────────────────
     // White-balance + tint are channel gains applied to LINEAR HDR before

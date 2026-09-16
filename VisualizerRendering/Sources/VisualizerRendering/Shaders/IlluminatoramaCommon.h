@@ -279,8 +279,13 @@ struct FrameUniforms {
     // Phase 9 — film-stock LUT blend strength. 0 = bypass, 1 = full grade.
     // NEW 16-byte cluster (stride 1088 → 1104). Three float pads fill.
     float    filmLUTStrength;
-    float    _padFilmLUT0;
-    float    _padFilmLUT1;
+    // DH-0441 — the WIDE AO ring. A second GTAO march whose occluders are weighted to the
+    // ANNULUS beyond `ssaoRadius` (out to `ssaoFarRadius`), so the architectural crease and
+    // furniture-scale grounding are two disjoint kernels with two strengths.
+    // `ssaoFarIntensity` 0 = OFF → the ring is never marched and the AO is byte-identical.
+    // Repurposes the former `_padFilmLUT0/1` slots — same 8 bytes, stride unchanged.
+    float    ssaoFarRadius;      // was _padFilmLUT0
+    float    ssaoFarIntensity;   // was _padFilmLUT1
     float    _padFilmLUT2;
     // Tonemap colour-grade (white-balance / tint pre-tonemap; contrast / shadows
     // / highlights as a post-tonemap curve). TWO new 16-byte clusters (stride

@@ -1160,6 +1160,12 @@ public final class IlluminatoramaRenderer {
     public var ssaoIntensity: Float = 0.85
     /// World-space hemisphere radius for SSAO samples, in metres.
     public var ssaoRadius: Float = 0.4
+    /// DH-0441 — outer radius (metres) of the wide AO ring, a second GTAO march whose
+    /// occluders are weighted to the annulus beyond `ssaoRadius`. See IlluminatoramaSSAO.metal.
+    public var ssaoFarRadius: Float = 0.5
+    /// DH-0441 — strength of the wide AO ring. 0 (default) = OFF, the ring is never marched
+    /// and the AO field is byte-identical.
+    public var ssaoFarIntensity: Float = 0
     /// Screen-space reflection intensity (0 = disabled).
     public var ssrIntensity: Float = 0.7
     /// Max view-space ray length for SSR marches, in metres.
@@ -9616,6 +9622,11 @@ public final class IlluminatoramaRenderer {
 
         let toLight = simd_normalize(directionalLightDirection)
 
+        // DH-0858 sub-texel jitter (see below): the wobble must be ONE shared physical
+        // light-position shift across all cascades, not scaled per cascade — captured from
+        // cascade 0 (the finest) on its iteration, reused by the coarser cascades after it.
+        var jitterTexelWorld0: Float = 0
+
         for c in 0..<count {
             let n = splitsPos[c]
             let f = splitsPos[c + 1]
@@ -9672,7 +9683,44 @@ public final class IlluminatoramaRenderer {
                 bottom: -radius, top: radius,
                 near: 0, far: 2 * radius + casterSlack
             )
-            cascadeVPs[c] = lightProj * lightView
+            // DH-0858 — sub-texel shadow-map jitter. The window/occluder edge rasterizes into
+            // this cascade at whole-texel precision (confirmed by pulling the raw depth texture:
+            // texelWorld exactly halves when resolution doubles — a real rasterization limit, not
+            // a filtering artifact), and no amount of downstream PCF/denoising can recover detail
+            // that was never captured. Jittering the light's own ortho projection by a sub-texel
+            // offset each accumulated frame — same Halton(2,3) sequence and taaFrameIndex the
+            // camera's own TAA jitter already uses (`uploadFrameUniforms`, further down this file)
+            // — re-rasterizes the occluder edge at a different sub-texel position every frame, so
+            // the photo lane's existing 32-frame accumulation supersamples the OCCLUDER, not just
+            // the receiver. Measured on the "Primary Bedroom, Facing North" repro: sub-pixel edge
+            // residual std 1.67 -> 0.87, matching the ~49% gain from doubling shadow-map
+            // resolution (1.66 -> 0.85) at zero extra VRAM/GPU cost, since this reuses accumulation
+            // that already runs every photo-lane frame. Gated on `taaEnabled` alone (not a
+            // separate flag) — harmless no-op magnitude (≤0.5 texel, ~1.6-19.6mm depending on
+            // cascade) when TAA is off, and this is the same the-photo-lane-IS-real-TAA-now fact
+            // DH-0858's history already re-derived once (a stale "TAA off everywhere" assumption
+            // misled two earlier sessions in this same investigation — see DH-0856/0858).
+            //
+            // The wobble is ONE shared physical light-position shift, not scaled per cascade. A
+            // first cut jittered each cascade by a fraction of ITS OWN texel (fine near, coarse
+            // far), which regressed `testCascadeSplitDoesNotKinkAShadowEdgeCrossingIt`: cascades
+            // 0 and 1 then wobbled by different REAL-WORLD amounts every frame, breaking the
+            // agreement the cascade-split blend depends on at their shared boundary. Fix: derive
+            // the jitter's world-space magnitude from cascade 0's (finest) texel once, then convert
+            // that SAME world shift into each cascade's own NDC units — every cascade moves
+            // together, so the blend stays seamless.
+            var cascadeVP = lightProj * lightView
+            if taaEnabled {
+                if c == 0 { jitterTexelWorld0 = 2 * radius / Float(shadowMap.width) }
+                let jh2 = Self.halton(taaFrameIndex &+ 1, base: 2) - 0.5
+                let jh3 = Self.halton(taaFrameIndex &+ 1, base: 3) - 0.5
+                let jx = jh2 * jitterTexelWorld0 / radius
+                let jy = jh3 * jitterTexelWorld0 / radius
+                var shadowJitter = matrix_identity_float4x4
+                shadowJitter.columns.3 = SIMD4(jx, jy, 0, 1)
+                cascadeVP = shadowJitter * cascadeVP
+            }
+            cascadeVPs[c] = cascadeVP
         }
     }
 
@@ -13052,6 +13100,12 @@ public final class IlluminatoramaRenderer {
         // 0 (default) → previous sampled at the same time → exact no-op for every scene that
         // never sets it and every settled capture (clock frozen ⇒ delta 0).
         u.windPrevDelta = max(0, windPreviousDelta)
+        // DH-0441 — the wide AO ring: a second GTAO march whose falloff is the near
+        // kernel's complement, weighing only occluders beyond `ssaoRadius` out to
+        // `ssaoFarRadius`. `ssaoFarIntensity` 0 (default) ⇒ `illumi_ssao` never marches the
+        // ring and the AO field is byte-identical. See IlluminatoramaSSAO.metal.
+        u.ssaoFarRadius = ssaoFarRadius
+        u.ssaoFarIntensity = ssaoFarIntensity
         // Chromatic aberration: tonemap CA strength (repurposes the former
         // _padPlush0 slot). 0 → exact no-op (the tonemap branch is gated on it).
         // Eased value (see advancePostFXEasing) so slider drags glide.

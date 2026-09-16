@@ -155,6 +155,44 @@ static inline float gtaoFalloff(float dist, float radius) {
     return 1.0 - x * x;
 }
 
+// The WIDE ring's falloff (DH-0441): the near kernel's complement times the ring's own
+// quadratic. Zero at the shaded point (the near kernel owns that occluder in full), ~1 just
+// past `nearRadius`, zero again at `farRadius`. The two weights never both claim an occluder
+// in full, which is what makes the kernels disjoint — and the hand-off is continuous.
+static inline float gtaoRingFalloff(float dist, float nearRadius, float farRadius) {
+    return (1.0 - gtaoFalloff(dist, nearRadius)) * gtaoFalloff(dist, farRadius);
+}
+
+// The ring's march steps per side. Its taps are spread across the band beyond the near
+// kernel, so the pass costs 48 more half-res depth reads while the ring is on, and none off.
+constant uint kGtaoFarSteps = 4;
+
+// One depth tap at full-res position `p`: the view-space offset `d` from the shaded point and
+// its length. False off screen, on sky, or on the shaded point itself.
+static inline bool gtaoTap(depth2d<float, access::read> gDepth, float2 p, float2 fdim,
+                           float4x4 invProj, float3 Pview, thread float3 &d, thread float &dist) {
+    if (p.x < 0.0 || p.y < 0.0 || p.x >= fdim.x || p.y >= fdim.y) return false;
+    uint2 sPx = uint2(p);
+    float sd = gDepth.read(sPx);
+    if (sd >= 0.99999) return false;
+    float2 sndc = (float2(sPx) + 0.5) / fdim * 2.0 - 1.0;
+    sndc.y = -sndc.y;
+    d = viewPosFromDepth(sndc, sd, invProj) - Pview;
+    dist = length(d);
+    return dist > 1e-4;
+}
+
+// Both sides' arc integrals for one slice from the two horizon cosines, clamped to the
+// hemisphere around the projected normal (before the projected-normal-length weight).
+static inline float gtaoSliceVisibility(float horizonPos, float horizonNeg,
+                                        float n, float cosN, float sinN) {
+    float hP =  acos(clamp(horizonPos, -1.0, 1.0));
+    float hN = -acos(clamp(horizonNeg, -1.0, 1.0));
+    hP = n + clamp(hP - n, -kHalfPi, kHalfPi);
+    hN = n + clamp(hN - n, -kHalfPi, kHalfPi);
+    return gtaoArc(hP, n, cosN, sinN) + gtaoArc(hN, n, cosN, sinN);
+}
+
 // View-space position at an integer full-res pixel, clamped to the buffer. Used to
 // reconstruct the GEOMETRIC surface normal from depth (below).
 static inline float3 gtaoViewPos(depth2d<float, access::read> gDepth, int2 p, int2 mx,
@@ -254,6 +292,38 @@ kernel void illumi_ssao(
     // skip, which is the grazing-flat speckle again at distance.
     float maxPix = clamp(radius * focalY * 0.5 * float(fullH) * invZ, kGtaoMinPix + 4.0, 220.0);
 
+    // ── The WIDE ring (DH-0441) ──────────────────────────────────────────────────
+    //
+    // One world-space radius was being asked to serve two scales: a drywall crease wants
+    // ~0.1 m (wider paints a half-metre band up every wall junction — DH-0440's "sponge"),
+    // and a counter stool standing on a floor wants ~0.5 m (at 0.1 m the stools float;
+    // `+StoolGrounding` measured grounding +2.60 at r0.10 vs +5.18 at r0.50). So there are
+    // two kernels, and the second is an ANNULUS: its falloff is the near kernel's complement
+    // times its own, `(1 − f_near(d)) · f_far(d)`, so an occluder the near kernel already
+    // counts in full carries ~zero weight here. The two scales are disjoint by construction —
+    // a crease inside `ssaoRadius` is not counted twice — and the hand-off is a smooth ramp,
+    // not a hard cut at `ssaoRadius` (a hard threshold is a coin flip, DH-0599).
+    //
+    // Why they are composed in HORIZON space rather than as `1-(1-a)(1-b)` or `max(a, b)`:
+    // within one slice side, occluders at different distances do not stack — the higher
+    // horizon hides the lower one — so the exact union of the two kernels' occluders is the
+    // per-side max of their horizon cosines. `1-(1-a)(1-b)` double-counts a direction both
+    // kernels see; `max(a, b)` on the scalar AO under-darkens when the kernels see different
+    // occluders in different directions. The union horizon has neither error. Its ratio to
+    // the near-only visibility is then exactly what the ring ADDS, which is what
+    // `ssaoFarIntensity` scales — at both intensities 1.0 the result is the union's
+    // visibility, exactly.
+    float farRadius = frame.ssaoFarRadius;
+    bool  farOn = frame.ssaoFarIntensity > 0.0 && farRadius > radius;
+    // The ring's disjointness is in WORLD distance (its falloff), not in screen offset, so it
+    // marches the WHOLE screen extent out to `farRadius`. Starting it where the near kernel's
+    // march ends looks equivalent and is not: the seat of a stool standing over a floor pixel
+    // is ~0.6 m away in the world but a few pixels away on screen, and a march that begins at
+    // `maxPix` steps straight over it — measured, that version recovered well under half of the
+    // grounding a single 0.5 m kernel gives on `+StoolGrounding`.
+    float farMaxPix = farOn ? max(maxPix + 4.0, min(farRadius * focalY * 0.5 * float(fullH) * invZ, 220.0))
+                            : maxPix;
+
     // Per-pixel azimuth rotation + a march-offset jitter, ADVANCED per frame by a
     // golden-ratio step keyed to `rtSunShadowSeed`. Three slices is too few to cover the
     // azimuth in one frame, so consecutive frames must sample DIFFERENT orientations for
@@ -275,6 +345,7 @@ kernel void illumi_ssao(
     float stepJitter  = fract(ssaoIGN(float2(gid) + float2(23.5, 41.5)) + frameAdvance * 1.324717957);
 
     float visibility = 0.0;
+    float unionVisibility = 0.0;   // near kernel ∪ ring — only accumulated while `farOn`
     for (uint s = 0; s < kGtaoSlices; ++s) {
         float phi = (float(M_PI_F) / float(kGtaoSlices)) * (float(s) + sliceJitter);
         float2 omega = float2(cos(phi), sin(phi));        // screen-space (pixel) direction
@@ -306,6 +377,7 @@ kernel void illumi_ssao(
         // contributes, which is what turns the radius dial into a true world distance.
         float horizonPos = -1.0;   // +omega side
         float horizonNeg = -1.0;   // -omega side
+        float3 d; float dist;
         for (uint k = 0; k < kGtaoSteps; ++k) {
             // Quadratic step spacing (XeGTAO's `pow` distribution). Four samples spread
             // LINEARLY over [kGtaoMinPix, maxPix] put nothing in the near field — at a
@@ -320,58 +392,52 @@ kernel void illumi_ssao(
             float t = mix(kGtaoMinPix, maxPix, frac * frac);
             float2 off = omega * t;
 
-            // +omega
-            float2 pPos = float2(fullGid) + off;
-            if (pPos.x >= 0.0 && pPos.y >= 0.0 && pPos.x < fdim.x && pPos.y < fdim.y) {
-                uint2 sPx = uint2(pPos);
-                float sd = gDepth.read(sPx);
-                if (sd < 0.99999) {
-                    float2 sndc = (float2(sPx) + 0.5) / fdim * 2.0 - 1.0;
-                    sndc.y = -sndc.y;
-                    float3 Ps = viewPosFromDepth(sndc, sd, frame.invProjection);
-                    float3 d = Ps - Pview;
-                    float dist = length(d);
-                    if (dist > 1e-4) {
-                        float fall = gtaoFalloff(dist, radius) * gtaoPlaneWeight(d, Ngeo, dist);
-                        float c = dot(d / dist, V);
-                        horizonPos = max(horizonPos, mix(-1.0, c, fall));
-                    }
-                }
+            if (gtaoTap(gDepth, float2(fullGid) + off, fdim, frame.invProjection, Pview, d, dist)) {
+                float fall = gtaoFalloff(dist, radius) * gtaoPlaneWeight(d, Ngeo, dist);
+                horizonPos = max(horizonPos, mix(-1.0, dot(d / dist, V), fall));
             }
-
-            // -omega
-            float2 pNeg = float2(fullGid) - off;
-            if (pNeg.x >= 0.0 && pNeg.y >= 0.0 && pNeg.x < fdim.x && pNeg.y < fdim.y) {
-                uint2 sPx = uint2(pNeg);
-                float sd = gDepth.read(sPx);
-                if (sd < 0.99999) {
-                    float2 sndc = (float2(sPx) + 0.5) / fdim * 2.0 - 1.0;
-                    sndc.y = -sndc.y;
-                    float3 Ps = viewPosFromDepth(sndc, sd, frame.invProjection);
-                    float3 d = Ps - Pview;
-                    float dist = length(d);
-                    if (dist > 1e-4) {
-                        float fall = gtaoFalloff(dist, radius) * gtaoPlaneWeight(d, Ngeo, dist);
-                        float c = dot(d / dist, V);
-                        horizonNeg = max(horizonNeg, mix(-1.0, c, fall));
-                    }
-                }
+            if (gtaoTap(gDepth, float2(fullGid) - off, fdim, frame.invProjection, Pview, d, dist)) {
+                float fall = gtaoFalloff(dist, radius) * gtaoPlaneWeight(d, Ngeo, dist);
+                horizonNeg = max(horizonNeg, mix(-1.0, dot(d / dist, V), fall));
             }
         }
 
-        // Angles from cosines, clamped to the hemisphere around the projected normal.
-        float hP =  acos(clamp(horizonPos, -1.0, 1.0));
-        float hN = -acos(clamp(horizonNeg, -1.0, 1.0));
-        hP = n + clamp(hP - n, -kHalfPi, kHalfPi);
-        hN = n + clamp(hN - n, -kHalfPi, kHalfPi);
+        visibility += projLen * gtaoSliceVisibility(horizonPos, horizonNeg, n, cosNorm, sinNorm);
 
-        visibility += projLen * (gtaoArc(hP, n, cosNorm, sinNorm) +
-                                 gtaoArc(hN, n, cosNorm, sinNorm));
+        if (farOn) {
+            // The ring's taps join the near kernel's horizons — the per-side max IS the union
+            // of the two kernels' occluders (see the ring note above `farOn`).
+            float unionPos = horizonPos, unionNeg = horizonNeg;
+            for (uint k = 0; k < kGtaoFarSteps; ++k) {
+                // Same quadratic spacing as the near march, over the ring's own extent: the
+                // taps a world-space-far occluder lands on can sit close on screen.
+                float frac = (float(k) + stepJitter) / float(kGtaoFarSteps);
+                float t = mix(kGtaoMinPix, farMaxPix, frac * frac);
+                float2 off = omega * t;
+                if (gtaoTap(gDepth, float2(fullGid) + off, fdim, frame.invProjection, Pview, d, dist)) {
+                    float fall = gtaoRingFalloff(dist, radius, farRadius) * gtaoPlaneWeight(d, Ngeo, dist);
+                    unionPos = max(unionPos, mix(-1.0, dot(d / dist, V), fall));
+                }
+                if (gtaoTap(gDepth, float2(fullGid) - off, fdim, frame.invProjection, Pview, d, dist)) {
+                    float fall = gtaoRingFalloff(dist, radius, farRadius) * gtaoPlaneWeight(d, Ngeo, dist);
+                    unionNeg = max(unionNeg, mix(-1.0, dot(d / dist, V), fall));
+                }
+            }
+            unionVisibility += projLen * gtaoSliceVisibility(unionPos, unionNeg, n, cosNorm, sinNorm);
+        }
     }
     visibility = clamp(visibility / float(kGtaoSlices), 0.0, 1.0);
 
     // Fold intensity in the same way the old estimator did: occlusion = 1 − visibility.
     float ao = 1.0 - (1.0 - visibility) * frame.ssaoIntensity;
+    if (farOn) {
+        // What the ring ADDS is the union's visibility over the near kernel's alone — ≤ 1,
+        // because a union horizon can only rise. Scaled by its own strength, so the ring can
+        // ground furniture without the near kernel's crease getting any darker.
+        float unionVis = clamp(unionVisibility / float(kGtaoSlices), 0.0, 1.0);
+        float ring = visibility > 1e-4 ? clamp(unionVis / visibility, 0.0, 1.0) : 1.0;
+        ao *= 1.0 - (1.0 - ring) * frame.ssaoFarIntensity;
+    }
     ao = clamp(ao, 0.0, 1.0);
     outAO.write(half4(half(ao)), gid);
 }
