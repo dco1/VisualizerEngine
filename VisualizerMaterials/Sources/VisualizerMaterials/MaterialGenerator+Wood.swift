@@ -624,7 +624,8 @@ extension MaterialGenerator {
                 // must be an INTEGER number of cycles across the tile or the grain jumps at the
                 // wrap (TextureAudit's seam tell). Planked wood keeps the free frequency — each
                 // board's wrap lands under a seam groove.
-                let free = min(wantCycles * scaleJit, maxCycles)
+                let physicalCycles = wantCycles * scaleJit
+                let free = min(physicalCycles, maxCycles)
                 let cycles = seams ? free : max(1, free.rounded())
 
                 // ── Cathedral bow: a SMOOTH, LOW-frequency lateral sweep of the whole ring
@@ -655,11 +656,24 @@ extension MaterialGenerator {
                 // cross-board frequency is what rises, which reshapes the arch without ever
                 // bending a line along itself. Measured on pine (∂u/∂v of albedo luma, higher is
                 // straighter): 3.99 → 12.31 on boards.
+                //
+                // **The ring widths are the TREE's, not the bake's** (DH-0734). This divided by
+                // `cycles` — the count AFTER `woodRingTexelFloor` band-limits it — so wherever the
+                // bake cannot draw every ring, the drawn rings widen and the arch swung further
+                // across the board with them: the swing grew as the bake SHRANK. Cherry's 17
+                // rings a board draw as 7 at a 256² bake, which put its arch across 1.2 boards
+                // instead of the 0.5 its recipe documents, and the oak veneer panel's swing
+                // doubled. A line swung that far runs ACROSS the board, and the ring relief and
+                // gloss it carries become the cross-grain ridges and patchy sheen of the
+                // "waterlogged" floor — the same picture as the 2026-08-19 inverted-axis defect,
+                // from a different construct. Dividing by the physical count holds the swing to
+                // the `distort × 12 × 1.6 / (ringsPerMeter × boardMeters)` the recipes are
+                // written against, at every bake size.
                 let bowRings = r.distort * 12 * (0.4 + 1.2 * Noise.unit(bh ^ 0xC4))
                 let drift  = (Noise.fbmTiled(u * 3, v, baseCells: 2, octaves: 2,
-                                             seed: bseed ^ 0xAA) - 0.5) * 2 * bowRings / cycles
+                                             seed: bseed ^ 0xAA) - 0.5) * 2 * bowRings / physicalCycles
                 let wiggle = (Noise.fbmTiled(u * 9, v, baseCells: 2, octaves: 2,
-                                             seed: bseed ^ 0xBB) - 0.5) * 0.5 * bowRings / cycles
+                                             seed: bseed ^ 0xBB) - 0.5) * 0.5 * bowRings / physicalCycles
 
                 // ── Ring-width irregularity. A warp of the cross-width coordinate, so it
                 // compresses and opens the ring spacing the way a run of wet and dry seasons
