@@ -30,13 +30,15 @@ using namespace metal;
 //     hexagons or heptagons that turn elliptical toward the corners, exactly as a
 //     photograph's do. `blades = 0` is a perfect circular iris.
 //
-// Three passes. `illumi_dof_tile` reduces the CoC to a max per 16×16 tile and
+// Four passes. `illumi_dof_tile` reduces the CoC to a max per 16×16 tile and
 // `illumi_dof_dilate` spreads that max by the gather's own reach, so the gather knows how
 // far it must look to find a NEAR-field neighbour whose disc covers it — without that,
 // foreground blur can only ever spread as far as the pixel it lands on already knows about,
 // and a defocused foreground silhouette stays crisp. The tile map also buys the early-out
 // that pays for the rest: a tile whose whole neighbourhood is in focus copies through
-// untouched.
+// untouched. `illumi_dof_prefilter` builds the half-resolution base of a CoC-weighted mip
+// pyramid (the renderer generates the rest), so each tap of the gather reads its colour
+// prefiltered to the spacing between taps rather than point-sampling detail finer than that.
 
 constant float kGoldenAngle = 2.39996323f;
 
@@ -50,7 +52,7 @@ struct DOFParams {
     float catsEye;          // 0…1 optical vignetting toward the frame corners
     uint  width;  uint height;
     uint  tileW;  uint tileH; uint tileSize;
-    float _pad0;
+    float prefilterScale;   // × each tap's footprint it is prefiltered over; 0 ⇒ point taps
 };
 
 // View-space distance (positive, metres) of a depth-buffer sample.
@@ -150,14 +152,54 @@ static inline float aperture_mask(float2 v, float aa, float2 offAxis, constant D
     return m;
 }
 
-// ── Pass 3: the gather ───────────────────────────────────────────────────────
+// ── Pass 3: the CoC-weighted prefilter pyramid ───────────────────────────────
+//
+// The gather spends 24–128 taps on a disc that, wide open, has thousands of pixels. A tap that
+// point-samples the frame therefore aliases every detail finer than the spacing between taps —
+// a small bright flame is hit by one tap in this pixel and missed in the next, which is the
+// grain inside a bokeh ball (DH-0728). Rotating the spiral per pixel only turned that aliasing
+// from a lattice into noise. The cure is to prefilter: each tap reads the frame averaged over
+// its own share of the disc, so it integrates the flame instead of gambling on hitting it.
+//
+// This writes the pyramid's base at HALF resolution (full-resolution LOD 1 — below that a tap
+// reads the frame directly) as premultiplied colour with the weight in alpha; the renderer's
+// mip generation box-filters the rest, and the gather divides the weight back out. The weight
+// is the texel's own CoC, so IN-FOCUS pixels all but vanish from the coarse levels: a tap
+// behind a sharp subject averages its defocused neighbours, not the subject's edge. Without
+// that a sharp silhouette would smear a halo of itself into the bokeh behind it.
+kernel void illumi_dof_prefilter(
+    texture2d<half,  access::read>  inHDR  [[texture(0)]],
+    texture2d<float, access::read>  gDepth [[texture(1)]],
+    texture2d<half,  access::write> outPre [[texture(2)]],
+    constant DOFParams&             p      [[buffer(0)]],
+    uint2 tid [[thread_position_in_grid]])
+{
+    if (tid.x >= outPre.get_width() || tid.y >= outPre.get_height()) return;
+    uint2 last = uint2(p.width - 1, p.height - 1);
+    float3 sum = 0.0f;
+    float  wsum = 0.0f;
+    for (uint dy = 0; dy < 2; ++dy) {
+        for (uint dx = 0; dx < 2; ++dx) {
+            uint2 s = min(tid * 2u + uint2(dx, dy), last);
+            float w = clamp(abs(coc_radius(view_z(gDepth.read(s).r, s, p), p)) * 0.5f, 0.02f, 1.0f);
+            sum  += float3(inHDR.read(s).rgb) * w;
+            wsum += w;
+        }
+    }
+    outPre.write(half4(half3(sum * 0.25f), half(wsum * 0.25f)), tid);
+}
+
+// ── Pass 4: the gather ───────────────────────────────────────────────────────
 constexpr sampler dofLinear(coord::normalized, filter::linear, address::clamp_to_edge);
+constexpr sampler dofTrilinear(coord::normalized, filter::linear, mip_filter::linear,
+                               address::clamp_to_edge);
 
 kernel void illumi_dof(
     texture2d<half,  access::sample> inHDR  [[texture(0)]],
     texture2d<float, access::read>   gDepth [[texture(1)]],
     texture2d<half,  access::write>  outHDR [[texture(2)]],
     texture2d<float, access::read>   tileMax[[texture(3)]],
+    texture2d<half,  access::sample> prefiltered [[texture(4)]],
     constant DOFParams&              p      [[buffer(0)]],
     uint2 gid [[thread_position_in_grid]])
 {
@@ -184,6 +226,10 @@ kernel void illumi_dof(
     // full area would be unaffordable. This is the compromise, and the jitter below is what
     // makes it hold up.
     int taps = clamp(int(reach * 6.0f), 24, 128);
+
+    // Each tap's share of the disc, as the side of a square of equal area: the width a tap's
+    // colour must be prefiltered over for the taps between them to cover the disc.
+    float tapFootprint = p.prefilterScale * reach * sqrt(M_PI_F / float(taps));
 
     // **Per-pixel rotation of the spiral.** Without this every output pixel samples the SAME
     // relative offsets, so a bright out-of-focus point is rebuilt as a periodic lattice of
@@ -214,8 +260,8 @@ kernel void illumi_dof(
         float a  = float(i) * kGoldenAngle + rot;
         float2 off = float2(cos(a), sin(a)) * rr;
 
-        // Colour is sampled BILINEARLY at the tap's true fractional position. Snapping taps
-        // to whole texels quantises them onto a grid, which is the other half of the stipple.
+        // Colour is sampled at the tap's true fractional position. Snapping taps to whole
+        // texels quantises them onto a grid, which is the other half of the stipple.
         float2 suv = (float2(gid) + 0.5f + off) * texel;
 
         // Depth stays a nearest read — interpolating depth across a silhouette would invent
@@ -243,7 +289,23 @@ kernel void illumi_dof(
         // proportion to that disc's area.
         w /= (tapAbs * tapAbs);
 
-        sum  += float3(inHDR.sample(dofLinear, suv).rgb) * w;
+        // …and PREFILTERED over the tap's footprint (see `illumi_dof_prefilter`), never wider
+        // than half the tap's own disc — a tap scatters its colour over that disc, so blurring
+        // it by less than the disc changes the result by less than the disc's edge. Full-res
+        // LOD 0…1 fades from the frame itself into the pyramid's half-resolution base.
+        float lod = log2(max(min(tapFootprint, tapAbs * 0.5f), 1.0f));
+        float3 col;
+        half4 pf = lod > 0.0f
+            ? prefiltered.sample(dofTrilinear, suv, level(max(lod - 1.0f, 0.0f)))
+            : half4(0.0h);
+        if (pf.a > 0.05h && lod >= 1.0f) {
+            col = float3(pf.rgb) / float(pf.a);
+        } else {
+            col = float3(inHDR.sample(dofLinear, suv).rgb);
+            if (pf.a > 0.05h) col = mix(col, float3(pf.rgb) / float(pf.a), lod);
+        }
+
+        sum  += col * w;
         wsum += w;
     }
 
