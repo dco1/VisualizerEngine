@@ -340,7 +340,12 @@ public struct IlluminatoramaFrameUniforms {
     /// Repurposes the former `_padSSS1` slot — same offset, stride unchanged. Mirror of the
     /// Metal `FrameUniforms.windPrevDelta`.
     public var windPrevDelta: Float = 0
-    public var _padSSS2: Float = 0
+    /// DH-0881 — which scene → display rendering the tonemap uses. 0 = the shipped fitted
+    /// ACES curve applied PER CHANNEL in Rec.709 primaries (byte-identical, the default),
+    /// 1 = the same curve evaluated in ACEScg/AP1 so its channel clipping happens in a wide
+    /// gamut and hue stops rotating as intensity rises, 2 = AgX. Repurposes the former
+    /// `_padSSS2` slot — same offset, stride unchanged.
+    public var displayTransform: UInt32 = 0
     // Phase 9 — film-stock LUT colour grade. Blends the 3D-LUT-graded result with
     // the ACES-tonemapped result. 0 = LUT fully bypassed (identity), 1 = full grade.
     // NEW 16-byte cluster (stride 1088 → 1104). Three float pads fill the cluster.

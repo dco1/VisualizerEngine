@@ -231,6 +231,111 @@ static inline float3 aces(float3 x) {
     return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
 }
 
+// ── The display transform is a CHOICE now (DH-0881) ──────────────────────────
+//
+// `aces()` above is Narkowicz's fitted RRT+ODT curve applied PER CHANNEL to whatever
+// primaries the render is already in — Rec.709/sRGB. There is no AP0/AP1 transform anywhere
+// in this file, which makes it ACES in name only, and the consequence is not subtle: a
+// per-channel curve desaturates by driving the dominant channel into its shoulder FIRST, so
+// hue rotates as intensity rises. Saturated blue goes purple, a hot red goes orange, a bright
+// green goes yellow. It is a large part of what makes a render read as CG rather than as a
+// photograph, and three knobs downstream (`tonemapSaturation`, `highlightChromaRolloff`, the
+// split tone) exist mostly to pay for it.
+//
+// Two alternatives, selected by `frame.displayTransform`. 0 is the shipped curve and is
+// byte-identical, so nothing moves until a host asks.
+
+// Rec.709/sRGB (D65) ⇄ ACEScg AP1. Metal's float3x3 takes COLUMNS.
+constant float3x3 kSRGBtoAP1 = float3x3(float3(0.6131, 0.0702, 0.0206),
+                                        float3(0.3395, 0.9164, 0.1096),
+                                        float3(0.0474, 0.0134, 0.8698));
+constant float3x3 kAP1toSRGB = float3x3(float3( 1.7050, -0.1302, -0.0240),
+                                        float3(-0.6217,  1.1408, -0.1290),
+                                        float3(-0.0832, -0.0106,  1.1529));
+
+/// **1 — the AP1 sandwich. MEASURED, THIS DOES NOT WORK — kept as a recorded negative.**
+///
+/// The idea is the obvious minimal fix: evaluate the same fitted curve in ACEScg instead of
+/// Rec.709, so its per-channel clipping happens in a wide gamut and a colour cannot have one
+/// 709 channel slammed into the shoulder alone. On the fixture house it made the artefact
+/// WORSE — hue rotation over +2 stops went 2.48° → 3.45°, with chroma down too (0.53 → 0.43).
+///
+/// Why, as far as the measurement shows: `aces()` ends in a `saturate`, and `kAP1toSRGB` has
+/// large negative off-diagonal terms, so the round trip lands a great many pixels outside
+/// [0,1] in sRGB and the final clamp is itself a per-channel clip — the very thing the
+/// sandwich was supposed to avoid, just moved one step later. A real ACES pipeline avoids it
+/// with a gamut compression before the inverse matrix, which this is not.
+///
+/// It stays in the switch, and the gate keeps printing its number, so the next person to have
+/// this idea finds the result instead of re-deriving it. Use `agx` for the actual fix.
+static inline float3 acesAP1(float3 x) {
+    return saturate(kAP1toSRGB * aces(kSRGBtoAP1 * max(x, 0.0)));
+}
+
+// AgX (Troy Sobotka's transform, in the form Blender ships). The published inset/outset
+// matrices — rows as documented, transposed here into Metal's column order.
+constant float3x3 kAgXInset  = float3x3(float3(0.8424790622530940, 0.0423282422610123, 0.0423756549057051),
+                                        float3(0.0784335999999992, 0.8784686364697720, 0.0784336000000000),
+                                        float3(0.0792237451477643, 0.0791661274605434, 0.8791429737931040));
+constant float3x3 kAgXOutset = float3x3(float3( 1.1968790051201738, -0.0528968517574562, -0.0529716355144438),
+                                        float3(-0.0980208811401368,  1.1519031299041727, -0.0980434501171241),
+                                        float3(-0.0990297440797205, -0.0989611768448433,  1.1510736726411610));
+
+/// The published 6th-order polynomial fit of AgX's default contrast sigmoid.
+static inline float3 agxContrast(float3 x) {
+    float3 x2 = x * x;
+    float3 x4 = x2 * x2;
+    return  15.5    * x4 * x2
+          - 40.14   * x4 * x
+          + 31.96   * x4
+          -  6.868  * x2 * x
+          +  0.4298 * x2
+          +  0.1191 * x
+          -  0.00232;
+}
+
+/// **2 — AgX.** Two things make it hold up where a naive per-channel curve does not. An
+/// INSET matrix desaturates before the curve, so no single channel is pushed into the
+/// shoulder alone — that is the notorious blue-light case, where a saturated blue lamp turns
+/// violet — and the matching outset restores the chroma afterwards. And the sigmoid acts on
+/// log2 STOPS over a fixed latitude rather than on linear light, which is why its highlights
+/// roll off like film rather than clamping. Blender moved to it for exactly these reasons.
+///
+/// Its sigmoid emits a display-encoded value, so the `pow(2.2)` at the end returns the chain
+/// to the linear display-referred convention everything downstream here assumes.
+static inline float3 agx(float3 v) {
+    const float minEv = -12.47393, maxEv = 4.026069;
+    v = kAgXInset * max(v, 0.0);
+    v = clamp(log2(max(v, 1e-10)), minEv, maxEv);
+    v = (v - minEv) / (maxEv - minEv);
+    v = agxContrast(saturate(v));
+    // ── The 'punchy' look, and it is not optional ────────────────────────────────
+    // The inset that buys AgX its hue stability also costs chroma: measured on the fixture
+    // house, bare AgX came back at 0.317 mean saturation against the shipped curve's 0.526.
+    // That is why Blender ships AgX WITH a look transform rather than bare, and its published
+    // 'punchy' figures are these: slope 1, power 1.35, saturation 1.4, applied in the
+    // sigmoid's own output domain (before the outset and the EOTF), so the contrast lift acts
+    // on the curve's result rather than on linear light.
+    {
+        const float3 lw = float3(0.2126, 0.7152, 0.0722);
+        v = pow(max(v, 0.0), float3(1.35));
+        float luma = dot(v, lw);
+        v = luma + 1.4 * (v - luma);
+    }
+    v = kAgXOutset * v;
+    return saturate(pow(max(v, 0.0), float3(2.2)));
+}
+
+/// The scene → display rendering this frame asked for. 0 keeps the shipped per-channel
+/// Rec.709 curve exactly, so every existing baseline is untouched.
+static inline float3 displayTransform(float3 scene, uint which) {
+    switch (which) {
+        case 1:  return acesAP1(scene);
+        case 2:  return agx(scene);
+        default: return aces(scene);
+    }
+}
+
 // ── Color-grade: white-balance gain from a Kelvin temperature ───────────────
 // Maps a correlated colour temperature (~2000–10000 K) to a normalized linear
 // RGB channel gain that, when MULTIPLIED into a neutral scene, warms it (HIGH K)
@@ -869,7 +974,7 @@ fragment float4 illumi_tonemap_fs(
         exposedScene *= cos2 * cos2;                  // cos⁴
     }
 
-    float3 mapped = aces(exposedScene);
+    float3 mapped = displayTransform(exposedScene, frame.displayTransform);
 
     // ── Film stock — a second DISPLAY TRANSFORM, not a grade on top of one ─────
     //

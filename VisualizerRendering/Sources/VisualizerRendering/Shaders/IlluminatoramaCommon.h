@@ -276,7 +276,11 @@ struct FrameUniforms {
     // between accumulation frames), ships a byte-identical velocity buffer. Repurposes the
     // former `_padSSS1` slot — same 4 bytes at the same offset, stride unchanged.
     float    windPrevDelta;
-    float    _padSSS2;
+    // DH-0881 — which scene→display rendering to use: 0 = the shipped per-channel Narkowicz
+    // curve in Rec.709 primaries, 1 = the same curve evaluated in ACEScg (AP1), 2 = AgX.
+    // 0 is byte-identical. Repurposes the former `_padSSS2` slot — same 4 bytes, stride
+    // unchanged. Mirrors the Swift `IlluminatoramaFrameUniforms`.
+    uint     displayTransform;   // was _padSSS2
     // Phase 9 — film-stock LUT blend strength. 0 = bypass, 1 = full grade.
     // NEW 16-byte cluster (stride 1088 → 1104). Three float pads fill.
     float    filmLUTStrength;

@@ -1000,6 +1000,27 @@ public final class IlluminatoramaRenderer {
     /// before the exposure meter and the tonemap, because it is the lens losing light, not a
     /// grade on the finished image (that is `vignetteStrength`). 0 = off. See DH-0882.
     public var naturalVignetteK: Float = 0
+
+    /// **Which scene → display rendering the tonemap applies** (DH-0881).
+    ///
+    /// The shipped one, `.acesRec709`, is Narkowicz's fitted RRT+ODT curve applied PER CHANNEL
+    /// in Rec.709 primaries — no AP0/AP1 transform anywhere, i.e. ACES in name only. A
+    /// per-channel curve desaturates by driving the dominant channel into its shoulder first,
+    /// so hue rotates as intensity rises: saturated blue → purple, hot red → orange. The other
+    /// two options fix that; `.acesRec709` stays the default and is byte-identical.
+    public enum DisplayTransform: UInt32, Sendable, CaseIterable, Equatable, Hashable {
+        /// The shipped curve, per channel in Rec.709. Byte-identical to every prior build.
+        case acesRec709 = 0
+        /// The SAME curve evaluated in ACEScg (AP1) and brought back. Same contrast, same
+        /// shoulder; the channel clipping now happens in a wide gamut, so hue holds. The
+        /// minimal, conservative fix.
+        case acesAP1 = 1
+        /// AgX — an inset matrix that desaturates before the sigmoid (so no channel enters the
+        /// shoulder alone, the blue-light case) and a log2-domain contrast curve. What Blender
+        /// moved to, for these reasons.
+        case agx = 2
+    }
+    public var displayTransform: DisplayTransform = .acesRec709
     /// Optical vignetting, 0…1 — how hard the lens barrel clips the aperture toward
     /// the frame corners, turning bokeh discs into cat's-eye lemons. 0 = none.
     public var dofCatsEye: Float = 0
@@ -13336,6 +13357,7 @@ public final class IlluminatoramaRenderer {
         u.filmLUTStrength = filmLUTTexture != nil ? max(0, min(1, filmLUTStrength)) : 0
         u.filmLUTSize = max(2, filmLUTSize)
         u.naturalVignetteK = max(0, naturalVignetteK)
+        u.displayTransform = displayTransform.rawValue
         // Tonemap colour-grade. Neutral defaults (6500/0/1/1/1) are exact no-ops in
         // the shader, so scenes that never touch these are byte-for-byte unchanged.
         u.whiteBalanceK = whiteBalanceK
