@@ -195,19 +195,27 @@ extension LeafSilhouette {
     /// A broad blade with a few gentle rounded lobes — the stylized stand-in for the monstera's
     /// signature fenestration.
     ///
-    /// The PREVIOUS curve swung u by 0.44-0.48 between adjacent control points (0.86 → 0.42 → 0.88
-    /// → 0.40 → 0.82 → 0.40) — Catmull-Rom subdivision smooths the PATH between two points, but it
-    /// threads THROUGH every control point, so a swing that sharp still turns a genuine corner AT
-    /// each one; "smoothing" the segments between two spikes doesn't blunt the spikes themselves.
-    /// The result rendered as a spiky star/urchin, not a lobed tropical leaf, confirmed both by a
-    /// realism pass and by direct visual inspection (DH-0775). Halving the swing to ~0.12-0.20 per
-    /// step is what actually reads as ROUNDED lobes with shallow scalloped valleys between them —
-    /// still a wavy, lobed margin (not a plain oval), just without the sharp reversal at each peak.
+    /// The ORIGINAL curve swung u by 0.44-0.48 between adjacent control points — a genuine corner
+    /// at each one, confirmed by realism pass and direct inspection (DH-0775). Halving the swing to
+    /// ~0.12-0.20 per step (still the shipped value on most silhouettes in this file) fixed the
+    /// "spiky star" read, but a REAL render still showed a fine, regular sawtooth (Danny: "reads as
+    /// shredded"). Measuring the actual TURNING ANGLE at each control point (not just eyeballing the
+    /// swing) explains why: at a genuine local peak or valley, Catmull-Rom threads exactly through
+    /// the point, so the turn there is driven by the peak-to-valley height DIFFERENCE relative to
+    /// how far apart the points are in `v` — the 0.12-0.20-swing curve still turned 60-90° at every
+    /// lobe tip regardless of subdivision count (measured: subdivisions 3→5 only took the worst
+    /// corner from 92°→69°, nowhere near smooth), because subdivision redistributes a corner's
+    /// existing turn across more, smaller segments — it does not reduce the TOTAL turn a peak must
+    /// make to reverse direction. The only real fix is a shallower peak-to-valley DIFFERENCE: this
+    /// curve keeps three broad, gentle lobes (peaks ~0.60-0.70, valleys ~0.56-0.60 — u swings only
+    /// ~0.06-0.10, not 0.12-0.20) which measures 33° worst-case at subdivisions 4, comfortably under
+    /// the ~40° a real crease starts at. A more subtly-lobed monstera than the signature deep-cut
+    /// fenestration would suggest, but a smooth one — see the memory file for the failed "fewer
+    /// BIGGER lobes" attempt that made this measurably worse before this shallow-lobe fix.
     public static let monstera = LeafSilhouette(
         name: "monstera",
-        hero: [(0.00, 0.00), (0.10, 0.52), (0.22, 0.68), (0.34, 0.56),
-               (0.46, 0.74), (0.58, 0.58), (0.70, 0.66), (0.82, 0.50),
-               (0.92, 0.32), (1.00, 0.00)])
+        hero: [(0.00, 0.00), (0.12, 0.56), (0.30, 0.66), (0.48, 0.60),
+               (0.66, 0.70), (0.84, 0.56), (1.00, 0.00)])
 
     /// A short, fat, very rounded fleshy paddle (jade / echeveria): widens fast to a broad rounded
     /// middle, then rounds over to a blunt tip. Entire margin.

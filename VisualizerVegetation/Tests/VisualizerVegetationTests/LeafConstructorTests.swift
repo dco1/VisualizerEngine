@@ -123,4 +123,79 @@ final class LeafConstructorTests: XCTestCase {
         XCTAssertEqual(alongMidrib.min()!, 0, accuracy: 1e-12)
         XCTAssertEqual(alongMidrib.max()!, p.height, accuracy: 1e-12)
     }
+
+    /// A blade split into a base piece and a tip piece — two `emitBlade` calls back to back, in one
+    /// function, into one sink — IS the unsplit blade, triangle for triangle, bit for bit.
+    ///
+    /// DH-0777 recorded the opposite: a two-tone leaf built this way came out wider and flatter than
+    /// the whole leaf, as if `fold` and `curl` had been dropped, and it was filed as a possible
+    /// compiler miscompile of the generic constructor. Splitting a margin is a legitimate thing to
+    /// want (one colour group per band on a `Mesh3`, which has no colour channel), so the question is
+    /// pinned here as a number: every station is a pure function of `(placement, v, u, fold, curl)`,
+    /// a cut at a shared control evaluates the seam identically from both sides, and nothing a
+    /// previous call did can reach the next. Asked of both scalars and both windings, on a tilted,
+    /// non-axis-aligned frame where a dropped fold or curl moves every coordinate.
+    func testBackToBackSplitBladesAreTheUnsplitBlade() {
+        let y = simd_normalize(SIMD3<Double>(0.31, 0.88, -0.36))
+        let x = simd_normalize(simd_cross(y, SIMD3<Double>(0.2, 0.1, 1)))
+        let bent = simd_cross(x, y)
+        let p = LeafConstructor.Placement<Double>(position: SIMD3(0.12, 0.64, -0.05), xAxis: x,
+                                                  yAxis: y, bentNormal: bent,
+                                                  width: 0.216, height: 0.52)
+        let fp = LeafConstructor.Placement<Float>(
+            position: SIMD3(p.position), xAxis: SIMD3(p.xAxis), yAxis: SIMD3(p.yAxis),
+            bentNormal: SIMD3(p.bentNormal), width: Float(p.width), height: Float(p.height))
+
+        for s in shippedSilhouettes {
+            let margin = s.margin(subdivisions: 3)
+            guard margin.count >= 4 else { continue }
+            // One cut, and two — the base/tip two-tone shape, and a three-band petal.
+            let cutSets = [[margin.count / 2], [margin.count / 3, 2 * margin.count / 3]]
+            for cuts in cutSets {
+                for w: LeafConstructor.Winding in [.singleSided, .doubleSidedShell] {
+                    let label = "\(s.name) cuts=\(cuts) \(w)"
+                    assertSplitIsWhole(placement: p, margin: margin, cuts: cuts, winding: w,
+                                       label: label + " Double")
+                    assertSplitIsWhole(placement: fp, margin: margin, cuts: cuts, winding: w,
+                                       label: label + " Float")
+                }
+            }
+        }
+    }
+
+    private func assertSplitIsWhole<S: LeafScalar>(placement: LeafConstructor.Placement<S>,
+                                                   margin: [LeafSilhouette.Control], cuts: [Int],
+                                                   winding: LeafConstructor.Winding, label: String) {
+        let fold = S(0.30), curl = S(0.34), wave = S(0.06)
+        var whole = CollectingSink<S>()
+        LeafConstructor.emitBlade(into: &whole, placement: placement, margin: margin, fold: fold,
+                                  curl: curl, winding: winding, waveAmplitude: wave, wavePhase: 0.7)
+
+        // The pieces share their cut control, so the seam is one station seen from both sides.
+        var split = CollectingSink<S>()
+        let bounds = [0] + cuts + [margin.count - 1]
+        for (lo, hi) in zip(bounds, bounds.dropFirst()) {
+            LeafConstructor.emitBlade(into: &split, placement: placement,
+                                      margin: Array(margin[lo ... hi]), fold: fold, curl: curl,
+                                      winding: winding, waveAmplitude: wave, wavePhase: 0.7)
+        }
+
+        XCTAssertEqual(split.count, whole.count, "\(label): triangle count")
+        func key(_ t: CollectingSink<S>.Triangle) -> [SIMD3<S>] { [t.a, t.b, t.c, t.outward] }
+        let wholeKeys = Set(whole.triangles.map(key))
+        let strays = split.triangles.filter { !wholeKeys.contains(key($0)) }
+        XCTAssertTrue(strays.isEmpty,
+                      "\(label): \(strays.count) split triangles are not on the unsplit blade")
+        XCTAssertEqual(split.extent(across: placement.xAxis), whole.extent(across: placement.xAxis),
+                       "\(label): width")
+        XCTAssertEqual(split.extent(across: placement.bentNormal),
+                       whole.extent(across: placement.bentNormal), "\(label): fold/curl depth")
+    }
+}
+
+private extension CollectingSink {
+    func extent(across axis: SIMD3<Scalar>) -> Scalar {
+        let d = positions.map { $0.x * axis.x + $0.y * axis.y + $0.z * axis.z }
+        return (d.max() ?? 0) - (d.min() ?? 0)
+    }
 }
