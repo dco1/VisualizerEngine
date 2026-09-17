@@ -978,6 +978,14 @@ public final class IlluminatoramaRenderer {
     public var dofBlades: Int = 0
     /// Orientation of the blade polygon, in radians.
     public var dofBladeRotation: Float = 0
+    /// How wide each gather tap's colour is prefiltered, as a multiple of that tap's own share
+    /// of the confusion disc. 1 = exactly its share (the intended value); 0 = point taps, i.e.
+    /// the pre-DH-0728 behaviour, kept as an A/B lever rather than as a default.
+    ///
+    /// This was `DOFParams._pad0` — a field named as a pad on the Swift side and as a control
+    /// on the Metal side — so the prefilter pyramid DH-0728 added to the shader was fed 0 and
+    /// the gather point-sampled every tap. See DH-0883.
+    public var dofPrefilterScale: Float = 1.0
     /// Optical vignetting, 0…1 — how hard the lens barrel clips the aperture toward
     /// the frame corners, turning bokeh discs into cat's-eye lemons. 0 = none.
     public var dofCatsEye: Float = 0
@@ -4022,7 +4030,11 @@ public final class IlluminatoramaRenderer {
         var focusDist: Float; var cocCoefficient: Float; var maxRadius: Float
         var blades: Float; var bladeRotation: Float; var catsEye: Float
         var width: UInt32; var height: UInt32
-        var tileW: UInt32; var tileH: UInt32; var tileSize: UInt32; var _pad0: Float = 0
+        var tileW: UInt32; var tileH: UInt32; var tileSize: UInt32
+        /// Mirrors the Metal `DOFParams.prefilterScale`. It used to be declared here as
+        /// `_pad0` and never set, which is why the shader's `0 ⇒ point taps` branch was the
+        /// only one that ever ran (DH-0883).
+        var prefilterScale: Float = 0
     }
     /// Tile size for the max-CoC reduction. Must match nothing in the shader but the
     /// value passed in `DOFParams.tileSize` — the kernel reads it from there.
@@ -4030,9 +4042,15 @@ public final class IlluminatoramaRenderer {
     private let dofPipeline: MTLComputePipelineState?
     private let dofTilePipeline: MTLComputePipelineState?
     private let dofDilatePipeline: MTLComputePipelineState?
+    private let dofPrefilterPipeline: MTLComputePipelineState?
     private var dofOutputTexture: MTLTexture?
     private var dofTileTexture: MTLTexture?
     private var dofTileDilatedTexture: MTLTexture?
+    /// Half-resolution, mipmapped, CoC-weighted colour pyramid the gather reads its taps from
+    /// (DH-0728/DH-0883). Premultiplied colour with the weight in alpha; the weight is the
+    /// texel's own CoC, so in-focus pixels all but vanish from the coarse levels and a sharp
+    /// silhouette cannot smear a halo of itself into the bokeh behind it.
+    private var dofPrefilterTexture: MTLTexture?
 
     // ── Volumetric shaft state ───────────────────────────────────────
     private struct VolUniforms {
@@ -4616,6 +4634,11 @@ public final class IlluminatoramaRenderer {
             self.dofDilatePipeline = try? device.makeComputePipelineState(function: dofDilateFn) // gpu-ok: one-time init, optional DoF pipeline
         } else {
             self.dofDilatePipeline = nil
+        }
+        if let dofPrefilterFn = library.makeFunction(name: "illumi_dof_prefilter") {
+            self.dofPrefilterPipeline = try? device.makeComputePipelineState(function: dofPrefilterFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            self.dofPrefilterPipeline = nil
         }
 
         // ── Volumetric shaft pipeline ────────────────────────────────
@@ -12332,8 +12355,27 @@ public final class IlluminatoramaRenderer {
             dofTileDilatedTexture = device.makeTexture(descriptor: d)
             dofTileDilatedTexture?.label = "Illuminatorama.dof.cocTilesDilated"
         }
+        // The prefilter pyramid: half resolution, full mip chain. Sized from the internal
+        // render size like everything else here, so it follows the draft/settled scale.
+        let pw = max(1, (width + 1) / 2), ph = max(1, (height + 1) / 2)
+        if dofPrefilterTexture == nil
+            || dofPrefilterTexture?.width != pw || dofPrefilterTexture?.height != ph {
+            let d = MTLTextureDescriptor()
+            d.textureType = .type2D
+            d.pixelFormat = .rgba16Float
+            d.width = pw; d.height = ph
+            d.mipmapLevelCount = Int(log2(Double(max(pw, ph))).rounded(.down)) + 1
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            dofPrefilterTexture = device.makeTexture(descriptor: d)
+            dofPrefilterTexture?.label = "Illuminatorama.dof.prefilter"
+        }
         guard let out = dofOutputTexture, let tiles = dofTileTexture,
               let dilated = dofTileDilatedTexture else { return }
+        // Point taps unless the pyramid is genuinely there to read: the shader treats 0 as
+        // "sample the frame directly", which is the correct fallback and NOT a silent one —
+        // it is the only value the field ever held before DH-0883.
+        let prefilter: MTLTexture? = dofPrefilterPipeline != nil ? dofPrefilterTexture : nil
         let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
         var p = DOFParams(
             invProjection: fu.invProjection,
@@ -12344,7 +12386,8 @@ public final class IlluminatoramaRenderer {
             bladeRotation: dofBladeRotation,
             catsEye: max(0, min(1, dofCatsEye)),
             width: UInt32(width), height: UInt32(height),
-            tileW: UInt32(tileW), tileH: UInt32(tileH), tileSize: UInt32(tile))
+            tileW: UInt32(tileW), tileH: UInt32(tileH), tileSize: UInt32(tile),
+            prefilterScale: prefilter != nil ? max(0, dofPrefilterScale) : 0)
         guard let tileEnc = timedComputeEncoder(cb, "dof.tiles") else { return }
         tileEnc.label = "Illuminatorama.dof.tiles"
         tileEnc.setComputePipelineState(tilePipeline)
@@ -12364,6 +12407,28 @@ public final class IlluminatoramaRenderer {
         dispatch(dilEnc, pipeline: dilatePipeline, width: tileW, height: tileH)
         dilEnc.endEncoding()
 
+        // Prefilter: the pyramid's base at half resolution, then the blit engine box-filters
+        // the rest. Without this each tap point-samples, and a tap's share of a large disc is
+        // many pixels wide — so a small bright highlight is either hit or missed per tap and
+        // the disc fills with grain. Runs on the SAME source the gather reads.
+        if let prePipeline = dofPrefilterPipeline, let pre = prefilter {
+            if let preEnc = timedComputeEncoder(cb, "dof.prefilter") {
+                preEnc.label = "Illuminatorama.dof.prefilter"
+                preEnc.setComputePipelineState(prePipeline)
+                preEnc.setTexture(displaySource, index: 0)
+                preEnc.setTexture(depthTexture, index: 1)
+                preEnc.setTexture(pre, index: 2)
+                preEnc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
+                dispatch(preEnc, pipeline: prePipeline, width: pre.width, height: pre.height)
+                preEnc.endEncoding()
+            }
+            if pre.mipmapLevelCount > 1, let blit = cb.makeBlitCommandEncoder() {
+                blit.label = "Illuminatorama.dof.prefilter.mips"
+                blit.generateMipmaps(for: pre)
+                blit.endEncoding()
+            }
+        }
+
         guard let enc = timedComputeEncoder(cb, "dof") else { return }
         enc.label = "Illuminatorama.dof"
         enc.setComputePipelineState(pipeline)
@@ -12371,6 +12436,7 @@ public final class IlluminatoramaRenderer {
         enc.setTexture(depthTexture, index: 1)
         enc.setTexture(out, index: 2)
         enc.setTexture(dilated, index: 3)
+        enc.setTexture(prefilter, index: 4)
         enc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
         dispatch(enc, pipeline: pipeline, width: width, height: height)
         enc.endEncoding()
