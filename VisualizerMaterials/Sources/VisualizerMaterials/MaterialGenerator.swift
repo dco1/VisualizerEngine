@@ -1196,10 +1196,18 @@ public enum MaterialGenerator {
                 // the surface stays unambiguously GREEN. A low-freq olive modulation adds subtle
                 // yellow-olive patchiness (broad, not per-pixel) so it's not a flat sheet without
                 // adding coherent-period banding or spiking the mowed-lawn's low chroma variance.
+                //
+                // CARPET PASS (DH-0077, 2026-09-13): the muted olive left the lawn's green to the
+                // blades, and from a dollhouse camera those read as "teeny little hairs" on a dull
+                // ground (Danny). A mowed lawn seen from above resolves as ONE green surface, so the
+                // tile now carries a richer turf green — G ≈0.23→0.28 at the mean, B pulled back
+                // under it (G−R ≈0.09→0.15) — still well inside measured turf reflectance and the
+                // dielectric band, and the blades are matched to THIS colour rather than out-running it.
+                // (A first cut at G−R ≈0.19 rendered as lime — the neon read 7a08a96 removed.)
                 let olive = 0.02 * (mottle - 0.5)   // ±0.01 low-freq yellow-olive patch tint on R
-                let lush = Vec3(clamp01(0.075 + gLevel * 0.14 + olive),
-                                clamp01(0.06 + gLevel * 0.40),
-                                clamp01(0.045 + gLevel * 0.095))
+                let lush = Vec3(clamp01(0.085 + gLevel * 0.12 + olive),
+                                clamp01(0.09 + gLevel * 0.46),
+                                clamp01(0.038 + gLevel * 0.06))
                 // Stressed patches yellow-brown (straw): R rises toward G, B stays low.
                 let straw = Vec3(clamp01(0.10 + gLevel * 0.55),
                                  clamp01(0.08 + gLevel * 0.62),
