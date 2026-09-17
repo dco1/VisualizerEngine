@@ -11513,7 +11513,17 @@ public final class IlluminatoramaRenderer {
             var u = RTAOUniforms(invViewProjection: fu.invViewProjection,
                                  radius: max(0.02, rtaoRadius),
                                  intensity: max(0, min(1, rtaoIntensity)),
-                                 rayCount: UInt32(max(1, min(32, rtaoRays))),
+                                 // DH-0888 — the budget the caller ASKED for. This used to be
+                                 // silently `min(32, …)`: a public property documented as the
+                                 // ray count, quietly capped three levels down, with no
+                                 // assertion and no log. Production never exceeds it
+                                 // (`settleRTAORays` 4, `photoRTAORays` 8) so no shipped frame
+                                 // changes, but it capped a diagnostic sweep and made a 512-ray
+                                 // arm read as converged when it had traced 32. A ceiling stays
+                                 // — a runaway value would hang the GPU — but at a number no
+                                 // legitimate caller reaches, and the property means what it says
+                                 // below it.
+                                 rayCount: UInt32(max(1, min(4096, rtaoRays))),
                                  // Same seed contract as every other traced term: walk only
                                  // while an accumulator can average it, else freeze.
                                  frameSeed: rtaoFrameSeed,
