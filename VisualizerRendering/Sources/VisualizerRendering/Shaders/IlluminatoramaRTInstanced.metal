@@ -111,7 +111,12 @@ struct RTInstUniforms {
     // [4..7] the same for reflections. Set only while the stats sidecar is.
     // `debugSurfCacheCharts` 1 ⇒ DebugTerm.surfaceCacheCharts: REPLACE the composite
     // with the PRIMARY surface's card, one hashed colour per card.
-    uint  surfStatsEnabled; uint debugSurfCacheCharts; uint _padIrr2;   // align the float4 cluster below
+    // DH-0872 — scotopic (Purkinje) night desaturation for the GI sky-MISS sample
+    // only (see the miss branch below). Mirrors `FrameUniforms.scotopicDesaturation`
+    // / `IlluminatoramaRenderer.scotopicDesaturation`; 0 (day, the default) ⇒ the
+    // branch below never runs ⇒ byte-identical. Repurposes `_padIrr2` — same 4
+    // bytes, stride unchanged; still aligns the float4 cluster below.
+    uint  surfStatsEnabled; uint debugSurfCacheCharts; float scotopicDesaturation;
     // ── Interior irradiance bands (mirror of FrameUniforms.interiorIrr*) ─────
     // A GI bounce or reflection landing on an interior ceiling must see the
     // FLOOR's bounce, not the outdoor cube's lawn — same fix, same values, as
@@ -544,7 +549,26 @@ kernel void illumi_rt_lighting_tlas(
                     indirect += hitRad;
                 }
             } else {
-                indirect += skyEquirect.sample(skySamp, dirToEquirectUV(dir)).rgb;
+                // DH-0872 — a raw, un-convolved single sample of the shared environment
+                // texture, unlike the CONVOLVED bake the deferred diffuse/specular IBL terms
+                // read (and unlike the interior-irradiance-band substitution above, which is
+                // day-only and only ever runs for geometry HITS, never for a sky miss). The
+                // below-horizon band deliberately carries a saturated "moonlit lawn" green
+                // tint at night (`groundFillRadiance`/N3) that the tonemap's own
+                // `scotopicDesaturation` is meant to neutralise — but that global pass runs
+                // on the FINAL composite, gated below its display-luma knee, and a
+                // ceiling-corner normal near a window sends most of its cosine-weighted rays
+                // straight out through the glass into exactly this band: undiluted, then
+                // amplified by `giStrength`, landing bright enough post-composite to dodge the
+                // knee entirely. Apply the same scotopic coefficient directly to the raw
+                // source sample instead — this is exterior night-ambient light gathered
+                // through one bounce, exactly the domain the scotopic model targets.
+                float3 sky = skyEquirect.sample(skySamp, dirToEquirectUV(dir)).rgb;
+                if (u.scotopicDesaturation > 0.0) {
+                    float skyLum = dot(sky, float3(0.2126, 0.7152, 0.0722));
+                    sky = mix(sky, float3(skyLum), u.scotopicDesaturation);
+                }
+                indirect += sky;
             }
         }
         indirect = (indirect / float(u.giRays)) * albedo * u.giStrength;

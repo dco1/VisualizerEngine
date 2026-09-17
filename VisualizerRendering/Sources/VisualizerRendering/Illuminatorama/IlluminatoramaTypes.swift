@@ -721,16 +721,25 @@ public struct IlluminatoramaPointLight {
     /// field flattens into a soft halo while the far field stays honest inverse-square. Default 0
     /// ⇒ exactly `1/d²`, byte-identical to the prior behaviour (Visualizer never sets it).
     public var softRadius: Float = 0
+    /// DH-0872 — 1 (default) ⇒ visible to the GI/reflection SECONDARY-ray local-light fill
+    /// (`secondaryLocalLightFill`) as well as the deferred pass; 0 ⇒ deferred-only. That
+    /// secondary path has no occlusion test (falloff + layer-mask only), so a light whose
+    /// containment depends on a wall actually blocking it — `nightWindowGlow`: untrapped, no
+    /// shadow map, origin just outboard of its own wall, relying on the deferred pass's own
+    /// normal-facing/cone-direction rejection — leaks its full, un-occluded, facade-calibrated
+    /// brightness onto nearby interior GI bounces. Mirrors the Metal `PointLight.giVisible`.
+    public var giVisible: UInt32 = 1
 
     public init(position: SIMD3<Float>, radius: Float, color: SIMD3<Float>,
                 layerMask: UInt32 = 0xFFFF_FFFF,
-                castsShadow: Bool = false, softRadius: Float = 0) {
+                castsShadow: Bool = false, softRadius: Float = 0, giVisible: Bool = true) {
         self.position = position
         self.radius = radius
         self.color = color
         self.layerMask = layerMask
         self.castsShadow = castsShadow ? 1 : 0
         self.softRadius = softRadius
+        self.giVisible = giVisible ? 1 : 0
     }
 }
 
@@ -800,12 +809,15 @@ public struct IlluminatoramaSpotLight {
     /// source flattens into a soft halo near the emitter instead of a hard blob on a nearby
     /// wall. Default 0 ⇒ exactly `1/d²`, byte-identical (Visualizer never sets it).
     public var softRadius: Float = 0
+    /// DH-0872 — see `IlluminatoramaPointLight.giVisible`; same field, same reason, same
+    /// default. Mirrors the Metal `SpotLight.giVisible` (stride grows 176 → 180).
+    public var giVisible: UInt32 = 1
 
     public init(position: SIMD3<Float>, direction: SIMD3<Float>,
                 innerCone: Float, outerCone: Float,
                 color: SIMD3<Float>, radius: Float,
                 layerMask: UInt32 = 0xFFFF_FFFF,
-                castsShadow: Bool = true, softRadius: Float = 0) {
+                castsShadow: Bool = true, softRadius: Float = 0, giVisible: Bool = true) {
         self.position = position
         self.direction = direction
         self.innerCone = innerCone
@@ -815,6 +827,7 @@ public struct IlluminatoramaSpotLight {
         self.layerMask = layerMask
         self.castsShadow = castsShadow ? 1 : 0
         self.softRadius = softRadius
+        self.giVisible = giVisible ? 1 : 0
     }
 }
 

@@ -108,7 +108,8 @@ struct FrameUniforms {
     float4   cascadeSplitsView;
     float    shadowBias;
     float    shadowSlopeBias;
-    uint     shadowEnabled;
+    uint     _padShadow;          // was `shadowEnabled`, never read (DH-0620); the
+                                  // kLightingShadowEnabled function constant gates shadows
     uint     shadowPcfRadius;
     // Phase 2.7 — Motion vectors + TAA. `previousViewProjection` is the
     // *jittered* VP from the previous frame so the rasterized history sample
@@ -523,6 +524,17 @@ struct PointLight {
     // flattens into a soft halo while the far field stays honest inverse-square. Default 0 ⇒
     // exactly `1/d²`, byte-identical to the prior behaviour (Visualizer never sets it).
     float  softRadius;
+    // DH-0872 — 1 (default) ⇒ visible to the GI/reflection SECONDARY-ray local-light fill
+    // (`secondaryLocalLightFill`, IlluminatoramaSecondary.h) as well as this deferred pass;
+    // 0 ⇒ deferred-only. That secondary path has NO occlusion test (falloff + layer-mask
+    // only — see its own header comment), so a light whose containment depends on a wall
+    // actually blocking it (`nightWindowGlow`: untrapped, no shadow map, origin just
+    // outboard of its own wall, relying on the deferred pass's screen-space/normal-facing
+    // rejection) leaks its full un-occluded, facade-calibrated brightness onto nearby
+    // interior GI bounces — read as a locally saturated colour cast next to that window.
+    // Ignored by this deferred kernel; consumed only by the RT mirror. Default 1 ⇒
+    // byte-identical for every light that never opts out.
+    uint   giVisible;
 };
 
 // Rectangular area light (#60 task 5). Mirror of Swift IlluminatoramaAreaLight.
@@ -587,6 +599,8 @@ struct SpotLight {
     // `1/(d² + softRadius²)`, so a cone from a finite-size source flattens into a soft halo
     // near the emitter instead of a hard blob on a nearby wall. Default 0 ⇒ exactly `1/d²`.
     float    softRadius;
+    // DH-0872 — see `PointLight.giVisible`; same field, same reason, same default.
+    uint     giVisible;
 };
 
 struct Instance {

@@ -3166,6 +3166,10 @@ public final class IlluminatoramaRenderer {
         /// C1 — 0 ⇒ the deferred pass already shaded the sun here (mirrors
         /// `directSunEnabled`, was `_padRT2`). See `RTSunOwnership`.
         var directSunEnabled: UInt32 = 0
+        /// DH-0872 — scotopic desaturation for the GI sky-miss sample only. Mirrors
+        /// `scotopicDesaturation` (the renderer's own property, also fed to the
+        /// tonemap pass). 0 (day) ⇒ byte-identical.
+        var scotopicDesaturation: Float = 0
     }
     /// Mirror of `RTDenoiseUniforms` in Illuminatorama.metal (stride 32, 16-aligned).
     private struct RTDenoiseUniforms {
@@ -3237,7 +3241,13 @@ public final class IlluminatoramaRenderer {
         var cardCount: UInt32; var triangleCount: UInt32; var indirectRays: UInt32; var frameSeed: UInt32
         var alpha: Float; var rayTMin: Float; var maxDist: Float; var incrementalEnabled: UInt32 = 0
         // DH-0653 — atlas reuse counter gate; DH-0849 — back-face guard (+ pad to the Metal stride).
-        var statsEnabled: UInt32 = 0; var backFaceGuard: UInt32 = 0; var _scPad1: UInt32 = 0; var _scPad2: UInt32 = 0
+        var statsEnabled: UInt32 = 0; var backFaceGuard: UInt32 = 0
+        /// DH-0872 — scotopic desaturation for this pass's own GI sky-MISS sample (the
+        /// cache-update kernel gathers indirect independently of the RT lighting kernels'
+        /// GI, and has the SAME raw-sample leak). Mirrors `scotopicDesaturation`. Repurposes
+        /// `_scPad1` — same 4 bytes. 0 (day) ⇒ byte-identical.
+        var scotopicDesaturation: Float = 0
+        var _scPad2: UInt32 = 0
     }
     private let surfCachePipeline: MTLComputePipelineState?
     /// §3 endpoint — TLAS-traced cache-update (traces the per-frame-refit instance
@@ -3562,7 +3572,11 @@ public final class IlluminatoramaRenderer {
         var directSunEnabled: UInt32 = 0
         var transportRayMask: UInt32 = 0x05
         // DH-0653 — hit/miss counter gate + chart overlay (were _padIrr0/_padIrr1).
-        var surfStatsEnabled: UInt32 = 0; var debugSurfCacheCharts: UInt32 = 0; var _padIrr2: UInt32 = 0
+        var surfStatsEnabled: UInt32 = 0; var debugSurfCacheCharts: UInt32 = 0
+        /// DH-0872 — scotopic desaturation for the GI sky-miss sample only. Mirrors
+        /// `scotopicDesaturation` (also fed to the tonemap pass). Repurposes
+        /// `_padIrr2` — same 4 bytes. 0 (day) ⇒ byte-identical.
+        var scotopicDesaturation: Float = 0
         // Interior irradiance bands — mirror of the Metal RTInstUniforms tail.
         var interiorIrrUp: SIMD4<Float> = .zero
         var interiorIrrSide: SIMD4<Float> = .zero
@@ -7015,6 +7029,9 @@ public final class IlluminatoramaRenderer {
                 incrementalEnabled: incremental ? 1 : 0)
             if !warming, atlasStats != nil { u.statsEnabled = 1 }
             u.backFaceGuard = surfaceCacheBackFaceGuard ? 1 : 0
+            // DH-0872 — same coefficient the tonemap pass uses, applied to this pass's own
+            // raw sky-miss sample (see the kernel's miss branch).
+            u.scotopicDesaturation = max(0, scotopicDesaturation)
             memcpy(surfCacheUniformBuffer.contents(), &u, MemoryLayout<SurfCacheUniforms>.stride)
 
             // Warm passes go untimed: the per-pass GPU timer holds 48 passes a frame.
@@ -8396,6 +8413,9 @@ public final class IlluminatoramaRenderer {
                 u.surfStatsEnabled = 1
             }
         }
+        // DH-0872 — same coefficient the tonemap pass uses, applied to the GI
+        // pass's own raw sky-miss sample (see the kernel's miss branch).
+        u.scotopicDesaturation = max(0, scotopicDesaturation)
         memcpy(rtInstUniformBuffer.contents(), &u, MemoryLayout<RTInstUniforms>.stride)
 
         guard let enc = timedComputeEncoder(cb, "rtLightingTLAS") else { return }
@@ -11815,6 +11835,9 @@ public final class IlluminatoramaRenderer {
         // reproduces every existing soup host, all of which zero
         // `directionalLightColor` before enabling RT.
         u.directSunEnabled = rtOwnsDirectSun ? 1 : 0
+        // DH-0872 — same coefficient the tonemap pass uses, applied to the GI
+        // pass's own raw sky-miss sample (see the kernel's miss branch).
+        u.scotopicDesaturation = max(0, scotopicDesaturation)
         memcpy(rtUniformBuffer.contents(), &u, MemoryLayout<RTUniforms>.stride)
 
         guard let enc = cb.makeComputeCommandEncoder() else { return }

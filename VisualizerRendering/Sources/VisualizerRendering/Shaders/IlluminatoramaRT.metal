@@ -63,6 +63,12 @@ struct RTUniforms {
     // wanted GI got the sun twice. Repurposes _padRT1's neighbour `_padRT2` —
     // same 4 bytes, stride unchanged. See `IlluminatoramaRenderer.RTSunOwnership`.
     uint  directSunEnabled;
+    // DH-0872 — scotopic (Purkinje) night desaturation for the GI sky-MISS sample
+    // only (see the miss branch below). Mirrors `FrameUniforms.scotopicDesaturation`
+    // / `IlluminatoramaRenderer.scotopicDesaturation`; 0 (day, the default) ⇒ the
+    // branch below never runs ⇒ byte-identical. Keep in lockstep with the Swift
+    // RTUniforms mirror.
+    float scotopicDesaturation;
 };
 
 // Analytic point emitter — mirrored from Illuminatorama.metal. Keep in lockstep.
@@ -478,7 +484,30 @@ kernel void illumi_rt_lighting(
                 indirect += hitRad;
             } else {
                 // Ray escaped the room (through the window) → sky.
+                //
+                // DH-0872 — unlike the deferred diffuse/specular IBL terms (which read a
+                // COSINE/GGX-CONVOLVED bake of this same texture, averaging away any one
+                // narrow band), this is a single RAW, un-convolved sample along the exact
+                // escaped-ray direction. The equirect's below-horizon band deliberately
+                // carries a saturated "moonlit lawn" green tint at night
+                // (`groundFillRadiance`/N3) — correct for a camera looking straight at the
+                // lawn, where the tonemap's own `scotopicDesaturation` neutralises it (human
+                // rods are colour-blind at night), but that global pass runs on the FINAL
+                // display-referred composite and only below its luma knee. A ceiling-corner
+                // normal near a window sends most of its cosine-weighted rays out through the
+                // glass toward exactly this band; those samples land here undiluted, then get
+                // amplified by `giStrength`, landing bright enough post-composite to dodge the
+                // tonemap's knee entirely — a visible green cast with no material or lighting
+                // term to blame (see the ticket for the round-1/round-2 isolation). Apply the
+                // SAME scotopic coefficient directly to the raw source sample instead: this is
+                // exterior night-ambient light gathered through one bounce, exactly the domain
+                // the scotopic model targets, so it should read neutral-dark on arrival — not
+                // only once it happens to still be dim after landing on a surface.
                 float3 sky = skyEquirect.sample(skySamp, dirToEquirectUV(dir)).rgb;
+                if (u.scotopicDesaturation > 0.0) {
+                    float skyLum = dot(sky, float3(0.2126, 0.7152, 0.0722));
+                    sky = mix(sky, float3(skyLum), u.scotopicDesaturation);
+                }
                 indirect += sky;
             }
         }

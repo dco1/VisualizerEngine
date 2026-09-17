@@ -73,7 +73,15 @@ struct SurfCacheUniforms {
     uint   statsEnabled;
     // DH-0849 — 1 ⇒ an indirect ray that lands on the BACK of a card (the hit triangle's
     // winding normal faces along the ray) brings back no light; see `sc_backFaceHit`.
-    uint   backFaceGuard; uint _scPad1; uint _scPad2;
+    uint   backFaceGuard;
+    // DH-0872 — scotopic (Purkinje) night desaturation for this kernel's OWN GI sky-MISS
+    // sample (see the miss branches below). This cache-update pass gathers its indirect
+    // term independently of `illumi_rt_lighting(_tlas)` — same raw, un-convolved leak, same
+    // fix. Mirrors `FrameUniforms.scotopicDesaturation` / `IlluminatoramaRenderer
+    // .scotopicDesaturation`. 0 (day, the default) ⇒ byte-identical. Repurposes `_scPad1` —
+    // same 4 bytes, stride unchanged.
+    float  scotopicDesaturation;
+    uint   _scPad2;
 };
 
 // ── shared helpers (kept local; Metal has no cross-file linkage) ──────────────
@@ -336,7 +344,22 @@ kernel void illumi_surfcache_update(
                                         cards, triCard, triUVa, triUVc,
                                         cardRect, u.atlasW, u.atlasH);
         } else {
-            indirect += skyEquirect.sample(skySamp, sc_dirToEquirectUV(dir)).rgb;
+            // DH-0872 — same leak, same fix, as `illumi_rt_lighting`'s GI miss branch: a raw,
+            // un-convolved single sample of the shared night environment, which deliberately
+            // carries a saturated "moonlit lawn" green tint in its below-horizon band
+            // (`groundFillRadiance`/N3). This kernel BUILDS the surface-cache atlas a GI hit
+            // later reads (`sampleSurfCache` above, and the RT lighting kernels' own cache
+            // reads) — its own miss branch is a SEPARATE, independent leak from the RT
+            // lighting kernels' (`illumi_rt_lighting(_tlas)`), not fixed by patching those
+            // alone: a card whose own cache-gather escapes to this band bakes the tint into
+            // its EMA-accumulated irradiance, which every later reader of that card inherits
+            // regardless of what its own direct rays do. Desaturate the raw sample here too.
+            float3 sky = skyEquirect.sample(skySamp, sc_dirToEquirectUV(dir)).rgb;
+            if (u.scotopicDesaturation > 0.0) {
+                float skyLum = dot(sky, float3(0.2126, 0.7152, 0.0722));
+                sky = mix(sky, float3(skyLum), u.scotopicDesaturation);
+            }
+            indirect += sky;
         }
     }
     indirect = indirect / float(rays);   // arriving irradiance (no albedo — applied at read)
@@ -495,7 +518,16 @@ kernel void illumi_surfcache_update_tlas(
         } else if (kSCCurvesEnabled && res.type == intersection_type::curve) {
             continue;   // occluded by a curve — no card, no sky (see above)
         } else {
-            indirect += skyEquirect.sample(skySamp, sc_dirToEquirectUV(dir)).rgb;
+            // DH-0872 — same leak, same fix, as the soup variant above (`illumi_surfcache_update`)
+            // and `illumi_rt_lighting_tlas`'s own GI miss branch: a raw, un-convolved sky sample
+            // that deliberately carries a saturated "moonlit lawn" green tint in its below-horizon
+            // band. Desaturate it here too, at the point this kernel gathers it into the cache.
+            float3 sky = skyEquirect.sample(skySamp, sc_dirToEquirectUV(dir)).rgb;
+            if (u.scotopicDesaturation > 0.0) {
+                float skyLum = dot(sky, float3(0.2126, 0.7152, 0.0722));
+                sky = mix(sky, float3(skyLum), u.scotopicDesaturation);
+            }
+            indirect += sky;
         }
     }
     indirect = indirect / float(rays);   // arriving irradiance (no albedo)

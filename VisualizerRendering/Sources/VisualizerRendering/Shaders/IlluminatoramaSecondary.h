@@ -93,10 +93,20 @@ struct PrimUV { float2 uvA; float2 uvB; float2 uvC; };
 
 /// Local-light currency. Mirrors `PointLight` / `SpotLight` in Illuminatorama.metal
 /// and the Swift `IlluminatoramaPointLight` / `IlluminatoramaSpotLight`.
+// `PointLight`/`SpotLight` (IlluminatoramaCommon.h, the deferred kernel's mirrors of the
+// SAME Swift-uploaded buffer) both grew a trailing `giVisible` field for DH-0872 — no
+// spare padding was left in either, so this struct MUST grow by the same 4 bytes in the
+// same place, not repurpose `_pad0/_pad1` in place, or the two Metal structs disagree on
+// `sizeof` and `pointLights[i]`/`spotLights[i]` misalign for every i > 0 on whichever
+// kernel reads the smaller one. Keep in lockstep.
 struct RTPointLight {
     float3 position;  float radius;
     float3 color;     uint  layerMask;
     uint   castsShadow; int shadowCubeIndex; int _pad0; int _pad1;
+    // DH-0872 — mirrors `PointLight.giVisible`. 1 (default) ⇒ visible to THIS un-occluded
+    // local-light-fill path too; 0 ⇒ skipped here (see `secondaryLocalLightFill` and the
+    // field's own doc comment on `PointLight` for why).
+    uint   giVisible;
 };
 struct RTSpotLight {
     float3   position;   float innerCone;
@@ -106,6 +116,8 @@ struct RTSpotLight {
     int      shadowSliceIndex;
     uint     layerMask;
     int      _pad1; int _pad2;
+    // DH-0872 — mirrors `SpotLight.giVisible`; see `RTPointLight.giVisible`.
+    uint     giVisible;
 };
 
 // ── RNG + sampling ───────────────────────────────────────────────────────────
@@ -501,6 +513,7 @@ static inline float3 secondaryLocalLightFill(float3 P, float3 N, uint layerBits,
     float3 sum = float3(0.0);
     for (uint i = 0u; i < p.pointLightCount; ++i) {
         RTPointLight pl = sc.pointLights[i];
+        if (pl.giVisible == 0u) continue;   // DH-0872 — see `giVisible`'s own doc comment
         if ((pl.layerMask & layerBits) == 0u) continue;
         float3 toL = pl.position - P;
         float dist = length(toL);
@@ -514,6 +527,7 @@ static inline float3 secondaryLocalLightFill(float3 P, float3 N, uint layerBits,
     }
     for (uint i = 0u; i < p.spotLightCount; ++i) {
         RTSpotLight sl = sc.spotLights[i];
+        if (sl.giVisible == 0u) continue;   // DH-0872 — see `giVisible`'s own doc comment
         if ((sl.layerMask & layerBits) == 0u) continue;
         float3 toL = sl.position - P;
         float dist = length(toL);
