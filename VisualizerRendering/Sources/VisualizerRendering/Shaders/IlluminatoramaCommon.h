@@ -482,7 +482,12 @@ struct FrameUniforms {
     float    highlightChromaRolloff;  // 0 = off
     float    shadowTemperatureK;      // 6500 = no-op
     float    highlightTemperatureK;   // 6500 = no-op
-    float    _padPhotoFinish;
+    // DH-0882 — NATURAL (cos^4) vignetting: (halfFrameDiagonalMM / focalLengthMM)^2, times
+    // however much of the physical falloff the host wants. The lens's own light loss, so it
+    // multiplies the SCENE before exposure/ACES — unlike `vignetteStrength`, which is a grade
+    // on the finished image. 0 = off, and off is an exact no-op. Repurposes the former
+    // `_padPhotoFinish` slot — same 4 bytes, stride unchanged.
+    float    naturalVignetteK;   // was _padPhotoFinish
     // DH-0715 — live-lane look-match: a cheap HDR-domain approximation of the
     // photo lane's RT bounce-GI + RTAO passes, for hosts that can't afford the
     // real thing live (see `IlluminatoramaTonemap.metal`'s use of these). Applied

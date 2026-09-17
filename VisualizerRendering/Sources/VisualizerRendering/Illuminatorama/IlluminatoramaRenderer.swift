@@ -986,6 +986,20 @@ public final class IlluminatoramaRenderer {
     /// on the Metal side — so the prefilter pyramid DH-0728 added to the shader was fed 0 and
     /// the gather point-sampled every tap. See DH-0883.
     public var dofPrefilterScale: Float = 1.0
+    /// **Diffraction**, as the Airy disc's CoC RADIUS in pixels of the internal buffer — a
+    /// floor under the circle of confusion at every distance, the focus plane included, since
+    /// a diffraction-limited image is soft everywhere rather than soft off the focus plane.
+    /// The host derives it from the aperture (`ThinLens.diffractionCoCPixels`); 0 = off.
+    ///
+    /// Stopped down this is not a subtlety: at 550 nm the Airy diameter is 2.44·λ·N, so f/22
+    /// puts it at 0.029 mm — exactly the acceptable CoC on full frame, which is why f/22 is
+    /// where a 35 mm lens stops resolving. On 4 × 5, f/22 is a normal working aperture.
+    public var dofDiffractionCoCPixels: Float = 0
+    /// **Natural (cos⁴) vignetting** — `(halfFrameDiagonalMM / focalLengthMM)²`, scaled by how
+    /// much of the physical falloff the host wants (1 = all of it). Multiplies the SCENE
+    /// before the exposure meter and the tonemap, because it is the lens losing light, not a
+    /// grade on the finished image (that is `vignetteStrength`). 0 = off. See DH-0882.
+    public var naturalVignetteK: Float = 0
     /// Optical vignetting, 0…1 — how hard the lens barrel clips the aperture toward
     /// the frame corners, turning bokeh discs into cat's-eye lemons. 0 = none.
     public var dofCatsEye: Float = 0
@@ -4035,6 +4049,9 @@ public final class IlluminatoramaRenderer {
         /// `_pad0` and never set, which is why the shader's `0 ⇒ point taps` branch was the
         /// only one that ever ran (DH-0883).
         var prefilterScale: Float = 0
+        /// Mirrors the Metal `DOFParams.cocFloor` — the diffraction Airy disc's CoC radius in
+        /// pixels, applied at every distance including the focus plane (DH-0882).
+        var cocFloor: Float = 0
     }
     /// Tile size for the max-CoC reduction. Must match nothing in the shader but the
     /// value passed in `DOFParams.tileSize` — the kernel reads it from there.
@@ -12387,7 +12404,8 @@ public final class IlluminatoramaRenderer {
             catsEye: max(0, min(1, dofCatsEye)),
             width: UInt32(width), height: UInt32(height),
             tileW: UInt32(tileW), tileH: UInt32(tileH), tileSize: UInt32(tile),
-            prefilterScale: prefilter != nil ? max(0, dofPrefilterScale) : 0)
+            prefilterScale: prefilter != nil ? max(0, dofPrefilterScale) : 0,
+            cocFloor: max(0, dofDiffractionCoCPixels))
         guard let tileEnc = timedComputeEncoder(cb, "dof.tiles") else { return }
         tileEnc.label = "Illuminatorama.dof.tiles"
         tileEnc.setComputePipelineState(tilePipeline)
@@ -13317,6 +13335,7 @@ public final class IlluminatoramaRenderer {
         // Phase 9 — film LUT strength: 0 when no LUT is bound (bypasses the shader branch).
         u.filmLUTStrength = filmLUTTexture != nil ? max(0, min(1, filmLUTStrength)) : 0
         u.filmLUTSize = max(2, filmLUTSize)
+        u.naturalVignetteK = max(0, naturalVignetteK)
         // Tonemap colour-grade. Neutral defaults (6500/0/1/1/1) are exact no-ops in
         // the shader, so scenes that never touch these are byte-for-byte unchanged.
         u.whiteBalanceK = whiteBalanceK

@@ -553,7 +553,16 @@ public struct IlluminatoramaFrameUniforms {
     /// approaches white, then put back a controlled amount of warmth.
     /// ONE new 16-byte cluster (stride 1536 → 1552); mirror of the Metal `FrameUniforms`.
     public var highlightTemperatureK: Float = 6500
-    public var _padPhotoFinish: Float = 0
+    /// DH-0882 — NATURAL (cos⁴) vignetting, as `(halfFrameDiagonalMM / focalLengthMM)²` scaled
+    /// by how much of the physical falloff the host wants. Every lens loses light off-axis as
+    /// cos⁴ of the field angle, which is why a 16 mm is visibly darker in the corners and a
+    /// 100 mm is not; the renderer had no notion of it, while the bokeh's `dofCatsEye` modelled
+    /// the same effect. Because it is the LENS losing light it multiplies the scene before
+    /// exposure and the tonemap — the shoulder can then recover — unlike `vignetteStrength`,
+    /// which is a grade on the finished image. 0 = off (an exact no-op), which is the default,
+    /// so every host that never sets it is byte-identical. Repurposes the former
+    /// `_padPhotoFinish` slot — same offset, stride unchanged.
+    public var naturalVignetteK: Float = 0
     // DH-0715 — live-lane look-match (see `IlluminatoramaTonemap.metal`). 0
     // (default) ⇒ byte-identical for every scene that never opts in. ONE new
     // 16-byte cluster (stride 1552 → 1568); mirror of the Metal `FrameUniforms`.

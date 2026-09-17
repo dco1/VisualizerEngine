@@ -849,6 +849,26 @@ fragment float4 illumi_tonemap_fs(
     // ALTERNATIVE display transform of this same value, not a grade layered on the
     // output of the first one (DH-0878).
     float3 exposedScene = graded * exposure;
+
+    // ── Natural (cos⁴) vignetting — the LENS losing light off-axis ─────────────
+    // Illuminance falls as cos⁴ of the field angle, and tan(angle) = r/f, so
+    // cos⁴ = 1/(1 + (r/f)²)². With ρ the radius as a fraction of the half-diagonal,
+    // (r/f)² = K·ρ² for K = (halfDiagonalMM / f)² — one scalar the host computes from the
+    // lens it is already projecting with. A 16 mm therefore darkens its corners visibly and
+    // a 100 mm barely at all, which is the whole point: `vignetteStrength` further down is a
+    // free artistic dial that knows nothing about the lens, and this is the physics.
+    //
+    // It multiplies the SCENE, before exposure's meter and before the tonemap, because that
+    // is where a lens actually takes the light: the shoulder is then free to recover some of
+    // it, exactly as a real negative does. A post-tonemap multiply can only crush.
+    // 0 ⇒ the branch never runs ⇒ byte-identical.
+    if (frame.naturalVignetteK > 0.0) {
+        float2 d   = in.uv - 0.5;
+        float  r2  = dot(d, d) * 2.0;                 // 0 at centre → 1 at the corner
+        float  cos2 = 1.0 / (1.0 + frame.naturalVignetteK * r2);
+        exposedScene *= cos2 * cos2;                  // cos⁴
+    }
+
     float3 mapped = aces(exposedScene);
 
     // ── Film stock — a second DISPLAY TRANSFORM, not a grade on top of one ─────
@@ -1033,14 +1053,38 @@ fragment float4 illumi_tonemap_fs(
         // RAW IEEE BITS (`as_type`), which extracts the most decorrelation the host's
         // `float` clock can carry: any two frames whose `frame.time` differ at all reseed.
         uint2 gp = uint2(gpf);
-        uint  h  = (gp.x * 73856093u) ^ (gp.y * 19349663u) ^ (as_type<uint>(frame.time) * 83492791u);
-        h ^= h >> 16; h *= 0x7feb352du;
-        h ^= h >> 15; h *= 0x846ca68bu;
-        h ^= h >> 16;
-        float n = float(h) * (1.0 / 4294967296.0) - 0.5;   // uniform ∈ [-0.5, 0.5)
+        uint  t  = as_type<uint>(frame.time);
+        // FOUR draws from the same bit mix, salted per draw: one shared luminance term plus
+        // an independent term per channel. A salt of 0 reproduces the original hash exactly,
+        // so the shared term is the grain this used to emit.
+        float n[4];
+        for (uint c = 0; c < 4; ++c) {
+            uint h = (gp.x * 73856093u) ^ (gp.y * 19349663u) ^ (t * 83492791u)
+                   ^ (c * 2654435761u);
+            h ^= h >> 16; h *= 0x7feb352du;
+            h ^= h >> 15; h *= 0x846ca68bu;
+            h ^= h >> 16;
+            n[c] = float(h) * (1.0 / 4294967296.0) - 0.5;   // uniform ∈ [-0.5, 0.5)
+        }
+        // ── Grain has COLOUR (DH-0880) ───────────────────────────────────────────
+        // One scalar added to all three channels is pure luminance noise, which is what
+        // video noise looks like. Film grain is per-dye-layer: three emulsion layers with
+        // independent silver, only partly correlated, and that faint chroma shimmer is a
+        // large part of why grain reads as film. 0.80 shared leaves ~24 % of each channel's
+        // amplitude independent — present, not a party trick. The `norm` keeps the total
+        // per-channel variance equal to the old monochrome grain's, so the strength dial
+        // means what it always meant.
+        const float kShared = 0.80, kOwn = 1.0 - kShared;
+        const float norm = 1.0 / sqrt(kShared * kShared + kOwn * kOwn);
+        float3 nRGB = (kShared * n[0] + kOwn * float3(n[1], n[2], n[3])) * norm;
+        // ── …and it is not a symmetric parabola ──────────────────────────────────
+        // `4·l·(1−l)` peaks exactly at mid-grey and dies at both ends at the same rate.
+        // Negative grain is roughly constant in DENSITY, so through the print the visible
+        // granularity peaks in the mid-to-LOW tones with a long tail into the shadows and a
+        // short one into the highlights, where the dye is thin. Asymmetric on purpose.
         float lumG = dot(mapped, float3(0.2126, 0.7152, 0.0722));
-        float mask = 4.0 * lumG * (1.0 - lumG);       // parabola: 1 at mid-grey, 0 at ends
-        mapped = saturate(mapped + n * frame.filmGrainStrength * mask);
+        float mask = smoothstep(0.0, 0.12, lumG) * (1.0 - smoothstep(0.55, 1.0, lumG));
+        mapped = saturate(mapped + nRGB * frame.filmGrainStrength * mask);
     }
 
     // ── Colour-grade LUT (issue #65) ──────────────────────────────────────────

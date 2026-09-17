@@ -53,6 +53,7 @@ struct DOFParams {
     uint  width;  uint height;
     uint  tileW;  uint tileH; uint tileSize;
     float prefilterScale;   // × each tap's footprint it is prefiltered over; 0 ⇒ point taps
+    float cocFloor;         // DIFFRACTION: Airy-disc CoC radius in px, the same everywhere
 };
 
 // View-space distance (positive, metres) of a depth-buffer sample.
@@ -70,7 +71,15 @@ static inline float view_z(float depth, uint2 gid, constant DOFParams& p) {
 static inline float coc_radius(float z, constant DOFParams& p) {
     float zz = max(z, 1e-4f);
     float signed_c = 0.5f * p.cocCoefficient * (p.focusDist - zz) / zz;
-    return clamp(signed_c, -p.maxRadius, p.maxRadius);
+    // DIFFRACTION (DH-0882). Stopped down, the Airy disc the aperture itself makes exceeds
+    // the acceptable circle of confusion and the WHOLE frame softens — on full frame that
+    // crossover is around f/16, and f/22 is an ordinary working aperture on 4×5. It is the
+    // same size at every distance, including exactly on the focus plane, so it is a FLOOR on
+    // the magnitude rather than a larger coefficient: a bigger coefficient would scale with
+    // |z − z_f| and leave the focus plane untouched, which is the one place diffraction is
+    // most obvious. The sign is kept so the gather's occlusion rules still apply.
+    float mag = min(max(abs(signed_c), p.cocFloor), p.maxRadius);
+    return (signed_c < 0.0f) ? -mag : mag;
 }
 
 // ── Pass 1: max |CoC| per tile ───────────────────────────────────────────────
