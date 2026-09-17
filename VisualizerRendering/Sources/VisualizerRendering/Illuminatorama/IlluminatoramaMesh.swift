@@ -70,7 +70,10 @@ public final class IlluminatoramaMesh {
     /// Object-space bounding sphere (centre, radius), computed ONCE from the vertex buffer on first
     /// ask (DH-0637). nil when the buffer is `.private` (GPU-only vertices) — callers must then
     /// treat the mesh as unbounded. Used by the spot-shadow reuse to ask "can this swaying
-    /// instance swing through that cone?"; nothing else reads it.
+    /// instance swing through that cone?", and by visibility culling (DH-0534) to bound every
+    /// draw group — so a mesh whose CPU-visible positions are rewritten in place after the first
+    /// ask would be culled against stale bounds. GPU-rewritten meshes are built with
+    /// `init(vertexBuffer:…)` (`cpuAuthoredVertices == false`), which the culler treats as unbounded.
     public var boundingSphere: (center: SIMD3<Float>, radius: Float)? {
         if let cached = cachedBoundingSphere { return cached }
         guard vertexBuffer.storageMode != .private, vertexCount > 0 else { return nil }
@@ -88,6 +91,36 @@ public final class IlluminatoramaMesh {
         return sphere
     }
     private var cachedBoundingSphere: (center: SIMD3<Float>, radius: Float)?
+
+    /// The largest positive vegetation-wind weights packed in this mesh's tangents — `sway` is
+    /// `tangent.x`, `flutter` is `tangent.z`, exactly what `applyTreeWind` reads — so visibility
+    /// culling (DH-0534) can bound how far the gust moves a vertex. Floored at 1: a tangent the
+    /// GPU synthesis pass writes later is a unit vector, and a scan taken before it lands must not
+    /// under-bound it. nil for GPU-only vertices (the caller then treats the draw as unbounded).
+    public var windAttributeMax: (sway: Float, flutter: Float)? {
+        if let cached = cachedWindAttributeMax { return cached }
+        guard vertexBuffer.storageMode != .private, vertexCount > 0 else { return nil }
+        let stride = MemoryLayout<IlluminatoramaVertex>.stride
+        let offset = MemoryLayout<IlluminatoramaVertex>.offset(of: \.tangent) ?? 48
+        let base = vertexBuffer.contents()
+        var sway: Float = 1, flutter: Float = 1
+        for v in 0..<vertexCount {
+            let t = base.load(fromByteOffset: v * stride + offset, as: SIMD4<Float>.self)
+            sway = max(sway, t.x); flutter = max(flutter, t.z)
+        }
+        let result = (sway: sway, flutter: flutter)
+        cachedWindAttributeMax = result
+        return result
+    }
+    private var cachedWindAttributeMax: (sway: Float, flutter: Float)?
+
+    /// True when the engine COPIED this mesh's vertices out of CPU arrays (every `vertices:` init
+    /// and the primitives built on them) — the CPU-side bounds are then the truth. False for the
+    /// GPU-direct `init(vertexBuffer:…)`, whose buffer a compute kernel may rewrite at any time;
+    /// visibility culling (DH-0534) never trusts a bound of such a mesh. Keyed on provenance, not
+    /// on `registerMesh`: Daydream Home registers its CPU-built house, furniture and trees through
+    /// that API, and a registration-based rule left every one of them unculled.
+    public private(set) var cpuAuthoredVertices: Bool = true
 
     public init(device: MTLDevice, vertices: [IlluminatoramaVertex], indices: [UInt16]) {
         guard let vb = device.makeBuffer(
@@ -196,6 +229,7 @@ public final class IlluminatoramaMesh {
         self.indexCount   = indexCount
         self.indexType    = indexType
         self.vertexCount  = vertexBuffer.length / MemoryLayout<IlluminatoramaVertex>.stride
+        self.cpuAuthoredVertices = false
     }
 
     // ── Procedural primitives ────────────────────────────────────────────────

@@ -5284,6 +5284,20 @@ public final class IlluminatoramaRenderer {
         return IlluminatoramaMeshHandle(kind: kind, mesh: mesh, renderer: self)
     }
 
+    /// The registered mesh behind a `MeshKind`, or nil if nothing is registered under it.
+    ///
+    /// Read-only lookup into the mesh table, for a host that needs the geometry it is DRAWING
+    /// rather than a copy of what it once submitted — exact cursor picking (ray vs the real
+    /// triangles, via `IlluminatoramaMesh.objectTriangleSoup()`), a measurement probe, a
+    /// geometry audit. The alternative is for every host to shadow the table with its own
+    /// `[MeshKind: IlluminatoramaMesh]`, which is a second source of truth for the same fact and
+    /// goes stale exactly when a mesh is re-registered.
+    ///
+    /// The returned object is the renderer's own entry, not a copy: treat its buffers as
+    /// read-only, and note a `.private`-storage mesh has no CPU-visible vertices at all
+    /// (`objectTriangleSoup()` is empty for it).
+    public func registeredMesh(_ kind: MeshKind) -> IlluminatoramaMesh? { meshes[kind] }
+
     /// Called by `IlluminatoramaMeshHandle.deinit` to evict the entry
     /// when the host drops its last strong reference. Internal because
     /// hosts should not call this directly — letting the handle's

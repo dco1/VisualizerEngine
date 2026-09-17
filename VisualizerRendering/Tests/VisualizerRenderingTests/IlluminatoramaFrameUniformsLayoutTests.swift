@@ -92,8 +92,7 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
         assertOffset(\.liveLookMatchStrength, 1552, "liveLookMatchStrength")
         assertOffset(\.liveLookGIDarken,      1556, "liveLookGIDarken")
         assertOffset(\.liveLookGIWarmth,      1560, "liveLookGIWarmth")
-        assertOffset(\.liveLookAODarken,      1564, "liveLookAODarken")
-    }
+        assertOffset(\.liveLookAODarken,      1564, "liveLookAODarken")    }
 
     /// The packing the shader's `gains[b >> 2][b & 3]` assumes, held on the Swift side that
     /// writes it. A table whose lanes are laid out differently from the way they are read is
