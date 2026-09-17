@@ -287,7 +287,10 @@ struct FrameUniforms {
     // Repurposes the former `_padFilmLUT0/1` slots — same 8 bytes, stride unchanged.
     float    ssaoFarRadius;      // was _padFilmLUT0
     float    ssaoFarIntensity;   // was _padFilmLUT1
-    float    _padFilmLUT2;
+    // Cells per axis of the film-stock cube (16 for the legacy 8-bit PNG strips, 33 for
+    // the float16 `.lutcube` assets). Repurposes the former `_padFilmLUT2` slot — same
+    // 4 bytes, stride unchanged. Mirrors the Swift `IlluminatoramaFrameUniforms`.
+    float    filmLUTSize;        // was _padFilmLUT2
     // Tonemap colour-grade (white-balance / tint pre-tonemap; contrast / shadows
     // / highlights as a post-tonemap curve). TWO new 16-byte clusters (stride
     // 1104 → 1136). Defaults are neutral: whiteBalanceK 6500 → gain (1,1,1),

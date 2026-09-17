@@ -1708,23 +1708,42 @@ public final class IlluminatoramaRenderer {
     public var debandDitherEnabled: Bool = true
 
     // ── Phase 9 — film-stock LUT (post-tonemap colour grade) ─────────
-    /// The 256×16 PNG strip loaded as a 16×16×16 `MTLTexture3D`. `nil`
-    /// = LUT bypassed (identity pass-through). Assign from the host via
-    /// `setFilmLUT(_:strength:)` — do NOT set this and `filmLUTStrength`
-    /// directly; the setter validates that the texture is 16×16×16 3D.
+    /// The film stock's cube as an `MTLTexture3D`, N×N×N. `nil` = stock bypassed
+    /// (identity pass-through). Assign from the host via `setFilmLUT(_:strength:)` —
+    /// do NOT set this, `filmLUTStrength` or `filmLUTSize` directly.
     public private(set) var filmLUTTexture: MTLTexture? = nil
-    /// Blend weight [0, 1]: 0 = LUT fully bypassed, 1 = full film grade.
+    /// Blend weight [0, 1]: 0 = stock fully bypassed, 1 = the stock's own rendering.
     public private(set) var filmLUTStrength: Float = 1.0
+    /// Cells per axis of `filmLUTTexture`, taken from the texture itself rather than
+    /// assumed — the shader's half-texel inset is derived from it (DH-0879).
+    public private(set) var filmLUTSize: Float = 16
 
-    /// Load and set a film LUT from a 256×16 PNG strip on disk.
-    /// The strip encodes a 16×16×16 cube with blue slices laid left-to-right.
+    /// Set the film stock's colour cube.
+    ///
+    /// The size is read OFF THE TEXTURE, not passed in and not assumed: the cube used to
+    /// be a hardcoded 16 on both sides, so shipping the 33-cube the stocks are actually
+    /// authored at would have silently sampled a 33³ texture on 16-cell coordinates —
+    /// wrong everywhere, and wrong in a way that reads as a grade rather than as a bug.
     /// - Parameters:
-    ///   - texture: A 16×16×16 3D MTLTexture (`rgba8Unorm` or `rgba8Unorm_srgb`).
-    ///     Pass `nil` to disable the grade.
-    ///   - strength: Blend weight toward the graded result [0, 1]. Defaults 1.
+    ///   - texture: An N×N×N 3D texture (any sampleable colour format — the app ships
+    ///     `rgba16Float`). Non-cubic or non-3D textures are rejected. `nil` disables.
+    ///   - strength: Blend weight toward the stock's rendering [0, 1]. Defaults 1.
     public func setFilmLUT(_ texture: MTLTexture?, strength: Float = 1.0) {
+        guard let texture else {
+            filmLUTTexture = nil
+            filmLUTStrength = strength
+            return
+        }
+        guard texture.textureType == .type3D,
+              texture.width == texture.height, texture.height == texture.depth,
+              texture.width >= 2 else {
+            assertionFailure("film LUT must be a cubic 3D texture, got \(texture.textureType) \(texture.width)×\(texture.height)×\(texture.depth)")
+            filmLUTTexture = nil
+            return
+        }
         filmLUTTexture = texture
         filmLUTStrength = strength
+        filmLUTSize = Float(texture.width)
     }
 
     // ── Phase 2.7 TAA knobs ──────────────────────────────────────────
@@ -13231,6 +13250,7 @@ public final class IlluminatoramaRenderer {
                                  jitterNDC.y - previousJitterNDC.y, 0, 0)
         // Phase 9 — film LUT strength: 0 when no LUT is bound (bypasses the shader branch).
         u.filmLUTStrength = filmLUTTexture != nil ? max(0, min(1, filmLUTStrength)) : 0
+        u.filmLUTSize = max(2, filmLUTSize)
         // Tonemap colour-grade. Neutral defaults (6500/0/1/1/1) are exact no-ops in
         // the shader, so scenes that never touch these are byte-for-byte unchanged.
         u.whiteBalanceK = whiteBalanceK

@@ -352,7 +352,11 @@ public struct IlluminatoramaFrameUniforms {
     /// DH-0441 — strength of the wide AO ring. 0 = OFF (the default) → the ring is never
     /// marched and the AO field is byte-identical. Repurposes the former `_padFilmLUT1` slot.
     public var ssaoFarIntensity: Float = 0
-    public var _padFilmLUT2: Float = 0
+    /// Cells per axis of the film-stock cube — 16 for the legacy 8-bit PNG strips, 33 for
+    /// the float16 `.lutcube` assets (DH-0879). The shader's half-texel inset is derived
+    /// from this rather than hardcoded, so a host can ship a finer cube without an engine
+    /// change. Repurposes the former `_padFilmLUT2` slot — same offset, stride unchanged.
+    public var filmLUTSize: Float = 16
     // ── Tonemap colour-grade ─────────────────────────────────────────
     // White-balance + tint are channel gains applied to LINEAR HDR before
     // exposure/ACES; contrast/shadows/highlights are a tone curve in the

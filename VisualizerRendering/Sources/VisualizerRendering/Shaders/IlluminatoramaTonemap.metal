@@ -879,8 +879,12 @@ fragment float4 illumi_tonemap_fs(
         // Cineon forward: cv = (685 + 300·log10(linear)) / 1023 — 10-bit printing
         // density, reference white at code 685, 300 code values per decade.
         float3 logc = saturate((685.0 + 300.0 * log10(max(exposedScene, float3(1e-4)))) / 1023.0);
-        // Half-texel inset for the 16-cell cube: coord = (logc·(N-1) + 0.5)/N.
-        float3 uvw = (logc * 15.0 + 0.5) / 16.0;
+        // Half-texel inset: coord = (logc·(N−1) + 0.5)/N. N comes from the TEXTURE
+        // (`filmLUTSize`), not a constant — the stocks are authored as 33-cubes and the
+        // app ships them as such (DH-0879); a hardcoded 16 here would sample a 33³ cube
+        // on 16-cell coordinates and read as a grade rather than as a bug.
+        float  n   = max(frame.filmLUTSize, 2.0);
+        float3 uvw = (logc * (n - 1.0) + 0.5) / n;
         float3 stock = pow(saturate(float3(filmLUT.sample(lutSampler, uvw).rgb)), float3(2.4));
         mapped = saturate(mix(mapped, stock, frame.filmLUTStrength));
     }
