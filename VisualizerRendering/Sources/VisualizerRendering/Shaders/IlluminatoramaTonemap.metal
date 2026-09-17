@@ -844,7 +844,46 @@ fragment float4 illumi_tonemap_fs(
     // sensor/illuminant shift), so they go in before exposure + ACES. Defaults
     // (whiteBalanceK = 6500, tint = 0) make both gains exactly (1,1,1) → no-op.
     float3 graded = mixed * whiteBalanceGain(frame.whiteBalanceK) * tintGain(frame.tint);
-    float3 mapped = aces(graded * exposure);
+    // The SCENE-referred exposed radiance — the last value before any display
+    // transform. Held in a named local because the film stock below is a second,
+    // ALTERNATIVE display transform of this same value, not a grade layered on the
+    // output of the first one (DH-0878).
+    float3 exposedScene = graded * exposure;
+    float3 mapped = aces(exposedScene);
+
+    // ── Film stock — a second DISPLAY TRANSFORM, not a grade on top of one ─────
+    //
+    // The Resolve Film Look cubes declare their domain: input Cineon printing-
+    // density log, output the stock's 'look' in Rec.709 gamma 2.4. The cube IS a
+    // scene → print rendering. It used to be evaluated on `mapped` — the ACES
+    // output, already `saturate`d into [0,1] — and that is wrong twice over
+    // (DH-0878):
+    //
+    //  • Cineon reference white is code 685, i.e. axis 0.6696. A display value can
+    //    never exceed 1.0, so the top 33 % of the cube's own input axis — the print
+    //    stock's SHOULDER, the part that makes film look like film — was never
+    //    addressed at all. The stock could only ever act as a midtone tint.
+    //  • It was a double tone map: ACES rolls the shoulder, then a stock whose whole
+    //    job is to BE the shoulder rolls what is left of it again.
+    //
+    // Evaluating it on `exposedScene` instead puts the scene's real highlight
+    // headroom on the axis (scene 1.0 → 0.6696; ~3.7 stops over white reaches 1.0),
+    // and makes `filmLUTStrength` a coherent blend between two display transforms of
+    // ONE scene — 0 = pure ACES, 1 = pure print stock — rather than a partial second
+    // pass over the first one's output. Everything downstream (saturation, tone
+    // curve, split tone, the creative LUT, vignette, grain, dither) then grades the
+    // chosen transform, which is the order a real DI runs in; the stock used to sit
+    // after all of them, grading an image already dithered to 8 bits.
+    if (frame.filmLUTStrength > 0.001) {
+        constexpr sampler lutSampler(filter::linear, address::clamp_to_edge);
+        // Cineon forward: cv = (685 + 300·log10(linear)) / 1023 — 10-bit printing
+        // density, reference white at code 685, 300 code values per decade.
+        float3 logc = saturate((685.0 + 300.0 * log10(max(exposedScene, float3(1e-4)))) / 1023.0);
+        // Half-texel inset for the 16-cell cube: coord = (logc·(N-1) + 0.5)/N.
+        float3 uvw = (logc * 15.0 + 0.5) / 16.0;
+        float3 stock = pow(saturate(float3(filmLUT.sample(lutSampler, uvw).rgb)), float3(2.4));
+        mapped = saturate(mix(mapped, stock, frame.filmLUTStrength));
+    }
     // Phase 4.15 — post-tonemap saturation boost. Narkowicz's fitted ACES
     // famously compresses midtone chroma harder than SCN's HDR chain, so
     // the deferred pipeline reads consistently flatter than the SCN
@@ -1039,37 +1078,6 @@ fragment float4 illumi_tonemap_fs(
         float tpdf = (n0 + n1) - 1.0;                    // ∈ [-1, 1], triangular
         srgb += tpdf * (1.0 / 255.0);                    // ±1 LSB at 8-bit
         mapped = pow(saturate(srgb), float3(2.2));       // decode back to linear
-    }
-
-    // Phase 9 — film-stock LUT colour grade. Samples a 16×16×16 3D LUT
-    // (stored as a 256×16 PNG strip: 16 blue slices, each 16×16, laid left
-    // to right; the Swift host unpacks this into a proper MTLTexture3D).
-    //
-    // The Resolve Film Look .cube stocks declare their domains explicitly:
-    //   Input:  Cineon Log  (floating point, range 0..1)
-    //   Output: the film stock 'look', Display ITU-Rec.709 Gamma 2.4
-    // so a lookup is only meaningful when its input axis is Cineon printing-
-    // density log. Feeding it the display-referred *linear* `mapped` straight in
-    // as [0,1] coords (the old code) landed the whole picture in the toe of the
-    // cube, where a warm print stock bottoms out the blue channel — the room read
-    // as one block of gold (DH-0451: oak-wall b/r 0.66 → 0.13 at full blend).
-    //
-    // Encode to Cineon log before the lookup, then decode the Rec.709 gamma-2.4
-    // output back to linear so the rest of the chain stays linear. Cineon forward
-    // (10-bit printing density, reference white at code 685, 300 code values per
-    // decade): cv = (685 + 300·log10(linear)) / 1023. This anchors a mid-grey
-    // input near the Cineon grey pocket (code ~460), which is where these print
-    // LUTs are near-neutral, instead of in the toe. `filmLUTStrength` blends
-    // between the ungraded and graded result.
-    if (frame.filmLUTStrength > 0.001) {
-        constexpr sampler lutSampler(filter::linear, address::clamp_to_edge);
-        float3 logc = saturate((685.0 + 300.0 * log10(max(mapped, float3(1e-4)))) / 1023.0);
-        // Half-texel inset for the 16-cell cube: coord = (logc·(N-1) + 0.5)/N.
-        float3 uvw = (logc * 15.0 + 0.5) / 16.0;
-        float3 graded = filmLUT.sample(lutSampler, uvw).rgb;
-        graded = pow(saturate(graded), float3(2.4));   // Rec.709 gamma 2.4 → linear
-        mapped = mix(mapped, graded, frame.filmLUTStrength);
-        mapped = saturate(mapped);
     }
 
     // ── Diagram cross-fade ───────────────────────────────────────────────────
