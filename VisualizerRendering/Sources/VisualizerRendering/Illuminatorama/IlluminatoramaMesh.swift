@@ -1105,6 +1105,51 @@ public final class IlluminatoramaMesh {
         return out
     }
 
+    /// Per-triangle-CORNER object-space vertex normals — 3 per triangle, in the EXACT
+    /// triangle order `objectFaceNormals()` uses — so a ray-traced hit can barycentric-
+    /// interpolate the SHADING normal the rasteriser uses instead of the flat face normal.
+    ///
+    /// The glass bounce loop needs this and nothing else does: a dielectric boundary's
+    /// normal IS its refraction, so a smooth-shaded moulded pane (a glass block's pillow,
+    /// a ripple) traced against its face normals refracts as a set of flat prisms — every
+    /// facet prints its own sharp, displaced copy of the scene behind it. Returns `[]` if the
+    /// buffers aren't CPU-readable; the shader then falls back to the face normal.
+    public func objectCornerNormals() -> [SIMD4<Float>] {
+        let triCount = indexCount / 3
+        guard triCount > 0 else { return [] }
+        guard vertexBuffer.storageMode != .private else { return [] }
+        let stride = MemoryLayout<IlluminatoramaVertex>.stride
+        let nOffset = MemoryLayout<IlluminatoramaVertex>.offset(of: \.normal) ?? 16
+        let vcount = vertexCount
+        let vbase = vertexBuffer.contents()
+        let ibase = indexBuffer.contents()
+        var out = [SIMD4<Float>](); out.reserveCapacity(triCount * 3)
+        for t in 0..<triCount {
+            var idx = (0, 0, 0)
+            if indexType == .uint16 {
+                let o = t * 3 * 2
+                idx = (Int(ibase.load(fromByteOffset: o,     as: UInt16.self)),
+                       Int(ibase.load(fromByteOffset: o + 2, as: UInt16.self)),
+                       Int(ibase.load(fromByteOffset: o + 4, as: UInt16.self)))
+            } else {
+                let o = t * 3 * 4
+                idx = (Int(ibase.load(fromByteOffset: o,     as: UInt32.self)),
+                       Int(ibase.load(fromByteOffset: o + 4, as: UInt32.self)),
+                       Int(ibase.load(fromByteOffset: o + 8, as: UInt32.self)))
+            }
+            // Same guard as objectFaceUVs: the array MUST stay exactly 3×triCount long. A zero
+            // normal is the shader's "use the face normal" signal.
+            guard idx.0 < vcount, idx.1 < vcount, idx.2 < vcount else {
+                out.append(.zero); out.append(.zero); out.append(.zero); continue
+            }
+            for i in [idx.0, idx.1, idx.2] {
+                let n = vbase.load(fromByteOffset: i * stride + nOffset, as: SIMD3<Float>.self)
+                out.append(SIMD4<Float>(n, 0))
+            }
+        }
+        return out
+    }
+
     /// Object-space positions + flat `UInt32` index list read straight from this
     /// mesh's CPU-readable shared-storage buffers (same access pattern as
     /// `objectFaceNormals`). The surface-cache TLAS path (P1c) uses this to bake

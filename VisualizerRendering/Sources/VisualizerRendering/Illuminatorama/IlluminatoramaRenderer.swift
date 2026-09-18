@@ -3688,7 +3688,8 @@ public final class IlluminatoramaRenderer {
         /// all lit by this term and by nothing else, so a secondary ray that omits it
         /// renders every one of them dim or absent — seen through a pane, the lamp
         /// lighting the room went missing. Read by `secondaryEmission` in
-        /// IlluminatoramaSecondary.h. w reserved.
+        /// IlluminatoramaSecondary.h. w: GLASS rows only — first corner-normal entry + 1 in
+        /// `rtGlassCornerNormalBuffer` (0 = none); opaque rows keep it 0.
         var emissionPad: SIMD4<Float> = .zero
     }
     /// Mirror of `RTInstUniforms`.
@@ -3802,13 +3803,16 @@ public final class IlluminatoramaRenderer {
     /// surface — the bounce loop reads its material from `rtGlassDataBuffer` — so the
     /// packed lanes are pinned to explicit "untextured / every layer / no emission"
     /// values instead of being left to whatever the normal matrix's padding holds.
-    private static func rtGlassInstanceRow(_ inst: IlluminatoramaGlassInstance, normalBase: Float) -> RTInstanceData {
+    private static func rtGlassInstanceRow(_ inst: IlluminatoramaGlassInstance, normalBase: Float,
+                                           cornerBase: Float = 0) -> RTInstanceData {
         var c0 = inst.normalMatrix.columns.0, c1 = inst.normalMatrix.columns.1
         c0.w = 0                                    // untextured
         c1.w = Float(bitPattern: UInt32.max)        // unmasked by any light layer
         return RTInstanceData(nrm0: c0, nrm1: c1, nrm2: inst.normalMatrix.columns.2,
                               albedoTriBase: SIMD4(inst.tintIor.x, inst.tintIor.y, inst.tintIor.z, normalBase),
-                              emissionPad: .zero)
+                              // w = first corner-normal entry + 1 (0 = none); a glass boundary
+                              // has no emission, so the xyz stay zero.
+                              emissionPad: SIMD4(0, 0, 0, cornerBase))
     }
 
     private let rtTLASPipeline: MTLComputePipelineState?
@@ -3848,6 +3852,12 @@ public final class IlluminatoramaRenderer {
         // Metal sequences repack-write → refit-read; the BLAS references `mesh.vertexBuffer`,
         // the same buffer the repack writes in place. `nil` for static meshes.
         var refit: (desc: MTLPrimitiveAccelerationStructureDescriptor, scratch: MTLBuffer)?
+        /// Per-triangle-CORNER shading normals (3 per triangle, `normals` order) — filled only
+        /// for a mesh some glass instance uses, and read only by the glass bounce loop, where a
+        /// dielectric boundary's normal is its refraction (`objectCornerNormals`). Empty for
+        /// every opaque-only mesh, so the scene pays nothing for it. Feeds
+        /// `rtGlassCornerNormalBuffer`.
+        var cornerNormals: [SIMD4<Float>] = []
     }
     private var rtMeshCache: [ObjectIdentifier: RTMeshEntry] = [:]
     /// Whether any cached mesh needs the per-frame refit. Stored rather than derived so the
@@ -3933,6 +3943,11 @@ public final class IlluminatoramaRenderer {
     /// "flat slabs" fix. Nil when no mesh exposed CPU-readable vertices.
     private var rtObjUVBuffer: MTLBuffer?
     private var rtObjUVCount: Int = 0
+    /// Concatenated per-corner SHADING normals of the meshes glass instances use (3 × `float4`
+    /// per triangle). A glass instance's slice starts at `RTInstanceData.emissionPad.w − 1`
+    /// (0 = none → the bounce loop keeps the face normal). Glass-only on purpose: opaque hits
+    /// shade with the face normal and would triple this buffer for nothing.
+    private var rtGlassCornerNormalBuffer: MTLBuffer?
     // Surface cache (P1c): per-TLAS-instance base offset into the grouped soup
     // triangle list (== the `triCard`/`triUVa`/`triUVc` index space). Built
     // alongside the world-space soup in `rebuildRTAccel` when the cache is on,
@@ -7892,6 +7907,10 @@ public final class IlluminatoramaRenderer {
                 // Ownership makes this impossible; assert it anyway, because when it was
                 // possible it silently traced the wrong geometry through every glass pane.
                 if cached.mesh !== mesh { rtStaleBLASReuseCount += 1 }
+                // A mesh first cached as OPAQUE (a shared kind) never read its corner normals.
+                if cached.cornerNormals.isEmpty {
+                    rtMeshCache[mid]?.cornerNormals = mesh.objectCornerNormals()
+                }
                 continue
             }
             let geom = MTLAccelerationStructureTriangleGeometryDescriptor()
@@ -7910,7 +7929,8 @@ public final class IlluminatoramaRenderer {
             blas.label = "Illuminatorama.rt.blas.glass"
             rtMeshCache[mid] = RTMeshEntry(mesh: mesh, blas: blas,
                                            normals: mesh.objectFaceNormals(),
-                                           uvs: mesh.objectFaceUVs(), refit: nil)
+                                           uvs: mesh.objectFaceUVs(), refit: nil,
+                                           cornerNormals: mesh.objectCornerNormals())
             pending.append((blas, d, scratch))
         }
         if !pending.isEmpty {
@@ -7966,6 +7986,23 @@ public final class IlluminatoramaRenderer {
             appendMesh(cached)
         }
         guard !rtBLASList.isEmpty, !concat.isEmpty else { return }
+        // Glass corner normals: one slice per distinct glass mesh, base stored +1 in each glass
+        // instance's row (see `rtGlassCornerNormalBuffer`).
+        var cornerConcat: [SIMD4<Float>] = []
+        var cornerBase: [ObjectIdentifier: Int] = [:]
+        for (kind, _) in glassFlat {
+            guard let mesh = meshes[kind] else { continue }
+            let mid = ObjectIdentifier(mesh)
+            guard cornerBase[mid] == nil, let cached = rtMeshCache[mid],
+                  !cached.cornerNormals.isEmpty,
+                  cached.cornerNormals.count == cached.normals.count * 3 else { continue }
+            cornerBase[mid] = cornerConcat.count
+            cornerConcat.append(contentsOf: cached.cornerNormals)
+        }
+        rtGlassCornerNormalBuffer = cornerConcat.isEmpty ? nil : device.makeBuffer(
+            bytes: cornerConcat, length: MemoryLayout<SIMD4<Float>>.stride * cornerConcat.count,
+            options: .storageModeShared)
+        rtGlassCornerNormalBuffer?.label = "Illuminatorama.rt.glassCornerNormal"
         rtObjNormalBuffer = device.makeBuffer(
             bytes: concat, length: MemoryLayout<SIMD4<Float>>.stride * concat.count,
             options: .storageModeShared)
@@ -8069,7 +8106,8 @@ public final class IlluminatoramaRenderer {
                 desc.intersectionFunctionTableOffset = 0
                 desc.transformationMatrix = packed4x3(inst.modelMatrix)
                 descPtr[i] = desc
-                dataPtr[i] = Self.rtGlassInstanceRow(inst, normalBase: Float(s.normalBase))
+                let cb = cornerBase[ObjectIdentifier(mesh)].map { Float($0 + 1) } ?? 0
+                dataPtr[i] = Self.rtGlassInstanceRow(inst, normalBase: Float(s.normalBase), cornerBase: cb)
                 glassData[gi] = IlluminatoramaRTGlassData(
                     tintIor: inst.tintIor, rdrf: inst.rdrf, dispersionPad: inst.dispersionPad)
             }
@@ -8460,7 +8498,8 @@ public final class IlluminatoramaRenderer {
                 guard i < cap else { break }
                 let inst = entry.inst
                 descPtr[i].transformationMatrix = packed4x3(inst.modelMatrix)
-                dataPtr[i] = Self.rtGlassInstanceRow(inst, normalBase: dataPtr[i].albedoTriBase.w)
+                dataPtr[i] = Self.rtGlassInstanceRow(inst, normalBase: dataPtr[i].albedoTriBase.w,
+                                                     cornerBase: dataPtr[i].emissionPad.w)
                 gPtr[gi] = IlluminatoramaRTGlassData(
                     tintIor: inst.tintIor, rdrf: inst.rdrf, dispersionPad: inst.dispersionPad)
             }
@@ -10931,6 +10970,9 @@ public final class IlluminatoramaRenderer {
             // window. Same ring buffers the lighting kernel reads this frame.
             enc.setFragmentBuffer(pointLightBuffer, offset: 0, index: 14)
             enc.setFragmentBuffer(spotLightBuffer, offset: 0, index: 15)
+            // Smooth refraction: glass hits interpolate these corner normals (a dummy with
+            // every row's base 0 means "face normal" — see `rtGlassCornerNormalBuffer`).
+            enc.setFragmentBuffer(rtGlassCornerNormalBuffer ?? instData, offset: 0, index: 16)
             // The TLAS references the BLASes which reference mesh buffers — all
             // must be resident for the fragment-stage intersector.
             for blas in rtBLASList { enc.useResource(blas, usage: .read) }

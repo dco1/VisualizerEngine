@@ -369,7 +369,35 @@ struct GlassRTState {
     const device uint*           soupTriBase;
     const device float4*         surfCardRect;
     const device SurfCard*       surfCards;
+    /// Per-corner SHADING normals of the glass meshes (3 per triangle); a glass instance's
+    /// slice starts at `insts[iid].emissionPad.w − 1`, and 0 there means "none — use the face
+    /// normal". See `glassHitShadingNormal`.
+    const device float4*         cornerN;
 };
+
+/// The SMOOTH normal at a glass hit — the barycentric blend of the triangle's three vertex
+/// normals, the same normal the rasteriser interpolates for the entry surface — or `hn` (the
+/// face normal) when this glass mesh supplied none.
+///
+/// A dielectric boundary's normal IS its refraction. Traced against face normals, a moulded
+/// pane (a glass block's pillow, a ripple) refracts as a set of flat prisms, and every facet
+/// prints its own sharp, displaced copy of the scene behind it — a mosaic, where a real block
+/// warps the view smoothly. Returned on the SAME side as `hn`, so the caller's
+/// entering/exiting test (which stays geometric) is untouched.
+static float3 glassHitShadingNormal(uint iid, uint prim, float2 bary, GlassRTState st, float3 hn) {
+    float base1 = st.sec.insts[iid].emissionPad.w;
+    if (base1 < 0.5) return hn;
+    uint o = uint(base1 - 0.5) + prim * 3u;     // (base1 − 1) + prim·3, rounded
+    float3 n0 = st.cornerN[o].xyz, n1 = st.cornerN[o + 1u].xyz, n2 = st.cornerN[o + 2u].xyz;
+    float w0 = 1.0 - bary.x - bary.y;
+    float3 nObj = w0 * n0 + bary.x * n1 + bary.y * n2;
+    RTInstanceData d = st.sec.insts[iid];
+    float3 n = float3x3(d.nrm0.xyz, d.nrm1.xyz, d.nrm2.xyz) * nObj;
+    float len = length(n);
+    if (len < 1e-6) return hn;
+    n /= len;
+    return dot(n, hn) < 0.0 ? -n : n;
+}
 
 // Re-shade or cache-read an OPAQUE triangle hit's outgoing radiance.
 //
@@ -480,8 +508,14 @@ static float3 traceRefractionPath(
             RTGlassData gd = st.glassData[gi];
             float hitIOR = max(1.0, gd.tintIor.w);
             float3 hn = hitWorldNormal(iid, res.primitive_id, st.sec.insts, st.sec.objNormal);
-            bool exiting = dot(r.direction, hn) > 0.0;  // leaving the medium we're in
-            float3 n = exiting ? -hn : hn;              // normal against the ray
+            bool exiting = dot(r.direction, hn) > 0.0;  // leaving the medium we're in — GEOMETRIC
+            float3 ng = exiting ? -hn : hn;             // face normal against the ray
+            // The refraction uses the SMOOTH normal (see `glassHitShadingNormal`); the medium
+            // bookkeeping and the nudges stay on the face normal, which is the real boundary.
+            float3 hs = glassHitShadingNormal(iid, res.primitive_id,
+                                              res.triangle_barycentric_coord, st, hn);
+            float3 n = exiting ? -hs : hs;
+            if (dot(r.direction, n) >= 0.0) n = ng;     // shading normal faces away: no lobe
             float n1 = curIOR;
             float n2 = exiting ? 1.0 : hitIOR;
             float gr = gd.rdrf.x;
@@ -489,13 +523,26 @@ static float3 traceRefractionPath(
             if (dot(t2, t2) < 1e-8) {
                 // Total internal reflection — bounce inside, same medium.
                 rd = reflect(r.direction, n);
-                ro = hitP + n * eps;                    // nudge to the incoming side
+                // A shading normal can tip a reflection through the real surface; keep it on
+                // the incoming side of the GEOMETRIC boundary it reflected from.
+                if (dot(rd, ng) <= 0.0) rd = reflect(r.direction, ng);
+                ro = hitP + ng * eps;                   // nudge to the incoming side
                 continue;
+            }
+            // Likewise a refraction must actually CROSS the geometric boundary.
+            if (dot(t2, ng) >= 0.0) {
+                float3 tg = refract(r.direction, ng, n1 / n2);
+                if (dot(tg, tg) < 1e-8) {
+                    rd = reflect(r.direction, ng);
+                    ro = hitP + ng * eps;
+                    continue;
+                }
+                t2 = tg;
             }
             if (secondaryConeVisible(gr, kGlassConeK))
                 t2 = coneSample(normalize(t2), secondaryConeRad(gr, kGlassConeK), rnd(seed), rnd(seed));
             rd = t2;
-            ro = hitP - n * eps;                        // cross the boundary
+            ro = hitP - ng * eps;                       // cross the boundary
             // Update medium state. Exiting ⇒ now in air; entering ⇒ in the new glass.
             if (exiting) { inside = false; curIOR = 1.0; tint = float3(1.0); density = 0.0; }
             else         { inside = true;  curIOR = hitIOR; tint = gd.tintIor.xyz; density = gd.rdrf.y; }
@@ -569,6 +616,7 @@ fragment float4 illumi_glass_rt_fs(
     const device float2*             albedoUVScale [[buffer(13)]],
     const device RTPointLight*       pointLights [[buffer(14)]],
     const device RTSpotLight*        spotLights  [[buffer(15)]],
+    const device float4*             cornerN     [[buffer(16)]],
     texture2d<float, access::sample> sky         [[texture(0)]],
     texture2d<float, access::sample> surfAtlas   [[texture(1)]],
     texture2d<float, access::sample> backdrop    [[texture(2)]],
@@ -594,6 +642,7 @@ fragment float4 illumi_glass_rt_fs(
     st.glassData = glassData;
     st.triCard = triCard; st.triUVa = triUVa; st.triUVc = triUVc;
     st.soupTriBase = soupTriBase; st.surfCardRect = surfCardRect; st.surfCards = surfCards;
+    st.cornerN = cornerN;
 
     intersector<triangle_data, instancing> isect;
     isect.set_triangle_cull_mode(triangle_cull_mode::none);

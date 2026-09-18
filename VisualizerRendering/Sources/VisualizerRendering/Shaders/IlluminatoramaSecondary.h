@@ -74,7 +74,7 @@ using namespace raytracing;
 struct RTInstanceData {
     float4 nrm0; float4 nrm1; float4 nrm2;
     float4 albedoTriBase;
-    float4 emissionPad;      // xyz = emission radiance, w reserved
+    float4 emissionPad;      // xyz = emission radiance; w = GLASS rows only: corner-normal base + 1 (0 = none)
 };
 
 /// Surface-cache card material. Mirror of `SurfCard` in
