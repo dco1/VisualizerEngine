@@ -21,8 +21,16 @@ extension MaterialGenerator {
                 // long-wave undulation (the float glass underneath).
                 let grain = Noise.fbmTiled(u, v, baseCells: 96, octaves: 3, seed: seed)
                 let wave = Noise.fbmTiled(u, v, baseCells: 4, octaves: 3, seed: seed &+ 7)
-                ch.albedo[ch.idx(x, y)] = clampBand(milk * (0.96 + 0.06 * grain))
-                ch.roughness[ch.idx(x, y)] = clamp01(0.52 + 0.16 * grain + 0.04 * (wave - 0.5))
+                // Etch DENSITY is not uniform across a pane — the blast or the acid bath lands
+                // heavier in some places — and a denser etch scatters more (milkier) and is
+                // rougher. It is the pane's only tonal structure at swatch scale. The grain alone
+                // left the albedo at ~0.6 % CV with roughness a copy of it (a·r corr 1.00), which
+                // TextureAudit reads as a flat swatch — and because every census gate runs one
+                // RenderCheck program, that one material failed sixteen gates (DH-0874).
+                let density = Noise.fbmTiled(u, v, baseCells: 6, octaves: 3, seed: seed &+ 19)
+                ch.albedo[ch.idx(x, y)] = clampBand(milk * (0.92 + 0.12 * density + 0.03 * grain))
+                ch.roughness[ch.idx(x, y)] = clamp01(0.50 + 0.16 * grain + 0.05 * density
+                                                     + 0.04 * (wave - 0.5))
                 ch.height[ch.idx(x, y)] = clamp01(0.5 + 0.06 * (grain - 0.5) + 0.02 * (wave - 0.5))
             }
         }
