@@ -470,7 +470,8 @@ static float3 traceRefractionPath(
     texturecube<float, access::sample> irrCube,
     texture2d_array<float, access::sample> albedoAtlas,
     thread uint& seed,
-    thread float3& outAbsorb)
+    thread float3& outAbsorb,
+    float2 entryStratum = float2(-1.0))
 {
     outAbsorb = float3(1.0);
     // Boundary offset for the DIELECTRIC walk, deliberately NOT `u.rayTMin`. That value (4 mm) is
@@ -487,7 +488,13 @@ static float3 traceRefractionPath(
     // Frosted: jitter the transmitted ray in a cone ∝ roughness². A sub-pixel cone is
     // skipped outright — see `secondaryConeVisible`; on a polished pane it was pure noise.
     if (secondaryConeVisible(roughness, kGlassConeK))
-        rd = coneSample(normalize(rd), secondaryConeRad(roughness, kGlassConeK), rnd(seed), rnd(seed));
+        // `entryStratum` (when the caller averages several paths) places this path's entry
+        // scatter in its own slice of the cone instead of at random — the first scatter carries
+        // most of a rough pane's variance, and stratifying it is what lets a frosted pane read
+        // as a glow on the live canvas, where one frozen frame is all there is.
+        rd = entryStratum.x >= 0.0
+            ? coneSample(normalize(rd), secondaryConeRad(roughness, kGlassConeK), entryStratum.x, entryStratum.y)
+            : coneSample(normalize(rd), secondaryConeRad(roughness, kGlassConeK), rnd(seed), rnd(seed));
     float3 ro = P - Ng * eps;                           // start just inside
     float3 throughput = float3(1.0);
     bool inside = true;                                 // inside the entry medium
@@ -752,7 +759,10 @@ fragment float4 illumi_glass_rt_fs(
         // noisy (TAA cleans it when static but it shimmers under motion). Average
         // a few stochastic path traces — count scales with roughness, so polished
         // glass pays for exactly one and only frosted glass pays more.
-        uint nRefr = secondaryConeSamples(roughness, kGlassConeK, 3.0, 4u);
+        // Up to 12 for a truly rough (etched) pane: a hollow glass block scatters at four
+        // boundaries in a row, and at the old cap of 4 the settled live frame — one frozen
+        // sample set, no accumulation — showed chroma speckle across the whole pane (DH-0898).
+        uint nRefr = secondaryConeSamples(roughness, kGlassConeK, 24.0, 12u);
         if (nRefr <= 1u) {
             refr = traceRefractionPath(isect, accel, P, V, N, ior, tint, density,
                                        roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
@@ -760,11 +770,16 @@ fragment float4 illumi_glass_rt_fs(
             ssAbsorbValid = true;
         } else {
             float3 acc = float3(0.0);
+            // Stratified entry scatter: azimuth in even slices under one per-pixel rotation,
+            // radius on a golden-ratio sequence under another — the samples tile the cone.
+            float rotA = rnd(seed), rotR = rnd(seed);
             for (uint s = 0u; s < nRefr; ++s) {
                 float3 coneAbsorb;
+                float2 stratum = float2(fract(rotR + float(s) * 0.6180340),
+                                        fract(rotA + (float(s) + 0.5) / float(nRefr)));
                 acc += traceRefractionPath(isect, accel, P, V, N, ior, tint, density,
                                            roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
-                                           coneAbsorb);
+                                           coneAbsorb, stratum);
             }
             refr = acc / float(nRefr);
         }
