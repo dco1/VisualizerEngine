@@ -1150,6 +1150,13 @@ public final class IlluminatoramaRenderer {
     /// Read it back with `lastExposureHistogram`. Changes no pixel.
     public var exposureHistogramEnabled: Bool = false
 
+    /// DH-0889 — jitter each window portal's shadow-map projection by a sub-texel Halton offset
+    /// per TAA frame, so an accumulating still supersamples the occluder's edge instead of
+    /// printing one sawtooth per texel. Default OFF: it re-renders the portal slices every frame,
+    /// which a live canvas's static-slice reuse would otherwise skip. Only the shadow-MAP path
+    /// uses it; traced portal visibility (`rtAreaShadowRays > 0`) has no texels to jitter.
+    public var areaShadowJitterEnabled: Bool = false
+
     /// One frame's histogram as the meter saw it. Log-luminance is log2 of the metered
     /// brightness (max of luma and half the max channel), pre-exposure.
     public struct ExposureHistogram: Sendable {
@@ -9940,7 +9947,23 @@ public final class IlluminatoramaRenderer {
             guard spotShadowCasters.count < capacity else { break }
             let slice = spotShadowCasters.count
             areaLights[i].shadowSliceIndex = Int32(slice)
-            let m = areaShadowMatrix(areaLights[i])
+            var m = areaShadowMatrix(areaLights[i])
+            // DH-0889 — sub-texel jitter of the portal's projection, the DH-0858 cascade fix
+            // applied to the portal slices. A portal map is ONE 150° perspective, so on a wall
+            // its light grazes a texel smears across ~10 screen px and a thin occluder's shadow
+            // edge prints as a sawtooth, one tooth per texel. Shifting the projection by a
+            // Halton(2,3) sub-texel offset each accumulated frame re-rasterises the occluder at a
+            // new sub-texel position, so the still's accumulation supersamples it. The SAME
+            // matrix renders the slice and samples it, and a changed matrix already defeats the
+            // static-slice reuse (`mats == lastSpotShadowMats`), so nothing reads a stale map.
+            // Off by default: the live canvas keeps its reuse; a host enables it for stills.
+            if areaShadowJitterEnabled && taaEnabled {
+                let texel = 2 / Float(max(1, spotShadowAtlas.width))
+                var j = matrix_identity_float4x4
+                j.columns.3 = SIMD4((Self.halton(taaFrameIndex &+ 1, base: 2) - 0.5) * texel,
+                                    (Self.halton(taaFrameIndex &+ 1, base: 3) - 0.5) * texel, 0, 1)
+                m = j * m
+            }
             areaLights[i].shadowMatrix = m
             // A portal faces INTO the room and its frustum is capped at the portal range —
             // the exterior lawn (the only GPU-fed geometry) can never enter it, so the slice
