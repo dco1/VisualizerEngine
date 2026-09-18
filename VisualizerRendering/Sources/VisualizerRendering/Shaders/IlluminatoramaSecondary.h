@@ -102,7 +102,11 @@ struct PrimUV { float2 uvA; float2 uvB; float2 uvC; };
 struct RTPointLight {
     float3 position;  float radius;
     float3 color;     uint  layerMask;
-    uint   castsShadow; int shadowCubeIndex; int _pad0; int _pad1;
+    uint   castsShadow; int shadowCubeIndex; int _pad0;
+    // DH-0818 — the source size, read (was `_pad1`: uploaded every frame, never read, so the
+    // bounce path lit near a floor lamp as a hard point while the deferred pass used a 0.70 m
+    // source). Same offset and 4-byte width as `PointLight.softRadius`, so sizeof is unchanged.
+    float  softRadius;
     // DH-0872 — mirrors `PointLight.giVisible`. 1 (default) ⇒ visible to THIS un-occluded
     // local-light-fill path too; 0 ⇒ skipped here (see `secondaryLocalLightFill` and the
     // field's own doc comment on `PointLight` for why).
@@ -115,7 +119,8 @@ struct RTSpotLight {
     float4x4 shadowMatrix;
     int      shadowSliceIndex;
     uint     layerMask;
-    int      _pad1; int _pad2;
+    int      castsShadow;   // host-side only; named so the offsets read the same as `SpotLight`
+    float    softRadius;    // DH-0818 — was `_pad2`; same slot as `SpotLight.softRadius`
     // DH-0872 — mirrors `SpotLight.giVisible`; see `RTPointLight.giVisible`.
     uint     giVisible;
 };
@@ -521,7 +526,8 @@ static inline float3 secondaryLocalLightFill(float3 P, float3 N, uint layerBits,
         float3 L = toL / max(dist, 1e-4);
         float nl = saturate(dot(N, L));
         if (nl <= 0.0) continue;
-        float atten = 1.0 / max(dist * dist, 1e-4);
+        // DH-0818 — the deferred pass's source-size falloff, `1/(d² + r²)`; r = 0 ⇒ `1/d²`.
+        float atten = 1.0 / max(dist * dist + pl.softRadius * pl.softRadius, 1e-4);
         float window = saturate(1.0 - pow(dist / pl.radius, 4.0));
         sum += pl.color * (atten * window * window * nl);
     }
@@ -538,7 +544,7 @@ static inline float3 secondaryLocalLightFill(float3 P, float3 N, uint layerBits,
         if (coneAtten <= 0.0) continue;
         float nl = saturate(dot(N, L));
         if (nl <= 0.0) continue;
-        float atten = 1.0 / max(dist * dist, 1e-4);
+        float atten = 1.0 / max(dist * dist + sl.softRadius * sl.softRadius, 1e-4);
         float window = saturate(1.0 - pow(dist / sl.radius, 4.0));
         sum += sl.color * (atten * window * window * coneAtten * nl);
     }
