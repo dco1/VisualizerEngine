@@ -32,7 +32,10 @@ struct RTInstUniforms {
     float3 skyAmbient;       float specStrength;
     uint  width;   uint height;
     uint  shadowRays; uint giRays;
-    uint  frameSeed;  float rayTMin;  float maxGIDist;  uint _pad1;
+    uint  frameSeed;  float rayTMin;  float maxGIDist;
+    // DH-0896 — 1 ⇒ `specIBL` holds the deferred composite's specular-IBL share and a
+    // reflection HIT replaces it (was the `_pad1` slot — same 4 bytes, stride unchanged).
+    uint  reflReplacesIBL;
     float reflStrength; float reflMaxDist; float reflRoughnessCutoff;
     uint  reflRays;  uint reflEnabled;
     // Surface cache (P1c): read cached multi-bounce radiance at GI/reflection
@@ -351,6 +354,9 @@ kernel void illumi_rt_lighting_tlas(
     // 4 GI rays reached the screen raw — the "dark noisy blotches".
     texture2d<half, access::write>        rtDiffuse   [[texture(8)]],
     device atomic_uint*                   surfHitStats [[buffer(19)]],  // DH-0653 hit/miss counters (gated)
+    // DH-0896 — the deferred pass's specular-IBL share of `outHDR` (read only when
+    // `u.reflReplacesIBL`; a 1×1 dummy otherwise).
+    texture2d<half, access::read>         specIBL     [[texture(9)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -577,6 +583,14 @@ kernel void illumi_rt_lighting_tlas(
 
     // ── Glossy reflections (RT) ───────────────────────────────────
     float3 reflection = float3(0.0);
+    // DH-0896 — how much of the deferred SKY reflection this pixel's rays proved wrong.
+    // `outHDR` already carries the specular IBL — the sky cube along R — at the full
+    // Fresnel of the surface. A reflection ray that MISSES leaves it (the sky is what that
+    // direction sees). A ray that HITS the scene saw a wall, not the sky, so the sky that
+    // direction contributed must come OUT as the room goes IN. Adding the hit on top of it
+    // (as this pass did) left a mirror showing the sunset horizon with the room ghosted
+    // faintly through it — the whole of the Primary Bathroom report.
+    float reflHitFraction = 0.0;
     if (u.reflEnabled != 0 && u.reflStrength > 0.0 && roughness <= u.reflRoughnessCutoff) {
         float3 V = normalize(u.cameraWorldPos - P);
         float3 R = reflect(-V, N);
@@ -628,6 +642,7 @@ kernel void illumi_rt_lighting_tlas(
         // Kept as a comment rather than deleted because the asymmetry with glass is deliberate
         // and someone will otherwise "fix" it back.
         float3 acc = float3(0.0);
+        uint hits = 0u;
         isect.accept_any_intersection(false);
         for (uint i = 0; i < rrays; ++i) {
             float3 dir = secondaryConeVisible(roughness, kReflConeK)
@@ -664,10 +679,12 @@ kernel void illumi_rt_lighting_tlas(
                         hitRad += cA * (1.0 / M_PI_F) * u.sunColor * hN * sv;
                     }
                     acc += hitRad;
+                    hits += 1u;
                 }
                 continue;
             }
             if (res.type != intersection_type::triangle) continue;
+            hits += 1u;
             // Re-shade through the ONE secondary-ray surface shader (see
             // IlluminatoramaSecondary.h), cached or not. This is where this path used to
             // shade a reflected surface with the instance's MEAN albedo under a flat
@@ -714,6 +731,7 @@ kernel void illumi_rt_lighting_tlas(
             cacheRefl += cacheTerm;
         }
         reflection = (acc / float(rrays)) * fres * u.reflStrength;
+        reflHitFraction = saturate(float(hits) / float(rrays) * u.reflStrength);
         cacheTerms += (cacheRefl / float(rrays)) * fres * u.reflStrength;
     }
 
@@ -749,7 +767,11 @@ kernel void illumi_rt_lighting_tlas(
     //     fixed-radius bilateral) clean it before it reaches the composite.
     // Sky pixels early-out at the top, so `rtDiffuse` is left untouched there and
     // the denoise pass guards on the same depth test.
-    outHDR.write(half4(prev.rgb + half3(reflection), prev.a), gid);
+    float3 skySeenThrough = float3(0.0);
+    if (u.reflReplacesIBL != 0u && reflHitFraction > 0.0) {
+        skySeenThrough = float3(specIBL.read(gid).rgb) * reflHitFraction;
+    }
+    outHDR.write(half4(max(prev.rgb - half3(skySeenThrough), half3(0.0h)) + half3(reflection), prev.a), gid);
     rtDiffuse.write(half4(half3(direct + indirect), 1.0h), gid);
 }
 

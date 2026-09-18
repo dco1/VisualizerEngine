@@ -978,6 +978,13 @@ kernel void illumi_lighting(
     // an unread dummy and the write is skipped, so non-SSS scenes pay nothing).
     // (texture(20): 18/19 were taken by gLayer/pointShadowAtlas in the merge.)
     texture2d<half,  access::write>         sssOut          [[texture(20)]],
+    // DH-0896 — the EXACT specular-IBL term this pixel's composite carries (the sky
+    // reflection, after specular occlusion, the interior split, clearcoat attenuation and
+    // aerial perspective), handed to the RT reflection pass so a reflection ray that HITS
+    // the scene can REPLACE the sky it saw instead of being added on top of it. Written
+    // only when the host binds a full-size target (RT reflections on); otherwise the
+    // binding is a 1×1 dummy and the write is skipped, so every other frame pays nothing.
+    texture2d<half,  access::write>         specIBLOut      [[texture(22)]],
     constant FrameUniforms&                 frame           [[buffer(0)]],
     const device PointLight*                pointLights     [[buffer(1)]],
     constant DDGIUniforms&                  ddgi            [[buffer(2)]],
@@ -1554,6 +1561,10 @@ kernel void illumi_lighting(
     // Debug accumulators (frame.debugTerm split-render) — populated below.
     float3 dbgDiffuseIBL = float3(0.0);
     float3 dbgSpecularIBL = float3(0.0);
+    // DH-0896 — the specular-IBL share of the FINAL composite (see `specIBLOut`). Starts as
+    // the debug term and follows `color` through clearcoat attenuation + aerial perspective,
+    // which the isolated debug view deliberately does not.
+    float3 specIBLInComposite = float3(0.0);
     float3 dbgAmbient = float3(0.0);
     if (kLightingIBLEnabled) {  // function_constant(0)
         constexpr sampler cubeSampler(filter::linear, mip_filter::linear);
@@ -1814,6 +1825,7 @@ kernel void illumi_lighting(
                  * frame.iblIntensity;
         dbgDiffuseIBL = diffuseIBL * frame.iblIntensity * ao * interiorIBLKd;
         dbgSpecularIBL = specularIBL * frame.iblIntensity * specOcc * interiorIBLKs;
+        specIBLInComposite = dbgSpecularIBL;
         // ── Cloth sheen, environment arm ─────────────────────────────────────
         // The direct arm lives in `brdf`; this is the other half. A cushion in a room the sun
         // never reaches is lit almost entirely by the environment, and the Phase-7b bolt-on
@@ -1916,6 +1928,7 @@ kernel void illumi_lighting(
         float baseAtten = 1.0 - houseCC * (ccF0 + (1.0 - ccF0) * pow(1.0 - saturate(dot(N, V)), 5.0));
         directSun    *= baseAtten;
         indirect     *= baseAtten;
+        specIBLInComposite *= baseAtten;   // DH-0896
     }
 
     // ── Sausage-casing clearcoat (HotdogDropUltra) ──────────────────────────
@@ -2033,10 +2046,14 @@ kernel void illumi_lighting(
                                                                 level(max(mips - 3.0, 0.0))).rgb)
                                   * frame.iblIntensity;
                 color = mix(airlight, color, t);
+                specIBLInComposite *= t;   // DH-0896 — what of it survives the extinction
             }
         }
     }
     outHDR.write(half4(half3(color), 1.0h), gid);
+    if (specIBLOut.get_width() == outHDR.get_width() && frame.debugTerm == 0u) {
+        specIBLOut.write(half4(half3(specIBLInComposite), 0.0h), gid);
+    }
 
     // Issue #65 — hand the diffuse-lit term to the separable SSS blur. rgb = the
     // diffuse irradiance peeled off above; a = the SSS mask (1 = blur, 0 = leave).

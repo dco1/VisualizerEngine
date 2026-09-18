@@ -2593,6 +2593,38 @@ public final class IlluminatoramaRenderer {
     // RT diffuse (soft shadow + 1-bounce GI) buffer — written by the RT pass,
     // bilateral-filtered into the composite by `encodeRTDenoiseComposite`.
     private var rtDiffuseTexture: MTLTexture
+    /// **DH-0896 — the deferred composite's specular-IBL share, handed to the RT reflection
+    /// pass.** `outHDR` already carries the sky cube reflected along R; a reflection ray that
+    /// HITS the scene must replace that sky, not be added on top of it (which is what made a
+    /// wall mirror read as a sunset with the room ghosted faintly through it). Allocated
+    /// lazily at the HDR size the first frame RT reflections run, dropped on resize.
+    private var specIBLTexture: MTLTexture?
+    /// 1×1 stand-in bound to both kernels whenever the hand-off is off — the lighting kernel
+    /// skips its write when the target is not full-size, the RT kernel skips its read on the flag.
+    private lazy var specIBLDummyTexture: MTLTexture? = {
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1, height: 1,
+                                                         mipmapped: false)
+        d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private
+        let t = device.makeTexture(descriptor: d); t?.label = "Illuminatorama.rt.specIBL.dummy"
+        return t
+    }()
+    /// Whether THIS frame's lighting pass wrote `specIBLTexture` — the RT kernel's read is
+    /// gated on it, so a frame that skipped the write can never subtract a stale sky.
+    private var specIBLWrittenThisFrame = false
+
+    /// The full-size hand-off target when RT reflections will composite this frame, else nil.
+    private func specIBLHandoffTarget() -> MTLTexture? {
+        // A debug-term frame isolates one term; the kernel skips the write then, so no target.
+        guard rtReflectionsEnabled, rtEnabled, rtTLASSupported, debugTerm == .normal else { return nil }
+        let w = hdrTexture.width, h = hdrTexture.height
+        if let t = specIBLTexture, t.width == w, t.height == h { return t }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: w, height: h,
+                                                         mipmapped: false)
+        d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private
+        specIBLTexture = device.makeTexture(descriptor: d)
+        specIBLTexture?.label = "Illuminatorama.rt.specIBL"
+        return specIBLTexture
+    }
     // Phase 2 — full-res HDR with SSR composited on top of direct lighting.
     // Bloom and tonemap read from this so reflections feed both effects.
     private var hdrCompositeTexture: MTLTexture
@@ -3668,7 +3700,10 @@ public final class IlluminatoramaRenderer {
         var skyAmbient: SIMD3<Float>; var specStrength: Float
         var width: UInt32; var height: UInt32
         var shadowRays: UInt32; var giRays: UInt32
-        var frameSeed: UInt32; var rayTMin: Float; var maxGIDist: Float; var _pad1: UInt32 = 0
+        var frameSeed: UInt32; var rayTMin: Float; var maxGIDist: Float
+        /// DH-0896 — 1 ⇒ `specIBLTexture` holds this frame's deferred specular-IBL share and
+        /// a reflection HIT replaces it. Was `_pad1` (same 4 bytes, stride unchanged).
+        var reflReplacesIBL: UInt32 = 0
         var reflStrength: Float; var reflMaxDist: Float; var reflRoughnessCutoff: Float
         var reflRays: UInt32; var reflEnabled: UInt32
         // Surface cache (P1c) — mirror of the Metal RTInstUniforms tail.
@@ -8490,6 +8525,9 @@ public final class IlluminatoramaRenderer {
             reflRoughnessCutoff: max(0, rtReflRoughnessCutoff),
             reflRays: UInt32(max(1, min(8, rtReflRays))),
             reflEnabled: rtReflectionsEnabled ? 1 : 0)
+        // DH-0896 — a reflection hit REPLACES the sky the deferred pass put there.
+        let specIBLOn = rtReflectionsEnabled && specIBLWrittenThisFrame && specIBLTexture != nil
+        u.reflReplacesIBL = specIBLOn ? 1 : 0
         // Surface cache read (P1c): on only when the grouped soup + cards + base
         // are all live this topology. The kernel gates every atlas read on this.
         let cacheOn = surfCacheActive && surfCardCount > 0
@@ -8634,6 +8672,7 @@ public final class IlluminatoramaRenderer {
         // path does. Before this the TLAS kernel composited it inline, which is
         // why both denoisers sat in the soup-only `else` branch doing nothing.
         enc.setTexture(rtDiffuseTexture, index: 8)
+        enc.setTexture(specIBLOn ? specIBLTexture : specIBLDummyTexture, index: 9)
         // DH-0653 hit/miss counters (buffer 19). Dummy = instData, never added to while
         // `surfStatsEnabled` is 0.
         enc.setBuffer(hitStats ?? instData, offset: 0, index: 19)
@@ -11855,6 +11894,10 @@ public final class IlluminatoramaRenderer {
         // DH-0140 — the kernel reads this only when frame.extendedGBuffer != 0; any texture
         // satisfies the binding otherwise.
         enc.setTexture((extendedGBufferActive ? gbufferMaterial : nil) ?? gbufferEmission, index: 21)
+        // DH-0896 — the specular-IBL hand-off to the RT reflection pass (see `specIBLTexture`).
+        let specTarget = specIBLHandoffTarget()
+        specIBLWrittenThisFrame = specTarget != nil
+        enc.setTexture(specTarget ?? specIBLDummyTexture, index: 22)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
         enc.setBuffer(pointLightBuffer, offset: 0, index: 1)
         enc.setBuffer(ddgiUniformBuffer, offset: 0, index: 2)
