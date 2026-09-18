@@ -376,20 +376,27 @@ static inline float3 tintGain(float tint) {
 // Shadows/highlights are luma-weighted so mid-tones stay put and the two ends
 // move independently. All three default to 1.0 → an exact no-op.
 //
-// CONTRAST IS A TWO-SIDED POWER S-CURVE, not a line through the pivot. It used to be
-// `(c − 0.18)·k + 0.18` then `max(·, 0)`, which sends every value below 0.18·(1 − 1/k) to
-// EXACT black: at k = 1.31 that is display-linear 0.0425 (≈ sRGB 58/255) and at 1.46 ≈ sRGB
-// 66. A dial that turns non-black input into 0 is a crush, not a contrast — measured on the
-// AgX-retuned presets it blacked out 70 % of the window-night hero, 22 % of living-night, and
-// every dim test rig entirely (DH-0890). Now: `p·(c/p)^k` below the pivot and its mirror
-// `1 − (1−p)·((1−c)/(1−p))^k` above it — slope k AT the pivot (the same mid-tone punch the
-// line gave), 0 → 0 and 1 → 1 fixed, so the ends are compressed toward, never clamped onto.
+// CONTRAST IS A MID-TONE S-CURVE — slope k at the pivot, slope 1 at black and at white.
+//
+// It was first `(c − 0.18)·k + 0.18` then `max(·, 0)`, which sends every value below
+// 0.18·(1 − 1/k) to EXACT black (k = 1.31 ⇒ ≈ sRGB 58/255): 70 % of the window-night hero went
+// black under the AgX presets (DH-0890). A power law around the pivot fixed the clamp but not the
+// shape: `p·(c/p)^k` stretches the EV distance below the pivot by k, so the deeper the shadow the
+// harder it is pushed — 1.6 stops at display 0.01 for k = 1.39 — and dim scenes rendered two
+// stops darker than the look they were matched to (DH-0891: realtor's p50 at −4 EV, 12.8 → 3.9).
+//
+// Now each side is the cubic Hermite g(x) = x + (k − 1)·x²·(x − 1) on its own normalised span:
+// g(0) = 0, g(1) = 1, g′(1) = k (the mid-tone punch), g′(0) = 1 (the ends keep their own
+// ratios — neither crushed nor lifted). Monotone for any k < 4. k = 1 is an exact no-op.
+static inline float3 midtoneContrast(float3 x, float k) {
+    return x + (k - 1.0) * x * x * (x - 1.0);
+}
 static inline float3 toneCurve(float3 c, float contrast, float shadows, float highlights) {
     const float pivot = 0.18;
-    const float k = max(contrast, 1e-3);
+    const float k = clamp(contrast, 0.0, 3.9);
     c = saturate(c);
-    float3 lo = pivot * pow(c / pivot, float3(k));
-    float3 hi = 1.0 - (1.0 - pivot) * pow((1.0 - c) / (1.0 - pivot), float3(k));
+    float3 lo = pivot * midtoneContrast(c / pivot, k);
+    float3 hi = 1.0 - (1.0 - pivot) * midtoneContrast((1.0 - c) / (1.0 - pivot), k);
     c = select(hi, lo, c <= pivot);
     // Per-pixel luma drives the shadow/highlight weights.
     float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
