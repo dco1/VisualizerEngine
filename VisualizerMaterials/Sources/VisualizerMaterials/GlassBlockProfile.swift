@@ -95,10 +95,6 @@ public enum GlassBlockProfile {
     /// two shells ripple at right angles (vertical reeds front, horizontal back), which is the
     /// classic cross-hatched "wave" block.
     public static let rippleMeters = 0.0012
-    /// Samples across one ripple wave. Three is the fewest that carries a SLOPE at every sample
-    /// (two would land only on crests and troughs, where the slope is zero); the pane ships
-    /// analytic smooth normals, so the refraction between samples is still continuous.
-    public static let rippleSamplesPerWave = 3
     /// Samples across a block face along the axis that carries no ripple — the pillow dome is
     /// gentle and smooth-normalled, so a handful is enough.
     public static let pillowSegmentsPerBlock = 6
@@ -110,38 +106,10 @@ public enum GlassBlockProfile {
     /// a coplanar face (which would z-fight in raster and make RT hits order-dependent).
     public static let edgeClearanceMeters = 0.0005
     /// Hard ceiling on one pane's GLASS triangles, so a wall-sized glass-block window can never
-    /// blow the structural triangle budget: the sampling is stepped down until it fits
-    /// (`sampling(blocksX:blocksZ:)`). Deterministic — a pure function of the block count.
+    /// blow the structural triangle budget: the pane builder steps its pressing's detail down
+    /// until it fits (DaydreamCore `GlassBlockStyle.detailLevels`). Deterministic — a pure
+    /// function of the block count and the style.
     public static let maxPaneTriangles = 24_000
-
-    /// The sampling one pane is built at: samples across a face along its ripple axis and
-    /// along its pillow axis, and how many ripple waves each face carries (0 = flat inside).
-    public struct Sampling: Equatable, Sendable {
-        public var ripple: Int
-        public var pillow: Int
-        public var waves: Int
-        public init(ripple: Int, pillow: Int, waves: Int) {
-            self.ripple = ripple; self.pillow = pillow; self.waves = waves
-        }
-    }
-
-    /// Glass triangles one pane costs at `s`: two shells per block, each two faces of
-    /// `ripple × pillow` quads plus a rim ringing them.
-    @inlinable public static func paneTriangles(blocksX bx: Int, blocksZ bz: Int, _ s: Sampling) -> Int {
-        bx * bz * 2 * (2 * s.ripple * s.pillow + 2 * (s.ripple + s.pillow)) * 2
-    }
-
-    /// The richest sampling that fits `maxPaneTriangles` for a `bx × bz` block pane. Steps the
-    /// pillow down first (its dome is smooth-normalled and barely needs samples), then drops
-    /// the ripple rather than alias it.
-    @inlinable public static func sampling(blocksX bx: Int, blocksZ bz: Int) -> Sampling {
-        let waves = Int(flutesPerBlock)
-        for pillow in [pillowSegmentsPerBlock, 4, 2] {
-            let s = Sampling(ripple: waves * rippleSamplesPerWave, pillow: pillow, waves: waves)
-            if paneTriangles(blocksX: bx, blocksZ: bz, s) <= maxPaneTriangles { return s }
-        }
-        return Sampling(ripple: 2, pillow: 2, waves: 0)
-    }
 
     /// The inside-face ripple at `u` ∈ [0, 1] across a face, as a 0…1 fraction of
     /// `rippleMeters` (0 at both edges, so every shell's rim is a plain rectangle).

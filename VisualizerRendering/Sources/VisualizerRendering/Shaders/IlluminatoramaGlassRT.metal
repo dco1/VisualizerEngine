@@ -473,7 +473,14 @@ static float3 traceRefractionPath(
     thread float3& outAbsorb)
 {
     outAbsorb = float3(1.0);
-    float eps = max(u.rayTMin, 1e-3);
+    // Boundary offset for the DIELECTRIC walk, deliberately NOT `u.rayTMin`. That value (4 mm) is
+    // sized for opaque room geometry, and the walk applies it twice per boundary — once as the
+    // normal nudge, once as `min_distance` — so it stepped ~8 mm past every surface it crossed.
+    // A glass-block shell is 9 mm: the ray jumped straight over the near shell's moulded inside
+    // face and only the far shell's pattern ever rendered (a fluted or prism block, moulded on
+    // one shell, came out looking like clear glass). 0.1 mm is ~50 float ulps at house scale —
+    // clear of self-intersection, and far below any real glass thickness.
+    float eps = 1e-4;
     // Refract into the glass at the entry surface.
     float3 rd = refract(-V, Ng, 1.0 / max(1.0, iorEntry));
     if (dot(rd, rd) < 1e-8) rd = reflect(-V, Ng);      // grazing guard
@@ -646,6 +653,32 @@ fragment float4 illumi_glass_rt_fs(
 
     intersector<triangle_data, instancing> isect;
     isect.set_triangle_cull_mode(triangle_cull_mode::none);
+
+    // ── Only the NEAREST glass surface shades ────────────────────────────────
+    // The trace below walks the whole glass volume from the entry surface, so a pixel must be
+    // shaded once, from the first glass the eye meets. The pass cannot guarantee that with
+    // raster state alone: it depth-tests against the opaque scene but never writes depth, and
+    // back-face culling only removes surfaces facing AWAY. A hollow or nested body has a second
+    // camera-facing surface behind the first — a glass block's far shell faces its cavity, i.e.
+    // the camera — and that fragment, drawn later, overwrote the near one, so the trace started
+    // on the far shell and the near shell's moulding never rendered (a fluted or prism block
+    // looked like clear glass). One any-hit glass ray from the eye decides it, order-free and
+    // without touching the scene depth the later passes read. Skipped under the soap-bubble
+    // undulation, whose raster surface is displaced away from the one in the TLAS.
+    if (u.wobbleAmp <= 0.0) {
+        float d = length(u.cameraWorldPos - in.worldPos);
+        if (d > 2e-3) {
+            ray eye; eye.origin = u.cameraWorldPos; eye.direction = -V;
+            eye.min_distance = 0.0; eye.max_distance = d - 1e-3;
+            isect.accept_any_intersection(true);
+            auto front = isect.intersect(eye, accel, 0x02u);   // glass only
+            isect.accept_any_intersection(false);
+            // `discard_fragment` does not end the invocation (the lane can live on as a helper),
+            // and a discarded lane that goes on to run the full RT walk below faulted the GPU —
+            // so leave explicitly.
+            if (front.type == intersection_type::triangle) { discard_fragment(); return float4(0.0); }
+        }
+    }
 
     // Per-fragment seed for the stochastic cones; varies per frame so TAA averages.
     uint seed = pcgHash(uint(in.clipPos.x) + uint(in.clipPos.y) * 9781u + u.frameSeed * 6151u);
