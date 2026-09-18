@@ -1127,6 +1127,53 @@ public final class IlluminatoramaRenderer {
     /// Negative pulls the highlights further down. Only read when protection > 0.
     public var autoExposureHighlightEV: Float = 0
 
+    // ── DH-0655 — the luminance histogram and percentile metering ────────────
+    //
+    // The mean meter cannot see what it is about to clip; a percentile can, but needs a
+    // distribution the reduction never had. `illumi_exposure_estimate` now builds a 64-bin
+    // log-luminance histogram (0.25 EV a bin over its [−8, +8] clamp) from the SAME samples the
+    // mean averages, when asked. Both levers default OFF and the shipped meter is untouched.
+
+    /// How the auto-exposure target is chosen. `.mean` (default) is the geometric mean it has
+    /// always been. `.percentile` meters `autoExposureKeyPercentile` of the log-luminance
+    /// distribution instead, and — when `autoExposureGuardPercentile > 0` — caps exposure so
+    /// that percentile lands at `autoExposureGuardEV` (a `min`, never a boost).
+    public enum AutoExposureMetering: Sendable { case mean, percentile }
+    public var autoExposureMetering: AutoExposureMetering = .mean
+    /// The metered percentile under `.percentile` (0…1). 0.5 = the median.
+    public var autoExposureKeyPercentile: Float = 0.5
+    /// The highlight-guard percentile (0…1; 0 = no guard), e.g. 0.95 or 0.99.
+    public var autoExposureGuardPercentile: Float = 0
+    /// Where the guard percentile is asked to land, log2 linear, pre-tonemap.
+    public var autoExposureGuardEV: Float = 0
+    /// Build and publish the histogram even while metering the mean — the INSTRUMENT.
+    /// Read it back with `lastExposureHistogram`. Changes no pixel.
+    public var exposureHistogramEnabled: Bool = false
+
+    /// One frame's histogram as the meter saw it. Log-luminance is log2 of the metered
+    /// brightness (max of luma and half the max channel), pre-exposure.
+    public struct ExposureHistogram: Sendable {
+        public static let bins = 64, minLogLum: Float = -8, binEV: Float = 0.25
+        public let counts: [Float]
+        public let total: Float
+        public let p50: Float, p95: Float, p99: Float
+        /// The kernel's own geometric-mean statistic, for comparing the two meters.
+        public let meanLogLum: Float
+        /// The percentile the key asked for.
+        public let keyLogLum: Float
+    }
+    /// The last histogram the estimator published, or nil if it has never built one.
+    /// Valid after the command buffer that encoded it has completed.
+    public var lastExposureHistogram: ExposureHistogram? {
+        let n = ExposureHistogram.bins
+        let p = exposureHistogramBuffer.contents().assumingMemoryBound(to: Float.self)
+        let total = p[n]
+        guard total > 0 else { return nil }
+        return ExposureHistogram(counts: Array(UnsafeBufferPointer(start: p, count: n)), total: total,
+                                 p50: p[n + 1], p95: p[n + 2], p99: p[n + 3],
+                                 meanLogLum: p[n + 4], keyLogLum: p[n + 5])
+    }
+
 
     // ── Per-term split-render diagnostic ─────────────────────────────
     /// Isolates ONE lighting term in the deferred kernel so a flooded /
@@ -3068,6 +3115,8 @@ public final class IlluminatoramaRenderer {
     /// host can seed it once at init and inspect for diagnostics; the
     /// kernel writes back via a `device&` binding.
     private let exposureBuffer: MTLBuffer
+    /// DH-0655 — `ExposureHistogram.bins` counts + total, p50, p95, p99, mean, key.
+    private let exposureHistogramBuffer: MTLBuffer
 
     // Phase 4.11 — particle pipelines. The compute step integrates
     // positions/velocities/life; the render pipeline draws survivors as
@@ -3179,6 +3228,12 @@ public final class IlluminatoramaRenderer {
     /// exposure-invariant result from two scenes that happened to be exposed the same.
     public var lastAutoExposure: Float {
         exposureBuffer.contents().advanced(by: 4).assumingMemoryBound(to: Float.self).pointee
+    }
+    /// TEST-OBSERVABLE: the log2 luminance the meter TARGETED on the last completed frame
+    /// (slot 2 of `ExposureState`) — before the EMA and the boost clamp, so two meters can be
+    /// compared even when both are pinned at `autoExposureMaxBoost` (DH-0655).
+    public var lastAutoExposureTargetLogLum: Float {
+        exposureBuffer.contents().advanced(by: 8).assumingMemoryBound(to: Float.self).pointee
     }
 
     /// Matches the Metal `ExtParticleParams` struct byte-for-byte.
@@ -4731,6 +4786,13 @@ public final class IlluminatoramaRenderer {
         memcpy(expoBuf.contents(), initialState,
                MemoryLayout<Float>.stride * initialState.count)
         self.exposureBuffer = expoBuf
+        guard let histBuf = device.makeBuffer(length: MemoryLayout<Float>.stride * (ExposureHistogram.bins + 8),
+                                              options: .storageModeShared) else {
+            throw IlluminatoramaError.bufferAllocationFailed("exposureHistogram")
+        }
+        histBuf.label = "Illuminatorama.exposureHistogram"
+        memset(histBuf.contents(), 0, histBuf.length)
+        self.exposureHistogramBuffer = histBuf
         self.ddgiTracePipeline = ddgiTrace
         self.ddgiUpdateIrrPipeline = ddgiUpdateIrr
         self.ddgiUpdateDepthPipeline = ddgiUpdateDepth
@@ -12669,8 +12731,17 @@ public final class IlluminatoramaRenderer {
         // `autoExposureHighlightProtection` for why the statistic is the upper-half
         // mean rather than a percentile.
         var params2 = SIMD4<Float>(max(0, min(1, autoExposureHighlightProtection)),
-                                   autoExposureHighlightEV, 0, 0)
+                                   autoExposureHighlightEV,
+                                   exposureHistogramEnabled ? 1 : 0, 0)
         enc.setBytes(&params2, length: MemoryLayout<SIMD4<Float>>.stride, index: 3)
+        // params3 (DH-0655): x = metering (0 mean, 1 percentile), y = key percentile,
+        // z = guard percentile (0 = none), w = guard EV. Mean + instrument off ⇒ no histogram.
+        var params3 = SIMD4<Float>(autoExposureMetering == .percentile ? 1 : 0,
+                                   max(0, min(1, autoExposureKeyPercentile)),
+                                   max(0, min(1, autoExposureGuardPercentile)),
+                                   autoExposureGuardEV)
+        enc.setBytes(&params3, length: MemoryLayout<SIMD4<Float>>.stride, index: 4)
+        enc.setBuffer(exposureHistogramBuffer, offset: 0, index: 5)
         // Update the host-driven `dt` slot in the buffer — the EMA step
         // inside the kernel needs to know how much wall-time elapsed
         // since the last estimate so the half-life math is correct.
@@ -12685,6 +12756,7 @@ public final class IlluminatoramaRenderer {
         // and 1024 for uints. Set both indices.
         enc.setThreadgroupMemoryLength(256 * MemoryLayout<Float>.stride, index: 0)
         enc.setThreadgroupMemoryLength(256 * MemoryLayout<UInt32>.stride, index: 1)
+        enc.setThreadgroupMemoryLength(ExposureHistogram.bins * MemoryLayout<UInt32>.stride, index: 2)
         let tg = MTLSize(width: 256, height: 1, depth: 1)
         let groups = MTLSize(width: 1, height: 1, depth: 1)
         enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)

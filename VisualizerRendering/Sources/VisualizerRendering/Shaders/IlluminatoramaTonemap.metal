@@ -49,14 +49,46 @@ struct ExposureState {
 // For a 1920×1080 image that's 1 in ~250 pixels — plenty for a stable
 // luminance estimate that doesn't trigger on outlier bright pixels.
 
+// ── DH-0655 — the luminance HISTOGRAM and percentile metering ─────────────────
+//
+// The mean below answers "how bright is this scene", never "will anything clip", and a
+// percentile needs a distribution the reduction never had. So: 64 bins over the kernel's own
+// [−8, +8] log2 clamp (0.25 EV a bin), filled from the SAME cached samples the mean averages —
+// mean and percentile then describe one population, so the two are directly comparable.
+// Threadgroup atomics: 8 K increments over 64 bins is nothing, and it needs no 32 KB per-thread
+// scratch. Built only when the instrument or percentile metering asks (a uniform, so every
+// thread takes the same barriers); both default OFF, which leaves the shipped meter untouched.
+constant uint  kExposureHistBins  = 64;
+constant float kExposureHistMinLL = -8.0;
+constant float kExposureHistBinEV = 0.25;
+
+/// The log-luminance below which `pct` of the samples lie, linearly interpolated inside the
+/// bin that crosses it. Runs on one thread over the reduced counts.
+static inline float exposureHistPercentile(threadgroup atomic_uint* hist, uint total, float pct) {
+    float want = clamp(pct, 0.0, 1.0) * float(total);
+    float run = 0.0;
+    for (uint b = 0; b < kExposureHistBins; ++b) {
+        float c = float(atomic_load_explicit(&hist[b], memory_order_relaxed));
+        if (run + c >= want && c > 0.0) {
+            float f = (want - run) / c;
+            return kExposureHistMinLL + (float(b) + f) * kExposureHistBinEV;
+        }
+        run += c;
+    }
+    return kExposureHistMinLL + float(kExposureHistBins) * kExposureHistBinEV;
+}
+
 kernel void illumi_exposure_estimate(
     texture2d<half, access::sample> inHDR     [[texture(0)]],
     device ExposureState&           state     [[buffer(0)]],
     constant uint2&                 imgSize   [[buffer(1)]],
     constant float4&                params    [[buffer(2)]],  // x=targetEV, y=halfLife, z=maxBoost, w=minBoost
-    constant float4&                params2   [[buffer(3)]],  // x=highlightProtection, y=highlightEV, zw reserved
+    constant float4&                params2   [[buffer(3)]],  // x=highlightProtection, y=highlightEV, z=histogram instrument ON, w reserved
+    constant float4&                params3   [[buffer(4)]],  // x=metering (0 mean, 1 percentile), y=key pct, z=guard pct (0 off), w=guard EV
+    device float*                   histOut   [[buffer(5)]],  // kExposureHistBins counts + total, p50, p95, p99, mean, key
     threadgroup float*              sharedAcc [[threadgroup(0)]],
     threadgroup uint*               sharedCnt [[threadgroup(1)]],
+    threadgroup atomic_uint*        hist      [[threadgroup(2)]],
     uint                            tid       [[thread_position_in_threadgroup]],
     uint                            tgSize    [[threads_per_threadgroup]]
 ) {
@@ -154,6 +186,23 @@ kernel void illumi_exposure_estimate(
     float frameMean = (sharedCnt[0] > 0u)
                     ? (sharedAcc[0] / float(sharedCnt[0]))
                     : state.prevTargetLogLum;
+    // The sample total, read with the mean — the highlight pass below reuses `sharedCnt`.
+    const uint sharedCntTotal = sharedCnt[0];
+
+    const bool percentileMeter = params3.x > 0.5;
+    const bool histogramOn = percentileMeter || params2.z > 0.5;
+    if (histogramOn) {
+        for (uint b = tid; b < kExposureHistBins; b += tgSize) {
+            atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < thisKept; ++k) {
+            uint b = uint(clamp((thisLL[k] - kExposureHistMinLL) / kExposureHistBinEV,
+                                0.0, float(kExposureHistBins - 1)));
+            atomic_fetch_add_explicit(&hist[b], 1u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     float hiAcc = 0.0;
     uint  hiCnt = 0u;
@@ -181,6 +230,24 @@ kernel void illumi_exposure_estimate(
         // to `state.prevTargetLogLum` when no sample landed in the valid range),
         // because the highlight pass has to see the same number the mean pass did.
         float target = frameMean;
+        float guardLL = 0.0;
+        if (histogramOn) {
+            uint total = sharedCntTotal;
+            float key = exposureHistPercentile(hist, total, params3.y);
+            if (percentileMeter && total > 0u) {
+                target = key;
+                if (params3.z > 0.0) guardLL = exposureHistPercentile(hist, total, params3.z);
+            }
+            for (uint b = 0; b < kExposureHistBins; ++b) {
+                histOut[b] = float(atomic_load_explicit(&hist[b], memory_order_relaxed));
+            }
+            histOut[kExposureHistBins + 0] = float(total);
+            histOut[kExposureHistBins + 1] = exposureHistPercentile(hist, total, 0.50);
+            histOut[kExposureHistBins + 2] = exposureHistPercentile(hist, total, 0.95);
+            histOut[kExposureHistBins + 3] = exposureHistPercentile(hist, total, 0.99);
+            histOut[kExposureHistBins + 4] = frameMean;
+            histOut[kExposureHistBins + 5] = key;
+        }
         // Auto-exposure: we want the target luminance to land at
         // `2^targetEV`. So the exposure scalar is `2^(targetEV - target)`.
         // Negative target log lum (scene is dim) → positive exposure
@@ -193,6 +260,11 @@ kernel void illumi_exposure_estimate(
         if (protect > 0.0) {
             float hiWanted = exp2(params2.y - hiMean);
             wantedExposure = mix(wantedExposure, min(wantedExposure, hiWanted), protect);
+        }
+        // Percentile highlight GUARD: cap exposure so the guard percentile lands at `guardEV`.
+        // A `min`, never a boost — like the upper-half cap above.
+        if (percentileMeter && params3.z > 0.0 && sharedCntTotal > 0u) {
+            wantedExposure = min(wantedExposure, exp2(params3.w - guardLL));
         }
         // EMA toward `wantedExposure` with a half-life set by
         // `params.y` seconds. Convert half-life + dt into a per-frame
