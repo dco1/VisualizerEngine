@@ -2052,6 +2052,13 @@ public final class IlluminatoramaRenderer {
     /// exists to avoid. Default OFF.
     public var blockingLightingCompile: Bool = false
 
+    /// TEST-OBSERVABLE (DH-0869): the specialisation flags of the lighting variant the LAST
+    /// frame actually dispatched — bit 1 ibl · 2 shadow · 4 dfg · 8 ddgi · 16 irrCache · 32 rtSun.
+    /// `0xFF` until a specialised variant has run. On the non-blocking path a not-yet-compiled
+    /// combination runs the init-time variant and leaves this at the PREVIOUS value, so a test
+    /// that flips a flag can assert the frame really ran it.
+    public var activeLightingVariantFlags: UInt8 { lastLightingFlags }
+
     /// **S3.2 Ultra — trace the probe field against the REAL TLAS.** The
     /// analytic trace only intersects box/sphere/ground primitives, so a
     /// `.custom`-mesh host stands in coarse `ddgiProxyInstances`. With this on
