@@ -471,9 +471,11 @@ static float3 traceRefractionPath(
     texture2d_array<float, access::sample> albedoAtlas,
     thread uint& seed,
     thread float3& outAbsorb,
+    thread float3& outExitDir,
     float2 entryStratum = float2(-1.0))
 {
     outAbsorb = float3(1.0);
+    outExitDir = -V;
     // Boundary offset for the DIELECTRIC walk, deliberately NOT `u.rayTMin`. That value (4 mm) is
     // sized for opaque room geometry, and the walk applies it twice per boundary — once as the
     // normal nudge, once as `min_distance` — so it stepped ~8 mm past every surface it crossed.
@@ -509,6 +511,7 @@ static float3 traceRefractionPath(
         if (res.type != intersection_type::triangle) {
             // Escaped to the sky.
             outAbsorb = throughput;
+            outExitDir = normalize(rd);
             return throughput * sampleSky(sky, rd, u.skyIntensity, glassNightSky(u), u.nightPixAngle);
         }
         uint iid = res.instance_id;
@@ -567,10 +570,12 @@ static float3 traceRefractionPath(
                                     res.triangle_barycentric_coord, hitP, r.direction,
                                     u, st, surfAtlas, irrCube, albedoAtlas, seed, res);
         outAbsorb = throughput;
+        outExitDir = normalize(r.direction);
         return throughput * rad;
     }
     // Bounce budget exhausted — return the accumulated sky as a fallback.
     outAbsorb = throughput;
+    outExitDir = normalize(rd);
     return throughput * sampleSky(sky, rd, u.skyIntensity, glassNightSky(u), u.nightPixAngle);
 }
 
@@ -733,6 +738,7 @@ fragment float4 illumi_glass_rt_fs(
     // absorption is not meaningful (dispersion splits it three ways) or where screen space
     // cannot represent the result anyway (a frosted cone blurs what it samples).
     float3 refrAbsorb = float3(1.0);
+    float3 refrExit = -V;
     bool ssAbsorbValid = false;
     float3 refr;
     if (u.dispersionEnabled != 0u && dispersion > 1e-4) {
@@ -741,18 +747,18 @@ fragment float4 illumi_glass_rt_fs(
         // paths — gated, so only dispersive glass pays it.
         float spread = dispersion * 0.04 * ior;         // ±IOR offset
         uint s0 = seed;
-        float3 dropAbsorb;
+        float3 dropAbsorb, dropExit;
         float r = traceRefractionPath(isect, accel, P, V, N, ior - spread, tint, density,
                                       roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
-                                      dropAbsorb).r;
+                                      dropAbsorb, dropExit).r;
         seed = s0 ^ 0x1234u;
         float g = traceRefractionPath(isect, accel, P, V, N, ior, tint, density,
                                       roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
-                                      dropAbsorb).g;
+                                      dropAbsorb, dropExit).g;
         seed = s0 ^ 0x9abcu;
         float bb = traceRefractionPath(isect, accel, P, V, N, ior + spread, tint, density,
                                        roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
-                                       dropAbsorb).b;
+                                       dropAbsorb, dropExit).b;
         refr = float3(r, g, bb);
     } else {
         // Frosted glass jitters the refraction in a cone, so a single sample is
@@ -766,7 +772,7 @@ fragment float4 illumi_glass_rt_fs(
         if (nRefr <= 1u) {
             refr = traceRefractionPath(isect, accel, P, V, N, ior, tint, density,
                                        roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
-                                       refrAbsorb);
+                                       refrAbsorb, refrExit);
             ssAbsorbValid = true;
         } else {
             float3 acc = float3(0.0);
@@ -774,12 +780,12 @@ fragment float4 illumi_glass_rt_fs(
             // radius on a golden-ratio sequence under another — the samples tile the cone.
             float rotA = rnd(seed), rotR = rnd(seed);
             for (uint s = 0u; s < nRefr; ++s) {
-                float3 coneAbsorb;
+                float3 coneAbsorb, coneExit;
                 float2 stratum = float2(fract(rotR + float(s) * 0.6180340),
                                         fract(rotA + (float(s) + 0.5) / float(nRefr)));
                 acc += traceRefractionPath(isect, accel, P, V, N, ior, tint, density,
                                            roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
-                                           coneAbsorb, stratum);
+                                           coneAbsorb, coneExit, stratum);
             }
             refr = acc / float(nRefr);
         }
@@ -830,7 +836,13 @@ fragment float4 illumi_glass_rt_fs(
     bool absorbs = density > 1e-3 && any(clamp(tint, 0.0, 1.0) < 0.999);
     if (u.ssTransmissionEnabled != 0u && ssAbsorbValid && !absorbs
         && u.viewW > 0.5 && u.viewH > 0.5) {
-        float w = smoothstep(0.80, 0.95, cosI);
+        // …and ONLY where the traced ray came out UNBENT. The composite is the pixel straight
+        // behind the pane, which is the transmitted radiance only for a flat parallel slab (its
+        // exit ray is parallel to its entry ray). Moulded glass bends the view by design: fluted
+        // glazing has no body tint, so the `absorbs` gate never excluded it, and near head-on the
+        // reeds' refraction was thrown away for the unbent backdrop — fluted read as clear glass.
+        // 0.9990 → 0.9999 is ~2.6° → ~0.8° of deviation.
+        float w = smoothstep(0.80, 0.95, cosI) * smoothstep(0.9990, 0.9999, dot(refrExit, -V));
         if (w > 0.0) {
             constexpr sampler bdSmp(filter::linear, address::clamp_to_edge);
             float2 uv = in.clipPos.xy / float2(u.viewW, u.viewH);
