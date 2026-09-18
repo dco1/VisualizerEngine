@@ -375,11 +375,22 @@ static inline float3 tintGain(float tint) {
 //   • highlights lifts/rolls the high-luma end (1.0 = no-op)
 // Shadows/highlights are luma-weighted so mid-tones stay put and the two ends
 // move independently. All three default to 1.0 → an exact no-op.
+//
+// CONTRAST IS A TWO-SIDED POWER S-CURVE, not a line through the pivot. It used to be
+// `(c − 0.18)·k + 0.18` then `max(·, 0)`, which sends every value below 0.18·(1 − 1/k) to
+// EXACT black: at k = 1.31 that is display-linear 0.0425 (≈ sRGB 58/255) and at 1.46 ≈ sRGB
+// 66. A dial that turns non-black input into 0 is a crush, not a contrast — measured on the
+// AgX-retuned presets it blacked out 70 % of the window-night hero, 22 % of living-night, and
+// every dim test rig entirely (DH-0890). Now: `p·(c/p)^k` below the pivot and its mirror
+// `1 − (1−p)·((1−c)/(1−p))^k` above it — slope k AT the pivot (the same mid-tone punch the
+// line gave), 0 → 0 and 1 → 1 fixed, so the ends are compressed toward, never clamped onto.
 static inline float3 toneCurve(float3 c, float contrast, float shadows, float highlights) {
-    // Contrast around mid-grey pivot.
     const float pivot = 0.18;
-    c = (c - pivot) * contrast + pivot;
-    c = max(c, 0.0);
+    const float k = max(contrast, 1e-3);
+    c = saturate(c);
+    float3 lo = pivot * pow(c / pivot, float3(k));
+    float3 hi = 1.0 - (1.0 - pivot) * pow((1.0 - c) / (1.0 - pivot), float3(k));
+    c = select(hi, lo, c <= pivot);
     // Per-pixel luma drives the shadow/highlight weights.
     float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
     // Smooth low/high masks: shadowW ≈ 1 in blacks → 0 by mid; highW the inverse.
