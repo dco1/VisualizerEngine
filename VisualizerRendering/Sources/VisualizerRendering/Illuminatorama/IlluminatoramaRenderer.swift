@@ -1768,6 +1768,14 @@ public final class IlluminatoramaRenderer {
     /// the error surface was nearly flat over [0.40, 0.70] here, so this
     /// sits in the middle of that range rather than at the exact minimum.
     public var liveLookAODarken: Float = 0.50
+    /// **What the look-match's AO share actually mixes toward THIS frame (Daydream DH-0785).**
+    /// `liveLookAODarken` is a STAND-IN for ray-traced AO on a lane that never traces it, and it
+    /// reads the same AO buffer RTAO writes into. When RTAO is live for the frame the buffer
+    /// already carries real occlusion, so the stand-in would darken every corner a second time —
+    /// on exactly the settled frames a host shows while it converges. 1.0 makes the shader's
+    /// `mix(1, darken, aoMask)` a no-op. The GI share is untouched: GI is a separate term, and a
+    /// host that traces AO without GI still wants it.
+    public var effectiveLiveLookAODarken: Float { rtaoActive ? 1.0 : liveLookAODarken }
     /// Opt-in hex-stochastic anti-tiling strength [0,1]. **Default 0 = OFF**, which
     /// is a hard no-op: the G-buffer shader short-circuits every textured sample to a
     /// single plain read, so scenes that leave this at 0 render byte-for-byte
@@ -13598,7 +13606,7 @@ public final class IlluminatoramaRenderer {
         u.liveLookMatchStrength = max(0, min(1, liveLookMatchStrength))
         u.liveLookGIDarken = liveLookGIDarken
         u.liveLookGIWarmth = max(0, min(4, liveLookGIWarmth))
-        u.liveLookAODarken = liveLookAODarken
+        u.liveLookAODarken = effectiveLiveLookAODarken   // DH-0785 — never on top of traced AO
         // Interior day-light separation. Mask 0 (default) ⇒ the kernel's factors stay
         // exactly 1.0 ⇒ byte-identical for every scene that never opts in.
         u.interiorMask = interiorLayerMask
