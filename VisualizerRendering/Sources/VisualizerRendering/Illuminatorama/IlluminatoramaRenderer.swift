@@ -513,6 +513,24 @@ public final class IlluminatoramaRenderer {
     /// shadow toward the target with `k = 1 − e^(−dt/postFXEasingTau)`, so dragging
     /// a slider glides instead of snapping. 0 = instant (no easing).
     public var postFXEasingTau: Double = 0.40
+    /// **A host-owned frame clock for the renderer's SELF-TIMED integrators.** `nil` (the default,
+    /// and what every live canvas wants) = each integrator measures its own `dt` off the wall clock
+    /// (`CACurrentMediaTime()`), which keeps its half-life in SECONDS at any frame rate. Non-nil =
+    /// every one of them advances by exactly this many seconds per `render()`, regardless of how long
+    /// the frame actually took:
+    ///
+    ///  - the auto-exposure EMA (`encodeExposureEstimate` → `ExposureState.deltaTime`),
+    ///  - the post-FX easing glide (`advancePostFXEasing`),
+    ///  - the particle integration step (`encodeParticleStep`).
+    ///
+    /// Why it exists: a headless "settle N frames" is a frame COUNT, not a duration. With the wall
+    /// clock, N frames land wherever machine load puts them along each glide — the auto-exposure
+    /// meter at the shipped 0.25 s half-life is ~37 % converged after 10 frames at 60 fps and ~93 %
+    /// at 10 fps — so a frame's GAIN was a function of how busy the machine was. `renderer.time`
+    /// (the shader oscillators) is already host-owned; this is the other half. Set it to `1/60` for a
+    /// deterministic capture and the same N frames produce the same frame on an idle or a loaded
+    /// machine (Daydream Home DH-0043).
+    public var fixedFrameDelta: Double? = nil
     private var easedExposure: Float = 1.0
     private var easedBloomThreshold: Float = 1.0
     private var easedBloomIntensity: Float = 0.6
@@ -10473,7 +10491,7 @@ public final class IlluminatoramaRenderer {
     private func encodeParticleStep(_ cb: MTLCommandBuffer) {
         guard !particleEmitters.isEmpty else { return }
         let now = CACurrentMediaTime()
-        let dt = Float(max(0, min(0.05, now - lastParticleTickTime)))
+        let dt = Float(max(0, min(0.05, fixedFrameDelta ?? (now - lastParticleTickTime))))
         lastParticleTickTime = now
         guard dt > 0 else { return }
         guard let enc = cb.makeComputeCommandEncoder() else { return }
@@ -12822,7 +12840,7 @@ public final class IlluminatoramaRenderer {
         // Per-frame dt, clamped to a sane window so a stalled frame
         // (debugger pause, scene reload) doesn't pump the EMA.
         let now = CACurrentMediaTime()
-        lastFrameDuration = max(0.001, min(0.5, now - lastExposureTickTime))
+        lastFrameDuration = max(0.001, min(0.5, fixedFrameDelta ?? (now - lastExposureTickTime)))
         lastExposureTickTime = now
         guard let enc = timedComputeEncoder(cb, "exposureEstimate") else { return }
         enc.label = "Illuminatorama.exposureEstimate"
@@ -13306,7 +13324,7 @@ public final class IlluminatoramaRenderer {
     /// current targets (no startup glide). Mirrors AspectTest's `easeCamera`.
     private func advancePostFXEasing() {
         let now = CACurrentMediaTime()
-        let dt = lastPostFXEaseTime == 0 ? 0 : max(0, min(0.1, now - lastPostFXEaseTime))
+        let dt = lastPostFXEaseTime == 0 ? 0 : max(0, min(0.1, fixedFrameDelta ?? (now - lastPostFXEaseTime)))
         lastPostFXEaseTime = now
         let k = (postFXEasingTau <= 0 || dt == 0) ? 1.0 : 1 - exp(-dt / postFXEasingTau)
         let kf = Float(k)
