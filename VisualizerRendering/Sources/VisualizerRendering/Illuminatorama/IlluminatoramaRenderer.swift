@@ -7586,7 +7586,18 @@ public final class IlluminatoramaRenderer {
         // this feature must not be able to regress glass.
         let sunShadowRT = rtSunSoftShadowsEnabled && rtTLASForReflections && rtEnabled
             && !meshGroups.isEmpty && !instances.isEmpty
-        guard rtTLASSupported, (extractedRT || hasGlass || reflectionsRT || sunShadowRT) else {
+        // Fifth trigger (Daydream DH-0911): ray-traced AO claims the TLAS in its own right.
+        // `rtaoActive` requires a live TLAS, but nothing let RTAO ASK for one — so on a host's
+        // settled canvas (no extracted scene, reflections and traced sun both off) RTAO ran only
+        // when the scene happened to contain glass and the glass pass built a TLAS anyway. The
+        // host already requests it (it sets `rtTLASForReflections` whenever it wants RTAO); this
+        // is the engine honouring that request. Measured before: 0 of 32 settle frames traced AO
+        // in a room with no glazing, 31 of 32 with it. Same shape and glass-arm caps as the
+        // reflections and sun-shadow triggers above, for the same reason; gated on intensity so
+        // a zero-strength AO never builds a TLAS for nothing.
+        let aoRT = rtaoEnabled && rtaoIntensity > 0 && rtTLASForReflections && rtEnabled
+            && !meshGroups.isEmpty && !instances.isEmpty
+        guard rtTLASSupported, (extractedRT || hasGlass || reflectionsRT || sunShadowRT || aoRT) else {
             rtTLASActive = false; return }
         // Curve primitives (#60 item 7): adopt registry changes BEFORE the
         // topology hash, so a registration/unregistration lands as a rebuild.
