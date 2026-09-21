@@ -3243,6 +3243,36 @@ public final class IlluminatoramaRenderer {
     }
     private var meshGroups: [MeshDrawGroup] = []
 
+    // ── DH-0534 — VISIBILITY CULLING, the renderer-side wiring ──────────────────
+    // The logic and its correctness argument live in IlluminatoramaVisibilityCull.swift: a group
+    // whose world bounds lie wholly outside one clip half-space of the matrix a pass rasterises
+    // with cannot produce a fragment there, so skipping its draw changes no pixel. This is the
+    // part DH-0871 lost to an accidental `git checkout` and nothing had called since — the logic
+    // was committed (0718f54) with zero call sites, so every pass still drew every group.
+    /// Master switch. A pure skip, so ON by default; the lever is for A/B and for a host that
+    /// wants the old draw-everything behaviour back.
+    public var visibilityCullingEnabled = true
+    /// Draw calls each raster pass issued and skipped, cumulative since init. Take deltas.
+    public private(set) var visibilityCullStats = IlluminatoramaVisibilityCullStats()
+    /// World bounds of each entry in `meshGroups`, index-parallel to it.
+    private var meshGroupCullBounds: [IlluminatoramaCullBounds] = []
+    /// What `meshGroupCullBounds` was built from. Sway bounds are angle-independent by
+    /// construction (the sphere about the pivot), so TIME is deliberately not in here — only a
+    /// regroup, a wind-strength change, or a change in what the GPU is allowed to overwrite.
+    private struct CullBoundsKey: Equatable {
+        var groupsVersion: Int
+        var wind: Float
+        var hostWritesInstances: Bool
+        var repackCount: Int
+    }
+    private var cullBoundsKey: CullBoundsKey?
+    /// Bumped whenever `uploadInstances` regroups. NOT bumped on its static-skip frames, whose
+    /// grouping is identical — which is what lets the bounds survive them for free.
+    private var meshGroupsVersion = 0
+    /// The exact view-projection the G-buffer pass rasterises with — JITTERED when TAA is. The
+    /// cull contract is "the matrix the pass uses", not an unjittered approximation of it.
+    private var gbufferCullVP = matrix_identity_float4x4
+
     // ── Perfect analytic superquadric (hero primitive) ─────────────────────────
     // The impostor pipeline (ray-traces the analytic surface in-fragment, writes
     // the G-buffer + analytic depth + motion vectors) and a parallel param buffer.
@@ -9378,6 +9408,7 @@ public final class IlluminatoramaRenderer {
         updatePointShadows()
         uploadFrameUniforms()
         uploadInstances()
+        computeCullBounds()   // DH-0534 — reads the CPU-written instance copy, before any GPU hook
         uploadPointLights()
         uploadSpotLights()
         uploadAreaLights()
@@ -9889,9 +9920,11 @@ public final class IlluminatoramaRenderer {
             // one draw call replaces N per-instance draws per cascade /
             // per spot.
             let instStride = MemoryLayout<IlluminatoramaInstance>.stride
-            for group in meshGroups {
+            let cullClip = cullVolume(lightVP)   // DH-0534
+            for (gi, group) in meshGroups.enumerated() {
                 if directionalShadowExcludedKinds.contains(group.kind) { continue }  // e.g. lamps — no sun shadow
                 guard let mesh = meshes[group.kind] else { continue }
+                if shouldCull(gi, group, mesh, cullClip, drawn: \.cascadeDrawn, culled: \.cascadeCulled) { continue }
                 let want = shadowCullMode(mesh)
                 if want != cull { cull = want; enc.setCullMode(cull) }
                 let off = instStride * group.start
@@ -10304,8 +10337,10 @@ public final class IlluminatoramaRenderer {
             // one draw call replaces N per-instance draws per cascade /
             // per spot.
             let instStride = MemoryLayout<IlluminatoramaInstance>.stride
-            for group in meshGroups {
+            let cullClip = cullVolume(lightVP)   // DH-0534
+            for (gi, group) in meshGroups.enumerated() {
                 guard let mesh = meshes[group.kind] else { continue }
+                if shouldCull(gi, group, mesh, cullClip, drawn: \.spotDrawn, culled: \.spotCulled) { continue }
                 let want = shadowCullMode(mesh)
                 if want != cull { cull = want; enc.setCullMode(cull) }
                 let off = instStride * group.start
@@ -10461,8 +10496,10 @@ public final class IlluminatoramaRenderer {
                 var shadowTime = time
                 enc.setVertexBytes(&shadowTime, length: MemoryLayout<Float>.stride, index: 4)
 
-                for group in meshGroups {
+                let cullClip = cullVolume(lightVP)   // DH-0534
+                for (gi, group) in meshGroups.enumerated() {
                     guard let mesh = meshes[group.kind] else { continue }
+                    if shouldCull(gi, group, mesh, cullClip, drawn: \.pointDrawn, culled: \.pointCulled) { continue }
                     let want = shadowCullMode(mesh)
                     if want != cull { cull = want; enc.setCullMode(cull) }
                     let off = instStride * group.start
@@ -11153,7 +11190,8 @@ public final class IlluminatoramaRenderer {
         // groups are all ordinary meshes (the common case).
         var prevVertsBound = false
         var substrateBiased = false
-        for group in meshGroups {
+        let cullClip = cullVolume(gbufferCullVP)   // DH-0534
+        for (gi, group) in meshGroups.enumerated() {
             // Superquadric impostor box kinds are drawn by the impostor pipeline
             // below; RT-proxy kinds exist only in the TLAS; shadow-only kinds are
             // lighting occluders that draw solely into the shadow maps. All skipped here.
@@ -11161,6 +11199,7 @@ public final class IlluminatoramaRenderer {
                rtProxyMeshKinds.contains(group.kind) ||
                shadowOnlyMeshKinds.contains(group.kind) { continue }
             guard let mesh = meshes[group.kind] else { continue }
+            if shouldCull(gi, group, mesh, cullClip, drawn: \.gbufferDrawn, culled: \.gbufferCulled) { continue }
             // Two-sided meshes (open / dynamic MC fluid surfaces) render cull
             // `.none` so they don't go hollow when their back side faces the
             // camera; the fragment shader flips the normal for back faces.
@@ -13418,6 +13457,7 @@ public final class IlluminatoramaRenderer {
         // `IlluminatoramaFrameUniforms.taaJitterDelta`.
         lastFrameJitterNDC = jitterNDC
         let vp = proj * view
+        gbufferCullVP = vp   // DH-0534: the G-buffer culls against exactly this
         let invVP = vp.inverse
         let invProj = proj.inverse
         let invView = view.inverse
@@ -13756,6 +13796,7 @@ public final class IlluminatoramaRenderer {
         // same grouping last → this frame.
         meshGroups.removeAll(keepingCapacity: true)
         meshGroupRange.removeAll(keepingCapacity: true)
+        meshGroupsVersion &+= 1   // DH-0534: the cull bounds describe the old grouping now
         guard !instances.isEmpty else { return }
 
         // VEGETATION WIND, LIVENESS. `treeWindStrength` is a global, but as of 2026-08-17 the
@@ -13819,6 +13860,64 @@ public final class IlluminatoramaRenderer {
                 kind: kind, start: groupStart, count: srcIndices.count))
             meshGroupRange[kind] = groupStart ..< (groupStart + srcIndices.count)
         }
+    }
+
+    /// DH-0534 — rebuild `meshGroupCullBounds` when its inputs changed. Everything the CPU cannot
+    /// see is UNBOUNDED and always draws: a host `onEncodeGPUInstances` kernel may overwrite ANY
+    /// instance slot (so with the hook set, nothing is culled at all); `gpuRepackTasks` rewrite a
+    /// kind's vertices (which also covers the deforming meshes behind `prevPosByKind`); and a mesh
+    /// built on caller-owned buffers has no CPU-visible vertices (`cpuAuthoredVertices == false`).
+    private func computeCullBounds() {
+        let hostWritesInstances = onEncodeGPUInstances != nil
+        let key = CullBoundsKey(groupsVersion: meshGroupsVersion, wind: treeWindStrength,
+                                hostWritesInstances: hostWritesInstances,
+                                repackCount: gpuRepackTasks.count)
+        if key == cullBoundsKey, meshGroupCullBounds.count == meshGroups.count { return }
+        cullBoundsKey = key
+        meshGroupCullBounds.removeAll(keepingCapacity: true)
+        let total = meshGroups.last.map { $0.start + $0.count } ?? 0
+        guard total > 0 else { return }
+        let repacked = Set(gpuRepackTasks.map(\.kind))
+        let inst = currentInstanceBuffer.contents()
+            .bindMemory(to: IlluminatoramaInstance.self, capacity: total)
+        for group in meshGroups {
+            guard !hostWritesInstances, !repacked.contains(group.kind),
+                  let mesh = meshes[group.kind], mesh.cpuAuthoredVertices,
+                  let local = mesh.boundingSphere else {
+                meshGroupCullBounds.append(.unbounded)
+                continue
+            }
+            var bounds = IlluminatoramaCullBounds.empty
+            var bounded = true
+            for i in group.start ..< group.start + group.count {
+                guard let sphere = IlluminatoramaCullBounds.worldSphere(
+                    local: local, instance: inst[i], treeWindStrength: treeWindStrength,
+                    windMax: { mesh.windAttributeMax }) else { bounded = false; break }
+                bounds.formUnion(center: sphere.center, radius: sphere.radius)
+            }
+            meshGroupCullBounds.append(bounded ? bounds : .unbounded)
+        }
+    }
+
+    /// The clip volume a pass culls against, or nil when culling is off (nil ⇒ draw everything).
+    private func cullVolume(_ vp: simd_float4x4) -> IlluminatoramaClipVolume? {
+        visibilityCullingEnabled ? IlluminatoramaClipVolume(vp) : nil
+    }
+
+    /// DH-0534 — true when group `gi` cannot produce a fragment in a pass rasterising with `clip`.
+    /// Counts the group into `drawn` or `culled` either way, so the stats are complete.
+    @inline(__always)
+    private func shouldCull(_ gi: Int, _ group: MeshDrawGroup, _ mesh: IlluminatoramaMesh,
+                            _ clip: IlluminatoramaClipVolume?,
+                            drawn: WritableKeyPath<IlluminatoramaVisibilityCullStats, Int>,
+                            culled: WritableKeyPath<IlluminatoramaVisibilityCullStats, Int>) -> Bool {
+        if let clip, gi < meshGroupCullBounds.count, clip.excludes(meshGroupCullBounds[gi]) {
+            visibilityCullStats[keyPath: culled] += 1
+            visibilityCullStats.trianglesCulled += (mesh.indexCount / 3) * group.count
+            return true
+        }
+        visibilityCullStats[keyPath: drawn] += 1
+        return false
     }
 
     /// `MeshKind` → its contiguous `[start, end)` slot range in the grouped
