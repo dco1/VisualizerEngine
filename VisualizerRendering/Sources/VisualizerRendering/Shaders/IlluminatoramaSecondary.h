@@ -124,6 +124,69 @@ struct RTSpotLight {
     // DH-0872 — mirrors `SpotLight.giVisible`; see `RTPointLight.giVisible`.
     uint     giVisible;
 };
+/// Mirror of `AreaLight` (IlluminatoramaCommon.h) — the SAME Swift-uploaded
+/// `IlluminatoramaAreaLight` buffer the deferred kernel reads (stride 144). Keep in
+/// lockstep with that struct, field for field.
+struct RTAreaLight {
+    float3   center;     float twoSided;
+    float3   ex;         uint  layerMask;
+    float3   ey;         float _pad1;
+    float3   color;      float radius;
+    float4x4 shadowMatrix;
+    int      shadowSliceIndex;
+    int      castsShadow;
+    float    _pad2; float _pad3;
+};
+
+// ── Rectangular area light: the clamped-cosine form factor ───────────────────
+//
+// ONE copy, shared by the deferred kernel (`evalAreaLight`'s diffuse) and the
+// secondary path below (DH-0718 — a reflected or GI-bounce hit lit by a window
+// portal must be lit by the same number the directly-seen surface is).
+
+// Vector irradiance of one polygon edge (clamped-cosine), v1/v2 normalised.
+//
+// Hill & Heitz's rational fit of θ/sin θ (the LTC reference implementation), NOT the
+// literal acos form this shipped with first. The literal form is singular exactly where
+// a WINDOW PORTAL lives: a fragment coplanar with the light (the wall the portal is cut
+// into — every fragment of it) sees two corners in near-opposite directions, θ→π,
+// sin θ→0, θ/sin θ→∞ while cross(v1,v2)→0 — 0·∞ = NaN, and the TAA settle smears one
+// NaN into a fully black frame (measured: the first portal arm rendered 1 152 000 black
+// pixels). A −0.9999 clamp tames the infinity but leaves acos's catastrophic
+// cancellation at both ends — salt-and-pepper speckle across any coplanar floor or
+// ceiling. The fit is stable at BOTH limits (the x → −1 branch pairs the 1/√(1−x²)
+// growth against the cross's shrink analytically) and is what production LTC ships.
+// Visualizer's softboxes float in open space and never exercised these limits; the
+// sub-percent difference from the acos form elsewhere is the fit's documented accuracy.
+static inline float3 ltcIntegrateEdge(float3 v1, float3 v2) {
+    float x = clamp(dot(v1, v2), -1.0, 1.0);
+    float y = abs(x);
+    float a = 0.8543985 + (0.4965155 + 0.0145206 * y) * y;
+    float b = 3.4175940 + (4.1616724 + y) * y;
+    float v = a / b;
+    float thetaSinTheta = (x > 0.0)
+        ? v
+        : 0.5 * rsqrt(max(1.0 - x * x, 1e-7)) - v;
+    return cross(v1, v2) * thetaSinTheta;
+}
+
+// Clamped-cosine form factor of the quad (corners p0..p3 CCW, relative to the
+// shaded point) seen from a surface with normal N. Returns [0,1]; one-sided
+// clamps the receiver to the front hemisphere, two-sided takes |·|.
+static inline float ltcPolygonForm(float3 N, float3 p0, float3 p1, float3 p2, float3 p3,
+                                   bool twoSided) {
+    // Length-guarded normalise: a fragment AT a light corner (a portal's jamb pixel)
+    // hands normalize() a zero vector — the remaining NaN seed once the edge integral
+    // above went stable.
+    float3 L0 = p0 * rsqrt(max(dot(p0, p0), 1e-8));
+    float3 L1 = p1 * rsqrt(max(dot(p1, p1), 1e-8));
+    float3 L2 = p2 * rsqrt(max(dot(p2, p2), 1e-8));
+    float3 L3 = p3 * rsqrt(max(dot(p3, p3), 1e-8));
+    float3 vsum = ltcIntegrateEdge(L0, L1) + ltcIntegrateEdge(L1, L2)
+                + ltcIntegrateEdge(L2, L3) + ltcIntegrateEdge(L3, L0);
+    float z = dot(vsum, N) * (1.0 / (2.0 * M_PI_F));
+    return twoSided ? abs(z) : max(0.0, z);
+}
 
 // ── RNG + sampling ───────────────────────────────────────────────────────────
 
@@ -329,6 +392,11 @@ struct SecondaryShadeParams {
     uint   objUVCount;      // bound of objUV in float2 entries
     // Local lights bound in `SecondaryScene`. 0/0 ⇒ sun + sky only.
     uint   pointLightCount; uint spotLightCount;
+    // DH-0718 — rectangular area lights (a house's window PORTALS by day) bound in
+    // `SecondaryScene.areaLights`. 0 ⇒ none, the exact pre-DH-0718 behaviour: a
+    // reflected or GI-bounce hit then saw sun + sky + lamps but not the room's
+    // dominant daytime source. `areaShadowRays` 0 ⇒ lit but unoccluded.
+    uint   areaLightCount; uint areaShadowRays;
     // C3 — which TLAS instances stop this hit's SUN SHADOW ray. 0x01 = opaque
     // (glass 0x02 never casts a solid shadow). A transport path adds 0x04, the
     // "invisible occluder" bit: a slab that is real to light and never drawn —
@@ -350,6 +418,7 @@ struct SecondaryScene {
     const device float2*         uvScale;      // albedo-atlas per-slice letterbox
     const device RTPointLight*   pointLights;
     const device RTSpotLight*    spotLights;
+    const device RTAreaLight*    areaLights;   // DH-0718; read only when `areaLightCount` > 0
 };
 
 /// One opaque triangle hit, however the ray that found it was fired.
@@ -551,6 +620,83 @@ static inline float3 secondaryLocalLightFill(float3 P, float3 N, uint layerBits,
     return sum * (1.0 / M_PI_F);
 }
 
+// ── Area lights (window portals) ─────────────────────────────────────────────
+
+/// Rectangular area lights at a secondary hit (DH-0718). Returns RADIANCE-per-albedo —
+/// the caller multiplies by albedo — matching the deferred kernel's diffuse
+/// `albedo · color · formFactor · window` exactly (same form factor, same one-sided
+/// test, same radius window, same layer mask), so a surface lit by a window reads the
+/// same seen directly, in a mirror, or as the source of a GI bounce.
+///
+/// Why it matters, measured before this existed: by day a window portal is the room's
+/// dominant source, and the secondary path had none — a reflected room was lit by the
+/// sun + sky fill + lamps only (Danny, 2026-09-08: the TV's reflected dining chairs
+/// "have no shadows"), and an RT GI bounce off a window-lit floor carried nothing of
+/// the window, so a north room's still got no bounce from its own daylight.
+///
+/// OCCLUDED like the deferred path's traced variant (`rtAreaVisibility`): each portal
+/// that asked for a shadow (`castsShadow`) gets `areaShadowRays` rays toward jittered
+/// points on its rectangle, stopping 2 cm short of the pane. A secondary hit's budget
+/// is one ray per light by default — an accumulating still converges it like the
+/// sun's cone. Skipped below `kSecondaryAreaSkip` (a portal far down the hall or
+/// behind the hit contributes a rounding error, which needs no visibility ray).
+constant float kSecondaryAreaSkip = 1e-4;
+
+template <typename Isect>
+static inline float3 secondaryAreaLightFill(thread Isect& isect,
+                                            instance_acceleration_structure accel,
+                                            float3 P, float3 N, uint layerBits,
+                                            SecondaryShadeParams p, SecondaryScene sc,
+                                            thread uint& seed)
+{
+    float3 sum = float3(0.0);
+    for (uint i = 0u; i < p.areaLightCount; ++i) {
+        RTAreaLight al = sc.areaLights[i];
+        if ((al.layerMask & layerBits) == 0u) continue;
+        float3 nL = cross(al.ex, al.ey);
+        float  nLlen = length(nL);
+        if (nLlen < 1e-8) continue;
+        nL /= nLlen;
+        bool twoSided = al.twoSided > 0.5;
+        if (!twoSided && dot(nL, P - al.center) <= 0.0) continue;
+        float dist = length(al.center - P);
+        if (dist > al.radius) continue;
+        float window = saturate(1.0 - pow(dist / al.radius, 4.0));
+        window *= window;
+        // Corner order as `evalAreaLight` — clockwise from +nL.
+        float3 p0 = al.center - al.ex - al.ey - P;
+        float3 p1 = al.center - al.ex + al.ey - P;
+        float3 p2 = al.center + al.ex + al.ey - P;
+        float3 p3 = al.center + al.ex - al.ey - P;
+        float ff = ltcPolygonForm(N, p0, p1, p2, p3, twoSided);
+        float3 L = al.color * (ff * window);
+        if (dot(L, float3(0.2126, 0.7152, 0.0722)) <= kSecondaryAreaSkip) continue;
+        if (al.castsShadow != 0 && p.areaShadowRays > 0u) {
+            float3 offN = (dot(N, al.center - P) >= 0.0) ? N : -N;
+            float3 origin = P + offN * 2e-3;
+            isect.accept_any_intersection(true);
+            uint hits = 0u;
+            for (uint s = 0u; s < p.areaShadowRays; ++s) {
+                float u = rnd(seed) * 2.0 - 1.0;
+                float v = rnd(seed) * 2.0 - 1.0;
+                float3 d = al.center + al.ex * u + al.ey * v - origin;
+                float len = length(d);
+                if (len < 1e-4) continue;
+                ray sr;
+                sr.origin = origin;
+                sr.direction = d / len;
+                sr.min_distance = 2e-3;
+                sr.max_distance = max(2e-3, len - 0.02);   // never the pane itself
+                if (isect.intersect(sr, accel, p.occluderMask).type != intersection_type::none) hits++;
+            }
+            isect.accept_any_intersection(false);
+            L *= 1.0 - float(hits) / float(p.areaShadowRays);
+        }
+        sum += L;
+    }
+    return sum;
+}
+
 // ── Direct sun ───────────────────────────────────────────────────────────────
 
 /// Fraction of the sun disc visible from a secondary hit, by shadow ray(s) against
@@ -624,6 +770,9 @@ static inline float3 shadeSecondarySurface(thread Isect& isect,
     cacheTerm = cached ? A * cacheIndirect : float3(0.0);
     rad += cached ? cacheTerm : A * secondaryIndirectFill(h.N, layerBits, p, irrCube);
     rad += A * secondaryLocalLightFill(h.P, h.N, layerBits, p, sc);
+    if (p.areaLightCount > 0u) {
+        rad += A * secondaryAreaLightFill(isect, accel, h.P, h.N, layerBits, p, sc, seed);
+    }
     float3 Ld = normalize(p.sunDir);
     float nl = saturate(dot(h.N, Ld));
     // `shadowRays == 0` means "do not TEST the shadow", not "do not light the surface".

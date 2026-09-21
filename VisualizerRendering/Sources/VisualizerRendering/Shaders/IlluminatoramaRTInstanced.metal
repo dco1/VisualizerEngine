@@ -290,6 +290,11 @@ static inline SecondaryShadeParams fullRadianceParams(constant RTInstUniforms& u
     p.objUVCount = u.objUVCount;
     p.pointLightCount = u.pointLightCount;
     p.spotLightCount = u.spotLightCount;
+    // DH-0718 — the window portals (area lights), carried in the room-gain meta's spare
+    // lanes (y = count, z = shadow rays per portal) so the uniform layout is unchanged.
+    // 0 ⇒ none, the pre-DH-0718 behaviour.
+    p.areaLightCount = uint(max(0.0, u.interiorRoomGainMeta.y));
+    p.areaShadowRays = uint(max(0.0, u.interiorRoomGainMeta.z));
     // C3 — a secondary hit found by this kernel is on a TRANSPORT path, so its own
     // sun shadow ray honours invisible occluders too. Without this a GI bounce that
     // lands on a floor under a lighting-only ceiling would come back full-sunlit and
@@ -344,6 +349,9 @@ kernel void illumi_rt_lighting_tlas(
     const device float2*                  albedoUVScale [[buffer(16)]],
     const device RTPointLight*            pointLights [[buffer(17)]],
     const device RTSpotLight*             spotLights  [[buffer(18)]],
+    // DH-0718 — the frame's area lights (window portals); read only when
+    // `interiorRoomGainMeta.y` > 0, a dummy otherwise.
+    const device RTAreaLight*             areaLights  [[buffer(20)]],
     texturecube<float, access::sample>    irrCube     [[texture(6)]],
     texture2d_array<float, access::sample> albedoAtlas [[texture(7)]],
     // C2 — the noisy diffuse (soft shadow + 1-bounce GI) goes OUT to its own
@@ -400,6 +408,7 @@ kernel void illumi_rt_lighting_tlas(
     sec.insts = insts;        sec.objNormal = objNormal;
     sec.objUV = objUV;        sec.uvScale = albedoUVScale;
     sec.pointLights = pointLights; sec.spotLights = spotLights;
+    sec.areaLights = areaLights;
     SecondaryShadeParams secFull   = fullRadianceParams(u);   // reflections + cache fallbacks
     SecondaryShadeParams secBounce = giBounceParams(u);       // GI bounces (no sky double-count)
 

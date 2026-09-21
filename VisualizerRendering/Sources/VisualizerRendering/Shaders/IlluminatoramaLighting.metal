@@ -516,49 +516,9 @@ static inline float3 brdfDiffuse(
 // point sample (the rect point closest to the reflection ray) — a declared
 // approximation pending the fitted GGX LTC specular LUT (increment 2).
 
-// Vector irradiance of one polygon edge (clamped-cosine), v1/v2 normalised.
-//
-// Hill & Heitz's rational fit of θ/sin θ (the LTC reference implementation), NOT the
-// literal acos form this shipped with first. The literal form is singular exactly where
-// a WINDOW PORTAL lives: a fragment coplanar with the light (the wall the portal is cut
-// into — every fragment of it) sees two corners in near-opposite directions, θ→π,
-// sin θ→0, θ/sin θ→∞ while cross(v1,v2)→0 — 0·∞ = NaN, and the TAA settle smears one
-// NaN into a fully black frame (measured: the first portal arm rendered 1 152 000 black
-// pixels). A −0.9999 clamp tames the infinity but leaves acos's catastrophic
-// cancellation at both ends — salt-and-pepper speckle across any coplanar floor or
-// ceiling. The fit is stable at BOTH limits (the x → −1 branch pairs the 1/√(1−x²)
-// growth against the cross's shrink analytically) and is what production LTC ships.
-// Visualizer's softboxes float in open space and never exercised these limits; the
-// sub-percent difference from the acos form elsewhere is the fit's documented accuracy.
-static inline float3 ltcIntegrateEdge(float3 v1, float3 v2) {
-    float x = clamp(dot(v1, v2), -1.0, 1.0);
-    float y = abs(x);
-    float a = 0.8543985 + (0.4965155 + 0.0145206 * y) * y;
-    float b = 3.4175940 + (4.1616724 + y) * y;
-    float v = a / b;
-    float thetaSinTheta = (x > 0.0)
-        ? v
-        : 0.5 * rsqrt(max(1.0 - x * x, 1e-7)) - v;
-    return cross(v1, v2) * thetaSinTheta;
-}
-
-// Clamped-cosine form factor of the quad (corners p0..p3 CCW, relative to the
-// shaded point) seen from a surface with normal N. Returns [0,1]; one-sided
-// clamps the receiver to the front hemisphere, two-sided takes |·|.
-static inline float ltcPolygonForm(float3 N, float3 p0, float3 p1, float3 p2, float3 p3,
-                                   bool twoSided) {
-    // Length-guarded normalise: a fragment AT a light corner (a portal's jamb pixel)
-    // hands normalize() a zero vector — the remaining NaN seed once the edge integral
-    // above went stable.
-    float3 L0 = p0 * rsqrt(max(dot(p0, p0), 1e-8));
-    float3 L1 = p1 * rsqrt(max(dot(p1, p1), 1e-8));
-    float3 L2 = p2 * rsqrt(max(dot(p2, p2), 1e-8));
-    float3 L3 = p3 * rsqrt(max(dot(p3, p3), 1e-8));
-    float3 vsum = ltcIntegrateEdge(L0, L1) + ltcIntegrateEdge(L1, L2)
-                + ltcIntegrateEdge(L2, L3) + ltcIntegrateEdge(L3, L0);
-    float z = dot(vsum, N) * (1.0 / (2.0 * M_PI_F));
-    return twoSided ? abs(z) : max(0.0, z);
-}
+// `ltcIntegrateEdge` / `ltcPolygonForm` — the diffuse polygon form factor — live in
+// IlluminatoramaSecondary.h (DH-0718): the secondary path lights reflected and GI-bounce
+// hits with window portals by the SAME form factor, so there is one copy.
 
 // Clip the LTC-space quad to z ≥ 0 — the shading horizon in clamped-cosine space —
 // before edge integration (Heitz et al. 2016, the reference implementation's 16-case

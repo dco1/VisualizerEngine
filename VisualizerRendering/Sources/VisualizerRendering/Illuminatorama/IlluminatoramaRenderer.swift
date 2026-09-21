@@ -2502,6 +2502,17 @@ public final class IlluminatoramaRenderer {
     /// Apply the host's interior IBL/ambient separation at the hit. Off ⇒ an interior
     /// surface gets exterior-strength fill, several times short.
     public var glassHitInteriorFillEnabled: Bool = true
+    /// DH-0718 — light every secondary hit (a reflection, a GI bounce, the world through a
+    /// pane) with the frame's rectangular AREA lights too, by the same form factor the
+    /// deferred kernel uses. Off ⇒ the pre-DH-0718 behaviour: a secondary hit saw sun + sky
+    /// + point/spot lights but no area light — which in Daydream Home is every window
+    /// portal, i.e. a room's dominant daytime source, so a reflected room was lit by a
+    /// different light than the room itself and cast none of that light's shadows.
+    public var secondaryAreaLightsEnabled: Bool = false   // DH-0718 WIP: default flips to true when it lands
+    /// DH-0718 — visibility rays per shadow-casting area light at a secondary hit (toward
+    /// jittered points on the rectangle, like `rtAreaShadowRays` on the primary). 0 ⇒ lit
+    /// but unoccluded. 1 by default: an accumulating still converges it like the sun cone.
+    public var secondaryAreaShadowRays: Int = 1
 
     /// CHEAP semi-transparent glass (no TLAS, no per-frank BLAS). Off (0) keeps the
     /// plain Fresnel+sky fallback unchanged for every other scene. A host opts in
@@ -4332,6 +4343,12 @@ public final class IlluminatoramaRenderer {
     private var spotLightCapacity: Int
     private var areaLightRing: [MTLBuffer]
     private var areaLightBuffer: MTLBuffer { areaLightRing[frameRingIndex] }
+    /// DH-0718 — how many area lights a secondary hit reads this frame (0 ⇒ none bound).
+    /// Gated by the local-lights switch too: that is the ablation lever every secondary
+    /// light term already answers to.
+    private var secondaryAreaLightCount: Int {
+        (secondaryAreaLightsEnabled && glassHitLocalLightsEnabled) ? areaLights.count : 0
+    }
     private var areaLightCapacity: Int
     private var extraDirectionalRing: [MTLBuffer]
     private var extraDirectionalBuffer: MTLBuffer { extraDirectionalRing[frameRingIndex] }
@@ -8658,6 +8675,10 @@ public final class IlluminatoramaRenderer {
         let rtIrrW = max(0, min(1, interiorIrradianceWeight))
         u.interiorIrrUp = SIMD4(simd_max(interiorIrradianceUp, .zero), rtIrrW)
         u.setInteriorRoomGains(interiorRoomGains, enabled: interiorRoomGainsEnabled)
+        // DH-0718 — area lights at secondary hits, in the room-gain meta's spare lanes.
+        let rtAreaCount = secondaryAreaLightCount
+        u.interiorRoomGainMeta.y = Float(rtAreaCount)
+        u.interiorRoomGainMeta.z = Float(max(0, min(secondaryAreaShadowRays, 8)))
         u.interiorIrrSide = SIMD4(simd_max(interiorIrradianceSide, .zero), 0)
         u.interiorIrrDown = SIMD4(simd_max(interiorIrradianceDown, .zero), 0)
         // C1 — exactly one sun (see `RTSunOwnership`). This pass is ADDITIVE over a
@@ -8730,6 +8751,8 @@ public final class IlluminatoramaRenderer {
         enc.setBuffer(albedoAtlas.uvScaleBuffer, offset: 0, index: 16)
         enc.setBuffer(pointLightBuffer, offset: 0, index: 17)
         enc.setBuffer(spotLightBuffer, offset: 0, index: 18)
+        // DH-0718 — area lights (buffer 20); a dummy when none are read.
+        enc.setBuffer(secondaryAreaLightCount > 0 ? areaLightBuffer : instData, offset: 0, index: 20)
         enc.setTexture(irradianceCube, index: 6)
         enc.setTexture(albedoAtlas.texture, index: 7)
         // C2 — the noisy diffuse (soft shadow + GI) goes to its own buffer so the
@@ -10878,6 +10901,9 @@ public final class IlluminatoramaRenderer {
         let glassIrrW = max(0, min(1, interiorIrradianceWeight))
         u.interiorIrrUp = SIMD4(simd_max(interiorIrradianceUp, .zero), glassIrrW)
         u.setInteriorRoomGains(interiorRoomGains, enabled: interiorRoomGainsEnabled)
+        // DH-0718 — area lights at through-glass hits too (same body, same lanes).
+        u.interiorRoomGainMeta.y = rtShade ? Float(secondaryAreaLightCount) : 0
+        u.interiorRoomGainMeta.z = Float(max(0, min(secondaryAreaShadowRays, 8)))
         u.interiorIrrSide = SIMD4(simd_max(interiorIrradianceSide, .zero), 0)
         u.interiorIrrDown = SIMD4(simd_max(interiorIrradianceDown, .zero), 0)
         // ── The night sky, THROUGH the glass ─────────────────────────────────
@@ -10999,6 +11025,9 @@ public final class IlluminatoramaRenderer {
             // Smooth refraction: glass hits interpolate these corner normals (a dummy with
             // every row's base 0 means "face normal" — see `rtGlassCornerNormalBuffer`).
             enc.setFragmentBuffer(rtGlassCornerNormalBuffer ?? instData, offset: 0, index: 16)
+            // DH-0718 — area lights at the refracted hit (buffer 17); dummy when none.
+            enc.setFragmentBuffer(secondaryAreaLightCount > 0 ? areaLightBuffer : instData,
+                                  offset: 0, index: 17)
             // The TLAS references the BLASes which reference mesh buffers — all
             // must be resident for the fragment-stage intersector.
             for blas in rtBLASList { enc.useResource(blas, usage: .read) }

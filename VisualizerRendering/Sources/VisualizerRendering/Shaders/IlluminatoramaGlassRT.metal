@@ -239,6 +239,9 @@ static inline SecondaryShadeParams glassSecondaryParams(constant GlassRTUniforms
     p.objUVCount = u.objUVCount;
     p.pointLightCount = u.pointLightCount;
     p.spotLightCount = u.spotLightCount;
+    // DH-0718 — window portals, in the room-gain meta's spare lanes (see the RT kernel).
+    p.areaLightCount = uint(max(0.0, u.interiorRoomGainMeta.y));
+    p.areaShadowRays = uint(max(0.0, u.interiorRoomGainMeta.z));
     // C3 — the glass pass keeps the PLAIN opaque mask on purpose. Its rays are
     // camera-visible (a refraction ray is what the eye sees through the pane), and
     // the lighting-only ceiling slabs were excluded from RT precisely because this
@@ -636,6 +639,7 @@ fragment float4 illumi_glass_rt_fs(
     const device RTPointLight*       pointLights [[buffer(14)]],
     const device RTSpotLight*        spotLights  [[buffer(15)]],
     const device float4*             cornerN     [[buffer(16)]],
+    const device RTAreaLight*        areaLights  [[buffer(17)]],   // DH-0718; gated by meta.y
     texture2d<float, access::sample> sky         [[texture(0)]],
     texture2d<float, access::sample> surfAtlas   [[texture(1)]],
     texture2d<float, access::sample> backdrop    [[texture(2)]],
@@ -658,6 +662,7 @@ fragment float4 illumi_glass_rt_fs(
     st.sec.insts = insts;        st.sec.objNormal = objNormal;
     st.sec.objUV = objUV;        st.sec.uvScale = albedoUVScale;
     st.sec.pointLights = pointLights; st.sec.spotLights = spotLights;
+    st.sec.areaLights = areaLights;
     st.glassData = glassData;
     st.triCard = triCard; st.triUVa = triUVa; st.triUVc = triUVc;
     st.soupTriBase = soupTriBase; st.surfCardRect = surfCardRect; st.surfCards = surfCards;
