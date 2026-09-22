@@ -1124,11 +1124,14 @@ public enum MaterialGenerator {
                 let u = Double(x) / Double(size), v = Double(y) / Double(size)
                 let cure  = Noise.fbmTiled(u, v, baseCells: 2, octaves: 3, seed: seed) - 0.5
                 let swirl = Noise.fbmTiled(u, v, baseCells: 6, octaves: 3, seed: seed ^ 0x51) - 0.5
-                let grit  = Noise.fbmTiled(u, v, baseCells: 96, octaves: 2, seed: seed ^ 0xA7) - 0.5
+                // Two grits: the sand itself (6 mm) and the float's clumped aggregate (12 mm) —
+                // the coarser one is what still reads from across the street.
+                let grit  = 0.55 * (Noise.fbmTiled(u, v, baseCells: 96, octaves: 2, seed: seed ^ 0xA7) - 0.5)
+                          + 0.75 * (Noise.fbmTiled(u, v, baseCells: 44, octaves: 2, seed: seed ^ 0x6E) - 0.5)
                 let pit   = Noise.fbmTiled(u, v, baseCells: 48, octaves: 2, seed: seed ^ 0x3C)
                 // Tone: the cure patchiness is the read from the street; the grit is what the
                 // eye resolves from the sidewalk. Pits between grains are a shade darker.
-                let macro = 1.0 + 0.040 * cure + 0.020 * swirl + 0.070 * grit - 0.025 * max(0, 0.55 - pit)
+                let macro = 1.0 + 0.045 * cure + 0.025 * swirl + 0.095 * grit - 0.030 * max(0, 0.55 - pit)
                 ch.albedo[ch.idx(x, y)] = clampBand(color * macro)
                 ch.height[ch.idx(x, y)] = clamp01(0.5 + 0.30 * swirl + 0.45 * grit)
                 // A sand float is matte everywhere; the grit only scatters it unevenly.
@@ -1136,7 +1139,7 @@ public enum MaterialGenerator {
             }
         }
         ch.clearcoat = 0
-        ch.deriveNormals(strength: 2.2)
+        ch.deriveNormals(strength: 2.8)
         addMicroDetail(&ch, seed: seed ^ 0xD4, baseCells: 120, strength: 0.7)
         return ch
     }
