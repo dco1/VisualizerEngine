@@ -372,6 +372,10 @@ public final class VolumetricCloudRenderer {
         /// `.proceduralGradient`. Raise for a punchier sky, lower if the
         /// zenith clips.
         public var atmosphereIntensity: Float = 20.0
+        /// Chroma of the physical sky about its own luma: 1 = the nishita march as computed,
+        /// 0 = grey, 2 = twice the colour. Luma-preserving, so it never re-exposes the scene;
+        /// applied only to the atmosphere (`.nishita`), never to clouds, sun disc or ground.
+        public var skySaturation: Float = 1.0
 
         // ── Flat studio background (opt-in) ─────────────────────────────
         /// Replace the ENTIRE dome — atmosphere, sun disk, clouds, stars/moon — with a flat,
@@ -790,6 +794,8 @@ struct SkyUniforms {
     var cloudExtra: SIMD4<Float>
     var cloudExtra2: SIMD4<Float>
     var studioParams: SIMD4<Float>
+    /// x = `Params.skySaturation` — see the Metal mirror.
+    var skyGrade: SIMD4<Float>
 
     init(params: VolumetricCloudRenderer.Params, time: Float) {
         let sun = normalize(params.sunDir)
@@ -865,5 +871,6 @@ struct SkyUniforms {
         // studioParams: xyz = flat background colour, w = enable flag (>0.5 = on).
         self.studioParams = SIMD4<Float>(params.flatBackgroundColor,
                                          params.flatBackground ? 1 : 0)
+        self.skyGrade = SIMD4<Float>(max(0, params.skySaturation), 0, 0, 0)
     }
 }

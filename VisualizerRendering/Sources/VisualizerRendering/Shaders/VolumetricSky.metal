@@ -176,6 +176,15 @@ struct SkyUniforms {
     // direction-independent colour when enabled — see `volSkyRender`'s first branch.
     // xyz = colour (linear HDR), w = enable flag (>0.5 = on).
     float4 studioParams;
+
+    // ── Sky grade ────────────────────────────────────────────────────
+    // x = skySaturation: chroma of the physical sky about its own luma, 1 = the
+    //     nishita march untouched, 0 = grey, >1 = deeper. The one lever a host has
+    //     over the sky's COLOUR without re-grading the scene under it: a global
+    //     saturation dial reaches the sky only through everything else (measured
+    //     on Daydream's street render: the wall's blue channel collapsed to 4 before
+    //     the sky got anywhere near a photograph's). y, z, w = unused.
+    float4 skyGrade;
 };
 
 // The cloud kernel reads the noise volume's tile size from its own width
@@ -737,8 +746,12 @@ inline float3 nishitaScatter(float3 rayDir, float3 sunDir, float intensity) {
 // ~72-code step — three times the seam it set out to remove.
 inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u) {
     float intensity = max(0.0f, u.atmosphereParams.y);
+    float sat = u.skyGrade.x;
     if (rayDir.y >= 0.0f) {
-        return nishitaScatter(rayDir, u.sunDir.xyz, intensity);
+        float3 s = nishitaScatter(rayDir, u.sunDir.xyz, intensity);
+        // Chroma about luma, luma preserved — the sky's exposure does not move with it.
+        float l = dot(s, float3(0.2126f, 0.7152f, 0.0722f));
+        return max(mix(float3(l), s, sat), 0.0f);
     }
     // The horizontal component, guarded: at the NADIR (0, -1, 0) — which the full-sphere
     // dome bake does sample — x and z are both zero and `normalize` of a zero vector is NaN.
@@ -750,6 +763,7 @@ inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u) {
     float3 grazing = (hlen > 1e-5f) ? float3(hxz.x / hlen, 0.0f, hxz.y / hlen)
                                     : float3(1.0f, 0.0f, 0.0f);
     float3 horizonHaze = nishitaScatter(grazing, u.sunDir.xyz, intensity);
+    horizonHaze = max(mix(float3(dot(horizonHaze, float3(0.2126f, 0.7152f, 0.0722f))), horizonHaze, sat), 0.0f);
     // Airlight scale in radians of depression: the 1/e point of the haze->ground
     // handover. 0.0035 rad (~0.2 deg) is one eye-height in ~3 km of haze, which is
     // where a real horizon hands over.
