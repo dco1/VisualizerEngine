@@ -376,6 +376,9 @@ public final class VolumetricCloudRenderer {
         /// 0 = grey, 2 = twice the colour. Luma-preserving, so it never re-exposes the scene;
         /// applied only to the atmosphere (`.nishita`), never to clouds, sun disc or ground.
         public var skySaturation: Float = 1.0
+        /// A hue pull toward blue: the sky's blue channel scaled by this with the luma restored.
+        /// 1 = untouched. What a deep-blue photographic sky needs that saturation cannot give.
+        public var skyBlueLift: Float = 1.0
 
         // ── Flat studio background (opt-in) ─────────────────────────────
         /// Replace the ENTIRE dome — atmosphere, sun disk, clouds, stars/moon — with a flat,
@@ -871,6 +874,6 @@ struct SkyUniforms {
         // studioParams: xyz = flat background colour, w = enable flag (>0.5 = on).
         self.studioParams = SIMD4<Float>(params.flatBackgroundColor,
                                          params.flatBackground ? 1 : 0)
-        self.skyGrade = SIMD4<Float>(max(0, params.skySaturation), 0, 0, 0)
+        self.skyGrade = SIMD4<Float>(max(0, params.skySaturation), max(0, params.skyBlueLift), 0, 0)
     }
 }
