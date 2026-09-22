@@ -26,7 +26,9 @@ using namespace raytracing;
 
 struct RTInstUniforms {
     float4x4 invViewProjection;
-    float3 cameraWorldPos;   float _pad0;
+    // 1 ⇒ `diffSky` holds the deferred composite's diffuse SKY share and the traced GI,
+    // whose misses are the sky, REPLACES it (was `_pad0` — same 4 bytes, stride unchanged).
+    float3 cameraWorldPos;   uint giReplacesDiffuseSky;
     float3 sunDir;           float sunSoftnessRad;
     float3 sunColor;         float giStrength;
     float3 skyAmbient;       float specStrength;
@@ -365,6 +367,7 @@ kernel void illumi_rt_lighting_tlas(
     // DH-0896 — the deferred pass's specular-IBL share of `outHDR` (read only when
     // `u.reflReplacesIBL`; a 1×1 dummy otherwise).
     texture2d<half, access::read>         specIBL     [[texture(9)]],
+    texture2d<half, access::read>         diffSky     [[texture(10)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -583,7 +586,9 @@ kernel void illumi_rt_lighting_tlas(
                     float skyLum = dot(sky, float3(0.2126, 0.7152, 0.0722));
                     sky = mix(sky, float3(skyLum), u.scotopicDesaturation);
                 }
-                indirect += sky;
+                // Replacing the deferred sky: a miss carries the sky at the SAME intensity
+                // the deferred diffuse term used, so the host's sky-fill dial stays live.
+                indirect += (u.giReplacesDiffuseSky != 0u) ? sky * u.skyIntensity : sky;
             }
         }
         indirect = (indirect / float(u.giRays)) * albedo * u.giStrength;
@@ -780,7 +785,12 @@ kernel void illumi_rt_lighting_tlas(
     if (u.reflReplacesIBL != 0u && reflHitFraction > 0.0) {
         skySeenThrough = float3(specIBL.read(gid).rgb) * reflHitFraction;
     }
-    outHDR.write(half4(max(prev.rgb - half3(skySeenThrough), half3(0.0h)) + half3(reflection), prev.a), gid);
+    // The traced GI owns the diffuse sky wherever it ran: the deferred share comes out.
+    float3 diffSkyReplaced = float3(0.0);
+    if (u.giReplacesDiffuseSky != 0u && u.giRays > 0 && u.giStrength > 0.0) {
+        diffSkyReplaced = float3(diffSky.read(gid).rgb);
+    }
+    outHDR.write(half4(max(prev.rgb - half3(skySeenThrough) - half3(diffSkyReplaced), half3(0.0h)) + half3(reflection), prev.a), gid);
     rtDiffuse.write(half4(half3(direct + indirect), 1.0h), gid);
 }
 

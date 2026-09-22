@@ -205,6 +205,18 @@ public final class IlluminatoramaRenderer {
         return (instances.count, meshGroups.count, tris,
                 rtTLASActive, rtAutoDisabled, gpuRepackTasks.count)
     }
+    /// The triangle count the RT size guard checks against its ceiling — every UNIQUE mesh
+    /// once (a mesh placed ten times is one BLAS), glass included — beside the ceiling itself.
+    /// `frameDrawCensus.expandedTriangles` counts per instance and so cannot answer "how close
+    /// is this still to losing ray tracing?"; over the ceiling the renderer drops the whole TLAS
+    /// (GI, RTAO, traced sun, glass) with nothing but a log line to say so.
+    public var rtTriangleEstimate: (triangles: Int, ceiling: Int) {
+        var tris = 0
+        for g in meshGroups { if let m = meshes[g.kind] { tris += m.indexCount / 3 } }
+        for g in (rtGlassEnabled ? flattenGlass() : []) { if let m = meshes[g.kind] { tris += m.indexCount / 3 } }
+        let strictLive = buildRTFromExtractedScene && rtEnabled && !rtStillCapsRelaxed
+        return (tris, strictLive ? Self.rtMaxTrianglesForLiveRT : Self.rtMaxTrianglesForGlassOnlyRT)
+    }
     private var lastUploadedInstances: [InstanceRef] = []
     private var instanceStableFrames: Int = 0
     /// Frames since any instance's SHAPE (meshKind / modelMatrix / sway fields)
@@ -725,6 +737,17 @@ public final class IlluminatoramaRenderer {
     public var rtSunSoftShadowsEnabled: Bool = false
     /// Strength of the one-bounce indirect contribution.
     public var rtGIStrength: Float = 1.0
+    /// **The traced GI REPLACES the deferred diffuse sky instead of adding a second one.**
+    /// A GI ray that misses returns the sky, so the traced estimate already integrates the
+    /// whole hemisphere; the deferred pass has ALSO lit the pixel with the sky's irradiance
+    /// cube. Added together the sky is counted twice — measured on a sunlit exterior wall
+    /// (Daydream Home, north side of 4000 Sunset): (96,101,64) → (129,145,116), a pale blue
+    /// lift on every surface that sees sky. When true the deferred pass hands its diffuse
+    /// OUTDOOR-cube share (never an interior band) to the traced pass, which subtracts it
+    /// where its GI rays ran and scales its misses by `iblIntensity` so the sky-fill dial keeps
+    /// its meaning. The diffuse sibling of DH-0896's `reflReplacesIBL`. Default `false`:
+    /// byte-identical for every host that does not opt in.
+    public var rtGIReplacesDiffuseSky: Bool = false
     /// Cone-sampled shadow rays per pixel per frame for `rtSunSoftShadowsEnabled`'s traced
     /// sun visibility, host-clamped (`rtSunShadowRayCount`'s write, below) and shader-clamped
     /// (`rtSunSoftVisibility`, IlluminatoramaLighting.metal) to 1…32. DH-0856 measured this
@@ -2662,6 +2685,32 @@ public final class IlluminatoramaRenderer {
         specIBLTexture?.label = "Illuminatorama.rt.specIBL"
         return specIBLTexture
     }
+    /// The deferred composite's diffuse SKY share, handed to the traced GI pass (see
+    /// `rtGIReplacesDiffuseSky`). Lazily allocated at the HDR size, dropped on resize.
+    private var diffSkyTexture: MTLTexture?
+    private lazy var diffSkyDummyTexture: MTLTexture? = {
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1, height: 1,
+                                                         mipmapped: false)
+        d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private
+        let t = device.makeTexture(descriptor: d); t?.label = "Illuminatorama.rt.diffSky.dummy"
+        return t
+    }()
+    /// Whether THIS frame's lighting pass wrote `diffSkyTexture` — the traced pass only
+    /// subtracts a share that was written this frame.
+    private var diffSkyWrittenThisFrame = false
+    /// The full-size hand-off target when the traced GI will replace the diffuse sky this frame.
+    private func diffSkyHandoffTarget() -> MTLTexture? {
+        guard rtGIReplacesDiffuseSky, rtGIStrength > 0, rtOpaqueLightingEnabled, rtEnabled,
+              rtTLASSupported, debugTerm == .normal else { return nil }
+        let w = hdrTexture.width, h = hdrTexture.height
+        if let t = diffSkyTexture, t.width == w, t.height == h { return t }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: w, height: h,
+                                                         mipmapped: false)
+        d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private
+        diffSkyTexture = device.makeTexture(descriptor: d)
+        diffSkyTexture?.label = "Illuminatorama.rt.diffSky"
+        return diffSkyTexture
+    }
     // Phase 2 — full-res HDR with SSR composited on top of direct lighting.
     // Bloom and tonemap read from this so reflections feed both effects.
     private var hdrCompositeTexture: MTLTexture
@@ -3762,7 +3811,8 @@ public final class IlluminatoramaRenderer {
     /// Mirror of `RTInstUniforms`.
     private struct RTInstUniforms {
         var invViewProjection: simd_float4x4
-        var cameraWorldPos: SIMD3<Float>; var _pad0: Float = 0
+        /// 1 ⇒ the traced GI replaces the deferred diffuse sky (`rtGIReplacesDiffuseSky`). Was `_pad0`.
+        var cameraWorldPos: SIMD3<Float>; var giReplacesDiffuseSky: UInt32 = 0
         var sunDir: SIMD3<Float>; var sunSoftnessRad: Float
         var sunColor: SIMD3<Float>; var giStrength: Float
         var skyAmbient: SIMD3<Float>; var specStrength: Float
@@ -8661,6 +8711,8 @@ public final class IlluminatoramaRenderer {
         // DH-0896 — a reflection hit REPLACES the sky the deferred pass put there.
         let specIBLOn = rtReflectionsEnabled && specIBLWrittenThisFrame && specIBLTexture != nil
         u.reflReplacesIBL = specIBLOn ? 1 : 0
+        let diffSkyOn = rtGIReplacesDiffuseSky && diffSkyWrittenThisFrame && diffSkyTexture != nil
+        u.giReplacesDiffuseSky = diffSkyOn ? 1 : 0
         // Surface cache read (P1c): on only when the grouped soup + cards + base
         // are all live this topology. The kernel gates every atlas read on this.
         let cacheOn = surfCacheActive && surfCardCount > 0
@@ -8812,6 +8864,7 @@ public final class IlluminatoramaRenderer {
         // why both denoisers sat in the soup-only `else` branch doing nothing.
         enc.setTexture(rtDiffuseTexture, index: 8)
         enc.setTexture(specIBLOn ? specIBLTexture : specIBLDummyTexture, index: 9)
+        enc.setTexture(diffSkyOn ? diffSkyTexture : diffSkyDummyTexture, index: 10)
         // DH-0653 hit/miss counters (buffer 19). Dummy = instData, never added to while
         // `surfStatsEnabled` is 0.
         enc.setBuffer(hitStats ?? instData, offset: 0, index: 19)
@@ -12055,6 +12108,9 @@ public final class IlluminatoramaRenderer {
         let specTarget = specIBLHandoffTarget()
         specIBLWrittenThisFrame = specTarget != nil
         enc.setTexture(specTarget ?? specIBLDummyTexture, index: 22)
+        let diffSkyTarget = diffSkyHandoffTarget()
+        diffSkyWrittenThisFrame = diffSkyTarget != nil
+        enc.setTexture(diffSkyTarget ?? diffSkyDummyTexture, index: 23)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
         enc.setBuffer(pointLightBuffer, offset: 0, index: 1)
         enc.setBuffer(ddgiUniformBuffer, offset: 0, index: 2)

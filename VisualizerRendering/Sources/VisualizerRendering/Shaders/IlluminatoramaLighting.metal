@@ -945,6 +945,11 @@ kernel void illumi_lighting(
     // only when the host binds a full-size target (RT reflections on); otherwise the
     // binding is a 1×1 dummy and the write is skipped, so every other frame pays nothing.
     texture2d<half,  access::write>         specIBLOut      [[texture(22)]],
+    // The diffuse SKY share of the final composite, handed to the traced GI pass — the
+    // diffuse sibling of `specIBLOut`. A traced GI estimate integrates the whole hemisphere
+    // (its misses ARE the sky), so where it runs it REPLACES this share instead of adding a
+    // second sky on top of it. Written only when the host binds a full-size target.
+    texture2d<half,  access::write>         diffSkyOut      [[texture(23)]],
     constant FrameUniforms&                 frame           [[buffer(0)]],
     const device PointLight*                pointLights     [[buffer(1)]],
     constant DDGIUniforms&                  ddgi            [[buffer(2)]],
@@ -1525,6 +1530,9 @@ kernel void illumi_lighting(
     // the debug term and follows `color` through clearcoat attenuation + aerial perspective,
     // which the isolated debug view deliberately does not.
     float3 specIBLInComposite = float3(0.0);
+    // …and the DIFFUSE sky share (see `diffSkyOut`): the outdoor-cube part of the diffuse
+    // IBL only — an interior band is the room's own light, which no traced ray re-supplies.
+    float3 diffSkyInComposite = float3(0.0);
     float3 dbgAmbient = float3(0.0);
     if (kLightingIBLEnabled) {  // function_constant(0)
         constexpr sampler cubeSampler(filter::linear, mip_filter::linear);
@@ -1621,6 +1629,7 @@ kernel void illumi_lighting(
         // above, beside the ambient supplement that shares it) gives the step BETWEEN
         // rooms — the one no dial could produce while the bands were a frame uniform.
         float apBandFactor = 1.0;
+        float3 irradianceCubeSat = irradianceSat;   // before the band takes its share
         if (interiorBandW > 0.0) {
             float3 band = mix(frame.interiorIrrSide.xyz,
                               N.y >= 0.0 ? frame.interiorIrrUp.xyz
@@ -1784,6 +1793,8 @@ kernel void illumi_lighting(
         indirect = (diffuseIBL * ao * interiorIBLKd + specularIBL * specOcc * interiorIBLKs)
                  * frame.iblIntensity;
         dbgDiffuseIBL = diffuseIBL * frame.iblIntensity * ao * interiorIBLKd;
+        diffSkyInComposite = kD * irradianceCubeSat * albedo * (1.0 - interiorBandW)
+                           * ao * interiorIBLKd * frame.iblIntensity;
         dbgSpecularIBL = specularIBL * frame.iblIntensity * specOcc * interiorIBLKs;
         specIBLInComposite = dbgSpecularIBL;
         // ── Cloth sheen, environment arm ─────────────────────────────────────
@@ -1889,6 +1900,7 @@ kernel void illumi_lighting(
         directSun    *= baseAtten;
         indirect     *= baseAtten;
         specIBLInComposite *= baseAtten;   // DH-0896
+        diffSkyInComposite *= baseAtten;
     }
 
     // ── Sausage-casing clearcoat (HotdogDropUltra) ──────────────────────────
@@ -2007,12 +2019,16 @@ kernel void illumi_lighting(
                                   * frame.iblIntensity;
                 color = mix(airlight, color, t);
                 specIBLInComposite *= t;   // DH-0896 — what of it survives the extinction
+                diffSkyInComposite *= t;
             }
         }
     }
     outHDR.write(half4(half3(color), 1.0h), gid);
     if (specIBLOut.get_width() == outHDR.get_width() && frame.debugTerm == 0u) {
         specIBLOut.write(half4(half3(specIBLInComposite), 0.0h), gid);
+    }
+    if (diffSkyOut.get_width() == outHDR.get_width() && frame.debugTerm == 0u) {
+        diffSkyOut.write(half4(half3(diffSkyInComposite), 0.0h), gid);
     }
 
     // Issue #65 — hand the diffuse-lit term to the separable SSS blur. rgb = the
