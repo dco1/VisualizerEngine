@@ -1105,6 +1105,42 @@ public enum MaterialGenerator {
         return ch
     }
 
+    /// **Sand-finish stucco** — the exterior render of a Southern California house: a cement
+    /// plaster floated with a sand-charged sponge, so the surface is a dense field of millimetre
+    /// grit under a faint swirl of float marks, and its colour is a pigmented coat that cures
+    /// unevenly into a soft patchiness. Everything `paint` deliberately is NOT: paint's tone is
+    /// near-uniform (its variance moved into roughness — see `paint`), and that is right for a
+    /// rolled interior wall and wrong for a plastered exterior one, which reads as "flat colour"
+    /// from across the street (DH-0939 — the local judge's standing top signal on 4000 Sunset).
+    ///
+    /// Bands, on the paint tile (0.6 m): the cure patchiness at 1–2 cells (30–60 cm, 2 %), the
+    /// float swirl at 6 cells (10 cm), the sand grit at 96 cells (6 mm) carried in albedo,
+    /// height AND roughness, and a 1.6 mm micro-tooth in the detail normal. Dead flat sheen.
+    public static func stucco(size: Int = MaterialGenerator.bakeSize, color: Vec3 = Vec3(0.72, 0.68, 0.60),
+                              seed: UInt64 = 23) -> MaterialChannels {
+        var ch = MaterialChannels(size: size, category: .paint)
+        for y in 0..<size {
+            for x in 0..<size {
+                let u = Double(x) / Double(size), v = Double(y) / Double(size)
+                let cure  = Noise.fbmTiled(u, v, baseCells: 2, octaves: 3, seed: seed) - 0.5
+                let swirl = Noise.fbmTiled(u, v, baseCells: 6, octaves: 3, seed: seed ^ 0x51) - 0.5
+                let grit  = Noise.fbmTiled(u, v, baseCells: 96, octaves: 2, seed: seed ^ 0xA7) - 0.5
+                let pit   = Noise.fbmTiled(u, v, baseCells: 48, octaves: 2, seed: seed ^ 0x3C)
+                // Tone: the cure patchiness is the read from the street; the grit is what the
+                // eye resolves from the sidewalk. Pits between grains are a shade darker.
+                let macro = 1.0 + 0.040 * cure + 0.020 * swirl + 0.070 * grit - 0.025 * max(0, 0.55 - pit)
+                ch.albedo[ch.idx(x, y)] = clampBand(color * macro)
+                ch.height[ch.idx(x, y)] = clamp01(0.5 + 0.30 * swirl + 0.45 * grit)
+                // A sand float is matte everywhere; the grit only scatters it unevenly.
+                ch.roughness[ch.idx(x, y)] = clamp01(0.86 + 0.08 * grit + 0.03 * swirl)
+            }
+        }
+        ch.clearcoat = 0
+        ch.deriveNormals(strength: 2.2)
+        addMicroDetail(&ch, seed: seed ^ 0xD4, baseCells: 120, strength: 0.7)
+        return ch
+    }
+
     // MARK: – Phase 8 civil / site materials
 
     /// Grass ground cover: green base with height/density variation and stem detail.
