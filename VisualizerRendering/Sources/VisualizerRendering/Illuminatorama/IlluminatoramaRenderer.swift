@@ -5840,7 +5840,7 @@ public final class IlluminatoramaRenderer {
     /// `VIZ_ILLUMI_SURFCACHE_STATS_PATH` (sandbox eats os_log). Used to quantify
     /// the P2/P3 atlas-efficiency wins before/after. No-op without the env var.
     nonisolated static func recordSurfCacheStats(_ line: String) {
-        guard let p = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SURFCACHE_STATS_PATH"] else { return }
+        guard let p = frameEnv("VIZ_ILLUMI_SURFCACHE_STATS_PATH") else { return }
         guard let data = (line + "\n").data(using: .utf8) else { return }
         if let h = FileHandle(forWritingAtPath: p) { h.seekToEndOfFile(); h.write(data); try? h.close() }
         else { try? data.write(to: URL(fileURLWithPath: p)) }
@@ -5861,7 +5861,17 @@ public final class IlluminatoramaRenderer {
     /// The counters run exactly when the sidecar they report to exists. Read per frame
     /// (not cached) so a test can scope it with `setenv`/`unsetenv`.
     private static var surfCacheStatsRequested: Bool {
-        ProcessInfo.processInfo.environment["VIZ_ILLUMI_SURFCACHE_STATS_PATH"] != nil
+        frameEnv("VIZ_ILLUMI_SURFCACHE_STATS_PATH") != nil
+    }
+
+    /// **An environment read that is cheap enough for a frame.** `ProcessInfo.processInfo
+    /// .environment` builds the WHOLE environment into a new Dictionary on every access. Read per
+    /// frame, or per material, that is real time: Daydream Home's material resolver did it once per
+    /// resolution and it cost ~1 ms/frame on its Hero fixture. `getenv` walks `environ` without
+    /// allocating, and it still sees a runtime `setenv`, which is why these switches are read per
+    /// frame rather than cached in a `static let`.
+    nonisolated static func frameEnv(_ name: String) -> String? {
+        getenv(name).map { String(cString: $0) }
     }
 
     /// Allocate (zeroed) on first use; nil only on allocation failure (counters then no-op).
@@ -6180,14 +6190,14 @@ public final class IlluminatoramaRenderer {
               let pipe = curveWindDisplacePipeline,
               let rest = rtSoupCurveRestPoints, let pool = rtSoupCurvePoolPoints,
               let wind = rtSoupCurveWindAttr, rtSoupCurvePointCount > 0 else {
-            if ProcessInfo.processInfo.environment["VIZ_CURVE_DEBUG"] == "1", !curveDbgPrinted {
+            if !curveDbgPrinted, Self.frameEnv("VIZ_CURVE_DEBUG") == "1" {
                 curveDbgPrinted = true
                 let m = "CURVE displace SKIPPED: active=\(rtSoupCurvesActive) noRefit=\(noCurveRefit) pipe=\(curveWindDisplacePipeline != nil) rest=\(rtSoupCurveRestPoints != nil) pool=\(rtSoupCurvePoolPoints != nil) wind=\(rtSoupCurveWindAttr != nil) pts=\(rtSoupCurvePointCount)\n"
                 FileHandle.standardError.write(m.data(using: .utf8)!)
             }
             return
         }
-        if ProcessInfo.processInfo.environment["VIZ_CURVE_DEBUG"] == "1", !curveDbgPrinted {
+        if !curveDbgPrinted, Self.frameEnv("VIZ_CURVE_DEBUG") == "1" {
             curveDbgPrinted = true
             let m = "CURVE displace RAN: pts=\(rtSoupCurvePointCount) time=\(time) windStrength=\(treeWindStrength) heading=\(treeWindHeading)\n"
             FileHandle.standardError.write(m.data(using: .utf8)!)
@@ -9638,7 +9648,7 @@ public final class IlluminatoramaRenderer {
         let sem = inFlightSemaphore
         let meter = gpuMeter
         let pt = passTimer
-        let errPath = ProcessInfo.processInfo.environment["VIZ_ILLUMI_CBERROR_PATH"]
+        let errPath = Self.frameEnv("VIZ_ILLUMI_CBERROR_PATH")
         // The awaited-frame signal, if `renderAwaited()` armed one. It must be created and
         // installed HERE — `addCompletedHandler` is only legal before `commit()`, so a caller
         // cannot decide to wait asynchronously after the fact.
