@@ -205,6 +205,18 @@ public final class IlluminatoramaRenderer {
         return (instances.count, meshGroups.count, tris,
                 rtTLASActive, rtAutoDisabled, gpuRepackTasks.count)
     }
+    /// The triangle count the RT size guard checks against its ceiling — every UNIQUE mesh
+    /// once (a mesh placed ten times is one BLAS), glass included — beside the ceiling itself.
+    /// `frameDrawCensus.expandedTriangles` counts per instance and so cannot answer "how close
+    /// is this still to losing ray tracing?"; over the ceiling the renderer drops the whole TLAS
+    /// (GI, RTAO, traced sun, glass) with nothing but a log line to say so.
+    public var rtTriangleEstimate: (triangles: Int, ceiling: Int) {
+        var tris = 0
+        for g in meshGroups { if let m = meshes[g.kind] { tris += m.indexCount / 3 } }
+        for g in (rtGlassEnabled ? flattenGlass() : []) { if let m = meshes[g.kind] { tris += m.indexCount / 3 } }
+        let strictLive = buildRTFromExtractedScene && rtEnabled && !rtStillCapsRelaxed
+        return (tris, strictLive ? Self.rtMaxTrianglesForLiveRT : Self.rtMaxTrianglesForGlassOnlyRT)
+    }
     private var lastUploadedInstances: [InstanceRef] = []
     private var instanceStableFrames: Int = 0
     /// Frames since any instance's SHAPE (meshKind / modelMatrix / sway fields)
@@ -225,10 +237,16 @@ public final class IlluminatoramaRenderer {
     /// Spot-shadow skip signature: the atlas slices currently hold depth maps
     /// rendered with exactly these light matrices (and the stable content).
     private var lastSpotShadowMats: [simd_float4x4] = []
-    /// Which `spotLights` index owns each shadow-atlas slice, in slice order. Set by
-    /// `updateSpotShadows`; `encodeSpotShadowPasses` renders through it. A slice is no longer
-    /// a light's array index — see `IlluminatoramaSpotLight.castsShadow`.
-    private var spotShadowSliceOwners: [Int] = []
+    /// Who owns each shadow-atlas slice, in slice order (DH-0601 — the atlas is shared by
+    /// spot cones AND window-portal area lights). Set by `updateSpotShadows`;
+    /// `encodeSpotShadowPasses` renders through it. A slice is no longer a light's array
+    /// index — see `IlluminatoramaSpotLight.castsShadow`.
+    private enum ShadowOwner { case spot(Int); case area(Int) }
+    /// One caster per atlas slice, in slice order. `matrix` is the light-space VP the depth
+    /// pass rasterises with; `reuseBit` = the DH-0631 "no GPU-fed geometry can enter this
+    /// frustum" assertion; `owner` maps back to the light so a trimmed slice can be reset.
+    private struct ShadowCaster { var matrix: simd_float4x4; var reuseBit: Bool; var owner: ShadowOwner }
+    private var spotShadowCasters: [ShadowCaster] = []
     /// Point-shadow skip signature: (position, radius) per cube-holding light in
     /// enumeration order + the cube-page assignment vector. Any ranking change,
     /// light move, or radius change breaks equality → re-render.
@@ -248,6 +266,64 @@ public final class IlluminatoramaRenderer {
     private var sceneStaticForShadows: Bool {
         instanceShapeStableFrames >= 1 && !contentHasSway
             && gpuRepackTasks.isEmpty && onEncodeGPUInstances == nil
+    }
+    /// The same, minus the GPU-fed-geometry terms (DH-0631): every CPU-visible instance held and
+    /// nothing sways. A spot slice whose owner carries
+    /// `IlluminatoramaSpotLight.castsShadowIgnoresGPUGeometry` may be reused under this weaker
+    /// condition — the host has asserted that the live GPU geometry cannot enter that cone.
+    private var sceneStaticExceptGPUGeometry: Bool {
+        instanceShapeStableFrames >= 1 && !contentHasSway
+    }
+    /// A/B lever for the per-slice reuse above (default on). Off = every slice re-renders whenever
+    /// GPU-fed geometry is live, the pre-DH-0631 behaviour.
+    public var spotShadowGPUGeometryOptOutEnabled: Bool = true
+
+    /// World-space spheres that bound every SWAYING instance's whole swing (DH-0637): the mesh's
+    /// bounding sphere under the instance's matrix, grown by the pendulum's reach (amplitude ×
+    /// diameter, an upper bound on how far a top-pivot pendant's foot travels) and its jostle.
+    /// Rebuilt with `contentHasSway`, i.e. only when the instance SHAPE changed — never per frame.
+    /// A swaying instance whose mesh has no CPU-readable vertices contributes an unbounded entry
+    /// (`radius = .infinity`), which blocks every cone, the old behaviour.
+    private var swayingSpheres: [(center: SIMD3<Float>, radius: Float)] = []
+    private func rebuildSwayingSpheres() {
+        swayingSpheres.removeAll(keepingCapacity: true)
+        guard contentHasSway else { return }
+        for ref in instances where ref.data.swayMode == 2 {
+            let m = ref.data.modelMatrix
+            guard let mesh = meshes[ref.meshKind], let local = mesh.boundingSphere else {
+                swayingSpheres.append((SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z), .infinity))
+                continue
+            }
+            let c4 = m * SIMD4<Float>(local.center, 1)
+            let scale = max(simd_length(SIMD3(m.columns.0.x, m.columns.0.y, m.columns.0.z)),
+                            simd_length(SIMD3(m.columns.1.x, m.columns.1.y, m.columns.1.z)),
+                            simd_length(SIMD3(m.columns.2.x, m.columns.2.y, m.columns.2.z)))
+            let r = local.radius * scale
+            let swing = abs(ref.data.swayLean) * 2 * r + abs(ref.data.swayJostle)
+            swayingSpheres.append((SIMD3(c4.x, c4.y, c4.z), r + swing))
+        }
+    }
+
+    /// Does any swaying instance's swing-sphere intersect this spot's shadow frustum (the cone
+    /// `updateSpotShadows` fits the map to: outer half-angle × 1.1, out to `radius`)? A slice whose
+    /// cone none of them can enter still holds a valid map while everything CPU-visible holds.
+    private func swayingGeometryCanEnter(_ spot: IlluminatoramaSpotLight) -> Bool {
+        guard !swayingSpheres.isEmpty else { return false }
+        let apex = spot.position
+        let axis = simd_normalize(spot.direction)
+        let half = min(1.475, acos(min(0.9999, max(0.01, spot.outerCone))) * 1.1)
+        let cosT = cos(half), sinT = sin(half)
+        let range = max(0.5, spot.radius)
+        for s in swayingSpheres {
+            if s.radius == .infinity { return true }
+            let v = s.center - apex
+            let along = simd_dot(v, axis)
+            if along > range + s.radius || along < -s.radius { continue }
+            let perp = simd_length(v - axis * along)
+            // Signed distance from the cone's surface (negative inside the cone).
+            if perp * cosT - along * sinT <= s.radius { return true }
+        }
+        return false
     }
 
     /// Opt-in GPU-resident instance hook (additive — nil for every scene that
@@ -319,6 +395,14 @@ public final class IlluminatoramaRenderer {
     /// `FrameUniforms.plushSheen/plushTransmission`.
     public var plushSheen: Float = 0
     public var plushTransmission: Float = 0
+    /// Lamp-shade fabric translucency strength (DH-0458). 0 = OFF (default) → the
+    /// shade thin-sheet transmission branch is skipped entirely. A paper/linen drum
+    /// shade is a thin translucent sheet; this drives the back-lit transmission that
+    /// lets external light (a sunset through the glazing, the room behind the shade)
+    /// scatter through the fabric rather than landing flat on an opaque cone. Only
+    /// the shade-flagged mesh (`normalRoughness.w` ≈ 0.62) reads it. Mirrors the
+    /// deferred `FrameUniforms.shadeTransmission`.
+    public var shadeTransmission: Float = 0
     public var exposure: Float = 1.0
     public var bloomThreshold: Float = 1.0
     public var bloomIntensity: Float = 0.6
@@ -441,6 +525,24 @@ public final class IlluminatoramaRenderer {
     /// shadow toward the target with `k = 1 − e^(−dt/postFXEasingTau)`, so dragging
     /// a slider glides instead of snapping. 0 = instant (no easing).
     public var postFXEasingTau: Double = 0.40
+    /// **A host-owned frame clock for the renderer's SELF-TIMED integrators.** `nil` (the default,
+    /// and what every live canvas wants) = each integrator measures its own `dt` off the wall clock
+    /// (`CACurrentMediaTime()`), which keeps its half-life in SECONDS at any frame rate. Non-nil =
+    /// every one of them advances by exactly this many seconds per `render()`, regardless of how long
+    /// the frame actually took:
+    ///
+    ///  - the auto-exposure EMA (`encodeExposureEstimate` → `ExposureState.deltaTime`),
+    ///  - the post-FX easing glide (`advancePostFXEasing`),
+    ///  - the particle integration step (`encodeParticleStep`).
+    ///
+    /// Why it exists: a headless "settle N frames" is a frame COUNT, not a duration. With the wall
+    /// clock, N frames land wherever machine load puts them along each glide — the auto-exposure
+    /// meter at the shipped 0.25 s half-life is ~37 % converged after 10 frames at 60 fps and ~93 %
+    /// at 10 fps — so a frame's GAIN was a function of how busy the machine was. `renderer.time`
+    /// (the shader oscillators) is already host-owned; this is the other half. Set it to `1/60` for a
+    /// deterministic capture and the same N frames produce the same frame on an idle or a loaded
+    /// machine (Daydream Home DH-0043).
+    public var fixedFrameDelta: Double? = nil
     private var easedExposure: Float = 1.0
     private var easedBloomThreshold: Float = 1.0
     private var easedBloomIntensity: Float = 0.6
@@ -492,6 +594,16 @@ public final class IlluminatoramaRenderer {
     /// symptom** — check the instance, not this value.
     public var treeWindStrength: Float = 0
     public var treeWindHeading: Float = 0
+    /// Foliage-wind motion-vector delta, in **seconds** — the simulated time elapsed between
+    /// this frame and the previous one (DH-0492). The G-buffer samples the previous frame's
+    /// `applyTreeWind` at `time − windPreviousDelta`, so a swaying canopy/blade writes a real
+    /// screen-space velocity TAA can reproject instead of crawling between pixels. Leave it at
+    /// 0 (the default) and the previous position is sampled at the SAME time as the current —
+    /// the pre-DH-0492 no-op, so every scene that never sets it, and every settled capture
+    /// (whose clock does not advance between accumulation frames), is byte-identical. The host
+    /// feeds it the real per-frame clock delta ONLY on the live, advancing canvas; a frozen
+    /// capture must leave it 0 (its previous == current time) to stay still.
+    public var windPreviousDelta: Float = 0
 
     // ── Highlight outline (feathered halo around selected / hovered objects) ──
     /// When true, every box in `highlightMaskInstances` receives a feathered halo
@@ -625,7 +737,78 @@ public final class IlluminatoramaRenderer {
     public var rtSunSoftShadowsEnabled: Bool = false
     /// Strength of the one-bounce indirect contribution.
     public var rtGIStrength: Float = 1.0
+    /// **The traced GI REPLACES the deferred diffuse sky instead of adding a second one.**
+    /// A GI ray that misses returns the sky, so the traced estimate already integrates the
+    /// whole hemisphere; the deferred pass has ALSO lit the pixel with the sky's irradiance
+    /// cube. Added together the sky is counted twice — measured on a sunlit exterior wall
+    /// (Daydream Home, north side of 4000 Sunset): (96,101,64) → (129,145,116), a pale blue
+    /// lift on every surface that sees sky. When true the deferred pass hands its diffuse
+    /// OUTDOOR-cube share (never an interior band) to the traced pass, which subtracts it
+    /// where its GI rays ran and scales its misses by `iblIntensity` so the sky-fill dial keeps
+    /// its meaning. The diffuse sibling of DH-0896's `reflReplacesIBL`. Default `false`:
+    /// byte-identical for every host that does not opt in.
+    public var rtGIReplacesDiffuseSky: Bool = false
+    /// Cone-sampled shadow rays per pixel per frame for `rtSunSoftShadowsEnabled`'s traced
+    /// sun visibility, host-clamped (`rtSunShadowRayCount`'s write, below) and shader-clamped
+    /// (`rtSunSoftVisibility`, IlluminatoramaLighting.metal) to 1…32. DH-0856 measured this
+    /// alone does not close the gap to the cascade shadow map's edge quality at any practical
+    /// budget — the Monte-Carlo estimator's noise floor drops sharply from 1 to 4 rays, then
+    /// only slowly (single-digit percent per doubling) from 4 to 32, so raising the shipped
+    /// default costs real per-frame GPU time for little further gain. Default 4, matching the
+    /// budget every existing host already renders at.
     public var rtShadowRays: Int = 4
+    /// **S4.3 — ray-traced PORTAL (area-light) visibility, in the same deferred-kernel variant
+    /// as the soft sun shadows.** When > 0 and `rtSunSoftShadowsEnabled` is live, every
+    /// shadow-casting area light (`shadowSliceIndex >= 0` — a host's window portals) has its
+    /// single-perspective 512² PCF map REPLACED by this many shadow rays per pixel toward
+    /// jittered points on the emitting rectangle, traced against the TLAS. Exact in every
+    /// direction (a 150° perspective from the portal centre cannot see a niche beside the
+    /// window), and a penumbra that scales with the portal's real size — the daytime interior
+    /// shadow a room's dominant source has to cast. Per-frame Monte-Carlo like the sun rays,
+    /// so it belongs to a still that accumulates. 0 (default) keeps the PCF path byte-identical.
+    public var rtAreaShadowRays: Int = 0
+    /// **S4.4 — a STILL may build the extracted-scene TLAS under the glass-arm caps.** The
+    /// live-RT caps (128 mesh groups / 150 k triangles) exist because a live loop's first
+    /// rebuild of a heavy scene never returns; a still that accumulates pays that rebuild
+    /// once, off the vsync budget, so it can carry the same 512-group / 1.2 M-triangle
+    /// ceiling the glass-only arm already trusts. A furnished document (200+ groups) is
+    /// exactly what the live caps auto-disable RT GI on — which is why the shipped photo
+    /// export never had bounce. Default `false`: every live host is byte-identical.
+    public var rtStillCapsRelaxed: Bool = false
+
+    // ── RTAO — ray-traced ambient occlusion on the near field (DH-0528) ────────────────
+    /// When true AND a TLAS is live, the AO pass traces `rtaoRays` cosine-weighted hemisphere
+    /// rays per half-res texel against the real geometry (`illumi_rtao_tlas`) instead of the
+    /// screen-space GTAO march, writing the same raw AO texture into the same bilateral +
+    /// temporal chain. The reach is a TRUE world-space distance, so one metre grounds a sofa
+    /// foot and stays tight at a drywall junction. Per-frame Monte-Carlo: meant for a still
+    /// that accumulates. Falls back to GTAO on any frame without a TLAS (`rtaoDidRunLastFrame`
+    /// is the record). Default `false`: byte-identical for every host that never opts in.
+    public var rtaoEnabled: Bool = false
+    /// 0…1 AO strength, the `ssaoIntensity` contract.
+    public var rtaoIntensity: Float = 1.0
+    /// Occlusion reach in world metres (the ray `max_distance`).
+    public var rtaoRadius: Float = 0.5
+    /// Cosine-hemisphere rays per half-res texel per frame (clamped 1…32).
+    public var rtaoRays: Int = 8
+    /// Whether the LAST encoded AO pass was the traced one — a gate's proof that RTAO fired
+    /// rather than silently falling back to the screen-space march.
+    public private(set) var rtaoDidRunLastFrame: Bool = false
+    /// Mirror of the Metal `RTAOUniforms` (IlluminatoramaRTInstanced.metal) — field for field.
+    private struct RTAOUniforms {
+        var invViewProjection: simd_float4x4
+        var radius: Float
+        var intensity: Float
+        var rayCount: UInt32
+        var frameSeed: UInt32
+        var rayTMin: Float
+        var transportRayMask: UInt32
+        var fullWidth: UInt32
+        var fullHeight: UInt32
+    }
+    private var rtaoActive: Bool {
+        rtaoEnabled && rtaoIntensity > 0 && rtTLASSupported && rtTLASActive && rtTLAS != nil
+    }
     public var rtGIRays: Int = 4
     /// Soft sun specular strength on the RT direct term.
     public var rtSpecStrength: Float = 0.25
@@ -793,24 +976,95 @@ public final class IlluminatoramaRenderer {
     // read this CACHED radiance at their hit (multi-bounce, accumulated over
     // frames) instead of re-shading sun-only — richer indirect + cheaper hits.
     // Requires `rtEnabled` (shares the AS). No-op without cards or RT support.
-    public var surfaceCacheEnabled: Bool = false
+    public var surfaceCacheEnabled: Bool = false {
+        // DH-0622 — turning the cache on over an existing atlas must not read light from whenever it
+        // was last updated (a second export after the sun moved): warm it fresh, like a new bake.
+        didSet { if surfaceCacheEnabled && !oldValue { surfCacheWarmPending = max(0, surfaceCacheWarmIterations) } }
+    }
     /// Indirect rays per atlas texel in the update pass (multi-bounce gather).
     public var surfCacheIndirectRays: Int = 4
     /// Temporal EMA blend for the cache update — fraction of the new radiance
     /// folded in each frame. Lower = smoother/slower convergence.
     public var surfCacheAlpha: Float = 0.1
+    /// Extra α = 1 cache updates run on the frame after cards bake or the cache turns on (DH-0622),
+    /// so a still that switches the cache on starts from a filled atlas instead of an empty one —
+    /// each update carries the light one bounce further. 0 (default) = none.
+    public var surfaceCacheWarmIterations: Int = 0
+    /// DH-0849 — an indirect ray in the cache update that strikes the BACK of a card (its triangle's
+    /// winding normal faces along the ray) brings back no light instead of that card's front-side
+    /// irradiance. Without it, wall bands hidden inside a closed plenum (above a ceiling deck, below a
+    /// floor) read the deck's room-side light off its back and glow, and GI hits at the crease pick
+    /// that up as a bright line. Changing it takes effect on the next update (the EMA re-converges).
+    public var surfaceCacheBackFaceGuard: Bool = true
 
     // ── Depth of field ───────────────────────────────────────────────
-    /// Gather DOF on the resolved HDR before bloom. Off = sharp everywhere.
+    /// Lens-accurate DOF on the resolved HDR before bloom. Off = sharp everywhere.
     public var dofEnabled: Bool = false
     /// Focus plane distance from the camera, in metres.
     public var dofFocusDistance: Float = 3.0
-    /// Aperture multiplier on the circle of confusion (bigger = shallower).
-    public var dofAperture: Float = 1.0
-    /// Maximum blur radius in pixels (internal resolution) at full CoC.
-    public var dofMaxRadius: Float = 14.0
-    /// View-space distance from the focus plane at which the CoC saturates.
-    public var dofFocusRange: Float = 4.0
+    /// **The whole lens, as one number.** The circle-of-confusion DIAMETER in pixels
+    /// per unit of `|z − z_f| / z`, which is the thin-lens relation with everything
+    /// that does not vary per pixel — focal length, f-number, focus distance, sensor
+    /// size, buffer height — already folded in. The host computes it (in Daydream
+    /// Home, `ThinLens.cocCoefficientPixels`); the renderer never re-derives optics.
+    ///
+    /// Because the host scales it by the buffer height, the defocus is automatically
+    /// the same fraction of the frame at every render scale and export size.
+    public var dofCoCCoefficient: Float = 0
+    /// Clamp on the CoC radius in pixels. A performance and sanity bound on the
+    /// gather's reach, not part of the optics — leave it generous.
+    public var dofMaxRadius: Float = 32.0
+    /// Iris blade count. `0` (or < 3) is a perfectly circular aperture; 5–9 are the
+    /// common real values, and give bokeh balls their polygonal edge.
+    public var dofBlades: Int = 0
+    /// Orientation of the blade polygon, in radians.
+    public var dofBladeRotation: Float = 0
+    /// How wide each gather tap's colour is prefiltered, as a multiple of that tap's own share
+    /// of the confusion disc. 1 = exactly its share (the intended value); 0 = point taps, i.e.
+    /// the pre-DH-0728 behaviour, kept as an A/B lever rather than as a default.
+    ///
+    /// This was `DOFParams._pad0` — a field named as a pad on the Swift side and as a control
+    /// on the Metal side — so the prefilter pyramid DH-0728 added to the shader was fed 0 and
+    /// the gather point-sampled every tap. See DH-0883.
+    public var dofPrefilterScale: Float = 1.0
+    /// **Diffraction**, as the Airy disc's CoC RADIUS in pixels of the internal buffer — a
+    /// floor under the circle of confusion at every distance, the focus plane included, since
+    /// a diffraction-limited image is soft everywhere rather than soft off the focus plane.
+    /// The host derives it from the aperture (`ThinLens.diffractionCoCPixels`); 0 = off.
+    ///
+    /// Stopped down this is not a subtlety: at 550 nm the Airy diameter is 2.44·λ·N, so f/22
+    /// puts it at 0.029 mm — exactly the acceptable CoC on full frame, which is why f/22 is
+    /// where a 35 mm lens stops resolving. On 4 × 5, f/22 is a normal working aperture.
+    public var dofDiffractionCoCPixels: Float = 0
+    /// **Natural (cos⁴) vignetting** — `(halfFrameDiagonalMM / focalLengthMM)²`, scaled by how
+    /// much of the physical falloff the host wants (1 = all of it). Multiplies the SCENE
+    /// before the exposure meter and the tonemap, because it is the lens losing light, not a
+    /// grade on the finished image (that is `vignetteStrength`). 0 = off. See DH-0882.
+    public var naturalVignetteK: Float = 0
+
+    /// **Which scene → display rendering the tonemap applies** (DH-0881).
+    ///
+    /// The shipped one, `.acesRec709`, is Narkowicz's fitted RRT+ODT curve applied PER CHANNEL
+    /// in Rec.709 primaries — no AP0/AP1 transform anywhere, i.e. ACES in name only. A
+    /// per-channel curve desaturates by driving the dominant channel into its shoulder first,
+    /// so hue rotates as intensity rises: saturated blue → purple, hot red → orange. The other
+    /// two options fix that; `.acesRec709` stays the default and is byte-identical.
+    public enum DisplayTransform: UInt32, Sendable, CaseIterable, Equatable, Hashable {
+        /// The shipped curve, per channel in Rec.709. Byte-identical to every prior build.
+        case acesRec709 = 0
+        /// The SAME curve evaluated in ACEScg (AP1) and brought back. Same contrast, same
+        /// shoulder; the channel clipping now happens in a wide gamut, so hue holds. The
+        /// minimal, conservative fix.
+        case acesAP1 = 1
+        /// AgX — an inset matrix that desaturates before the sigmoid (so no channel enters the
+        /// shoulder alone, the blue-light case) and a log2-domain contrast curve. What Blender
+        /// moved to, for these reasons.
+        case agx = 2
+    }
+    public var displayTransform: DisplayTransform = .acesRec709
+    /// Optical vignetting, 0…1 — how hard the lens barrel clips the aperture toward
+    /// the frame corners, turning bokeh discs into cat's-eye lemons. 0 = none.
+    public var dofCatsEye: Float = 0
 
     // ── Volumetric light shaft (god-rays) ────────────────────────────
     /// Single-scatter ray-march of the sun through hazy air, making the beam
@@ -914,6 +1168,60 @@ public final class IlluminatoramaRenderer {
     /// Negative pulls the highlights further down. Only read when protection > 0.
     public var autoExposureHighlightEV: Float = 0
 
+    // ── DH-0655 — the luminance histogram and percentile metering ────────────
+    //
+    // The mean meter cannot see what it is about to clip; a percentile can, but needs a
+    // distribution the reduction never had. `illumi_exposure_estimate` now builds a 64-bin
+    // log-luminance histogram (0.25 EV a bin over its [−8, +8] clamp) from the SAME samples the
+    // mean averages, when asked. Both levers default OFF and the shipped meter is untouched.
+
+    /// How the auto-exposure target is chosen. `.mean` (default) is the geometric mean it has
+    /// always been. `.percentile` meters `autoExposureKeyPercentile` of the log-luminance
+    /// distribution instead, and — when `autoExposureGuardPercentile > 0` — caps exposure so
+    /// that percentile lands at `autoExposureGuardEV` (a `min`, never a boost).
+    public enum AutoExposureMetering: Sendable { case mean, percentile }
+    public var autoExposureMetering: AutoExposureMetering = .mean
+    /// The metered percentile under `.percentile` (0…1). 0.5 = the median.
+    public var autoExposureKeyPercentile: Float = 0.5
+    /// The highlight-guard percentile (0…1; 0 = no guard), e.g. 0.95 or 0.99.
+    public var autoExposureGuardPercentile: Float = 0
+    /// Where the guard percentile is asked to land, log2 linear, pre-tonemap.
+    public var autoExposureGuardEV: Float = 0
+    /// Build and publish the histogram even while metering the mean — the INSTRUMENT.
+    /// Read it back with `lastExposureHistogram`. Changes no pixel.
+    public var exposureHistogramEnabled: Bool = false
+
+    /// DH-0889 — jitter each window portal's shadow-map projection by a sub-texel Halton offset
+    /// per TAA frame, so an accumulating still supersamples the occluder's edge instead of
+    /// printing one sawtooth per texel. Default OFF: it re-renders the portal slices every frame,
+    /// which a live canvas's static-slice reuse would otherwise skip. Only the shadow-MAP path
+    /// uses it; traced portal visibility (`rtAreaShadowRays > 0`) has no texels to jitter.
+    public var areaShadowJitterEnabled: Bool = false
+
+    /// One frame's histogram as the meter saw it. Log-luminance is log2 of the metered
+    /// brightness (max of luma and half the max channel), pre-exposure.
+    public struct ExposureHistogram: Sendable {
+        public static let bins = 64, minLogLum: Float = -8, binEV: Float = 0.25
+        public let counts: [Float]
+        public let total: Float
+        public let p50: Float, p95: Float, p99: Float
+        /// The kernel's own geometric-mean statistic, for comparing the two meters.
+        public let meanLogLum: Float
+        /// The percentile the key asked for.
+        public let keyLogLum: Float
+    }
+    /// The last histogram the estimator published, or nil if it has never built one.
+    /// Valid after the command buffer that encoded it has completed.
+    public var lastExposureHistogram: ExposureHistogram? {
+        let n = ExposureHistogram.bins
+        let p = exposureHistogramBuffer.contents().assumingMemoryBound(to: Float.self)
+        let total = p[n]
+        guard total > 0 else { return nil }
+        return ExposureHistogram(counts: Array(UnsafeBufferPointer(start: p, count: n)), total: total,
+                                 p50: p[n + 1], p95: p[n + 2], p99: p[n + 3],
+                                 meanLogLum: p[n + 4], keyLogLum: p[n + 5])
+    }
+
 
     // ── Per-term split-render diagnostic ─────────────────────────────
     /// Isolates ONE lighting term in the deferred kernel so a flooded /
@@ -970,6 +1278,15 @@ public final class IlluminatoramaRenderer {
         /// the sun and `frame.ambientColor` alone — so a lamp-lit sofa received exactly zero
         /// sheen and read as plaster. A night-with-lamps frame MUST show fabric here.
         case clothSheen = 17
+        /// **Chart-assignment overlay** (DH-0653): REPLACES the composite with one hashed
+        /// colour per surface-cache CARD at each pixel's own (primary) surface — the chart
+        /// decomposition `VIZ_SURFCACHE_CHARTS` builds, made visible, so merge quality and
+        /// residual GI seams are read off topology instead of eyeballed off the composite.
+        /// A non-resident card keeps its hue at near-black; near-black grey = no card.
+        /// Wired in `illumi_rt_lighting_tlas` like 8/9, so it needs RT + the surface cache
+        /// (a TLAS scene). The per-frame hit/miss numbers that go with it are in the
+        /// `VIZ_ILLUMI_SURFCACHE_STATS_PATH` sidecar (`hits:` / `atlas:` lines).
+        case surfaceCacheCharts = 18
     }
     public var debugTerm: DebugTerm = .normal
     /// Tracked by the renderer each frame (set from the host's
@@ -981,6 +1298,12 @@ public final class IlluminatoramaRenderer {
     public var ssaoIntensity: Float = 0.85
     /// World-space hemisphere radius for SSAO samples, in metres.
     public var ssaoRadius: Float = 0.4
+    /// DH-0441 — outer radius (metres) of the wide AO ring, a second GTAO march whose
+    /// occluders are weighted to the annulus beyond `ssaoRadius`. See IlluminatoramaSSAO.metal.
+    public var ssaoFarRadius: Float = 0.5
+    /// DH-0441 — strength of the wide AO ring. 0 (default) = OFF, the ring is never marched
+    /// and the AO field is byte-identical.
+    public var ssaoFarIntensity: Float = 0
     /// Screen-space reflection intensity (0 = disabled).
     public var ssrIntensity: Float = 0.7
     /// Max view-space ray length for SSR marches, in metres.
@@ -1238,6 +1561,53 @@ public final class IlluminatoramaRenderer {
     /// The cull mode a shadow pass starts in, so the first group does not have to correct it.
     private var shadowInitialCullMode: MTLCullMode { shadowStoresFrontFaces ? .back : .front }
 
+    // MARK: - The substrate (a surface other surfaces are laid flush ON)
+
+    /// Mesh kinds that are **substrate** — the ground a street, a driveway or a court line is
+    /// laid flush on, whose separation from them is millimetres of deliberate lift rather than
+    /// real space. These are biased AWAY from the camera so that anything resting on them wins
+    /// the depth test at any distance.
+    ///
+    /// **Why the substrate recedes instead of the decal advancing.** Both close the same gap,
+    /// and the gap is real: the camera projects into a NON-reversed `depth32Float` buffer where
+    /// the smallest resolvable separation grows with the square of the distance —
+    /// `≈ ulp(1.0) · z² / zNear`, which at `zNear = 0.05` is 0.5 mm at 20 m but **7.6 mm at
+    /// 80 m and 17 mm at 120 m**. Any fixed lift therefore has a range past which the surface
+    /// underneath starts winning pixels and the decal dithers into it. Measured in Daydream
+    /// Home, 2026-08-28: a street with a 10 mm lift is clean to ~90 m and eaten by dirt beyond.
+    ///
+    /// Pushing the DECAL forward closes it too, but it spends the whole bias in the direction
+    /// where something legitimately sits above the decal — a pavement stands on a 150 mm kerb,
+    /// and a bias big enough to fix the road at 150 m is big enough to lift the road over that
+    /// kerb. Pushing the SUBSTRATE back spends it in the direction where nothing is: there is,
+    /// by definition, nothing under the ground. So the bias can be generous without inverting
+    /// anything, and every surface laid on the ground is fixed at once rather than one by one.
+    ///
+    /// Empty by default — a host that declares no substrate gets byte-identical frames.
+    public var substrateMeshKinds: Set<MeshKind> = []
+
+    /// How far the substrate is pushed away from the camera, in depth-buffer ULPs (positive =
+    /// further, since this buffer is not reversed).
+    ///
+    /// **Why 32.** Swept on Daydream Home's flat-lot street at a fixed camera, measuring the
+    /// share of two windows lying wholly ON the roadway — one a few tens of metres out, one
+    /// past where a 10 mm lift stops resolving — that read as bare ground rather than asphalt:
+    ///
+    /// | bias | near roadway eaten | far roadway eaten |
+    /// |---|---|---|
+    /// | 0 | 0.06 | **0.77** |
+    /// | 16 | 0.00 | 0.00 |
+    /// | 64 | 0.00 | 0.00 |
+    /// | 128 | 0.00 | 0.00 |
+    ///
+    /// 16 already clears it completely; 32 is one doubling of margin for scenes whose substrate
+    /// sits at a different depth range. It is not pushed higher for free: the G-buffer depth is
+    /// what SSAO and contact shadows sample, and a bias is a real error in that texture — 32
+    /// ULPs is ~1.5 cm of world-equivalent depth error on ground 20 m away and ~38 cm at 100 m,
+    /// which is under the AO radius near the camera and irrelevant at the far end, where ground
+    /// is a handful of pixels. Doubling again would start eating into the near figure.
+    public var substrateDepthBias: Float = 32
+
     /// PCF kernel radius in shadow-map texels: 0 = single tap, 1 = 3×3, 2 = 5×5.
     public var shadowPcfRadius: UInt32 = 1
     /// How far from the camera the outermost cascade extends, in metres. Past
@@ -1255,10 +1625,49 @@ public final class IlluminatoramaRenderer {
     /// Constant depth bias subtracted from the spot light-space depth
     /// before the PCF compare. Combats acne on lit surfaces.
     public var spotShadowBias: Float = 0.0005
-    /// Up to this many spots in the `spotLights` array get a shadow map
-    /// each frame. Bounded by `spotShadowAtlas`'s slice count. Spots
-    /// beyond this index render as direct-only (no shadow modulation).
-    public var spotShadowMaxCount: Int { spotShadowAtlasCapacity }
+    /// Up to this many shadow-CASTING spots in the `spotLights` array get a shadow map each
+    /// frame; the rest render as direct-only (no shadow modulation). This is the host's
+    /// `spotShadowCapacityRequest` — the atlas grows to meet it lazily (`ensureSpotShadowAtlas`),
+    /// so it is the CAP, not the allocation; the allocation is `spotShadowAtlasSliceCount`.
+    public var spotShadowMaxCount: Int { spotShadowCapacityRequest }
+    /// **How many spot cones may carry a shadow map (DH-0134).** Default 8 — the shipped live
+    /// footprint (8 × 512² × 4 B = 8 MiB), byte-identical for every host that never sets it.
+    /// A still has no vsync budget, so a host's photo/export lane asks for
+    /// `spotShadowCapacityHardMax` and every casting cone in the scene is shadowed; the live lane
+    /// asks for the default again on the way out. The atlas reallocates only when a caster
+    /// actually needs a slice it does not have, and shrinks back when the request drops, so
+    /// nothing is paid up front and nothing lingers (~1 MiB per slice). Clamped to
+    /// `1...spotShadowCapacityHardMax`.
+    public var spotShadowCapacityRequest: Int = IlluminatoramaRenderer.spotShadowCapacityDefault {
+        didSet {
+            let clamped = min(max(1, spotShadowCapacityRequest), Self.spotShadowCapacityHardMax)
+            if clamped != spotShadowCapacityRequest { spotShadowCapacityRequest = clamped }
+        }
+    }
+    /// The live-lane allocation every host gets without asking. Mirrored by hosts that ration
+    /// slices on the CPU (Daydream Home's `ShadowSlotBudget.engineSpotShadowCapacity`).
+    public static let spotShadowCapacityDefault = 8
+    /// The most slices the atlas will ever hold. Metal allows 2048 array slices, but each one
+    /// is a full-scene depth pass per frame (~0.5 ms) plus 1 MiB, so "no limit" still needs an
+    /// implementation cap; 64 cones is far past any house's fixture count.
+    public static let spotShadowCapacityHardMax = 64
+    /// Slices currently ALLOCATED in the spot-shadow atlas — `spotShadowCapacityDefault` until a
+    /// host asks for more and a caster needs it. Diagnostics / gates; the cap is `spotShadowMaxCount`.
+    public var spotShadowAtlasSliceCount: Int { spotShadowAtlasCapacity }
+
+    /// **The photo-lane G-buffer (DH-0140).** When true the G-buffer pass runs the six-target
+    /// pipeline variant and writes `GBufferOut.material` — a per-pixel material payload the
+    /// five-target live pass has no room for (its one spare scalar is a discrete class tag), and
+    /// the lighting kernel reads it. The sixth target and its two pipeline variants are
+    /// allocated / compiled on FIRST use and dropped on resize, so a host that never sets this —
+    /// every Visualizer scene, Daydream's live canvas — is byte-identical and pays nothing.
+    /// Payloads so far: per-material clearcoat roughness (slice 1). Reserved lanes:
+    /// transmission/alpha, per-texel grain tangent (DH-0478). A host's photo / export lane sets
+    /// this for the still and clears it on the way out.
+    public var extendedGBufferEnabled: Bool = false
+    /// True while THIS frame's G-buffer pass wrote the sixth target — the flag AND the target
+    /// allocation both succeeded. Diagnostics / gates.
+    public private(set) var extendedGBufferActive: Bool = false
 
     // ── Point-light cubemap shadows (opt-in, additive) ────────────────
     /// Master enable for the point-light depth-cubemap shadow pass. Default
@@ -1298,8 +1707,10 @@ public final class IlluminatoramaRenderer {
     public var tonemapSaturation: Float = 1.10
     // ── Tonemap colour-grade (white-balance / tint / contrast / shadows / highlights) ──
     /// White-balance colour temperature in Kelvin (~2000–10000). 6500 = neutral
-    /// (channel gain (1,1,1) → exact no-op). Lower = warmer, higher = cooler.
-    /// Applied as a linear-HDR channel multiply BEFORE exposure + ACES.
+    /// (channel gain (1,1,1) → exact no-op). Photo-tool convention (DH-0453):
+    /// higher K = warmer, lower K = cooler — the inverse of the physical blackbody
+    /// sign, matching Lightroom/in-camera WB dials. Applied as a linear-HDR channel
+    /// multiply BEFORE exposure + ACES.
     public var whiteBalanceK: Float = 6500
     /// Green↔magenta tint on [-1, 1]. 0 = no-op; >0 magenta, <0 green. Luma-
     /// preserving channel gain applied pre-tonemap alongside white-balance.
@@ -1311,6 +1722,83 @@ public final class IlluminatoramaRenderer {
     public var highlights: Float = 1.0
     /// Contrast about mid-grey 0.18, ~0.7–1.3. 1.0 = no-op. Post-tonemap curve.
     public var contrast: Float = 1.0
+
+    // ── Photographic finish (the two things a flat saturation multiply undoes) ──
+    /// **Highlight chroma roll-off** — how much a pixel's chroma fades as it
+    /// approaches white, 0…1. 0 = OFF (default) → an exact shader no-op.
+    ///
+    /// ACES already desaturates toward white; `tonemapSaturation` then pushes that
+    /// chroma back out with a `mix(luma, colour, S)` that is FLAT in luminance, so
+    /// the two fight and the bright end keeps full saturation. That is what makes a
+    /// lamp-lit wooden wall or a sunlit render clip to a saturated block of colour
+    /// rather than to the pale warm white a camera gives. This restores the roll-off
+    /// WITHOUT giving up the midtone chroma the saturation multiplier is there for.
+    public var highlightChromaRolloff: Float = 0
+    /// **Split tone, shadow end** — colour temperature (Kelvin) applied to the low-luma
+    /// end through the same `whiteBalanceGain` curve as the global white balance
+    /// (luma-normalized: it tints, it does not dim). 6500 = neutral (default) → an
+    /// exact no-op. BELOW 6500 cools the shadows (photo convention, DH-0453), which
+    /// is what gives warm practical lights something to contrast against instead of
+    /// every tone sitting in one warm universe.
+    public var shadowTemperatureK: Float = 6500
+    /// **Split tone, highlight end** — the same, masked to the high-luma end.
+    /// 6500 = neutral (default) → an exact no-op. Above 6500 keeps highlights warm;
+    /// pair it with `highlightChromaRolloff` for the photographic combination —
+    /// the scene's own chroma rolls off toward white, and a controlled amount of
+    /// warmth goes back in.
+    public var highlightTemperatureK: Float = 6500
+
+    // ── DH-0715: live-lane look-match ─────────────────────────────────────────
+    /// Master enable/blend [0,1] for the live-lane approximation of the still's
+    /// RT bounce-GI + RTAO passes (`illumi_tonemap_fs`, applied in the HDR
+    /// domain BEFORE white-balance/exposure/ACES/grade — see that file for why
+    /// that ordering is what makes this compose with whatever Visuals settings
+    /// a scene has, rather than fighting them). 0 (default) = exact no-op. Hosts
+    /// gate this live-lane-only — a still keeps the real RT terms.
+    public var liveLookMatchStrength: Float = 0
+    /// Multiplier the fake-bounce term mixes toward in shadow/mid tones, <1.
+    /// The still's real GI reads DARKER at the same exposure (ACES's shoulder
+    /// compresses the wider dynamic range bounce adds), not brighter.
+    ///
+    /// **Calibrated 2026-09-11, TWICE.** First against one media-console frame
+    /// alone (0.44) — validated against 3 real Views × 4 `RenderStyle` presets
+    /// (12 combos) and found to close anywhere from 101% to 1668% of the
+    /// measured gap depending on scene/preset, because a flat constant has no
+    /// way to know how big the real gap actually is. `illumi_tonemap_fs` then
+    /// gained two adaptive normalizers (`gradeNorm` off `tonemapSaturation`,
+    /// `sceneNorm` off the auto-exposure EMA) so the term scales with the
+    /// scene and the Visuals dials instead of applying a fixed push, and this
+    /// is the REFIT against that shader (`HouseRenderBridgeGPUTests
+    /// _LiveLookMatchMatrix.testLiveLookMatchMultiSceneCalibration`, a 4-scene
+    /// joint fit spanning both saturation extremes and two very different
+    /// brightness profiles): total squared error 15.08 (no correction at all)
+    /// → 6.15 at this value, a real interior minimum (error rises again past
+    /// it in both directions), not a boundary artifact.
+    public var liveLookGIDarken: Float = 0.15
+    /// Strength of the fake-bounce warm gain spread (push red up / blue down),
+    /// clamped [0, 4] — NOT a 0..1 blend fraction: it scales the tilt's own
+    /// magnitude continuously. **0 after the 2026-09-11 multi-scene refit**: the
+    /// joint fit across 4 scenes never preferred a nonzero value — the darken
+    /// term's own interaction with the existing post-ACES saturation lerp
+    /// already carries the chroma match, and adding an explicit R/B tilt on
+    /// top only overshot it. Left as a live lever (not deleted) in case a
+    /// future fit over more scenes finds it earns its keep after all.
+    public var liveLookGIWarmth: Float = 0.0
+    /// Multiplier the fake-AO term mixes toward, keyed by the EXISTING AO
+    /// visibility buffer (`inAO`) rather than a flat screen tint — extra
+    /// contact darkening approximating RTAO, riding on real occlusion
+    /// geometry. Refit 2026-09-11 alongside `liveLookGIDarken` (see there) —
+    /// the error surface was nearly flat over [0.40, 0.70] here, so this
+    /// sits in the middle of that range rather than at the exact minimum.
+    public var liveLookAODarken: Float = 0.50
+    /// **What the look-match's AO share actually mixes toward THIS frame (Daydream DH-0785).**
+    /// `liveLookAODarken` is a STAND-IN for ray-traced AO on a lane that never traces it, and it
+    /// reads the same AO buffer RTAO writes into. When RTAO is live for the frame the buffer
+    /// already carries real occlusion, so the stand-in would darken every corner a second time —
+    /// on exactly the settled frames a host shows while it converges. 1.0 makes the shader's
+    /// `mix(1, darken, aoMask)` a no-op. The GI share is untouched: GI is a separate term, and a
+    /// host that traces AO without GI still wants it.
+    public var effectiveLiveLookAODarken: Float { rtaoActive ? 1.0 : liveLookAODarken }
     /// Opt-in hex-stochastic anti-tiling strength [0,1]. **Default 0 = OFF**, which
     /// is a hard no-op: the G-buffer shader short-circuits every textured sample to a
     /// single plain read, so scenes that leave this at 0 render byte-for-byte
@@ -1412,23 +1900,42 @@ public final class IlluminatoramaRenderer {
     public var debandDitherEnabled: Bool = true
 
     // ── Phase 9 — film-stock LUT (post-tonemap colour grade) ─────────
-    /// The 256×16 PNG strip loaded as a 16×16×16 `MTLTexture3D`. `nil`
-    /// = LUT bypassed (identity pass-through). Assign from the host via
-    /// `setFilmLUT(_:strength:)` — do NOT set this and `filmLUTStrength`
-    /// directly; the setter validates that the texture is 16×16×16 3D.
+    /// The film stock's cube as an `MTLTexture3D`, N×N×N. `nil` = stock bypassed
+    /// (identity pass-through). Assign from the host via `setFilmLUT(_:strength:)` —
+    /// do NOT set this, `filmLUTStrength` or `filmLUTSize` directly.
     public private(set) var filmLUTTexture: MTLTexture? = nil
-    /// Blend weight [0, 1]: 0 = LUT fully bypassed, 1 = full film grade.
+    /// Blend weight [0, 1]: 0 = stock fully bypassed, 1 = the stock's own rendering.
     public private(set) var filmLUTStrength: Float = 1.0
+    /// Cells per axis of `filmLUTTexture`, taken from the texture itself rather than
+    /// assumed — the shader's half-texel inset is derived from it (DH-0879).
+    public private(set) var filmLUTSize: Float = 16
 
-    /// Load and set a film LUT from a 256×16 PNG strip on disk.
-    /// The strip encodes a 16×16×16 cube with blue slices laid left-to-right.
+    /// Set the film stock's colour cube.
+    ///
+    /// The size is read OFF THE TEXTURE, not passed in and not assumed: the cube used to
+    /// be a hardcoded 16 on both sides, so shipping the 33-cube the stocks are actually
+    /// authored at would have silently sampled a 33³ texture on 16-cell coordinates —
+    /// wrong everywhere, and wrong in a way that reads as a grade rather than as a bug.
     /// - Parameters:
-    ///   - texture: A 16×16×16 3D MTLTexture (`rgba8Unorm` or `rgba8Unorm_srgb`).
-    ///     Pass `nil` to disable the grade.
-    ///   - strength: Blend weight toward the graded result [0, 1]. Defaults 1.
+    ///   - texture: An N×N×N 3D texture (any sampleable colour format — the app ships
+    ///     `rgba16Float`). Non-cubic or non-3D textures are rejected. `nil` disables.
+    ///   - strength: Blend weight toward the stock's rendering [0, 1]. Defaults 1.
     public func setFilmLUT(_ texture: MTLTexture?, strength: Float = 1.0) {
+        guard let texture else {
+            filmLUTTexture = nil
+            filmLUTStrength = strength
+            return
+        }
+        guard texture.textureType == .type3D,
+              texture.width == texture.height, texture.height == texture.depth,
+              texture.width >= 2 else {
+            assertionFailure("film LUT must be a cubic 3D texture, got \(texture.textureType) \(texture.width)×\(texture.height)×\(texture.depth)")
+            filmLUTTexture = nil
+            return
+        }
         filmLUTTexture = texture
         filmLUTStrength = strength
+        filmLUTSize = Float(texture.width)
     }
 
     // ── Phase 2.7 TAA knobs ──────────────────────────────────────────
@@ -1679,6 +2186,102 @@ public final class IlluminatoramaRenderer {
     /// converge as hysteresis builds up the indirect term.
     public var ddgiTwoBounceEnabled: Bool = false
 
+    /// **Compile the `illumi_lighting` feature variant BLOCKING instead of async.**
+    ///
+    /// The per-frame path (`currentLightingPipeline`) normally compiles a
+    /// newly-needed function-constant variant in the BACKGROUND and runs the
+    /// init-time uber-variant meanwhile (WWDC23 #10127 lever 2), so a live host
+    /// never hitches when a feature flag first toggles. The completion handler
+    /// lands the compiled variant via `Task { @MainActor }`, which needs the main
+    /// runloop to spin.
+    ///
+    /// A headless `@MainActor` capture harness that renders in a tight synchronous
+    /// `render(blocking:)` loop STARVES that hop — the main actor never yields, so
+    /// the specialized variant never lands and every frame silently runs the
+    /// init-time uber-variant. The uber-variant is built with the flags present at
+    /// init (DDGI off), so a harness that flips `ddgiEnabled` on and settles a
+    /// still measures a lane whose DDGI path never ran (DH-0552 — the vacuous DDGI
+    /// gates). Same trap for any flag that differs from init.
+    ///
+    /// Set this in such a lane to compile the needed variant BLOCKING (the same
+    /// choice the RT-sun variant makes for its settled/photo lane): the frame then
+    /// actually runs the specialized path. Leave OFF for any live/vsync host —
+    /// blocking a frame on a fresh compile is exactly the hitch the async path
+    /// exists to avoid. Default OFF.
+    public var blockingLightingCompile: Bool = false
+
+    /// TEST-OBSERVABLE (DH-0869): the specialisation flags of the lighting variant the LAST
+    /// frame actually dispatched — bit 1 ibl · 2 shadow · 4 dfg · 8 ddgi · 16 irrCache · 32 rtSun.
+    /// `0xFF` until a specialised variant has run. On the non-blocking path a not-yet-compiled
+    /// combination runs the init-time variant and leaves this at the PREVIOUS value, so a test
+    /// that flips a flag can assert the frame really ran it.
+    public var activeLightingVariantFlags: UInt8 { lastLightingFlags }
+
+    /// **S3.2 Ultra — trace the probe field against the REAL TLAS.** The
+    /// analytic trace only intersects box/sphere/ground primitives, so a
+    /// `.custom`-mesh host stands in coarse `ddgiProxyInstances`. With this on
+    /// (and a TLAS live — `rtTLASActive`), `illumi_ddgi_trace_tlas` fills the
+    /// SAME ray buffer from the instance acceleration structure instead: real
+    /// occlusion (window holes admit light, furniture shades the floor), mean
+    /// albedo + emission at hits, and a sun shadow ray per hit. Falls back to
+    /// the analytic kernel any frame the TLAS is not available, and the settle
+    /// gate re-arms on the flip so the field re-converges rather than mixing
+    /// lanes. Default OFF — hosts opt in from a quality tier.
+    public var ddgiRTTraceEnabled: Bool = false
+
+    /// Whether the TLAS trace kernel compiled on this device — shaders build at
+    /// run time here, so a silent fallback to the analytic lane would otherwise
+    /// be indistinguishable from Ultra working. Gates assert this, not the knob.
+    public var ddgiRTTraceSupported: Bool { ddgiTraceTLASPipeline != nil }
+
+    /// **Non-rendered DDGI proxy channel.** DDGI's trace kernel can only
+    /// intersect the analytic primitives it understands — box / sphere / ground
+    /// (`MeshKind` 0/1/2). A host whose real scene is all `.custom` meshes (a
+    /// house of walls, floors, furniture ⇒ every mesh is meshKind 3, silently
+    /// skipped) therefore has NOTHING for probes to bounce off. These proxies fix
+    /// that WITHOUT drawing anything: each is an ordinary `InstanceRef` (its
+    /// `modelMatrix` places/scales the unit primitive, its material feeds the
+    /// probe's Lambertian re-emission) that is appended to the DDGI trace's
+    /// instance buffer but never enters the raster / G-buffer / RT passes. A
+    /// house feeds coarse box proxies for its walls, floor and ceiling so the
+    /// probe field sees the room's enclosure (occlusion for the Chebyshev depth
+    /// test, colour for diffuse bleed). Empty by default — a scene that already
+    /// registers analytic primitives on the render list (Visualizer's DDGI demo)
+    /// is unaffected.
+    public var ddgiProxyInstances: [InstanceRef] = [] {
+        didSet { ddgiProxiesDirty = true }
+    }
+
+    /// **View-independent settle budget for the DDGI trace (S3.2).** The probe
+    /// field is world-space and camera-independent, so a camera-only orbit does
+    /// not change it — re-tracing every frame during an orbit recomputes an
+    /// identical field and is the per-frame cost that makes a heavy scene stutter.
+    /// When positive, the trace + the two atlas-update kernels run only while the
+    /// field is settling (this many frames after any probe-field input changes —
+    /// geometry moved, sun rotated, proxies rebuilt) and are skipped once it has
+    /// converged; the last atlas is reused. **0 (default) ⇒ trace every frame**,
+    /// bit-identical to the pre-gate renderer, so no existing scene is affected.
+    /// A host with EMA hysteresis `h` wants roughly `3–5 / (1 - h)` frames here
+    /// (≈100–150 at the 0.97 default) to let the exponential average settle.
+    /// See `DDGIConvergenceGate`.
+    public var ddgiConvergenceFrames: Int = 0
+
+    /// Whether `encodeDDGIFrame` actually ran the trace on the most recent frame
+    /// (true) or reused the converged atlas (false). Test/instrument observable —
+    /// a perf gate asserts that orbiting N settled frames traces 0 of them. Always
+    /// true while `ddgiConvergenceFrames == 0`.
+    public private(set) var ddgiDidTraceLastFrame: Bool = false
+
+    /// The settle-gate state (pure value; see `DDGIConvergenceGate`).
+    private var ddgiConvergenceGate = DDGIConvergenceGate()
+    /// Set whenever `ddgiProxyInstances` is reassigned; cleared once the proxies
+    /// have been packed into the trace instance buffer. Forces a re-arm + repack.
+    private var ddgiProxiesDirty = false
+    /// Monotonic counter bumped on any frame the render/proxy geometry was
+    /// unstable, folded into the settle-gate hash so a moving wall re-traces while
+    /// a still orbit does not.
+    private var ddgiGeometryEpoch: UInt64 = 0
+
     // ── Phase 3.2 split-sum DFG LUT ──────────────────────────────────
     /// Toggle the pre-integrated DFG LUT for the F0-weighted IBL specular
     /// response. Off = Lagarde's roughness-Schlick approximation (Phase 3.0
@@ -1711,16 +2314,18 @@ public final class IlluminatoramaRenderer {
     /// The shipping default for ``dfgUseIBLGeometryRemap``. Named so the decision is
     /// greppable and reversible in one line.
     ///
-    /// **`false` — the HISTORICAL, SHIPPING behaviour** (`k = (roughness+1)²/8`), i.e. the
-    /// LUT every frame both apps have ever rendered was baked with. It stays the default
-    /// deliberately: S1.6 measured the corrected bake but did NOT adopt it.
+    /// **`true` — the CORRECTED split-sum bake** (`k = α/2`, the geometry remap the IBL
+    /// integral actually needs), adopted 2026-08-28 on Danny's ruling (DH-0366, answered
+    /// 2026-08-25: *"Yes, switch to the corrected formula"*). Before this it was `false` —
+    /// the historical `k = (roughness+1)²/8` bake that under-reported the lobe's directional
+    /// albedo and darkened specular IBL on every polished surface, worst at low roughness /
+    /// grazing angles (grazing `Ess` 0.536 → 0.967). The gain lands on dielectrics — marble
+    /// +53.9 %, concrete +55.4 %, matte-black +25.4 % in isolated specular IBL — not metals
+    /// (chrome +2.4 %, invisible; S1.3b multi-scatter already saturates bright metals).
     ///
-    /// **Flipping this to `true` is a LOOK CHANGE, not a bug fix landing.** It brightens
-    /// specular IBL on every polished surface — metals, marble, gloss, glazing — in BOTH
-    /// Daydream Home and Visualizer, at once, with no per-app opt-out. That is Danny's call
-    /// to make and it has not been made; until it is, the corrected arm is reachable for
-    /// measurement only (set ``dfgUseIBLGeometryRemap`` directly, or `VIZ_ILLUMI_DFG_IBL_K=1`),
-    /// which is what lets one binary render both arms side by side.
+    /// **This is a LOOK CHANGE across BOTH host apps at once**, no per-app opt-out — set
+    /// `false` (or `VIZ_ILLUMI_DFG_IBL_K=0`) to render the historical arm for an A/B. The
+    /// exterior measurements below are the record Danny ruled on.
     ///
     /// **Both host apps have now measured an exterior, and they agree on the verdict while
     /// disagreeing on the mechanism — which is worth knowing before anyone re-opens this.**
@@ -1744,9 +2349,10 @@ public final class IlluminatoramaRenderer {
     /// all. **The mover is foliage.** A leaf card is a big rough dielectric, which is exactly
     /// what this remap lifts, and looked at 2× the crown picks up a cool blue-grey sky sheen
     /// and loses its green. That IS Visualizer's veiling glare, arriving through the trees
-    /// instead of the grass. **Recommendation unchanged: do not flip it.** Published
+    /// instead of the grass. The S1.6 recommendation was "do not flip it"; Danny overruled
+    /// it 2026-08-28 (DH-0366) in favour of the physically-correct bake. Published
     /// `s16-dfg-exterior`, `s16-dfg-canopy`.
-    public nonisolated static let dfgIBLGeometryRemapDefault = false
+    public nonisolated static let dfgIBLGeometryRemapDefault = true
 
     /// The baked split-sum DFG LUT (RG16F, `x` = F0 scale, `y` = bias, keyed on
     /// (NdotV, roughness) over (0,1]). Exposed read-only so a gate can measure the
@@ -2028,6 +2634,17 @@ public final class IlluminatoramaRenderer {
     /// Apply the host's interior IBL/ambient separation at the hit. Off ⇒ an interior
     /// surface gets exterior-strength fill, several times short.
     public var glassHitInteriorFillEnabled: Bool = true
+    /// DH-0718 — light every secondary hit (a reflection, a GI bounce, the world through a
+    /// pane) with the frame's rectangular AREA lights too, by the same form factor the
+    /// deferred kernel uses. Off ⇒ the pre-DH-0718 behaviour: a secondary hit saw sun + sky
+    /// + point/spot lights but no area light — which in Daydream Home is every window
+    /// portal, i.e. a room's dominant daytime source, so a reflected room was lit by a
+    /// different light than the room itself and cast none of that light's shadows.
+    public var secondaryAreaLightsEnabled: Bool = false   // DH-0718 WIP: default flips to true when it lands
+    /// DH-0718 — visibility rays per shadow-casting area light at a secondary hit (toward
+    /// jittered points on the rectangle, like `rtAreaShadowRays` on the primary). 0 ⇒ lit
+    /// but unoccluded. 1 by default: an accumulating still converges it like the sun cone.
+    public var secondaryAreaShadowRays: Int = 1
 
     /// CHEAP semi-transparent glass (no TLAS, no per-frank BLAS). Off (0) keeps the
     /// plain Fresnel+sky fallback unchanged for every other scene. A host opts in
@@ -2127,12 +2744,17 @@ public final class IlluminatoramaRenderer {
     private var gbufferAlbedoMet: MTLTexture
     private var gbufferNormalRgh: MTLTexture
     private var gbufferEmission: MTLTexture
+    /// DH-0140 — the photo-lane sixth G-buffer target (`GBufferOut.material`, RGBA16F). nil until
+    /// `extendedGBufferEnabled` first asks for it; dropped by `resize`.
+    private var gbufferMaterial: MTLTexture?
     private var depthTexture: MTLTexture
     /// Last frame's G-buffer depth, blit-copied from `depthTexture` at the end of
     /// each frame and read by the TAA resolve for disocclusion rejection (so a
     /// fast mover that vacated a pixel onto a similar-luma surface doesn't trail —
-    /// the case neighbourhood-clamp alone can't catch). Standalone, not pooled;
-    /// safe to read-then-overwrite in place under `maxFramesInFlight == 1`.
+    /// the case neighbourhood-clamp alone can't catch). Standalone, not pooled: the
+    /// copy is a GPU blit on the frame's own command buffer, and command buffers on
+    /// one queue execute in order, so it is ordered against the next frame's G-buffer
+    /// regardless of the in-flight pool depth.
     private var previousDepthTexture: MTLTexture
     private var hdrTexture: MTLTexture
     // Phase 2 — half-res visibility map from SSAO, fed to the lighting pass.
@@ -2140,6 +2762,64 @@ public final class IlluminatoramaRenderer {
     // RT diffuse (soft shadow + 1-bounce GI) buffer — written by the RT pass,
     // bilateral-filtered into the composite by `encodeRTDenoiseComposite`.
     private var rtDiffuseTexture: MTLTexture
+    /// **DH-0896 — the deferred composite's specular-IBL share, handed to the RT reflection
+    /// pass.** `outHDR` already carries the sky cube reflected along R; a reflection ray that
+    /// HITS the scene must replace that sky, not be added on top of it (which is what made a
+    /// wall mirror read as a sunset with the room ghosted faintly through it). Allocated
+    /// lazily at the HDR size the first frame RT reflections run, dropped on resize.
+    private var specIBLTexture: MTLTexture?
+    /// 1×1 stand-in bound to both kernels whenever the hand-off is off — the lighting kernel
+    /// skips its write when the target is not full-size, the RT kernel skips its read on the flag.
+    private lazy var specIBLDummyTexture: MTLTexture? = {
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1, height: 1,
+                                                         mipmapped: false)
+        d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private
+        let t = device.makeTexture(descriptor: d); t?.label = "Illuminatorama.rt.specIBL.dummy"
+        return t
+    }()
+    /// Whether THIS frame's lighting pass wrote `specIBLTexture` — the RT kernel's read is
+    /// gated on it, so a frame that skipped the write can never subtract a stale sky.
+    private var specIBLWrittenThisFrame = false
+
+    /// The full-size hand-off target when RT reflections will composite this frame, else nil.
+    private func specIBLHandoffTarget() -> MTLTexture? {
+        // A debug-term frame isolates one term; the kernel skips the write then, so no target.
+        guard rtReflectionsEnabled, rtEnabled, rtTLASSupported, debugTerm == .normal else { return nil }
+        let w = hdrTexture.width, h = hdrTexture.height
+        if let t = specIBLTexture, t.width == w, t.height == h { return t }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: w, height: h,
+                                                         mipmapped: false)
+        d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private
+        specIBLTexture = device.makeTexture(descriptor: d)
+        specIBLTexture?.label = "Illuminatorama.rt.specIBL"
+        return specIBLTexture
+    }
+    /// The deferred composite's diffuse SKY share, handed to the traced GI pass (see
+    /// `rtGIReplacesDiffuseSky`). Lazily allocated at the HDR size, dropped on resize.
+    private var diffSkyTexture: MTLTexture?
+    private lazy var diffSkyDummyTexture: MTLTexture? = {
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1, height: 1,
+                                                         mipmapped: false)
+        d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private
+        let t = device.makeTexture(descriptor: d); t?.label = "Illuminatorama.rt.diffSky.dummy"
+        return t
+    }()
+    /// Whether THIS frame's lighting pass wrote `diffSkyTexture` — the traced pass only
+    /// subtracts a share that was written this frame.
+    private var diffSkyWrittenThisFrame = false
+    /// The full-size hand-off target when the traced GI will replace the diffuse sky this frame.
+    private func diffSkyHandoffTarget() -> MTLTexture? {
+        guard rtGIReplacesDiffuseSky, rtGIStrength > 0, rtOpaqueLightingEnabled, rtEnabled,
+              rtTLASSupported, debugTerm == .normal else { return nil }
+        let w = hdrTexture.width, h = hdrTexture.height
+        if let t = diffSkyTexture, t.width == w, t.height == h { return t }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: w, height: h,
+                                                         mipmapped: false)
+        d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private
+        diffSkyTexture = device.makeTexture(descriptor: d)
+        diffSkyTexture?.label = "Illuminatorama.rt.diffSky"
+        return diffSkyTexture
+    }
     // Phase 2 — full-res HDR with SSR composited on top of direct lighting.
     // Bloom and tonemap read from this so reflections feed both effects.
     private var hdrCompositeTexture: MTLTexture
@@ -2266,11 +2946,34 @@ public final class IlluminatoramaRenderer {
     private var cascadeVPs: [simd_float4x4] = Array(repeating: matrix_identity_float4x4, count: 3)
 
     // Phase 4.10 — depth atlas for spot light shadow maps. One slice per
-    // shadowed spot. 8 slices × 512² × 4-byte depth = 8 MB. Fixed at
-    // allocation time; `spotShadowMaxCount` reads from this capacity.
-    private let spotShadowAtlas: MTLTexture
-    private let spotShadowAtlasCapacity: Int = 8
-    private let spotShadowMapResolution: Int = 512
+    // shadowed spot. 8 slices × 512² × 4-byte depth = 8 MB at rest. NOT fixed any more
+    // (DH-0134): `ensureSpotShadowAtlas` reallocates toward the host's
+    // `spotShadowCapacityRequest` when a caster needs a slice it does not have, and shrinks
+    // back when the request drops. Every binding reads the var at encode time, and the
+    // cached per-slice pass descriptors are dropped on reallocation.
+    private var spotShadowAtlas: MTLTexture
+    private var spotShadowAtlasCapacity: Int = IlluminatoramaRenderer.spotShadowCapacityDefault
+    /// Per-slice resolution of the spot/area shadow atlas.
+    ///
+    /// **This is the number that decides whether a chair leg has a shadow.** A slice covers a
+    /// whole cone's footprint, so at 512² a pendant lighting ~4 m of floor gets ~7.8 mm per texel
+    /// — and a 20 mm furniture leg is 2.5 texels wide, which the 3×3 PCF then averages down to
+    /// nothing. The seat above it (~400 mm, 50 texels) casts cleanly, so the object appears to
+    /// hover: a shadow blob with no legs reaching it. Daydream Home reported this for months as
+    /// "there are no contact shadows" (DH-0601/0441/0640/0709).
+    ///
+    /// Settable so the host can spend memory where its scenes need it: cost is
+    /// `resolution² × 4 bytes × capacity` (512/8 = 8 MB, 1024/8 = 34 MB, 2048/8 = 134 MB), plus
+    /// a depth pass per slice — which the static-scene skip already elides on a settled camera.
+    /// Clamped to a power of two in [256, 4096]; reallocates the atlas on change.
+    public var spotShadowMapResolution: Int = 512 {
+        didSet {
+            let want = min(4096, max(256, spotShadowMapResolution))
+            if want != spotShadowMapResolution { spotShadowMapResolution = want; return }
+            guard want != oldValue else { return }
+            reallocateSpotShadowAtlas(resolution: want, capacity: spotShadowAtlasCapacity)
+        }
+    }
     private var cascadeSplitsView: SIMD4<Float> = .zero
 
     // ── Point-light cubemap shadows (lazy — allocated on first enable) ─────────
@@ -2611,6 +3314,10 @@ public final class IlluminatoramaRenderer {
     /// per-vertex positions from buffer(5) and writes a real motion vector. Every
     /// other draw keeps `gbufferPipeline` (kUsePrevVerts = false), unchanged.
     private let gbufferPipelinePrevVerts: MTLRenderPipelineState
+    /// DH-0140 — the six-target variants (kExtendedGBuffer = true), compiled on first use so the
+    /// live app never pays the fragment compile for a lane it may never enter.
+    private var gbufferPipelineExt: MTLRenderPipelineState?
+    private var gbufferPipelinePrevVertsExt: MTLRenderPipelineState?
     private let shadowPipeline: MTLRenderPipelineState
     private let depthState: MTLDepthStencilState
     private let lightingPipeline: MTLComputePipelineState
@@ -2620,6 +3327,7 @@ public final class IlluminatoramaRenderer {
     private let prefilterBakePipeline: MTLComputePipelineState
     private let dfgBakePipeline: MTLComputePipelineState
     private let ssaoSpatialPipeline: MTLComputePipelineState
+    private let rtaoPipeline: MTLComputePipelineState?   // nil on non-RT hardware (never dispatched there)
     private let ssaoTemporalPipeline: MTLComputePipelineState
     private let ssrTemporalPipeline: MTLComputePipelineState
     private let ssrCompositePipeline: MTLComputePipelineState
@@ -2654,6 +3362,8 @@ public final class IlluminatoramaRenderer {
     /// host can seed it once at init and inspect for diagnostics; the
     /// kernel writes back via a `device&` binding.
     private let exposureBuffer: MTLBuffer
+    /// DH-0655 — `ExposureHistogram.bins` counts + total, p50, p95, p99, mean, key.
+    private let exposureHistogramBuffer: MTLBuffer
 
     // Phase 4.11 — particle pipelines. The compute step integrates
     // positions/velocities/life; the render pipeline draws survivors as
@@ -2696,6 +3406,36 @@ public final class IlluminatoramaRenderer {
         let count: Int
     }
     private var meshGroups: [MeshDrawGroup] = []
+
+    // ── DH-0534 — VISIBILITY CULLING, the renderer-side wiring ──────────────────
+    // The logic and its correctness argument live in IlluminatoramaVisibilityCull.swift: a group
+    // whose world bounds lie wholly outside one clip half-space of the matrix a pass rasterises
+    // with cannot produce a fragment there, so skipping its draw changes no pixel. This is the
+    // part DH-0871 lost to an accidental `git checkout` and nothing had called since — the logic
+    // was committed (0718f54) with zero call sites, so every pass still drew every group.
+    /// Master switch. A pure skip, so ON by default; the lever is for A/B and for a host that
+    /// wants the old draw-everything behaviour back.
+    public var visibilityCullingEnabled = true
+    /// Draw calls each raster pass issued and skipped, cumulative since init. Take deltas.
+    public private(set) var visibilityCullStats = IlluminatoramaVisibilityCullStats()
+    /// World bounds of each entry in `meshGroups`, index-parallel to it.
+    private var meshGroupCullBounds: [IlluminatoramaCullBounds] = []
+    /// What `meshGroupCullBounds` was built from. Sway bounds are angle-independent by
+    /// construction (the sphere about the pivot), so TIME is deliberately not in here — only a
+    /// regroup, a wind-strength change, or a change in what the GPU is allowed to overwrite.
+    private struct CullBoundsKey: Equatable {
+        var groupsVersion: Int
+        var wind: Float
+        var hostWritesInstances: Bool
+        var repackCount: Int
+    }
+    private var cullBoundsKey: CullBoundsKey?
+    /// Bumped whenever `uploadInstances` regroups. NOT bumped on its static-skip frames, whose
+    /// grouping is identical — which is what lets the bounds survive them for free.
+    private var meshGroupsVersion = 0
+    /// The exact view-projection the G-buffer pass rasterises with — JITTERED when TAA is. The
+    /// cull contract is "the matrix the pass uses", not an unjittered approximation of it.
+    private var gbufferCullVP = matrix_identity_float4x4
 
     // ── Perfect analytic superquadric (hero primitive) ─────────────────────────
     // The impostor pipeline (ray-traces the analytic surface in-fragment, writes
@@ -2766,6 +3506,12 @@ public final class IlluminatoramaRenderer {
     public var lastAutoExposure: Float {
         exposureBuffer.contents().advanced(by: 4).assumingMemoryBound(to: Float.self).pointee
     }
+    /// TEST-OBSERVABLE: the log2 luminance the meter TARGETED on the last completed frame
+    /// (slot 2 of `ExposureState`) — before the EMA and the boost clamp, so two meters can be
+    /// compared even when both are pinned at `autoExposureMaxBoost` (DH-0655).
+    public var lastAutoExposureTargetLogLum: Float {
+        exposureBuffer.contents().advanced(by: 8).assumingMemoryBound(to: Float.self).pointee
+    }
 
     /// Matches the Metal `ExtParticleParams` struct byte-for-byte.
     /// Set via `setVertexBytes` per emitter draw.
@@ -2785,6 +3531,10 @@ public final class IlluminatoramaRenderer {
     private let ddgiTracePipeline: MTLComputePipelineState
     private let ddgiUpdateIrrPipeline: MTLComputePipelineState
     private let ddgiUpdateDepthPipeline: MTLComputePipelineState
+    /// S3.2 Ultra — the TLAS-backed trace variant. Optional: a device or
+    /// metallib without it degrades to the analytic kernel, never fails init.
+    private lazy var ddgiTraceTLASPipeline: MTLComputePipelineState? =
+        engine.pipelineCache.pipelineState(name: "illumi_ddgi_trace_tlas", device: device)
 
     // ── Hardware ray tracing state ───────────────────────────────────
     /// Mirror of `RTUniforms` in IlluminatoramaRT.metal.
@@ -2810,6 +3560,10 @@ public final class IlluminatoramaRenderer {
         /// C1 — 0 ⇒ the deferred pass already shaded the sun here (mirrors
         /// `directSunEnabled`, was `_padRT2`). See `RTSunOwnership`.
         var directSunEnabled: UInt32 = 0
+        /// DH-0872 — scotopic desaturation for the GI sky-miss sample only. Mirrors
+        /// `scotopicDesaturation` (the renderer's own property, also fed to the
+        /// tonemap pass). 0 (day) ⇒ byte-identical.
+        var scotopicDesaturation: Float = 0
     }
     /// Mirror of `RTDenoiseUniforms` in Illuminatorama.metal (stride 32, 16-aligned).
     private struct RTDenoiseUniforms {
@@ -2880,6 +3634,14 @@ public final class IlluminatoramaRenderer {
         var atlasW: UInt32; var atlasH: UInt32; var tileSize: UInt32; var tilesPerRow: UInt32
         var cardCount: UInt32; var triangleCount: UInt32; var indirectRays: UInt32; var frameSeed: UInt32
         var alpha: Float; var rayTMin: Float; var maxDist: Float; var incrementalEnabled: UInt32 = 0
+        // DH-0653 — atlas reuse counter gate; DH-0849 — back-face guard (+ pad to the Metal stride).
+        var statsEnabled: UInt32 = 0; var backFaceGuard: UInt32 = 0
+        /// DH-0872 — scotopic desaturation for this pass's own GI sky-MISS sample (the
+        /// cache-update kernel gathers indirect independently of the RT lighting kernels'
+        /// GI, and has the SAME raw-sample leak). Mirrors `scotopicDesaturation`. Repurposes
+        /// `_scPad1` — same 4 bytes. 0 (day) ⇒ byte-identical.
+        var scotopicDesaturation: Float = 0
+        var _scPad2: UInt32 = 0
     }
     private let surfCachePipeline: MTLComputePipelineState?
     /// §3 endpoint — TLAS-traced cache-update (traces the per-frame-refit instance
@@ -2915,8 +3677,10 @@ public final class IlluminatoramaRenderer {
     // (`surfIncrementalReady`) and is a no-op on chart/soup/static scenes (a fully
     // static frame diffs to zero moved instances → zero re-framing), so enabling it
     // by default only helps animated TLAS scenes. `VIZ_SURFCACHE_INCREMENTAL=0` is
-    // the kill-switch. SAFE only while `maxFramesInFlight == 1` (the in-place
-    // `surfCardBuffer` rewrite races a ≥2 pool — ping-pong the card buffer first).
+    // the kill-switch. The default lane re-frames on the GPU, on this frame's command
+    // buffer (hazard-tracked); the CPU fallback rewrites `surfCardBuffer` in place and
+    // first waits for the in-flight frame (`awaitInFlightFrameBeforeCPUCacheWrite`,
+    // DH-0537 #1) — the pool is 2, so an unguarded in-place write would race.
     public var surfaceCacheIncremental: Bool = true
     // Phase 5 / B1 — cache-domain à-trous denoiser. Spatially filters the radiance
     // atlas (same-card-guarded, variance-guided) before the GI/reflection consumers
@@ -2930,7 +3694,7 @@ public final class IlluminatoramaRenderer {
     private let surfAtrousPipeline: MTLComputePipelineState?
     // Phase 5 / A (streaming) — residency feedback. When on, the GI/reflection
     // cache hits mark `cardRequested[card]=1`; the host drains the buffer the NEXT
-    // frame (maxFramesInFlight==1) to log the per-frame WORKING SET size — the data
+    // frame (after waiting for the in-flight one) to log the per-frame WORKING SET size — the data
     // that sizes the atlas budget and that A1's residency pass will key off. Plain
     // instrumentation for now (no behavior change). `VIZ_ILLUMI_SURFCACHE_FEEDBACK=1`.
     public var surfaceCacheFeedback: Bool =
@@ -2950,7 +3714,7 @@ public final class IlluminatoramaRenderer {
     // SLOTS (= A0's bake-time resident-card rects) based on the `cardRequested`
     // working set: a sampled-but-non-resident card is promoted into a slot freed by
     // an unsampled resident card. Mutates `texelCard` + `cardRect` + `dirty` in place
-    // (safe under maxFramesInFlight==1, same class as the incremental writes) — NO
+    // (after `awaitInFlightFrameBeforeCPUCacheWrite`, same class as the incremental writes) — NO
     // kernel addressing change (the kernels still read texel→card / card→rect, and
     // A0's zero-rect-⇒-fallback path already handles a non-resident card).
     // `VIZ_ILLUMI_SURFCACHE_STREAM=1` (implies feedback). Default off.
@@ -3044,10 +3808,34 @@ public final class IlluminatoramaRenderer {
     }
     private var surfGPUDiffDeformDispatches: [SurfDeformDispatch] = []
     /// 4×uint written by the kernels via relaxed atomics ([0] moved instances,
-    /// [1] dirtied cards, [2] deformed instances, [3] spare), read + zeroed by
-    /// the CPU the NEXT frame (safe under `maxFramesInFlight == 1`) for the
-    /// `recordSurfCacheStats` sidecar.
-    private var surfGPUDiffStatsBuffer: MTLBuffer?
+    /// [1] dirtied cards, [2] deformed instances, [3] spare), read + zeroed by the CPU
+    /// for the `recordSurfCacheStats` sidecar. RING-buffered (DH-0537 #1): with
+    /// `maxFramesInFlight == 2` the previous frame's kernel can still be incrementing while
+    /// this frame's CPU reads and zeroes, so one buffer was a read-during-write race. A slot
+    /// is reused every `maxFramesInFlight` frames, and the in-flight semaphore guarantees the
+    /// frame that last wrote it has COMPLETED before this frame's encode begins.
+    private var surfGPUDiffStatsRing: [MTLBuffer] = []
+    /// The most recently committed FRAME command buffer (DH-0537 #1). The opt-in / kill-switch
+    /// CPU paths that rewrite GPU-read buffers in place (`surfCardBuffer`, `surfCardDirtyBuffer`,
+    /// `texelCard`, `cardRect`, `cardRequested`) wait on it first — see
+    /// `awaitInFlightFrameBeforeCPUCacheWrite`.
+    private var lastCommittedFrameCB: MTLCommandBuffer?
+
+    /// **The awaited-frame handshake** — armed by `renderAwaited()`, consumed by
+    /// `awaitCommittedFrame()`. See `renderAwaited()` for why a second completion path
+    /// exists at all; these two properties are the whole of its state.
+    ///
+    /// `armAwaitedFrame` is read-and-cleared at the TOP of `render`, so every exit path of
+    /// that function — including the empty-scene and dropped-frame early returns — leaves it
+    /// disarmed and a later plain `render(blocking:)` cannot inherit it.
+    private var armAwaitedFrame = false
+    /// The signal the next `awaitCommittedFrame()` waits on, or nil when the frame it would
+    /// have described never reached the GPU (an early return above). Nil is therefore
+    /// "nothing to wait for", not an error.
+    private var pendingFrameCompletion: FrameCompletionSignal?
+    private var surfGPUDiffStatsBuffer: MTLBuffer? {
+        surfGPUDiffStatsRing.isEmpty ? nil : surfGPUDiffStatsRing[frameRingIndex % surfGPUDiffStatsRing.count]
+    }
     /// Swift mirror of the Metal `SCReframeUniforms` (32 B, passed via setBytes).
     private struct SCReframeUniforms {
         var count: UInt32; var cardCount: UInt32; var instanceCount: UInt32; var epsilon: Float
@@ -3074,10 +3862,15 @@ public final class IlluminatoramaRenderer {
         ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_DEFORM_CARDS"] == "1"
     private var surfAtlasA: MTLTexture?
     private var surfAtlasB: MTLTexture?
+    /// DH-0622 — the INDIRECT term alone, ping-ponged in lockstep with the full atlas. The
+    /// full atlas (direct + indirect) is only the update kernel's multi-bounce feedback; every
+    /// consumer (GI, reflection, glass) shades its hit itself and reads only this.
+    private var surfIndirectAtlasA: MTLTexture?
+    private var surfIndirectAtlasB: MTLTexture?
     // Phase 5 / B1 — cache-domain denoiser output. NOT ping-ponged: recomputed
-    // each frame from the just-updated current atlas (display-only; the EMA
-    // feedback keeps reading the raw atlas). Bound to the GI/reflection consumers
-    // in place of the current atlas when `surfaceCacheDenoise` is on.
+    // each frame from the just-updated current INDIRECT atlas (display-only; the EMA
+    // feedback keeps reading the raw atlases). Bound to the GI/reflection consumers
+    // in place of the current indirect atlas when `surfaceCacheDenoise` is on.
     private var surfAtlasDenoised: MTLTexture?
     private var surfUseAtlasA: Bool = true
     private let surfCacheUniformBuffer: MTLBuffer
@@ -3092,15 +3885,24 @@ public final class IlluminatoramaRenderer {
     private var surfAtlasW: Int = 1
     private var surfAtlasH: Int = 1
     private var surfFrameSeed: UInt32 = 0
+    /// The (TLAS topology, triangle budget) the cards were last baked — or skipped — for. Lets a
+    /// host turn the cache on over an already-built TLAS and get cards on the next frame, without
+    /// an over-budget scene re-attempting the bake every frame (DH-0622).
+    private var surfCacheBakeKey: Int?
+    /// Warm-up updates still owed by the latest bake or enable (DH-0622) — see `surfaceCacheWarmIterations`.
+    private var surfCacheWarmPending = 0
     /// The atlas the lighting/RT pass should READ this frame (current). Set by
     /// `encodeSurfaceCacheUpdate` after the ping-pong swap.
     private var surfCacheCurrentAtlas: MTLTexture? { surfUseAtlasA ? surfAtlasA : surfAtlasB }
     private var surfCachePreviousAtlas: MTLTexture? { surfUseAtlasA ? surfAtlasB : surfAtlasA }
+    private var surfCacheCurrentIndirectAtlas: MTLTexture? { surfUseAtlasA ? surfIndirectAtlasA : surfIndirectAtlasB }
+    private var surfCachePreviousIndirectAtlas: MTLTexture? { surfUseAtlasA ? surfIndirectAtlasB : surfIndirectAtlasA }
     /// Phase 5 / B1 — the atlas the GI/reflection CONSUMERS read: the denoised
     /// copy when the cache-domain filter is on (and allocated), else the raw
-    /// current atlas. The update kernel's feedback always reads the raw atlas.
+    /// current INDIRECT atlas (DH-0622). The update kernel's feedback always reads
+    /// the raw full atlas.
     private var surfConsumerAtlas: MTLTexture? {
-        (surfaceCacheDenoise ? surfAtlasDenoised : nil) ?? surfCacheCurrentAtlas
+        (surfaceCacheDenoise ? surfAtlasDenoised : nil) ?? surfCacheCurrentIndirectAtlas
     }
 
     // ── TLAS — instanced RT for animated extracted scenes ────────────
@@ -3117,19 +3919,24 @@ public final class IlluminatoramaRenderer {
         /// all lit by this term and by nothing else, so a secondary ray that omits it
         /// renders every one of them dim or absent — seen through a pane, the lamp
         /// lighting the room went missing. Read by `secondaryEmission` in
-        /// IlluminatoramaSecondary.h. w reserved.
+        /// IlluminatoramaSecondary.h. w: GLASS rows only — first corner-normal entry + 1 in
+        /// `rtGlassCornerNormalBuffer` (0 = none); opaque rows keep it 0.
         var emissionPad: SIMD4<Float> = .zero
     }
     /// Mirror of `RTInstUniforms`.
     private struct RTInstUniforms {
         var invViewProjection: simd_float4x4
-        var cameraWorldPos: SIMD3<Float>; var _pad0: Float = 0
+        /// 1 ⇒ the traced GI replaces the deferred diffuse sky (`rtGIReplacesDiffuseSky`). Was `_pad0`.
+        var cameraWorldPos: SIMD3<Float>; var giReplacesDiffuseSky: UInt32 = 0
         var sunDir: SIMD3<Float>; var sunSoftnessRad: Float
         var sunColor: SIMD3<Float>; var giStrength: Float
         var skyAmbient: SIMD3<Float>; var specStrength: Float
         var width: UInt32; var height: UInt32
         var shadowRays: UInt32; var giRays: UInt32
-        var frameSeed: UInt32; var rayTMin: Float; var maxGIDist: Float; var _pad1: UInt32 = 0
+        var frameSeed: UInt32; var rayTMin: Float; var maxGIDist: Float
+        /// DH-0896 — 1 ⇒ `specIBLTexture` holds this frame's deferred specular-IBL share and
+        /// a reflection HIT replaces it. Was `_pad1` (same 4 bytes, stride unchanged).
+        var reflReplacesIBL: UInt32 = 0
         var reflStrength: Float; var reflMaxDist: Float; var reflRoughnessCutoff: Float
         var reflRays: UInt32; var reflEnabled: UInt32
         // Surface cache (P1c) — mirror of the Metal RTInstUniforms tail.
@@ -3163,7 +3970,12 @@ public final class IlluminatoramaRenderer {
         // 0x01 opaque | 0x04 invisible occluder.
         var directSunEnabled: UInt32 = 0
         var transportRayMask: UInt32 = 0x05
-        var _padIrr0: UInt32 = 0; var _padIrr1: UInt32 = 0; var _padIrr2: UInt32 = 0
+        // DH-0653 — hit/miss counter gate + chart overlay (were _padIrr0/_padIrr1).
+        var surfStatsEnabled: UInt32 = 0; var debugSurfCacheCharts: UInt32 = 0
+        /// DH-0872 — scotopic desaturation for the GI sky-miss sample only. Mirrors
+        /// `scotopicDesaturation` (also fed to the tonemap pass). Repurposes
+        /// `_padIrr2` — same 4 bytes. 0 (day) ⇒ byte-identical.
+        var scotopicDesaturation: Float = 0
         // Interior irradiance bands — mirror of the Metal RTInstUniforms tail.
         var interiorIrrUp: SIMD4<Float> = .zero
         var interiorIrrSide: SIMD4<Float> = .zero
@@ -3223,13 +4035,16 @@ public final class IlluminatoramaRenderer {
     /// surface — the bounce loop reads its material from `rtGlassDataBuffer` — so the
     /// packed lanes are pinned to explicit "untextured / every layer / no emission"
     /// values instead of being left to whatever the normal matrix's padding holds.
-    private static func rtGlassInstanceRow(_ inst: IlluminatoramaGlassInstance, normalBase: Float) -> RTInstanceData {
+    private static func rtGlassInstanceRow(_ inst: IlluminatoramaGlassInstance, normalBase: Float,
+                                           cornerBase: Float = 0) -> RTInstanceData {
         var c0 = inst.normalMatrix.columns.0, c1 = inst.normalMatrix.columns.1
         c0.w = 0                                    // untextured
         c1.w = Float(bitPattern: UInt32.max)        // unmasked by any light layer
         return RTInstanceData(nrm0: c0, nrm1: c1, nrm2: inst.normalMatrix.columns.2,
                               albedoTriBase: SIMD4(inst.tintIor.x, inst.tintIor.y, inst.tintIor.z, normalBase),
-                              emissionPad: .zero)
+                              // w = first corner-normal entry + 1 (0 = none); a glass boundary
+                              // has no emission, so the xyz stay zero.
+                              emissionPad: SIMD4(0, 0, 0, cornerBase))
     }
 
     private let rtTLASPipeline: MTLComputePipelineState?
@@ -3269,6 +4084,12 @@ public final class IlluminatoramaRenderer {
         // Metal sequences repack-write → refit-read; the BLAS references `mesh.vertexBuffer`,
         // the same buffer the repack writes in place. `nil` for static meshes.
         var refit: (desc: MTLPrimitiveAccelerationStructureDescriptor, scratch: MTLBuffer)?
+        /// Per-triangle-CORNER shading normals (3 per triangle, `normals` order) — filled only
+        /// for a mesh some glass instance uses, and read only by the glass bounce loop, where a
+        /// dielectric boundary's normal is its refraction (`objectCornerNormals`). Empty for
+        /// every opaque-only mesh, so the scene pays nothing for it. Feeds
+        /// `rtGlassCornerNormalBuffer`.
+        var cornerNormals: [SIMD4<Float>] = []
     }
     private var rtMeshCache: [ObjectIdentifier: RTMeshEntry] = [:]
     /// Whether any cached mesh needs the per-frame refit. Stored rather than derived so the
@@ -3354,6 +4175,11 @@ public final class IlluminatoramaRenderer {
     /// "flat slabs" fix. Nil when no mesh exposed CPU-readable vertices.
     private var rtObjUVBuffer: MTLBuffer?
     private var rtObjUVCount: Int = 0
+    /// Concatenated per-corner SHADING normals of the meshes glass instances use (3 × `float4`
+    /// per triangle). A glass instance's slice starts at `RTInstanceData.emissionPad.w − 1`
+    /// (0 = none → the bounce loop keeps the face normal). Glass-only on purpose: opaque hits
+    /// shade with the face normal and would triple this buffer for nothing.
+    private var rtGlassCornerNormalBuffer: MTLBuffer?
     // Surface cache (P1c): per-TLAS-instance base offset into the grouped soup
     // triangle list (== the `triCard`/`triUVa`/`triUVc` index space). Built
     // alongside the world-space soup in `rebuildRTAccel` when the cache is on,
@@ -3435,6 +4261,14 @@ public final class IlluminatoramaRenderer {
     private var curveDbgPrinted = false   // VIZ_CURVE_DEBUG one-shot
     private let rtInstUniformBuffer: MTLBuffer
     private var rtInstFrameSeed: UInt32 = 0
+    /// RTAO's own per-dispatch seed. It rotates EVERY frame, TAA or not: the AO temporal
+    /// accumulator (`encodeSSAOTemporalPass`) exists to converge a per-frame estimator, and a
+    /// seed frozen at 0 hands it the same 32-ray realisation every frame — 42 settled frames
+    /// averaged to one sample. Measured on the DH-0528 gate (raw lane, TAA off): frozen seed
+    /// 0.861 in-band crust against GTAO's 0.474; the march is deterministic and spatially
+    /// blurred, the rays were one unconverged draw. `rtInstFrameSeed` is not reused because it
+    /// only advances when an RT lighting or glass pass encodes, which the raw lane may not.
+    private var rtaoFrameSeed: UInt32 = 0
     /// True after a successful TLAS (re)build/refit this frame — the RT pass
     /// then traces the instance AS instead of the primitive-AS soup.
     private var rtTLASActive: Bool = false
@@ -3556,8 +4390,17 @@ public final class IlluminatoramaRenderer {
     /// Σ group.count · meshTris), which can dwarf the per-mesh `estTriangles`
     /// used to gate live RT — so it gets its own cap. Past it the TLAS still
     /// runs (RT lighting intact); only the cache read is skipped.
-    private static let surfaceCacheMaxTrianglesTLAS: Int = 60_000
-    private static let surfaceCachePerTriTileSize: Int = 6
+    ///
+    /// A host that turns the cache on for a real scene raises it: a furnished house is well past
+    /// 60 000 (4000 Sunset ~154 k), where the cache is skipped and the frame is identical to cache
+    /// off. Read at each TLAS topology build, so set it before the build that should bake cards.
+    /// `VIZ_ILLUMI_SURFCACHE_MAXTRIS` overrides the default — an instrument, like
+    /// `VIZ_ILLUMI_RT_GROUPCAP` (DH-0622 measured 0 cached hits on the ~90 k Debug Tester without it).
+    public var surfaceCacheMaxTriangles: Int =
+        ProcessInfo.processInfo.environment["VIZ_ILLUMI_SURFCACHE_MAXTRIS"].flatMap { Int($0) } ?? 60_000
+    /// Atlas texels per side of a per-triangle card tile, read at each card bake. A large triangle's
+    /// texels span tens of cm at 6, which is what DH-0849 (light along junctions) is being A/B'd against.
+    public var surfaceCachePerTriangleTileSize: Int = 6
 
     /// Reset the RT auto-disable guard. Called on every scene attach (via
     /// `IlluminatoramaOverlay.setExtractedSceneRT`) so a freshly-shown scene
@@ -3570,11 +4413,33 @@ public final class IlluminatoramaRenderer {
     // ── Depth-of-field state ─────────────────────────────────────────
     private struct DOFParams {
         var invProjection: simd_float4x4
-        var focusDist: Float; var aperture: Float; var maxRadius: Float; var focusRange: Float
-        var width: UInt32; var height: UInt32; var _p0: Float = 0; var _p1: Float = 0
+        var focusDist: Float; var cocCoefficient: Float; var maxRadius: Float
+        var blades: Float; var bladeRotation: Float; var catsEye: Float
+        var width: UInt32; var height: UInt32
+        var tileW: UInt32; var tileH: UInt32; var tileSize: UInt32
+        /// Mirrors the Metal `DOFParams.prefilterScale`. It used to be declared here as
+        /// `_pad0` and never set, which is why the shader's `0 ⇒ point taps` branch was the
+        /// only one that ever ran (DH-0883).
+        var prefilterScale: Float = 0
+        /// Mirrors the Metal `DOFParams.cocFloor` — the diffraction Airy disc's CoC radius in
+        /// pixels, applied at every distance including the focus plane (DH-0882).
+        var cocFloor: Float = 0
     }
+    /// Tile size for the max-CoC reduction. Must match nothing in the shader but the
+    /// value passed in `DOFParams.tileSize` — the kernel reads it from there.
+    private static let dofTileSize = 16
     private let dofPipeline: MTLComputePipelineState?
+    private let dofTilePipeline: MTLComputePipelineState?
+    private let dofDilatePipeline: MTLComputePipelineState?
+    private let dofPrefilterPipeline: MTLComputePipelineState?
     private var dofOutputTexture: MTLTexture?
+    private var dofTileTexture: MTLTexture?
+    private var dofTileDilatedTexture: MTLTexture?
+    /// Half-resolution, mipmapped, CoC-weighted colour pyramid the gather reads its taps from
+    /// (DH-0728/DH-0883). Premultiplied colour with the weight in alpha; the weight is the
+    /// texel's own CoC, so in-focus pixels all but vanish from the coarse levels and a sharp
+    /// silhouette cannot smear a halo of itself into the bokeh behind it.
+    private var dofPrefilterTexture: MTLTexture?
 
     // ── Volumetric shaft state ───────────────────────────────────────
     private struct VolUniforms {
@@ -3673,6 +4538,12 @@ public final class IlluminatoramaRenderer {
     private var spotLightCapacity: Int
     private var areaLightRing: [MTLBuffer]
     private var areaLightBuffer: MTLBuffer { areaLightRing[frameRingIndex] }
+    /// DH-0718 — how many area lights a secondary hit reads this frame (0 ⇒ none bound).
+    /// Gated by the local-lights switch too: that is the ablation lever every secondary
+    /// light term already answers to.
+    private var secondaryAreaLightCount: Int {
+        (secondaryAreaLightsEnabled && glassHitLocalLightsEnabled) ? areaLights.count : 0
+    }
     private var areaLightCapacity: Int
     private var extraDirectionalRing: [MTLBuffer]
     private var extraDirectionalBuffer: MTLBuffer { extraDirectionalRing[frameRingIndex] }
@@ -3780,7 +4651,7 @@ public final class IlluminatoramaRenderer {
         vsBaseConsts.setConstantValue(&userPrevVertsFalse, type: .bool, index: 10)
         pdesc.vertexFunction = try library.makeFunction(name: "illumi_vs",
                                                         constantValues: vsBaseConsts)
-        pdesc.fragmentFunction = library.makeFunction(name: "illumi_fs")
+        pdesc.fragmentFunction = try Self.makeGBufferFragment(library: library, extended: false)
         pdesc.colorAttachments[0].pixelFormat = .rgba16Float
         pdesc.colorAttachments[1].pixelFormat = .rgba16Float
         pdesc.colorAttachments[2].pixelFormat = .rgba16Float
@@ -3904,7 +4775,7 @@ public final class IlluminatoramaRenderer {
             "illumi_irradiance_bake",
             "illumi_mesh_build_adjacency", "illumi_mesh_synth", "illumi_particles_step",
             "illumi_prefilter_bake", "illumi_repack_pos_norm", "illumi_rt_denoise",
-            "illumi_rt_gi_temporal", "illumi_ssao", "illumi_ssao_spatial",
+            "illumi_rt_gi_temporal", "illumi_rtao_tlas", "illumi_ssao", "illumi_ssao_spatial",
             "illumi_ssao_temporal", "illumi_ssr_composite", "illumi_ssr_gather",
             "illumi_ssr_temporal", "illumi_surfcache_atrous",
             "illumi_surfcache_reframe_chart",
@@ -4016,6 +4887,9 @@ public final class IlluminatoramaRenderer {
         }
         self.lightingPipeline = lighting
         self.ssaoPipeline = ssao
+        // RTAO (DH-0528) — a TLAS kernel; on hardware without ray-tracing support the pipeline
+        // simply never compiles and `rtaoActive` (which needs a live TLAS) keeps it undispatched.
+        self.rtaoPipeline = cache.pipelineState(name: "illumi_rtao_tlas", device: device)
         self.ssaoSpatialPipeline  = ssaoSpatial
         self.ssaoTemporalPipeline = ssaoTemporal
         self.ssrGatherPipeline    = ssrGather
@@ -4125,10 +4999,15 @@ public final class IlluminatoramaRenderer {
         // dependency; nil leaves curves rigid (no per-frame re-displace).
         self.curveWindDisplacePipeline =
             cache.pipelineState(name: "illumi_curve_wind_displace", device: device)
-        surfGPUDiffStatsBuffer = device.makeBuffer(
-            length: MemoryLayout<UInt32>.stride * 4, options: .storageModeShared)
-        surfGPUDiffStatsBuffer?.label = "Illuminatorama.surfcache.gpuDiffStats"
-        if let sb = surfGPUDiffStatsBuffer { memset(sb.contents(), 0, sb.length) }
+        var statsRing: [MTLBuffer] = []
+        for slot in 0..<IlluminatoramaRenderer.maxFramesInFlight {
+            guard let b = device.makeBuffer(length: MemoryLayout<UInt32>.stride * 4,
+                                            options: .storageModeShared) else { continue }
+            b.label = "Illuminatorama.surfcache.gpuDiffStats.\(slot)"
+            memset(b.contents(), 0, b.length)
+            statsRing.append(b)
+        }
+        surfGPUDiffStatsRing = statsRing
 
         // ── Instanced-RT (TLAS) pipeline ─────────────────────────────
         // Same constant-declaring caveat as the surfcache TLAS kernel above:
@@ -4148,11 +5027,26 @@ public final class IlluminatoramaRenderer {
         self.rtInstUniformBuffer = riUB
         timing.mark("RT + surfcache + TLAS pipelines (specialized)")
 
-        // ── Depth-of-field pipeline ──────────────────────────────────
+        // ── Depth-of-field pipelines ─────────────────────────────────
         if let dofFn = library.makeFunction(name: "illumi_dof") {
             self.dofPipeline = try? device.makeComputePipelineState(function: dofFn) // gpu-ok: one-time init, optional DoF pipeline
         } else {
             self.dofPipeline = nil
+        }
+        if let dofTileFn = library.makeFunction(name: "illumi_dof_tile") {
+            self.dofTilePipeline = try? device.makeComputePipelineState(function: dofTileFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            self.dofTilePipeline = nil
+        }
+        if let dofDilateFn = library.makeFunction(name: "illumi_dof_dilate") {
+            self.dofDilatePipeline = try? device.makeComputePipelineState(function: dofDilateFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            self.dofDilatePipeline = nil
+        }
+        if let dofPrefilterFn = library.makeFunction(name: "illumi_dof_prefilter") {
+            self.dofPrefilterPipeline = try? device.makeComputePipelineState(function: dofPrefilterFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            self.dofPrefilterPipeline = nil
         }
 
         // ── Volumetric shaft pipeline ────────────────────────────────
@@ -4207,6 +5101,13 @@ public final class IlluminatoramaRenderer {
         memcpy(expoBuf.contents(), initialState,
                MemoryLayout<Float>.stride * initialState.count)
         self.exposureBuffer = expoBuf
+        guard let histBuf = device.makeBuffer(length: MemoryLayout<Float>.stride * (ExposureHistogram.bins + 8),
+                                              options: .storageModeShared) else {
+            throw IlluminatoramaError.bufferAllocationFailed("exposureHistogram")
+        }
+        histBuf.label = "Illuminatorama.exposureHistogram"
+        memset(histBuf.contents(), 0, histBuf.length)
+        self.exposureHistogramBuffer = histBuf
         self.ddgiTracePipeline = ddgiTrace
         self.ddgiUpdateIrrPipeline = ddgiUpdateIrr
         self.ddgiUpdateDepthPipeline = ddgiUpdateDepth
@@ -4863,6 +5764,20 @@ public final class IlluminatoramaRenderer {
         return IlluminatoramaMeshHandle(kind: kind, mesh: mesh, renderer: self)
     }
 
+    /// The registered mesh behind a `MeshKind`, or nil if nothing is registered under it.
+    ///
+    /// Read-only lookup into the mesh table, for a host that needs the geometry it is DRAWING
+    /// rather than a copy of what it once submitted — exact cursor picking (ray vs the real
+    /// triangles, via `IlluminatoramaMesh.objectTriangleSoup()`), a measurement probe, a
+    /// geometry audit. The alternative is for every host to shadow the table with its own
+    /// `[MeshKind: IlluminatoramaMesh]`, which is a second source of truth for the same fact and
+    /// goes stale exactly when a mesh is re-registered.
+    ///
+    /// The returned object is the renderer's own entry, not a copy: treat its buffers as
+    /// read-only, and note a `.private`-storage mesh has no CPU-visible vertices at all
+    /// (`objectTriangleSoup()` is empty for it).
+    public func registeredMesh(_ kind: MeshKind) -> IlluminatoramaMesh? { meshes[kind] }
+
     /// Called by `IlluminatoramaMeshHandle.deinit` to evict the entry
     /// when the host drops its last strong reference. Internal because
     /// hosts should not call this directly — letting the handle's
@@ -5126,10 +6041,80 @@ public final class IlluminatoramaRenderer {
     /// `VIZ_ILLUMI_SURFCACHE_STATS_PATH` (sandbox eats os_log). Used to quantify
     /// the P2/P3 atlas-efficiency wins before/after. No-op without the env var.
     nonisolated static func recordSurfCacheStats(_ line: String) {
-        guard let p = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SURFCACHE_STATS_PATH"] else { return }
+        guard let p = frameEnv("VIZ_ILLUMI_SURFCACHE_STATS_PATH") else { return }
         guard let data = (line + "\n").data(using: .utf8) else { return }
         if let h = FileHandle(forWritingAtPath: p) { h.seekToEndOfFile(); h.write(data); try? h.close() }
         else { try? data.write(to: URL(fileURLWithPath: p)) }
+    }
+
+    // ── DH-0653: surface-cache hit/miss + atlas reuse counters ────────────────
+    //
+    // Two atomic counter buffers the kernels add to only while the stats sidecar is
+    // set: `surfHitStatsBuffer` (8 slots, `illumi_rt_lighting_tlas` — what each GI /
+    // reflection triangle hit was served by) and `surfAtlasStatsBuffer` (2 slots, the
+    // update kernel — texels EMA-reused vs refreshed at α = 1). Each is drained at the
+    // NEXT frame's encode, after the in-flight frame completes, and written as one
+    // `hits:` / `atlas:` line. The DH-0622 trade ("cheaper than re-shade" → "richer
+    // than re-shade") is the `cached` share of the `hits:` line.
+    private var surfHitStatsBuffer: MTLBuffer?
+    private var surfAtlasStatsBuffer: MTLBuffer?
+
+    /// The counters run exactly when the sidecar they report to exists. Read per frame
+    /// (not cached) so a test can scope it with `setenv`/`unsetenv`.
+    private static var surfCacheStatsRequested: Bool {
+        frameEnv("VIZ_ILLUMI_SURFCACHE_STATS_PATH") != nil
+    }
+
+    /// **An environment read that is cheap enough for a frame.** `ProcessInfo.processInfo
+    /// .environment` builds the WHOLE environment into a new Dictionary on every access. Read per
+    /// frame, or per material, that is real time: Daydream Home's material resolver did it once per
+    /// resolution and it cost ~1 ms/frame on its Hero fixture. `getenv` walks `environ` without
+    /// allocating, and it still sees a runtime `setenv`, which is why these switches are read per
+    /// frame rather than cached in a `static let`.
+    nonisolated static func frameEnv(_ name: String) -> String? {
+        getenv(name).map { String(cString: $0) }
+    }
+
+    /// Allocate (zeroed) on first use; nil only on allocation failure (counters then no-op).
+    private func surfCounterBuffer(_ existing: MTLBuffer?, slots: Int, label: String) -> MTLBuffer? {
+        if let existing { return existing }
+        let b = device.makeBuffer(length: MemoryLayout<UInt32>.stride * slots, options: .storageModeShared)
+        b?.label = label
+        if let b { memset(b.contents(), 0, b.length) }
+        return b
+    }
+
+    /// Read + zero a counter buffer. Opt-in diagnostic lane only, so it may wait for the
+    /// in-flight frame whose kernel is still adding (the feedback drain does the same).
+    private func drainSurfCounters(_ b: MTLBuffer, slots: Int) -> [UInt32] {
+        awaitInFlightFrameBeforeCPUCacheWrite()
+        let p = b.contents().bindMemory(to: UInt32.self, capacity: slots)
+        let counts = (0..<slots).map { p[$0] }
+        memset(b.contents(), 0, MemoryLayout<UInt32>.stride * slots)
+        return counts
+    }
+
+    /// `hits:` sidecar line from the 8 hit slots (GI 0–3, reflection 4–7, each
+    /// cached / fallback / noCard / reshade). nil when the frame made no surface hit.
+    nonisolated static func surfCacheHitLine(_ c: [UInt32]) -> String? {
+        guard c.count >= 8 else { return nil }
+        let total = c.prefix(8).reduce(0) { $0 + Int($1) }
+        guard total > 0 else { return nil }
+        let cached = Int(c[0]) + Int(c[4])
+        let rate = String(format: "%.1f", Double(cached) / Double(total) * 100)
+        func group(_ o: Int) -> String {
+            "cached=\(c[o]) fallback=\(c[o + 1]) noCard=\(c[o + 2]) reshade=\(c[o + 3])"
+        }
+        return "hits: cacheHitRate=\(rate)% cached=\(cached) of \(total) surface hits"
+            + " gi[\(group(0))] refl[\(group(4))]"
+    }
+
+    /// `atlas:` sidecar line — texels temporally reused vs recomputed from scratch.
+    nonisolated static func surfCacheAtlasLine(reused: UInt32, refreshed: UInt32) -> String? {
+        let total = Int(reused) + Int(refreshed)
+        guard total > 0 else { return nil }
+        let rate = String(format: "%.1f", Double(reused) / Double(total) * 100)
+        return "atlas: reuseRate=\(rate)% reused=\(reused) refreshed=\(refreshed) of \(total) texels"
     }
 
     public func setRTGeometry(positions: [SIMD3<Float>],
@@ -5406,14 +6391,14 @@ public final class IlluminatoramaRenderer {
               let pipe = curveWindDisplacePipeline,
               let rest = rtSoupCurveRestPoints, let pool = rtSoupCurvePoolPoints,
               let wind = rtSoupCurveWindAttr, rtSoupCurvePointCount > 0 else {
-            if ProcessInfo.processInfo.environment["VIZ_CURVE_DEBUG"] == "1", !curveDbgPrinted {
+            if !curveDbgPrinted, Self.frameEnv("VIZ_CURVE_DEBUG") == "1" {
                 curveDbgPrinted = true
                 let m = "CURVE displace SKIPPED: active=\(rtSoupCurvesActive) noRefit=\(noCurveRefit) pipe=\(curveWindDisplacePipeline != nil) rest=\(rtSoupCurveRestPoints != nil) pool=\(rtSoupCurvePoolPoints != nil) wind=\(rtSoupCurveWindAttr != nil) pts=\(rtSoupCurvePointCount)\n"
                 FileHandle.standardError.write(m.data(using: .utf8)!)
             }
             return
         }
-        if ProcessInfo.processInfo.environment["VIZ_CURVE_DEBUG"] == "1", !curveDbgPrinted {
+        if !curveDbgPrinted, Self.frameEnv("VIZ_CURVE_DEBUG") == "1" {
             curveDbgPrinted = true
             let m = "CURVE displace RAN: pts=\(rtSoupCurvePointCount) time=\(time) windStrength=\(treeWindStrength) heading=\(treeWindHeading)\n"
             FileHandle.standardError.write(m.data(using: .utf8)!)
@@ -5931,6 +6916,12 @@ public final class IlluminatoramaRenderer {
         surfGPUDiffDeformIdxBuffer = nil; surfGPUDiffDeformDispatches = []
         surfAtlasA = atlasA
         surfAtlasB = atlasB
+        // DH-0622 — nil on alloc failure leaves the update (and every consumer) off.
+        surfIndirectAtlasA = device.makeTexture(descriptor: texDesc)
+        surfIndirectAtlasB = device.makeTexture(descriptor: texDesc)
+        surfIndirectAtlasA?.label = "Illuminatorama.surfcache.indirectA"
+        surfIndirectAtlasB?.label = "Illuminatorama.surfcache.indirectB"
+        surfCacheWarmPending = max(0, surfaceCacheWarmIterations)   // fresh textures are empty
         // Phase 5 / B1 — denoiser output (same descriptor; not ping-ponged). nil on
         // alloc failure just leaves consumers on the raw atlas (the filter no-ops).
         surfAtlasDenoised = device.makeTexture(descriptor: texDesc)
@@ -6017,10 +7008,10 @@ public final class IlluminatoramaRenderer {
     /// `surfCardBuffer` straight from the solver's live position buffer). The
     /// CPU loop below remains only as the `VIZ_SURFCACHE_GPU_DIFF=0` fallback.
     ///
-    /// `surfCardBuffer` is written in place (not ping-ponged) — SAFE only because
-    /// `maxFramesInFlight == 1` (the previous frame's GPU read has completed
-    /// before this CPU write begins). If that pool is ever raised to ≥2, ping-pong
-    /// the card buffer or this becomes a read-during-write hazard.
+    /// `surfCardBuffer` is written in place (not ping-ponged). On the default GPU lane that
+    /// is a kernel on this frame's command buffer, ordered by hazard tracking; on the CPU
+    /// fallback it is a host write that first waits for the in-flight frame
+    /// (`awaitInFlightFrameBeforeCPUCacheWrite`, DH-0537 #1) — the pool is 2.
     ///
     /// **#60 item 1 + Phase D — GPU-side transform diff.** Both dynamic sources
     /// now run as compute kernels on the frame's command buffer: RIGID movers
@@ -6086,6 +7077,8 @@ public final class IlluminatoramaRenderer {
         let curPtr = currentInstanceBuffer.contents().bindMemory(to: IlluminatoramaInstance.self, capacity: total)
         let prevPtr = previousInstanceBuffer.contents().bindMemory(to: IlluminatoramaInstance.self, capacity: total)
 
+        // CPU fallback: it rewrites the card + dirty buffers the in-flight frame may be reading.
+        awaitInFlightFrameBeforeCPUCacheWrite()
         // Clear last frame's dirty flags; cards that stop moving revert to EMA.
         memset(dirtyBuf.contents(), 0, dirtyBuf.length)
         let dirty = dirtyBuf.contents().bindMemory(to: UInt32.self, capacity: surfCardCount)
@@ -6170,6 +7163,7 @@ public final class IlluminatoramaRenderer {
                                                          dirtyBuf: MTLBuffer, cardBuf: MTLBuffer) {
         // Charts are rigid-mover only — the deforming per-card path doesn't apply.
         guard surfaceCacheIncremental else { return }
+        awaitInFlightFrameBeforeCPUCacheWrite()   // in-place card/dirty rewrite below
         let total = instances.count
         guard chart.instCardLo.count == total, chart.instCardHi.count == total,
               chart.objectFrame.count == surfCardCount else { return }
@@ -6271,7 +7265,7 @@ public final class IlluminatoramaRenderer {
         surfGPUDiffObjVertsBuffer = vb
         surfGPUDiffDeformIdxBuffer = ib
         surfGPUDiffTriCount = triCount
-        if let sb = surfGPUDiffStatsBuffer { memset(sb.contents(), 0, sb.length) }
+        for sb in surfGPUDiffStatsRing { memset(sb.contents(), 0, sb.length) }
     }
 
     /// Chart-path GPU-diff maps (#60 item 1): per-card owner instance (−1 =
@@ -6298,7 +7292,7 @@ public final class IlluminatoramaRenderer {
         fb.label = "Illuminatorama.surfcache.gpuDiff.cardFrame"
         surfGPUDiffChartOwnerBuffer = ob
         surfGPUDiffChartFrameBuffer = fb
-        if let sb = surfGPUDiffStatsBuffer { memset(sb.contents(), 0, sb.length) }
+        for sb in surfGPUDiffStatsRing { memset(sb.contents(), 0, sb.length) }
     }
 
     /// Phase D + #60 item 1 — the full GPU per-triangle dynamic-card pass.
@@ -6383,9 +7377,23 @@ public final class IlluminatoramaRenderer {
     /// Encode the GPU-side moved-set detection + re-frame (#60 item 1). One
     /// dispatch; the surface-cache update kernel later in the same command
     /// buffer reads the re-framed cards + dirty flags (hazard tracking orders
-    /// the two). Also drains LAST frame's atomic stats into the diagnostic
-    /// sidecar — safe to read on the CPU here because `maxFramesInFlight == 1`
-    /// guarantees that command buffer has completed.
+    /// the two). Also drains this ring slot's atomic stats into the diagnostic
+    /// sidecar — the slot was last written `maxFramesInFlight` frames ago, and the
+    /// in-flight semaphore guarantees that frame has completed (DH-0537 #1).
+    /// DH-0537 #1 — before a CPU write into a buffer the PREVIOUS frame's GPU passes may still
+    /// be reading. Under `maxFramesInFlight == 2` that frame can be executing while this frame's
+    /// CPU encode runs, so an in-place rewrite of `surfCardBuffer` / `surfCardDirtyBuffer` /
+    /// `texelCard` / `cardRect` / `cardRequested` was a read-during-write hazard (the comments
+    /// said "SAFE only while maxFramesInFlight == 1", and the pool had been 2 for a long time).
+    /// Waiting drains the pipeline for that one frame, so only the paths that touch GPU-owned
+    /// memory from the CPU pay it: the `VIZ_SURFCACHE_GPU_DIFF=0` fallback loops, the chart
+    /// CPU re-frame, streaming residency and the feedback drain. The default GPU-diff lane
+    /// writes those buffers from kernels on THIS frame's command buffer, which hazard
+    /// tracking orders, and never calls this.
+    private func awaitInFlightFrameBeforeCPUCacheWrite() {
+        lastCommittedFrameCB?.waitUntilCompleted()   // gpu-ok: opt-in CPU cache paths only, never the default per-frame lane
+    }
+
     private func encodeGPUDiffReframe(_ cb: MTLCommandBuffer,
                                       pipeline: MTLComputePipelineState,
                                       threadCount: Int,
@@ -6477,69 +7485,111 @@ public final class IlluminatoramaRenderer {
         // re-frames every frame). Both require the per-triangle CPU maps.
         let incremental = (surfaceCacheIncremental || surfHasDeformingCards) && surfIncrementalReady
 
-        // Ping-pong swap at the START (mirrors DDGI): Current is what we write
-        // AND what the RT pass reads after we return; Previous is the bounce
-        // source. First frame after (re)alloc both are empty → indirect = 0.
-        surfUseAtlasA.toggle()
-        guard let curAtlas = surfCacheCurrentAtlas,
-              let prevAtlas = surfCachePreviousAtlas else { return }
+        // DH-0622 — WARM-UP. A freshly baked (or freshly enabled) atlas holds no light, and every
+        // bounce builds on the previous update's atlas, so at the normal blend a still's first frames
+        // carry almost none of the multi-bounce light — measured cold on 4000 Sunset: +2.7 % after one
+        // 32-frame export against a ~+22 % level-off. So the frame after a bake or an enable runs
+        // `surfaceCacheWarmIterations` extra updates at α = 1 first: each carries the light one bounce
+        // further, and the normal update then resumes smoothing from a filled atlas.
+        let warm = surfCacheWarmPending
+        surfCacheWarmPending = 0
 
-        surfFrameSeed &+= 1
-        var u = SurfCacheUniforms(
-            sunDir: SIMD4(simd_normalize(rtSunDirection), 0),
-            sunColor: SIMD4(rtSunColor, 0),
-            skyAmbient: SIMD4(ambientColor, 0),
-            atlasW: UInt32(surfAtlasW), atlasH: UInt32(surfAtlasH),
-            tileSize: UInt32(surfActiveTileSize), tilesPerRow: UInt32(surfTilesPerRow),
-            cardCount: UInt32(surfCardCount), triangleCount: UInt32(rtTriangleCount),
-            indirectRays: UInt32(max(1, min(16, surfCacheIndirectRays))),
-            frameSeed: surfFrameSeed,
-            alpha: max(0.02, min(1.0, surfCacheAlpha)), rayTMin: 0.004, maxDist: 60.0,
-            incrementalEnabled: incremental ? 1 : 0)
-        memcpy(surfCacheUniformBuffer.contents(), &u, MemoryLayout<SurfCacheUniforms>.stride)
-
-        guard let enc = timedComputeEncoder(cb, "surfcacheUpdate") else { return }
-        enc.label = "Illuminatorama.surfcache"
-        enc.setComputePipelineState(pipeline)
-        enc.setTexture(curAtlas, index: 0)
-        enc.setTexture(prevAtlas, index: 1)   // read access
-        enc.setTexture(prevAtlas, index: 2)   // sample access
-        enc.setTexture(equirectSky ?? dummySkyTexture, index: 3)
-        enc.setAccelerationStructure(accel, bufferIndex: 0)
-        enc.setBuffer(cards, offset: 0, index: 1)
-        enc.setBuffer(tc, offset: 0, index: 2)
-        enc.setBuffer(ta, offset: 0, index: 3)
-        enc.setBuffer(tcc, offset: 0, index: 4)
-        enc.setBuffer(surfCacheUniformBuffer, offset: 0, index: 5)
-        enc.setBuffer(crect, offset: 0, index: 6)
-        enc.setBuffer(txcard, offset: 0, index: 7)
-        enc.setBuffer(cdirty, offset: 0, index: 8)
-        if useTLAS {
-            // TLAS hit → global soup tri via soupTriBase[instance_id]+primitive_id.
-            // The TLAS references the BLASes, which reference the mesh vertex/index
-            // buffers (and the curve BLASes the pooled curve buffers) — all must
-            // be resident for the intersector.
-            enc.setBuffer(rtSoupTriBaseBuffer, offset: 0, index: 9)
-            for blas in rtBLASList { enc.useResource(blas, usage: .read) }
-            for blas in rtCurveBLASList { enc.useResource(blas, usage: .read) }
-            for buf in rtResidentBuffers { enc.useResource(buf, usage: .read) }
-        } else if let vb = rtVertexBuffer, let ib = rtIndexBuffer {
-            // Curve-only primitive AS at buffer(9) — the SOUP kernel's slot (the
-            // TLAS variant uses 9 for soupTriBase; different pipeline). Dummy =
-            // the triangle `accel` for the base (curve-free) variant.
-            enc.setAccelerationStructure((rtSoupCurvesActive ? rtSoupCurveAccel : nil) ?? accel, bufferIndex: 9)
-            enc.useResource(vb, usage: .read)
-            enc.useResource(ib, usage: .read)
-            // Curve AS + pool buffers the soup curve trace references (#60 item 7 incr. 2).
-            if rtSoupCurvesActive {
-                if let ca = rtSoupCurveAccel { enc.useResource(ca, usage: .read) }
-                if let p = rtSoupCurvePoolPoints { enc.useResource(p, usage: .read) }
-                if let r = rtSoupCurveRadii { enc.useResource(r, usage: .read) }
-                if let s = rtSoupCurveSegments { enc.useResource(s, usage: .read) }
+        // DH-0653 — atlas reuse counter: report the previous frame's, arm this frame's final update.
+        var atlasStats: MTLBuffer? = nil
+        if Self.surfCacheStatsRequested {
+            surfAtlasStatsBuffer = surfCounterBuffer(surfAtlasStatsBuffer, slots: 2,
+                                                     label: "Illuminatorama.surfcache.atlasStats")
+            if let sb = surfAtlasStatsBuffer {
+                let c = drainSurfCounters(sb, slots: 2)
+                if let line = Self.surfCacheAtlasLine(reused: c[0], refreshed: c[1]) {
+                    Self.recordSurfCacheStats(line)
+                }
+                atlasStats = sb
             }
         }
-        dispatch(enc, pipeline: pipeline, width: surfAtlasW, height: surfAtlasH)
-        enc.endEncoding()
+
+        for pass in 0...warm {
+            let warming = pass < warm
+            // Ping-pong swap at the START (mirrors DDGI): Current is what we write
+            // AND what the RT pass reads after we return; Previous is the bounce
+            // source. First frame after (re)alloc both are empty → indirect = 0.
+            surfUseAtlasA.toggle()
+            guard let curAtlas = surfCacheCurrentAtlas,
+                  let prevAtlas = surfCachePreviousAtlas,
+                  let curIndirect = surfCacheCurrentIndirectAtlas,
+                  let prevIndirect = surfCachePreviousIndirectAtlas else { return }
+
+            surfFrameSeed &+= 1
+            var u = SurfCacheUniforms(
+                sunDir: SIMD4(simd_normalize(rtSunDirection), 0),
+                sunColor: SIMD4(rtSunColor, 0),
+                skyAmbient: SIMD4(ambientColor, 0),
+                atlasW: UInt32(surfAtlasW), atlasH: UInt32(surfAtlasH),
+                tileSize: UInt32(surfActiveTileSize), tilesPerRow: UInt32(surfTilesPerRow),
+                cardCount: UInt32(surfCardCount), triangleCount: UInt32(rtTriangleCount),
+                indirectRays: UInt32(max(1, min(16, surfCacheIndirectRays))),
+                frameSeed: surfFrameSeed,
+                alpha: warming ? 1.0 : max(0.02, min(1.0, surfCacheAlpha)), rayTMin: 0.004, maxDist: 60.0,
+                incrementalEnabled: incremental ? 1 : 0)
+            if !warming, atlasStats != nil { u.statsEnabled = 1 }
+            u.backFaceGuard = surfaceCacheBackFaceGuard ? 1 : 0
+            // DH-0872 — same coefficient the tonemap pass uses, applied to this pass's own
+            // raw sky-miss sample (see the kernel's miss branch).
+            u.scotopicDesaturation = max(0, scotopicDesaturation)
+            memcpy(surfCacheUniformBuffer.contents(), &u, MemoryLayout<SurfCacheUniforms>.stride)
+
+            // Warm passes go untimed: the per-pass GPU timer holds 48 passes a frame.
+            guard let enc = warming ? cb.makeComputeCommandEncoder() : timedComputeEncoder(cb, "surfcacheUpdate")
+            else { return }
+            enc.label = warming ? "Illuminatorama.surfcache.warm" : "Illuminatorama.surfcache"
+            enc.setComputePipelineState(pipeline)
+            enc.setTexture(curAtlas, index: 0)
+            enc.setTexture(prevAtlas, index: 1)   // read access
+            enc.setTexture(prevAtlas, index: 2)   // sample access
+            enc.setTexture(equirectSky ?? dummySkyTexture, index: 3)
+            enc.setTexture(curIndirect, index: 4)    // DH-0622 — write: the indirect-only EMA
+            enc.setTexture(prevIndirect, index: 5)   // read
+            enc.setAccelerationStructure(accel, bufferIndex: 0)
+            enc.setBuffer(cards, offset: 0, index: 1)
+            enc.setBuffer(tc, offset: 0, index: 2)
+            enc.setBuffer(ta, offset: 0, index: 3)
+            enc.setBuffer(tcc, offset: 0, index: 4)
+            // Bytes per pass, not the shared uniform buffer: a buffer is read when the command buffer
+            // EXECUTES, so every pass encoded into this frame would see the last pass's α and seed.
+            enc.setBytes(&u, length: MemoryLayout<SurfCacheUniforms>.stride, index: 5)
+            enc.setBuffer(crect, offset: 0, index: 6)
+            enc.setBuffer(txcard, offset: 0, index: 7)
+            enc.setBuffer(cdirty, offset: 0, index: 8)
+            // DH-0653 counters (buffer 10, both variants). Dummy = the dirty buffer, which
+            // the kernel never adds to while `statsEnabled` is 0.
+            enc.setBuffer(atlasStats ?? cdirty, offset: 0, index: 10)
+            if useTLAS {
+                // TLAS hit → global soup tri via soupTriBase[instance_id]+primitive_id.
+                // The TLAS references the BLASes, which reference the mesh vertex/index
+                // buffers (and the curve BLASes the pooled curve buffers) — all must
+                // be resident for the intersector.
+                enc.setBuffer(rtSoupTriBaseBuffer, offset: 0, index: 9)
+                for blas in rtBLASList { enc.useResource(blas, usage: .read) }
+                for blas in rtCurveBLASList { enc.useResource(blas, usage: .read) }
+                for buf in rtResidentBuffers { enc.useResource(buf, usage: .read) }
+            } else if let vb = rtVertexBuffer, let ib = rtIndexBuffer {
+                // Curve-only primitive AS at buffer(9) — the SOUP kernel's slot (the
+                // TLAS variant uses 9 for soupTriBase; different pipeline). Dummy =
+                // the triangle `accel` for the base (curve-free) variant.
+                enc.setAccelerationStructure((rtSoupCurvesActive ? rtSoupCurveAccel : nil) ?? accel, bufferIndex: 9)
+                enc.useResource(vb, usage: .read)
+                enc.useResource(ib, usage: .read)
+                // Curve AS + pool buffers the soup curve trace references (#60 item 7 incr. 2).
+                if rtSoupCurvesActive {
+                    if let ca = rtSoupCurveAccel { enc.useResource(ca, usage: .read) }
+                    if let p = rtSoupCurvePoolPoints { enc.useResource(p, usage: .read) }
+                    if let r = rtSoupCurveRadii { enc.useResource(r, usage: .read) }
+                    if let s = rtSoupCurveSegments { enc.useResource(s, usage: .read) }
+                }
+            }
+            dispatch(enc, pipeline: pipeline, width: surfAtlasW, height: surfAtlasH)
+            enc.endEncoding()
+        }
     }
 
     // Phase 5 / B1 — cache-domain à-trous denoiser. Mirror of the Metal
@@ -6558,7 +7608,7 @@ public final class IlluminatoramaRenderer {
     private func encodeSurfaceCacheDenoise(_ cb: MTLCommandBuffer) {
         guard surfaceCacheDenoise,
               let pipeline = surfAtrousPipeline,
-              let src = surfCacheCurrentAtlas,
+              let src = surfCacheCurrentIndirectAtlas,
               let dst = surfAtlasDenoised,
               let txcard = surfTexelCardBuffer,
               surfCardCount > 0 else { return }
@@ -6580,7 +7630,7 @@ public final class IlluminatoramaRenderer {
     /// the cache update (so the update relights this frame's resident set) and AFTER
     /// the incremental re-frame (so a promoted card's dirty flag isn't clobbered by
     /// the rigid-mover pass). Reads the PREVIOUS frame's `cardRequested` working set
-    /// (safe under maxFramesInFlight==1), promotes sampled-but-non-resident cards into
+    /// (after waiting for the in-flight frame), promotes sampled-but-non-resident cards into
     /// slots freed by unsampled residents, and rewrites `texelCard` / `cardRect` /
     /// `dirty` in place. No kernel change — A0's zero-rect fallback already covers a
     /// card the instant it's demoted. Logs the structural success metric
@@ -6594,6 +7644,7 @@ public final class IlluminatoramaRenderer {
               let rectBuf = surfCardRectBuffer,
               let texelBuf = surfTexelCardBuffer,
               let dirtyBuf = surfCardDirtyBuffer else { return }
+        awaitInFlightFrameBeforeCPUCacheWrite()   // reads cardRequested, rewrites texelCard/cardRect/dirty
         let req = reqBuf.contents().bindMemory(to: UInt32.self, capacity: surfCardCount)
         // A2 — refresh per-card heat from this frame's working set (sampled → full,
         // else cool by one). Done before demotability so a just-sampled card is hot.
@@ -6746,7 +7797,18 @@ public final class IlluminatoramaRenderer {
         // this feature must not be able to regress glass.
         let sunShadowRT = rtSunSoftShadowsEnabled && rtTLASForReflections && rtEnabled
             && !meshGroups.isEmpty && !instances.isEmpty
-        guard rtTLASSupported, (extractedRT || hasGlass || reflectionsRT || sunShadowRT) else {
+        // Fifth trigger (Daydream DH-0911): ray-traced AO claims the TLAS in its own right.
+        // `rtaoActive` requires a live TLAS, but nothing let RTAO ASK for one — so on a host's
+        // settled canvas (no extracted scene, reflections and traced sun both off) RTAO ran only
+        // when the scene happened to contain glass and the glass pass built a TLAS anyway. The
+        // host already requests it (it sets `rtTLASForReflections` whenever it wants RTAO); this
+        // is the engine honouring that request. Measured before: 0 of 32 settle frames traced AO
+        // in a room with no glazing, 31 of 32 with it. Same shape and glass-arm caps as the
+        // reflections and sun-shadow triggers above, for the same reason; gated on intensity so
+        // a zero-strength AO never builds a TLAS for nothing.
+        let aoRT = rtaoEnabled && rtaoIntensity > 0 && rtTLASForReflections && rtEnabled
+            && !meshGroups.isEmpty && !instances.isEmpty
+        guard rtTLASSupported, (extractedRT || hasGlass || reflectionsRT || sunShadowRT || aoRT) else {
             rtTLASActive = false; return }
         // Curve primitives (#60 item 7): adopt registry changes BEFORE the
         // topology hash, so a registration/unregistration lands as a rebuild.
@@ -6766,15 +7828,18 @@ public final class IlluminatoramaRenderer {
         // only the glass fragments, so it carries a much higher triangle ceiling than
         // the per-pixel RT-lighting path — an interior with a lawn otherwise trips the
         // strict cap and its windows silently drop to the flat fallback.
-        let triCap = extractedRT ? Self.rtMaxTrianglesForLiveRT
-                                 : Self.rtMaxTrianglesForGlassOnlyRT
+        // S4.4 — a still under `rtStillCapsRelaxed` takes the glass-arm ceilings even on the
+        // extracted-RT path (see the flag's note); the live loop keeps the strict pair.
+        let strictLive = extractedRT && !rtStillCapsRelaxed
+        let triCap = strictLive ? Self.rtMaxTrianglesForLiveRT
+                                : Self.rtMaxTrianglesForGlassOnlyRT
         // …and the same asymmetry on the mesh-GROUP axis. A furnished architectural
         // document carries 200+ distinct geometries (one group per wall edge / room floor /
         // millwork sub-part), so the live-RT 128 turned AAA glass off scene-wide on every
         // real document. See `rtMaxMeshGroupsForGlassOnlyRT` for the measured ladder.
         let groupCap = rtMeshGroupCapOverride
-            ?? (extractedRT ? Self.rtMaxMeshGroupsForLiveRT
-                            : Self.rtMaxMeshGroupsForGlassOnlyRT)
+            ?? (strictLive ? Self.rtMaxMeshGroupsForLiveRT
+                           : Self.rtMaxMeshGroupsForGlassOnlyRT)
         // O(1) caps first, triangle sum only if they pass. This ordering matters
         // now that the guard re-evaluates every frame instead of latching: a
         // scene that busts the mesh-group cap (thousands of groups) would
@@ -6800,7 +7865,7 @@ public final class IlluminatoramaRenderer {
                 (\(instances.count) instances, \(meshGroups.count) mesh groups, \
                 \(tris) tris; caps \
                 \(Self.rtMaxInstancesForLiveRT)/\(groupCap)/\(triCap) — \
-                \(extractedRT ? "live-RT" : "glass-only") path)
+                \(strictLive ? "live-RT" : (extractedRT ? "still-RT" : "glass-only")) path)
                 """)
             return
         }
@@ -6843,6 +7908,15 @@ public final class IlluminatoramaRenderer {
             rtTLASTopologyHash = topo
         } else {
             rtConsecutiveRebuilds = 0   // stable topology this frame → reset
+            // DH-0622 — cards otherwise bake only in `rebuildRTAccel`, i.e. on a topology change,
+            // and turning the cache on is not one: a host that enables it over a live TLAS (a still
+            // switching it on at capture) would refit forever and never get a card. Bake once per
+            // (topology, budget); a scene over budget records its skip and does not retry.
+            let surfBakeKey = (topo &* 31 &+ surfaceCacheMaxTriangles) &* 31 &+ surfaceCachePerTriangleTileSize
+            if surfaceCacheEnabled, surfCacheBakeKey != surfBakeKey {
+                buildGroupedSurfaceSoup(total: instances.count)
+                surfCacheBakeKey = surfBakeKey
+            }
             // PERF (static-scene skip): the TLAS is world-space — a camera-only
             // frame refit it into a byte-identical AS while rewriting every
             // instance descriptor on the CPU first. When the opaque instances
@@ -7128,6 +8202,10 @@ public final class IlluminatoramaRenderer {
                 // Ownership makes this impossible; assert it anyway, because when it was
                 // possible it silently traced the wrong geometry through every glass pane.
                 if cached.mesh !== mesh { rtStaleBLASReuseCount += 1 }
+                // A mesh first cached as OPAQUE (a shared kind) never read its corner normals.
+                if cached.cornerNormals.isEmpty {
+                    rtMeshCache[mid]?.cornerNormals = mesh.objectCornerNormals()
+                }
                 continue
             }
             let geom = MTLAccelerationStructureTriangleGeometryDescriptor()
@@ -7146,7 +8224,8 @@ public final class IlluminatoramaRenderer {
             blas.label = "Illuminatorama.rt.blas.glass"
             rtMeshCache[mid] = RTMeshEntry(mesh: mesh, blas: blas,
                                            normals: mesh.objectFaceNormals(),
-                                           uvs: mesh.objectFaceUVs(), refit: nil)
+                                           uvs: mesh.objectFaceUVs(), refit: nil,
+                                           cornerNormals: mesh.objectCornerNormals())
             pending.append((blas, d, scratch))
         }
         if !pending.isEmpty {
@@ -7202,6 +8281,23 @@ public final class IlluminatoramaRenderer {
             appendMesh(cached)
         }
         guard !rtBLASList.isEmpty, !concat.isEmpty else { return }
+        // Glass corner normals: one slice per distinct glass mesh, base stored +1 in each glass
+        // instance's row (see `rtGlassCornerNormalBuffer`).
+        var cornerConcat: [SIMD4<Float>] = []
+        var cornerBase: [ObjectIdentifier: Int] = [:]
+        for (kind, _) in glassFlat {
+            guard let mesh = meshes[kind] else { continue }
+            let mid = ObjectIdentifier(mesh)
+            guard cornerBase[mid] == nil, let cached = rtMeshCache[mid],
+                  !cached.cornerNormals.isEmpty,
+                  cached.cornerNormals.count == cached.normals.count * 3 else { continue }
+            cornerBase[mid] = cornerConcat.count
+            cornerConcat.append(contentsOf: cached.cornerNormals)
+        }
+        rtGlassCornerNormalBuffer = cornerConcat.isEmpty ? nil : device.makeBuffer(
+            bytes: cornerConcat, length: MemoryLayout<SIMD4<Float>>.stride * cornerConcat.count,
+            options: .storageModeShared)
+        rtGlassCornerNormalBuffer?.label = "Illuminatorama.rt.glassCornerNormal"
         rtObjNormalBuffer = device.makeBuffer(
             bytes: concat, length: MemoryLayout<SIMD4<Float>>.stride * concat.count,
             options: .storageModeShared)
@@ -7305,7 +8401,8 @@ public final class IlluminatoramaRenderer {
                 desc.intersectionFunctionTableOffset = 0
                 desc.transformationMatrix = packed4x3(inst.modelMatrix)
                 descPtr[i] = desc
-                dataPtr[i] = Self.rtGlassInstanceRow(inst, normalBase: Float(s.normalBase))
+                let cb = cornerBase[ObjectIdentifier(mesh)].map { Float($0 + 1) } ?? 0
+                dataPtr[i] = Self.rtGlassInstanceRow(inst, normalBase: Float(s.normalBase), cornerBase: cb)
                 glassData[gi] = IlluminatoramaRTGlassData(
                     tintIor: inst.tintIor, rdrf: inst.rdrf, dispersionPad: inst.dispersionPad)
             }
@@ -7352,7 +8449,10 @@ public final class IlluminatoramaRenderer {
         // cache-UPDATE pass traces. Runs only on topology change (not per refit),
         // so an animated scene's moved geometry reads bounded-stale cache — lighting
         // still animates via the TLAS refit. Skipped (TLAS unaffected) past the cap.
-        if surfaceCacheEnabled { buildGroupedSurfaceSoup(total: total) }
+        if surfaceCacheEnabled {
+            buildGroupedSurfaceSoup(total: total)
+            surfCacheBakeKey = (rtTopologyHash() &* 31 &+ surfaceCacheMaxTriangles) &* 31 &+ surfaceCachePerTriangleTileSize
+        }
     }
 
     /// Build the grouped-order world-space soup + per-triangle cards + the
@@ -7366,9 +8466,9 @@ public final class IlluminatoramaRenderer {
         // Cost gate: the instance-expanded triangle count, not the per-mesh count.
         var expandedTris = 0
         for g in meshGroups { if let m = meshes[g.kind] { expandedTris += g.count * (m.indexCount / 3) } }
-        guard expandedTris > 0, expandedTris <= Self.surfaceCacheMaxTrianglesTLAS else {
-            if expandedTris > Self.surfaceCacheMaxTrianglesTLAS {
-                Self.log.notice("Surface cache (TLAS) skipped: \(expandedTris) tris > cap \(Self.surfaceCacheMaxTrianglesTLAS)")
+        guard expandedTris > 0, expandedTris <= surfaceCacheMaxTriangles else {
+            if expandedTris > surfaceCacheMaxTriangles {
+                Self.log.notice("Surface cache (TLAS) skipped: \(expandedTris) tris > cap \(self.surfaceCacheMaxTriangles)")
             }
             // Leave the cache off for this scene; the kernel gates on the uniform.
             surfCardCount = 0; rtSoupTriBaseBuffer = nil; rtSoupTriBaseCount = 0
@@ -7379,6 +8479,7 @@ public final class IlluminatoramaRenderer {
         var indices: [UInt32] = [];        indices.reserveCapacity(expandedTris * 3)
         var triAlbedo: [SIMD3<Float>] = []; triAlbedo.reserveCapacity(expandedTris)
         var triNormal: [SIMD3<Float>] = []; triNormal.reserveCapacity(expandedTris)
+        var triEmission: [SIMD3<Float>] = []; triEmission.reserveCapacity(expandedTris)
         var soupBase = [UInt32](repeating: 0, count: total)
         // #60 item 1 + Phase D — GPU-diff maps, accumulated in lockstep with the
         // appended soup triangles (so global triangle order matches exactly,
@@ -7434,6 +8535,13 @@ public final class IlluminatoramaRenderer {
                 soupBase[i] = UInt32(indices.count / 3)
                 let model = instPtr[i].modelMatrix
                 let albedo = instPtr[i].albedo
+                // DH-0537 (2) — a card carries its emitter's glow into the bounce. Both card
+                // bakers accepted `triangleEmission` and neither call site passed it, so a lit
+                // lamp shade contributed nothing to cached bounce light and a room lit by its own
+                // fixtures bounced as if they were dark. Solid emission already folds intensity
+                // in; a textured emitter has no mean here, exactly as `albedo` stands in for a
+                // textured albedo.
+                let emission = instPtr[i].emission
                 let base = UInt32(positions.count)
                 for p in soup.positions {
                     let w = model * SIMD4<Float>(p, 1)
@@ -7465,7 +8573,7 @@ public final class IlluminatoramaRenderer {
                     var n = simd_cross(w1 - w0, w2 - w0)
                     let len = simd_length(n)
                     n = len > 1e-8 ? n / len : SIMD3<Float>(0, 1, 0)
-                    triNormal.append(n); triAlbedo.append(albedo)
+                    triNormal.append(n); triAlbedo.append(albedo); triEmission.append(emission)
                     // Phase D parity: with the freeze override the CPU path never
                     // re-frames a deforming kind (its object soup is empty there),
                     // so mark its triangles sentinel — never re-framed, dirty=0.
@@ -7504,7 +8612,8 @@ public final class IlluminatoramaRenderer {
         if useCharts {
             let g = Self.makeCoplanarChartCards(
                 positions: positions, indices: indices,
-                triangleAlbedo: triAlbedo, triangleNormal: triNormal)
+                triangleAlbedo: triAlbedo, triangleNormal: triNormal,
+                triangleEmission: triEmission)
             // Adaptive per-chart tile size: a chart's tile scales with its world
             // extent, shelf-packed, so big walls get more texels than small facets
             // and the atlas stays efficient across the chart-size spread.
@@ -7581,10 +8690,11 @@ public final class IlluminatoramaRenderer {
             let g = Self.makePerTriangleSurfaceCards(
                 positions: positions, indices: indices,
                 triangleAlbedo: triAlbedo, triangleNormal: triNormal,
+                triangleEmission: triEmission,
                 blockStarts: soupBase.map { Int($0) })
             setSurfaceCacheCards(cards: g.cards, triCard: g.triCard,
                                  triUVa: g.triUVa, triUVc: g.triUVc,
-                                 tileSize: Self.surfaceCachePerTriTileSize)
+                                 tileSize: surfaceCachePerTriangleTileSize)
             // #60 item 6 — invariance guard (DEBUG). The fold bakes ONE per-mesh UV
             // table into the shared BLAS; that's only correct if every instance block
             // of a mesh got the same frame-A/B layout above. Verify the first block of
@@ -7683,7 +8793,8 @@ public final class IlluminatoramaRenderer {
                 guard i < cap else { break }
                 let inst = entry.inst
                 descPtr[i].transformationMatrix = packed4x3(inst.modelMatrix)
-                dataPtr[i] = Self.rtGlassInstanceRow(inst, normalBase: dataPtr[i].albedoTriBase.w)
+                dataPtr[i] = Self.rtGlassInstanceRow(inst, normalBase: dataPtr[i].albedoTriBase.w,
+                                                     cornerBase: dataPtr[i].emissionPad.w)
                 gPtr[gi] = IlluminatoramaRTGlassData(
                     tintIor: inst.tintIor, rdrf: inst.rdrf, dispersionPad: inst.dispersionPad)
             }
@@ -7748,11 +8859,16 @@ public final class IlluminatoramaRenderer {
             reflRoughnessCutoff: max(0, rtReflRoughnessCutoff),
             reflRays: UInt32(max(1, min(8, rtReflRays))),
             reflEnabled: rtReflectionsEnabled ? 1 : 0)
+        // DH-0896 — a reflection hit REPLACES the sky the deferred pass put there.
+        let specIBLOn = rtReflectionsEnabled && specIBLWrittenThisFrame && specIBLTexture != nil
+        u.reflReplacesIBL = specIBLOn ? 1 : 0
+        let diffSkyOn = rtGIReplacesDiffuseSky && diffSkyWrittenThisFrame && diffSkyTexture != nil
+        u.giReplacesDiffuseSky = diffSkyOn ? 1 : 0
         // Surface cache read (P1c): on only when the grouped soup + cards + base
         // are all live this topology. The kernel gates every atlas read on this.
         let cacheOn = surfCacheActive && surfCardCount > 0
             && rtSoupTriBaseBuffer != nil && surfTriCardBuffer != nil
-            && surfCacheCurrentAtlas != nil
+            && surfConsumerAtlas != nil
             && rtSoupTriBaseCount == instances.count   // base buffer matches this topology
         if cacheOn {
             u.surfCacheEnabled = 1
@@ -7776,6 +8892,7 @@ public final class IlluminatoramaRenderer {
         u.surfFeedbackEnabled = needFeedback ? 1 : 0
         if surfaceCacheFeedback, !surfaceCacheStreaming,
            let rb = surfCardRequestedBuffer, surfCardCount > 0 {
+            awaitInFlightFrameBeforeCPUCacheWrite()   // the in-flight RT pass may still be marking cards
             let p = rb.contents().bindMemory(to: UInt32.self, capacity: surfCardCount)
             var requested = 0
             for i in 0..<surfCardCount where p[i] != 0 { requested += 1 }
@@ -7812,6 +8929,10 @@ public final class IlluminatoramaRenderer {
         let rtIrrW = max(0, min(1, interiorIrradianceWeight))
         u.interiorIrrUp = SIMD4(simd_max(interiorIrradianceUp, .zero), rtIrrW)
         u.setInteriorRoomGains(interiorRoomGains, enabled: interiorRoomGainsEnabled)
+        // DH-0718 — area lights at secondary hits, in the room-gain meta's spare lanes.
+        let rtAreaCount = secondaryAreaLightCount
+        u.interiorRoomGainMeta.y = Float(rtAreaCount)
+        u.interiorRoomGainMeta.z = Float(max(0, min(secondaryAreaShadowRays, 8)))
         u.interiorIrrSide = SIMD4(simd_max(interiorIrradianceSide, .zero), 0)
         u.interiorIrrDown = SIMD4(simd_max(interiorIrradianceDown, .zero), 0)
         // C1 — exactly one sun (see `RTSunOwnership`). This pass is ADDITIVE over a
@@ -7824,6 +8945,25 @@ public final class IlluminatoramaRenderer {
         // slabs that are real to light and never drawn. Camera-visible rays
         // (reflections here, refraction in the glass pass) deliberately don't.
         u.transportRayMask = Self.rtTransportRayMask
+        // DH-0653 — chart-assignment overlay + hit/miss counters. The counters run with
+        // the cache OFF too: their `reshade` column is the baseline a cache-on run's
+        // `cached` column is compared against.
+        u.debugSurfCacheCharts = (debugTerm == .surfaceCacheCharts) ? 1 : 0
+        var hitStats: MTLBuffer? = nil
+        if Self.surfCacheStatsRequested {
+            surfHitStatsBuffer = surfCounterBuffer(surfHitStatsBuffer, slots: 8,
+                                                   label: "Illuminatorama.surfcache.hitStats")
+            if let sb = surfHitStatsBuffer {
+                if let line = Self.surfCacheHitLine(drainSurfCounters(sb, slots: 8)) {
+                    Self.recordSurfCacheStats(line)
+                }
+                hitStats = sb
+                u.surfStatsEnabled = 1
+            }
+        }
+        // DH-0872 — same coefficient the tonemap pass uses, applied to the GI
+        // pass's own raw sky-miss sample (see the kernel's miss branch).
+        u.scotopicDesaturation = max(0, scotopicDesaturation)
         memcpy(rtInstUniformBuffer.contents(), &u, MemoryLayout<RTInstUniforms>.stride)
 
         guard let enc = timedComputeEncoder(cb, "rtLightingTLAS") else { return }
@@ -7865,6 +9005,8 @@ public final class IlluminatoramaRenderer {
         enc.setBuffer(albedoAtlas.uvScaleBuffer, offset: 0, index: 16)
         enc.setBuffer(pointLightBuffer, offset: 0, index: 17)
         enc.setBuffer(spotLightBuffer, offset: 0, index: 18)
+        // DH-0718 — area lights (buffer 20); a dummy when none are read.
+        enc.setBuffer(secondaryAreaLightCount > 0 ? areaLightBuffer : instData, offset: 0, index: 20)
         enc.setTexture(irradianceCube, index: 6)
         enc.setTexture(albedoAtlas.texture, index: 7)
         // C2 — the noisy diffuse (soft shadow + GI) goes to its own buffer so the
@@ -7872,6 +9014,11 @@ public final class IlluminatoramaRenderer {
         // path does. Before this the TLAS kernel composited it inline, which is
         // why both denoisers sat in the soup-only `else` branch doing nothing.
         enc.setTexture(rtDiffuseTexture, index: 8)
+        enc.setTexture(specIBLOn ? specIBLTexture : specIBLDummyTexture, index: 9)
+        enc.setTexture(diffSkyOn ? diffSkyTexture : diffSkyDummyTexture, index: 10)
+        // DH-0653 hit/miss counters (buffer 19). Dummy = instData, never added to while
+        // `surfStatsEnabled` is 0.
+        enc.setBuffer(hitStats ?? instData, offset: 0, index: 19)
         // The TLAS references the BLASes, which reference the mesh vertex/index
         // buffers (and the curve BLASes the pooled curve buffers) — all must be
         // resident for the intersector.
@@ -8152,6 +9299,7 @@ public final class IlluminatoramaRenderer {
             self.rtDiffuseTexture    = t.rtDiffuse
             self.velocityTexture     = t.velocity
             self.gbufferLayer        = t.layer
+            self.gbufferMaterial     = nil          // DH-0140 — re-made at the new size on first use
             self.historyA            = t.historyA
             self.historyB            = t.historyB
             self.taaResolvedTexture  = t.taaResolved
@@ -8249,6 +9397,11 @@ public final class IlluminatoramaRenderer {
         ssrNeedsFirstFrame  = true
         rtGINeedsFirstFrame = true
 
+        // S3.2 — a document swap throws away accumulated frames; force the DDGI
+        // settle gate to re-trace next frame even if the new scene happens to hash
+        // identically to the old one, so a stale converged atlas is never reused.
+        ddgiConvergenceGate.reset()
+
         // Auto-exposure EMA — re-seed the GPU ExposureState buffer to the exact
         // cold-start values written once in the constructor:
         //   [prevTargetLogLum = -2.0, smoothedExposure = 1.0,
@@ -8323,6 +9476,13 @@ public final class IlluminatoramaRenderer {
     /// fixed Timer cadence, and to skip re-presenting a stale `outputTexture`.
     @discardableResult
     public func render(blocking: Bool = false) -> Bool {
+        // Read-and-CLEAR the awaited-frame arming here, before any early return, so no exit
+        // path can leave it set for the next caller (see `renderAwaited()`). A nil
+        // `pendingFrameCompletion` is what an early return leaves behind, and
+        // `awaitCommittedFrame()` reads that as "nothing to wait for".
+        let awaited = armAwaitedFrame
+        armAwaitedFrame = false
+        if awaited { pendingFrameCompletion = nil }
         // Fail LOUD on a boot-relative animation clock. `time` is a Float used as a phase by
         // every GPU oscillator, so a large absolute value quantises all of them (see `time`'s
         // doc and `RenderClock`). This is the check that would have caught the defect on the
@@ -8451,6 +9611,7 @@ public final class IlluminatoramaRenderer {
             instanceStableFrames = 0
             lastUploadedInstances = instances   // COW reference, no deep copy
             contentHasSway = instances.contains { $0.data.swayMode == 2 }
+            rebuildSwayingSpheres()
         }
         if glassNow.count == lastGlassFlat.count,
            zip(glassNow, lastGlassFlat).allSatisfy({ $0.kind == $1.kind && $0.insts == $1.insts }) {
@@ -8479,6 +9640,7 @@ public final class IlluminatoramaRenderer {
         updatePointShadows()
         uploadFrameUniforms()
         uploadInstances()
+        computeCullBounds()   // DH-0534 — reads the CPU-written instance copy, before any GPU hook
         uploadPointLights()
         uploadSpotLights()
         uploadAreaLights()
@@ -8656,9 +9818,9 @@ public final class IlluminatoramaRenderer {
         encodeTAAResolve(cb)
         // Stash this frame's depth as next frame's "previous" for the resolve's
         // disocclusion test. The resolve above already consumed last frame's
-        // copy. In-place copy is safe under maxFramesInFlight==1 — this command
-        // buffer fully completes before the next frame's G-buffer overwrites
-        // `depthTexture`. Skipped when TAA is off (nothing reads it); the
+        // copy. The in-place copy is a GPU blit on this command buffer, and buffers on
+        // one queue execute in order, so it lands before the next frame's G-buffer pass
+        // overwrites `depthTexture` whatever the in-flight pool depth. Skipped when TAA is off (nothing reads it); the
         // enable-transition's taaNeedsFirstFrame covers the first re-enabled frame.
         if taaEnabled, let blit = cb.makeBlitCommandEncoder() {
             blit.copy(from: depthTexture, to: previousDepthTexture)
@@ -8697,7 +9859,12 @@ public final class IlluminatoramaRenderer {
         let sem = inFlightSemaphore
         let meter = gpuMeter
         let pt = passTimer
-        let errPath = ProcessInfo.processInfo.environment["VIZ_ILLUMI_CBERROR_PATH"]
+        let errPath = Self.frameEnv("VIZ_ILLUMI_CBERROR_PATH")
+        // The awaited-frame signal, if `renderAwaited()` armed one. It must be created and
+        // installed HERE — `addCompletedHandler` is only legal before `commit()`, so a caller
+        // cannot decide to wait asynchronously after the fact.
+        let completion: FrameCompletionSignal? = awaited ? FrameCompletionSignal() : nil
+        pendingFrameCompletion = completion
         cb.addCompletedHandler { buf in
             meter.record(buf)
             let gpuMs = (buf.gpuEndTime - buf.gpuStartTime) * 1000.0
@@ -8723,7 +9890,12 @@ public final class IlluminatoramaRenderer {
             // permit, shrinking the effective in-flight depth from 2 to 1 so heavy RT
             // scenes stay responsive. Converges back to 2 when frames get light again.
             sync.frameCompletedAdaptive(gpuMs: gpuMs, semaphore: sem)
+            // LAST, and after `markCompleted` above: an awaiter resumes into
+            // `promoteCompletedBuffer()`, which can only find this frame once `writeIdx` is
+            // published. Same ordering `waitUntilCompleted()` gives the blocking path.
+            completion?.signal()
         }
+        lastCommittedFrameCB = cb
         cb.commit()
 
         // CAPTURE CONTRACT (see `blocking` on this method). A snapshot caller must be
@@ -8735,7 +9907,10 @@ public final class IlluminatoramaRenderer {
         // returns only after the completion handler above has run, so `markCompleted`
         // has already published `writeIdx` and the promote below always finds it.
         // Live rendering (`blocking == false`) is untouched and stays pipelined.
-        if blocking {
+        // `awaited` keeps the never-drop half of the contract (the semaphore wait above) and
+        // moves ONLY the CPU stall: `awaitCommittedFrame()` performs the same wait-then-promote
+        // from a suspension instead of from `__psynch_cvwait` on the caller's thread.
+        if blocking && !awaited {
             cb.waitUntilCompleted()
             promoteCompletedBuffer()
         }
@@ -8775,6 +9950,53 @@ public final class IlluminatoramaRenderer {
             irrCacheToggle.toggle()
         }
         return true
+    }
+
+    /// **A `blocking` frame whose CPU wait is a suspension instead of a stall.** Commit the
+    /// frame under the full capture contract — never dropped, promoted before the caller
+    /// reads `outputTexture` — but return as soon as it is *committed*, leaving the
+    /// wait-and-promote to `awaitCommittedFrame()`.
+    ///
+    /// WHY. `render(blocking: true)` ends in `cb.waitUntilCompleted()`, which parks the
+    /// CALLING thread in `__psynch_cvwait` until the GPU is done. For a headless harness that
+    /// is exactly right — there is nothing else for that thread to do. For an interactive
+    /// host settling a still on the main thread it is not: a 4-second ray-traced frame is
+    /// 4 seconds in which the run loop does not iterate, so the window does not repaint, the
+    /// cursor does not track and a progress indicator does not move. Rendering one frame per
+    /// `await` does not help by itself — the thread is still inside the wait for all but the
+    /// microseconds between frames. The wait itself has to move.
+    ///
+    /// Pair it strictly:
+    /// ```swift
+    /// _ = renderer.renderAwaited()
+    /// await renderer.awaitCommittedFrame()   // outputTexture is now THIS frame
+    /// ```
+    /// Between the two calls the frame is in flight and `outputTexture` still holds the
+    /// PREVIOUS one, so a reader that skips the await gets a frame behind — the same trap
+    /// `blocking: false` has always had, and the reason the blocking path exists.
+    ///
+    /// Not a replacement for `render(blocking:)`: a synchronous caller (every `swift test`
+    /// capture, every GPU gate) has no suspension point to spend and should keep using it.
+    @discardableResult
+    public func renderAwaited() -> Bool {
+        armAwaitedFrame = true
+        return render(blocking: true)
+    }
+
+    /// Wait for the frame `renderAwaited()` committed, then promote it — the second half of
+    /// that call's capture contract, performed from a suspension so the caller's thread stays
+    /// in its run loop while the GPU works.
+    ///
+    /// Safe to call when nothing is pending (no armed render, or one that returned early on an
+    /// empty scene): it promotes and returns, which is precisely what the blocking path leaves
+    /// behind in those cases. Awaiting the same frame twice is likewise a no-op rather than a
+    /// hang — the signal is consumed on the first await.
+    public func awaitCommittedFrame() async {
+        if let signal = pendingFrameCompletion {
+            pendingFrameCompletion = nil
+            await signal.wait()
+        }
+        promoteCompletedBuffer()
     }
 
     // ── Presented-buffer pool helpers ─────────────────────────────────────────
@@ -8881,7 +10103,17 @@ public final class IlluminatoramaRenderer {
     // the lighting kernel can read from any slice without UB.
 
     private func encodeShadowPasses(_ cb: MTLCommandBuffer) {
-        guard shadowsEnabled else { return }
+        // Even with the sun cascades OFF we still open (and therefore `.clear`) every
+        // depth slice to 1.0 and issue no draws — a fully-lit map. Returning early
+        // instead (`guard shadowsEnabled else { return }`) left the last ENABLED frame's
+        // depths resident in the array, and the lighting kernel gates shadowing on the
+        // `kLightingShadowEnabled` FUNCTION CONSTANT alone (`frame.shadowEnabled` is a
+        // dead uniform). The init-time uber lighting variant — the one that runs for the
+        // frames the shadow-OFF specialization is still compiling in the background — is
+        // built with that constant true, so it kept sampling the stale cascade map and
+        // printed the previous frame's shadows with the toggle already off. A cleared
+        // slice (depth == 1.0) compares as "lit" everywhere, so no consumer can resurrect
+        // a shadow regardless of which lighting variant is live. (DH-0619)
         for cascade in 0..<Self.cascadeCount {
             let pass = MTLRenderPassDescriptor()
             pass.depthAttachment.texture = shadowMap
@@ -8892,6 +10124,8 @@ public final class IlluminatoramaRenderer {
 
             guard let enc = timedRenderEncoder(cb, pass, "shadow.sunCascades") else { continue }
             enc.label = "Illuminatorama.shadow.c\(cascade)"
+            // Disabled → the clear above already made this a fully-lit slice; no draws.
+            guard shadowsEnabled else { enc.endEncoding(); continue }
             enc.setRenderPipelineState(shadowPipeline)
             enc.setDepthStencilState(depthState)
             // Front-face cull keeps the shadow projection biased on the
@@ -8918,9 +10152,11 @@ public final class IlluminatoramaRenderer {
             // one draw call replaces N per-instance draws per cascade /
             // per spot.
             let instStride = MemoryLayout<IlluminatoramaInstance>.stride
-            for group in meshGroups {
+            let cullClip = cullVolume(lightVP)   // DH-0534
+            for (gi, group) in meshGroups.enumerated() {
                 if directionalShadowExcludedKinds.contains(group.kind) { continue }  // e.g. lamps — no sun shadow
                 guard let mesh = meshes[group.kind] else { continue }
+                if shouldCull(gi, group, mesh, cullClip, drawn: \.cascadeDrawn, culled: \.cascadeCulled) { continue }
                 let want = shadowCullMode(mesh)
                 if want != cull { cull = want; enc.setCullMode(cull) }
                 let off = instStride * group.start
@@ -8967,6 +10203,11 @@ public final class IlluminatoramaRenderer {
         let invView = camera.viewMatrix.inverse
 
         let toLight = simd_normalize(directionalLightDirection)
+
+        // DH-0858 sub-texel jitter (see below): the wobble must be ONE shared physical
+        // light-position shift across all cascades, not scaled per cascade — captured from
+        // cascade 0 (the finest) on its iteration, reused by the coarser cascades after it.
+        var jitterTexelWorld0: Float = 0
 
         for c in 0..<count {
             let n = splitsPos[c]
@@ -9024,7 +10265,44 @@ public final class IlluminatoramaRenderer {
                 bottom: -radius, top: radius,
                 near: 0, far: 2 * radius + casterSlack
             )
-            cascadeVPs[c] = lightProj * lightView
+            // DH-0858 — sub-texel shadow-map jitter. The window/occluder edge rasterizes into
+            // this cascade at whole-texel precision (confirmed by pulling the raw depth texture:
+            // texelWorld exactly halves when resolution doubles — a real rasterization limit, not
+            // a filtering artifact), and no amount of downstream PCF/denoising can recover detail
+            // that was never captured. Jittering the light's own ortho projection by a sub-texel
+            // offset each accumulated frame — same Halton(2,3) sequence and taaFrameIndex the
+            // camera's own TAA jitter already uses (`uploadFrameUniforms`, further down this file)
+            // — re-rasterizes the occluder edge at a different sub-texel position every frame, so
+            // the photo lane's existing 32-frame accumulation supersamples the OCCLUDER, not just
+            // the receiver. Measured on the "Primary Bedroom, Facing North" repro: sub-pixel edge
+            // residual std 1.67 -> 0.87, matching the ~49% gain from doubling shadow-map
+            // resolution (1.66 -> 0.85) at zero extra VRAM/GPU cost, since this reuses accumulation
+            // that already runs every photo-lane frame. Gated on `taaEnabled` alone (not a
+            // separate flag) — harmless no-op magnitude (≤0.5 texel, ~1.6-19.6mm depending on
+            // cascade) when TAA is off, and this is the same the-photo-lane-IS-real-TAA-now fact
+            // DH-0858's history already re-derived once (a stale "TAA off everywhere" assumption
+            // misled two earlier sessions in this same investigation — see DH-0856/0858).
+            //
+            // The wobble is ONE shared physical light-position shift, not scaled per cascade. A
+            // first cut jittered each cascade by a fraction of ITS OWN texel (fine near, coarse
+            // far), which regressed `testCascadeSplitDoesNotKinkAShadowEdgeCrossingIt`: cascades
+            // 0 and 1 then wobbled by different REAL-WORLD amounts every frame, breaking the
+            // agreement the cascade-split blend depends on at their shared boundary. Fix: derive
+            // the jitter's world-space magnitude from cascade 0's (finest) texel once, then convert
+            // that SAME world shift into each cascade's own NDC units — every cascade moves
+            // together, so the blend stays seamless.
+            var cascadeVP = lightProj * lightView
+            if taaEnabled {
+                if c == 0 { jitterTexelWorld0 = 2 * radius / Float(shadowMap.width) }
+                let jh2 = Self.halton(taaFrameIndex &+ 1, base: 2) - 0.5
+                let jh3 = Self.halton(taaFrameIndex &+ 1, base: 3) - 0.5
+                let jx = jh2 * jitterTexelWorld0 / radius
+                let jy = jh3 * jitterTexelWorld0 / radius
+                var shadowJitter = matrix_identity_float4x4
+                shadowJitter.columns.3 = SIMD4(jx, jy, 0, 1)
+                cascadeVP = shadowJitter * cascadeVP
+            }
+            cascadeVPs[c] = cascadeVP
         }
     }
 
@@ -9043,7 +10321,7 @@ public final class IlluminatoramaRenderer {
     /// (so the cone fully fits into NDC), near = small fixed bias, far =
     /// the spot's `radius`. Aspect 1.0 (square shadow map).
     private func updateSpotShadows() {
-        let capacity = spotShadowAtlasCapacity
+        let capacity = spotShadowCapacityRequest
         let enabled = spotShadowsEnabled
         // Slices go to the shadow-CASTING spots, compacted — not to array indices. A spot with
         // `castsShadow == 0` is skipped and, crucially, does not consume the slice it would
@@ -9054,14 +10332,48 @@ public final class IlluminatoramaRenderer {
         //
         // Every spot starts unshadowed so a light that loses (or never wanted) a slice cannot
         // sample a stale one — the same reset `updatePointShadows` does.
-        spotShadowSliceOwners.removeAll(keepingCapacity: true)
+        spotShadowCasters.removeAll(keepingCapacity: true)
         for i in 0..<spotLights.count { spotLights[i].shadowSliceIndex = -1 }
+        for i in 0..<areaLights.count { areaLights[i].shadowSliceIndex = -1 }
         guard enabled else { return }
+        // DH-0601 — window portals (area lights) claim slices FIRST. Daylight is the room's
+        // dominant daytime source, so it outranks a fixture cone when the atlas is tight; at
+        // night there are no portals (dayFrac 0 ⇒ none emitted), so every slice still goes to
+        // fixtures. `windowDaylightMode != .portals` scenes never set `castsShadow`, so this
+        // loop is a no-op for them (and for Visualizer softboxes).
+        for i in 0..<areaLights.count {
+            guard areaLights[i].castsShadow != 0 else { continue }
+            guard spotShadowCasters.count < capacity else { break }
+            let slice = spotShadowCasters.count
+            areaLights[i].shadowSliceIndex = Int32(slice)
+            var m = areaShadowMatrix(areaLights[i])
+            // DH-0889 — sub-texel jitter of the portal's projection, the DH-0858 cascade fix
+            // applied to the portal slices. A portal map is ONE 150° perspective, so on a wall
+            // its light grazes a texel smears across ~10 screen px and a thin occluder's shadow
+            // edge prints as a sawtooth, one tooth per texel. Shifting the projection by a
+            // Halton(2,3) sub-texel offset each accumulated frame re-rasterises the occluder at a
+            // new sub-texel position, so the still's accumulation supersamples it. The SAME
+            // matrix renders the slice and samples it, and a changed matrix already defeats the
+            // static-slice reuse (`mats == lastSpotShadowMats`), so nothing reads a stale map.
+            // Off by default: the live canvas keeps its reuse; a host enables it for stills.
+            if areaShadowJitterEnabled && taaEnabled {
+                let texel = 2 / Float(max(1, spotShadowAtlas.width))
+                var j = matrix_identity_float4x4
+                j.columns.3 = SIMD4((Self.halton(taaFrameIndex &+ 1, base: 2) - 0.5) * texel,
+                                    (Self.halton(taaFrameIndex &+ 1, base: 3) - 0.5) * texel, 0, 1)
+                m = j * m
+            }
+            areaLights[i].shadowMatrix = m
+            // A portal faces INTO the room and its frustum is capped at the portal range —
+            // the exterior lawn (the only GPU-fed geometry) can never enter it, so the slice
+            // is reusable while the CPU-visible scene holds (same argument as an interior cone,
+            // DH-0631).
+            spotShadowCasters.append(ShadowCaster(matrix: m, reuseBit: true, owner: .area(i)))
+        }
         for i in 0..<spotLights.count {
             guard spotLights[i].castsShadow != 0 else { continue }
-            guard spotShadowSliceOwners.count < capacity else { break }
-            let slice = spotShadowSliceOwners.count
-            spotShadowSliceOwners.append(i)
+            guard spotShadowCasters.count < capacity else { break }
+            let slice = spotShadowCasters.count
             spotLights[i].shadowSliceIndex = Int32(slice)
             // Light view: apex at spot.position, looking down the spot's
             // direction (which already points the way light travels).
@@ -9096,7 +10408,82 @@ public final class IlluminatoramaRenderer {
             let near = max(0.005, far * 0.002)
             let proj = Self.perspectiveRH(fovY: fovY, aspect: 1.0, near: near, far: far)
             spotLights[i].shadowMatrix = proj * lightView
+            let reuse = spotLights[i].castsShadow & IlluminatoramaSpotLight.castsShadowIgnoresGPUGeometry != 0
+            spotShadowCasters.append(ShadowCaster(matrix: spotLights[i].shadowMatrix,
+                                                  reuseBit: reuse, owner: .spot(i)))
         }
+        ensureSpotShadowAtlas(casting: spotShadowCasters.count)
+        // If the reallocation could not happen, no slice index may point past the atlas —
+        // trim the surplus back to unshadowed (the same state a caster past the cap is in).
+        while spotShadowCasters.count > spotShadowAtlasCapacity {
+            switch spotShadowCasters.removeLast().owner {
+            case .spot(let i): spotLights[i].shadowSliceIndex = -1
+            case .area(let i): areaLights[i].shadowSliceIndex = -1
+            }
+        }
+    }
+
+    /// DH-0601 — the light-space view-projection for a window portal's VISIBILITY shadow map.
+    /// A single perspective from the portal centre looking along its inward emitting normal
+    /// (`normalize(cross(ex, ey))`), wide enough to frame the room the portal lights. It cannot
+    /// cover the full emitting hemisphere — the LTC eval still lights the grazing edges — but a
+    /// receiver outside the frustum reads as fully visible (the same fallback the spot path
+    /// takes), and the near/mid room where objects actually stand is well inside it. Near/far
+    /// follow the spot convention against the same 512² depth atlas.
+    private func areaShadowMatrix(_ al: IlluminatoramaAreaLight) -> simd_float4x4 {
+        var nL = simd_cross(al.ex, al.ey)
+        let len = simd_length(nL)
+        guard len > 1e-6 else { return matrix_identity_float4x4 }
+        nL /= len
+        let upHint: SIMD3<Float> = abs(nL.y) < 0.95 ? SIMD3(0, 1, 0) : SIMD3(0, 0, 1)
+        let lightView = Self.lookAtRH(eye: al.center, target: al.center + nL, up: upHint)
+        let far  = max(0.5, al.radius)
+        let near = max(0.005, far * 0.002)
+        // ~150° — wide enough to reach the near-window floor and flanking walls without the
+        // grazing-edge precision loss of a full 170°.
+        let fovY: Float = 2.62
+        let proj = Self.perspectiveRH(fovY: fovY, aspect: 1.0, near: near, far: far)
+        return proj * lightView
+    }
+
+    /// DH-0134 — size the spot-shadow atlas to the host's request, lazily.
+    ///
+    /// Grows only when a CASTER needs a slice the atlas does not have (never on the request
+    /// alone, so a host that asks for 64 and has three lamps still pays for 8), in whole
+    /// 8-slice steps so a scene gaining lights one at a time does not reallocate per light,
+    /// and never past the request. Shrinks back to the shipped 8-slice footprint when the
+    /// request drops below the allocation — the host left its photo lane. A failed
+    /// reallocation keeps the old atlas; the caller trims slice indices to what exists.
+    private func ensureSpotShadowAtlas(casting: Int) {
+        let request = spotShadowCapacityRequest
+        let floor = Self.spotShadowCapacityDefault
+        var want = spotShadowAtlasCapacity
+        if casting > want { want = min(request, ((casting + 7) / 8) * 8) }
+        if request < want && want > floor { want = max(floor, request) }
+        guard want != spotShadowAtlasCapacity else { return }
+        reallocateSpotShadowAtlas(resolution: spotShadowMapResolution, capacity: want)
+    }
+
+    /// Rebuild the spot/area shadow atlas at `resolution` × `capacity`, and drop every cache that
+    /// points at the old texture. The ONE place the atlas is replaced, so a resolution change and
+    /// a capacity change cannot forget different halves of the invalidation.
+    private func reallocateSpotShadowAtlas(resolution: Int, capacity: Int) {
+        let fresh: MTLTexture
+        do {
+            fresh = try Self.makeSpotShadowAtlas(device: device,
+                                                 resolution: resolution,
+                                                 capacity: capacity)
+        } catch {
+            Self.log.error("spot-shadow atlas reallocation to \(capacity) slices at \(resolution)² failed: \(error.localizedDescription); keeping \(self.spotShadowAtlasCapacity)")
+            return
+        }
+        spotShadowAtlas = fresh
+        spotShadowAtlasCapacity = capacity
+        // The cached pass descriptors point at the OLD texture, and the static-scene skip
+        // would otherwise believe the (empty) new atlas already holds this frame's maps.
+        spotShadowPassDescs.removeAll()
+        spotShadowPassLabels.removeAll()
+        lastSpotShadowMats.removeAll()
     }
 
     /// Render the depth-only pass for each shadowed spot into its slice
@@ -9104,18 +10491,27 @@ public final class IlluminatoramaRenderer {
     /// spots are present, or when the host hasn't pushed any instances
     /// (no occluders → no shadow data needed).
     private func encodeSpotShadowPasses(_ cb: MTLCommandBuffer) {
-        guard spotShadowsEnabled, !spotShadowSliceOwners.isEmpty, !instances.isEmpty else { return }
-        let count = spotShadowSliceOwners.count
+        guard spotShadowsEnabled, !spotShadowCasters.isEmpty, !instances.isEmpty else { return }
+        let count = spotShadowCasters.count
         // PERF (static-scene skip): spot shadow maps are LIGHT-space — a camera
         // orbit re-rendered every slice (up to 8 full scene depth passes) into
         // byte-identical maps every frame. When the scene content held (see
         // `sceneStaticForShadows`) and every slice's light matrix is unchanged,
         // the atlas already contains exactly these maps — reuse them.
-        let mats = spotShadowSliceOwners.map { spotLights[$0].shadowMatrix }
+        let mats = spotShadowCasters.map { $0.matrix }
         if sceneStaticForShadows && mats == lastSpotShadowMats {
             staticSkipStats.spotShadowPassesSkipped += count
             return
         }
+        // DH-0631 / DH-0637 — per-slice reuse when the only things keeping the scene from "static"
+        // are live GPU-fed geometry (the lawn) and/or swaying pendants. A slice still holds a valid
+        // map from the last time it was rendered with this same matrix if (a) every CPU-visible
+        // instance held, (b) either no GPU geometry is live or the owner asserts none can enter its
+        // cone, and (c) no swaying instance's swing-sphere intersects its cone. Slices that fail
+        // (b) or (c) — exterior cones, the can above a swinging pendant — re-render as before.
+        let gpuGeometryLive = !gpuRepackTasks.isEmpty || onEncodeGPUInstances != nil
+        let perSliceBase = spotShadowGPUGeometryOptOutEnabled
+            && instanceShapeStableFrames >= 1 && mats == lastSpotShadowMats
         lastSpotShadowMats = mats
         // Pass descriptors + labels are cached per slice (they never change after
         // the atlas exists) — this loop used to allocate a fresh descriptor and
@@ -9132,6 +10528,22 @@ public final class IlluminatoramaRenderer {
             spotShadowPassLabels.append("Illuminatorama.spotShadow.s\(slice)")
         }
         for slice in 0..<count {
+            if perSliceBase {
+                // (b) GPU geometry: none live, or the owner asserted none can enter its frustum.
+                // (c) Sway (DH-0637): no swaying instance's swing-sphere intersects a spot's cone; an
+                //     area-light slice has no cone to test, so it re-renders while anything sways.
+                let caster = spotShadowCasters[slice]
+                let gpuOK = !gpuGeometryLive || caster.reuseBit
+                let swayOK: Bool
+                switch caster.owner {
+                case .spot(let li): swayOK = !swayingGeometryCanEnter(spotLights[li])
+                case .area:         swayOK = swayingSpheres.isEmpty
+                }
+                if gpuOK && swayOK {
+                    staticSkipStats.spotShadowPassesSkipped += 1
+                    continue
+                }
+            }
             guard let enc = timedRenderEncoder(cb, spotShadowPassDescs[slice], "shadow.spot") else { continue }
             enc.label = spotShadowPassLabels[slice]
             enc.setRenderPipelineState(shadowPipeline)
@@ -9143,7 +10555,7 @@ public final class IlluminatoramaRenderer {
             enc.setFrontFacing(.counterClockwise)
             applyShadowRasterBias(enc)
 
-            var lightVP = spotLights[spotShadowSliceOwners[slice]].shadowMatrix
+            var lightVP = spotShadowCasters[slice].matrix
             enc.setVertexBytes(&lightVP,
                                length: MemoryLayout<simd_float4x4>.stride,
                                index: 3)
@@ -9157,8 +10569,10 @@ public final class IlluminatoramaRenderer {
             // one draw call replaces N per-instance draws per cascade /
             // per spot.
             let instStride = MemoryLayout<IlluminatoramaInstance>.stride
-            for group in meshGroups {
+            let cullClip = cullVolume(lightVP)   // DH-0534
+            for (gi, group) in meshGroups.enumerated() {
                 guard let mesh = meshes[group.kind] else { continue }
+                if shouldCull(gi, group, mesh, cullClip, drawn: \.spotDrawn, culled: \.spotCulled) { continue }
                 let want = shadowCullMode(mesh)
                 if want != cull { cull = want; enc.setCullMode(cull) }
                 let off = instStride * group.start
@@ -9314,8 +10728,10 @@ public final class IlluminatoramaRenderer {
                 var shadowTime = time
                 enc.setVertexBytes(&shadowTime, length: MemoryLayout<Float>.stride, index: 4)
 
-                for group in meshGroups {
+                let cullClip = cullVolume(lightVP)   // DH-0534
+                for (gi, group) in meshGroups.enumerated() {
                     guard let mesh = meshes[group.kind] else { continue }
+                    if shouldCull(gi, group, mesh, cullClip, drawn: \.pointDrawn, culled: \.pointCulled) { continue }
                     let want = shadowCullMode(mesh)
                     if want != cull { cull = want; enc.setCullMode(cull) }
                     let off = instStride * group.start
@@ -9375,7 +10791,7 @@ public final class IlluminatoramaRenderer {
     private func encodeParticleStep(_ cb: MTLCommandBuffer) {
         guard !particleEmitters.isEmpty else { return }
         let now = CACurrentMediaTime()
-        let dt = Float(max(0, min(0.05, now - lastParticleTickTime)))
+        let dt = Float(max(0, min(0.05, fixedFrameDelta ?? (now - lastParticleTickTime))))
         lastParticleTickTime = now
         guard dt > 0 else { return }
         guard let enc = cb.makeComputeCommandEncoder() else { return }
@@ -9675,7 +11091,7 @@ public final class IlluminatoramaRenderer {
         // refraction/reflection hit reads the cached multi-bounce radiance when on.
         let cacheOn = useRT && surfCacheActive && surfCardCount > 0
             && rtSoupTriBaseBuffer != nil && surfTriCardBuffer != nil
-            && surfCacheCurrentAtlas != nil
+            && surfConsumerAtlas != nil
             && rtSoupTriBaseCount == instances.count
         var u = IlluminatoramaGlassRTUniforms()
         u.cameraWorldPos = fu.cameraWorldPos
@@ -9754,6 +11170,9 @@ public final class IlluminatoramaRenderer {
         let glassIrrW = max(0, min(1, interiorIrradianceWeight))
         u.interiorIrrUp = SIMD4(simd_max(interiorIrradianceUp, .zero), glassIrrW)
         u.setInteriorRoomGains(interiorRoomGains, enabled: interiorRoomGainsEnabled)
+        // DH-0718 — area lights at through-glass hits too (same body, same lanes).
+        u.interiorRoomGainMeta.y = rtShade ? Float(secondaryAreaLightCount) : 0
+        u.interiorRoomGainMeta.z = Float(max(0, min(secondaryAreaShadowRays, 8)))
         u.interiorIrrSide = SIMD4(simd_max(interiorIrradianceSide, .zero), 0)
         u.interiorIrrDown = SIMD4(simd_max(interiorIrradianceDown, .zero), 0)
         // ── The night sky, THROUGH the glass ─────────────────────────────────
@@ -9872,6 +11291,12 @@ public final class IlluminatoramaRenderer {
             // window. Same ring buffers the lighting kernel reads this frame.
             enc.setFragmentBuffer(pointLightBuffer, offset: 0, index: 14)
             enc.setFragmentBuffer(spotLightBuffer, offset: 0, index: 15)
+            // Smooth refraction: glass hits interpolate these corner normals (a dummy with
+            // every row's base 0 means "face normal" — see `rtGlassCornerNormalBuffer`).
+            enc.setFragmentBuffer(rtGlassCornerNormalBuffer ?? instData, offset: 0, index: 16)
+            // DH-0718 — area lights at the refracted hit (buffer 17); dummy when none.
+            enc.setFragmentBuffer(secondaryAreaLightCount > 0 ? areaLightBuffer : instData,
+                                  offset: 0, index: 17)
             // The TLAS references the BLASes which reference mesh buffers — all
             // must be resident for the fragment-stage intersector.
             for blas in rtBLASList { enc.useResource(blas, usage: .read) }
@@ -9891,6 +11316,11 @@ public final class IlluminatoramaRenderer {
     }
 
     private func encodeGBufferPass(_ cb: MTLCommandBuffer) {
+        // DH-0140 — the lane was decided when this frame's uniforms were written; pick the
+        // matching pipelines once. The extended variants exist whenever `extendedGBufferActive`.
+        let extended = extendedGBufferActive
+        let basePipe: MTLRenderPipelineState = (extended ? gbufferPipelineExt : nil) ?? gbufferPipeline
+        let prevPipe: MTLRenderPipelineState = (extended ? gbufferPipelinePrevVertsExt : nil) ?? gbufferPipelinePrevVerts
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = gbufferAlbedoMet
         pass.colorAttachments[0].loadAction = .clear
@@ -9919,6 +11349,14 @@ public final class IlluminatoramaRenderer {
         pass.colorAttachments[4].loadAction = .clear
         pass.colorAttachments[4].storeAction = .store
         pass.colorAttachments[4].clearColor = MTLClearColor(red: Double(UInt32.max), green: 0, blue: 0, alpha: 0)
+        if extended, let material = gbufferMaterial {
+            // Clear to 0 = "not written": impostors and any legacy pipeline that draws into this
+            // pass without declaring color(5) leave the clear value, and every reader falls back.
+            pass.colorAttachments[5].texture = material
+            pass.colorAttachments[5].loadAction = .clear
+            pass.colorAttachments[5].storeAction = .store
+            pass.colorAttachments[5].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        }
         pass.depthAttachment.texture = depthTexture
         pass.depthAttachment.loadAction = .clear
         pass.depthAttachment.storeAction = .store
@@ -9926,7 +11364,7 @@ public final class IlluminatoramaRenderer {
 
         guard let enc = timedRenderEncoder(cb, pass, "gbuffer") else { return }
         enc.label = "Illuminatorama.gbuffer"
-        enc.setRenderPipelineState(gbufferPipeline)
+        enc.setRenderPipelineState(basePipe)
         enc.setDepthStencilState(depthState)
         enc.setFrontFacing(.counterClockwise)
         // Cull mode is a PER-MESH decision here (a two-sided mesh draws `.none`),
@@ -9983,7 +11421,9 @@ public final class IlluminatoramaRenderer {
         // Track which pipeline is bound to avoid redundant state switches when the
         // groups are all ordinary meshes (the common case).
         var prevVertsBound = false
-        for group in meshGroups {
+        var substrateBiased = false
+        let cullClip = cullVolume(gbufferCullVP)   // DH-0534
+        for (gi, group) in meshGroups.enumerated() {
             // Superquadric impostor box kinds are drawn by the impostor pipeline
             // below; RT-proxy kinds exist only in the TLAS; shadow-only kinds are
             // lighting occluders that draw solely into the shadow maps. All skipped here.
@@ -9991,21 +11431,30 @@ public final class IlluminatoramaRenderer {
                rtProxyMeshKinds.contains(group.kind) ||
                shadowOnlyMeshKinds.contains(group.kind) { continue }
             guard let mesh = meshes[group.kind] else { continue }
+            if shouldCull(gi, group, mesh, cullClip, drawn: \.gbufferDrawn, culled: \.gbufferCulled) { continue }
             // Two-sided meshes (open / dynamic MC fluid surfaces) render cull
             // `.none` so they don't go hollow when their back side faces the
             // camera; the fragment shader flips the normal for back faces.
             let want: MTLCullMode = mesh.doubleSided ? .none : .back
             if cull != want { cull = want; enc.setCullMode(want) }
+            // The substrate takes a depth-buffer bias so a millimetre of lift on top of it keeps
+            // winning at any distance (see `substrateMeshKinds`). Tracked like `cull` — one
+            // state change per run of groups, not per group.
+            let wantBias = substrateMeshKinds.contains(group.kind)
+            if wantBias != substrateBiased {
+                substrateBiased = wantBias
+                enc.setDepthBias(wantBias ? substrateDepthBias : 0, slopeScale: 0, clamp: 0)
+            }
             let off = instStride * group.start
             // Issue #65 — deforming GPU meshes draw with the kUsePrevVerts pipeline
             // and bind their per-vertex prev positions at buffer(5); every other
             // group uses the base pipeline (which declares no buffer(5)).
             let prevPos = prevPosByKind[group.kind]
             if prevPos != nil {
-                if !prevVertsBound { enc.setRenderPipelineState(gbufferPipelinePrevVerts) }
+                if !prevVertsBound { enc.setRenderPipelineState(prevPipe) }
                 prevVertsBound = true
             } else if prevVertsBound {
-                enc.setRenderPipelineState(gbufferPipeline)
+                enc.setRenderPipelineState(basePipe)
                 prevVertsBound = false
             }
             enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
@@ -10040,6 +11489,8 @@ public final class IlluminatoramaRenderer {
         // the fragment ray-traces the analytic surface, writing the G-buffer +
         // analytic depth + analytic motion vectors. The param buffer is bound at
         // the same per-group offset as the instance buffer (grouped-order aligned).
+        if substrateBiased { substrateBiased = false; enc.setDepthBias(0, slopeScale: 0, clamp: 0) }
+
         if let sqPipe = superquadricImpostorPipeline, !impostorMeshKinds.isEmpty {
             enc.setRenderPipelineState(sqPipe)
             if cull != .front { cull = .front; enc.setCullMode(.front) }
@@ -10148,7 +11599,9 @@ public final class IlluminatoramaRenderer {
         var irradianceScale: Float;            var enabled: UInt32          // 64
         var irrTileSize: UInt32;               var depthTileSize: UInt32    // 72
         var instanceCount: UInt32;             var twoBounceEnabled: UInt32 // 80
-        var emitterCount: UInt32 = 0; var _pad2: UInt32 = 0                 // 88..92
+        // `rayMask` repurposes the former `_pad2` (S3.2 Ultra): the TLAS
+        // transport-ray mask for `illumi_ddgi_trace_tlas`; 0 on the analytic path.
+        var emitterCount: UInt32 = 0; var rayMask: UInt32 = 0               // 88..92
         // stride: 96 bytes
     }
 
@@ -10243,6 +11696,42 @@ public final class IlluminatoramaRenderer {
         ddgiInstanceDataCapacity = newCap
     }
 
+    /// FNV-1a digest of every DDGI probe-field input EXCEPT the instance / proxy
+    /// geometry (folded in separately via `ddgiGeometryEpoch`). A change re-arms the
+    /// settle gate — the sun rotating, the grid moving, an emitter lighting up, a
+    /// ray/hysteresis knob turned. NOT hashed: the sky texture's *contents* (an
+    /// in-place re-bake keeps the same object); a time-of-day change that alters the
+    /// sky also rotates `directionalLightDirection`, which IS hashed, so the common
+    /// case re-arms anyway.
+    private func ddgiScalarInputHash(
+        emitterLights: [(position: SIMD3<Float>, color: SIMD3<Float>, radius: Float)]
+    ) -> UInt64 {
+        var h: UInt64 = 0xcbf2_9ce4_8422_2325
+        func mix(_ f: Float) { h = (h ^ UInt64(f.bitPattern)) &* 0x0000_0100_0000_01b3 }
+        func mix3(_ v: SIMD3<Float>) { mix(v.x); mix(v.y); mix(v.z) }
+        func mixI(_ i: Int) { h = (h ^ UInt64(bitPattern: Int64(i))) &* 0x0000_0100_0000_01b3 }
+        mix3(simd_normalize(directionalLightDirection))
+        mix3(directionalLightColor)
+        mix3(ddgiGridOrigin)
+        mixI(ddgiGridDims.x); mixI(ddgiGridDims.y); mixI(ddgiGridDims.z)
+        mix(ddgiProbeSpacing); mixI(max(1, ddgiRaysPerProbe))
+        mix(ddgiHysteresis); mix(ddgiIrradianceScale)
+        mixI(ddgiTwoBounceEnabled ? 1 : 0)
+        // S3.2 Ultra — the lane itself is an input: flipping between the TLAS
+        // and analytic kernels (knob or TLAS availability) must re-arm the
+        // settle gate so the field re-converges instead of freezing mid-mix.
+        mixI(ddgiRTTraceUsable ? 1 : 0)
+        for e in emitterLights { mix3(e.position); mix3(e.color); mix(e.radius) }
+        return h
+    }
+
+    /// True when this frame's DDGI trace can run against the real TLAS.
+    private var ddgiRTTraceUsable: Bool {
+        ddgiRTTraceEnabled && rtTLASActive && rtTLAS != nil
+            && rtInstanceDataBuffer != nil && rtObjNormalBuffer != nil
+            && ddgiTraceTLASPipeline != nil
+    }
+
     private func encodeDDGIFrame(_ cb: MTLCommandBuffer) {
         // Phase 3.3 — toggle the ping-pong at the *start* of the DDGI frame
         // (not the end) so accessor semantics stay obvious through the
@@ -10256,7 +11745,17 @@ public final class IlluminatoramaRenderer {
         //   Previous = A (both still empty). Trace reads zero, so two-
         //   bounce contributes zero this frame; one-bounce direct works
         //   normally. Subsequent frames carry real data.
-        ddgiUseAtlasA.toggle()
+        //
+        // S3.2 — the ping-pong toggle MOVED below the settle gate: a frame the
+        // gate skips must NOT toggle, or `ddgiIrradianceCurrent` would flip to the
+        // atlas we did not write and the lighting pass would read a half-stale
+        // field. Only a frame that actually traces advances the ping-pong.
+
+        // S3.2 — the trace intersects the render instances (analytic subset) PLUS
+        // the host's non-rendered proxy boxes (a house's walls/floor/ceiling). The
+        // uniform instance count, the buffer capacity and the pack loop all cover
+        // both.
+        let totalDDGIInstances = instances.count + ddgiProxyInstances.count
 
         // Write the DDGIUniforms buffer regardless of the enabled flag —
         // the lighting kernel always binds it (enabled=0 makes the lookup a no-op).
@@ -10276,7 +11775,7 @@ public final class IlluminatoramaRenderer {
             enabled:              ddgiEnabled ? 1 : 0,
             irrTileSize:          UInt32(Self.ddgiIrrTileSize),
             depthTileSize:        UInt32(Self.ddgiDepthTileSize),
-            instanceCount:        UInt32(instances.count),
+            instanceCount:        UInt32(totalDDGIInstances),
             twoBounceEnabled:     (ddgiEnabled && ddgiTwoBounceEnabled) ? 1 : 0
         )
 
@@ -10289,10 +11788,36 @@ public final class IlluminatoramaRenderer {
             if let light = f.ddgiLight { emitterLights.append(light) }
         }
         u.emitterCount = UInt32(emitterLights.count)
+        // S3.2 Ultra — transport mask for the TLAS trace: opaque + invisible
+        // occluder, the same mask GI rays carry (a probe ray must stop at the
+        // lighting-only ceiling slabs or interiors flood with sky). 0 on the
+        // analytic lane, where the kernel never reads it.
+        let rtTrace = ddgiRTTraceUsable
+        u.rayMask = rtTrace ? Self.rtTransportRayMask : 0
 
         memcpy(ddgiUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaDDGIUniforms>.stride)
 
-        guard ddgiEnabled, !instances.isEmpty else { return }
+        guard ddgiEnabled, totalDDGIInstances > 0 else { return }
+
+        // ── S3.2 view-independent settle gate ────────────────────────────
+        // The probe field is world-space; a camera-only orbit does not change it,
+        // so re-tracing every frame during an orbit is pure waste. Re-arm the
+        // trace only when a probe-field INPUT actually moves: geometry (folded via
+        // a monotonic epoch bumped on any unstable-content frame), proxies, the
+        // directional light, the grid, the ray/hysteresis knobs, or the emitters.
+        // With `ddgiConvergenceFrames == 0` (every scene but Daydream's house) the
+        // gate always traces — pre-S3.2 behaviour, bit-identical.
+        if instanceStableFrames == 0 || ddgiProxiesDirty { ddgiGeometryEpoch &+= 1 }
+        let scalarHash = ddgiScalarInputHash(emitterLights: emitterLights)
+        let inputHash = ddgiGeometryEpoch &* 0x100000001b3 ^ scalarHash
+        let trace = ddgiConvergenceGate.shouldTrace(
+            inputHash: inputHash, convergenceFrames: ddgiConvergenceFrames)
+        ddgiDidTraceLastFrame = trace
+        // A skipped frame reuses the converged atlas the lighting pass already
+        // reads (`ddgiIrradianceCurrent`, untouched since the last traced frame).
+        guard trace else { return }
+
+        ddgiUseAtlasA.toggle()
         ensureDDGIResources()
         guard let irrAtlas    = ddgiIrradianceCurrent,
               let depAtlas    = ddgiDepthCurrent,
@@ -10323,15 +11848,18 @@ public final class IlluminatoramaRenderer {
         // PERF (static-scene skip): this loop pays a general 4×4 inverse per instance
         // per frame — with stable content the packed buffer already holds exactly this
         // data, so repack only when the content generation moved (or on first use).
-        ensureDDGIInstanceDataBuffer(count: instances.count)
+        ensureDDGIInstanceDataBuffer(count: totalDDGIInstances)
         guard let instBuf = ddgiInstanceDataBuffer else { return }
-        if instanceStableFrames == 0 || ddgiPackedInstanceCount != instances.count {
+        if instanceStableFrames == 0 || ddgiPackedInstanceCount != totalDDGIInstances
+            || ddgiProxiesDirty {
             let instPtr = instBuf.contents().bindMemory(
-                to: DDGIGPUInstanceData.self, capacity: instances.count)
-            for (i, ref) in instances.enumerated() {
+                to: DDGIGPUInstanceData.self, capacity: totalDDGIInstances)
+            // Render instances first (analytic subset intersects; meshKind 3 is
+            // skipped in-shader), then the non-rendered proxy boxes appended.
+            var i = 0
+            for ref in instances {
                 // Phase 2.6 — meshKind=3 is "custom mesh, no analytic intersection";
                 // the trace kernel skips intersection on anything not in {0,1,2}.
-                let kind: UInt32 = ref.meshKind.gpuMeshKind
                 instPtr[i] = DDGIGPUInstanceData(
                     invModelMatrix: ref.data.modelMatrix.inverse,
                     normalMatrix:   ref.data.normalMatrix,
@@ -10339,10 +11867,24 @@ public final class IlluminatoramaRenderer {
                     metallic:       ref.data.metallic,
                     emission:       ref.data.emission,
                     roughness:      ref.data.roughness,
-                    meshKind:       kind
+                    meshKind:       ref.meshKind.gpuMeshKind
                 )
+                i += 1
             }
-            ddgiPackedInstanceCount = instances.count
+            for ref in ddgiProxyInstances {
+                instPtr[i] = DDGIGPUInstanceData(
+                    invModelMatrix: ref.data.modelMatrix.inverse,
+                    normalMatrix:   ref.data.normalMatrix,
+                    albedo:         ref.data.albedo,
+                    metallic:       ref.data.metallic,
+                    emission:       ref.data.emission,
+                    roughness:      ref.data.roughness,
+                    meshKind:       ref.meshKind.gpuMeshKind
+                )
+                i += 1
+            }
+            ddgiPackedInstanceCount = totalDDGIInstances
+            ddgiProxiesDirty = false
         }
 
         let probeCount   = ddgiGridDims.x * ddgiGridDims.y * ddgiGridDims.z
@@ -10357,7 +11899,29 @@ public final class IlluminatoramaRenderer {
         // for the second-bounce lookup; the update kernels below write to
         // the CURRENT-frame atlases. With ping-pong these are distinct
         // textures so the read-then-write within one encoder doesn't alias.
-        enc.setComputePipelineState(ddgiTracePipeline)
+        //
+        // S3.2 Ultra — when the TLAS lane is usable this dispatches
+        // `illumi_ddgi_trace_tlas` instead: same ray pattern, same uniforms,
+        // same DDGIRayRecord output, but hits come from the real acceleration
+        // structure (buffers 4–6). The update kernels below cannot tell the
+        // difference; `ddgiScalarInputHash` mixes the lane so a flip re-settles.
+        let tracePipeline: MTLComputePipelineState
+        if rtTrace, let tlasPipeline = ddgiTraceTLASPipeline,
+           let tlas = rtTLAS, let rtInst = rtInstanceDataBuffer, let objN = rtObjNormalBuffer {
+            tracePipeline = tlasPipeline
+            enc.setComputePipelineState(tlasPipeline)
+            enc.setAccelerationStructure(tlas, bufferIndex: 4)
+            enc.setBuffer(rtInst, offset: 0, index: 5)
+            enc.setBuffer(objN,   offset: 0, index: 6)
+            // The TLAS references the BLASes, which reference the mesh
+            // vertex/index buffers — all must be resident for the intersector.
+            for blas in rtBLASList { enc.useResource(blas, usage: .read) }
+            for blas in rtCurveBLASList { enc.useResource(blas, usage: .read) }
+            for buf in rtResidentBuffers { enc.useResource(buf, usage: .read) }
+        } else {
+            tracePipeline = ddgiTracePipeline
+            enc.setComputePipelineState(ddgiTracePipeline)
+        }
         enc.setBuffer(rayBuf,              offset: 0, index: 0)
         enc.setBuffer(ddgiUniformBuffer,   offset: 0, index: 1)
         enc.setBuffer(instBuf,             offset: 0, index: 2)
@@ -10365,7 +11929,7 @@ public final class IlluminatoramaRenderer {
         enc.setTexture(sky,         index: 0)
         enc.setTexture(irrAtlasPrv, index: 1)
         enc.setTexture(depAtlasPrv, index: 2)
-        let tgwT = ddgiTracePipeline.threadExecutionWidth
+        let tgwT = tracePipeline.threadExecutionWidth
         enc.dispatchThreadgroups(
             MTLSize(width: (raysPerProbe + tgwT - 1) / tgwT, height: probeCount, depth: 1),
             threadsPerThreadgroup: MTLSize(width: tgwT, height: 1, depth: 1))
@@ -10432,6 +11996,47 @@ public final class IlluminatoramaRenderer {
         if !ssaoActive, ensureNeutralAOTexture(cb) { return }
         let halfW = max(1, width / 2)
         let halfH = max(1, height / 2)
+        // RTAO (DH-0528): with a live TLAS and the host opted in, trace the near field against
+        // the real geometry into the SAME raw AO texture, so the bilateral + temporal chain and
+        // the lighting kernel's read are untouched. A frame without a TLAS (frame 1, a tripped
+        // guard) falls back to the screen-space march below, and says so.
+        if rtaoActive, let tlas = rtTLAS, let pipeline = rtaoPipeline,
+           let enc = timedComputeEncoder(cb, "rtao") {
+            enc.label = "Illuminatorama.rtao"
+            enc.setComputePipelineState(pipeline)
+            enc.setTexture(depthTexture, index: 0)
+            enc.setTexture(gbufferNormalRgh, index: 1)
+            enc.setTexture(aoTexture, index: 2)
+            enc.setAccelerationStructure(tlas, bufferIndex: 0)
+            let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
+            var u = RTAOUniforms(invViewProjection: fu.invViewProjection,
+                                 radius: max(0.02, rtaoRadius),
+                                 intensity: max(0, min(1, rtaoIntensity)),
+                                 // DH-0888 — the budget the caller ASKED for. This used to be
+                                 // silently `min(32, …)`: a public property documented as the
+                                 // ray count, quietly capped three levels down, with no
+                                 // assertion and no log. Production never exceeds it
+                                 // (`settleRTAORays` 4, `photoRTAORays` 8) so no shipped frame
+                                 // changes, but it capped a diagnostic sweep and made a 512-ray
+                                 // arm read as converged when it had traced 32. A ceiling stays
+                                 // — a runaway value would hang the GPU — but at a number no
+                                 // legitimate caller reaches, and the property means what it says
+                                 // below it.
+                                 rayCount: UInt32(max(1, min(4096, rtaoRays))),
+                                 // Same seed contract as every other traced term: walk only
+                                 // while an accumulator can average it, else freeze.
+                                 frameSeed: rtaoFrameSeed,
+                                 rayTMin: 0.004,
+                                 transportRayMask: 0x01 | 0x04,
+                                 fullWidth: UInt32(width), fullHeight: UInt32(height))
+            enc.setBytes(&u, length: MemoryLayout<RTAOUniforms>.stride, index: 1)
+            dispatch(enc, pipeline: pipeline, width: halfW, height: halfH)
+            enc.endEncoding()
+            rtaoFrameSeed &+= 1
+            rtaoDidRunLastFrame = true
+            return
+        }
+        rtaoDidRunLastFrame = false
         guard let enc = timedComputeEncoder(cb, "ssao") else { return }
         enc.label = "Illuminatorama.ssao"
         enc.setComputePipelineState(ssaoPipeline)
@@ -10549,6 +12154,19 @@ public final class IlluminatoramaRenderer {
             ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
             ddgi: ddgiEnabled, ddgiIrrCache: ddgiIrrCacheEnabled,
             rtSunShadow: rtSun)
+        // Headless/settled lane (no runloop to land the async completion — a
+        // @MainActor render loop starves the MainActor hop): compile the variant
+        // BLOCKING so the frame actually runs the specialized path instead of the
+        // init-time uber fallback. DH-0552.
+        if blockingLightingCompile {
+            if let built = engine.pipelineCache.pipelineState(
+                name: "illumi_lighting", device: device, constants: cv, variantKey: key) {
+                lastLightingFlags = bits
+                lastLightingPipeline = built
+                return built
+            }
+            return lightingPipeline
+        }
         // Non-blocking: ready variant → memoise + use it; still compiling → run
         // the uber-variant this frame and re-check next frame (no memo).
         if let ready = engine.pipelineCache.pipelineStateAsync(
@@ -10641,6 +12259,16 @@ public final class IlluminatoramaRenderer {
         // it when frame.sssStrength > 0, so non-SSS scenes leave it idle).
         // (index 20: 18/19 went to gLayer/pointShadowAtlas in the merge.)
         enc.setTexture(sssDiffuseTexture, index: 20)
+        // DH-0140 — the kernel reads this only when frame.extendedGBuffer != 0; any texture
+        // satisfies the binding otherwise.
+        enc.setTexture((extendedGBufferActive ? gbufferMaterial : nil) ?? gbufferEmission, index: 21)
+        // DH-0896 — the specular-IBL hand-off to the RT reflection pass (see `specIBLTexture`).
+        let specTarget = specIBLHandoffTarget()
+        specIBLWrittenThisFrame = specTarget != nil
+        enc.setTexture(specTarget ?? specIBLDummyTexture, index: 22)
+        let diffSkyTarget = diffSkyHandoffTarget()
+        diffSkyWrittenThisFrame = diffSkyTarget != nil
+        enc.setTexture(diffSkyTarget ?? diffSkyDummyTexture, index: 23)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
         enc.setBuffer(pointLightBuffer, offset: 0, index: 1)
         enc.setBuffer(ddgiUniformBuffer, offset: 0, index: 2)
@@ -10817,6 +12445,9 @@ public final class IlluminatoramaRenderer {
         // reproduces every existing soup host, all of which zero
         // `directionalLightColor` before enabling RT.
         u.directSunEnabled = rtOwnsDirectSun ? 1 : 0
+        // DH-0872 — same coefficient the tonemap pass uses, applied to the GI
+        // pass's own raw sky-miss sample (see the kernel's miss branch).
+        u.scotopicDesaturation = max(0, scotopicDesaturation)
         memcpy(rtUniformBuffer.contents(), &u, MemoryLayout<RTUniforms>.stride)
 
         guard let enc = cb.makeComputeCommandEncoder() else { return }
@@ -11129,6 +12760,9 @@ public final class IlluminatoramaRenderer {
         enc.setComputePipelineState(pipeline)
         enc.setTexture(hdrCompositeTexture, index: 0)
         enc.setTexture(noise, index: 1)
+        // v2 depth clip — the kernel writes only where this says there is no
+        // geometry, so the deck can no longer paint over the building.
+        enc.setTexture(depthTexture, index: 2)
         enc.setBuffer(skyU, offset: 0, index: 0)
         enc.setBuffer(cloudInViewUniformBuffer, offset: 0, index: 1)
         enc.setBuffer(lights, offset: 0, index: 2)
@@ -11235,12 +12869,19 @@ public final class IlluminatoramaRenderer {
         (dofApplied ? dofOutputTexture : nil) ?? displaySource
     }
 
-    /// Gather depth-of-field on the resolved HDR. Runs after the exposure
+    /// Lens-accurate depth-of-field on the resolved HDR. Runs after the exposure
     /// estimate and before bloom; writes a private DOF texture that bloom +
-    /// tonemap then read. No-op unless `dofEnabled` and the pipeline exists.
+    /// tonemap then read. No-op unless `dofEnabled` and the pipelines exist.
+    ///
+    /// Three dispatches: a max-|CoC| reduction per 16×16 tile, a dilate of that map by the
+    /// gather's own reach, then the gather — which reads one dilated texel to learn how far it
+    /// must look to find a NEAR-field neighbour whose confusion disc covers it, and to skip
+    /// whole tiles that are in focus. See `IlluminatoramaDOF.metal` for the optics.
     private func encodeDOFPass(_ cb: MTLCommandBuffer) {
         dofApplied = false
-        guard dofEnabled, let pipeline = dofPipeline else { return }
+        guard dofEnabled, dofCoCCoefficient > 0,
+              let pipeline = dofPipeline, let tilePipeline = dofTilePipeline,
+              let dilatePipeline = dofDilatePipeline else { return }
         // Lazily (re)allocate the DOF target to the current internal size.
         if dofOutputTexture == nil
             || dofOutputTexture?.width != width || dofOutputTexture?.height != height {
@@ -11253,19 +12894,104 @@ public final class IlluminatoramaRenderer {
             dofOutputTexture = device.makeTexture(descriptor: d)
             dofOutputTexture?.label = "Illuminatorama.dof"
         }
-        guard let out = dofOutputTexture else { return }
+        let tile = Self.dofTileSize
+        let tileW = max(1, (width + tile - 1) / tile), tileH = max(1, (height + tile - 1) / tile)
+        if dofTileTexture == nil
+            || dofTileTexture?.width != tileW || dofTileTexture?.height != tileH {
+            let d = MTLTextureDescriptor()
+            d.textureType = .type2D
+            d.pixelFormat = .r32Float
+            d.width = tileW; d.height = tileH
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            dofTileTexture = device.makeTexture(descriptor: d)
+            dofTileTexture?.label = "Illuminatorama.dof.cocTiles"
+            dofTileDilatedTexture = device.makeTexture(descriptor: d)
+            dofTileDilatedTexture?.label = "Illuminatorama.dof.cocTilesDilated"
+        }
+        // The prefilter pyramid: half resolution, full mip chain. Sized from the internal
+        // render size like everything else here, so it follows the draft/settled scale.
+        let pw = max(1, (width + 1) / 2), ph = max(1, (height + 1) / 2)
+        if dofPrefilterTexture == nil
+            || dofPrefilterTexture?.width != pw || dofPrefilterTexture?.height != ph {
+            let d = MTLTextureDescriptor()
+            d.textureType = .type2D
+            d.pixelFormat = .rgba16Float
+            d.width = pw; d.height = ph
+            d.mipmapLevelCount = Int(log2(Double(max(pw, ph))).rounded(.down)) + 1
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            dofPrefilterTexture = device.makeTexture(descriptor: d)
+            dofPrefilterTexture?.label = "Illuminatorama.dof.prefilter"
+        }
+        guard let out = dofOutputTexture, let tiles = dofTileTexture,
+              let dilated = dofTileDilatedTexture else { return }
+        // Point taps unless the pyramid is genuinely there to read: the shader treats 0 as
+        // "sample the frame directly", which is the correct fallback and NOT a silent one —
+        // it is the only value the field ever held before DH-0883.
+        let prefilter: MTLTexture? = dofPrefilterPipeline != nil ? dofPrefilterTexture : nil
         let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
         var p = DOFParams(
             invProjection: fu.invProjection,
-            focusDist: max(0.05, dofFocusDistance), aperture: max(0, dofAperture),
-            maxRadius: max(0, dofMaxRadius), focusRange: max(0.05, dofFocusRange),
-            width: UInt32(width), height: UInt32(height))
+            focusDist: max(0.05, dofFocusDistance),
+            cocCoefficient: max(0, dofCoCCoefficient),
+            maxRadius: max(1, dofMaxRadius),
+            blades: dofBlades >= 3 ? Float(dofBlades) : 0,
+            bladeRotation: dofBladeRotation,
+            catsEye: max(0, min(1, dofCatsEye)),
+            width: UInt32(width), height: UInt32(height),
+            tileW: UInt32(tileW), tileH: UInt32(tileH), tileSize: UInt32(tile),
+            prefilterScale: prefilter != nil ? max(0, dofPrefilterScale) : 0,
+            cocFloor: max(0, dofDiffractionCoCPixels))
+        guard let tileEnc = timedComputeEncoder(cb, "dof.tiles") else { return }
+        tileEnc.label = "Illuminatorama.dof.tiles"
+        tileEnc.setComputePipelineState(tilePipeline)
+        tileEnc.setTexture(depthTexture, index: 0)
+        tileEnc.setTexture(tiles, index: 1)
+        tileEnc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
+        dispatch(tileEnc, pipeline: tilePipeline, width: tileW, height: tileH)
+        tileEnc.endEncoding()
+
+        // Spread each tile's max by the gather's reach, so the gather itself reads one texel.
+        guard let dilEnc = timedComputeEncoder(cb, "dof.dilate") else { return }
+        dilEnc.label = "Illuminatorama.dof.dilate"
+        dilEnc.setComputePipelineState(dilatePipeline)
+        dilEnc.setTexture(tiles, index: 0)
+        dilEnc.setTexture(dilated, index: 1)
+        dilEnc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
+        dispatch(dilEnc, pipeline: dilatePipeline, width: tileW, height: tileH)
+        dilEnc.endEncoding()
+
+        // Prefilter: the pyramid's base at half resolution, then the blit engine box-filters
+        // the rest. Without this each tap point-samples, and a tap's share of a large disc is
+        // many pixels wide — so a small bright highlight is either hit or missed per tap and
+        // the disc fills with grain. Runs on the SAME source the gather reads.
+        if let prePipeline = dofPrefilterPipeline, let pre = prefilter {
+            if let preEnc = timedComputeEncoder(cb, "dof.prefilter") {
+                preEnc.label = "Illuminatorama.dof.prefilter"
+                preEnc.setComputePipelineState(prePipeline)
+                preEnc.setTexture(displaySource, index: 0)
+                preEnc.setTexture(depthTexture, index: 1)
+                preEnc.setTexture(pre, index: 2)
+                preEnc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
+                dispatch(preEnc, pipeline: prePipeline, width: pre.width, height: pre.height)
+                preEnc.endEncoding()
+            }
+            if pre.mipmapLevelCount > 1, let blit = cb.makeBlitCommandEncoder() {
+                blit.label = "Illuminatorama.dof.prefilter.mips"
+                blit.generateMipmaps(for: pre)
+                blit.endEncoding()
+            }
+        }
+
         guard let enc = timedComputeEncoder(cb, "dof") else { return }
         enc.label = "Illuminatorama.dof"
         enc.setComputePipelineState(pipeline)
         enc.setTexture(displaySource, index: 0)
         enc.setTexture(depthTexture, index: 1)
         enc.setTexture(out, index: 2)
+        enc.setTexture(dilated, index: 3)
+        enc.setTexture(prefilter, index: 4)
         enc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
         dispatch(enc, pipeline: pipeline, width: width, height: height)
         enc.endEncoding()
@@ -11425,7 +13151,7 @@ public final class IlluminatoramaRenderer {
         // Per-frame dt, clamped to a sane window so a stalled frame
         // (debugger pause, scene reload) doesn't pump the EMA.
         let now = CACurrentMediaTime()
-        lastFrameDuration = max(0.001, min(0.5, now - lastExposureTickTime))
+        lastFrameDuration = max(0.001, min(0.5, fixedFrameDelta ?? (now - lastExposureTickTime)))
         lastExposureTickTime = now
         guard let enc = timedComputeEncoder(cb, "exposureEstimate") else { return }
         enc.label = "Illuminatorama.exposureEstimate"
@@ -11449,8 +13175,17 @@ public final class IlluminatoramaRenderer {
         // `autoExposureHighlightProtection` for why the statistic is the upper-half
         // mean rather than a percentile.
         var params2 = SIMD4<Float>(max(0, min(1, autoExposureHighlightProtection)),
-                                   autoExposureHighlightEV, 0, 0)
+                                   autoExposureHighlightEV,
+                                   exposureHistogramEnabled ? 1 : 0, 0)
         enc.setBytes(&params2, length: MemoryLayout<SIMD4<Float>>.stride, index: 3)
+        // params3 (DH-0655): x = metering (0 mean, 1 percentile), y = key percentile,
+        // z = guard percentile (0 = none), w = guard EV. Mean + instrument off ⇒ no histogram.
+        var params3 = SIMD4<Float>(autoExposureMetering == .percentile ? 1 : 0,
+                                   max(0, min(1, autoExposureKeyPercentile)),
+                                   max(0, min(1, autoExposureGuardPercentile)),
+                                   autoExposureGuardEV)
+        enc.setBytes(&params3, length: MemoryLayout<SIMD4<Float>>.stride, index: 4)
+        enc.setBuffer(exposureHistogramBuffer, offset: 0, index: 5)
         // Update the host-driven `dt` slot in the buffer — the EMA step
         // inside the kernel needs to know how much wall-time elapsed
         // since the last estimate so the half-life math is correct.
@@ -11465,6 +13200,7 @@ public final class IlluminatoramaRenderer {
         // and 1024 for uints. Set both indices.
         enc.setThreadgroupMemoryLength(256 * MemoryLayout<Float>.stride, index: 0)
         enc.setThreadgroupMemoryLength(256 * MemoryLayout<UInt32>.stride, index: 1)
+        enc.setThreadgroupMemoryLength(ExposureHistogram.bins * MemoryLayout<UInt32>.stride, index: 2)
         let tg = MTLSize(width: 256, height: 1, depth: 1)
         let groups = MTLSize(width: 1, height: 1, depth: 1)
         enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
@@ -11899,7 +13635,7 @@ public final class IlluminatoramaRenderer {
     /// current targets (no startup glide). Mirrors AspectTest's `easeCamera`.
     private func advancePostFXEasing() {
         let now = CACurrentMediaTime()
-        let dt = lastPostFXEaseTime == 0 ? 0 : max(0, min(0.1, now - lastPostFXEaseTime))
+        let dt = lastPostFXEaseTime == 0 ? 0 : max(0, min(0.1, fixedFrameDelta ?? (now - lastPostFXEaseTime)))
         lastPostFXEaseTime = now
         let k = (postFXEasingTau <= 0 || dt == 0) ? 1.0 : 1 - exp(-dt / postFXEasingTau)
         let kf = Float(k)
@@ -11956,6 +13692,7 @@ public final class IlluminatoramaRenderer {
         // `IlluminatoramaFrameUniforms.taaJitterDelta`.
         lastFrameJitterNDC = jitterNDC
         let vp = proj * view
+        gbufferCullVP = vp   // DH-0534: the G-buffer culls against exactly this
         let invVP = vp.inverse
         let invProj = proj.inverse
         let invView = view.inverse
@@ -12023,6 +13760,10 @@ public final class IlluminatoramaRenderer {
             plushSheen: max(0, plushSheen),
             plushTransmission: max(0, plushTransmission)
         )
+        // DH-0458 — lamp-shade fabric translucency. Written into the former `_padPhase3`
+        // slot (default 0 in the memberwise init above), so a host that never sets it —
+        // every Visualizer scene — ships a byte-identical uniform blob.
+        u.shadeTransmission = max(0, shadeTransmission)
         // C1 — sun ownership, enforced here rather than left to the host. With
         // `rtSunOwnership == .rayTraced` the RT lighting pass computes the sun
         // (soft disc shadows), so the deferred directional + its cascades MUST go
@@ -12042,6 +13783,17 @@ public final class IlluminatoramaRenderer {
         // shader's applyTreeWind early-returns), so every other scene is unaffected.
         u._padPhase2A = treeWindStrength
         u._padPhase2B = treeWindHeading
+        // Foliage-wind motion vector (DH-0492): the previous-frame wind is sampled at
+        // `time − windPrevDelta` so a swaying canopy writes a real velocity TAA can track.
+        // 0 (default) → previous sampled at the same time → exact no-op for every scene that
+        // never sets it and every settled capture (clock frozen ⇒ delta 0).
+        u.windPrevDelta = max(0, windPreviousDelta)
+        // DH-0441 — the wide AO ring: a second GTAO march whose falloff is the near
+        // kernel's complement, weighing only occluders beyond `ssaoRadius` out to
+        // `ssaoFarRadius`. `ssaoFarIntensity` 0 (default) ⇒ `illumi_ssao` never marches the
+        // ring and the AO field is byte-identical. See IlluminatoramaSSAO.metal.
+        u.ssaoFarRadius = ssaoFarRadius
+        u.ssaoFarIntensity = ssaoFarIntensity
         // Chromatic aberration: tonemap CA strength (repurposes the former
         // _padPlush0 slot). 0 → exact no-op (the tonemap branch is gated on it).
         // Eased value (see advancePostFXEasing) so slider drags glide.
@@ -12130,6 +13882,9 @@ public final class IlluminatoramaRenderer {
                                  jitterNDC.y - previousJitterNDC.y, 0, 0)
         // Phase 9 — film LUT strength: 0 when no LUT is bound (bypasses the shader branch).
         u.filmLUTStrength = filmLUTTexture != nil ? max(0, min(1, filmLUTStrength)) : 0
+        u.filmLUTSize = max(2, filmLUTSize)
+        u.naturalVignetteK = max(0, naturalVignetteK)
+        u.displayTransform = displayTransform.rawValue
         // Tonemap colour-grade. Neutral defaults (6500/0/1/1/1) are exact no-ops in
         // the shader, so scenes that never touch these are byte-for-byte unchanged.
         u.whiteBalanceK = whiteBalanceK
@@ -12145,6 +13900,17 @@ public final class IlluminatoramaRenderer {
         // Scotopic (Purkinje) night desaturation. 0 (default) ⇒ the tonemap branch
         // never runs ⇒ byte-identical; hosts fade it in with their night blend.
         u.scotopicDesaturation = max(0, scotopicDesaturation)
+        // Photographic finish — highlight chroma roll-off + split tone. 0 / 6500 /
+        // 6500 (the defaults) make every branch an exact no-op, so Visualizer and any
+        // scene that never opts in is byte-identical.
+        u.highlightChromaRolloff = max(0, min(1, highlightChromaRolloff))
+        u.shadowTemperatureK = max(1000, min(20000, shadowTemperatureK))
+        u.highlightTemperatureK = max(1000, min(20000, highlightTemperatureK))
+        // DH-0715 — live-lane look-match. Strength 0 (default) ⇒ byte-identical.
+        u.liveLookMatchStrength = max(0, min(1, liveLookMatchStrength))
+        u.liveLookGIDarken = liveLookGIDarken
+        u.liveLookGIWarmth = max(0, min(4, liveLookGIWarmth))
+        u.liveLookAODarken = effectiveLiveLookAODarken   // DH-0785 — never on top of traced AO
         // Interior day-light separation. Mask 0 (default) ⇒ the kernel's factors stay
         // exactly 1.0 ⇒ byte-identical for every scene that never opts in.
         u.interiorMask = interiorLayerMask
@@ -12171,7 +13937,15 @@ public final class IlluminatoramaRenderer {
         // cone-sampling noise into speckle that crawls on a perfectly static frame.
         u.rtSunShadowSeed = taaEnabled ? taaFrameIndex : 0
         u.rtSunShadowAngle = max(0.0005, rtSunSoftnessRad)
-        u.rtSunShadowRayCount = UInt32(max(1, min(8, rtShadowRays)))
+        // DH-0856 — clamp raised 8 -> 32: at the photo lane's fixed 32-frame settle budget,
+        // 8 cone-sampled rays/frame left the traced penumbra's Monte-Carlo noise (edge
+        // residual std ~5.2px on the "Primary Bedroom, Facing North" repro) far short of the
+        // cascade-map default's analytic PCF (~1.6px) — measured directly, not assumed. Raising
+        // the cap costs real per-frame GPU time (linear in ray count) but nothing else; the
+        // shader-side clamp in `rtSunSoftVisibility` (IlluminatoramaLighting.metal) moved with
+        // it so a value above 8 is not silently re-clamped one level down.
+        u.rtSunShadowRayCount = UInt32(max(1, min(32, rtShadowRays)))
+        u.rtAreaShadowRayCount = rtSunSoftShadowsEnabled ? UInt32(max(0, min(8, rtAreaShadowRays))) : 0
         // Analytic night sky. All-zero defaults keep the kernel's sky branch an
         // exact no-op; hosts fade the brightnesses with nightBlend themselves.
         u.nightSkyParams = SIMD4(max(0, nightSkyStarBrightness),
@@ -12200,6 +13974,11 @@ public final class IlluminatoramaRenderer {
             }
         }
         lastLensFlareParams = u.lensFlareParams
+        // DH-0140 — decide the G-buffer lane for THIS frame here, before any pass encodes, so the
+        // pass that writes the sixth target and the kernel that reads it agree by construction.
+        extendedGBufferActive = extendedGBufferEnabled && ensureExtendedGBufferResources()
+        if !extendedGBufferEnabled, gbufferMaterial != nil { gbufferMaterial = nil }   // the lane left: give the memory back
+        u.extendedGBuffer = extendedGBufferActive ? 1 : 0
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
 
@@ -12252,6 +14031,7 @@ public final class IlluminatoramaRenderer {
         // same grouping last → this frame.
         meshGroups.removeAll(keepingCapacity: true)
         meshGroupRange.removeAll(keepingCapacity: true)
+        meshGroupsVersion &+= 1   // DH-0534: the cull bounds describe the old grouping now
         guard !instances.isEmpty else { return }
 
         // VEGETATION WIND, LIVENESS. `treeWindStrength` is a global, but as of 2026-08-17 the
@@ -12315,6 +14095,64 @@ public final class IlluminatoramaRenderer {
                 kind: kind, start: groupStart, count: srcIndices.count))
             meshGroupRange[kind] = groupStart ..< (groupStart + srcIndices.count)
         }
+    }
+
+    /// DH-0534 — rebuild `meshGroupCullBounds` when its inputs changed. Everything the CPU cannot
+    /// see is UNBOUNDED and always draws: a host `onEncodeGPUInstances` kernel may overwrite ANY
+    /// instance slot (so with the hook set, nothing is culled at all); `gpuRepackTasks` rewrite a
+    /// kind's vertices (which also covers the deforming meshes behind `prevPosByKind`); and a mesh
+    /// built on caller-owned buffers has no CPU-visible vertices (`cpuAuthoredVertices == false`).
+    private func computeCullBounds() {
+        let hostWritesInstances = onEncodeGPUInstances != nil
+        let key = CullBoundsKey(groupsVersion: meshGroupsVersion, wind: treeWindStrength,
+                                hostWritesInstances: hostWritesInstances,
+                                repackCount: gpuRepackTasks.count)
+        if key == cullBoundsKey, meshGroupCullBounds.count == meshGroups.count { return }
+        cullBoundsKey = key
+        meshGroupCullBounds.removeAll(keepingCapacity: true)
+        let total = meshGroups.last.map { $0.start + $0.count } ?? 0
+        guard total > 0 else { return }
+        let repacked = Set(gpuRepackTasks.map(\.kind))
+        let inst = currentInstanceBuffer.contents()
+            .bindMemory(to: IlluminatoramaInstance.self, capacity: total)
+        for group in meshGroups {
+            guard !hostWritesInstances, !repacked.contains(group.kind),
+                  let mesh = meshes[group.kind], mesh.cpuAuthoredVertices,
+                  let local = mesh.boundingSphere else {
+                meshGroupCullBounds.append(.unbounded)
+                continue
+            }
+            var bounds = IlluminatoramaCullBounds.empty
+            var bounded = true
+            for i in group.start ..< group.start + group.count {
+                guard let sphere = IlluminatoramaCullBounds.worldSphere(
+                    local: local, instance: inst[i], treeWindStrength: treeWindStrength,
+                    windMax: { mesh.windAttributeMax }) else { bounded = false; break }
+                bounds.formUnion(center: sphere.center, radius: sphere.radius)
+            }
+            meshGroupCullBounds.append(bounded ? bounds : .unbounded)
+        }
+    }
+
+    /// The clip volume a pass culls against, or nil when culling is off (nil ⇒ draw everything).
+    private func cullVolume(_ vp: simd_float4x4) -> IlluminatoramaClipVolume? {
+        visibilityCullingEnabled ? IlluminatoramaClipVolume(vp) : nil
+    }
+
+    /// DH-0534 — true when group `gi` cannot produce a fragment in a pass rasterising with `clip`.
+    /// Counts the group into `drawn` or `culled` either way, so the stats are complete.
+    @inline(__always)
+    private func shouldCull(_ gi: Int, _ group: MeshDrawGroup, _ mesh: IlluminatoramaMesh,
+                            _ clip: IlluminatoramaClipVolume?,
+                            drawn: WritableKeyPath<IlluminatoramaVisibilityCullStats, Int>,
+                            culled: WritableKeyPath<IlluminatoramaVisibilityCullStats, Int>) -> Bool {
+        if let clip, gi < meshGroupCullBounds.count, clip.excludes(meshGroupCullBounds[gi]) {
+            visibilityCullStats[keyPath: culled] += 1
+            visibilityCullStats.trianglesCulled += (mesh.indexCount / 3) * group.count
+            return true
+        }
+        visibilityCullStats[keyPath: drawn] += 1
+        return false
     }
 
     /// `MeshKind` → its contiguous `[start, end)` slot range in the grouped
@@ -12604,6 +14442,70 @@ public final class IlluminatoramaRenderer {
         }
         t.label = "Illuminatorama.shadowMap"
         return t
+    }
+
+    /// `illumi_fs` specialised for one lane (DH-0140): `extended` selects the six-target output
+    /// struct. The fragment carries a function constant now, so it can no longer be made by name alone.
+    private static func makeGBufferFragment(library: MTLLibrary, extended: Bool) throws -> MTLFunction {
+        let c = MTLFunctionConstantValues()
+        var ext = extended
+        c.setConstantValue(&ext, type: .bool, index: 11)
+        return try library.makeFunction(name: "illumi_fs", constantValues: c)
+    }
+
+    /// DH-0140 — build one six-target G-buffer pipeline variant. Same attachments as the live PSO
+    /// plus color(5) RGBA16F for `GBufferOut.material`.
+    private static func makeExtendedGBufferPipeline(device: MTLDevice, library: MTLLibrary,
+                                                    prevVerts: Bool) throws -> MTLRenderPipelineState {
+        let d = MTLRenderPipelineDescriptor()
+        d.label = prevVerts ? "Illuminatorama.gbuffer.prevVerts.ext" : "Illuminatorama.gbuffer.ext"
+        let vsC = MTLFunctionConstantValues()
+        var pv = prevVerts
+        vsC.setConstantValue(&pv, type: .bool, index: 10)
+        d.vertexFunction = try library.makeFunction(name: "illumi_vs", constantValues: vsC)
+        d.fragmentFunction = try makeGBufferFragment(library: library, extended: true)
+        d.colorAttachments[0].pixelFormat = .rgba16Float
+        d.colorAttachments[1].pixelFormat = .rgba16Float
+        d.colorAttachments[2].pixelFormat = .rgba16Float
+        d.colorAttachments[3].pixelFormat = .rg16Float
+        d.colorAttachments[4].pixelFormat = .r32Uint
+        d.colorAttachments[5].pixelFormat = .rgba16Float
+        d.depthAttachmentPixelFormat = .depth32Float
+        return try device.makeRenderPipelineState(descriptor: d)
+    }
+
+    /// DH-0140 — make the sixth target and the two extended pipelines exist for this frame, at the
+    /// current internal size. Returns false (logged) if Metal refuses, in which case the frame runs
+    /// the five-target pass and the lighting kernel stays on its live-lane constants.
+    private func ensureExtendedGBufferResources() -> Bool {
+        if gbufferPipelineExt == nil || gbufferPipelinePrevVertsExt == nil {
+            guard let library = engine.library else {
+                Self.log.error("extended G-buffer: no shader library — staying on the 5-target pass")
+                return false
+            }
+            do {
+                gbufferPipelineExt = try Self.makeExtendedGBufferPipeline(device: device, library: library, prevVerts: false)
+                gbufferPipelinePrevVertsExt = try Self.makeExtendedGBufferPipeline(device: device, library: library, prevVerts: true)
+            } catch {
+                Self.log.error("extended G-buffer: pipeline compile failed: \(error.localizedDescription) — staying on the 5-target pass")
+                return false
+            }
+        }
+        if let t = gbufferMaterial, t.width == width, t.height == height { return true }
+        let d = MTLTextureDescriptor()
+        d.textureType = .type2D
+        d.pixelFormat = .rgba16Float
+        d.width = width
+        d.height = height
+        d.usage = [.renderTarget, .shaderRead]
+        d.storageMode = .private
+        guard let t = device.makeTexture(descriptor: d) else {
+            Self.log.error("extended G-buffer: material target allocation failed at \(self.width)×\(self.height)")
+            return false
+        }
+        t.label = "Illuminatorama.gbuffer.material"
+        gbufferMaterial = t
+        return true
     }
 
     /// Phase 4.10 — depth atlas for spot light shadows. Same format /
@@ -13024,6 +14926,50 @@ private final class IlluminatoramaGPUMeter: @unchecked Sendable {
                           avg, n, p50, p95, p99, minMs, maxMs)
         lock.unlock()
         if let d = line.data(using: .utf8) { try? d.write(to: URL(fileURLWithPath: path)) }
+    }
+}
+
+/// A one-shot "the GPU finished this frame" latch that an `async` caller can await.
+///
+/// Exists because the two ends of the handshake live on different threads and neither can be
+/// moved: `MTLCommandBuffer.addCompletedHandler` fires on a Metal-owned background thread, and
+/// the awaiter is main-actor code inside `awaitCommittedFrame()`. A `DispatchSemaphore` would
+/// bridge them only by blocking a cooperative-pool thread, which is the stall this whole path
+/// exists to remove.
+///
+/// Latched rather than gated: `signal()` may land BEFORE anyone awaits (a fast frame finishing
+/// while the caller is still unwinding the commit), so `wait()` on an already-signalled latch
+/// must return immediately instead of parking forever. Both calls are idempotent — a second
+/// `signal()` is dropped and the continuation is resumed exactly once.
+final class FrameCompletionSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var completed = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    /// Called from the GPU completion handler. Resumes the awaiter OUTSIDE the lock —
+    /// a continuation resume can run arbitrary code, and doing that under the lock would
+    /// re-enter it if that code touched this latch again.
+    func signal() {
+        lock.lock()
+        if completed { lock.unlock(); return }
+        completed = true
+        let waiter = continuation
+        continuation = nil
+        lock.unlock()
+        waiter?.resume()
+    }
+
+    func wait() async {
+        await withCheckedContinuation { (k: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if completed {
+                lock.unlock()
+                k.resume()          // already finished — never park
+            } else {
+                continuation = k
+                lock.unlock()
+            }
+        }
     }
 }
 

@@ -94,13 +94,19 @@ public enum PaintFinish: String, CaseIterable, Equatable, Hashable, Sendable, Co
 public struct PaintParams: Equatable, Hashable, Sendable, Codable {
     public var color: Vec3
     public var finish: PaintFinish
+    /// Multiplier on the finish's own surface tooth (`reliefScale`) — the trowel/roller relief the
+    /// normal map carries. `nil` = the finish's standard tooth. A hand-troweled plaster wall is the
+    /// case: the same sheen as a flat paint with two to three times the relief; without this every
+    /// wall bakes to the one drywall texture and reads as a perfectly smooth plane.
+    public var relief: Double?
 
-    public init(color: Vec3, finish: PaintFinish = .default) {
+    public init(color: Vec3, finish: PaintFinish = .default, relief: Double? = nil) {
         self.color = color
         self.finish = finish
+        self.relief = relief.map { Swift.max(0, Swift.min(6, $0)) }
     }
 
-    private enum CodingKeys: String, CodingKey { case color, finish }
+    private enum CodingKeys: String, CodingKey { case color, finish, relief }
 
     /// **A bare colour IS a paint at the default sheen — that is the format, not a fallback.**
     ///
@@ -120,11 +126,12 @@ public struct PaintParams: Equatable, Hashable, Sendable, Codable {
         }
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.init(color: try c.decode(Vec3.self, forKey: .color),
-                  finish: try c.decodeIfPresent(PaintFinish.self, forKey: .finish) ?? .default)
+                  finish: try c.decodeIfPresent(PaintFinish.self, forKey: .finish) ?? .default,
+                  relief: try c.decodeIfPresent(Double.self, forKey: .relief))
     }
 
     public func encode(to encoder: Encoder) throws {
-        guard finish != .default else {
+        guard finish != .default || relief != nil else {
             var single = encoder.singleValueContainer()
             try single.encode(color)
             return
@@ -132,5 +139,6 @@ public struct PaintParams: Equatable, Hashable, Sendable, Codable {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encode(color, forKey: .color)
         try c.encode(finish, forKey: .finish)
+        try c.encodeIfPresent(relief, forKey: .relief)
     }
 }

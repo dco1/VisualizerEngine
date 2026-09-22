@@ -8,17 +8,20 @@ using namespace raytracing;
 // A Lumen-style on-surface lit-radiance cache. Each static RT "card" (a planar
 // parallelogram — the room's floor / walls / ceiling / window jambs) owns a
 // tile in a ping-pong radiance atlas. Once per frame the update kernel re-lights
-// every atlas texel and EMA-blends it into the current atlas; the RT GI +
-// reflection rays then READ this cached radiance at their hit point instead of
-// re-shading sun-only. Two wins:
+// every atlas texel and EMA-blends it into the current atlas.
 //
 //   • Multi-bounce — the update's indirect term samples the PREVIOUS frame's
 //     atlas at its own ray hits, so light bounces accumulate frame over frame
 //     (direct sun on the floor this frame → indirect on the wall next frame →
 //     indirect on the ceiling the frame after …).
-//   • Cheaper hits — a GI/reflection ray hit becomes one atlas read instead of
-//     a re-shade + shadow ray; the shadow work is done once per atlas texel and
-//     amortised across every ray that lands on that surface.
+//   • Two atlases (DH-0622). The FULL atlas (direct + indirect) is what that
+//     feedback reads — a bounce needs the hit's whole outgoing radiance. The
+//     INDIRECT atlas (the same EMA of the indirect term alone) is what the RT GI,
+//     reflection and glass hits read: each hit is still shaded by the one
+//     secondary shader (textured albedo, sun + shadow ray, local lights, emission)
+//     and the cache adds only the multi-bounce term that shader lacks. A cached hit
+//     is RICHER than a re-shade, not cheaper — handing consumers the full atlas
+//     made a cached hit drop every point/spot light and texture instead.
 //
 // The cache is COARSE on purpose (low-res per-card tiles) — it only feeds
 // INDIRECT light (GI bounces + reflections of distant surfaces); primary
@@ -28,7 +31,7 @@ using namespace raytracing;
 // STRUCT / SAMPLER DUPLICATION: the `SurfCard` array is OWNED here (only the
 // update kernel reads card frames). The consumers — IlluminatoramaRT.metal and
 // IlluminatoramaRTInstanced.metal — carry only the per-triangle card-UV layout +
-// a `sampleSurfCacheRT()` copy that reads `triCard`/`triUVa`/`triUVc` + the
+// an atlas-sampler copy that reads `triCard`/`triUVa`/`triUVc` + the
 // atlas. Because a hit's barycentric→UV routes to the correct half of a packed
 // tile, the samplers are AGNOSTIC to the A/B split and don't change for P3 — but
 // keep the UV-layout + atlas-indexing math in lockstep across all three files,
@@ -63,6 +66,22 @@ struct SurfCacheUniforms {
     uint   atlasW;   uint atlasH;   uint tileSize;  uint tilesPerRow;
     uint   cardCount; uint triangleCount; uint indirectRays; uint frameSeed;
     float  alpha;    float rayTMin; float maxDist;  uint incrementalEnabled;
+    // DH-0653 — atlas reuse counter. 1 ⇒ each texel adds itself to `atlasStats`
+    // [0] (EMA-blended with its history — REUSED) or [1] (α = 1, history discarded —
+    // REFRESHED). Set only while `VIZ_ILLUMI_SURFCACHE_STATS_PATH` is, so the
+    // atomic add costs nothing in a normal frame.
+    uint   statsEnabled;
+    // DH-0849 — 1 ⇒ an indirect ray that lands on the BACK of a card (the hit triangle's
+    // winding normal faces along the ray) brings back no light; see `sc_backFaceHit`.
+    uint   backFaceGuard;
+    // DH-0872 — scotopic (Purkinje) night desaturation for this kernel's OWN GI sky-MISS
+    // sample (see the miss branches below). This cache-update pass gathers its indirect
+    // term independently of `illumi_rt_lighting(_tlas)` — same raw, un-convolved leak, same
+    // fix. Mirrors `FrameUniforms.scotopicDesaturation` / `IlluminatoramaRenderer
+    // .scotopicDesaturation`. 0 (day, the default) ⇒ byte-identical. Repurposes `_scPad1` —
+    // same 4 bytes, stride unchanged.
+    float  scotopicDesaturation;
+    uint   _scPad2;
 };
 
 // ── shared helpers (kept local; Metal has no cross-file linkage) ──────────────
@@ -174,6 +193,26 @@ static inline float3 sampleSurfCache(
     return albedo * irr + emission;
 }
 
+// DH-0849 — did an indirect ray strike the BACK of the hit triangle's card? A card stores the
+// irradiance arriving on its FRONT (winding-normal) side, and `sampleSurfCache` hands that back
+// whichever side the ray hit. A texel that can see a card's back is one the room cannot see —
+// a wall band inside the closed plenum above a ceiling deck, a sole below the floor — and reading
+// the deck's room-side light there lit those hidden bands, which GI hits at the crease then read
+// as a bright line. Frame pick is `sampleSurfCache`'s: frame B iff packed and the hit's reference
+// uvA is B's (1,1). Card normals are winding-derived (the soup's cross product, and the re-frame
+// kernels'), so this is the triangle's geometric side, not a shading normal.
+static inline bool sc_backFaceHit(uint prim, float3 dir,
+                                  const device SurfCard* cards,
+                                  const device uint*   triCard,
+                                  const device float4* triUVa)
+{
+    SurfCard sc = cards[triCard[prim]];
+    float4 a = triUVa[prim];
+    bool useB = sc.normal.w > 0.5 && (a.x + a.y > 1.0);
+    float3 n = useB ? sc.normalB.xyz : sc.normal.xyz;
+    return dot(n, dir) > 0.0;
+}
+
 // ── update kernel ────────────────────────────────────────────────────────────
 //
 // One thread per atlas texel. Reconstructs the texel's world position + normal
@@ -198,6 +237,9 @@ kernel void illumi_surfcache_update(
     // kSCCurvesEnabled, traced alongside `accel` as an occluder (canopy darkens the
     // cards beneath). Bound to `accel` as a harmless dummy for the base variant.
     primitive_acceleration_structure  curveAccel  [[buffer(9)]],
+    device atomic_uint*               atlasStats  [[buffer(10)]],  // DH-0653: [0] reused, [1] refreshed (gated)
+    texture2d<float, access::write>   outIndirect   [[texture(4)]],   // DH-0622: what the consumers read
+    texture2d<float, access::read>    prevIndirectR [[texture(5)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.atlasW || gid.y >= u.atlasH) return;
@@ -295,12 +337,29 @@ kernel void illumi_surfcache_update(
         if (res.type == intersection_type::triangle) {
             uint prim = res.primitive_id;
             if (prim >= u.triangleCount) continue;
+            // DH-0849 — a back-face hit is occluded: no light, still one ray of the average.
+            if (u.backFaceGuard != 0u && sc_backFaceHit(prim, dir, cards, triCard, triUVa)) continue;
             indirect += sampleSurfCache(prevAtlasS, prim,
                                         res.triangle_barycentric_coord,
                                         cards, triCard, triUVa, triUVc,
                                         cardRect, u.atlasW, u.atlasH);
         } else {
-            indirect += skyEquirect.sample(skySamp, sc_dirToEquirectUV(dir)).rgb;
+            // DH-0872 — same leak, same fix, as `illumi_rt_lighting`'s GI miss branch: a raw,
+            // un-convolved single sample of the shared night environment, which deliberately
+            // carries a saturated "moonlit lawn" green tint in its below-horizon band
+            // (`groundFillRadiance`/N3). This kernel BUILDS the surface-cache atlas a GI hit
+            // later reads (`sampleSurfCache` above, and the RT lighting kernels' own cache
+            // reads) — its own miss branch is a SEPARATE, independent leak from the RT
+            // lighting kernels' (`illumi_rt_lighting(_tlas)`), not fixed by patching those
+            // alone: a card whose own cache-gather escapes to this band bakes the tint into
+            // its EMA-accumulated irradiance, which every later reader of that card inherits
+            // regardless of what its own direct rays do. Desaturate the raw sample here too.
+            float3 sky = skyEquirect.sample(skySamp, sc_dirToEquirectUV(dir)).rgb;
+            if (u.scotopicDesaturation > 0.0) {
+                float skyLum = dot(sky, float3(0.2126, 0.7152, 0.0722));
+                sky = mix(sky, float3(skyLum), u.scotopicDesaturation);
+            }
+            indirect += sky;
         }
     }
     indirect = indirect / float(rays);   // arriving irradiance (no albedo — applied at read)
@@ -315,6 +374,8 @@ kernel void illumi_surfcache_update(
     // cards keep their small α and their accumulated multi-bounce irradiance.
     float alpha = clamp(u.alpha, 0.02, 1.0);
     if (u.incrementalEnabled != 0u && cardDirty[card] != 0u) alpha = 1.0;
+    if (u.statsEnabled != 0u)
+        atomic_fetch_add_explicit(&atlasStats[alpha >= 1.0 ? 1u : 0u], 1u, memory_order_relaxed);
     float4 prevTexel = prevAtlasR.read(gid);
     float3 outIrr = mix(prevTexel.rgb, newIrr, alpha);
     // B0 — EMA the per-texel luminance² into .w alongside the radiance, so
@@ -324,6 +385,12 @@ kernel void illumi_surfcache_update(
     float newL = sc_luminance(newIrr);
     float outM2 = mix(prevTexel.a, newL * newL, alpha);
     outAtlas.write(float4(outIrr, outM2), gid);
+    // DH-0622 — the indirect term alone, same α (a dirty card resets both in lockstep), with
+    // its OWN luminance² in .a, so the consumer-side denoiser keys off the variance of the
+    // term the consumers actually read.
+    float4 prevInd = prevIndirectR.read(gid);
+    float indL = sc_luminance(indirect);
+    outIndirect.write(float4(mix(prevInd.rgb, indirect, alpha), mix(prevInd.a, indL * indL, alpha)), gid);
 }
 
 // ── update kernel — TLAS-traced variant (§3 endpoint) ─────────────────────────
@@ -358,6 +425,9 @@ kernel void illumi_surfcache_update_tlas(
     const device uint*                texelCard   [[buffer(7)]],
     const device uint*                cardDirty   [[buffer(8)]],
     const device uint*                soupTriBase [[buffer(9)]],   // TLAS (inst,prim) → global soup tri
+    device atomic_uint*               atlasStats  [[buffer(10)]],  // DH-0653: [0] reused, [1] refreshed (gated)
+    texture2d<float, access::write>   outIndirect   [[texture(4)]],   // DH-0622: what the consumers read
+    texture2d<float, access::read>    prevIndirectR [[texture(5)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.atlasW || gid.y >= u.atlasH) return;
@@ -439,6 +509,8 @@ kernel void illumi_surfcache_update_tlas(
         if (res.type == intersection_type::triangle) {
             uint prim = soupTriBase[res.instance_id] + res.primitive_id;
             if (prim >= u.triangleCount) continue;
+            // DH-0849 — kept line-for-line with the soup variant.
+            if (u.backFaceGuard != 0u && sc_backFaceHit(prim, dir, cards, triCard, triUVa)) continue;
             indirect += sampleSurfCache(prevAtlasS, prim,
                                         res.triangle_barycentric_coord,
                                         cards, triCard, triUVa, triUVc,
@@ -446,7 +518,16 @@ kernel void illumi_surfcache_update_tlas(
         } else if (kSCCurvesEnabled && res.type == intersection_type::curve) {
             continue;   // occluded by a curve — no card, no sky (see above)
         } else {
-            indirect += skyEquirect.sample(skySamp, sc_dirToEquirectUV(dir)).rgb;
+            // DH-0872 — same leak, same fix, as the soup variant above (`illumi_surfcache_update`)
+            // and `illumi_rt_lighting_tlas`'s own GI miss branch: a raw, un-convolved sky sample
+            // that deliberately carries a saturated "moonlit lawn" green tint in its below-horizon
+            // band. Desaturate it here too, at the point this kernel gathers it into the cache.
+            float3 sky = skyEquirect.sample(skySamp, sc_dirToEquirectUV(dir)).rgb;
+            if (u.scotopicDesaturation > 0.0) {
+                float skyLum = dot(sky, float3(0.2126, 0.7152, 0.0722));
+                sky = mix(sky, float3(skyLum), u.scotopicDesaturation);
+            }
+            indirect += sky;
         }
     }
     indirect = indirect / float(rays);   // arriving irradiance (no albedo)
@@ -455,12 +536,20 @@ kernel void illumi_surfcache_update_tlas(
 
     float alpha = clamp(u.alpha, 0.02, 1.0);
     if (u.incrementalEnabled != 0u && cardDirty[card] != 0u) alpha = 1.0;
+    if (u.statsEnabled != 0u)   // DH-0653 — kept line-for-line with the soup variant
+        atomic_fetch_add_explicit(&atlasStats[alpha >= 1.0 ? 1u : 0u], 1u, memory_order_relaxed);
     float4 prevTexel = prevAtlasR.read(gid);
     float3 outIrr = mix(prevTexel.rgb, newIrr, alpha);
     // B0 — luminance² EMA in .w (see the soup variant above; kept line-for-line).
     float newL = sc_luminance(newIrr);
     float outM2 = mix(prevTexel.a, newL * newL, alpha);
     outAtlas.write(float4(outIrr, outM2), gid);
+    // DH-0622 — the indirect term alone, same α (a dirty card resets both in lockstep), with
+    // its OWN luminance² in .a, so the consumer-side denoiser keys off the variance of the
+    // term the consumers actually read.
+    float4 prevInd = prevIndirectR.read(gid);
+    float indL = sc_luminance(indirect);
+    outIndirect.write(float4(mix(prevInd.rgb, indirect, alpha), mix(prevInd.a, indL * indL, alpha)), gid);
 }
 
 // ── Phase 5 / B1: cache-domain à-trous denoiser ──────────────────────────────

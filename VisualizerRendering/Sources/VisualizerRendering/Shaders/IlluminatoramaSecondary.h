@@ -74,7 +74,7 @@ using namespace raytracing;
 struct RTInstanceData {
     float4 nrm0; float4 nrm1; float4 nrm2;
     float4 albedoTriBase;
-    float4 emissionPad;      // xyz = emission radiance, w reserved
+    float4 emissionPad;      // xyz = emission radiance; w = GLASS rows only: corner-normal base + 1 (0 = none)
 };
 
 /// Surface-cache card material. Mirror of `SurfCard` in
@@ -93,10 +93,24 @@ struct PrimUV { float2 uvA; float2 uvB; float2 uvC; };
 
 /// Local-light currency. Mirrors `PointLight` / `SpotLight` in Illuminatorama.metal
 /// and the Swift `IlluminatoramaPointLight` / `IlluminatoramaSpotLight`.
+// `PointLight`/`SpotLight` (IlluminatoramaCommon.h, the deferred kernel's mirrors of the
+// SAME Swift-uploaded buffer) both grew a trailing `giVisible` field for DH-0872 — no
+// spare padding was left in either, so this struct MUST grow by the same 4 bytes in the
+// same place, not repurpose `_pad0/_pad1` in place, or the two Metal structs disagree on
+// `sizeof` and `pointLights[i]`/`spotLights[i]` misalign for every i > 0 on whichever
+// kernel reads the smaller one. Keep in lockstep.
 struct RTPointLight {
     float3 position;  float radius;
     float3 color;     uint  layerMask;
-    uint   castsShadow; int shadowCubeIndex; int _pad0; int _pad1;
+    uint   castsShadow; int shadowCubeIndex; int _pad0;
+    // DH-0818 — the source size, read (was `_pad1`: uploaded every frame, never read, so the
+    // bounce path lit near a floor lamp as a hard point while the deferred pass used a 0.70 m
+    // source). Same offset and 4-byte width as `PointLight.softRadius`, so sizeof is unchanged.
+    float  softRadius;
+    // DH-0872 — mirrors `PointLight.giVisible`. 1 (default) ⇒ visible to THIS un-occluded
+    // local-light-fill path too; 0 ⇒ skipped here (see `secondaryLocalLightFill` and the
+    // field's own doc comment on `PointLight` for why).
+    uint   giVisible;
 };
 struct RTSpotLight {
     float3   position;   float innerCone;
@@ -105,8 +119,74 @@ struct RTSpotLight {
     float4x4 shadowMatrix;
     int      shadowSliceIndex;
     uint     layerMask;
-    int      _pad1; int _pad2;
+    int      castsShadow;   // host-side only; named so the offsets read the same as `SpotLight`
+    float    softRadius;    // DH-0818 — was `_pad2`; same slot as `SpotLight.softRadius`
+    // DH-0872 — mirrors `SpotLight.giVisible`; see `RTPointLight.giVisible`.
+    uint     giVisible;
 };
+/// Mirror of `AreaLight` (IlluminatoramaCommon.h) — the SAME Swift-uploaded
+/// `IlluminatoramaAreaLight` buffer the deferred kernel reads (stride 144). Keep in
+/// lockstep with that struct, field for field.
+struct RTAreaLight {
+    float3   center;     float twoSided;
+    float3   ex;         uint  layerMask;
+    float3   ey;         float _pad1;
+    float3   color;      float radius;
+    float4x4 shadowMatrix;
+    int      shadowSliceIndex;
+    int      castsShadow;
+    float    _pad2; float _pad3;
+};
+
+// ── Rectangular area light: the clamped-cosine form factor ───────────────────
+//
+// ONE copy, shared by the deferred kernel (`evalAreaLight`'s diffuse) and the
+// secondary path below (DH-0718 — a reflected or GI-bounce hit lit by a window
+// portal must be lit by the same number the directly-seen surface is).
+
+// Vector irradiance of one polygon edge (clamped-cosine), v1/v2 normalised.
+//
+// Hill & Heitz's rational fit of θ/sin θ (the LTC reference implementation), NOT the
+// literal acos form this shipped with first. The literal form is singular exactly where
+// a WINDOW PORTAL lives: a fragment coplanar with the light (the wall the portal is cut
+// into — every fragment of it) sees two corners in near-opposite directions, θ→π,
+// sin θ→0, θ/sin θ→∞ while cross(v1,v2)→0 — 0·∞ = NaN, and the TAA settle smears one
+// NaN into a fully black frame (measured: the first portal arm rendered 1 152 000 black
+// pixels). A −0.9999 clamp tames the infinity but leaves acos's catastrophic
+// cancellation at both ends — salt-and-pepper speckle across any coplanar floor or
+// ceiling. The fit is stable at BOTH limits (the x → −1 branch pairs the 1/√(1−x²)
+// growth against the cross's shrink analytically) and is what production LTC ships.
+// Visualizer's softboxes float in open space and never exercised these limits; the
+// sub-percent difference from the acos form elsewhere is the fit's documented accuracy.
+static inline float3 ltcIntegrateEdge(float3 v1, float3 v2) {
+    float x = clamp(dot(v1, v2), -1.0, 1.0);
+    float y = abs(x);
+    float a = 0.8543985 + (0.4965155 + 0.0145206 * y) * y;
+    float b = 3.4175940 + (4.1616724 + y) * y;
+    float v = a / b;
+    float thetaSinTheta = (x > 0.0)
+        ? v
+        : 0.5 * rsqrt(max(1.0 - x * x, 1e-7)) - v;
+    return cross(v1, v2) * thetaSinTheta;
+}
+
+// Clamped-cosine form factor of the quad (corners p0..p3 CCW, relative to the
+// shaded point) seen from a surface with normal N. Returns [0,1]; one-sided
+// clamps the receiver to the front hemisphere, two-sided takes |·|.
+static inline float ltcPolygonForm(float3 N, float3 p0, float3 p1, float3 p2, float3 p3,
+                                   bool twoSided) {
+    // Length-guarded normalise: a fragment AT a light corner (a portal's jamb pixel)
+    // hands normalize() a zero vector — the remaining NaN seed once the edge integral
+    // above went stable.
+    float3 L0 = p0 * rsqrt(max(dot(p0, p0), 1e-8));
+    float3 L1 = p1 * rsqrt(max(dot(p1, p1), 1e-8));
+    float3 L2 = p2 * rsqrt(max(dot(p2, p2), 1e-8));
+    float3 L3 = p3 * rsqrt(max(dot(p3, p3), 1e-8));
+    float3 vsum = ltcIntegrateEdge(L0, L1) + ltcIntegrateEdge(L1, L2)
+                + ltcIntegrateEdge(L2, L3) + ltcIntegrateEdge(L3, L0);
+    float z = dot(vsum, N) * (1.0 / (2.0 * M_PI_F));
+    return twoSided ? abs(z) : max(0.0, z);
+}
 
 // ── RNG + sampling ───────────────────────────────────────────────────────────
 
@@ -247,14 +327,15 @@ static inline float3 secondaryEmission(uint iid, const device RTInstanceData* in
 
 // ── Surface cache ────────────────────────────────────────────────────────────
 
-/// Outgoing radiance at a cached triangle hit: the atlas stores albedo-free
-/// IRRADIANCE, so reconstruct L_out = albedo·irr + emission from the card (a card
-/// seam is then not amplified by the albedo multiply). `primData` is the hit's
-/// `res.primitive_data`: non-null ⇒ the BLAS carries baked per-mesh card UVs
+/// The accumulated INDIRECT irradiance at a cached triangle hit (DH-0622): the
+/// multi-bounce term alone — albedo-free, no direct sun, no emission. Read from the
+/// indirect atlas, never the full one: the hit itself is shaded by
+/// `shadeSecondarySurface`, which takes this as its indirect term, so a cached and an
+/// uncached hit are one shading model differing only by that term. `primData` is the
+/// hit's `res.primitive_data`: non-null ⇒ the BLAS carries baked per-mesh card UVs
 /// (#60 item 6) and the `triUVa`/`triUVc` dependent loads (32 B/hit) are skipped.
-static inline float3 sampleSurfCacheRT(
+static inline float3 sampleSurfCacheIndirectRT(
     texture2d<float, access::sample> atlas, uint prim, float2 bary,
-    const device SurfCard* cards,
     const device uint* triCard, const device float4* triUVa, const device float4* triUVc,
     const device void* primData, const device float4* cardRect, uint atlasW, uint atlasH)
 {
@@ -274,13 +355,7 @@ static inline float3 sampleSurfCacheRT(
     uv = clamp(uv, inset, 1.0 - inset);
     float2 px = rect.xy + uv * rect.zw;
     constexpr sampler samp(filter::linear, address::clamp_to_edge);
-    float3 irr = atlas.sample(samp, px / float2(atlasW, atlasH)).rgb;
-    SurfCard sc = cards[card];
-    // Frame-B membership: frame A has uvA=(0,0) (sum 0), frame B has uvA=(1,1) (sum 2).
-    bool useB = sc.normal.w > 0.5 && (uvA.x + uvA.y > 1.0);
-    float3 albedo   = useB ? sc.albedoB.xyz   : sc.albedo.xyz;
-    float3 emission = useB ? sc.emissionB.xyz : sc.emission.xyz;
-    return albedo * irr + emission;
+    return atlas.sample(samp, px / float2(atlasW, atlasH)).rgb;
 }
 
 // ── What the shading needs, in one place per call site ───────────────────────
@@ -317,6 +392,11 @@ struct SecondaryShadeParams {
     uint   objUVCount;      // bound of objUV in float2 entries
     // Local lights bound in `SecondaryScene`. 0/0 ⇒ sun + sky only.
     uint   pointLightCount; uint spotLightCount;
+    // DH-0718 — rectangular area lights (a house's window PORTALS by day) bound in
+    // `SecondaryScene.areaLights`. 0 ⇒ none, the exact pre-DH-0718 behaviour: a
+    // reflected or GI-bounce hit then saw sun + sky + lamps but not the room's
+    // dominant daytime source. `areaShadowRays` 0 ⇒ lit but unoccluded.
+    uint   areaLightCount; uint areaShadowRays;
     // C3 — which TLAS instances stop this hit's SUN SHADOW ray. 0x01 = opaque
     // (glass 0x02 never casts a solid shadow). A transport path adds 0x04, the
     // "invisible occluder" bit: a slab that is real to light and never drawn —
@@ -338,6 +418,7 @@ struct SecondaryScene {
     const device float2*         uvScale;      // albedo-atlas per-slice letterbox
     const device RTPointLight*   pointLights;
     const device RTSpotLight*    spotLights;
+    const device RTAreaLight*    areaLights;   // DH-0718; read only when `areaLightCount` > 0
 };
 
 /// One opaque triangle hit, however the ray that found it was fired.
@@ -491,18 +572,6 @@ static inline float3 secondaryIndirectFill(float3 hitN, uint hitLayerBits,
     return irr + mix(p.skyAmbient * 0.4, p.skyAmbient, upness) * ambK;
 }
 
-/// Outgoing radiance of a surface-cache card that is KNOWN but not resident
-/// (budget streaming zeroed its atlas rect, so reading the atlas would sample
-/// (0,0)). Emission + the card's albedo under the same indirect fill a re-shade
-/// would get — never black, and never the exterior-strength flat ambient the
-/// deferred path used to substitute here.
-static inline float3 secondaryCardFallback(SurfCard card, float3 hitN, uint hitLayerBits,
-                                           SecondaryShadeParams p,
-                                           texturecube<float, access::sample> irrCube)
-{
-    return card.emission.xyz + card.albedo.xyz * secondaryIndirectFill(hitN, hitLayerBits, p, irrCube);
-}
-
 // ── Local lights ─────────────────────────────────────────────────────────────
 
 /// Local point + spot lights at a secondary hit — the same falloff and cone math
@@ -518,6 +587,7 @@ static inline float3 secondaryLocalLightFill(float3 P, float3 N, uint layerBits,
     float3 sum = float3(0.0);
     for (uint i = 0u; i < p.pointLightCount; ++i) {
         RTPointLight pl = sc.pointLights[i];
+        if (pl.giVisible == 0u) continue;   // DH-0872 — see `giVisible`'s own doc comment
         if ((pl.layerMask & layerBits) == 0u) continue;
         float3 toL = pl.position - P;
         float dist = length(toL);
@@ -525,12 +595,14 @@ static inline float3 secondaryLocalLightFill(float3 P, float3 N, uint layerBits,
         float3 L = toL / max(dist, 1e-4);
         float nl = saturate(dot(N, L));
         if (nl <= 0.0) continue;
-        float atten = 1.0 / max(dist * dist, 1e-4);
+        // DH-0818 — the deferred pass's source-size falloff, `1/(d² + r²)`; r = 0 ⇒ `1/d²`.
+        float atten = 1.0 / max(dist * dist + pl.softRadius * pl.softRadius, 1e-4);
         float window = saturate(1.0 - pow(dist / pl.radius, 4.0));
         sum += pl.color * (atten * window * window * nl);
     }
     for (uint i = 0u; i < p.spotLightCount; ++i) {
         RTSpotLight sl = sc.spotLights[i];
+        if (sl.giVisible == 0u) continue;   // DH-0872 — see `giVisible`'s own doc comment
         if ((sl.layerMask & layerBits) == 0u) continue;
         float3 toL = sl.position - P;
         float dist = length(toL);
@@ -541,11 +613,88 @@ static inline float3 secondaryLocalLightFill(float3 P, float3 N, uint layerBits,
         if (coneAtten <= 0.0) continue;
         float nl = saturate(dot(N, L));
         if (nl <= 0.0) continue;
-        float atten = 1.0 / max(dist * dist, 1e-4);
+        float atten = 1.0 / max(dist * dist + sl.softRadius * sl.softRadius, 1e-4);
         float window = saturate(1.0 - pow(dist / sl.radius, 4.0));
         sum += sl.color * (atten * window * window * coneAtten * nl);
     }
     return sum * (1.0 / M_PI_F);
+}
+
+// ── Area lights (window portals) ─────────────────────────────────────────────
+
+/// Rectangular area lights at a secondary hit (DH-0718). Returns RADIANCE-per-albedo —
+/// the caller multiplies by albedo — matching the deferred kernel's diffuse
+/// `albedo · color · formFactor · window` exactly (same form factor, same one-sided
+/// test, same radius window, same layer mask), so a surface lit by a window reads the
+/// same seen directly, in a mirror, or as the source of a GI bounce.
+///
+/// Why it matters, measured before this existed: by day a window portal is the room's
+/// dominant source, and the secondary path had none — a reflected room was lit by the
+/// sun + sky fill + lamps only (Danny, 2026-09-08: the TV's reflected dining chairs
+/// "have no shadows"), and an RT GI bounce off a window-lit floor carried nothing of
+/// the window, so a north room's still got no bounce from its own daylight.
+///
+/// OCCLUDED like the deferred path's traced variant (`rtAreaVisibility`): each portal
+/// that asked for a shadow (`castsShadow`) gets `areaShadowRays` rays toward jittered
+/// points on its rectangle, stopping 2 cm short of the pane. A secondary hit's budget
+/// is one ray per light by default — an accumulating still converges it like the
+/// sun's cone. Skipped below `kSecondaryAreaSkip` (a portal far down the hall or
+/// behind the hit contributes a rounding error, which needs no visibility ray).
+constant float kSecondaryAreaSkip = 1e-4;
+
+template <typename Isect>
+static inline float3 secondaryAreaLightFill(thread Isect& isect,
+                                            instance_acceleration_structure accel,
+                                            float3 P, float3 N, uint layerBits,
+                                            SecondaryShadeParams p, SecondaryScene sc,
+                                            thread uint& seed)
+{
+    float3 sum = float3(0.0);
+    for (uint i = 0u; i < p.areaLightCount; ++i) {
+        RTAreaLight al = sc.areaLights[i];
+        if ((al.layerMask & layerBits) == 0u) continue;
+        float3 nL = cross(al.ex, al.ey);
+        float  nLlen = length(nL);
+        if (nLlen < 1e-8) continue;
+        nL /= nLlen;
+        bool twoSided = al.twoSided > 0.5;
+        if (!twoSided && dot(nL, P - al.center) <= 0.0) continue;
+        float dist = length(al.center - P);
+        if (dist > al.radius) continue;
+        float window = saturate(1.0 - pow(dist / al.radius, 4.0));
+        window *= window;
+        // Corner order as `evalAreaLight` — clockwise from +nL.
+        float3 p0 = al.center - al.ex - al.ey - P;
+        float3 p1 = al.center - al.ex + al.ey - P;
+        float3 p2 = al.center + al.ex + al.ey - P;
+        float3 p3 = al.center + al.ex - al.ey - P;
+        float ff = ltcPolygonForm(N, p0, p1, p2, p3, twoSided);
+        float3 L = al.color * (ff * window);
+        if (dot(L, float3(0.2126, 0.7152, 0.0722)) <= kSecondaryAreaSkip) continue;
+        if (al.castsShadow != 0 && p.areaShadowRays > 0u) {
+            float3 offN = (dot(N, al.center - P) >= 0.0) ? N : -N;
+            float3 origin = P + offN * 2e-3;
+            isect.accept_any_intersection(true);
+            uint hits = 0u;
+            for (uint s = 0u; s < p.areaShadowRays; ++s) {
+                float u = rnd(seed) * 2.0 - 1.0;
+                float v = rnd(seed) * 2.0 - 1.0;
+                float3 d = al.center + al.ex * u + al.ey * v - origin;
+                float len = length(d);
+                if (len < 1e-4) continue;
+                ray sr;
+                sr.origin = origin;
+                sr.direction = d / len;
+                sr.min_distance = 2e-3;
+                sr.max_distance = max(2e-3, len - 0.02);   // never the pane itself
+                if (isect.intersect(sr, accel, p.occluderMask).type != intersection_type::none) hits++;
+            }
+            isect.accept_any_intersection(false);
+            L *= 1.0 - float(hits) / float(p.areaShadowRays);
+        }
+        sum += L;
+    }
+    return sum;
 }
 
 // ── Direct sun ───────────────────────────────────────────────────────────────
@@ -597,9 +746,12 @@ static inline float secondarySunVisibility(thread Isect& isect,
 /// zeroing the corresponding `SecondaryShadeParams` fields rather than by keeping a
 /// second copy of the body. That is the whole point of this function.
 ///
-/// Callers that have a resident surface-cache card should prefer it
-/// (`sampleSurfCacheRT` returns full multi-bounce radiance for one atlas read);
-/// this is the re-shade for everything the cache does not cover.
+/// A hit on a surface-cache card is shaded by THIS body too (DH-0622) — `cached` true,
+/// `cacheIndirect` the card's traced multi-bounce irradiance, which takes the place of
+/// the indirect fill (sky IBL + ambient): both estimate the same arriving light, and the
+/// traced one is the better estimate. Everything else — textured albedo, local lights,
+/// the sun and its shadow ray, emission — is evaluated exactly as for an uncached hit.
+/// `cacheTerm` receives `albedo · cacheIndirect`, the cache's share alone (debug term 8).
 template <typename Isect>
 static inline float3 shadeSecondarySurface(thread Isect& isect,
                                            instance_acceleration_structure accel,
@@ -608,13 +760,19 @@ static inline float3 shadeSecondarySurface(thread Isect& isect,
                                            SecondaryScene sc,
                                            texturecube<float, access::sample> irrCube,
                                            texture2d_array<float, access::sample> albedoAtlas,
-                                           thread uint& seed)
+                                           thread uint& seed,
+                                           bool cached, float3 cacheIndirect,
+                                           thread float3& cacheTerm)
 {
     uint layerBits = secondaryLayerBits(h.instanceID, sc.insts);
     float3 A = secondaryAlbedo(h, p, sc, albedoAtlas);
     float3 rad = secondaryEmission(h.instanceID, sc.insts);
-    rad += A * secondaryIndirectFill(h.N, layerBits, p, irrCube);
+    cacheTerm = cached ? A * cacheIndirect : float3(0.0);
+    rad += cached ? cacheTerm : A * secondaryIndirectFill(h.N, layerBits, p, irrCube);
     rad += A * secondaryLocalLightFill(h.P, h.N, layerBits, p, sc);
+    if (p.areaLightCount > 0u) {
+        rad += A * secondaryAreaLightFill(isect, accel, h.P, h.N, layerBits, p, sc, seed);
+    }
     float3 Ld = normalize(p.sunDir);
     float nl = saturate(dot(h.N, Ld));
     // `shadowRays == 0` means "do not TEST the shadow", not "do not light the surface".
@@ -630,4 +788,20 @@ static inline float3 shadeSecondarySurface(thread Isect& isect,
         rad += A * (1.0 / M_PI_F) * p.sunColor * nl * vis;
     }
     return rad;
+}
+
+/// An uncached hit — the body above with no cache term.
+template <typename Isect>
+static inline float3 shadeSecondarySurface(thread Isect& isect,
+                                           instance_acceleration_structure accel,
+                                           SecondaryHit h,
+                                           SecondaryShadeParams p,
+                                           SecondaryScene sc,
+                                           texturecube<float, access::sample> irrCube,
+                                           texture2d_array<float, access::sample> albedoAtlas,
+                                           thread uint& seed)
+{
+    float3 cacheTerm;
+    return shadeSecondarySurface(isect, accel, h, p, sc, irrCube, albedoAtlas, seed,
+                                 false, float3(0.0), cacheTerm);
 }

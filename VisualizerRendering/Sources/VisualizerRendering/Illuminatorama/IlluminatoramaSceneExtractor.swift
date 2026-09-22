@@ -966,9 +966,11 @@ public final class IlluminatoramaSceneExtractor {
         // without rebuilding. (Also keyed off the older
         // `VIZ_DISABLE_TEXTURE_ATLAS` name for back-compat with shell
         // scripts.)
+        // Per MATERIAL, every frame (`IlluminatoramaOverlay.tick` → `extractFrame`), so `getenv`,
+        // not two whole-environment Dictionary builds (see `IlluminatoramaRenderer.frameEnv`).
         let disableTex =
-            ProcessInfo.processInfo.environment["VIZ_ILLUMINATORAMA_NO_TEXTURES"] == "1"
-            || ProcessInfo.processInfo.environment["VIZ_DISABLE_TEXTURE_ATLAS"] == "1"
+            IlluminatoramaRenderer.frameEnv("VIZ_ILLUMINATORAMA_NO_TEXTURES") == "1"
+            || IlluminatoramaRenderer.frameEnv("VIZ_DISABLE_TEXTURE_ATLAS") == "1"
         let albedoSlice: Int32
         let metallicSlice: Int32
         let roughnessSlice: Int32

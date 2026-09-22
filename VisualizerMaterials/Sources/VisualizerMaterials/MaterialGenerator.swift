@@ -528,7 +528,9 @@ public enum MaterialGenerator {
     /// flat-roughness tell; albedo carries enough macro contrast to clear the flat-colour tell.
     public static func stoneware(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 151,
                                  body: Vec3 = Vec3(0.90, 0.89, 0.86)) -> MaterialChannels {
-        var ch = MaterialChannels(size: size, category: .tile)
+        // `.ceramic`, not `.tile`: this is a fired clay BODY with no grid on it. Filing it with
+        // unit masonry is what put a grout-less tableware glaze in the floor and wall pickers.
+        var ch = MaterialChannels(size: size, category: .ceramic)
         let sh = seed
         for y in 0..<size {
             for x in 0..<size {
@@ -586,7 +588,9 @@ public enum MaterialGenerator {
     /// three TASTE DIALS above.
     public static func ceramic(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 197,
                                body: Vec3 = MaterialGenerator.ceramicAlbedo) -> MaterialChannels {
-        var ch = MaterialChannels(size: size, category: .tile)
+        // `.ceramic`, not `.tile` — see `stoneware`. Both families are COHERENT for anti-tiling,
+        // so the pixels and the hex-blend decision are unchanged; only the filing is honest now.
+        var ch = MaterialChannels(size: size, category: .ceramic)
         let sh = seed
         for y in 0..<size {
             for x in 0..<size {
@@ -871,6 +875,77 @@ public enum MaterialGenerator {
               patina: Vec3(0.30, 0.36, 0.28))      // dusky brown-green tarnish
     }
 
+    /// **Corten (weathering steel)** — the rust-patina metal a modern garden planter / edging
+    /// wears (DH-0124). A `.metal` (so it renders metallic, and the tone tell is correctly
+    /// lifted — a metal's albedo is its reflectance), but a MATTE one: the whole look is the
+    /// oxide, so roughness sits high (0.55–0.85) and drifts spatially. The weathering is
+    /// authored VERTICALLY — rain washes the oxide down the face in streaks — so the drift is
+    /// v-directional (`v * 24`, integer for a seamless wrap), with darker rain-runs and the odd
+    /// brighter fresh-oxide bloom. Isotropic (no grain tangent): the streaks are tone, not a
+    /// brushed grain the engine should stretch a highlight along.
+    public static func corten(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 211,
+                              base: Vec3 = Vec3(0.44, 0.23, 0.13),      // warm rust orange-brown
+                              bloom: Vec3 = Vec3(0.58, 0.36, 0.21),     // lighter fresh-oxide flush
+                              runoff: Vec3 = Vec3(0.24, 0.13, 0.09)     // dark rain-streak stain
+    ) -> MaterialChannels {
+        var ch = MaterialChannels(size: size, category: .metal)
+        for y in 0..<size {
+            for x in 0..<size {
+                let u = Double(x) / Double(size), v = Double(y) / Double(size)
+                // Broad blotchy patina + vertical rain-runs + fine pit mottle.
+                let patch  = Noise.fbmTiled(u, v, baseCells: 3, octaves: 4, seed: seed)
+                let streak = Noise.fbmTiled(u, v * 24.0, baseCells: 4, octaves: 3, seed: seed ^ 0x5C)
+                let grit   = Noise.fbmTiled(u, v, baseCells: 30, octaves: 2, seed: seed ^ 0x2B)
+                let run    = pow(streak, 3) * 0.6                        // dark vertical runoff, sparse
+                let flush  = pow(patch, 4) * 0.5                          // bright fresh-oxide bloom
+                var c = mix(base * (0.90 + 0.18 * patch), bloom, flush)
+                c = mix(c, runoff, run)
+                ch.albedo[ch.idx(x, y)] = clampBand(c)
+                // Matte oxide: rough everywhere, roughest in the runoff, a touch smoother at a bloom.
+                ch.roughness[ch.idx(x, y)] = clamp01(0.60 + 0.20 * run + 0.10 * grit
+                    - 0.08 * flush + (patch - 0.5) * 0.10)
+                ch.height[ch.idx(x, y)] = clamp01(0.5 + (grit - 0.5) * 0.5 - run * 0.15)
+            }
+        }
+        ch.clearcoat = 0.0                          // no lacquer — bare weathered oxide
+        ch.deriveNormals(strength: 2.5)
+        addMicroDetail(&ch, seed: seed ^ 0xF3, baseCells: 84, octaves: 2, strength: 0.85)   // oxide tooth
+        return ch
+    }
+
+    /// **Terracotta (unglazed fired clay)** — the warm earthenware a classic garden planter is
+    /// thrown from (DH-0124). Categorised `.stone` (a fired-earth dielectric that belongs with
+    /// the natural-mineral surfaces and de-repeats stochastically), never glazed: matte, no
+    /// clearcoat, an orange-red body mottled by uneven firing with the odd darker scorch and a
+    /// scatter of tiny surface pinholes (the air pockets a low-fire clay always shows). The
+    /// mottle carries the macro albedo variation the dielectric tone tell requires.
+    public static func terracotta(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 223,
+                                  base: Vec3 = Vec3(0.60, 0.31, 0.20)) -> MaterialChannels {
+        var ch = MaterialChannels(size: size, category: .stone)
+        let scorch = Vec3(0.44, 0.22, 0.14)          // darker over-fired blush
+        let light  = Vec3(0.70, 0.42, 0.29)          // lighter under-fired flush
+        for y in 0..<size {
+            for x in 0..<size {
+                let u = Double(x) / Double(size), v = Double(y) / Double(size)
+                let fire = Noise.fbmTiled(u, v, baseCells: 3, octaves: 5, seed: seed)          // firing mottle
+                let blush = pow(Noise.fbmTiled(u, v, baseCells: 4, octaves: 4, seed: seed ^ 0x31), 2.5) * 0.7
+                let pit = Noise.voronoiTiled(u, v, cells: 22, jitter: 0.9, seed: seed ^ 0x6D)
+                let hole = 1 - smoothstep(0.0, 0.030, pit.f1)                                   // 1 inside a pinhole
+                var c = mix(base * (0.88 + 0.20 * fire), light, blush)
+                c = mix(c, scorch, pow(1 - fire, 3) * 0.5)
+                c = c * (1 - 0.35 * hole)                                                       // pinholes read darker
+                ch.albedo[ch.idx(x, y)] = clampBand(c)
+                ch.roughness[ch.idx(x, y)] = clamp01(0.70 + 0.10 * fire + 0.12 * hole
+                    + (Noise.fbmTiled(u, v, baseCells: 26, octaves: 2, seed: seed ^ 0x4E) - 0.5) * 0.08)
+                ch.height[ch.idx(x, y)] = clamp01(0.55 + (fire - 0.5) * 0.3 - 0.5 * hole)
+            }
+        }
+        ch.clearcoat = 0.0                          // unglazed — no gloss
+        ch.deriveNormals(strength: 2.5)
+        addMicroDetail(&ch, seed: seed ^ 0xE7, baseCells: 88, octaves: 2, strength: 0.80)   // clay grain tooth
+        return ch
+    }
+
     /// Velvet — the **sheen** lobe (§3) made the whole point: a *dark* base with a
     /// strong retroreflective grazing sheen and a fine woven nap normal. Sheen, not
     /// roughness, carries the look, so the channels stay matte and dark while the
@@ -892,6 +967,8 @@ public enum MaterialGenerator {
             }
         }
         ch.sheen = 0.85                            // velvet is sheen-dominated
+        ch.sheenRoughness = 0.45                    // dense cut pile → a BROAD, soft grazing glow
+                                                    // (DH-0081; was the 0.30 library default)
         ch.deriveNormals(strength: 2)
         // Very fine sub-thread nap so the pile catches grazing light as fuzz, not plastic.
         addMicroDetail(&ch, seed: seed ^ 0xB3, baseCells: 120, strength: 0.40)
@@ -929,6 +1006,8 @@ public enum MaterialGenerator {
         // what "medium" means here. `MaterialTextureTests.testEveryUncoatedFabricCarriesSheen`
         // now iterates the registry, so no future fabric can lose it silently.
         ch.sheen = 0.45
+        ch.sheenRoughness = 0.60                    // chunky looped bouclé → the broadest, fuzziest
+                                                    // nap of the fabric set (DH-0081)
         ch.deriveNormals(strength: 4)
         // Soft fibrous fuzz over the chunky loops — the between-loop wool haze at close range.
         addMicroDetail(&ch, seed: seed ^ 0xB4, baseCells: 60, strength: 0.70)
@@ -1026,6 +1105,45 @@ public enum MaterialGenerator {
         return ch
     }
 
+    /// **Sand-finish stucco** — the exterior render of a Southern California house: a cement
+    /// plaster floated with a sand-charged sponge, so the surface is a dense field of millimetre
+    /// grit under a faint swirl of float marks, and its colour is a pigmented coat that cures
+    /// unevenly into a soft patchiness. Everything `paint` deliberately is NOT: paint's tone is
+    /// near-uniform (its variance moved into roughness — see `paint`), and that is right for a
+    /// rolled interior wall and wrong for a plastered exterior one, which reads as "flat colour"
+    /// from across the street (DH-0939 — the local judge's standing top signal on 4000 Sunset).
+    ///
+    /// Bands, on the paint tile (0.6 m): the cure patchiness at 1–2 cells (30–60 cm, 2 %), the
+    /// float swirl at 6 cells (10 cm), the sand grit at 96 cells (6 mm) carried in albedo,
+    /// height AND roughness, and a 1.6 mm micro-tooth in the detail normal. Dead flat sheen.
+    public static func stucco(size: Int = MaterialGenerator.bakeSize, color: Vec3 = Vec3(0.72, 0.68, 0.60),
+                              seed: UInt64 = 23) -> MaterialChannels {
+        var ch = MaterialChannels(size: size, category: .paint)
+        for y in 0..<size {
+            for x in 0..<size {
+                let u = Double(x) / Double(size), v = Double(y) / Double(size)
+                let cure  = Noise.fbmTiled(u, v, baseCells: 2, octaves: 3, seed: seed) - 0.5
+                let swirl = Noise.fbmTiled(u, v, baseCells: 6, octaves: 3, seed: seed ^ 0x51) - 0.5
+                // Two grits: the sand itself (6 mm) and the float's clumped aggregate (12 mm) —
+                // the coarser one is what still reads from across the street.
+                let grit  = 0.55 * (Noise.fbmTiled(u, v, baseCells: 96, octaves: 2, seed: seed ^ 0xA7) - 0.5)
+                          + 0.75 * (Noise.fbmTiled(u, v, baseCells: 44, octaves: 2, seed: seed ^ 0x6E) - 0.5)
+                let pit   = Noise.fbmTiled(u, v, baseCells: 48, octaves: 2, seed: seed ^ 0x3C)
+                // Tone: the cure patchiness is the read from the street; the grit is what the
+                // eye resolves from the sidewalk. Pits between grains are a shade darker.
+                let macro = 1.0 + 0.045 * cure + 0.025 * swirl + 0.095 * grit - 0.030 * max(0, 0.55 - pit)
+                ch.albedo[ch.idx(x, y)] = clampBand(color * macro)
+                ch.height[ch.idx(x, y)] = clamp01(0.5 + 0.30 * swirl + 0.45 * grit)
+                // A sand float is matte everywhere; the grit only scatters it unevenly.
+                ch.roughness[ch.idx(x, y)] = clamp01(0.86 + 0.08 * grit + 0.03 * swirl)
+            }
+        }
+        ch.clearcoat = 0
+        ch.deriveNormals(strength: 2.8)
+        addMicroDetail(&ch, seed: seed ^ 0xD4, baseCells: 120, strength: 0.7)
+        return ch
+    }
+
     // MARK: – Phase 8 civil / site materials
 
     /// Grass ground cover: green base with height/density variation and stem detail.
@@ -1117,10 +1235,18 @@ public enum MaterialGenerator {
                 // the surface stays unambiguously GREEN. A low-freq olive modulation adds subtle
                 // yellow-olive patchiness (broad, not per-pixel) so it's not a flat sheet without
                 // adding coherent-period banding or spiking the mowed-lawn's low chroma variance.
+                //
+                // CARPET PASS (DH-0077, 2026-09-13): the muted olive left the lawn's green to the
+                // blades, and from a dollhouse camera those read as "teeny little hairs" on a dull
+                // ground (Danny). A mowed lawn seen from above resolves as ONE green surface, so the
+                // tile now carries a richer turf green — G ≈0.23→0.28 at the mean, B pulled back
+                // under it (G−R ≈0.09→0.15) — still well inside measured turf reflectance and the
+                // dielectric band, and the blades are matched to THIS colour rather than out-running it.
+                // (A first cut at G−R ≈0.19 rendered as lime — the neon read 7a08a96 removed.)
                 let olive = 0.02 * (mottle - 0.5)   // ±0.01 low-freq yellow-olive patch tint on R
-                let lush = Vec3(clamp01(0.075 + gLevel * 0.14 + olive),
-                                clamp01(0.06 + gLevel * 0.40),
-                                clamp01(0.045 + gLevel * 0.095))
+                let lush = Vec3(clamp01(0.085 + gLevel * 0.12 + olive),
+                                clamp01(0.09 + gLevel * 0.46),
+                                clamp01(0.038 + gLevel * 0.06))
                 // Stressed patches yellow-brown (straw): R rises toward G, B stays low.
                 let straw = Vec3(clamp01(0.10 + gLevel * 0.55),
                                  clamp01(0.08 + gLevel * 0.62),
@@ -1145,6 +1271,146 @@ public enum MaterialGenerator {
         // amplification keeps the remaining stochastic micro-relief from aliasing at grazing angle.
         ch.deriveNormals(strength: 1.3)
         return ch
+    }
+
+    /// The per-species knobs over the ONE clipped-hedge foliage generator (`hedgeFoliage`).
+    /// Species-based hedges (DH-0123): a real boxwood, privet and holly are the same *surface
+    /// kind* — a dense stochastic Worley leaf lattice — but differ in leaf colour, leaf/spray
+    /// scale, how much bright new growth flushes, and how waxy (glossy) the lamina reads. Only
+    /// these knobs vary; the noise structure is shared so all three tile seamlessly and pass the
+    /// same `TextureAudit`. Phase A is BROADLEAF only — needled conifers (yew, arborvitae) need
+    /// geometric needle cards (Phase B), not a material tint.
+    public struct HedgeFoliageParams: Sendable {
+        /// Deep shaded-lamina leaf green, and the lighter tint of sun-lit fresh growth.
+        public var deep: Vec3
+        public var fresh: Vec3
+        /// Voronoi cell counts — the broad leaf-spray scale and the fine individual-leaf scale.
+        /// Fewer cells → larger leaves (privet); more → smaller, denser leaves (holly).
+        public var coarseCells: Int
+        public var fineCells: Int
+        /// Multiplier on the fresh-growth fraction: 1 = boxwood's yellow-green flush, <1 keeps a
+        /// species uniformly dark (holly), >1 flushes brighter (privet).
+        public var newGrowth: Double
+        /// Base roughness of the leaf face — lower is glossier/waxier.
+        public var roughnessBase: Double
+        /// Clearcoat leaf sheen — the waxy highlight, not a wet gloss.
+        public var clearcoat: Double
+
+        public init(deep: Vec3, fresh: Vec3, coarseCells: Int = 11, fineCells: Int = 22,
+                    newGrowth: Double = 1.0, roughnessBase: Double = 0.52, clearcoat: Double = 0.08) {
+            self.deep = deep; self.fresh = fresh
+            self.coarseCells = coarseCells; self.fineCells = fineCells
+            self.newGrowth = newGrowth; self.roughnessBase = roughnessBase; self.clearcoat = clearcoat
+        }
+
+        /// Clipped **boxwood** — deep green, small waxy leaves, a modest yellow-green new-growth
+        /// flush. The shipped default (DH-0122); these values reproduce the original `boxwood`
+        /// generator exactly, so the boxwood material is byte-identical to before DH-0123.
+        public static let boxwood = HedgeFoliageParams(
+            deep: Vec3(0.045, 0.115, 0.040), fresh: Vec3(0.150, 0.250, 0.075),
+            coarseCells: 11, fineCells: 22, newGrowth: 1.0, roughnessBase: 0.52, clearcoat: 0.08)
+
+        /// **Privet** (Ligustrum) — a brighter, more open mid-green with LARGER oval leaves and a
+        /// vigorous bright new-growth flush; glossier than boxwood. PROVISIONAL (DH-0123 Phase A):
+        /// tuned from reference, to be judged on the published hero capture, not frozen here.
+        public static let privet = HedgeFoliageParams(
+            deep: Vec3(0.055, 0.140, 0.050), fresh: Vec3(0.175, 0.300, 0.095),
+            coarseCells: 8, fineCells: 16, newGrowth: 1.35, roughnessBase: 0.46, clearcoat: 0.12)
+
+        /// **Holly** (Ilex) — very dark blue-green, small dense spiny leaves, almost no bright
+        /// flush (it stays uniformly dark), and a hard waxy gloss. PROVISIONAL (DH-0123 Phase A):
+        /// tuned from reference, to be judged on the published hero capture, not frozen here.
+        public static let holly = HedgeFoliageParams(
+            deep: Vec3(0.028, 0.082, 0.046), fresh: Vec3(0.068, 0.145, 0.072),
+            coarseCells: 13, fineCells: 28, newGrowth: 0.35, roughnessBase: 0.40, clearcoat: 0.17)
+    }
+
+    /// Clipped **hedge foliage** — a dense mass of small waxy leaves read at close range, NOT
+    /// turf. The hedge placeable used the `grass` tile as a stand-in, but grass is soil-gapped
+    /// vertical blades: it reads as lawn stood on end, never as a trimmed shrub. A clipped hedge
+    /// is the opposite surface — a continuous canopy of overlapping oval leaves with dark recesses
+    /// between the sprays, deep green shading to a lighter tint where fresh growth catches the
+    /// sun, and a faint waxy leaf sheen. All structure is a Worley leaf lattice + tiled fbm
+    /// undulation, so it is fully stochastic and tileable — no coherent period to band in a wide
+    /// yard shot — and `.ground` category (yard-only + the hex de-repeat, exactly like `grass`).
+    ///
+    /// The leaf relief lives ENTIRELY in the material (the hedge mesh is a clipped box, no
+    /// per-leaf geometry), so this is a `.needsMicroRelief` surface — it ships a detail normal.
+    /// Species differ only through `HedgeFoliageParams` (DH-0123).
+    public static func hedgeFoliage(_ p: HedgeFoliageParams,
+                                    size: Int = MaterialGenerator.bakeSize,
+                                    seed: UInt64 = 47) -> MaterialChannels {
+        var ch = MaterialChannels(size: size, category: .ground)
+        let deep  = p.deep
+        let fresh = p.fresh
+        for y in 0..<size {
+            for x in 0..<size {
+                let u = Double(x) / Double(size), v = Double(y) / Double(size)
+                // Broad clipped-canopy undulation — the shadow pockets between leaf sprays.
+                let spray = Noise.fbmTiled(u, v, baseCells: 4, octaves: 4, seed: seed)
+                // DOMAIN WARP before the leaf lattice. A raw Worley partition reads as regular
+                // stone crazing (a continuous even outline, the mosaic tell); warping the sample
+                // point with a low-freq tiled fbm buckles the cells into irregular organic
+                // clusters. The warp field is periodic, so the wrap stays seamless.
+                let wu = u + 0.05 * (Noise.fbmTiled(u, v, baseCells: 5, octaves: 2, seed: seed ^ 0x1A2B) - 0.5)
+                let wv = v + 0.05 * (Noise.fbmTiled(u, v, baseCells: 5, octaves: 2, seed: seed ^ 0x3C4D) - 0.5)
+                // TWO leaf scales so cluster size varies (a single scale is what makes a mosaic):
+                // broad sprays + the fine individual leaves within them.
+                let coarse = Noise.voronoiTiled(wu, wv, cells: p.coarseCells, jitter: 0.95, seed: seed ^ 0x5C2D)
+                let fine   = Noise.voronoiTiled(wu, wv, cells: p.fineCells, jitter: 0.95, seed: seed ^ 0x77E9)
+                let dome  = clamp01(1.0 - fine.f1 * 1.4)                    // 1 at a leaf centre
+                let broad = clamp01(1.0 - coarse.f1 * 1.2)                  // 1 at a spray centre
+                // Per-leaf tint, biased toward its broad cluster so whole sprays vary together.
+                let leafT = mix(Noise.unit(fine.cellId), Noise.unit(coarse.cellId), 0.4)
+                // Within-leaf micro tonal variation (waxy highlight vs. shaded lamina).
+                let micro = Noise.fbmTiled(u * 6.0, v * 6.0, baseCells: 8, octaves: 2, seed: seed ^ 0x91A3)
+
+                // A fraction of leaves are fresh new growth, biased toward the sun-lit sprays; the
+                // rest stay deep green. `newGrowth` scales how much a species flushes.
+                let freshFrac = clamp01((leafT - 0.50) * 1.6) * clamp01(0.4 + spray) * p.newGrowth
+                var col = mix(deep, fresh, clamp01(freshFrac))
+                // BROKEN gap: the leaf-edge outline only darkens where a micro-noise agrees, so
+                // the shadow between leaves reads as intermittent pockets, not a crackle net.
+                let edge = 1.0 - smoothstep(0.0, 0.10, fine.f2 - fine.f1)
+                let pocket = edge * smoothstep(0.35, 0.70, micro)
+                let shade = clamp01(0.26 * (1.0 - spray) + 0.42 * pocket)   // 0 lit … 1 recess
+                col = col * (0.82 + 0.30 * micro) * (1.0 - 0.50 * shade)
+                ch.albedo[ch.idx(x, y)] = clampBand(col)
+
+                // Waxy leaf faces read semi-glossy; the shaded recesses go matte. The spatial
+                // swing carries the roughness-std TextureAudit tell.
+                ch.roughness[ch.idx(x, y)] = clamp01(p.roughnessBase + 0.30 * shade + 0.08 * (micro - 0.5))
+
+                // Leaf clusters stand proud, recesses sink — the macro relief that reads as
+                // many small overlapping leaves once deriveNormals runs.
+                ch.height[ch.idx(x, y)] = clamp01(0.42 + 0.30 * dome + 0.18 * broad
+                                                  + 0.14 * spray - 0.22 * pocket)
+            }
+        }
+        ch.clearcoat = p.clearcoat   // faint waxy leaf sheen — not a wet gloss
+        ch.deriveNormals(strength: 2.6)
+        // Fine leaf-lamina tooth (the macro leaves are in the height field above; this is the
+        // sub-leaf grain that stops the canopy reading plastic at a grazing angle).
+        addMicroDetail(&ch, seed: seed ^ 0xB6, baseCells: 110, strength: 0.40)
+        return ch
+    }
+
+    /// Clipped **boxwood** hedge foliage — the shipped default (DH-0122). Delegates to the shared
+    /// `hedgeFoliage` generator with the boxwood species knobs; byte-identical to the pre-DH-0123
+    /// implementation.
+    public static func boxwood(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 47) -> MaterialChannels {
+        hedgeFoliage(.boxwood, size: size, seed: seed)
+    }
+
+    /// Clipped **privet** hedge foliage — a brighter, larger-leaved broadleaf species (DH-0123).
+    public static func privet(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 47) -> MaterialChannels {
+        hedgeFoliage(.privet, size: size, seed: seed)
+    }
+
+    /// Clipped **holly** hedge foliage — a very dark, small-leaved, hard-waxy broadleaf species
+    /// (DH-0123).
+    public static func holly(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 47) -> MaterialChannels {
+        hedgeFoliage(.holly, size: size, seed: seed)
     }
 
     /// Asphalt road surface: near-black base aging to worn gray; Voronoi aggregate pitting;
@@ -1600,6 +1866,30 @@ public enum MaterialGenerator {
                                     roughness: 0.88),
               litter: litter,
               litterPalette: (Vec3(0.26, 0.18, 0.10), Vec3(0.50, 0.35, 0.17)))
+    }
+
+    /// **Garden mulch — a bed of shredded bark chips over dark planting soil.** The regional
+    /// base-ground a garden plot wears (DH-0575). Built on the same `earth` construction as
+    /// `forestFloor` — an organic mat lying ON broken earth — but the overlay is BARK, not fallen
+    /// leaves, and that changes three things: the chips are warmer and redder (fresh shredded
+    /// hardwood/cedar, not a year of mixed rotted leaf), their tone spread is TIGHTER (a bagged
+    /// mulch is close to one colour where a forest floor is every autumn shade at once), and the
+    /// coverage runs near-closed (a fresh mulch bed hides the soil). The earth beneath is a dark,
+    /// damp PLANTING bed — potting soil under the chips, not sun-baked open-yard loam — so where
+    /// the chips thin it reads as shadow, not as a bald dirt patch.
+    ///
+    /// The spatially-varying roughness comes for free from `earth`: damp hollows level smoother,
+    /// grit/fines roughen, so `TextureAudit`'s roughness-SD tell is cleared the same way `dirt`
+    /// and `forestFloor` clear it. Outdoor-grade, no clearcoat, `.ground` category.
+    public static func mulch(size: Int = MaterialGenerator.bakeSize,
+                             seed: UInt64 = 157) -> MaterialChannels {
+        earth(size: size, seed: seed, damp: 0.5,
+              palette: EarthPalette(dry: Vec3(0.26, 0.17, 0.11),
+                                    damp: Vec3(0.13, 0.085, 0.055),
+                                    grit: Vec3(0.30, 0.24, 0.19),
+                                    roughness: 0.90),
+              litter: 0.92,
+              litterPalette: (Vec3(0.34, 0.17, 0.10), Vec3(0.50, 0.28, 0.15)))
     }
 
     /// Phase 8 — tree BARK for the yard trunk/branches. Warm grey-brown with the canonical
@@ -2606,6 +2896,10 @@ public enum MaterialGenerator {
         // velvet grade so it reads as matte upholstery, not satin: the fabric character is carried
         // mostly by the albedo weave + roughness variation, with sheen as the finishing soft glow.
         ch.sheen = 0.30
+        // Nap width kept at the library DEFAULT (0.30) on purpose: a flat plain weave has a
+        // medium, unremarkable sheen breadth, and this is the fabric the cloth-sheen render gate
+        // measures — leaving it default keeps that frame byte-identical (DH-0081).
+        ch.sheenRoughness = 0.30
         ch.grainTangent = [Vec2](repeating: Vec2(1, 0), count: size * size)
         ch.deriveNormals(strength: 0.1)            // near-flat — the weave is only a hint, so a
                                                    // grazing back cushion stays even soft cloth,
@@ -2646,8 +2940,21 @@ public enum MaterialGenerator {
         return ch
     }
 
+    /// The colourway a bare `matteBlack()` bakes — the near-neutral powder-coat black, luma 0.10
+    /// with the historical faint-warm tint (×0.98 green, ×0.96 blue). Declared once so the
+    /// registry's `matte-black` default and the generator's default `color:` cannot drift apart.
+    public static let matteBlackDefaultColor = Vec3(0.10, 0.098, 0.096)
+
     /// Matte black — powder-coat / anodized finish. Deep absorptive, micro-textured.
-    public static func matteBlack(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 117) -> MaterialChannels {
+    ///
+    /// `color` is a **colourway** (DH-0470): it drives the albedo ONLY. A powder coat's life is
+    /// its orange-peel tooth and its roughness field, and those are the SAME finish whatever the
+    /// pigment — a white, bronze or sage powder-coat is cast and cured exactly like the black one.
+    /// So the roughness field and the cast micro-relief below are identical for every colour, and
+    /// only the albedo follows `color`. Bare `matteBlack()` bakes the historical black bit-for-bit
+    /// (`matteBlackDefaultColor` is the old `Vec3(luma, luma*0.98, luma*0.96)` mean).
+    public static func matteBlack(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 117,
+                                  color: Vec3 = MaterialGenerator.matteBlackDefaultColor) -> MaterialChannels {
         var ch = MaterialChannels(size: size, category: .metal)
         let sh = seed
         for y in 0..<size {
@@ -2671,12 +2978,15 @@ public enum MaterialGenerator {
                 //
                 // Same treatment as `paint`: the variance moves OUT of tone and stays in
                 // roughness (untouched below, ±0.22 micro / ±0.10 coat) and in the relief
-                // normal. Centred on 0.10 — the exact mean of the old range — so the
-                // material's overall darkness is unchanged; the residual ±0.15 % is a
-                // whisper that keeps the bake off a mathematically dead flat fill without
-                // being visible (well under one 8-bit code value at this luminance).
-                let luma = clampBand(0.10 + (micro - 0.5) * 0.002 + (coat - 0.5) * 0.001)
-                ch.albedo[ch.idx(x, y)] = Vec3(luma, luma * 0.98, luma * 0.96)
+                // normal. The residual ±0.15 % tone whisper keeps the bake off a
+                // mathematically dead flat fill without being visible (well under one 8-bit
+                // code value at the black's luminance). It is applied MULTIPLICATIVELY so it
+                // scales with the chosen colourway rather than being a fixed black offset —
+                // a white powder-coat gets the same ±1.5 % relative whisper, not a ±0.0015
+                // one that would vanish against a 0.85 base. At the default black this is the
+                // historical `0.10 + micro*0.002 + coat*0.001`.
+                let toneVar = (micro - 0.5) * 0.002 + (coat - 0.5) * 0.001
+                ch.albedo[ch.idx(x, y)] = clampBand(color * (1.0 + toneVar / 0.10))
                 ch.roughness[ch.idx(x, y)] = clamp01(0.68 + (micro - 0.5) * 0.22
                     + (coat - 0.5) * 0.10)
                 ch.height[ch.idx(x, y)] = clamp01(0.50 + (micro - 0.5) * 0.10)

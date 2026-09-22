@@ -30,7 +30,10 @@ public struct IlluminatoramaFrameUniforms {
     /// `_padCamera` pad — see the Metal twin in IlluminatoramaCommon.h for the contract.
     public var aerialPerspectiveDensity: Float = 0
     public var directionalLightDir: SIMD3<Float>      // world-space, toward light
-    public var _padDir: Float = 0
+    /// DH-0140 — 1 when this frame's G-buffer pass wrote the extended sixth target and the
+    /// lighting kernel may read it; 0 keeps the 5-target lighting byte-identical. Set by the
+    /// renderer from `extendedGBufferEnabled`, never by a host. Repurposes `_padDir`.
+    public var extendedGBuffer: Float = 0
     public var directionalLightColor: SIMD3<Float>    // pre-multiplied intensity
     public var _padColor: Float = 0
     public var ambientColor: SIMD3<Float>
@@ -66,8 +69,17 @@ public struct IlluminatoramaFrameUniforms {
     /// 0 disables IBL (lighting kernel falls back to hemispheric ambient,
     /// sky pixels still come from the equirect texture).
     public var iblEnabled: UInt32
-    /// Padding so the struct stride closes on a 16-byte boundary.
-    public var _padPhase3: Float = 0
+    /// Lamp-shade fabric translucency strength (DH-0458). 0 = OFF (the default for
+    /// every scene) → the shade thin-sheet transmission branch in the lighting
+    /// kernel is an EXACT no-op unless a host sets it. A paper/linen drum shade is
+    /// a thin translucent sheet: this drives the back-lit transmission that lets the
+    /// sunset (or the room behind the shade) scatter THROUGH the fabric instead of
+    /// landing flat on an opaque cone. Shade fragments are flagged in
+    /// `normalRoughness.w` (≈0.62 — a scene tags its shade vertices with colour
+    /// alpha in (0.60, 0.66]). Repurposes the former `_padPhase3` pad — same 4
+    /// bytes at the same offset, so the struct stride is unchanged. Mirrors
+    /// `shadeTransmission` in the Metal `FrameUniforms`.
+    public var shadeTransmission: Float = 0
     // ── Phase 2.5: Cascaded shadow maps ──────────────────────────────
     /// Per-cascade light-space view-projection matrices. Three cascades
     /// declared individually rather than as a 3-tuple/array so the layout
@@ -327,15 +339,36 @@ public struct IlluminatoramaFrameUniforms {
     /// opaque pixel as SSS-flagged so the effect can be render-verified without
     /// re-tagging a mesh. 0 in normal use → only the [0.90,0.98] flag band scatters.
     public var sssDebugForceAll: Float = 0
-    public var _padSSS1: Float = 0
-    public var _padSSS2: Float = 0
+    /// Foliage-wind motion-vector delta, seconds (DH-0492). The G-buffer samples the
+    /// PREVIOUS frame's `applyTreeWind` at `time − windPrevDelta` so a swaying canopy/blade
+    /// writes a real screen-space velocity TAA can reproject (killing the sub-pixel crawl).
+    /// 0 (the default) = previous sampled at the SAME time ⇒ the pre-DH-0492 no-op, so every
+    /// scene that never sets it and every settled/frozen capture stays byte-identical.
+    /// Repurposes the former `_padSSS1` slot — same offset, stride unchanged. Mirror of the
+    /// Metal `FrameUniforms.windPrevDelta`.
+    public var windPrevDelta: Float = 0
+    /// DH-0881 — which scene → display rendering the tonemap uses. 0 = the shipped fitted
+    /// ACES curve applied PER CHANNEL in Rec.709 primaries (byte-identical, the default),
+    /// 1 = the same curve evaluated in ACEScg/AP1 so its channel clipping happens in a wide
+    /// gamut and hue stops rotating as intensity rises, 2 = AgX. Repurposes the former
+    /// `_padSSS2` slot — same offset, stride unchanged.
+    public var displayTransform: UInt32 = 0
     // Phase 9 — film-stock LUT colour grade. Blends the 3D-LUT-graded result with
     // the ACES-tonemapped result. 0 = LUT fully bypassed (identity), 1 = full grade.
     // NEW 16-byte cluster (stride 1088 → 1104). Three float pads fill the cluster.
     public var filmLUTStrength: Float = 0
-    public var _padFilmLUT0: Float = 0
-    public var _padFilmLUT1: Float = 0
-    public var _padFilmLUT2: Float = 0
+    /// DH-0441 — outer radius (metres) of the WIDE AO ring: a second GTAO march whose
+    /// occluders are weighted to the annulus beyond `ssaoRadius`. Repurposes the former
+    /// `_padFilmLUT0` slot — same offset, stride unchanged. Mirrors the Metal `FrameUniforms`.
+    public var ssaoFarRadius: Float = 0.5
+    /// DH-0441 — strength of the wide AO ring. 0 = OFF (the default) → the ring is never
+    /// marched and the AO field is byte-identical. Repurposes the former `_padFilmLUT1` slot.
+    public var ssaoFarIntensity: Float = 0
+    /// Cells per axis of the film-stock cube — 16 for the legacy 8-bit PNG strips, 33 for
+    /// the float16 `.lutcube` assets (DH-0879). The shader's half-texel inset is derived
+    /// from this rather than hardcoded, so a host can ship a finer cube without an engine
+    /// change. Repurposes the former `_padFilmLUT2` slot — same offset, stride unchanged.
+    public var filmLUTSize: Float = 16
     // ── Tonemap colour-grade ─────────────────────────────────────────
     // White-balance + tint are channel gains applied to LINEAR HDR before
     // exposure/ACES; contrast/shadows/highlights are a tone curve in the
@@ -491,7 +524,9 @@ public struct IlluminatoramaFrameUniforms {
     public var rtSunShadowSeed: UInt32 = 0
     public var rtSunShadowAngle: Float = 0
     public var rtSunShadowRayCount: UInt32 = 0
-    public var _padRTSunShadow: Float = 0
+    /// S4.3 — ray-traced portal visibility (see `rtAreaShadowRays`). Occupies the former
+    /// `_padRTSunShadow` slot, so the stride is unchanged. 0 ⇒ the PCF slice path, byte-identical.
+    public var rtAreaShadowRayCount: UInt32 = 0
     /// Per-room interior band LEVEL (S3.5 Stage E). One gain per light-layer bit —
     /// the same 32-bit room identity `interiorMask` and `PointLight.layerMask` use —
     /// packed 4 to a vector, so a fragment's bits resolve to how much daylight ITS
@@ -511,6 +546,42 @@ public struct IlluminatoramaFrameUniforms {
     public var interiorRoomGain6: SIMD4<Float> = .one
     public var interiorRoomGain7: SIMD4<Float> = .one
     public var interiorRoomGainMeta: SIMD4<Float> = .zero   // x = enabled
+
+    // ── Photographic finish: highlight chroma roll-off + split tone ──────────
+    /// Fades chroma out as a pixel approaches white. ACES desaturates toward white
+    /// on its own, but `tonemapSaturation` is a FLAT `mix(luma, colour, S)` — it
+    /// pushes that chroma straight back out, which is how a lamp-lit wooden wall
+    /// clips to saturated yellow instead of a pale warm white. 0 (default) ⇒ the
+    /// tonemap branch never runs ⇒ byte-identical for every scene that never opts in.
+    public var highlightChromaRolloff: Float = 0
+    /// Split-tone temperature of the SHADOW end, in Kelvin, through the same
+    /// `whiteBalanceGain` curve the global white balance uses (luma-normalized, so it
+    /// tints without dimming) under a low-luma mask. 6500 (default) = gain (1,1,1) =
+    /// exact no-op. Below 6500 cools the shadows (photo convention, DH-0453) — the
+    /// archviz separation that gives warm practicals something to read against.
+    public var shadowTemperatureK: Float = 6500
+    /// Split-tone temperature of the HIGHLIGHT end. 6500 (default) = exact no-op.
+    /// Pairs with `highlightChromaRolloff`: roll the scene's own chroma off as it
+    /// approaches white, then put back a controlled amount of warmth.
+    /// ONE new 16-byte cluster (stride 1536 → 1552); mirror of the Metal `FrameUniforms`.
+    public var highlightTemperatureK: Float = 6500
+    /// DH-0882 — NATURAL (cos⁴) vignetting, as `(halfFrameDiagonalMM / focalLengthMM)²` scaled
+    /// by how much of the physical falloff the host wants. Every lens loses light off-axis as
+    /// cos⁴ of the field angle, which is why a 16 mm is visibly darker in the corners and a
+    /// 100 mm is not; the renderer had no notion of it, while the bokeh's `dofCatsEye` modelled
+    /// the same effect. Because it is the LENS losing light it multiplies the scene before
+    /// exposure and the tonemap — the shoulder can then recover — unlike `vignetteStrength`,
+    /// which is a grade on the finished image. 0 = off (an exact no-op), which is the default,
+    /// so every host that never sets it is byte-identical. Repurposes the former
+    /// `_padPhotoFinish` slot — same offset, stride unchanged.
+    public var naturalVignetteK: Float = 0
+    // DH-0715 — live-lane look-match (see `IlluminatoramaTonemap.metal`). 0
+    // (default) ⇒ byte-identical for every scene that never opts in. ONE new
+    // 16-byte cluster (stride 1552 → 1568); mirror of the Metal `FrameUniforms`.
+    public var liveLookMatchStrength: Float = 0
+    public var liveLookGIDarken: Float = 0
+    public var liveLookGIWarmth: Float = 0
+    public var liveLookAODarken: Float = 0
 
     /// Fill the eight gain vectors from a flat 32-entry table, and stamp the enable.
     public mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
@@ -591,10 +662,26 @@ public struct IlluminatoramaAreaLight {
     public var _pad1: Float = 0
     public var color: SIMD3<Float>           // pre-multiplied intensity
     public var radius: Float                 // distance-falloff range (metres)
+    /// DH-0601 — portal VISIBILITY shadow. World → light-space NDC for the depth map
+    /// rendered from the portal centre into the shared spot-shadow atlas. Computed by the
+    /// renderer each frame (`updateSpotShadows`) from `(center, ex, ey, radius)`; identity
+    /// until a slice is assigned. Mirrors `IlluminatoramaSpotLight.shadowMatrix`.
+    public var shadowMatrix: simd_float4x4 = matrix_identity_float4x4
+    /// Slice into the shared `spotShadowAtlas`. `< 0` ⇒ no map this frame; the light
+    /// contributes as fully visible (the exact pre-DH-0601 path — so an area light that
+    /// never opts in is byte-identical). Set by the renderer.
+    public var shadowSliceIndex: Int32 = -1
+    /// 1 ⇒ this area light may claim a shadow-atlas slice (a window portal). 0 ⇒ it never
+    /// does — a diffuse cove/softbox that should not occlude (Visualizer, light strips).
+    /// Default 0, so every existing caller is unchanged. Mirrors `IlluminatoramaPointLight
+    /// .castsShadow`.
+    public var castsShadow: Int32 = 0
+    public var _pad2: Float = 0
+    public var _pad3: Float = 0
 
     public init(center: SIMD3<Float>, ex: SIMD3<Float>, ey: SIMD3<Float>,
                 color: SIMD3<Float>, radius: Float, twoSided: Bool = false,
-                layerMask: UInt32 = 0xFFFF_FFFF) {
+                layerMask: UInt32 = 0xFFFF_FFFF, castsShadow: Bool = false) {
         self.center = center
         self.ex = ex
         self.ey = ey
@@ -602,6 +689,7 @@ public struct IlluminatoramaAreaLight {
         self.radius = radius
         self.twoSided = twoSided ? 1 : 0
         self.layerMask = layerMask
+        self.castsShadow = castsShadow ? 1 : 0
     }
 }
 
@@ -649,19 +737,34 @@ public struct IlluminatoramaPointLight {
     /// lights a page; the rest fall back to unshadowed. Mirrors the Metal
     /// `PointLight.shadowCubeIndex`. Default `-1`.
     public var shadowCubeIndex: Int32 = -1
-    /// Two explicit pads so the struct closes on a 16-byte boundary (stride 48 → 48;
-    /// the base struct was 32 B + the layerMask cluster). Mirror the Metal padding.
+    /// One explicit pad so the struct closes on a 16-byte boundary. Mirror the Metal padding.
     public var _padPointShadow0: Int32 = 0
-    public var _padPointShadow1: Int32 = 0
+    /// Source-size term for the near-field falloff (was `_padPointShadow1`; reinterpreted, so
+    /// the struct stride is unchanged). The lighting kernel attenuates by `1/(d² + softRadius²)`
+    /// instead of `1/d²`: a point source of zero size explodes as d→0, so a wall a metre from a
+    /// bulb reads as a hard blob. `softRadius` gives the source a finite apparent size — the near
+    /// field flattens into a soft halo while the far field stays honest inverse-square. Default 0
+    /// ⇒ exactly `1/d²`, byte-identical to the prior behaviour (Visualizer never sets it).
+    public var softRadius: Float = 0
+    /// DH-0872 — 1 (default) ⇒ visible to the GI/reflection SECONDARY-ray local-light fill
+    /// (`secondaryLocalLightFill`) as well as the deferred pass; 0 ⇒ deferred-only. That
+    /// secondary path has no occlusion test (falloff + layer-mask only), so a light whose
+    /// containment depends on a wall actually blocking it — `nightWindowGlow`: untrapped, no
+    /// shadow map, origin just outboard of its own wall, relying on the deferred pass's own
+    /// normal-facing/cone-direction rejection — leaks its full, un-occluded, facade-calibrated
+    /// brightness onto nearby interior GI bounces. Mirrors the Metal `PointLight.giVisible`.
+    public var giVisible: UInt32 = 1
 
     public init(position: SIMD3<Float>, radius: Float, color: SIMD3<Float>,
                 layerMask: UInt32 = 0xFFFF_FFFF,
-                castsShadow: Bool = false) {
+                castsShadow: Bool = false, softRadius: Float = 0, giVisible: Bool = true) {
         self.position = position
         self.radius = radius
         self.color = color
         self.layerMask = layerMask
         self.castsShadow = castsShadow ? 1 : 0
+        self.softRadius = softRadius
+        self.giVisible = giVisible ? 1 : 0
     }
 }
 
@@ -713,14 +816,33 @@ public struct IlluminatoramaSpotLight {
     /// 2026-08-15 tree: blob/surround 0.740 with the slice, 1.014 without). One lamp had it and
     /// the other did not, decided by nothing but which one inherited the spare.
     public var castsShadow: Int32 = 1
-    /// One explicit pad so the struct closes on a 16-byte boundary. Stride 176.
-    public var _padSpot2: Int32 = 0
+    /// **Bit flag OR-ed into `castsShadow` (DH-0631): the host asserts that no GPU-fed geometry can
+    /// enter this cone's frustum.** Shadow maps are light-space, so a parked scene could reuse
+    /// them — but the reuse was gated on the WHOLE scene being CPU-visible (no compute-fed or
+    /// GPU-written geometry), and a yard's grass field is always live, so every document with a
+    /// lawn re-rasterised all its spot slices every frame into a byte-identical atlas. A cone
+    /// that sits INSIDE a room (Daydream masks such lights to their room's layer, so they cannot
+    /// light an exterior pixel at all) can never have a blade of grass between it and anything it
+    /// lights; the host says so with this bit, and `encodeSpotShadowPasses` then reuses that
+    /// slice while the CPU-visible scene holds. The bit keeps `castsShadow` non-zero, so every
+    /// `!= 0` test still reads "casts"; a host must not set it on a cone with `castsShadow == 0`.
+    /// Exterior cones (a deck lamp, a sconce over the lawn) leave it clear and re-render as before.
+    public static let castsShadowIgnoresGPUGeometry: Int32 = 2
+    /// Source-size term for the near-field falloff (was `_padSpot2`; reinterpreted, so the
+    /// struct stride is unchanged — 176). Same rule as `IlluminatoramaPointLight.softRadius`:
+    /// the lighting kernel attenuates by `1/(d² + softRadius²)`, so a cone from a finite-size
+    /// source flattens into a soft halo near the emitter instead of a hard blob on a nearby
+    /// wall. Default 0 ⇒ exactly `1/d²`, byte-identical (Visualizer never sets it).
+    public var softRadius: Float = 0
+    /// DH-0872 — see `IlluminatoramaPointLight.giVisible`; same field, same reason, same
+    /// default. Mirrors the Metal `SpotLight.giVisible` (stride grows 176 → 180).
+    public var giVisible: UInt32 = 1
 
     public init(position: SIMD3<Float>, direction: SIMD3<Float>,
                 innerCone: Float, outerCone: Float,
                 color: SIMD3<Float>, radius: Float,
                 layerMask: UInt32 = 0xFFFF_FFFF,
-                castsShadow: Bool = true) {
+                castsShadow: Bool = true, softRadius: Float = 0, giVisible: Bool = true) {
         self.position = position
         self.direction = direction
         self.innerCone = innerCone
@@ -729,6 +851,8 @@ public struct IlluminatoramaSpotLight {
         self.radius = radius
         self.layerMask = layerMask
         self.castsShadow = castsShadow ? 1 : 0
+        self.softRadius = softRadius
+        self.giVisible = giVisible ? 1 : 0
     }
 }
 
@@ -744,7 +868,11 @@ public struct IlluminatoramaInstance {
     // padding gap between `metallic` and `emission` (offsets 148-159); stride
     // stays 208. Default 0 = no clearcoat (no change to existing materials).
     public var clearcoat: Float = 0          // lobe strength [0, 1]
-    public var clearcoatRoughness: Float = 0.10  // GGX alpha^2 for clearcoat
+    /// GGX roughness of the clearcoat lobe. 0.08 IS the constant the lighting kernel used for
+    /// every material until DH-0140, so the default renders exactly as before; a material that
+    /// sets its own value is honoured only where the photo-lane G-buffer target carries it
+    /// (`IlluminatoramaRenderer.extendedGBufferEnabled`) — the live lane keeps the constant.
+    public var clearcoatRoughness: Float = 0.08
     // Phase 7b — cloth sheen lobe strength [0,1] (velvet/wool/linen). Repurposes the former
     // `_padClearcoat` slot (same offset 156, stride stays 208). Packed as a NEGATIVE
     // emission.alpha in the G-buffer (a surface is polished OR cloth, never both).
@@ -964,8 +1092,80 @@ public struct IlluminatoramaInstance {
     ///   w = fraction of lattice cells that carry a knot
     public var woodKnots: SIMD4<Float> = .zero
 
+    // ── Per-INSTANCE (per-object) macro material variation ─────────────────────
+    // NEW 16-byte cluster (offsets 288-303): two floats + 8 bytes pad, stride 288 -> 304.
+    //
+    // The MACRO tier of the material system. Two placed pieces that wear the SAME baked
+    // material id share ONE atlas slice and ONE registered mesh, so without a per-instance
+    // channel they render the identical texels through the identical UVs — "two nightstands
+    // are the same pixels twice". The meso/micro bands (grain, pores, detail relief) live in
+    // the baked texture and so are shared too; only a per-INSTANCE term can break the
+    // object-to-object repeat.
+    //
+    // `macroTone` is an ACHROMATIC multiplier on the FINAL albedo (AFTER the atlas sample and
+    // the per-vertex colour), so it works whether the material is textured or flat and shifts
+    // the piece LIGHTER/DARKER without ever changing hue (a hue shift would read as a different
+    // finish, not the same finish cut from a different board). `macroRoughnessDelta` is added
+    // to the resolved roughness. Both identity by default — 1 and 0 — so Visualizer and every
+    // instance that never opts in is byte-identical. Hosts seed these off the element's own
+    // stable id (never `hashValue`, which reseeds per process), so the variation is document
+    // state: stable across save/load and identical in the app and in every headless capture.
+    public var macroTone: Float = 1
+    public var macroRoughnessDelta: Float = 0
+
+    /// **Per-INSTANCE UV phase** (DH-0475) — a translation, in tile-UV units, added to the UV that
+    /// every MATERIAL sample reads (the same `matUV` the wood-knot warp displaces), so two placed
+    /// pieces that share ONE baked slice and ONE mesh don't show the same GRAIN figure in the same
+    /// place. `macroTone`/`macroRoughnessDelta` shift a twin lighter/darker or rougher; this shifts
+    /// WHICH part of the tiling material it's cut from — the same finish, a different board.
+    ///
+    /// It rides in the 8 bytes that were trailing padding, so the struct stride is UNCHANGED (304)
+    /// and `.zero` (the default) is an exact shader no-op: every non-opting instance — every
+    /// Visualizer scene — is byte-identical. Only translation, never rotation: furniture wood grain
+    /// is directional, so an offset relocates the figure while keeping the grain running along the
+    /// board, whereas a rotation would twist it off-axis and read as a defect. Because the material
+    /// tiles seamlessly under the hardware `repeat` sampler, any offset is seam-free.
+    public var uvPhase: SIMD2<Float> = .zero
+
+    /// **Per-material cloth-sheen ROUGHNESS** (DH-0081) — the WIDTH of the sheen nap, the sibling of
+    /// `sheen` (its strength). Low = a crisp grazing highlight (sateen); high = a broad soft glow
+    /// (velvet, wool). `0.30` (the default) is the single constant the lobe shipped with, so an
+    /// instance that never sets it — every Visualizer scene, every non-cloth surface — renders
+    /// exactly as before. The G-buffer snaps it to the nearest of a few curated bands and folds the
+    /// band into the INTEGER part of the sign-multiplexed `sheen` emission.alpha channel (band 0 ⇒
+    /// the value packs `-sheen` byte-for-byte as it did before this existed). Only read where
+    /// `sheen > 0`. NEW 16-byte cluster (offsets 304-319): stride 304 → 320.
+    public var sheenRoughness: Float = 0.30
+
+    /// **Carpet pile-lay tone bands** (DH-0472) — a low-frequency achromatic value field the
+    /// G-buffer draws on the UNWRAPPED uv (`sampleCarpetMacro` in `IlluminatoramaMaterial.h`), the
+    /// metre-scale nap variation a ~0.30 m carpet tile physically cannot carry. Rides in the 8 bytes
+    /// of trailing pad after `sheenRoughness` (a float2 aligns to offset 312), so the struct stride
+    /// stays 320 and `.zero` — the default and every non-carpet instance — is an exact shader no-op.
+    ///   x = band lattice cells per UV unit (0 = disabled)
+    ///   y = ± tone amplitude
+    /// Mirrors `Instance.carpetMacro` in `IlluminatoramaCommon.h`.
+    public var carpetMacro: SIMD2<Float> = .zero
+
+    /// DH-0478 — slice index (non-colour atlas) of the per-texel grain-direction map, encoded as
+    /// (cos 2θ, sin 2θ) in RG, θ from the material's U axis. `< 0` = none: the anisotropy lobe keeps
+    /// its per-instance axis. Read ONLY by the photo-lane G-buffer variant (`kExtendedGBuffer`),
+    /// which re-expresses it as a world-space angle in `material.gb` for the lighting kernel. NEW
+    /// 16-byte cluster (offsets 320-335): stride 320 → 336. Every host that never sets it — every
+    /// Visualizer scene — is byte-identical (the field is never read on the live lane).
+    public var grainTangentTextureSlice: Int32 = -1
+    /// DH-0140 slice 3 — thin-sheet translucency [0,1]: the fraction of light reaching the FAR face
+    /// that comes through diffusely (milky polycarbonate ≈ 0.5, a woven shade ≈ 0.3). Honoured only
+    /// in the still (the photo-lane G-buffer carries it in `material.r`; the lighting kernel adds
+    /// `albedo × transmitted incident × t`); the live canvas renders the sheet opaque as it always
+    /// has. 0 = opaque — the default, and byte-identical for every host that never sets it.
+    public var thinTransmission: Float = 0
+    public var _padGrain1: Int32 = 0
+    public var _padGrain2: Int32 = 0
+
     // ── Animated UV DOMAIN WARP (per instance) ────────────────────────────────
-    // NEW 16-byte cluster (offsets 288-303): stride 288 → 304.
+    // NEW 16-byte cluster (offsets 336-351): stride 336 → 352. (Landed at 288 on a
+    // parallel line; moved after the DH macro/sheen/grain clusters in the merge.)
     //
     // Offsets the UV the material is sampled at, as a smooth function of the UV
     // itself and of time — a domain warp, not a scroll. A scroll translates the
@@ -1017,10 +1217,10 @@ public struct IlluminatoramaInstance {
         self.normalMatrix = Self.normalMatrix(from: m)
     }
 
-    /// Compile-time guard: Swift and Metal structs must agree on 272 bytes.
+    /// Compile-time guard: Swift and Metal structs must agree on 352 bytes.
     /// If this fires, either a Swift field was added without the matching Metal
     /// field (or vice versa), or alignment changed unexpectedly.
-    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 304, "IlluminatoramaInstance stride must be 304") }()
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 352, "IlluminatoramaInstance stride must be 352") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //

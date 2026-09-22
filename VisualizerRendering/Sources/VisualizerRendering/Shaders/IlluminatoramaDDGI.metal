@@ -4,6 +4,7 @@
 // SAMPLER they share with the lighting kernel live in IlluminatoramaDDGI.h.
 
 #include <metal_stdlib>
+#include <metal_raytracing>
 #include "IlluminatoramaCommon.h"
 #include "IlluminatoramaDDGI.h"
 using namespace metal;
@@ -380,4 +381,162 @@ kernel void illumi_ddgi_update_depth(
     float2 existing = float2(depthAtlas.read(coord).rg);
     float2 blended  = mix(float2(mean, mean2), existing, ddgi.depthHysteresis);
     depthAtlas.write(half4(half2(blended), 0.0h, 1.0h), coord);
+}
+
+// ── S3.2 Ultra: DDGI trace against the REAL TLAS ─────────────────────────────
+//
+// The analytic trace above can only bounce off box/sphere/ground primitives, so
+// a host with `.custom` meshes stands in coarse proxies (Daydream: one box per
+// wall). This variant is the "Phase 4" the analytic loop's comment promised:
+// the SAME ray pattern, uniforms, and DDGIRayRecord contract — the update and
+// sampling kernels cannot tell which kernel filled the buffer — but hits come
+// from the instance acceleration structure the RT passes already maintain. That
+// buys real occlusion (light actually enters through window HOLES, furniture
+// shadows the floor beneath it) and per-instance mean albedo/emission at hits.
+//
+// Shading conventions deliberately mirror the analytic kernel (no 1/π on the
+// direct term, emission added, previous-atlas second bounce) so a host can flip
+// between lanes without re-tuning `ddgiIrradianceScale`. The ONE upgrade beyond
+// parity is a sun SHADOW ray per hit — the TLAS makes visibility a single
+// intersect, and unshadowed direct at hits is the analytic path's largest error.
+//
+// `ddgi.rayMask` carries the transport mask (opaque 0x01 | invisible occluder
+// 0x04): probe rays MUST stop at the lighting-only `ceilshadow.*` slabs over a
+// roofless dollhouse or every interior probe floods with sky — the exact leak
+// the deferred GI rays already guard against (see RTInstUniforms.transportRayMask).
+
+// Mirror of RTInstanceData in IlluminatoramaSecondary.h (which also documents
+// the Caustics copy). Kept local because this file predates the raytracing
+// header split; layouts are asserted equal by the host's buffer stride.
+struct DDGITLASInstanceData {
+    float4 nrm0; float4 nrm1; float4 nrm2;
+    float4 albedoTriBase;   // xyz = mean albedo, w = triBase into objNormal
+    float4 emissionPad;     // xyz = self-lit radiance
+};
+
+kernel void illumi_ddgi_trace_tlas(
+    device DDGIRayRecord*                     outRays      [[buffer(0)]],
+    constant DDGIUniforms&                    ddgi         [[buffer(1)]],
+    const device DDGIPointEmitter*            emitters     [[buffer(3)]],
+    raytracing::instance_acceleration_structure accel      [[buffer(4)]],
+    const device DDGITLASInstanceData*        insts        [[buffer(5)]],
+    const device float4*                      objNormal    [[buffer(6)]],
+    texture2d<float, access::sample>          skyEquirect  [[texture(0)]],
+    texture2d<half,  access::sample>          irrAtlasPrev [[texture(1)]],
+    texture2d<half,  access::sample>          depAtlasPrev [[texture(2)]],
+    uint2                                     gid          [[thread_position_in_grid]]
+) {
+    uint rayIdx   = gid.x;
+    uint probeIdx = gid.y;
+    uint probeCount = ddgi.gridDimsX * ddgi.gridDimsY * ddgi.gridDimsZ;
+    if (rayIdx >= ddgi.raysPerProbe || probeIdx >= probeCount) return;
+
+    float3 probePos = ddgiProbePos(probeIdx, ddgi);
+
+    // Identical direction set to the analytic kernel — the atlases converge to
+    // the same integral, so lane flips re-settle instead of re-styling.
+    float3 fibDir = ddgiSphericalFibonacci(rayIdx, ddgi.raysPerProbe);
+    float  angle  = float(probeIdx) * 2.399963229f;
+    float  sa = sin(angle), ca = cos(angle);
+    float3 rayDir = float3(fibDir.x * ca - fibDir.y * sa,
+                           fibDir.x * sa + fibDir.y * ca,
+                           fibDir.z);
+
+    // Instancing + triangle + curve contract, like illumi_rt_lighting_tlas's
+    // intersector: `instancing` is what admits a TLAS at all, and the TLAS may
+    // hold curve BLASes (plants), so the contract must include curves too.
+    raytracing::intersector<raytracing::triangle_data, raytracing::instancing,
+                            raytracing::curve_data> isect;
+    isect.assume_geometry_type(raytracing::geometry_type::triangle | raytracing::geometry_type::curve);
+    isect.accept_any_intersection(false);
+
+    raytracing::ray r;
+    r.origin = probePos;
+    r.direction = rayDir;
+    r.min_distance = 1e-3f;
+    r.max_distance = 1.0e4f;
+    auto res = isect.intersect(r, accel, ddgi.rayMask);
+
+    uint outIdx = probeIdx * ddgi.raysPerProbe + rayIdx;
+
+    if (res.type == raytracing::intersection_type::none) {
+        // Miss → sky, plus any emitter the ray passes near (same as analytic).
+        float3 sky = sampleSkyEquirect(skyEquirect, rayDir);
+        for (uint e = 0; e < ddgi.emitterCount; ++e) {
+            float3 toE   = emitters[e].position - probePos;
+            float  tE    = dot(toE, rayDir);
+            if (tE < 0.0f) continue;
+            float3 perp  = toE - rayDir * tE;
+            float  perpD = length(perp);
+            float  rr    = max(emitters[e].radius, 0.001f);
+            float  atten = max(0.0f, 1.0f - perpD / rr);
+            atten       *= atten;
+            sky          += emitters[e].color * atten;
+        }
+        outRays[outIdx].dirAndDist = float4(rayDir, -1.0f);
+        outRays[outIdx].radiance   = float4(sky, 0.0f);
+        return;
+    }
+
+    float hitT = res.distance;
+    float3 hitWorld = probePos + rayDir * hitT;
+
+    float3 albedo   = float3(0.35f);              // curve hits: neutral occluder
+    float3 emission = float3(0.0f);
+    float3 N        = -rayDir;
+    if (res.type == raytracing::intersection_type::triangle) {
+        DDGITLASInstanceData d = insts[res.instance_id];
+        albedo   = d.albedoTriBase.xyz;
+        emission = d.emissionPad.xyz;
+        uint triBase = uint(d.albedoTriBase.w);
+        float3 nObj  = objNormal[triBase + res.primitive_id].xyz;
+        float3x3 nm  = float3x3(d.nrm0.xyz, d.nrm1.xyz, d.nrm2.xyz);
+        float3 n     = nm * nObj;
+        float len    = length(n);
+        N = len > 1e-8f ? n / len : float3(0.0f, 1.0f, 0.0f);
+        // Probes sit on BOTH sides of a wall; shade the face the ray struck.
+        if (dot(N, rayDir) > 0.0f) N = -N;
+    }
+
+    // Direct sun — with a real shadow ray (the TLAS's one free upgrade).
+    float3 directLight = float3(0.0f);
+    float NdotL = max(0.0f, dot(N, ddgi.directionalLightDir));
+    if (NdotL > 0.0f) {
+        raytracing::ray sr;
+        sr.origin = hitWorld + N * 0.01f;
+        sr.direction = ddgi.directionalLightDir;
+        sr.min_distance = 1e-3f;
+        sr.max_distance = 1.0e4f;
+        isect.accept_any_intersection(true);
+        bool lit = isect.intersect(sr, accel, ddgi.rayMask).type
+                   == raytracing::intersection_type::none;
+        isect.accept_any_intersection(false);
+        if (lit) directLight = albedo * ddgi.directionalLightColor * NdotL;
+    }
+
+    // Second bounce off the previous-frame atlas — verbatim analytic behaviour.
+    float3 indirectBounce = float3(0.0f);
+    if (ddgi.twoBounceEnabled != 0u) {
+        float3 hitBiased = hitWorld + N * 0.02f;
+        float3 prevIrr = sampleDDGIIrradiance(
+            hitBiased, N, irrAtlasPrev, depAtlasPrev, ddgi);
+        indirectBounce = albedo * prevIrr;
+    }
+
+    // Emitter point-light contribution at the hit (same falloff as analytic).
+    float3 emitterLight = float3(0.0f);
+    for (uint e = 0; e < ddgi.emitterCount; ++e) {
+        float3 toE = emitters[e].position - hitWorld;
+        float  d   = length(toE);
+        float  rr  = max(emitters[e].radius, 0.001f);
+        float  atten = max(0.0f, 1.0f - d / rr);
+        atten       *= atten;
+        if (atten < 0.001f) continue;
+        float NdotE = max(0.0f, dot(N, toE / max(d, 0.001f)));
+        emitterLight += emitters[e].color * atten * NdotE * albedo;
+    }
+
+    outRays[outIdx].dirAndDist = float4(rayDir, hitT);
+    outRays[outIdx].radiance   = float4(
+        directLight + indirectBounce + emission + emitterLight, 1.0f);
 }

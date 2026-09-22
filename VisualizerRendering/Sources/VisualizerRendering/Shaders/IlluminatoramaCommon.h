@@ -61,7 +61,11 @@ struct FrameUniforms {
     // not a fog effect.
     float    aerialPerspectiveDensity;   // was _padCamera
     float3   directionalLightDir;
-    float    _padDir;
+    // DH-0140 — 1.0 when THIS frame's G-buffer pass wrote the extended sixth target
+    // (`GBufferOut.material`, color(5)) and the lighting kernel may read `gMaterial`;
+    // 0.0 (every host that never opts in) keeps the 5-target lighting byte-identical.
+    // Repurposes the former `_padDir` slot — same 4 bytes, same offset, stride unchanged.
+    float    extendedGBuffer;            // was _padDir
     float3   directionalLightColor;
     float    _padColor;
     float3   ambientColor;
@@ -85,7 +89,13 @@ struct FrameUniforms {
     float    iblIntensity;
     uint     iblPrefilteredMipCount;
     uint     iblEnabled;
-    float    _padPhase3;
+    // Lamp-shade fabric translucency strength (DH-0458). 0 = OFF (default) → the
+    // shade thin-sheet transmission branch in illumi_lighting_fs is an EXACT no-op
+    // for every scene; only a shade mesh tagged with colour alpha in (0.60, 0.66]
+    // (→ normalRoughness.w ≈ 0.62) reads it. Repurposes the former `_padPhase3`
+    // pad — same 4 bytes at the same offset, so stride is unchanged. Field-for-
+    // field mirror of the Swift IlluminatoramaFrameUniforms.shadeTransmission.
+    float    shadeTransmission;
     // Phase 2.5 — Cascaded shadow maps for the directional sun light. Three
     // cascades; each has its own light-space view-projection matrix. The
     // lighting kernel picks a cascade per pixel from view-space Z and does a
@@ -98,7 +108,8 @@ struct FrameUniforms {
     float4   cascadeSplitsView;
     float    shadowBias;
     float    shadowSlopeBias;
-    uint     shadowEnabled;
+    uint     _padShadow;          // was `shadowEnabled`, never read (DH-0620); the
+                                  // kLightingShadowEnabled function constant gates shadows
     uint     shadowPcfRadius;
     // Phase 2.7 — Motion vectors + TAA. `previousViewProjection` is the
     // *jittered* VP from the previous frame so the rasterized history sample
@@ -254,14 +265,36 @@ struct FrameUniforms {
     float    sssTintG;      // per-channel scatter-distance scale (G)
     float    sssTintB;      // per-channel scatter-distance scale (B)
     float    sssDebugForceAll;  // 1 = treat every opaque pixel as SSS (headless verify)
-    float    _padSSS1;
-    float    _padSSS2;
+    // Foliage-wind motion-vector delta (DH-0492). The vegetation gust in `applyTreeWind`
+    // is a pure function of `frame.time`, so with the previous-frame position sampled at the
+    // SAME time the wind contributed ~0 to the screen-space velocity buffer — TAA could not
+    // reproject the swaying sub-pixel canopy/blade edges and they crawled/shimmered between
+    // pixels instead of reading as a continuous bend. `illumi_vs` now samples the PREVIOUS
+    // frame's wind at `frame.time − windPrevDelta`, so a moving canopy writes a real motion
+    // vector TAA can track. 0 = same-time (the pre-DH-0492 behaviour, an EXACT no-op) — every
+    // scene that never sets it, and every SETTLED capture (whose clock does not advance
+    // between accumulation frames), ships a byte-identical velocity buffer. Repurposes the
+    // former `_padSSS1` slot — same 4 bytes at the same offset, stride unchanged.
+    float    windPrevDelta;
+    // DH-0881 — which scene→display rendering to use: 0 = the shipped per-channel Narkowicz
+    // curve in Rec.709 primaries, 1 = the same curve evaluated in ACEScg (AP1), 2 = AgX.
+    // 0 is byte-identical. Repurposes the former `_padSSS2` slot — same 4 bytes, stride
+    // unchanged. Mirrors the Swift `IlluminatoramaFrameUniforms`.
+    uint     displayTransform;   // was _padSSS2
     // Phase 9 — film-stock LUT blend strength. 0 = bypass, 1 = full grade.
     // NEW 16-byte cluster (stride 1088 → 1104). Three float pads fill.
     float    filmLUTStrength;
-    float    _padFilmLUT0;
-    float    _padFilmLUT1;
-    float    _padFilmLUT2;
+    // DH-0441 — the WIDE AO ring. A second GTAO march whose occluders are weighted to the
+    // ANNULUS beyond `ssaoRadius` (out to `ssaoFarRadius`), so the architectural crease and
+    // furniture-scale grounding are two disjoint kernels with two strengths.
+    // `ssaoFarIntensity` 0 = OFF → the ring is never marched and the AO is byte-identical.
+    // Repurposes the former `_padFilmLUT0/1` slots — same 8 bytes, stride unchanged.
+    float    ssaoFarRadius;      // was _padFilmLUT0
+    float    ssaoFarIntensity;   // was _padFilmLUT1
+    // Cells per axis of the film-stock cube (16 for the legacy 8-bit PNG strips, 33 for
+    // the float16 `.lutcube` assets). Repurposes the former `_padFilmLUT2` slot — same
+    // 4 bytes, stride unchanged. Mirrors the Swift `IlluminatoramaFrameUniforms`.
+    float    filmLUTSize;        // was _padFilmLUT2
     // Tonemap colour-grade (white-balance / tint pre-tonemap; contrast / shadows
     // / highlights as a post-tonemap curve). TWO new 16-byte clusters (stride
     // 1104 → 1136). Defaults are neutral: whiteBalanceK 6500 → gain (1,1,1),
@@ -412,7 +445,11 @@ struct FrameUniforms {
     uint     rtSunShadowSeed;      // per-frame RNG decorrelation (0 = frozen)
     float    rtSunShadowAngle;     // sun angular radius, radians (cone half-angle)
     uint     rtSunShadowRayCount;  // shadow rays per pixel, host-clamped 1…8
-    float    _padRTSunShadow;
+    // S4.3 — ray-traced PORTAL visibility (the same kLightingRTSunShadow variant and
+    // TLAS): shadow rays per pixel toward a jittered point on each shadow-casting
+    // area light, replacing that light's single-perspective PCF map. 0 (the default,
+    // and the former padding slot — same 4 bytes) keeps the PCF path byte-identical.
+    uint     rtAreaShadowRayCount;
     // ── Per-room interior band LEVEL (S3.5 Stage E) ──────────────────────────
     // The bands above are ONE environment for the whole frame, pegged to the host's
     // ambient fill — so a room walled in glass and a windowless closet rendered the
@@ -428,6 +465,44 @@ struct FrameUniforms {
     // IlluminatoramaFrameUniforms.interiorRoomGain0…7 + interiorRoomGainMeta.
     float4   interiorRoomGain[8];   // 32 room gains, bit b at [b >> 2][b & 3]
     float4   interiorRoomGainMeta;  // x = enabled (0 = off); yzw unused
+    // ── Photographic finish: highlight chroma roll-off + split tone ──────────
+    // Two things a real camera does that a flat post-tonemap saturation multiply
+    // undoes, applied at the very end of the tone chain in the display (0..1)
+    // domain.
+    //
+    // `highlightChromaRolloff` fades chroma out as a pixel approaches white.
+    // ACES already desaturates toward white, but `tonemapSaturation`'s
+    // `mix(luma, colour, S)` is FLAT in luminance, so it pushes that chroma
+    // straight back out — which is why a lamp-lit wooden wall clips to saturated
+    // yellow instead of a pale warm white. 0 (default) ⇒ the branch never runs.
+    //
+    // `shadowTemperatureK` / `highlightTemperatureK` are a split tone: the same
+    // `whiteBalanceGain` curve the global white balance uses, applied through a
+    // luma mask so the two ends of the scale can sit at different temperatures
+    // (the classic cool-shadow / warm-highlight separation). 6500 on both
+    // (default) ⇒ both gains are exactly (1,1,1) and the branch never runs.
+    // ONE new 16-byte cluster (stride 1536 → 1552); mirror of the Swift
+    // IlluminatoramaFrameUniforms.
+    float    highlightChromaRolloff;  // 0 = off
+    float    shadowTemperatureK;      // 6500 = no-op
+    float    highlightTemperatureK;   // 6500 = no-op
+    // DH-0882 — NATURAL (cos^4) vignetting: (halfFrameDiagonalMM / focalLengthMM)^2, times
+    // however much of the physical falloff the host wants. The lens's own light loss, so it
+    // multiplies the SCENE before exposure/ACES — unlike `vignetteStrength`, which is a grade
+    // on the finished image. 0 = off, and off is an exact no-op. Repurposes the former
+    // `_padPhotoFinish` slot — same 4 bytes, stride unchanged.
+    float    naturalVignetteK;   // was _padPhotoFinish
+    // DH-0715 — live-lane look-match: a cheap HDR-domain approximation of the
+    // photo lane's RT bounce-GI + RTAO passes, for hosts that can't afford the
+    // real thing live (see `IlluminatoramaTonemap.metal`'s use of these). Applied
+    // BEFORE white-balance/exposure/ACES/grade — see that file for why. 0 (the
+    // default) ⇒ the branch never runs ⇒ byte-identical for every scene that
+    // never opts in. ONE new 16-byte cluster (stride 1552 → 1568); mirror of
+    // the Swift IlluminatoramaFrameUniforms.
+    float    liveLookMatchStrength;   // 0 = off (master enable/blend)
+    float    liveLookGIDarken;        // multiplier the fake-bounce term mixes toward, <1
+    float    liveLookGIWarmth;        // 0..1 blend toward the fake-bounce warm tilt
+    float    liveLookAODarken;        // multiplier the fake-AO term mixes toward, <1
 };
 
 // Secondary directional light (#60 task 5). Mirror of Swift
@@ -454,7 +529,24 @@ struct PointLight {
     uint   castsShadow;
     int    shadowCubeIndex;
     int    _padPointShadow0;
-    int    _padPointShadow1;
+    // Source-size term for the near-field falloff (was `_padPointShadow1`; reinterpreted,
+    // so the struct stride is unchanged). Attenuation is `1/(d² + softRadius²)` instead of
+    // `1/d²`: a point source of zero size blows up as d→0, so a wall a metre from a bulb
+    // reads as a hard blob. `softRadius` gives it a finite apparent size — the near field
+    // flattens into a soft halo while the far field stays honest inverse-square. Default 0 ⇒
+    // exactly `1/d²`, byte-identical to the prior behaviour (Visualizer never sets it).
+    float  softRadius;
+    // DH-0872 — 1 (default) ⇒ visible to the GI/reflection SECONDARY-ray local-light fill
+    // (`secondaryLocalLightFill`, IlluminatoramaSecondary.h) as well as this deferred pass;
+    // 0 ⇒ deferred-only. That secondary path has NO occlusion test (falloff + layer-mask
+    // only — see its own header comment), so a light whose containment depends on a wall
+    // actually blocking it (`nightWindowGlow`: untrapped, no shadow map, origin just
+    // outboard of its own wall, relying on the deferred pass's screen-space/normal-facing
+    // rejection) leaks its full un-occluded, facade-calibrated brightness onto nearby
+    // interior GI bounces — read as a locally saturated colour cast next to that window.
+    // Ignored by this deferred kernel; consumed only by the RT mirror. Default 1 ⇒
+    // byte-identical for every light that never opts out.
+    uint   giVisible;
 };
 
 // Rectangular area light (#60 task 5). Mirror of Swift IlluminatoramaAreaLight.
@@ -463,12 +555,24 @@ struct AreaLight {
     float3 center;   float twoSided;   // twoSided: 1 = emit both faces, 0 = front only
     // Light-layer mask (was `_pad0` — same 4 bytes, stride unchanged; same rule as
     // PointLight/SpotLight). Default 0xFFFFFFFF ⇒ affects every fragment,
-    // byte-identical to the pre-mask behaviour. This is what CONTAINS a window
-    // portal: an unmasked area light has no visibility term and no shadow map, so
-    // without it a portal lights the yard through the back of its own wall.
+    // byte-identical to the pre-mask behaviour. This is one of TWO containments of a
+    // window portal (see shadowMatrix below): an unmasked area light lights the yard
+    // through the back of its own wall.
     float3 ex;       uint layerMask;   // half-width edge vector (world) + mask
     float3 ey;       float _pad1;      // half-height edge vector (world)
     float3 color;    float radius;     // premultiplied color + distance-falloff range
+    // DH-0601 — portal VISIBILITY shadow (a window portal by day is the room's dominant
+    // source; without occlusion nothing indoors casts a shadow). One depth map rendered
+    // from the portal centre into the SHARED spotShadowAtlas, sampled here purely as a
+    // visibility term while LTC/MRP keeps doing the shading. Same machinery as SpotLight:
+    // shadowMatrix maps world → light-space NDC; shadowSliceIndex is the atlas page (< 0 ⇒
+    // no map, fully visible — the exact pre-change path, so every AreaLight that never opts
+    // in (Visualizer softboxes) is byte-identical). castsShadow is host-side only (1 ⇒ may
+    // claim a slice); the kernel branches on shadowSliceIndex.
+    float4x4 shadowMatrix;
+    int      shadowSliceIndex;
+    int      castsShadow;
+    float    _pad2; float _pad3;       // close on a 16-byte boundary (stride 144)
 };
 
 // A daylight aperture (S3.5 Stage D) — a glazed opening reduced to what the interior
@@ -502,7 +606,13 @@ struct SpotLight {
     // fact travels WITH the light instead of being inferred from its array position.
     // Reinterpreted from a former int pad, so the struct stride is unchanged.
     int      castsShadow;
-    int      _padSpot2;
+    // Source-size term for the near-field falloff (was `_padSpot2`; reinterpreted, so the
+    // struct stride is unchanged). Same rule as `PointLight.softRadius`: attenuation is
+    // `1/(d² + softRadius²)`, so a cone from a finite-size source flattens into a soft halo
+    // near the emitter instead of a hard blob on a nearby wall. Default 0 ⇒ exactly `1/d²`.
+    float    softRadius;
+    // DH-0872 — see `PointLight.giVisible`; same field, same reason, same default.
+    uint     giVisible;
 };
 
 struct Instance {
@@ -514,7 +624,9 @@ struct Instance {
     // 12-byte padding gap between metallic (offset 144) and emission (offset 160);
     // stride stays 208. Default 0 = off (no change to existing materials).
     float    clearcoat;              // [0,1] lobe strength
-    float    clearcoatRoughness;     // GGX roughness for the clearcoat layer
+    float    clearcoatRoughness;     // GGX roughness for the clearcoat layer — read by the
+                                     // lighting kernel ONLY through the photo-lane G-buffer
+                                     // target (DH-0140); the live lane keeps its 0.08 constant
     float    sheen;                  // Phase 7b — cloth sheen strength [0,1] (was _padClearcoat)
     float3   emission;
     float    roughness;
@@ -635,9 +747,50 @@ struct Instance {
     //   z = darkness of the core against the wood it grew through, [0,1]
     //   w = fraction of lattice cells that carry a knot
     float4   woodKnots;
+    // ── Per-INSTANCE (per-object) macro material variation ────────────────────────
+    // NEW 16-byte cluster (offsets 288-303): two floats + 8 bytes pad, stride 288 -> 304.
+    // Two placed pieces wearing the SAME material id share one atlas slice and one mesh, so
+    // without a per-instance channel they render the identical texels ("two nightstands are
+    // the same pixels twice"). macroTone is an ACHROMATIC multiplier on the FINAL albedo (post
+    // atlas + vertex colour); macroRoughnessDelta adds to the resolved roughness. Both identity
+    // (1 / 0) by default, so a host that never opts in — every Visualizer scene — is
+    // byte-identical.
+    float    macroTone;
+    float    macroRoughnessDelta;
+    // DH-0475 — per-INSTANCE UV phase (translation, tile-UV units) added into `matUV` so two
+    // pieces sharing one slice + one mesh don't show the same GRAIN figure in the same place.
+    // Fills the 8 bytes that were trailing pad, so stride stays 304; `float2(0)` is an exact
+    // no-op (identical to every existing scene). Mirrors `IlluminatoramaInstance.uvPhase`.
+    float2   uvPhase;
+    // DH-0081 — per-material cloth-sheen ROUGHNESS (the nap WIDTH; sibling of `sheen`, its
+    // strength). NEW 16-byte cluster (offsets 304-319): stride 304 -> 320. The G-buffer snaps it
+    // to a band and folds the band into the integer part of the sign-multiplexed `sheen`
+    // emission.alpha (see clothSheenBandForRoughness); band 0 (default 0.30) packs `-sheen` exactly
+    // as before, so a host that never sets it — every Visualizer scene — is byte-identical.
+    // Mirrors `IlluminatoramaInstance.sheenRoughness`.
+    float    sheenRoughness;
+    // DH-0472 — carpet pile-lay tone bands. A low-frequency achromatic value field drawn on the
+    // UNWRAPPED uv (`sampleCarpetMacro` in IlluminatoramaMaterial.h) — the metre-scale nap variation
+    // a ~0.30 m carpet tile can't carry (an in-tile term repeats every 0.30 m and dissolves under the
+    // hex de-repeat). Fills the trailing pad after `sheenRoughness` (float2 aligns to offset 312), so
+    // stride stays 320; `float2(0)` is an exact no-op. x = band cells per UV unit (0 = off), y = ±
+    // tone amplitude. Mirrors `IlluminatoramaInstance.carpetMacro`.
+    float2   carpetMacro;
+    // DH-0478 — per-texel grain-direction map slice (non-colour atlas; RG = cos 2θ, sin 2θ from the
+    // material U axis). < 0 = none. Read ONLY by the kExtendedGBuffer fragment variant, which writes
+    // the world-space grain angle into `GBufferOut.material.gb`. NEW 16-byte cluster (offsets
+    // 320-335): stride 320 -> 336. Mirrors `IlluminatoramaInstance.grainTangentTextureSlice`.
+    int      grainTangentTextureSlice;
+    // DH-0140 slice 3 — thin-sheet TRANSLUCENCY [0,1]: the fraction of the light reaching the FAR
+    // face that comes through diffusely (milky polycarbonate ≈ 0.5). Read ONLY by the
+    // kExtendedGBuffer fragment (→ `material.r`); the live lane renders the sheet opaque as before.
+    // 0 (default) = opaque. Mirrors `IlluminatoramaInstance.thinTransmission`.
+    float    thinTransmission;
+    int      _padGrain1;
+    int      _padGrain2;
 
     // ── Animated UV DOMAIN WARP (see `warpUV` in IlluminatoramaGBuffer.metal) ──
-    // NEW 16-byte cluster (offsets 288-303): stride 288 -> 304.
+    // NEW 16-byte cluster (offsets 336-351): stride 336 -> 352.
     //
     //   x = amplitude in UV units (0 = disabled — the default, and an exact no-op)
     //   y = spatial frequency: wobbles across one UV unit
@@ -649,7 +802,52 @@ struct Instance {
 // The Swift mirror (`IlluminatoramaInstance._assertStride240`) has always asserted this
 // side of the contract; this is the other side, and it costs a compile. A Swift field
 // added without its Metal twin used to be caught only by a wrong-looking render.
-static_assert(sizeof(Instance) == 304, "Instance must match IlluminatoramaInstance (304 bytes)");
+static_assert(sizeof(Instance) == 352, "Instance must match IlluminatoramaInstance (352 bytes)");
+
+// ── Anisotropy base tangent (DH-0478) ─────────────────────────────────────────────────────
+// The in-plane direction the grain lobe measures its stretch along when a material has no
+// per-texel grain map: horizontal in the face (or plan-X on a near-horizontal face), or its
+// in-plane perpendicular when the instance asks for VERTICAL grain. ONE definition, used by the
+// lighting kernel (as the grain tangent itself, and as the reference a per-texel angle is
+// decoded against) and by the photo-lane G-buffer (as the reference that angle is ENCODED
+// against) — so the two ends of `material.gb` cannot drift apart.
+static inline float3 anisoBaseTangent(float3 N, bool grainVertical) {
+    float3 up = float3(0.0, 1.0, 0.0);
+    if (abs(dot(N, up)) > 0.95) {
+        // Near-horizontal face (an appliance TOP): "vertical" has no meaning in the ground
+        // plane, so fall back to the plan axes — horizontal = plan-X, vertical = plan-Z.
+        float3 planX = normalize(float3(1.0, 0.0, 0.0) - N * N.x);
+        return grainVertical ? normalize(cross(N, planX)) : planX;
+    }
+    float3 horiz = normalize(cross(N, up));                    // in-plane, horizontal
+    return grainVertical ? normalize(cross(N, horiz)) : horiz; // in-plane, up-aligned (vertical)
+}
+
+// ── Cloth sheen roughness bands (DH-0081) ─────────────────────────────────────────────────
+// The sheen lobe's roughness is carried per-material by folding a small BAND index into the
+// INTEGER part of the (negative) sheen magnitude packed in `emission.alpha`, leaving the
+// FRACTION for sheen strength: `emission.alpha = -(band + strength)`. Band 0 is the historical
+// single constant (0.30), so a material that keeps the default nap packs `-strength` exactly as
+// it did before this existed — byte-for-byte. Four curated bands span crisp pile → broad fuzz; a
+// material's continuous `sheenRoughness` snaps to the nearest at pack time. Both directions live
+// here (this header is included by the G-buffer packer AND the lighting unpacker) so the band
+// table has ONE definition.
+inline float clothSheenRoughnessForBand(int band) {
+    switch (band) {
+        case 1:  return 0.18f;   // crisp / tight nap (sateen, silk)
+        case 2:  return 0.45f;   // broad soft nap (velvet, carpet pile)
+        case 3:  return 0.60f;   // very broad fuzz (wool bouclé, chenille)
+        default: return 0.30f;   // default — linen / general plain-weave upholstery
+    }
+}
+inline int clothSheenBandForRoughness(float r) {
+    // Nearest band. 0.30 (band 0) is listed first so a default-nap material snaps to it and
+    // packs identically to the pre-band encoding. Keep in sync with the switch above.
+    float bands[4] = { 0.30f, 0.18f, 0.45f, 0.60f };
+    int best = 0; float bestD = fabs(r - bands[0]);
+    for (int i = 1; i < 4; ++i) { float d = fabs(r - bands[i]); if (d < bestD) { bestD = d; best = i; } }
+    return best;
+}
 
 struct Vertex {
     float3 position;

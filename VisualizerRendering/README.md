@@ -57,6 +57,26 @@ materials (instances, meshes, atlas, lights, camera).
 > `equirectSky` or you get a magenta frame). Working references:
 > `IlluminatoramaRoom`/`IlluminatoramaHouse` in the Visualizer app.
 
+### The still lane — a photo export with everything traced
+
+The live loop is a one-frame-per-answer renderer; a still gets 32–96 accumulated jittered
+frames, and the engine exposes the switches a host flips for the duration of one export
+(Daydream Home's `HouseRenderBridge+Quality.swift` is the reference writer, and restores every
+one of them on the way out):
+
+| Switch | What it does in the still |
+| --- | --- |
+| `rtSunSoftShadowsEnabled` + `sunSoftnessRad` | The deferred sun's visibility is traced against the TLAS as a cone (0.005 rad ⇒ ~1 cm edges, 0.05 ⇒ ~10 cm); the shadow map keeps owning the live loop. |
+| `rtAreaShadowRays` | Window-portal (area-light) visibility traced per pixel per frame — 1 ray converges under accumulation. Portals whose unshadowed LTC term is below `kRTAreaShadowSkipLuma` skip their rays. |
+| `rtStillCapsRelaxed` + `buildRTFromExtractedScene` + `rtOpaqueLightingEnabled` | Lets a furnished house (hundreds of mesh groups) build the full-scene TLAS and run the opaque RT-lighting pass — one-bounce diffuse GI (`rtGIStrength`) under `rtSunOwnership = .deferred`, so the sun is shaded once. |
+| `rtGIRays` / `rtGITemporalBlend` | GI samples per pixel per frame and the GI accumulator's steady-state blend. The RT-lighting pass is the still's whole cost (measured 22.6 s of a 25.4 s frame at 24 MP with 4 rays); the budget is rays × frames, so a still wants 1–2 rays and a long window (the kernel floors the blend at 1/32). |
+| `rtaoEnabled` / `rtaoRadius` / `rtaoRays` / `rtaoIntensity` | Ray-traced AO dispatched in place of the GTAO march (half-res, R2-stratified, its own per-frame seed so the AO accumulator converges it with or without TAA). `rtaoDidRunLastFrame` is the engine's own record that the ray path fired — it falls back to the march silently on any frame with no live TLAS. |
+| `rtGlassEnabled` | Glass on the ray-traced path: a skylight lens as an `IlluminatoramaGlassInstance` lets the sky through the well and the sun down it. |
+| `taaJitterPixels` / `taaHistoryBlend` | Accumulation. `taaHistoryBlend` is the CURRENT frame's weight and is a per-frame uniform, so a host can average cumulatively — write `1/k` on the k-th frame (down to the kernel's 0.01 floor) instead of a fixed EMA: 96 frames at 1/32 carry an effective ~57 samples and 5 % of the seed frame; at `1/k` all 96 count equally. `resetTemporalHistory()` between A/B arms — history survives re-entering the scope. |
+
+Per-pass GPU timings for any of this come from `IlluminatoramaPassTimer`
+(`VIZ_ILLUMI_PASS_PROFILE=<file>`), which cross-checks its tick scale against the frame's GPU time.
+
 ### Ray-traced compositors
 
 | Type                    | Notes                                                    |

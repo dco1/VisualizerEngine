@@ -64,7 +64,9 @@ struct SkyUniforms {
     float4 sunColor;             // xyz = HDR colour, w = disk intensity scalar
 
     // ── Sky gradient ────────────────────────────────────────────────
-    float4 skyZenith;            // xyz = colour at the zenith, w = unused
+    float4 skyZenith;            // xyz = colour at the zenith, w = cloudAmbientGrey
+                                 //   (0 = cloud underside lit by blue sky-ambient,
+                                 //    1 = neutral overcast grey — DH-0585)
     float4 skyHorizon;           // xyz = colour at the horizon, w = haze power (1..8)
     float4 groundColor;          // xyz = colour for rays pointing down, w = horizon blend
 
@@ -168,6 +170,24 @@ struct SkyUniforms {
     //     nightMoonDisk) sets this to 0 so the dome doesn't double-draw a
     //     blurry low-res copy underneath the crisp one. z,w reserved.
     float4 cloudExtra2;
+
+    // ── Flat studio background (opt-in) ──────────────────────────────
+    // Bypasses the ENTIRE dome (atmosphere, sun, clouds, stars/moon) with a flat,
+    // direction-independent colour when enabled — see `volSkyRender`'s first branch.
+    // xyz = colour (linear HDR), w = enable flag (>0.5 = on).
+    float4 studioParams;
+
+    // ── Sky grade ────────────────────────────────────────────────────
+    // x = skySaturation: chroma of the physical sky about its own luma, 1 = the
+    //     nishita march untouched, 0 = grey, >1 = deeper. The one lever a host has
+    //     over the sky's COLOUR without re-grading the scene under it: a global
+    //     saturation dial reaches the sky only through everything else (measured
+    //     on Daydream's street render: the wall's blue channel collapsed to 4 before
+    //     the sky got anywhere near a photograph's).
+    // y = skyBlueLift: the blue channel scaled by this and the luma restored — a HUE pull toward
+    //     blue. Saturation alone could not reach a photograph's sky: about its own luma the
+    //     march goes cyan (red falls, blue barely rises). 1 = untouched. z, w = unused.
+    float4 skyGrade;
 };
 
 // The cloud kernel reads the noise volume's tile size from its own width
@@ -549,9 +569,8 @@ inline float3 atmosphereColor(float3 rayDir, constant SkyUniforms &u) {
 //     (altitude × view-zenith), a multiple-scattering table, and a per-frame
 //     sky-view LUT, then the per-pixel sky is a couple of texture fetches + the
 //     phase function. Faster per-pixel than O'Neil AND more accurate (it adds
-//     multiple scattering — which is what gives a real twilight its blue
-//     zenith, the thing our single-scatter march gets greenish because it has
-//     no ozone term). The catch: it's a whole subsystem (extra kernels, LUT
+//     multiple scattering, which the single-scatter march above lacks; ozone
+//     absorption is already in the march). The catch: it's a whole subsystem (extra kernels, LUT
 //     textures, parameterisation) for what is currently one baked dome. This is
 //     the right answer if many scenes want a live, cheap, physically-correct
 //     sky — revisit if Nishita becomes the default across scenes.
@@ -569,8 +588,8 @@ constant float  kMieG        = 0.76;     // Mie anisotropy (forward bias)
 // Ozone absorption β (m⁻¹), Chappuis band — pure absorption, no scattering. The
 // green/red-heavy cross-section (Hillaire 2020) is what gives a real twilight its
 // BLUE zenith: over the long grazing sun-ray path at sunset ozone eats the green
-// and red, leaving blue. Without it our single-scatter march reads greenish/olive
-// at the twilight zenith (the documented no-ozone limitation).
+// and red, leaving blue. Without it a single-scatter march reads greenish/olive
+// at the twilight zenith.
 constant float3 kBetaO       = float3(0.650e-6, 1.881e-6, 0.085e-6);
 constant float  kOzoneCenter = 25000.0;  // m — ozone layer peak altitude
 constant float  kOzoneWidth  = 15000.0;  // m — tent half-width (density → 0 by ~10/40 km)
@@ -728,10 +747,24 @@ inline float3 nishitaScatter(float3 rayDir, float3 sunDir, float intensity) {
 // horizon here (the exterior hero falls 182 -> 164 over the 13 px above it),
 // so a mirrored band climbs back to ~197 and meets the 125 lawn with a
 // ~72-code step — three times the seam it set out to remove.
+/// The sky grade: chroma about luma, then a blue lift with the luma put back. Both preserve
+/// the sky's exposure, so the grade never re-meters the scene under it.
+inline float3 skyGraded(float3 s, float sat, float blueLift) {
+    const float3 kLuma = float3(0.2126f, 0.7152f, 0.0722f);
+    float l = dot(s, kLuma);
+    float3 g = max(mix(float3(l), s, sat), 0.0f);
+    g.z *= max(blueLift, 0.0f);
+    float l2 = dot(g, kLuma);
+    return (l2 > 1e-6f) ? g * (l / l2) : g;
+}
+
 inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u) {
     float intensity = max(0.0f, u.atmosphereParams.y);
+    float sat = u.skyGrade.x;
     if (rayDir.y >= 0.0f) {
-        return nishitaScatter(rayDir, u.sunDir.xyz, intensity);
+        float3 s = nishitaScatter(rayDir, u.sunDir.xyz, intensity);
+        // Chroma about luma, luma preserved — the sky's exposure does not move with it.
+        return skyGraded(s, sat, u.skyGrade.y);
     }
     // The horizontal component, guarded: at the NADIR (0, -1, 0) — which the full-sphere
     // dome bake does sample — x and z are both zero and `normalize` of a zero vector is NaN.
@@ -743,6 +776,7 @@ inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u) {
     float3 grazing = (hlen > 1e-5f) ? float3(hxz.x / hlen, 0.0f, hxz.y / hlen)
                                     : float3(1.0f, 0.0f, 0.0f);
     float3 horizonHaze = nishitaScatter(grazing, u.sunDir.xyz, intensity);
+    horizonHaze = skyGraded(horizonHaze, sat, u.skyGrade.y);
     // Airlight scale in radians of depression: the 1/e point of the haze->ground
     // handover. 0.0035 rad (~0.2 deg) is one eye-height in ~3 km of haze, which is
     // where a real horizon hands over.
@@ -1031,6 +1065,15 @@ kernel void volSkyRender(
     uint H = outTex.get_height();
     if (gid.x >= W || gid.y >= H) return;
 
+    // Flat studio background — bypass atmosphere/sun/clouds/stars entirely and write one
+    // constant colour to every texel. Feeds BOTH the visible dome and the small IBL bake
+    // (same kernel, two dispatch resolutions — see `VolumetricCloudRenderer.render(params:)`),
+    // so this flattens ambient lighting too, not just what the camera sees behind the scene.
+    if (u.studioParams.w > 0.5f) {
+        outTex.write(float4(u.studioParams.xyz, 1.0f), gid);
+        return;
+    }
+
     // Equirect: u in [0, 2π), v in [+π/2, -π/2] so the texture's top row maps
     // to looking straight up. SceneKit wraps an equirect background such that
     // the +X direction in world space lines up with the texture's seam (u=0).
@@ -1250,7 +1293,15 @@ kernel void volSkyRender(
                 moonContrib = kMoonTint * moonGain * lit * powder;
             }
 
-            float3 ambientContrib = u.skyZenith.xyz * ambient;
+            // Cloud underside ambient fill. skyZenith is a saturated daytime
+            // BLUE, so a thick opaque deck lit only by this reads as "deeper
+            // blue sky" from below, not overcast. skyZenith.w (cloudAmbientGrey)
+            // desaturates the fill toward a luminance-preserving neutral grey so
+            // an overcast deck reads grey (DH-0585); 0 = the legacy blue fill.
+            float  ambGrey = clamp(u.skyZenith.w, 0.0f, 1.0f);
+            float  ambLum  = dot(u.skyZenith.xyz, float3(0.2126f, 0.7152f, 0.0722f));
+            float3 ambCol  = mix(u.skyZenith.xyz, float3(ambLum), ambGrey);
+            float3 ambientContrib = ambCol * ambient;
 
             // Fireworks: single-scattered radiance from the ray's culled
             // light list. Bursts below the slab glow the cloud base from
@@ -1342,10 +1393,20 @@ kernel void volSkyRender(
 // (volSkyRender, above) is UNTOUCHED and still drives every other scene + the
 // IBL environment. See issue #61.
 //
-// v1 scope: no scene-depth clip — the only opt-in scene (FireworksUltra) has no
-// opaque G-buffer geometry (sky + additive particles), so every visible pixel is
-// a sky/cloud pixel and the in-view result simply REPLACES it. A depth-clipped
-// "composite over geometry" generalisation is a v2 concern (noted in #61).
+// v2 — DEPTH-CLIPPED. This kernel overwrites the pixel it runs on (`outTex` is
+// write-only, so it cannot blend), and every one of its early-outs writes the
+// atmosphere colour. v1 dispatched over the WHOLE frame on the strength of its
+// one opt-in scene (FireworksUltra) having no opaque G-buffer geometry — so in
+// any scene that DOES have geometry it painted sky straight over the building.
+// A house scene hid that fact well enough to be missed twice: below the horizon
+// the kernel returns the host's `groundColor` fill, which an architectural host
+// calibrates against its own lawn, so the lawn survived the overwrite looking
+// almost right and only the building was destroyed.
+//
+// So the pass now takes the scene depth and writes ONLY where there is no
+// geometry (cleared depth), leaving every opaque pixel exactly as the deferred
+// pass shaded it. `depth >= 0.99999 ⇒ sky` is the same test the RT composite
+// uses (IlluminatoramaRT.metal), against the same 1.0 clear.
 
 struct CloudInViewUniforms {
     float4x4 invViewProjection;  // host clip → world (jittered VP inverse)
@@ -1355,6 +1416,9 @@ struct CloudInViewUniforms {
 kernel void illumi_cloud_inview(
     texture2d<float, access::write>  outTex      [[texture(0)]],
     texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    // Scene depth — the v2 clip. Cleared to 1.0, so anything below that is
+    // opaque geometry this pass must not touch.
+    depth2d<float,   access::read>   gDepth      [[texture(2)]],
     constant SkyUniforms &u                      [[buffer(0)]],
     constant CloudInViewUniforms &cv             [[buffer(1)]],
     device const VSBurstLight* burstLights       [[buffer(2)]],
@@ -1363,6 +1427,8 @@ kernel void illumi_cloud_inview(
     uint W = outTex.get_width();
     uint H = outTex.get_height();
     if (gid.x >= W || gid.y >= H) return;
+    // Opaque geometry owns this pixel — leave the deferred composite alone.
+    if (gDepth.read(gid) < 0.99999f) return;
 
     // ── Reconstruct the world-space camera ray (the ONLY difference vs the
     // equirect kernel). NDC: x,y ∈ [-1,1] with +Y up (texture row 0 = top), z = 1
@@ -1501,7 +1567,15 @@ kernel void illumi_cloud_inview(
                     : exp(-odM * absK) * phaseM;
                 moonContrib = kMoonTint * moonGain * lit * powder;
             }
-            float3 ambientContrib = u.skyZenith.xyz * ambient;
+            // Cloud underside ambient fill. skyZenith is a saturated daytime
+            // BLUE, so a thick opaque deck lit only by this reads as "deeper
+            // blue sky" from below, not overcast. skyZenith.w (cloudAmbientGrey)
+            // desaturates the fill toward a luminance-preserving neutral grey so
+            // an overcast deck reads grey (DH-0585); 0 = the legacy blue fill.
+            float  ambGrey = clamp(u.skyZenith.w, 0.0f, 1.0f);
+            float  ambLum  = dot(u.skyZenith.xyz, float3(0.2126f, 0.7152f, 0.0722f));
+            float3 ambCol  = mix(u.skyZenith.xyz, float3(ambLum), ambGrey);
+            float3 ambientContrib = ambCol * ambient;
             float3 burstContrib = float3(0.0f);
             for (uint li = 0u; li < rayLightCount; ++li) {
                 float3 toL  = rayLights[li].positionIntensity.xyz - pos;

@@ -124,7 +124,8 @@ static inline float cascadeVisibility(
     float3 worldPos,
     float3 N,
     float  slope,
-    uint   cascade
+    uint   cascade,
+    uint   pcfRadius
 ) {
     // Slope-scaled depth bias — surfaces nearly parallel to the light direction
     // need more bias to avoid acne, but biasing too much causes peter-panning.
@@ -149,16 +150,49 @@ static inline float cascadeVisibility(
     float3 row0 = float3(cascadeVP[0][0], cascadeVP[1][0], cascadeVP[2][0]);
     float  radius = 1.0 / max(length(row0), 1e-6);
     float  texelWorld = 2.0 * radius / float(shadowMap.get_width());
-    // Widen mildly on grazing incidence (where acne is worst) but stay bounded
-    // — 1–3 texels, never the runaway depth bias produced.
-    // Reduced from (1.0 + 2.0*slope) — front-face culling (second-depth) is the primary acne
-    // defence, so a smaller normal offset keeps acne away while the contact shadow stays tight
-    // (the larger offset peter-panned shadows off object bases). Also capped so an outer-cascade
-    // texel can't produce a runaway world push.
-    float3 biasedPos = worldPos + N * min(texelWorld * (0.4 + 0.8 * slope), 0.006);
+    // How far the sample must be pushed is set by TWO things, and the old factor
+    // `(0.4 + 0.8 * slope)` — a 0.4…1.2 ramp, then clamped to an absolute 6 mm — carried
+    // only a weak version of one of them.
+    //
+    // One texel of the map spans `texelWorld` across the receiver, and the depth stored for
+    // it is the surface's depth at the texel CENTRE. So the depth error a receiver sees is
+    // its own depth gradient across that texel — and for a surface lying at angle θ to the
+    // light, that gradient is `texelWorld * tan(θ)`. The tangent is the whole story: it is 0
+    // for a surface facing the light and diverges as the surface turns edge-on. At the
+    // 6.8° golden-hour sun this app opens with, the ground sits at θ ≈ 83° to the sun, so
+    // tan(θ) ≈ 8.4 — the old ramp topped out at 1.2, seven times short, and the 6 mm clamp
+    // then removed even that. A 6 mm push along the normal converts to 6 mm × NdotL = 0.7 mm
+    // of depth at this angle, against a quantisation error of ~60 mm.
+    //
+    // So the ground shadowed ITSELF across the whole cascade — measured on the launch
+    // document as **17.4 % of the sun lost** by open ground merely for being inside the
+    // cascade's box, with the box's rim drawn on the yard as a hard-edged polygon (DH-0617;
+    // Danny: "a workable space in the canvas is showing a darker space"). PCF was hiding part
+    // of it — with `shadowPcfRadius 0` the same measurement reads 22.3 %, which is the tell
+    // that it is acne and not a shadow.
+    //
+    // Scaling by tan(θ) fixes the term rather than the symptom, and it is self-limiting where
+    // it matters: a surface facing the light gets ~0.4 texels exactly as before, so nothing
+    // that was tuned against head-on geometry moves — the wall-foot seal and the contact
+    // shadows are untouched. The cap stays TEXEL-relative (the quantity the error is actually
+    // made of) instead of an absolute distance, with a generous absolute backstop so a 200 m
+    // context cascade cannot push a sample by metres.
+    // …and the push has to clear the PCF KERNEL, not just the centre tap. Every tap compares
+    // the SAME biased depth against a texel up to `pcfRadius` away, and each texel of that
+    // reach is another `texelWorld * tan(θ)` of the receiver's own recession. So the offset
+    // that makes the centre tap safe still leaves the outer taps landing on the receiver —
+    // which is why a first cut of this fix measured clean in the mid field and still drew the
+    // cascade box's rim and corners across the far ground, where the outer cascade's texel is
+    // coarsest (Danny, on siterect-baseline-smd20.png: "i am still seeing the edges and
+    // corners of the polygon at the top of the image").
+    float  ndotl    = clamp(1.0 - slope, 0.0, 1.0);
+    float  tanTheta = sqrt(saturate(1.0 - ndotl * ndotl)) / max(ndotl, 0.02);
+    float  pcfReach = 1.0 + float(min(pcfRadius, 2u));   // centre tap + the kernel's reach
+    float3 biasedPos = worldPos
+                     + N * min(texelWorld * clamp(tanTheta, 0.4, 12.0) * pcfReach, 0.25);
 
     return sampleCascade(shadowMap, shadowSampler, biasedPos,
-                         cascadeVP, cascade, bias, frame.shadowPcfRadius);
+                         cascadeVP, cascade, bias, pcfRadius);
 }
 
 // ── S1.4 — cascade-split blending ────────────────────────────────────────────
@@ -176,7 +210,14 @@ static inline float cascadeVisibility(
 // that have a successor (cascade 2 has none), and far less than 10 % of a typical
 // frame's pixels. Outside the band `t == 0` and this is bit-identical to the hard
 // select, so nothing but the seam moves.
-constant float kCascadeBlendFraction = 0.10;
+// RAISED 0.10 → 0.30 when the normal offset gained its grazing-angle term. The offset is
+// texel-relative and each cascade owns a different texel, so the sample displacement now JUMPS
+// at a split — ~10 cm between the outer two here — and a shadow edge crossing one kinked by
+// 9.66 px against an 8.0 px bar (`testCascadeSplitDoesNotKinkAShadowEdgeCrossingIt`). Widening
+// the band spreads that step into a gradient across three times the depth. The cost is the one
+// the constant already documents — a second cascade tap for pixels inside the band — now paid
+// over 30 % of a cascade's depth range rather than 10 %.
+constant float kCascadeBlendFraction = 0.30;
 
 static inline float sunVisibility(
     depth2d_array<float, access::sample> shadowMap,
@@ -195,7 +236,8 @@ static inline float sunVisibility(
     uint cascade = pickCascade(viewDist, splits);
     float slope = clamp(1.0 - NdotL, 0.0, 1.0);
 
-    float v = cascadeVisibility(shadowMap, shadowSampler, frame, worldPos, N, slope, cascade);
+    float v = cascadeVisibility(shadowMap, shadowSampler, frame, worldPos, N, slope, cascade,
+                                frame.shadowPcfRadius);
 
     // Inside the last `kCascadeBlendFraction` of this cascade's range, fade into the
     // next one. `cascade == 2` is the outermost, so it has nothing to fade into (its
@@ -208,7 +250,8 @@ static inline float sunVisibility(
         float t = (band > 1e-4) ? saturate((viewDist - (farZ - band)) / band) : 0.0;
         if (t > 0.0) {
             float vNext = cascadeVisibility(shadowMap, shadowSampler, frame,
-                                            worldPos, N, slope, cascade + 1u);
+                                            worldPos, N, slope, cascade + 1u,
+                                            frame.shadowPcfRadius);
             v = mix(v, vNext, t);
         }
     }
@@ -238,6 +281,9 @@ static inline float sunVisibility(
 // against the doctrine). So the slab stays an occluder here; the residual −19
 // is flagged as a Danny look-call in known-issues § S4.1.
 constant uint kRTSunShadowRayMask = 0x01 | 0x04;
+// Below this unshadowed luminance (HDR, pre-exposure) a portal's visibility is not traced —
+// the light's whole contribution is under a rounding error of the frame's exposure range.
+constant float kRTAreaShadowSkipLuma = 0.002;
 
 static inline float rtSunSoftVisibility(
     instance_acceleration_structure accel,
@@ -247,7 +293,9 @@ static inline float rtSunSoftVisibility(
     float3 Ld,
     uint2  gid
 ) {
-    uint rays = clamp(frame.rtSunShadowRayCount, 1u, 8u);
+    // DH-0856 — raised 8 -> 32 alongside the host-side clamp (IlluminatoramaRenderer.swift)
+    // so a caller asking for more rays isn't silently re-clamped back down here.
+    uint rays = clamp(frame.rtSunShadowRayCount, 1u, 32u);
     // Same seeding shape as the glass pass (pixel-decorrelated, frame-walked by
     // `rtSunShadowSeed` — which the host freezes at 0 when nothing accumulates).
     uint seed = pcgHash(gid.x + gid.y * 9781u + frame.rtSunShadowSeed * 6151u);
@@ -273,6 +321,59 @@ static inline float rtSunSoftVisibility(
         sr.direction = coneSample(Ld, frame.rtSunShadowAngle, rnd(seed), rnd(seed));
         sr.min_distance = 2e-3;
         sr.max_distance = 1e4;
+        if (isect.intersect(sr, accel, kRTSunShadowRayMask).type != intersection_type::none) {
+            hits++;
+        }
+    }
+    return 1.0 - float(hits) / float(rays);
+}
+
+// ── S4.3 — ray-traced PORTAL visibility (same variant, same TLAS) ─────────────
+//
+// A window portal's PCF map is one 150° perspective from the portal centre: a
+// receiver outside that frustum — a niche beside the window, the wall the
+// portal sits in — reads fully lit, and a 512² page over 150° blurs a shelf's
+// shadow to nothing. This traces `rtAreaShadowRayCount` rays toward jittered
+// points on the emitting rectangle instead: exact in every direction, and the
+// penumbra is the portal's real angular size. Same ray mask as the sun (opaque
+// + invisible occluder; glass excluded), same per-pixel/per-frame seeding, so a
+// still's accumulator converges it exactly as it converges the sun's cone.
+static inline float rtAreaVisibility(
+    instance_acceleration_structure accel,
+    constant FrameUniforms&         frame,
+    AreaLight                       al,
+    float3 worldPos,
+    float3 N,
+    uint2  gid,
+    uint   lightIndex
+) {
+    uint rays = clamp(frame.rtAreaShadowRayCount, 1u, 8u);
+    uint seed = pcgHash(gid.x + gid.y * 9781u + frame.rtSunShadowSeed * 6151u
+                        + (lightIndex + 1u) * 7919u);
+    float3 toCenter = al.center - worldPos;
+    float  ndl  = dot(N, toCenter);
+    float3 offN = (ndl >= 0.0) ? N : -N;
+    float3 origin = worldPos + offN * 2e-3;
+
+    intersector<triangle_data, instancing> isect;
+    isect.set_triangle_cull_mode(triangle_cull_mode::none);
+    isect.accept_any_intersection(true);
+
+    uint hits = 0u;
+    for (uint s = 0u; s < rays; ++s) {
+        float u = rnd(seed) * 2.0 - 1.0;
+        float v = rnd(seed) * 2.0 - 1.0;
+        float3 target = al.center + al.ex * u + al.ey * v;
+        float3 d = target - origin;
+        float  len = length(d);
+        if (len < 1e-4) continue;
+        ray sr;
+        sr.origin = origin;
+        sr.direction = d / len;
+        sr.min_distance = 2e-3;
+        // Stop just short of the portal plane so the pane and its own casing never
+        // count as occluders of the light they carry.
+        sr.max_distance = max(2e-3, len - 0.02);
         if (isect.intersect(sr, accel, kRTSunShadowRayMask).type != intersection_type::none) {
             hits++;
         }
@@ -309,10 +410,11 @@ static inline float clothSheenV(float NdotV, float NdotL) {
     return 1.0 / max(4.0 * (NdotL + NdotV - NdotL * NdotV), 1e-5);
 }
 
-/// One fixed sheen roughness for the whole library. The strength already arrives per material
-/// (packed as a negative `emission.alpha`); a per-material sheen ROUGHNESS would need a second
-/// instance field, and the instance stride is not this change's to move. 0.30 is a soft,
-/// broad nap — right for linen and wool, and velvet's much higher STRENGTH is what separates it.
+/// The DEFAULT sheen roughness (band 0). Per-material nap width now arrives folded into the
+/// negative `emission.alpha` alongside strength (DH-0081 — see `clothSheenRoughnessForBand`), so a
+/// material that keeps this default decodes 0.30 and is byte-identical to when this was the single
+/// library-wide constant. It remains the fallback for the `brdf` default argument and for the
+/// non-cloth unpack path. 0.30 is a soft, broad nap — a sensible neutral for a plain-weave cloth.
 constant float kClothSheenRoughness = 0.30;
 
 /// Fibre-tip colour: cloth sheen is scattered by the pale tips of the nap, not by the dyed
@@ -343,7 +445,8 @@ static inline float clothSheenEnvAlbedo(float NdotV) {
 static inline float3 brdf(
     float3 N, float3 V, float3 L, float3 albedo, float metallic, float roughness, float3 lightColor,
     float anisotropy = 0.0, float3 grainT = float3(0.0),
-    float sheenStrength = 0.0, thread float3 *sheenOut = nullptr
+    float sheenStrength = 0.0, thread float3 *sheenOut = nullptr,
+    float sheenRoughness = kClothSheenRoughness
 ) {
     float3 H = normalize(V + L);
     float NdotL = saturate(dot(N, L));
@@ -378,7 +481,7 @@ static inline float3 brdf(
     // `brdf` has always returned; a surface with no cloth sheen therefore cannot move by a bit.
     if (!(sheenStrength > 0.0)) return (diff + spec) * lightColor * NdotL;
 
-    float  Ds = clothSheenD(kClothSheenRoughness, NdotH);
+    float  Ds = clothSheenD(sheenRoughness, NdotH);
     float  Vs = clothSheenV(NdotV, NdotL);
     float3 sheen = clothSheenColor(albedo) * (sheenStrength * Ds * Vs);
     if (sheenOut != nullptr) *sheenOut += sheen * lightColor * NdotL;
@@ -413,49 +516,9 @@ static inline float3 brdfDiffuse(
 // point sample (the rect point closest to the reflection ray) — a declared
 // approximation pending the fitted GGX LTC specular LUT (increment 2).
 
-// Vector irradiance of one polygon edge (clamped-cosine), v1/v2 normalised.
-//
-// Hill & Heitz's rational fit of θ/sin θ (the LTC reference implementation), NOT the
-// literal acos form this shipped with first. The literal form is singular exactly where
-// a WINDOW PORTAL lives: a fragment coplanar with the light (the wall the portal is cut
-// into — every fragment of it) sees two corners in near-opposite directions, θ→π,
-// sin θ→0, θ/sin θ→∞ while cross(v1,v2)→0 — 0·∞ = NaN, and the TAA settle smears one
-// NaN into a fully black frame (measured: the first portal arm rendered 1 152 000 black
-// pixels). A −0.9999 clamp tames the infinity but leaves acos's catastrophic
-// cancellation at both ends — salt-and-pepper speckle across any coplanar floor or
-// ceiling. The fit is stable at BOTH limits (the x → −1 branch pairs the 1/√(1−x²)
-// growth against the cross's shrink analytically) and is what production LTC ships.
-// Visualizer's softboxes float in open space and never exercised these limits; the
-// sub-percent difference from the acos form elsewhere is the fit's documented accuracy.
-static inline float3 ltcIntegrateEdge(float3 v1, float3 v2) {
-    float x = clamp(dot(v1, v2), -1.0, 1.0);
-    float y = abs(x);
-    float a = 0.8543985 + (0.4965155 + 0.0145206 * y) * y;
-    float b = 3.4175940 + (4.1616724 + y) * y;
-    float v = a / b;
-    float thetaSinTheta = (x > 0.0)
-        ? v
-        : 0.5 * rsqrt(max(1.0 - x * x, 1e-7)) - v;
-    return cross(v1, v2) * thetaSinTheta;
-}
-
-// Clamped-cosine form factor of the quad (corners p0..p3 CCW, relative to the
-// shaded point) seen from a surface with normal N. Returns [0,1]; one-sided
-// clamps the receiver to the front hemisphere, two-sided takes |·|.
-static inline float ltcPolygonForm(float3 N, float3 p0, float3 p1, float3 p2, float3 p3,
-                                   bool twoSided) {
-    // Length-guarded normalise: a fragment AT a light corner (a portal's jamb pixel)
-    // hands normalize() a zero vector — the remaining NaN seed once the edge integral
-    // above went stable.
-    float3 L0 = p0 * rsqrt(max(dot(p0, p0), 1e-8));
-    float3 L1 = p1 * rsqrt(max(dot(p1, p1), 1e-8));
-    float3 L2 = p2 * rsqrt(max(dot(p2, p2), 1e-8));
-    float3 L3 = p3 * rsqrt(max(dot(p3, p3), 1e-8));
-    float3 vsum = ltcIntegrateEdge(L0, L1) + ltcIntegrateEdge(L1, L2)
-                + ltcIntegrateEdge(L2, L3) + ltcIntegrateEdge(L3, L0);
-    float z = dot(vsum, N) * (1.0 / (2.0 * M_PI_F));
-    return twoSided ? abs(z) : max(0.0, z);
-}
+// `ltcIntegrateEdge` / `ltcPolygonForm` — the diffuse polygon form factor — live in
+// IlluminatoramaSecondary.h (DH-0718): the secondary path lights reflected and GI-bounce
+// hits with window portals by the SAME form factor, so there is one copy.
 
 // Clip the LTC-space quad to z ≥ 0 — the shading horizon in clamped-cosine space —
 // before edge integration (Heitz et al. 2016, the reference implementation's 16-case
@@ -727,14 +790,37 @@ static inline float illumiContactShadow(
     float3                       viewPos,    // fragment position, view space
     float3                       LviewN,     // normalized view-space dir TOWARD the light
     uint2                        dims,       // depth-buffer (width, height)
+    uint2                        originPx,   // THIS fragment's own pixel (the kernel's gid)
     float                        lengthWS,   // march reach, world units
     uint                         steps,
     float                        thickness,  // occluder depth window, world units
     float                        ndotl       // surface NdotL toward the sun
 ) {
-    // Back-facing or grazing-to-sun fragments are already unlit by NdotL and
-    // self-occlude trivially — skip them to avoid contact-shadow acne.
-    if (ndotl <= 0.02 || steps == 0u || lengthWS <= 0.0) return 0.0;
+    if (steps == 0u || lengthWS <= 0.0) return 0.0;
+
+    // ── The ray has to climb clear of the window it is tested against ────────────────
+    //
+    // Marching toward the light lifts the ray off its own receiver at a rate of `ndotl`
+    // (the sine of the angle between the light and the surface), so over the whole reach it
+    // gains `lengthWS * ndotl` of height — and it is accepted as "occluded" by anything
+    // sitting within `thickness` of it. When that climb is SMALLER than the window, the ray
+    // never leaves its own receiver's acceptance band: the surface it was launched from
+    // qualifies as its own occluder for the entire march, and every fragment reports a hit.
+    //
+    // This is not a tuning threshold; it is the condition under which the test can return an
+    // answer at all. At the shipping 5 cm / 20 mm the ray clears the window once the light is
+    // ~24° off the surface, and below ~12° there is nothing to read. That regime is not one
+    // the feature was ever serving: a contact shadow at grazing light is a long CAST shadow,
+    // which the cascades draw, and what the march produced there instead was a full-strength
+    // false positive across open ground (Daydream Home's default document — an empty flat
+    // plane at golden hour — lost 70 % of its direct sun to it, DH-0611).
+    //
+    // The old guard here was `ndotl <= 0.02`, which is the same intent at an unprincipled
+    // constant: 1.1° off the surface, two orders of magnitude below where the march actually
+    // stops meaning anything. Fading rather than stepping keeps the sun's passage through the
+    // threshold over a day from drawing an edge of its own.
+    float climbFade = smoothstep(0.5, 1.0, (lengthWS * ndotl) / max(thickness, 1e-5));
+    if (climbFade <= 0.0) return 0.0;
 
     // Screen-extent guard — see the block comment above. Project the march's two
     // endpoints and fade out when the whole reach is sub-texel, where the depth
@@ -762,6 +848,34 @@ static inline float illumiContactShadow(
         float2 uv  = ndc.xy * float2(0.5, -0.5) + 0.5;
         if (any(uv < float2(0.0)) || any(uv > float2(1.0))) break;  // ray left the screen
         uint2  px  = min(uint2(uv * float2(dims)), dims - 1u);
+        // ── The step has to LEAVE this fragment's own pixel to mean anything ─────────
+        //
+        // The depth read below is a POINT read at integer pixel granularity, so while the
+        // ray is still inside the pixel it started in, `gDepth.read(px)` returns THIS
+        // fragment's own depth — the ray is being compared against the very surface it was
+        // launched from. `diff` is then just how far the ray has travelled into the scene
+        // along the light direction, which for the first step is `bias + lengthWS/steps`
+        // (6.7 mm at the shipping 5 cm / 12 steps) and lands squarely inside the acceptance
+        // window `(bias, bias + thickness)` = (2.5 mm, 22.5 mm). Every such fragment reports
+        // a first-step hit at full weight, i.e. `occ == 1`.
+        //
+        // The `extentFade` guard above does NOT cover this: it validates the extent of the
+        // WHOLE march, and a march can span 2+ pixels — passing that test at full strength —
+        // while each of its 12 steps advances only ~0.2 px and never leaves the origin texel.
+        // Total extent and per-step extent are different quantities, and the comparison that
+        // has to be resolvable is the per-step one.
+        //
+        // Measured on Daydream Home's default document (an EMPTY flat dirt plane at golden
+        // hour, sun 6.8° above the horizon and near the view axis — the geometry that
+        // foreshortens the march hardest): the ground lost 70 % of its direct sun beyond
+        // ~9 m, as a hard-edged dark band whose edge sat at a constant ~2.5 px of march
+        // extent across an 8× reach sweep. There is nothing in that scene to cast a shadow.
+        //
+        // Skipping costs no real occlusion: a fragment IS the visible surface at its own
+        // pixel, so the depth stored there can only ever be its own. When every step is
+        // skipped the march returns 0 — which is the honest answer for a march that cannot
+        // resolve anything, and the same contract the extent guard already established.
+        if (all(px == originPx)) continue;
         float  sceneDepth = gDepth.read(px);
         if (sceneDepth >= 0.99999) continue;                        // sky — no occluder
 
@@ -774,7 +888,7 @@ static inline float illumiContactShadow(
             // Densest at the contact, and scaled by how much of a pixel the march
             // actually spans — a hit found by a barely-resolved march is worth
             // proportionally less than one found by a fully-resolved one.
-            return (1.0 - float(i) / float(steps)) * extentFade;
+            return (1.0 - float(i) / float(steps)) * extentFade * climbFade;
         }
     }
     return 0.0;
@@ -784,6 +898,9 @@ kernel void illumi_lighting(
     texture2d<half,  access::read>          gAlbedoMet      [[texture(0)]],
     texture2d<half,  access::read>          gNormalRgh      [[texture(1)]],
     texture2d<half,  access::read>          gEmission       [[texture(2)]],
+    // DH-0140 — the photo-lane sixth G-buffer target (see `GBufferOut.material`). Read ONLY
+    // when `frame.extendedGBuffer != 0`; the host binds any texture otherwise.
+    texture2d<half,  access::read>          gMaterial       [[texture(21)]],
     depth2d<float,   access::read>          gDepth          [[texture(3)]],
     texture2d<half,  access::write>         outHDR          [[texture(4)]],
     texture2d<half,  access::read>          aoTex           [[texture(5)]],
@@ -821,6 +938,18 @@ kernel void illumi_lighting(
     // an unread dummy and the write is skipped, so non-SSS scenes pay nothing).
     // (texture(20): 18/19 were taken by gLayer/pointShadowAtlas in the merge.)
     texture2d<half,  access::write>         sssOut          [[texture(20)]],
+    // DH-0896 — the EXACT specular-IBL term this pixel's composite carries (the sky
+    // reflection, after specular occlusion, the interior split, clearcoat attenuation and
+    // aerial perspective), handed to the RT reflection pass so a reflection ray that HITS
+    // the scene can REPLACE the sky it saw instead of being added on top of it. Written
+    // only when the host binds a full-size target (RT reflections on); otherwise the
+    // binding is a 1×1 dummy and the write is skipped, so every other frame pays nothing.
+    texture2d<half,  access::write>         specIBLOut      [[texture(22)]],
+    // The diffuse SKY share of the final composite, handed to the traced GI pass — the
+    // diffuse sibling of `specIBLOut`. A traced GI estimate integrates the whole hemisphere
+    // (its misses ARE the sky), so where it runs it REPLACES this share instead of adding a
+    // second sky on top of it. Written only when the host binds a full-size target.
+    texture2d<half,  access::write>         diffSkyOut      [[texture(23)]],
     constant FrameUniforms&                 frame           [[buffer(0)]],
     const device PointLight*                pointLights     [[buffer(1)]],
     constant DDGIUniforms&                  ddgi            [[buffer(2)]],
@@ -883,7 +1012,17 @@ kernel void illumi_lighting(
     // of the 2026-08-09 re-siting: it used to be read at the very bottom of this kernel, after
     // the point and spot loops had already closed, so a lamp-lit sofa received no sheen at all.
     // 0 for every non-cloth surface, and `brdf` early-outs exactly on 0.
-    float  sheenStrength = (emH.a < -0.001h) ? float(-emH.a) : 0.0;
+    // DH-0081 — the negative alpha carries BOTH the strength (fraction) and the roughness BAND
+    // (integer part): `-(band + strength)`. Band 0 is the historical 0.30 nap, so a default-nap
+    // material decodes strength = -a and roughness = 0.30, exactly as before the band existed.
+    float  sheenStrength  = 0.0;
+    float  sheenRoughness = kClothSheenRoughness;
+    if (emH.a < -0.001h) {
+        float m    = float(-emH.a);
+        int   band = int(floor(m + 1e-3f));
+        sheenStrength  = m - float(band);
+        sheenRoughness = clothSheenRoughnessForBand(band);
+    }
     // Sheen-only accumulator for `DebugTerm.clothSheen` (17). Every `brdf` call below is handed
     // `&clothSheen`, so the term can still be isolated even though it is no longer a separable
     // bolt-on. Untouched (and dead-stripped) when nothing in the scene is cloth.
@@ -946,7 +1085,7 @@ kernel void illumi_lighting(
         float3 viewPos = (frame.view * float4(worldPos, 1.0)).xyz;
         float3 LviewN  = normalize((frame.view * float4(Ld, 0.0)).xyz);
         float  occ = illumiContactShadow(gDepth, frame, viewPos, LviewN,
-                                         uint2(w, h),
+                                         uint2(w, h), gid,
                                          frame.contactShadowLength,
                                          frame.contactShadowSteps,
                                          frame.contactShadowThickness,
@@ -955,16 +1094,36 @@ kernel void illumi_lighting(
     }
     // Terms kept separate so the per-term split-render (frame.debugTerm) can
     // isolate any one of them; the normal path just sums them at the end.
-    // Phase 7c — grain anisotropy: normalRoughness.w carries (1 + aniso) for wood/brushed-metal
-    // pixels (opaque is exactly 1.0). Reconstruct an in-plane grain tangent from a world reference
-    // (plan-X for floors/ceilings, horizontal for walls) — approximate (per-instance, not per-
-    // plank), but it's the highlight STRETCH that kills the plastic look, not the exact grain angle.
-    float aniso = (nrH.a > 1.001h) ? float(nrH.a - 1.0h) : 0.0;
+    // Phase 7c — grain anisotropy, now with an AUTHORABLE grain axis. normalRoughness.w packs the
+    // amount AND the orientation in two bands: (1.001,2] = HORIZONTAL grain (aniso = w-1, the
+    // original encoding), (2.001,3] = VERTICAL grain (aniso = w-2). The G-buffer chose the band
+    // from the SIGN of the instance's anisotropy (negative = vertical). This is why a brushed
+    // fridge/dishwasher door can run its highlight up the panel while a range runs it across —
+    // before, the tangent was reconstructed as `cross(N, up)` (horizontal on every vertical face)
+    // and nothing could say otherwise. The reconstruction is still per-instance from a world
+    // reference (not per-plank), but it's the STRETCH plus the AXIS that kill the plastic look.
+    float aniso; bool grainVertical;
+    if (nrH.a > 2.001h)      { aniso = float(nrH.a - 2.0h); grainVertical = true;  }
+    else if (nrH.a > 1.001h) { aniso = float(nrH.a - 1.0h); grainVertical = false; }
+    else                     { aniso = 0.0;                 grainVertical = false; }
     float3 grainT = float3(0.0);
     if (aniso > 0.001) {
-        float3 up = float3(0.0, 1.0, 0.0);
-        grainT = (abs(dot(N, up)) > 0.95) ? normalize(float3(1.0, 0.0, 0.0) - N * N.x)
-                                          : normalize(cross(N, up));
+        // The per-instance axis (shared definition — IlluminatoramaCommon.h).
+        grainT = anisoBaseTangent(N, grainVertical);
+        if (frame.extendedGBuffer != 0.0) {
+            // DH-0478 — the still carries the material's OWN grain direction per texel: `material.gb`
+            // is (cos 2φ, sin 2φ) of the angle from the base tangent above, doubled so it is
+            // sign-agnostic and wrap-free. A texel the pass never wrote (raw 0) decodes to length
+            // √2, off the unit circle, and keeps the base tangent — every ungrained or legacy
+            // pixel is pixel-identical to the live lane.
+            float2 e = float2(gMaterial.read(gid).gb) * 2.0 - 1.0;
+            float l2 = dot(e, e);
+            if (l2 > 0.5 && l2 < 1.5) {
+                float phi = 0.5 * atan2(e.y, e.x);
+                float3 baseB = normalize(cross(N, grainT));
+                grainT = normalize(cos(phi) * grainT + sin(phi) * baseB);
+            }
+        }
     }
     // NOTE the sheen accounting: `directSun` is scaled by `visibility` AFTER the call, so the
     // sheen `brdf` pushed into `clothSheen` has to be shadowed by hand to match. Every other
@@ -972,7 +1131,7 @@ kernel void illumi_lighting(
     float3 directSunSheen = float3(0.0);
     float3 directSun = brdf(N, V, Ld, albedo, metallic, roughness,
                             frame.directionalLightColor, aniso, grainT,
-                            sheenStrength, &directSunSheen) * visibility;
+                            sheenStrength, &directSunSheen, sheenRoughness) * visibility;
     clothSheen += directSunSheen * visibility;
     if (isSSS) sssDiffuse += brdfDiffuse(N, V, Ld, albedo, metallic,
                                          frame.directionalLightColor) * visibility;
@@ -1028,6 +1187,29 @@ kernel void illumi_lighting(
         transmission  = min(t, albedo * frame.directionalLightColor * visibility);
     }
 
+    // ── Lamp-shade fabric translucency (DH-0458) ────────────────────────────
+    // Shade pixels carry ≈0.62 in normalRoughness.w (0.60 < w < 0.66). A paper /
+    // linen drum shade is a THIN translucent sheet: light landing on its FAR face —
+    // the sunset through the glazed wall, or the room behind it — scatters through
+    // and lifts the near face, so the shade reads as lit fabric instead of an opaque
+    // pale cone (the DH-0458 dusk complaint). Same energy-clamped thin-sheet
+    // machinery as the leaf / plush terms, tuned for paper: MORE diffuse than the
+    // bear (a shade is smoother-scattering, so less forward spike) and only faintly
+    // warm. The internal bulb's own glow is a SEPARATE self-emission (the N5
+    // `LampShadeEmissionMap`, gated by nightness) — this term is the EXTERNAL half,
+    // which is why it is driven by the sun, not by a point light. Driven by
+    // `frame.shadeTransmission` (0 ⇒ skipped); no Visualizer scene ships the tag OR
+    // sets the scalar, so it is an exact no-op there. Mirrors the leaf gate so it
+    // never fires forward-lit.
+    if (nrH.a > 0.60h && nrH.a < 0.66h && frame.shadeTransmission > 0.0) {
+        float back    = saturate(dot(-N, Ld));                     // light on the FAR face
+        float backlit = smoothstep(0.02, 0.45, dot(V, -Ld));       // viewing toward the light
+        float through = back * backlit * (0.60 + 0.40 * saturate(dot(V, -Ld)));
+        float3 warm   = frame.directionalLightColor * float3(1.03, 1.00, 0.95);  // faintly warm through paper
+        float3 t      = albedo * warm * through * visibility * frame.shadeTransmission;
+        transmission  = min(t, albedo * frame.directionalLightColor * visibility);
+    }
+
     float3 pointSum = float3(0.0);
     float3 spotSum  = float3(0.0);
 
@@ -1052,7 +1234,10 @@ kernel void illumi_lighting(
         float  dist    = length(toLight);
         if (dist > pl.radius) continue;
         float3 L = toLight / max(dist, 1e-4);
-        float atten = 1.0 / max(dist * dist, 1e-4);
+        // Source-size softening: `1/(d² + r²)` caps the near field at `1/r²` instead of
+        // blowing up as d→0, so a finite-size source reads as a soft halo rather than a hot
+        // blob. r == 0 ⇒ exactly `1/d²` (the old path, byte-identical for scenes that never set it).
+        float atten = 1.0 / max(dist * dist + pl.softRadius * pl.softRadius, 1e-4);
         float window = saturate(1.0 - pow(dist / pl.radius, 4.0));
         atten *= window * window;
 
@@ -1099,7 +1284,7 @@ kernel void illumi_lighting(
         }
         if (visibility <= 0.0) continue;
         pointSum += brdf(N, V, L, albedo, metallic, roughness, pl.color * atten * visibility,
-                         0.0, float3(0.0), sheenStrength, &clothSheen);
+                         0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness);
         if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic,
                                              pl.color * atten * visibility);
     }
@@ -1124,7 +1309,9 @@ kernel void illumi_lighting(
         float coneCos   = dot(normalize(sl.direction), -L);
         float coneAtten = smoothstep(sl.outerCone, sl.innerCone, coneCos);
         if (coneAtten <= 0.0) continue;
-        float atten = 1.0 / max(dist * dist, 1e-4);
+        // Source-size softening (see the point-light path): `1/(d² + r²)` flattens the
+        // near field into a soft halo. r == 0 ⇒ exactly `1/d²`, byte-identical.
+        float atten = 1.0 / max(dist * dist + sl.softRadius * sl.softRadius, 1e-4);
         float window = saturate(1.0 - pow(dist / sl.radius, 4.0));
         atten *= window * window * coneAtten;
 
@@ -1152,7 +1339,11 @@ kernel void illumi_lighting(
                 // 3×3 PCF using hardware bilinear compare. Each
                 // `sample_compare` returns the linear-filtered fraction
                 // of taps that pass; summing 9 gives a smooth penumbra.
-                float w = 1.0 / 512.0; // shadow map texel size
+                // Texel size read from the ATLAS, not assumed. The two used to be independent
+                // constants; a resolution change on the Swift side would have left this PCF
+                // sampling a stale footprint (3 texels of a 512 map at 2048 = a 4x-too-wide
+                // blur), which is silent — the shadow just gets softer.
+                float w = 1.0 / float(spotShadowAtlas.get_width());
                 float sum = 0.0;
                 for (int oy = -1; oy <= 1; ++oy) {
                     for (int ox = -1; ox <= 1; ++ox) {
@@ -1169,7 +1360,7 @@ kernel void illumi_lighting(
         if (visibility <= 0.0) continue;
         spotSum += brdf(N, V, L, albedo, metallic, roughness,
                         sl.color * atten * visibility,
-                        0.0, float3(0.0), sheenStrength, &clothSheen);
+                        0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness);
         if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic,
                                              sl.color * atten * visibility);
     }
@@ -1179,12 +1370,70 @@ kernel void illumi_lighting(
     float3 areaSum = float3(0.0);
     bool areaLTC = frame.areaLTCEnabled != 0u;
     for (uint i = 0; i < frame.areaLightCount; ++i) {
-        // Light-layer mask — same rule as point/spot. An area light has no shadow map
-        // and no visibility term, so the mask is its ONLY containment (a window portal
-        // without it lights the yard through the back of its own wall).
-        if ((areaLights[i].layerMask & fragLayer) == 0u) continue;
-        areaSum += evalAreaLight(areaLights[i], worldPos, N, V, albedo, metallic, roughness,
-                                 ltcMat, ltcMag, areaLTC);
+        AreaLight al = areaLights[i];
+        // Light-layer mask — same rule as point/spot. For an UNSHADOWED area light (a
+        // diffuse cove/softbox, shadowSliceIndex < 0) the mask is its only containment
+        // (a window portal without it lights the yard through the back of its own wall).
+        if ((al.layerMask & fragLayer) == 0u) continue;
+        // DH-0601 — portal VISIBILITY term. A window portal by day is the room's dominant
+        // source; without occlusion nothing indoors casts a shadow. When the host assigned
+        // this light a slice of the SHARED spot-shadow atlas, project the fragment into the
+        // portal's light space and PCF-compare — identical machinery to the spot path — and
+        // modulate the whole LTC/MRP contribution by the result. shadowSliceIndex < 0 (every
+        // cove strip, every Visibility softbox) skips this entirely and is byte-identical.
+        float visibility = 1.0;
+        // S4.3 — in the RT-sun variant with portal rays requested, the traced answer
+        // REPLACES the PCF map for every light that asked for a shadow (function-constant
+        // gated, so the non-RT variant is untouched; ray count 0 keeps the map path).
+        //
+        // COST (S4.5): the rays are the still's single most expensive term — nine portals ×
+        // three rays was 27 any-hit traversals per pixel per frame (measured: 8.8 s a frame at
+        // 24 MP). Two cuts, neither visible: (1) evaluate the UNSHADOWED contribution first
+        // and skip the rays where it is below `rtAreaShadowSkipLuma` — a portal behind the
+        // fragment or far down the hall lights it by a rounding error, and a rounding error
+        // needs no visibility; (2) the host now asks for one ray per portal per frame, since
+        // the still's accumulator supplies the other 30–90.
+        if (kLightingRTSunShadow && kLightingShadowEnabled
+            && frame.rtAreaShadowRayCount > 0u && al.shadowSliceIndex >= 0) {
+            float3 unshadowed = evalAreaLight(al, worldPos, N, V, albedo, metallic, roughness,
+                                              ltcMat, ltcMag, areaLTC);
+            float lum = dot(unshadowed, float3(0.2126, 0.7152, 0.0722));
+            if (lum <= kRTAreaShadowSkipLuma) { areaSum += unshadowed; continue; }
+            visibility = rtAreaVisibility(rtSunAccel, frame, al, worldPos, N, gid, i);
+            areaSum += visibility * unshadowed;
+            continue;
+        } else if (al.shadowSliceIndex >= 0) {
+            float4 lsPos = al.shadowMatrix * float4(worldPos, 1.0);
+            if (lsPos.w > 0.0) {
+                float2 lsNDC = lsPos.xy / lsPos.w;
+                float  lsZ   = lsPos.z  / lsPos.w;
+                float2 shadowUV = float2(lsNDC.x * 0.5 + 0.5, -lsNDC.y * 0.5 + 0.5);
+                // Out-of-frustum fragments stay fully lit: a single perspective from the
+                // portal centre cannot cover the light's whole emitting hemisphere, and the
+                // LTC form factor already tapers the grazing edges the map misses.
+                bool inFrustum = lsZ > 0.0 && lsZ < 1.0
+                              && shadowUV.x >= 0.0 && shadowUV.x <= 1.0
+                              && shadowUV.y >= 0.0 && shadowUV.y <= 1.0;
+                if (inFrustum) {
+                    float ref = lsZ - frame.spotShadowBias;   // shared atlas ⇒ shared bias
+                    float wtx = 1.0 / float(spotShadowAtlas.get_width());   // see the spot PCF above
+                    float sum = 0.0;
+                    for (int oy = -1; oy <= 1; ++oy) {
+                        for (int ox = -1; ox <= 1; ++ox) {
+                            sum += spotShadowAtlas.sample_compare(
+                                spotShadowSampler,
+                                shadowUV + float2(float(ox), float(oy)) * wtx,
+                                uint(al.shadowSliceIndex),
+                                ref);
+                        }
+                    }
+                    visibility = sum * (1.0 / 9.0);
+                }
+            }
+        }
+        if (visibility <= 0.0) continue;
+        areaSum += visibility * evalAreaLight(al, worldPos, N, V, albedo, metallic, roughness,
+                                              ltcMat, ltcMag, areaLTC);
     }
 
     // Secondary directional lights (#60 task 5) — fill / back lights that a
@@ -1198,7 +1447,7 @@ kernel void illumi_lighting(
     for (uint i = 0; i < frame.directionalLightCount; ++i) {
         DirectionalLight dl = extraDirectionals[i];
         dirFillSum += brdf(N, V, dl.dir, albedo, metallic, roughness, dl.color,
-                           0.0, float3(0.0), sheenStrength, &clothSheen);
+                           0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness);
         if (isSSS) sssDiffuse += brdfDiffuse(N, V, dl.dir, albedo, metallic, dl.color);
     }
 
@@ -1241,6 +1490,30 @@ kernel void illumi_lighting(
                      * mix(1.0, roomBandGain, saturate(frame.interiorIrrUp.w));
         interiorBandW = saturate(frame.interiorIrrUp.w);
     }
+
+    // ── DH-0140 slice 3 — thin-sheet TRANSLUCENCY for ordinary geometry (photo lane only) ──
+    // A milky polycarbonate canopy or a woven shade is a thin diffusing sheet: a fraction of the
+    // light that reaches its FAR face comes through and lights the near face — which is why a
+    // real canopy GLOWS with sky under daylight instead of reading as a grey lid. The live G-buffer
+    // has no channel for that fraction, so the live canvas renders the sheet opaque; the still
+    // carries it in `material.r` (kExtendedGBuffer). Incident on the far face: the sun when it is
+    // behind the sheet, through the same cascade visibility (a panel's underside sits in its own
+    // top face's shadow, so this is mostly the SKY's job), plus the sky's hemispherical irradiance
+    // from the back side — the same convolved cube the diffuse IBL reads, sampled with −N, with
+    // the same interior dimming. Energy: never more than arrives (albedo ≤ 1, t ≤ 1). Only the
+    // ordinary-opaque class (the leaf, plush and shade classes have their own thin-sheet terms).
+    if (frame.extendedGBuffer != 0.0 && nrH.a >= 1.0h) {
+        float tt = saturate(float(gMaterial.read(gid).r));
+        if (tt > 0.001) {
+            float back = saturate(dot(-N, Ld));
+            float3 incident = frame.directionalLightColor * back * visibility;
+            if (kLightingIBLEnabled) {
+                constexpr sampler ttSampler(filter::linear, mip_filter::linear);
+                incident += float3(irradianceCube.sample(ttSampler, -N).rgb) * frame.iblIntensity * interiorIBLK;
+            }
+            transmission += albedo * incident * tt;
+        }
+    }
     // The DIFFUSE lobe's interior factor. As the host's irradiance bands take over
     // (w → 1) it folds to exactly 1.0: the bands already carry the up/side/down
     // weighting the `interiorIBLUp/Side` scalars faked, and scaling them again would
@@ -1253,6 +1526,13 @@ kernel void illumi_lighting(
     // Debug accumulators (frame.debugTerm split-render) — populated below.
     float3 dbgDiffuseIBL = float3(0.0);
     float3 dbgSpecularIBL = float3(0.0);
+    // DH-0896 — the specular-IBL share of the FINAL composite (see `specIBLOut`). Starts as
+    // the debug term and follows `color` through clearcoat attenuation + aerial perspective,
+    // which the isolated debug view deliberately does not.
+    float3 specIBLInComposite = float3(0.0);
+    // …and the DIFFUSE sky share (see `diffSkyOut`): the outdoor-cube part of the diffuse
+    // IBL only — an interior band is the room's own light, which no traced ray re-supplies.
+    float3 diffSkyInComposite = float3(0.0);
     float3 dbgAmbient = float3(0.0);
     if (kLightingIBLEnabled) {  // function_constant(0)
         constexpr sampler cubeSampler(filter::linear, mip_filter::linear);
@@ -1349,6 +1629,7 @@ kernel void illumi_lighting(
         // above, beside the ambient supplement that shares it) gives the step BETWEEN
         // rooms — the one no dial could produce while the bands were a frame uniform.
         float apBandFactor = 1.0;
+        float3 irradianceCubeSat = irradianceSat;   // before the band takes its share
         if (interiorBandW > 0.0) {
             float3 band = mix(frame.interiorIrrSide.xyz,
                               N.y >= 0.0 ? frame.interiorIrrUp.xyz
@@ -1470,6 +1751,19 @@ kernel void illumi_lighting(
             specularIBL = specEnv * F;
         }
 
+        // ── Foliage: no broad sky reflection ─────────────────────────────────
+        // Foliage is flagged in normalRoughness.w < 0.5 (the same flag the thin-sheet
+        // TRANSMISSION branch above and the GBuffer roughness cap consult). A matte leaf
+        // (roughness ~0.82, dielectric F0 = 0.04) still returns the split-sum ENVIRONMENT
+        // reflection `specEnv·(F0·dfg.x + dfg.y)`, and the `dfg.y` bias term is non-trivial
+        // at high roughness — so a skyward-facing leaf card MIRRORS the blue daytime sky.
+        // Leaf cards are rolled a full ±π in emitLeaves (physically-correct random
+        // orientation), so ~⅓ of every crown faces skyward and the whole canopy carries a
+        // uniform blue/lavender specular stipple (DH-0646 / DH-0629 signal 2). A leaf's real
+        // specular is the SUN (the direct term), not a broad sky reflection — so damp the
+        // environment lobe hard on foliage. Byte-identical for every non-foliage pixel.
+        if (nrH.a < 0.5h) specularIBL *= 0.12;
+
         // ── S1.3a — specular occlusion ───────────────────────────────────────
         // `ao` is a DIFFUSE visibility estimate: it answers "how much of the whole
         // hemisphere can this point see?", which is the right question for a
@@ -1499,7 +1793,10 @@ kernel void illumi_lighting(
         indirect = (diffuseIBL * ao * interiorIBLKd + specularIBL * specOcc * interiorIBLKs)
                  * frame.iblIntensity;
         dbgDiffuseIBL = diffuseIBL * frame.iblIntensity * ao * interiorIBLKd;
+        diffSkyInComposite = kD * irradianceCubeSat * albedo * (1.0 - interiorBandW)
+                           * ao * interiorIBLKd * frame.iblIntensity;
         dbgSpecularIBL = specularIBL * frame.iblIntensity * specOcc * interiorIBLKs;
+        specIBLInComposite = dbgSpecularIBL;
         // ── Cloth sheen, environment arm ─────────────────────────────────────
         // The direct arm lives in `brdf`; this is the other half. A cushion in a room the sun
         // never reaches is lit almost entirely by the environment, and the Phase-7b bolt-on
@@ -1558,7 +1855,15 @@ kernel void illumi_lighting(
     float3 clearcoat = float3(0.0);
     float houseCC = float(emH.a);
     if (houseCC > 0.001f) {
-        const float ccRough = 0.08;    // tight polish (terrazzo/marble)
+        float ccRough = 0.08;          // tight polish (terrazzo/marble) — the live lane's constant
+        if (frame.extendedGBuffer != 0.0) {
+            // DH-0140 slice 1 — the still reads the material's OWN clearcoat roughness from the
+            // sixth G-buffer target. 0 means the texel was never written (an impostor, a legacy
+            // pipeline) and keeps the constant, so the default still is pixel-for-pixel the live
+            // picture; only a material that asked for a different polish changes.
+            float ccr = float(gMaterial.read(gid).a);
+            if (ccr > 0.0) ccRough = ccr;
+        }
         const float ccF0    = 0.04;    // dielectric IOR 1.5
         float ccNdotV = saturate(dot(N, V));
         if (NdotL_sun > 0.0) {
@@ -1594,6 +1899,8 @@ kernel void illumi_lighting(
         float baseAtten = 1.0 - houseCC * (ccF0 + (1.0 - ccF0) * pow(1.0 - saturate(dot(N, V)), 5.0));
         directSun    *= baseAtten;
         indirect     *= baseAtten;
+        specIBLInComposite *= baseAtten;   // DH-0896
+        diffSkyInComposite *= baseAtten;
     }
 
     // ── Sausage-casing clearcoat (HotdogDropUltra) ──────────────────────────
@@ -1606,7 +1913,10 @@ kernel void illumi_lighting(
     // fixed-F0 dielectric GGX on the sun + a tight prefiltered-IBL sample,
     // weighted by Drop+'s 0.55 coat strength. No-op for every other scene.
     float3 hotdogCC = float3(0.0);
-    if (nrH.a > 0.6h && nrH.a < 0.9h) {
+    // Lower bound 0.6h → 0.66h: the (0.60, 0.66) sub-band belongs to the lamp-shade
+    // fabric (DH-0458), which must not pick up the wet-glaze clearcoat. Casing still
+    // carries exactly 0.75h, so this is a no-op for the frank.
+    if (nrH.a > 0.66h && nrH.a < 0.9h) {
         const float ccRough    = 0.18;
         const float ccF0       = 0.04;
         const float ccStrength = 0.55;
@@ -1708,10 +2018,18 @@ kernel void illumi_lighting(
                                                                 level(max(mips - 3.0, 0.0))).rgb)
                                   * frame.iblIntensity;
                 color = mix(airlight, color, t);
+                specIBLInComposite *= t;   // DH-0896 — what of it survives the extinction
+                diffSkyInComposite *= t;
             }
         }
     }
     outHDR.write(half4(half3(color), 1.0h), gid);
+    if (specIBLOut.get_width() == outHDR.get_width() && frame.debugTerm == 0u) {
+        specIBLOut.write(half4(half3(specIBLInComposite), 0.0h), gid);
+    }
+    if (diffSkyOut.get_width() == outHDR.get_width() && frame.debugTerm == 0u) {
+        diffSkyOut.write(half4(half3(diffSkyInComposite), 0.0h), gid);
+    }
 
     // Issue #65 — hand the diffuse-lit term to the separable SSS blur. rgb = the
     // diffuse irradiance peeled off above; a = the SSS mask (1 = blur, 0 = leave).

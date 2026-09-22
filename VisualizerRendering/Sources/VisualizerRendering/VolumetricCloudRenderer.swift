@@ -181,6 +181,12 @@ public final class VolumetricCloudRenderer {
         /// daytime cumulus where even the shadow side is well-lit by sky
         /// bounce. Drop to ~0.55 for moody / pre-storm clouds.
         public var ambient: Float = 0.95
+        /// Desaturates the cloud underside's sky-ambient fill toward a neutral,
+        /// luminance-preserving grey. 0 = the physical blue sky-ambient (a thin
+        /// deck reads correctly; a thick opaque deck reads as "deeper blue sky"
+        /// from below). 1 = grey — an overcast deck reads as overcast (DH-0585).
+        /// Only the overcast preset drives this up; other decks stay at 0.
+        public var cloudAmbientGrey: Float = 0
 
         // ── Wind ─────────────────────────────────────────────
         /// XZ unit direction the wind blows from -> to. Will be normalised.
@@ -254,7 +260,8 @@ public final class VolumetricCloudRenderer {
         /// position rather than dialed in per scene. `skyZenith`/`skyHorizon`
         /// are ignored in this mode (but `skyZenith` still feeds cloud
         /// ambient, and `groundColor` still fills the lower hemisphere).
-        /// Known gap: twilight zenith skews slightly green (no ozone term).
+        /// Ozone (Chappuis-band) absorption is included; the remaining gap
+        /// vs. a LUT atmosphere is multiple scattering (single-scatter only).
         ///
         /// `.proceduralGradient` is the original art-directed three-band
         /// gradient driven by `skyZenith` / `skyHorizon` / `hazePower` —
@@ -365,6 +372,26 @@ public final class VolumetricCloudRenderer {
         /// `.proceduralGradient`. Raise for a punchier sky, lower if the
         /// zenith clips.
         public var atmosphereIntensity: Float = 20.0
+        /// Chroma of the physical sky about its own luma: 1 = the nishita march as computed,
+        /// 0 = grey, 2 = twice the colour. Luma-preserving, so it never re-exposes the scene;
+        /// applied only to the atmosphere (`.nishita`), never to clouds, sun disc or ground.
+        public var skySaturation: Float = 1.0
+        /// A hue pull toward blue: the sky's blue channel scaled by this with the luma restored.
+        /// 1 = untouched. What a deep-blue photographic sky needs that saturation cannot give.
+        public var skyBlueLift: Float = 1.0
+
+        // ── Flat studio background (opt-in) ─────────────────────────────
+        /// Replace the ENTIRE dome — atmosphere, sun disk, clouds, stars/moon — with a flat,
+        /// direction-independent colour: a true seamless backdrop, unlike suppressing only the
+        /// ground/horizon fill. Because the dome feeds BOTH the visible background and the
+        /// diffuse/specular IBL (`VolumetricCloudRenderer.render(params:)` bakes both from the
+        /// same kernel), this also flattens ambient lighting to a neutral fill — the studio-photo
+        /// look a material/colour study wants, with the sun's direct light untouched. A host that
+        /// hides its walls/ground for a "swatch" preview still let the REAL sky show through at a
+        /// low orbit pitch (Danny, 2026-09-10, on the Tile Pattern Designer); this is the fix.
+        public var flatBackground: Bool = false
+        /// The flat colour (linear HDR), used only when `flatBackground` is true.
+        public var flatBackgroundColor: SIMD3<Float> = SIMD3<Float>(repeating: 0.5)
 
         public init() {}
     }
@@ -769,6 +796,9 @@ struct SkyUniforms {
     var cloudField: SIMD4<Float>
     var cloudExtra: SIMD4<Float>
     var cloudExtra2: SIMD4<Float>
+    var studioParams: SIMD4<Float>
+    /// x = `Params.skySaturation` — see the Metal mirror.
+    var skyGrade: SIMD4<Float>
 
     init(params: VolumetricCloudRenderer.Params, time: Float) {
         let sun = normalize(params.sunDir)
@@ -779,7 +809,7 @@ struct SkyUniforms {
         self.cameraPos   = SIMD4<Float>(params.cameraPos, 0)
         self.sunDir      = SIMD4<Float>(sun, 0)
         self.sunColor    = SIMD4<Float>(params.sunColor, params.sunIntensity)
-        self.skyZenith   = SIMD4<Float>(params.skyZenith, 0)
+        self.skyZenith   = SIMD4<Float>(params.skyZenith, params.cloudAmbientGrey)
         self.skyHorizon  = SIMD4<Float>(params.skyHorizon, params.hazePower)
         self.groundColor = SIMD4<Float>(params.groundColor, params.groundBlend)
         self.cloudSlab   = SIMD4<Float>(params.cloudBaseY,
@@ -841,5 +871,9 @@ struct SkyUniforms {
                                         params.celestialsInDome ? 1 : 0,
                                         max(0, params.cloudHorizonFadeStart),
                                         max(0, params.cloudHorizonFadeEnd))
+        // studioParams: xyz = flat background colour, w = enable flag (>0.5 = on).
+        self.studioParams = SIMD4<Float>(params.flatBackgroundColor,
+                                         params.flatBackground ? 1 : 0)
+        self.skyGrade = SIMD4<Float>(max(0, params.skySaturation), max(0, params.skyBlueLift), 0, 0)
     }
 }

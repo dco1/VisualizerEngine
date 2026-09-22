@@ -90,6 +90,12 @@ static inline float3 applyTreeWind(float3 wp, float4 windAttr, float time,
 // cases compose: a rigid GPU mesh has prevPos == currPos so velocity falls back
 // to the matrix delta, exactly as before.
 constant bool kUsePrevVerts [[function_constant(10)]];
+// DH-0140 — the PHOTO-LANE G-buffer variant writes a sixth target, `GBufferOut.material`.
+// The live canvas compiles this false and its output struct is the five targets it always
+// was; the still compiles it true. This is the carrier Danny asked for (2026-08-31): quality
+// that "would cost every pixel of every frame" is built for the highest-quality preset and
+// Photo Export only, and the interactive path pays nothing.
+constant bool kExtendedGBuffer [[function_constant(11)]];
 
 // ── Drag/impact sway (generic rigid secondary motion) ────────────────────────
 // The non-foliage sibling of applyTreeWind: a placed object the host is dragging
@@ -174,12 +180,16 @@ vertex VSOut illumi_vs(
     // longer be swung by the gust. `v.tangent.x` then selects WHICH vertices of a
     // vegetation mesh bend and by how much, which is all it was ever able to mean.
     //
-    // Same time for current + previous below: during a settled headless capture time is
-    // frozen so the pose is static (no TAA smear); in the live app the per-frame delta is
-    // tiny (gentle wind), matching the other deforming-geometry scenes. `windScale` is
-    // static per instance, so both arms read `inst` — taking it off `prevInst` would spike
-    // the motion vector on the frame a draw first opts in.
+    // Current uses `frame.time`; the PREVIOUS position (below) uses `frame.time − windPrevDelta`
+    // so the gust contributes a real screen-space velocity TAA can reproject (DH-0492) — without
+    // it the sub-pixel canopy/blade edges crawled between pixels instead of reading as a
+    // continuous bend. `windPrevDelta` is 0 for a SETTLED capture (its clock does not advance
+    // between accumulation frames) ⇒ prevWindTime == frame.time ⇒ the static pose is unchanged,
+    // byte-for-byte; it is the real per-frame clock delta only on the live, advancing canvas.
+    // `windScale` is static per instance, so both arms read `inst` — taking it off `prevInst`
+    // would spike the motion vector on the frame a draw first opts in.
     float windStrength = frame._padPhase2A * inst.windScale;
+    float prevWindTime = frame.time - frame.windPrevDelta;
     worldP.xyz = applyTreeWind(worldP.xyz, v.tangent, frame.time,
                                windStrength, frame._padPhase2B);
     float3 worldN = (inst.normalMatrix * float4(v.normal, 0.0)).xyz;
@@ -194,7 +204,7 @@ vertex VSOut illumi_vs(
         prevObjP = float3(prevPositions[vid]);
     }
     float4 prevWorldP = prevInst.modelMatrix * float4(prevObjP, 1.0);
-    prevWorldP.xyz = applyTreeWind(prevWorldP.xyz, v.tangent, frame.time,
+    prevWorldP.xyz = applyTreeWind(prevWorldP.xyz, v.tangent, prevWindTime,
                                    windStrength, frame._padPhase2B);
     // Phase 4.5 — transform the object-space tangent into world. Using
     // `modelMatrix` (not normalMatrix) because a tangent is along the
@@ -241,6 +251,13 @@ struct GBufferOut {
     // a scene that never sets a layer (all instances default 0xFFFFFFFF) writes
     // 0xFFFFFFFF everywhere ⇒ every light passes the mask ⇒ byte-identical.
     uint  layer            [[color(4)]];
+    // DH-0140 — photo-lane material payload (RGBA16F), present only when kExtendedGBuffer:
+    //   .r  thin-sheet translucency (DH-0140 slice 3: milky canopy, woven shade — 0 = opaque)
+    //   .gb per-texel grain tangent (reserved: DH-0478 — 0,0 = use the per-instance axis)
+    //   .a  clearcoat GGX roughness (DH-0478; 0 = "not written" → the lighting kernel's 0.08)
+    // A pipeline that does not write this target (impostors, any legacy PSO) leaves the clear
+    // value, and every reader treats 0 as "fall back to the live-lane behaviour".
+    half4 material         [[color(5), function_constant(kExtendedGBuffer)]];
 };
 
 // ── Shadow depth pass (Phase 2.5) ────────────────────────────────────────────
@@ -346,8 +363,16 @@ fragment GBufferOut illumi_fs(
     //
     // `in.uv` itself is kept for the things that must NOT move with the warp: the plank-cell
     // hash (a board index cannot slide), the soil marker, and the derivatives.
+    //
+    // DH-0475 — `inst.uvPhase` is a per-INSTANCE translation (tile-UV units) folded into the SAME
+    // `matUV` seam: two pieces that share one baked slice and one mesh sample the tiling material
+    // at different phases, so identical wood twins don't show the same grain figure in the same
+    // place. `float2(0)` — the default and every non-opting instance — leaves `matUV == in.uv`.
+    // It rides on `matUV` (not `in.uv`), so it moves the figure without sliding the plank-cell
+    // grid or the soil marker; the derivatives above are taken from the un-phased `in.uv`, which
+    // is correct because a constant offset has zero screen-space derivative.
     WoodKnotSample knot = sampleWoodKnots(in.uv, inst.woodKnots, inst.patternCells);
-    float2 matUV = in.uv + knot.warp;
+    float2 matUV = in.uv + knot.warp + inst.uvPhase;
     // `uvWarp.w >= 0.5` extends the animated domain warp to the MATERIAL maps
     // (albedo/roughness/normal) as well as emission. Default 0 = emission only,
     // which is the common case: a glow that morphs on a surface that does not.
@@ -488,6 +513,10 @@ fragment GBufferOut illumi_fs(
     // .color)) actually paints the fragment. SceneKit convention is
     // multiplicative: vertex colour and material diffuse compose.
     albedo *= in.vertexColor.rgb;
+    // Per-INSTANCE macro tone (the MACRO tier — a slight achromatic per-object lighten/darken so
+    // two pieces wearing the same material id don't read as the same pixels twice). Identity (1)
+    // by default ⇒ an exact no-op for every instance and host that never opts in.
+    albedo *= inst.macroTone;
 
     float metallic = inst.metallic;
     if (inst.metallicTextureSlice >= 0) {
@@ -532,6 +561,10 @@ fragment GBufferOut illumi_fs(
         roughness = saturate(roughness + inst.detailRoughnessStrength * (1.0 - detailOcc));
     }
 
+    // Per-INSTANCE macro roughness drift — the MACRO tier's companion to `macroTint`: a
+    // slightly more/less worn surface per object. 0 by default ⇒ an exact no-op.
+    roughness = saturate(roughness + inst.macroRoughnessDelta);
+
     // ── World-space wood knots: the branch, drawn on top of the wood it grew through ──────
     // Placed after roughness so both channels are in hand, and expressed as a modification of
     // the SAMPLED wood rather than as a colour of its own — which is what lets one shader term
@@ -562,6 +595,15 @@ fragment GBufferOut illumi_fs(
             n = normalize(n + normalize(kT * knot.radial.x + kB * knot.radial.y) * dish);
         }
     }
+
+    // ── Carpet pile-lay tone bands (DH-0472) ──────────────────────────────────
+    // A low-frequency achromatic value field on the UNWRAPPED uv — the metre-scale nap variation a
+    // ~0.30 m carpet tile physically cannot carry (its in-tile drift repeats every 0.30 m and then
+    // dissolves under the hex de-repeat, so at room distance the rug reads as one flat tone). Drawn
+    // here, on `in.uv`, so it never repeats at the tile period — the wood-knot mechanism, one scale
+    // up. `carpetMacro.x == 0` (the default, every other material) makes `sampleCarpetMacro` return
+    // 1.0, so this is an exact no-op for every existing scene and surface.
+    albedo *= sampleCarpetMacro(in.uv, inst.carpetMacro);
 
     // ── Procedural soil material (#58 #11/#12/#13) ───────────────────────────
     // Ground vertices pack soil data into uv as a NEGATIVE-x marker
@@ -1014,7 +1056,9 @@ fragment GBufferOut illumi_fs(
     // a solid per-instance colour, exactly like Drop+'s flat diffuse.
     // Drop+'s clearcoat (0.55 / cc-rough 0.18) has no Illuminatorama analog;
     // the 0.18 glossy floor of the roughness mottle approximates the glaze.
-    if (in.vertexColor.a > 0.6 && in.vertexColor.a < 0.9) {
+    // Lower bound raised 0.6 → 0.66 to leave the (0.60, 0.66] sub-band to the lamp
+    // shade fabric (DH-0458), which must NOT pick up the sausage wet-glaze look.
+    if (in.vertexColor.a > 0.66 && in.vertexColor.a < 0.9) {
         // Build a CONTINUOUS tangent frame from the surface normal.
         // Previous version used a hard branch on abs(n.y): as a horizontal frank's
         // normal swept around the tube it crossed the 0.9 threshold, snapping the
@@ -1110,13 +1154,31 @@ fragment GBufferOut illumi_fs(
     // clearcoat glaze lobe. Every foliage test is `w < 0.5` and the matRough
     // cap below is `< 0.5h`, so 0.75 behaves as ordinary opaque geometry
     // everywhere except the clearcoat branch.
-    if (in.vertexColor.a > 0.6 && in.vertexColor.a < 0.9) foliageFlag = 0.75h;
+    if (in.vertexColor.a > 0.66 && in.vertexColor.a < 0.9) foliageFlag = 0.75h;
+    // Lamp-shade fabric flag (DH-0458): colour alpha in (0.60, 0.66] → 0.62h. Carved
+    // from the casing band's low end (raised to >0.66 above), so a paper/linen drum
+    // shade is tagged for thin-sheet transmission WITHOUT the sausage clearcoat or the
+    // plush fuzz. 0.62 is not < 0.5 (roughness cap left alone) and outside every other
+    // band; the deferred lighting pass reads 0.60h<w<0.66h to add the fabric back-light.
+    // No-op for every other scene (no other mesh ships colour alpha in this band).
+    if (in.vertexColor.a > 0.60 && in.vertexColor.a <= 0.66) foliageFlag = 0.62h;
     // Plush flag (Teddy Bear Press): colour alpha ≈ 0.55 (band 0.5–0.6) → 0.55h.
     // 0.55 is not < 0.5 (so the foliage roughness cap below leaves plush's high
     // roughness alone) and not in (0.6,0.9) (so it skips the casing clearcoat); the
     // deferred lighting pass reads 0.5h<w<0.6h to add the fur sheen + SSS. No-op for
     // every other scene (no other mesh ships colour alpha in this band).
     if (in.vertexColor.a >= 0.5 && in.vertexColor.a <= 0.6) foliageFlag = 0.55h;
+    // Screen-space SSS flag (issue #65 / DH-0138): colour alpha ∈ [0.90,0.98] → 0.95h,
+    // for skin / wax / marble / food. This is the rung the lighting pass's SSS band
+    // (`nrH.a > 0.90h && nrH.a < 0.99h`) and every comment in Common.h / Types /
+    // Lighting already assumed existed — without it a 0.95-alpha mesh fell through to
+    // the 1.0h opaque tag and was reclassified as anisotropy, so SSS was unreachable
+    // outside the headless `sssDebugForceAll` escape. 0.95h lands BELOW 1.0h, so the
+    // `wTag >= 1.0h` anisotropy branch does NOT fire on it (it forgoes anisotropy, as
+    // plush/casing already do); 0.95 is not < 0.5h so the foliage roughness cap is left
+    // alone. No-op for every scene that ships opaque alpha 1.0, and dead unless the
+    // scene opts in via `frame.sssStrength > 0`.
+    if (in.vertexColor.a >= 0.9 && in.vertexColor.a <= 0.98) foliageFlag = 0.95h;
     // Waxy-leaf sheen (#58): a real leaf cuticle is markedly smoother than the
     // matte moss / bark / stone around it, so a single soup roughness reads
     // every surface as the same dry matte and leaves never catch a glint.
@@ -1141,13 +1203,23 @@ fragment GBufferOut illumi_fs(
     // ordinary-opaque tag carries it; a leaf or a plush surface keeps its class and
     // forgoes anisotropy, which costs nothing (neither ships a grain tangent).
     //
-    // Exactly identity when `inst.anisotropy == 0`: the write is `1.0h + 0.0h`, the same
+    // Exactly identity when `inst.anisotropy >= 0`: the write is `1.0h + clamp(a)`, the same
     // bits the old line produced, so every scene that never sets the field — which is
     // every Visualizer scene — is bit-identical. The clamp is insurance the field has
     // nowhere else in the pipeline: `brdf()` splits GGX as `ab = a * (1 - 0.7 * aniso)`,
     // which goes NEGATIVE past aniso ≈ 1.43.
+    //
+    // AUTHORABLE grain axis: the SIGN of `inst.anisotropy` chooses the band the lighting pass
+    // reads the orientation from — POSITIVE = horizontal grain (1+|a|, the original), NEGATIVE
+    // = vertical grain (2+|a|). A brushed fridge/dishwasher door ships negative anisotropy so its
+    // highlight runs UP the panel; a range ships positive so it runs across. See the decode in
+    // IlluminatoramaLighting.metal.
     half wTag = foliageFlag;
-    if (wTag >= 1.0h) wTag = 1.0h + half(clamp(inst.anisotropy, 0.0f, 1.0f));
+    if (wTag >= 1.0h) {
+        wTag = (inst.anisotropy < 0.0f)
+             ? 2.0h + half(clamp(-inst.anisotropy, 0.0f, 1.0f))
+             : 1.0h + half(clamp(inst.anisotropy, 0.0f, 1.0f));
+    }
     o.normalRoughness = half4(half(oct.x), half(oct.y), half(matRough), wTag);
     // Phase 4.9 — emission can be a texture (used heavily by Plus scenes
     // for glow effects on rails / lamps / fire) or a scalar. Both are
@@ -1166,8 +1238,45 @@ fragment GBufferOut illumi_fs(
     }
     // Phase 7 — pack clearcoat (≥0) OR cloth sheen (<0) into emission.alpha (was always 1.0,
     // unused). A surface is polished OR cloth, never both, so one channel carries either: > 0 =
-    // polished/lacquered second GGX lobe; < 0 = velvet/wool grazing-Fresnel sheen (strength = -a).
-    o.emission        = half4(half3(emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -inst.sheen));
+    // polished/lacquered second GGX lobe; < 0 = velvet/wool grazing-Fresnel sheen.
+    // DH-0081 — the sheen value folds the roughness BAND into its integer part and the STRENGTH
+    // into its fraction: `-(band + strength)`. Band 0 (default 0.30 nap) makes this `-strength`,
+    // byte-for-byte the pre-band encoding, so every non-opting material is unchanged.
+    float sheenAlpha = (inst.sheen > 0.0f)
+        ? float(clothSheenBandForRoughness(inst.sheenRoughness)) + min(inst.sheen, 0.98f)
+        : 0.0f;
+    o.emission        = half4(half3(emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -sheenAlpha));
+    if (kExtendedGBuffer) {
+        // DH-0478 — per-texel grain DIRECTION for the anisotropy lobe. The material's map holds
+        // (cos 2θ, sin 2θ), θ from its U axis in tangent space; here it becomes a world-space angle
+        // φ against the SAME base tangent the lighting kernel builds (`anisoBaseTangent`, on the
+        // normal this fragment writes), and is stored doubled again — (cos 2φ, sin 2φ) in .gb — so
+        // it is sign-agnostic and wrap-free. Raw (0,0) is "no per-texel grain": it decodes to a
+        // vector of length √2, off the unit circle, and the kernel keeps its base tangent.
+        float2 grainEnc = float2(0.0);
+        if (wTag > 1.001h && inst.grainTangentTextureSlice >= 0 &&
+            length_squared(in.worldTangent.xyz) > 1e-4) {
+            float4 gs = sampleAtlasHex(nonColorAtlas, texSampler, matUV,
+                                       uint(inst.grainTangentTextureSlice), nonColorUVScale,
+                                       nonColorSliceMean,
+                                       frame.antiTilingStrength * inst.antiTilingScale, duvdx, duvdy);
+            float2 d2 = gs.xy * 2.0 - 1.0;
+            float theta = 0.5 * atan2(d2.y, d2.x);
+            float3 nGeo = normalize(in.worldNormal);
+            float3 T = normalize(in.worldTangent.xyz);
+            float3 B = cross(nGeo, T) * in.worldTangent.w;
+            float3 Gw = normalize(cos(theta) * T + sin(theta) * B);
+            float3 baseT = anisoBaseTangent(n, inst.anisotropy < 0.0f);
+            float3 baseB = normalize(cross(n, baseT));
+            float phi = atan2(dot(Gw, baseB), dot(Gw, baseT));
+            grainEnc = float2(cos(2.0 * phi), sin(2.0 * phi)) * 0.5 + 0.5;
+        }
+        // .r thin-sheet translucency (slice 3): the kernel adds the light reaching the FAR face
+        //    times this fraction; 0 = opaque, the live-lane behaviour.
+        // .a per-material clearcoat roughness (slice 1); 0 = "not written" → the kernel's 0.08.
+        o.material = half4(half(saturate(inst.thinTransmission)), half(grainEnc.x), half(grainEnc.y),
+                           half(inst.clearcoat > 0.0 ? inst.clearcoatRoughness : 0.0));
+    }
     // Screen-space motion vector. NDC.y is up, UV.y is down → Y is flipped.
     // The result is (currentUV - previousUV), so history reprojection in the
     // TAA kernel is `historyUV = currentUV - velocity`.

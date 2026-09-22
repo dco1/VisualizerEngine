@@ -40,14 +40,16 @@ public struct CoinBody {
     public var prevOrient: SIMD4<Float>   // orientation at substep start (for deriving ω)
     public var angVel:     SIMD4<Float>   // xyz = angular velocity (world, rad/s), w = support flag
     // Shape: w = tag (0 = disc / capped cylinder, the default; 1 = box; 2 =
-    // sphere; 3 = capsule; 4 = convex hull). For a box, xyz = the three
-    // half-extents; sphere, x = radius; capsule, x = segment half-length.
+    // sphere; 3 = capsule; 4 = convex hull; 5 = ovoid/egg). For a box, xyz =
+    // the three half-extents; sphere, x = radius; capsule, x = segment
+    // half-length; ovoid, x = fat radius, y = tip radius, z = tip-centre offset.
     // Appended so every existing field keeps its offset — existing kernels and
     // CPU readbacks are byte-identical for discs.
     public var shapeExtents: SIMD4<Float>
-    // Convex hull only (tag 4): x = registered hull index (as float), yzw = the
-    // per-unit-mass INVERSE inertia diagonal in the hull's principal frame
-    // (I⁻¹ = invMass · yzw). Zero for every other shape.
+    // Convex hull (tag 4): x = registered hull index (as float). Ovoid (tag 5):
+    // x = fat-sphere centre offset from the COM. Both: yzw = the per-unit-mass
+    // INVERSE inertia diagonal in the principal frame (I⁻¹ = invMass · yzw).
+    // Zero for every other shape.
     public var hullRef: SIMD4<Float>
 
     public init(position: SIMD3<Float>,
@@ -252,7 +254,12 @@ public final class CoinDEMSolver: PenetrationProbing {
     private let integratePipeline:  MTLComputePipelineState
     private let cellClearPipeline:  MTLComputePipelineState
     private let cellCountPipeline:  MTLComputePipelineState
-    private let scanPipeline:       MTLComputePipelineState
+    // Hierarchical cell-offset scan (block sums ∥ → short serial block scan →
+    // offsets apply ∥) — the serial whole-grid scan tripped the GPU watchdog on
+    // house-scale grids (see CoinDEM.metal § cell-offset prefix sum).
+    private let blockSumsPipeline:  MTLComputePipelineState
+    private let blockScanPipeline:  MTLComputePipelineState
+    private let offsetsApplyPipeline: MTLComputePipelineState
     private let scatterPipeline:    MTLComputePipelineState
     private let contactPipeline:    MTLComputePipelineState
     private let applyPipeline:      MTLComputePipelineState
@@ -335,6 +342,10 @@ public final class CoinDEMSolver: PenetrationProbing {
     private let coinDeltaBuffer: MTLBuffer         // private — per-coin Jacobi delta
     private let cellCounts: MTLBuffer              // private
     private let cellOffsets: MTLBuffer             // private
+    /// Per-block partial sums for the hierarchical cell-offset scan (one uint per
+    /// CD_SCAN_BLOCK=1024 cells).
+    private let cellBlockSums: MTLBuffer           // private
+    private var numScanBlocks: Int { (numCells + 1023) / 1024 }
     private let sortedIndices: MTLBuffer           // private
     private let uniformBuffer: MTLBuffer
     // Diagnostic readback for coinMeasurePenetration: [0]=maxDepth µm, [1]=pairCount.
@@ -556,7 +567,8 @@ public final class CoinDEMSolver: PenetrationProbing {
     // ── Init ──────────────────────────────────────────────────────────────────
 
     struct Pipelines {
-        let integrate, cellClear, cellCount, scan, scatter: MTLComputePipelineState
+        let integrate, cellClear, cellCount, scatter: MTLComputePipelineState
+        let blockSums, blockScan, offsetsApply: MTLComputePipelineState
         let contact, apply, finalize, orient, transform: MTLComputePipelineState
         let joint: MTLComputePipelineState
         let measure: MTLComputePipelineState   // coinMeasurePenetration (diagnostic)
@@ -581,7 +593,9 @@ public final class CoinDEMSolver: PenetrationProbing {
             let p0 = resolve("coinIntegrate"),
             let p1 = resolve("coinCellClear"),
             let p2 = resolve("coinCellCount"),
-            let p3 = resolve("coinCellOffsetsScan"),
+            let pS1 = resolve("coinCellBlockSums"),
+            let pS2 = resolve("coinCellBlockScan"),
+            let pS3 = resolve("coinCellOffsetsApply"),
             let p4 = resolve("coinScatter"),
             let p5 = resolve("coinContactSolve"),
             let p6 = resolve("coinApplyDelta"),
@@ -621,7 +635,8 @@ public final class CoinDEMSolver: PenetrationProbing {
             let p32 = resolve("coinJointSolveCS"),
             let p33 = resolve("coinIslandUnionJoints")
         else { return nil }
-        return Pipelines(integrate: p0, cellClear: p1, cellCount: p2, scan: p3, scatter: p4,
+        return Pipelines(integrate: p0, cellClear: p1, cellCount: p2, scatter: p4,
+                         blockSums: pS1, blockScan: pS2, offsetsApply: pS3,
                          contact: p5, apply: p6, finalize: p7, orient: p8, transform: p9, joint: p10,
                          measure: p11, generate: p12, clearBody: p13, buildBody: p14, colorRound: p15,
                          colorInit: p34, colorWriteback: p35, clearContactCount: p41,
@@ -675,7 +690,7 @@ public final class CoinDEMSolver: PenetrationProbing {
           boundsMin: SIMD3<Float>,
           boundsMax: SIMD3<Float>) {
         let p0 = pipelines.integrate, p1 = pipelines.cellClear, p2 = pipelines.cellCount
-        let p3 = pipelines.scan, p4 = pipelines.scatter, p5 = pipelines.contact
+        let p4 = pipelines.scatter, p5 = pipelines.contact
         let p6 = pipelines.apply, p7 = pipelines.finalize, p8 = pipelines.orient
         let p9 = pipelines.transform, p10 = pipelines.joint, p11 = pipelines.measure
         let p12 = pipelines.generate
@@ -719,6 +734,8 @@ public final class CoinDEMSolver: PenetrationProbing {
                                         options: .storageModePrivate),
             let offsets = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * (cellCount + 1),
                                          options: .storageModePrivate),
+            let blockSums = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * ((cellCount + 1023) / 1024 + 1),
+                                           options: .storageModePrivate),
             let sorted = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * maxCoins,
                                         options: .storageModePrivate),
             let btype = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * maxCoins,
@@ -796,7 +813,9 @@ public final class CoinDEMSolver: PenetrationProbing {
         self.integratePipeline = p0
         self.cellClearPipeline = p1
         self.cellCountPipeline = p2
-        self.scanPipeline = p3
+        self.blockSumsPipeline = pipelines.blockSums
+        self.blockScanPipeline = pipelines.blockScan
+        self.offsetsApplyPipeline = pipelines.offsetsApply
         self.scatterPipeline = p4
         self.contactPipeline = p5
         self.applyPipeline = p6
@@ -845,6 +864,8 @@ public final class CoinDEMSolver: PenetrationProbing {
         self.coinDeltaBuffer = delta
         self.cellCounts = counts
         self.cellOffsets = offsets
+        blockSums.label = "Coin.cellBlockSums"
+        self.cellBlockSums = blockSums
         self.sortedIndices = sorted
         penResult.label = "Coin.penResult"
         penThresh.label = "Coin.penThreshold"
@@ -1134,6 +1155,123 @@ public final class CoinDEMSolver: PenetrationProbing {
         sleepTimerBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
         highWater = max(highWater, slot + 1)
         return slot
+    }
+
+    /// Activate an OVOID (egg) body — the convex hull of two spheres on the
+    /// local +Y axis: the FAT sphere (radius `fatRadius`, toward −Y) and the
+    /// TIP sphere (radius `tipRadius`, toward +Y) with centres `centerDistance`
+    /// apart, joined by the tangent-cone flank. Smooth everywhere, so it rolls
+    /// and wobbles like a real egg — no facets. The exact solid-of-revolution
+    /// COM and inertia are integrated here at spawn, so the body's position is
+    /// its true (fat-end-biased) centre of mass and the settle-to-the-fat-end
+    /// wobble is real physics. Constraint path only (like hulls): against a
+    /// plane the two end-sphere probes are exact; everything else resolves via
+    /// swept-radius segment probes + GJK/EPA support.
+    @discardableResult
+    public func spawnEgg(at position: SIMD3<Float>,
+                         fatRadius: Float,
+                         tipRadius: Float,
+                         centerDistance: Float,
+                         velocity: SIMD3<Float> = .zero,
+                         orient: SIMD4<Float> = SIMD4(0, 0, 0, 1),
+                         tumble: SIMD3<Float> = .zero,
+                         mass: Float = 1,
+                         friction: Float? = nil,
+                         restitution: Float? = nil,
+                         type: UInt32 = 0) -> Int? {
+        assert(solverMode == .constraint,
+               "spawnEgg requires solverMode == .constraint (legacy has no ovoid narrowphase)")
+        guard fatRadius > 1e-4, tipRadius > 1e-4, centerDistance >= 0 else { return nil }
+        let slot: Int
+        if let reused = freeSlots.popLast() {
+            slot = reused
+        } else if nextSlot < maxCoins {
+            slot = nextSlot; nextSlot += 1
+        } else {
+            return nil
+        }
+        // COM + per-unit-mass inertia of the swept-cone solid, memoised per
+        // (fatRadius, tipRadius, centerDistance) — a rain of identical eggs
+        // integrates once.
+        let props = Self.eggProperties(fatRadius: fatRadius, tipRadius: tipRadius,
+                                       centerDistance: centerDistance)
+        let ptr = coinBuffer.buffer.contents().bindMemory(to: CoinBody.self, capacity: maxCoins)
+        let invMass: Float = mass > 1e-6 ? 1.0 / mass : 1.0
+        ptr[slot] = CoinBody(position: position, invMass: invMass, velocity: velocity,
+                             orient: orient, angVel: tumble,
+                             shapeExtents: SIMD4(fatRadius, tipRadius, props.yTip, 5),  // w = 5 → ovoid
+                             hullRef: SIMD4(props.yFat,
+                                            props.invInertiaK.x, props.invInertiaK.y, props.invInertiaK.z))
+        // Bounding radius rides prevPos.w (broadphase reach), the full half-height
+        // rides vel.w (floor backstop + reach), mirroring the capsule convention.
+        let maxExtent = max(abs(props.yFat) + fatRadius, abs(props.yTip) + tipRadius)
+        ptr[slot].prevPos.w = maxExtent
+        ptr[slot].vel.w     = maxExtent
+        setMaterial(slot, friction: friction, restitution: restitution)
+        bodyTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = type
+        linkBuffer.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)[slot] = SIMD2(-1, 0)
+        // A reused slot must not inherit the previous body's sleep state.
+        asleepBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
+        sleepTimerBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
+        highWater = max(highWater, slot + 1)
+        return slot
+    }
+
+    /// COM offset + per-unit-mass inverse inertia of the ovoid solid. Sphere
+    /// centres pre-integration sit at y = 0 (fat) and y = `centerDistance`
+    /// (tip); the returned yFat/yTip are those centres re-expressed relative to
+    /// the integrated COM (the body origin the solver simulates around).
+    /// Numeric disc-stack integration over the true swept-union profile — exact
+    /// to sampling, no closed-form composite approximation to get subtly wrong.
+    struct EggBodyProperties {
+        var yFat: Float          // fat-sphere centre offset from COM (< 0)
+        var yTip: Float          // tip-sphere centre offset from COM (> 0)
+        var invInertiaK: SIMD3<Float>   // per-unit-mass inverse inertia diagonal
+    }
+    private static var eggPropsCache: [SIMD3<Float>: EggBodyProperties] = [:]
+    static func eggProperties(fatRadius r1: Float, tipRadius r2: Float,
+                              centerDistance d: Float) -> EggBodyProperties {
+        let key = SIMD3(r1, r2, d)
+        if let hit = eggPropsCache[key] { return hit }
+        // Cross-section radius of the swept union at height y: the max over the
+        // sphere family c(t) = t·d, r(t) = mix(r1,r2,t). 256 slices × 96 sweep
+        // samples is exact to ~1e-4 of the size — far inside DEM tolerance.
+        let yMin = Double(-r1), yMax = Double(d + r2)
+        let nY = 256, nT = 96
+        var v = 0.0, vy = 0.0                       // Σ r²·dy, Σ y·r²·dy (π cancels)
+        var slices = [Double](repeating: 0, count: nY)   // r² per slice
+        var ys     = [Double](repeating: 0, count: nY)
+        let dy = (yMax - yMin) / Double(nY)
+        for i in 0..<nY {
+            let y = yMin + (Double(i) + 0.5) * dy
+            var r2max = 0.0
+            for k in 0...nT {
+                let t = Double(k) / Double(nT)
+                let rt = Double(r1) + (Double(r2) - Double(r1)) * t
+                let dyc = y - t * Double(d)
+                let rr = rt * rt - dyc * dyc
+                if rr > r2max { r2max = rr }
+            }
+            slices[i] = r2max; ys[i] = y
+            v += r2max; vy += y * r2max
+        }
+        let yc = v > 1e-12 ? vy / v : 0.0
+        // Disc-stack inertia per unit mass: dI_axis = dm·(r²/2), dI_diam = dm·(r²/4 + z²).
+        var iAxis = 0.0, iDiam = 0.0
+        for i in 0..<nY {
+            let z = ys[i] - yc
+            iAxis += slices[i] * (slices[i] * 0.5)
+            iDiam += slices[i] * (slices[i] * 0.25 + z * z)
+        }
+        let norm = max(v, 1e-12)
+        let props = EggBodyProperties(
+            yFat: Float(0.0 - yc),
+            yTip: Float(Double(d) - yc),
+            invInertiaK: SIMD3(Float(norm / max(iDiam, 1e-12)),
+                               Float(norm / max(iAxis, 1e-12)),
+                               Float(norm / max(iDiam, 1e-12))))
+        eggPropsCache[key] = props
+        return props
     }
 
     // ── Convex hulls (constraint path) ────────────────────────────────────────
@@ -1599,6 +1737,30 @@ public final class CoinDEMSolver: PenetrationProbing {
         }
     }
 
+    /// Encode the hierarchical cell-offset scan (block sums ∥ → serial scan over
+    /// BLOCKS only → per-block apply ∥). One call replaces the old single-thread
+    /// whole-grid scan, whose cost was O(cells) on one GPU lane — seconds per
+    /// substep on a house-scale grid, and the cause of the 2026-08-27 GPU
+    /// watchdog timeouts. Contract unchanged: exclusive prefix sum + grand total
+    /// in `cellOffsets[numCells]`, `cellCounts` zeroed for the scatter cursor.
+    private func encodeCellScan(_ cb: MTLCommandBuffer, label: String) {
+        dispatch(cb, blockSumsPipeline, threads: numScanBlocks, label: "\(label).blockSums") { enc in
+            enc.setBuffer(self.cellCounts, offset: 0, index: 0)
+            enc.setBuffer(self.cellBlockSums, offset: 0, index: 1)
+            enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
+        }
+        dispatch(cb, blockScanPipeline, threads: 1, label: "\(label).blockScan") { enc in
+            enc.setBuffer(self.cellBlockSums, offset: 0, index: 0)
+            enc.setBuffer(self.uniformBuffer, offset: 0, index: 1)
+        }
+        dispatch(cb, offsetsApplyPipeline, threads: numScanBlocks, label: "\(label).apply") { enc in
+            enc.setBuffer(self.cellCounts, offset: 0, index: 0)
+            enc.setBuffer(self.cellOffsets, offset: 0, index: 1)
+            enc.setBuffer(self.cellBlockSums, offset: 0, index: 2)
+            enc.setBuffer(self.uniformBuffer, offset: 0, index: 3)
+        }
+    }
+
     private func encodeSubstep(_ cb: MTLCommandBuffer, coinCount: Int) {
         // 1. integrate (predict COM)
         dispatch(cb, integratePipeline, threads: coinCount, label: "Coin.integrate") { enc in
@@ -1614,11 +1776,7 @@ public final class CoinDEMSolver: PenetrationProbing {
             enc.setBuffer(self.cellCounts, offset: 0, index: 1)
             enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
         }
-        dispatch(cb, scanPipeline, threads: 1, label: "Coin.scan") { enc in
-            enc.setBuffer(self.cellCounts, offset: 0, index: 0)
-            enc.setBuffer(self.cellOffsets, offset: 0, index: 1)
-            enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
-        }
+        encodeCellScan(cb, label: "Coin.scan")
         dispatch(cb, scatterPipeline, threads: coinCount, label: "Coin.scatter") { enc in
             enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
             enc.setBuffer(self.cellCounts, offset: 0, index: 1)
@@ -1868,11 +2026,7 @@ public final class CoinDEMSolver: PenetrationProbing {
             enc.setBuffer(self.cellCounts, offset: 0, index: 1)
             enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
         }
-        dispatch(cb, scanPipeline, threads: 1, label: "Coin.measure.scan") { enc in
-            enc.setBuffer(self.cellCounts, offset: 0, index: 0)
-            enc.setBuffer(self.cellOffsets, offset: 0, index: 1)
-            enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
-        }
+        encodeCellScan(cb, label: "Coin.measure.scan")
         dispatch(cb, scatterPipeline, threads: coinCount, label: "Coin.measure.scatter") { enc in
             enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
             enc.setBuffer(self.cellCounts, offset: 0, index: 1)
@@ -1917,11 +2071,7 @@ public final class CoinDEMSolver: PenetrationProbing {
             enc.setBuffer(self.cellCounts, offset: 0, index: 1)
             enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
         }
-        dispatch(cb, scanPipeline, threads: 1, label: "Coin.cs.scan") { enc in
-            enc.setBuffer(self.cellCounts, offset: 0, index: 0)
-            enc.setBuffer(self.cellOffsets, offset: 0, index: 1)
-            enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
-        }
+        encodeCellScan(cb, label: "Coin.cs.scan")
         dispatch(cb, scatterPipeline, threads: coinCount, label: "Coin.cs.scatter") { enc in
             enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
             enc.setBuffer(self.cellCounts, offset: 0, index: 1)

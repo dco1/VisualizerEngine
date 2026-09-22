@@ -318,6 +318,50 @@ static inline WoodKnotSample sampleWoodKnots(float2 uv, float4 knot, float2 patt
     return k;
 }
 
+// ── Carpet pile-lay tone bands (DH-0472) ──────────────────────────────────────────────────────
+//
+// The metre-scale value variation a pile carpet shows because the fibres LIE one way and shift
+// value where the nap turns — the broad soft "shading" true of a brand-new rug, not wear. It cannot
+// be baked: the carpet tile is ~0.30 m, so any low-frequency term authored inside it repeats every
+// 0.30 m and then dissolves under the hex de-repeat, and the rug reads as one flat tone at room
+// distance. So it is drawn here, per pixel, on the UNWRAPPED uv — which counts up across the whole
+// rug and never repeats at the tile period. Exactly the wood-knot mechanism, one scale up.
+//
+// `macro` packs (see HouseRenderBridge, the one place metres become UV):
+//   x = band lattice cells per UV unit (0 disables the whole feature — the default, and an exact
+//       no-op for every scene and every material that never opts in)
+//   y = ± tone amplitude
+//
+// Returns an ACHROMATIC multiplier around 1.0 — a value shift only, never a hue shift (a hue wander
+// would read as dirt, not nap). Achromatic is also why the caller applies it to the sampled albedo
+// rather than compositing a colour, the same modelling choice `sampleWoodKnots` makes.
+static inline float carpetMacroHash(int cx, int cy) {
+    uint h = uint(cx) * 73856093u ^ uint(cy) * 19349663u ^ 0x9E3779B9u;
+    h ^= h >> 11; h *= 0x45d9f3bu; h ^= h >> 16;
+    return float(h & 0xFFFFu) / 65536.0f;                 // [0,1]
+}
+static inline float carpetMacroNoise(float2 p) {
+    float2 i = floor(p);
+    float2 f = fract(p);
+    float2 u = f * f * (3.0f - 2.0f * f);                 // smoothstep interpolation
+    int cx = int(i.x), cy = int(i.y);
+    float a = carpetMacroHash(cx,     cy);
+    float b = carpetMacroHash(cx + 1, cy);
+    float c = carpetMacroHash(cx,     cy + 1);
+    float d = carpetMacroHash(cx + 1, cy + 1);
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);      // [0,1]
+}
+static inline float sampleCarpetMacro(float2 uv, float2 macro) {
+    if (macro.x <= 0.0f || macro.y <= 0.0f) { return 1.0f; }
+    // Elongate the field along the lay direction so the tone varies as broad STREAKS (the pile
+    // laid one way), not isotropic blobs. Two octaves so the banding is organic, not a sine grid.
+    float2 p = uv * macro.x;
+    p.x *= 0.35f;
+    float n = carpetMacroNoise(p) * 0.65f + carpetMacroNoise(p * 2.3f + 7.1f) * 0.35f;
+    float sgn = n * 2.0f - 1.0f;                          // [-1,1]
+    return 1.0f + sgn * macro.y;
+}
+
 // `strength` gates the whole effect. When strength <= 0 (the DEFAULT for every
 // scene that never opts in) this returns EXACTLY `sampleAtlasAspect(atlas, s, uv,
 // slice, uvScale, duvdx, duvdy)` — the identical single texture read the pre-anti-tiling shader

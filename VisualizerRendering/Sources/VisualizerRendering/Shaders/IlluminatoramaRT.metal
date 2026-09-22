@@ -63,6 +63,12 @@ struct RTUniforms {
     // wanted GI got the sun twice. Repurposes _padRT1's neighbour `_padRT2` —
     // same 4 bytes, stride unchanged. See `IlluminatoramaRenderer.RTSunOwnership`.
     uint  directSunEnabled;
+    // DH-0872 — scotopic (Purkinje) night desaturation for the GI sky-MISS sample
+    // only (see the miss branch below). Mirrors `FrameUniforms.scotopicDesaturation`
+    // / `IlluminatoramaRenderer.scotopicDesaturation`; 0 (day, the default) ⇒ the
+    // branch below never runs ⇒ byte-identical. Keep in lockstep with the Swift
+    // RTUniforms mirror.
+    float scotopicDesaturation;
 };
 
 // Analytic point emitter — mirrored from Illuminatorama.metal. Keep in lockstep.
@@ -139,20 +145,27 @@ static inline float3 curveHitNormalRT(uint prim, float t,
     return nl > 1e-8 ? n / nl : float3(0.0, 1.0, 0.0);
 }
 
-// The atlas stores albedo-free IRRADIANCE (#60 task 2). Reconstruct the hit's
-// outgoing radiance L_out = albedo·irr + emission from its card, so a card seam
-// isn't amplified by the albedo multiply. Returns the same outgoing radiance the
-// callers always consumed — no caller math changes.
-static inline float3 sampleSurfCacheRT(
+// DH-0622 — what a surface-cache card adds to a re-shaded hit: its accumulated
+// INDIRECT irradiance (multi-bounce, albedo-free — the return value, read from the
+// indirect atlas) and the card's emission (`emission`). The hit's own sun and
+// emitters are still re-shaded by the caller; the card never stands in for them.
+// A non-resident card (budget streaming zeroed its rect) has no texels, so
+// `fallbackIrr` stands in for the read.
+static inline float3 surfCacheIndirectRT(
     texture2d<float, access::sample> atlas, uint prim, float2 bary,
     const device SurfCard* cards,
     const device uint* triCard, const device float4* triUVa,
     const device float4* triUVc,
-    const device float4* cardRect, uint atlasW, uint atlasH)
+    const device float4* cardRect, uint atlasW, uint atlasH,
+    float3 fallbackIrr, thread float3& emission)
 {
     uint card = triCard[prim];
     float4 rect = cardRect[card];          // (x, y, w, h) in atlas px
     float4 a = triUVa[prim]; float4 c = triUVc[prim];
+    SurfCard sc = cards[card];
+    bool useB = sc.normal.w > 0.5 && (a.x + a.y > 1.0);
+    emission = useB ? sc.emissionB.xyz : sc.emission.xyz;
+    if (rect.z <= 0.0) return fallbackIrr;
     float2 uvA = a.xy, uvB = a.zw, uvC = c.xy;
     float w0 = 1.0 - bary.x - bary.y;
     float2 uv = saturate(w0 * uvA + bary.x * uvB + bary.y * uvC);
@@ -160,12 +173,7 @@ static inline float3 sampleSurfCacheRT(
     uv = clamp(uv, inset, 1.0 - inset);
     float2 px = rect.xy + uv * rect.zw;
     constexpr sampler samp(filter::linear, address::clamp_to_edge);
-    float3 irr = atlas.sample(samp, px / float2(atlasW, atlasH)).rgb;
-    SurfCard sc = cards[card];
-    bool useB = sc.normal.w > 0.5 && (a.x + a.y > 1.0);
-    float3 albedo   = useB ? sc.albedoB.xyz   : sc.albedo.xyz;
-    float3 emission = useB ? sc.emissionB.xyz : sc.emission.xyz;
-    return albedo * irr + emission;
+    return atlas.sample(samp, px / float2(atlasW, atlasH)).rgb;
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -433,27 +441,6 @@ kernel void illumi_rt_lighting(
             if (res.type == intersection_type::triangle) {
                 uint prim = res.primitive_id;
                 if (prim >= u.triangleCount) continue;
-                if (u.surfCacheEnabled != 0) {
-                    // Cached path: reconstruct the hit's full outgoing radiance
-                    // (albedo·irradiance + emission, MULTI-bounce, accumulated over
-                    // frames) from the cache — one atlas read + a card lookup, no
-                    // shadow ray. Both cheaper and richer than the sun-only
-                    // re-shade below.
-                    // Phase 5 / A0 — residency: a non-resident card (budget streaming)
-                    // has a zero atlas rect; resident ⇒ cache read; non-resident ⇒
-                    // emission + ambient fallback (never black). Soup-path twin of the
-                    // TLAS residency gate.
-                    uint card = triCard[prim];
-                    if (surfCardRect[card].z > 0.0) {
-                        indirect += sampleSurfCacheRT(surfAtlas, prim,
-                            res.triangle_barycentric_coord, surfCards, triCard, triUVa, triUVc,
-                            surfCardRect, u.surfAtlasW, u.surfAtlasH);
-                    } else {
-                        SurfCard sc = surfCards[card];
-                        indirect += sc.emission.xyz + sc.albedo.xyz * u.skyAmbient;
-                    }
-                    continue;
-                }
                 float3 hitP = r.origin + dir * res.distance;
                 float3 hitN = normalize(triNormal[prim].xyz);
                 float3 hitA = triAlbedo[prim].xyz;
@@ -484,10 +471,43 @@ kernel void illumi_rt_lighting(
                     float NdotE = max(0.0f, dot(hitN, toE / max(d, 0.001f)));
                     hitRad += emitters[e].color * atten * NdotE * hitA * (1.0f / M_PI_F);
                 }
+                // DH-0622 — a cached card adds its multi-bounce indirect + emission to the
+                // re-shade above (sun + emitters); it never replaces it. Non-resident ⇒
+                // the flat ambient stands in for the read.
+                if (u.surfCacheEnabled != 0) {
+                    float3 cardEmission;
+                    float3 irr = surfCacheIndirectRT(surfAtlas, prim, res.triangle_barycentric_coord,
+                        surfCards, triCard, triUVa, triUVc, surfCardRect, u.surfAtlasW, u.surfAtlasH,
+                        u.skyAmbient, cardEmission);
+                    hitRad += hitA * irr + cardEmission;
+                }
                 indirect += hitRad;
             } else {
                 // Ray escaped the room (through the window) → sky.
+                //
+                // DH-0872 — unlike the deferred diffuse/specular IBL terms (which read a
+                // COSINE/GGX-CONVOLVED bake of this same texture, averaging away any one
+                // narrow band), this is a single RAW, un-convolved sample along the exact
+                // escaped-ray direction. The equirect's below-horizon band deliberately
+                // carries a saturated "moonlit lawn" green tint at night
+                // (`groundFillRadiance`/N3) — correct for a camera looking straight at the
+                // lawn, where the tonemap's own `scotopicDesaturation` neutralises it (human
+                // rods are colour-blind at night), but that global pass runs on the FINAL
+                // display-referred composite and only below its luma knee. A ceiling-corner
+                // normal near a window sends most of its cosine-weighted rays out through the
+                // glass toward exactly this band; those samples land here undiluted, then get
+                // amplified by `giStrength`, landing bright enough post-composite to dodge the
+                // tonemap's knee entirely — a visible green cast with no material or lighting
+                // term to blame (see the ticket for the round-1/round-2 isolation). Apply the
+                // SAME scotopic coefficient directly to the raw source sample instead: this is
+                // exterior night-ambient light gathered through one bounce, exactly the domain
+                // the scotopic model targets, so it should read neutral-dark on arrival — not
+                // only once it happens to still be dim after landing on a surface.
                 float3 sky = skyEquirect.sample(skySamp, dirToEquirectUV(dir)).rgb;
+                if (u.scotopicDesaturation > 0.0) {
+                    float skyLum = dot(sky, float3(0.2126, 0.7152, 0.0722));
+                    sky = mix(sky, float3(skyLum), u.scotopicDesaturation);
+                }
                 indirect += sky;
             }
         }
@@ -563,21 +583,6 @@ kernel void illumi_rt_lighting(
             if (res.type != intersection_type::triangle) continue;  // sky → IBL
             uint prim = res.primitive_id;
             if (prim >= u.triangleCount) continue;
-            if (u.surfCacheEnabled != 0) {
-                // Cached path: reflect the surface's full cached radiance
-                // (multi-bounce), one atlas read instead of a re-shade.
-                // Phase 5 / A0 — residency gate (same as the GI path above).
-                uint card = triCard[prim];
-                if (surfCardRect[card].z > 0.0) {
-                    acc += sampleSurfCacheRT(surfAtlas, prim,
-                        res.triangle_barycentric_coord, surfCards, triCard, triUVa, triUVc,
-                            surfCardRect, u.surfAtlasW, u.surfAtlasH);
-                } else {
-                    SurfCard sc = surfCards[card];
-                    acc += sc.emission.xyz + sc.albedo.xyz * u.skyAmbient;
-                }
-                continue;
-            }
             float3 hitP = r.origin + dir * res.distance;
             float3 hitN = normalize(triNormal[prim].xyz);
             float3 hitA = triAlbedo[prim].xyz;
@@ -586,7 +591,17 @@ kernel void illumi_rt_lighting(
             // reflections from reading darker than reality: every surface in
             // the deferred pass also gets this fill, so a reflection that drops
             // it looks dim. Sun term is added only when the hit faces the sun.
-            float3 hitRad = hitA * u.skyAmbient;
+            // DH-0622 — on a cached card its traced multi-bounce indirect replaces that flat
+            // fill (both estimate the same arriving light) and the card adds its emission;
+            // the sun below is re-shaded either way.
+            float3 fill = u.skyAmbient;
+            float3 cardEmission = float3(0.0);
+            if (u.surfCacheEnabled != 0) {
+                fill = surfCacheIndirectRT(surfAtlas, prim, res.triangle_barycentric_coord,
+                    surfCards, triCard, triUVa, triUVc, surfCardRect, u.surfAtlasW, u.surfAtlasH,
+                    u.skyAmbient, cardEmission);
+            }
+            float3 hitRad = hitA * fill + cardEmission;
             float hN = saturate(dot(hitN, Ld));
             if (hN > 0.0) {
                 isect.accept_any_intersection(true);

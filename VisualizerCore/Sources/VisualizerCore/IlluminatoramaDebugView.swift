@@ -7,7 +7,8 @@ import Foundation
 ///
 ///  • Cases 1–7 mirror `IlluminatoramaRenderer.DebugTerm` deferred-lighting
 ///    terms (the lighting kernel overwrites the composite with just that term).
-///  • 8–9 isolate the RT surface-cache GI / variance (RT + cache scenes only).
+///  • 8–9 isolate the RT surface-cache GI / variance (RT + cache scenes only);
+///    18 colours each pixel by its surface-cache card (chart overlay, DH-0653).
 ///  • 10–15 are raw G-buffer channels, drawn by a debug branch in the tonemap
 ///    fragment *before* tonemapping, so they read the true stored values.
 ///
@@ -34,6 +35,7 @@ public enum IlluminatoramaDebugView: Int, CaseIterable, Identifiable, Sendable {
     case metalness = 13
     case depth = 14
     case velocity = 15
+    case surfaceCacheCharts = 18
 
     public var id: Int { rawValue }
 
@@ -58,6 +60,7 @@ public enum IlluminatoramaDebugView: Int, CaseIterable, Identifiable, Sendable {
         case .metalness:            return "Metalness"
         case .depth:                return "Depth"
         case .velocity:             return "Velocity"
+        case .surfaceCacheCharts:   return "Surface-cache charts"
         }
     }
 
@@ -76,7 +79,7 @@ public enum IlluminatoramaDebugView: Int, CaseIterable, Identifiable, Sendable {
         case .directSun, .pointLights, .spotLights,
              .diffuseIBL, .specularIBL, .emission, .ambient:
             return .lighting
-        case .surfaceCacheGI, .surfaceCacheVariance:
+        case .surfaceCacheGI, .surfaceCacheVariance, .surfaceCacheCharts:
             return .rayTracing
         case .albedo, .normal, .roughness, .metalness, .depth, .velocity:
             return .gbuffer

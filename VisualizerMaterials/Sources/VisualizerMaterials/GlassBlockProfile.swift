@@ -18,8 +18,9 @@ import Foundation
 ///
 /// **The glazing pattern is SHAPE, not paint.** A glazing draw group never gets an albedo
 /// slice: the bridge routes it into the engine's dielectric pass, where the only thing that
-/// survives is the mesh's own surface. So a glass-block *window* has to carry its grid as
-/// real geometry — a pillowed face per block, falling to a valley at every mortar joint —
+/// survives is the mesh's own surface. So a glass-block *window* has to carry its pattern as
+/// real geometry — a hollow block per module (two thin shells, pillowed outside, rippled
+/// inside) set in an OPAQUE mortar lattice that the bridge draws as ordinary structure —
 /// exactly as fluted glass carries its reeds (`FlutedGlassProfile`). Nothing here raises the
 /// glass's roughness: a rough dielectric is a per-frame re-seeded stochastic ray estimator,
 /// which is the "live noise" that modelling obscuring glass as shape exists to avoid.
@@ -58,9 +59,8 @@ public enum GlassBlockProfile {
     /// and the pane both use to place the joint.
     public static var jointHalfFraction: Double { (mortarMeters / moduleMeters) / 2 }
 
-    /// Moulded waves across one block face. Used by the WALL bake (where relief is a normal
-    /// map and costs nothing); the pane deliberately spends its triangles on the pillow and
-    /// the joint valley instead — see `segmentsPerBlock`.
+    /// Moulded waves across one block face — the wall bake's normal-map flutes AND the pane's
+    /// inside-face ripple (`ripple(_:waves:)`), so the finish and the window are one block.
     public static let flutesPerBlock = 7.0
 
     // MARK: – the pane's moulded face
@@ -73,15 +73,7 @@ public enum GlassBlockProfile {
     /// module. Together with `jointHalfFraction` this is the whole cross-section of a joint:
     /// flat valley out to `jointHalfFraction`, then a shoulder, then the face plateau.
     public static let shoulderFraction = 0.16
-    /// Grid samples per block, per axis, when the profile is realised as pane geometry.
-    /// EVEN, so a sample lands exactly on every joint centre (an odd count straddles the
-    /// valley and flattens it). 10 keeps a 240 mm face's facet step under 25 mm while one
-    /// window's pane stays in the low thousands of triangles.
-    public static let segmentsPerBlock = 10
-    /// Hard ceiling on the quads of ONE pane face, so a wall-sized glass-block window can
-    /// never blow the structural triangle budget: the per-block segment count is stepped down
-    /// until the grid fits. (Deterministic — a pure function of the opening's size.)
-    public static let maxPaneQuadsPerFace = 3600
+    // MARK: – the pane: a HOLLOW block in a mortar lattice
 
     /// Whole blocks across a `span` metres of opening. ROUNDED, and the caller stretches the
     /// module to fit the real span — so a window never ends on a sliced-off partial block,
@@ -90,19 +82,46 @@ public enum GlassBlockProfile {
         max(1, Int((span / moduleMeters).rounded()))
     }
 
-    /// Grid samples per block that fit `maxPaneQuadsPerFace` for a `bx × bz` block pane.
-    /// Steps down in whole EVEN counts from `segmentsPerBlock`, never below 2 (a block still
-    /// gets its joint valley at 2).
-    @inlinable public static func segments(blocksX bx: Int, blocksZ bz: Int) -> Int {
-        var s = segmentsPerBlock
-        while s > 2 && (bx * s) * (bz * s) > maxPaneQuadsPerFace { s -= 2 }
-        return max(2, s)
+    /// Wall thickness of each pressed face shell. A glass block is two pressed halves fused
+    /// round a sealed air cavity — NOT 80 mm of solid glass. The difference is the whole look:
+    /// light crossing two thin moulded skins is warped and softened, while 80 mm of solid glass
+    /// at any angle shifts the scene sideways by centimetres and traps rays by internal
+    /// reflection, so each block showed its own displaced, hard-edged chunk of the world
+    /// behind it (DH-0713's "mosaic").
+    public static let shellMeters = 0.009
+    /// Peak-to-trough depth of the moulded ripple on the INSIDE face of each shell. The ripple
+    /// is what makes a block obscure the view (streaks of colour, no detail) — it lives inside,
+    /// where a real block's pattern is pressed, so the outer faces stay smooth and glossy. The
+    /// two shells ripple at right angles (vertical reeds front, horizontal back), which is the
+    /// classic cross-hatched "wave" block.
+    public static let rippleMeters = 0.0012
+    /// Samples across a block face along the axis that carries no ripple — the pillow dome is
+    /// gentle and smooth-normalled, so a handful is enough.
+    public static let pillowSegmentsPerBlock = 6
+    /// How far the mortar's face sits back from the blocks' edges — a tooled joint. The joint
+    /// is OPAQUE and it is the strongest glass-block cue there is: without it the grid never
+    /// reads, because the glass pass draws no colour of its own.
+    public static let mortarRecessMeters = 0.003
+    /// Air left between a block's glass edge and the mortar around it, so the two never share
+    /// a coplanar face (which would z-fight in raster and make RT hits order-dependent).
+    public static let edgeClearanceMeters = 0.0005
+    /// Hard ceiling on one pane's GLASS triangles, so a wall-sized glass-block window can never
+    /// blow the structural triangle budget: the pane builder steps its pressing's detail down
+    /// until it fits (DaydreamCore `GlassBlockStyle.detailLevels`). Deterministic — a pure
+    /// function of the block count and the style.
+    public static let maxPaneTriangles = 24_000
+
+    /// The inside-face ripple at `u` ∈ [0, 1] across a face, as a 0…1 fraction of
+    /// `rippleMeters` (0 at both edges, so every shell's rim is a plain rectangle).
+    @inlinable public static func ripple(_ u: Double, waves: Int) -> Double {
+        guard waves > 0 else { return 0 }
+        return 0.5 - 0.5 * cos(2 * Double.pi * Double(waves) * u)
     }
 
     /// The block-face relief at block-local coordinates `(fx, fy)` ∈ [0,1)², as a 0…1
-    /// fraction of `pillowMeters`. ZERO on the joint centre-lines (`fx` or `fy` at 0/1), so
-    /// neighbouring blocks meet at a common valley and the pane stays continuous and
-    /// watertight; 1 at the crown of the face.
+    /// fraction of `pillowMeters`. ZERO from the joint centre-line out to the face edge
+    /// (`jointHalfFraction`), so a block's outer face comes back to its shell's rim exactly;
+    /// 1 at the crown of the face.
     ///
     /// Two terms, each doing one job: the **plateau** (a chamfered flat face, which is what
     /// makes the joint read as a crisp grid line) and the **pillow** (a shallow dome over it,

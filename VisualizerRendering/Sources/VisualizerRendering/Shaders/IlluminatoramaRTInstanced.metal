@@ -26,13 +26,18 @@ using namespace raytracing;
 
 struct RTInstUniforms {
     float4x4 invViewProjection;
-    float3 cameraWorldPos;   float _pad0;
+    // 1 ⇒ `diffSky` holds the deferred composite's diffuse SKY share and the traced GI,
+    // whose misses are the sky, REPLACES it (was `_pad0` — same 4 bytes, stride unchanged).
+    float3 cameraWorldPos;   uint giReplacesDiffuseSky;
     float3 sunDir;           float sunSoftnessRad;
     float3 sunColor;         float giStrength;
     float3 skyAmbient;       float specStrength;
     uint  width;   uint height;
     uint  shadowRays; uint giRays;
-    uint  frameSeed;  float rayTMin;  float maxGIDist;  uint _pad1;
+    uint  frameSeed;  float rayTMin;  float maxGIDist;
+    // DH-0896 — 1 ⇒ `specIBL` holds the deferred composite's specular-IBL share and a
+    // reflection HIT replaces it (was the `_pad1` slot — same 4 bytes, stride unchanged).
+    uint  reflReplacesIBL;
     float reflStrength; float reflMaxDist; float reflRoughnessCutoff;
     uint  reflRays;  uint reflEnabled;
     // Surface cache (P1c): read cached multi-bounce radiance at GI/reflection
@@ -105,7 +110,18 @@ struct RTInstUniforms {
     // below) deliberately do NOT carry 0x04 — an undrawn slab must not appear in
     // the picture. Host default 0x05.
     uint  transportRayMask;
-    uint  _padIrr0; uint _padIrr1; uint _padIrr2;   // align the float4 cluster below
+    // ── DH-0653 surface-cache instruments (were _padIrr0/_padIrr1 — same bytes) ──
+    // `surfStatsEnabled` 1 ⇒ every GI / reflection TRIANGLE hit adds itself to
+    // `surfHitStats` (buffer 19): [0..3] GI cached / fallback / noCard / reshade,
+    // [4..7] the same for reflections. Set only while the stats sidecar is.
+    // `debugSurfCacheCharts` 1 ⇒ DebugTerm.surfaceCacheCharts: REPLACE the composite
+    // with the PRIMARY surface's card, one hashed colour per card.
+    // DH-0872 — scotopic (Purkinje) night desaturation for the GI sky-MISS sample
+    // only (see the miss branch below). Mirrors `FrameUniforms.scotopicDesaturation`
+    // / `IlluminatoramaRenderer.scotopicDesaturation`; 0 (day, the default) ⇒ the
+    // branch below never runs ⇒ byte-identical. Repurposes `_padIrr2` — same 4
+    // bytes, stride unchanged; still aligns the float4 cluster below.
+    uint  surfStatsEnabled; uint debugSurfCacheCharts; float scotopicDesaturation;
     // ── Interior irradiance bands (mirror of FrameUniforms.interiorIrr*) ─────
     // A GI bounce or reflection landing on an interior ceiling must see the
     // FLOOR's bounce, not the outdoor cube's lawn — same fix, same values, as
@@ -168,11 +184,11 @@ static inline float3 curveHitNormal(uint setIdx, uint prim, float t,
     return nl > 1e-8 ? n / nl : float3(0.0, 1.0, 0.0);
 }
 
-// `SurfCard`, `PrimUV`, `RTInstanceData` and `sampleSurfCacheRT` are the shared
+// `SurfCard`, `PrimUV`, `RTInstanceData` and `sampleSurfCacheIndirectRT` are the shared
 // mirror structs / cache read — see IlluminatoramaSecondary.h.
 
 // Phase 5 / B0 — variance readout for the cache-variance debug term. Same
-// card/UV addressing as sampleSurfCacheRT, but returns the texel's tracked
+// card/UV addressing as sampleSurfCacheIndirectRT, but returns the texel's tracked
 // variance E[L²] − μ² (μ² from the stored RGB luminance, E[L²] from the atlas
 // .w channel the update kernel now EMAs). Only sampled when the variance debug
 // term is on, so it adds no cost to the normal composite.
@@ -202,6 +218,29 @@ static inline float sampleSurfCacheVarRT(
     float4 t = atlas.sample(samp, px / float2(atlasW, atlasH));
     float mu = dot(t.rgb, float3(0.2126, 0.7152, 0.0722));
     return max(0.0, t.a - mu * mu);   // E[L²] − μ²
+}
+
+// DH-0653 — hit/miss counter slots in `surfHitStats` (GI slots; reflection = +4).
+// Every column is shaded by `shadeSecondarySurface`; they differ only in the indirect term (DH-0622).
+#define SURF_STAT_CACHED   0u   // resident card → its atlas indirect term
+#define SURF_STAT_FALLBACK 1u   // known card, not resident → the fill estimate stands in for the read
+#define SURF_STAT_NOCARD   2u   // cache on, triangle has no card → shaded as uncached
+#define SURF_STAT_RESHADE  3u   // cache off → shaded as uncached
+static inline void surfStat(device atomic_uint* s, uint enabled, uint slot) {
+    if (enabled != 0u) atomic_fetch_add_explicit(&s[slot], 1u, memory_order_relaxed);
+}
+
+// DH-0653 — chart-assignment overlay colour. One stable hashed hue per card index,
+// so two neighbouring cards differ in hue AND brightness and a coplanar chart reads
+// as one flat patch. A NON-resident card (budget streaming) keeps its hue but drops
+// to near-black, so residency is visible on the same picture.
+static inline float3 surfChartColour(uint card, bool resident) {
+    uint h = pcgHash(card * 2654435761u + 0x9E3779B9u);
+    float hue = float(h & 0xFFFFu) / 65535.0;
+    float sat = 0.55 + 0.40 * float((h >> 16) & 0xFFu) / 255.0;
+    float val = (resident ? 0.50 : 0.08) + (resident ? 0.45 : 0.04) * float((h >> 24) & 0xFFu) / 255.0;
+    float3 k = saturate(abs(fract(hue + float3(0.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0);
+    return val * mix(float3(1.0), k, sat);
 }
 
 // The RNG (`pcgHash`/`rnd`), the sampling bases (`onb`/`cosineSample`/`coneSample`)
@@ -253,6 +292,11 @@ static inline SecondaryShadeParams fullRadianceParams(constant RTInstUniforms& u
     p.objUVCount = u.objUVCount;
     p.pointLightCount = u.pointLightCount;
     p.spotLightCount = u.spotLightCount;
+    // DH-0718 — the window portals (area lights), carried in the room-gain meta's spare
+    // lanes (y = count, z = shadow rays per portal) so the uniform layout is unchanged.
+    // 0 ⇒ none, the pre-DH-0718 behaviour.
+    p.areaLightCount = uint(max(0.0, u.interiorRoomGainMeta.y));
+    p.areaShadowRays = uint(max(0.0, u.interiorRoomGainMeta.z));
     // C3 — a secondary hit found by this kernel is on a TRANSPORT path, so its own
     // sun shadow ray honours invisible occluders too. Without this a GI bounce that
     // lands on a floor under a lighting-only ceiling would come back full-sunlit and
@@ -307,6 +351,9 @@ kernel void illumi_rt_lighting_tlas(
     const device float2*                  albedoUVScale [[buffer(16)]],
     const device RTPointLight*            pointLights [[buffer(17)]],
     const device RTSpotLight*             spotLights  [[buffer(18)]],
+    // DH-0718 — the frame's area lights (window portals); read only when
+    // `interiorRoomGainMeta.y` > 0, a dummy otherwise.
+    const device RTAreaLight*             areaLights  [[buffer(20)]],
     texturecube<float, access::sample>    irrCube     [[texture(6)]],
     texture2d_array<float, access::sample> albedoAtlas [[texture(7)]],
     // C2 — the noisy diffuse (soft shadow + 1-bounce GI) goes OUT to its own
@@ -316,6 +363,11 @@ kernel void illumi_rt_lighting_tlas(
     // THIS texture, and nothing was writing it. With this app's TAA also off,
     // 4 GI rays reached the screen raw — the "dark noisy blotches".
     texture2d<half, access::write>        rtDiffuse   [[texture(8)]],
+    device atomic_uint*                   surfHitStats [[buffer(19)]],  // DH-0653 hit/miss counters (gated)
+    // DH-0896 — the deferred pass's specular-IBL share of `outHDR` (read only when
+    // `u.reflReplacesIBL`; a 1×1 dummy otherwise).
+    texture2d<half, access::read>         specIBL     [[texture(9)]],
+    texture2d<half, access::read>         diffSky     [[texture(10)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -359,8 +411,39 @@ kernel void illumi_rt_lighting_tlas(
     sec.insts = insts;        sec.objNormal = objNormal;
     sec.objUV = objUV;        sec.uvScale = albedoUVScale;
     sec.pointLights = pointLights; sec.spotLights = spotLights;
+    sec.areaLights = areaLights;
     SecondaryShadeParams secFull   = fullRadianceParams(u);   // reflections + cache fallbacks
     SecondaryShadeParams secBounce = giBounceParams(u);       // GI bounces (no sky double-count)
+
+    // ── DH-0653: chart-assignment overlay (DebugTerm.surfaceCacheCharts) ─────
+    // Terms 8/9 show what the SECONDARY rays read; this shows the PRIMARY surface's
+    // own card, so the chart decomposition (`VIZ_SURFCACHE_CHARTS`) and any residual
+    // seam are seen directly instead of eyeballed off the composite. The G-buffer
+    // stores no triangle id, so the pixel's surface is re-found with one short ray
+    // that brackets the depth-reconstructed point (5 cm either side, opaque mask —
+    // the drawn surface, never an invisible occluder or glass). Near-black grey = no
+    // card here (cache off / skipped for this scene, a curve, a miss).
+    if (u.debugSurfCacheCharts != 0) {
+        float3 chart = float3(0.02);
+        if (u.surfCacheEnabled != 0) {
+            float3 toP = P - u.cameraWorldPos;
+            float dist = length(toP);
+            float3 dir = toP / max(dist, 1e-6);
+            float bracket = min(0.05, 0.5 * dist);
+            isect.accept_any_intersection(false);
+            ray pr; pr.origin = P - dir * bracket; pr.direction = dir;
+            pr.min_distance = 0.0; pr.max_distance = 2.0 * bracket + 1e-3;
+            auto pres = isect.intersect(pr, accel, 0x01u);
+            if (pres.type == intersection_type::triangle) {
+                uint gp = soupTriBase[pres.instance_id] + pres.primitive_id;
+                uint card = (gp < u.surfTriCount) ? triCard[gp] : 0xFFFFFFFFu;
+                if (card != 0xFFFFFFFFu) chart = surfChartColour(card, surfCardRect[card].z > 0.0);
+            }
+        }
+        outHDR.write(half4(half3(chart), outHDR.read(gid).a), gid);
+        rtDiffuse.write(half4(0.0h), gid);   // isolation view owns the pixel; add nothing
+        return;
+    }
 
     // ── Direct sun (soft shadows) ─────────────────────────────────
     //
@@ -395,6 +478,8 @@ kernel void illumi_rt_lighting_tlas(
     // B0 — variance accumulated across cache hits when the variance debug term
     // is on (zero cost otherwise; the sample sites guard on u.debugSurfCacheVar).
     float surfVarAcc = 0.0; uint surfVarN = 0u;
+    // DH-0622 — debug term 8: the cache's share of GI + reflection alone, same weights.
+    float3 cacheGI = float3(0.0), cacheRefl = float3(0.0), cacheTerms = float3(0.0);
     if (u.giRays > 0 && u.giStrength > 0.0) {
         isect.accept_any_intersection(false);
         for (uint g = 0; g < u.giRays; ++g) {
@@ -406,60 +491,58 @@ kernel void illumi_rt_lighting_tlas(
             // open top misses everything and returns full sky.
             auto res = isect.intersect(r, accel, u.transportRayMask);
             if (res.type == intersection_type::triangle) {
-                if (u.surfCacheEnabled != 0) {
-                    // Cached path: reconstruct the hit's full outgoing radiance
-                    // (albedo·irradiance + emission, MULTI-bounce, accumulated over
-                    // frames) from the cache — one atlas read + a card lookup, no
-                    // shadow ray. A TLAS hit is per-instance-local, so resolve the
-                    // global soup triangle first. Cheaper AND richer than re-shade.
-                    uint gp = soupTriBase[res.instance_id] + res.primitive_id;
-                    uint hitCard = (gp < u.surfTriCount) ? triCard[gp] : 0xFFFFFFFFu;
-                    // Phase 5 / A — feedback marks the HIT card regardless of residency
-                    // (a non-resident-but-visible card must be discoverable so streaming
-                    // can promote it next frame), so this is OUTSIDE the residency gate.
-                    if (hitCard != 0xFFFFFFFFu && u.surfFeedbackEnabled != 0) cardRequested[hitCard] = 1u;
-                    // A0 — residency. A non-resident card (budget streaming) has a zero
-                    // atlas rect; reading it would sample (0,0). Resident ⇒ cache read;
-                    // non-resident ⇒ emission + ambient fallback (never black).
-                    bool resident = (hitCard != 0xFFFFFFFFu) && (surfCardRect[hitCard].z > 0.0);
-                    if (resident) {
-                        indirect += sampleSurfCacheRT(surfAtlas, gp,
-                            res.triangle_barycentric_coord, surfCards, triCard, triUVa, triUVc,
-                            res.primitive_data, surfCardRect, u.surfAtlasW, u.surfAtlasH);
-                        if (u.debugSurfCacheVar != 0) {
-                            surfVarAcc += sampleSurfCacheVarRT(surfAtlas, gp,
-                                res.triangle_barycentric_coord, triCard, triUVa, triUVc,
-                                res.primitive_data, surfCardRect, u.surfAtlasW, u.surfAtlasH);
-                            surfVarN++;
-                        }
-                    } else if (hitCard != 0xFFFFFFFFu) {
-                        // Known card, not resident (budget streaming zeroed its
-                        // rect). `secFull`, NOT `secBounce`: this stands in for a
-                        // cache read, and a resident card returns full radiance —
-                        // an evicted one must not turn a lit surface black. Shared
-                        // fallback, so it fills as a re-shade would instead of with
-                        // the flat `albedo * skyAmbient` slab it used to use.
-                        float3 cN = hitWorldNormal(res.instance_id, res.primitive_id, insts, objNormal);
-                        if (dot(cN, dir) > 0.0) cN = -cN;
-                        indirect += secondaryCardFallback(
-                            surfCards[hitCard], cN,
-                            secondaryLayerBits(res.instance_id, insts), secFull, irrCube);
-                    }
-                    continue;
-                }
-                // Re-shade through the ONE secondary-ray surface shader (see
-                // IlluminatoramaSecondary.h) — the same body the glass pass uses.
-                // `giBounceParams` suppresses the sky IBL + ambient (they would
-                // double-count the receiving surface's own fill); emission, the
-                // TEXTURED albedo, local lights and the sun all carry.
+                // Every opaque hit — cached or not — is shaded by the ONE secondary-ray
+                // surface shader (see IlluminatoramaSecondary.h), the same body the glass
+                // pass uses. `giBounceParams` suppresses the sky IBL + ambient (they would
+                // double-count the receiving surface's own fill); emission, the TEXTURED
+                // albedo, local lights and the sun all carry.
                 SecondaryHit h;
                 h.P = r.origin + dir * res.distance;
                 h.N = hitWorldNormal(res.instance_id, res.primitive_id, insts, objNormal);
                 if (dot(h.N, dir) > 0.0) h.N = -h.N;      // face the incoming ray
                 h.bary = res.triangle_barycentric_coord;
                 h.instanceID = res.instance_id; h.primitiveID = res.primitive_id;
-                indirect += shadeSecondarySurface(isect, accel, h, secBounce, sec,
-                                                  irrCube, albedoAtlas, seed);
+                // DH-0622 — a surface-cache card supplies ONLY the hit's multi-bounce
+                // indirect term; it never stands in for the shading. A TLAS hit is
+                // per-instance-local, so resolve the global soup triangle first.
+                uint cardState = SURF_STAT_RESHADE;
+                float3 cacheIrr = float3(0.0);
+                if (u.surfCacheEnabled != 0) {
+                    uint gp = soupTriBase[res.instance_id] + res.primitive_id;
+                    uint hitCard = (gp < u.surfTriCount) ? triCard[gp] : 0xFFFFFFFFu;
+                    // Phase 5 / A — feedback marks the HIT card regardless of residency (a
+                    // non-resident-but-visible card must be discoverable so streaming can
+                    // promote it next frame).
+                    if (hitCard != 0xFFFFFFFFu && u.surfFeedbackEnabled != 0) cardRequested[hitCard] = 1u;
+                    if (hitCard == 0xFFFFFFFFu) {
+                        cardState = SURF_STAT_NOCARD;       // no card: shaded as uncached
+                    } else if (surfCardRect[hitCard].z > 0.0) {
+                        cardState = SURF_STAT_CACHED;
+                        cacheIrr = sampleSurfCacheIndirectRT(surfAtlas, gp, h.bary, triCard, triUVa, triUVc,
+                                                             res.primitive_data, surfCardRect,
+                                                             u.surfAtlasW, u.surfAtlasH);
+                        if (u.debugSurfCacheVar != 0) {
+                            surfVarAcc += sampleSurfCacheVarRT(surfAtlas, gp, h.bary, triCard, triUVa, triUVc,
+                                                               res.primitive_data, surfCardRect,
+                                                               u.surfAtlasW, u.surfAtlasH);
+                            surfVarN++;
+                        }
+                    } else {
+                        // A0 — known card, not resident (budget streaming zeroed its rect, so
+                        // the atlas holds nothing for it). The full fill estimate of the same
+                        // arriving light (`secFull`, NOT `secBounce`) stands in for the read,
+                        // so an evicted card is never darker than its resident neighbour.
+                        cardState = SURF_STAT_FALLBACK;
+                        cacheIrr = secondaryIndirectFill(h.N, secondaryLayerBits(res.instance_id, insts),
+                                                         secFull, irrCube);
+                    }
+                }
+                surfStat(surfHitStats, u.surfStatsEnabled, cardState);
+                float3 cacheTerm;
+                indirect += shadeSecondarySurface(isect, accel, h, secBounce, sec, irrCube, albedoAtlas, seed,
+                                                  cardState == SURF_STAT_CACHED || cardState == SURF_STAT_FALLBACK,
+                                                  cacheIrr, cacheTerm);
+                cacheGI += cacheTerm;
             } else if (kRTCurvesEnabled && res.type == intersection_type::curve) {
                 // Curve hit (#60 item 7): no surface-cache card — re-shade with
                 // the set's material (same sun + visibility shape as the
@@ -484,14 +567,44 @@ kernel void illumi_rt_lighting_tlas(
                     indirect += hitRad;
                 }
             } else {
-                indirect += skyEquirect.sample(skySamp, dirToEquirectUV(dir)).rgb;
+                // DH-0872 — a raw, un-convolved single sample of the shared environment
+                // texture, unlike the CONVOLVED bake the deferred diffuse/specular IBL terms
+                // read (and unlike the interior-irradiance-band substitution above, which is
+                // day-only and only ever runs for geometry HITS, never for a sky miss). The
+                // below-horizon band deliberately carries a saturated "moonlit lawn" green
+                // tint at night (`groundFillRadiance`/N3) that the tonemap's own
+                // `scotopicDesaturation` is meant to neutralise — but that global pass runs
+                // on the FINAL composite, gated below its display-luma knee, and a
+                // ceiling-corner normal near a window sends most of its cosine-weighted rays
+                // straight out through the glass into exactly this band: undiluted, then
+                // amplified by `giStrength`, landing bright enough post-composite to dodge the
+                // knee entirely. Apply the same scotopic coefficient directly to the raw
+                // source sample instead — this is exterior night-ambient light gathered
+                // through one bounce, exactly the domain the scotopic model targets.
+                float3 sky = skyEquirect.sample(skySamp, dirToEquirectUV(dir)).rgb;
+                if (u.scotopicDesaturation > 0.0) {
+                    float skyLum = dot(sky, float3(0.2126, 0.7152, 0.0722));
+                    sky = mix(sky, float3(skyLum), u.scotopicDesaturation);
+                }
+                // Replacing the deferred sky: a miss carries the sky at the SAME intensity
+                // the deferred diffuse term used, so the host's sky-fill dial stays live.
+                indirect += (u.giReplacesDiffuseSky != 0u) ? sky * u.skyIntensity : sky;
             }
         }
         indirect = (indirect / float(u.giRays)) * albedo * u.giStrength;
+        cacheTerms += (cacheGI / float(u.giRays)) * albedo * u.giStrength;
     }
 
     // ── Glossy reflections (RT) ───────────────────────────────────
     float3 reflection = float3(0.0);
+    // DH-0896 — how much of the deferred SKY reflection this pixel's rays proved wrong.
+    // `outHDR` already carries the specular IBL — the sky cube along R — at the full
+    // Fresnel of the surface. A reflection ray that MISSES leaves it (the sky is what that
+    // direction sees). A ray that HITS the scene saw a wall, not the sky, so the sky that
+    // direction contributed must come OUT as the room goes IN. Adding the hit on top of it
+    // (as this pass did) left a mirror showing the sunset horizon with the room ghosted
+    // faintly through it — the whole of the Primary Bathroom report.
+    float reflHitFraction = 0.0;
     if (u.reflEnabled != 0 && u.reflStrength > 0.0 && roughness <= u.reflRoughnessCutoff) {
         float3 V = normalize(u.cameraWorldPos - P);
         float3 R = reflect(-V, N);
@@ -543,6 +656,7 @@ kernel void illumi_rt_lighting_tlas(
         // Kept as a comment rather than deleted because the asymmetry with glass is deliberate
         // and someone will otherwise "fix" it back.
         float3 acc = float3(0.0);
+        uint hits = 0u;
         isect.accept_any_intersection(false);
         for (uint i = 0; i < rrays; ++i) {
             float3 dir = secondaryConeVisible(roughness, kReflConeK)
@@ -579,66 +693,70 @@ kernel void illumi_rt_lighting_tlas(
                         hitRad += cA * (1.0 / M_PI_F) * u.sunColor * hN * sv;
                     }
                     acc += hitRad;
+                    hits += 1u;
                 }
                 continue;
             }
             if (res.type != intersection_type::triangle) continue;
-            if (u.surfCacheEnabled != 0) {
-                // Cached path: reflect the surface's full cached radiance
-                // (multi-bounce), one atlas read instead of a re-shade.
-                uint gp = soupTriBase[res.instance_id] + res.primitive_id;
-                uint hitCard = (gp < u.surfTriCount) ? triCard[gp] : 0xFFFFFFFFu;
-                // Phase 5 / A — feedback marks the hit card regardless of residency
-                // (see the GI path); OUTSIDE the residency gate.
-                if (hitCard != 0xFFFFFFFFu && u.surfFeedbackEnabled != 0) cardRequested[hitCard] = 1u;
-                // A0 — residency (same as the GI path): resident ⇒ cache read;
-                // non-resident ⇒ emission + ambient fallback (never black).
-                bool resident = (hitCard != 0xFFFFFFFFu) && (surfCardRect[hitCard].z > 0.0);
-                if (resident) {
-                    acc += sampleSurfCacheRT(surfAtlas, gp,
-                        res.triangle_barycentric_coord, surfCards, triCard, triUVa, triUVc,
-                            res.primitive_data, surfCardRect, u.surfAtlasW, u.surfAtlasH);
-                    if (u.debugSurfCacheVar != 0) {
-                        surfVarAcc += sampleSurfCacheVarRT(surfAtlas, gp,
-                            res.triangle_barycentric_coord, triCard, triUVa, triUVc,
-                            res.primitive_data, surfCardRect, u.surfAtlasW, u.surfAtlasH);
-                        surfVarN++;
-                    }
-                } else if (hitCard != 0xFFFFFFFFu) {
-                    // Known card, not resident — same shared fallback as the GI path.
-                    float3 cN = hitWorldNormal(res.instance_id, res.primitive_id, insts, objNormal);
-                    if (dot(cN, dir) > 0.0) cN = -cN;
-                    acc += secondaryCardFallback(
-                        surfCards[hitCard], cN,
-                        secondaryLayerBits(res.instance_id, insts), secFull, irrCube);
-                }
-                continue;
-            }
+            hits += 1u;
             // Re-shade through the ONE secondary-ray surface shader (see
-            // IlluminatoramaSecondary.h). This is where this path used to shade a
-            // reflected surface with the instance's MEAN albedo under a flat
-            // exterior-strength `albedo * skyAmbient` — no texture, no local
-            // lights, no emission, no interior split. Fixed once, for both paths.
+            // IlluminatoramaSecondary.h), cached or not. This is where this path used to
+            // shade a reflected surface with the instance's MEAN albedo under a flat
+            // exterior-strength `albedo * skyAmbient` — no texture, no local lights, no
+            // emission, no interior split. Fixed once, for both paths.
             SecondaryHit h;
             h.P = r.origin + dir * res.distance;
             h.N = hitWorldNormal(res.instance_id, res.primitive_id, insts, objNormal);
             if (dot(h.N, dir) > 0.0) h.N = -h.N;          // face the incoming ray
             h.bary = res.triangle_barycentric_coord;
             h.instanceID = res.instance_id; h.primitiveID = res.primitive_id;
-            acc += shadeSecondarySurface(isect, accel, h, secFull, sec,
-                                         irrCube, albedoAtlas, seed);
+            // DH-0622 — same card resolution as the GI path: the cache supplies only the
+            // indirect term the shader would otherwise estimate with its fill.
+            uint cardState = SURF_STAT_RESHADE;
+            float3 cacheIrr = float3(0.0);
+            if (u.surfCacheEnabled != 0) {
+                uint gp = soupTriBase[res.instance_id] + res.primitive_id;
+                uint hitCard = (gp < u.surfTriCount) ? triCard[gp] : 0xFFFFFFFFu;
+                if (hitCard != 0xFFFFFFFFu && u.surfFeedbackEnabled != 0) cardRequested[hitCard] = 1u;
+                if (hitCard == 0xFFFFFFFFu) {
+                    cardState = SURF_STAT_NOCARD;
+                } else if (surfCardRect[hitCard].z > 0.0) {
+                    cardState = SURF_STAT_CACHED;
+                    cacheIrr = sampleSurfCacheIndirectRT(surfAtlas, gp, h.bary, triCard, triUVa, triUVc,
+                                                         res.primitive_data, surfCardRect,
+                                                         u.surfAtlasW, u.surfAtlasH);
+                    if (u.debugSurfCacheVar != 0) {
+                        surfVarAcc += sampleSurfCacheVarRT(surfAtlas, gp, h.bary, triCard, triUVa, triUVc,
+                                                           res.primitive_data, surfCardRect,
+                                                           u.surfAtlasW, u.surfAtlasH);
+                        surfVarN++;
+                    }
+                } else {
+                    cardState = SURF_STAT_FALLBACK;
+                    cacheIrr = secondaryIndirectFill(h.N, secondaryLayerBits(res.instance_id, insts),
+                                                     secFull, irrCube);
+                }
+            }
+            surfStat(surfHitStats, u.surfStatsEnabled, 4u + cardState);
+            float3 cacheTerm;
+            acc += shadeSecondarySurface(isect, accel, h, secFull, sec, irrCube, albedoAtlas, seed,
+                                         cardState == SURF_STAT_CACHED || cardState == SURF_STAT_FALLBACK,
+                                         cacheIrr, cacheTerm);
+            cacheRefl += cacheTerm;
         }
         reflection = (acc / float(rrays)) * fres * u.reflStrength;
+        reflHitFraction = saturate(float(hits) / float(rrays) * u.reflStrength);
+        cacheTerms += (cacheRefl / float(rrays)) * fres * u.reflStrength;
     }
 
     half4 prev = outHDR.read(gid);
     if (u.debugSurfCacheGI != 0) {
-        // Isolation view: show ONLY the surface-cache-derived radiance. With the
-        // cache on, `indirect` and `reflection` ARE the atlas reads (the non-cache
-        // re-shade branches `continue` past), so this is the cache contribution in
-        // isolation — replacing the lit composite makes the stale-pose ghost on a
-        // moved object visible (it's sub-grain in the normal additive composite).
-        outHDR.write(half4(half3(indirect + reflection), prev.a), gid);
+        // Isolation view: ONLY the surface cache's share — `albedo · cached indirect` at
+        // every GI and reflection hit, carried through the same weights (DH-0622). What an
+        // uncached hit also has is left out, so this is exactly what the cache adds;
+        // replacing the lit composite makes the stale-pose ghost on a moved object
+        // visible (it's sub-grain in the normal additive composite).
+        outHDR.write(half4(half3(cacheTerms), prev.a), gid);
         rtDiffuse.write(half4(0.0h), gid);   // isolation view owns the pixel; add nothing
         return;
     }
@@ -663,6 +781,118 @@ kernel void illumi_rt_lighting_tlas(
     //     fixed-radius bilateral) clean it before it reaches the composite.
     // Sky pixels early-out at the top, so `rtDiffuse` is left untouched there and
     // the denoise pass guards on the same depth test.
-    outHDR.write(half4(prev.rgb + half3(reflection), prev.a), gid);
+    float3 skySeenThrough = float3(0.0);
+    if (u.reflReplacesIBL != 0u && reflHitFraction > 0.0) {
+        skySeenThrough = float3(specIBL.read(gid).rgb) * reflHitFraction;
+    }
+    // The traced GI owns the diffuse sky wherever it ran: the deferred share comes out.
+    float3 diffSkyReplaced = float3(0.0);
+    if (u.giReplacesDiffuseSky != 0u && u.giRays > 0 && u.giStrength > 0.0) {
+        diffSkyReplaced = float3(diffSky.read(gid).rgb);
+    }
+    outHDR.write(half4(max(prev.rgb - half3(skySeenThrough) - half3(diffSkyReplaced), half3(0.0h)) + half3(reflection), prev.a), gid);
     rtDiffuse.write(half4(half3(direct + indirect), 1.0h), gid);
+}
+
+// ── RAY-TRACED AMBIENT OCCLUSION (RTAO) — photo/export lane (DH-0528) ─────────
+//
+// Tier 2 of DH-0440's AO research, greenlit by Danny. The screen-space GTAO march
+// (`illumi_ssao`) draws a foamy crust at wall/ceiling junctions because it estimates
+// occlusion from the DEPTH buffer, which only knows the front-most surface — at a
+// concave junction there is no geometry behind the front face to sample, so the
+// horizon integral fills a noisy, half-res, per-pixel-rotated point cloud. RTAO
+// answers the same question against the REAL geometry: short cosine-weighted
+// hemisphere rays cast at the TLAS the RT sun-shadow / reflection passes already
+// build. The occlusion radius is a TRUE world-space distance (the ray
+// `max_distance`), which is what dissolves the DH-0441 fork — one physically
+// meaningful metre grounds a sofa foot AND stays tight at a drywall junction,
+// where the single screen-space band width could only do one.
+//
+// It is a DROP-IN raw-AO producer: it writes the same half-res AO texture
+// `illumi_ssao` does, in the same `1.0 = unoccluded` contract, so the existing
+// bilateral + temporal denoiser and the lighting kernel's AO read consume it
+// unchanged. Cosine-importance sampling makes the estimator simply the fraction of
+// occluded rays (the cosine weight is folded into the sample distribution), matching
+// GTAO's final `ao = 1 - occlusion·intensity`. Per-frame jitter (`frameSeed`) is the
+// same contract GTAO and the RT sun-shadow pass honour, so the photo lane's 32-frame
+// temporal accumulator integrates the Monte-Carlo noise out.
+//
+// PHOTO/EXPORT LANE ONLY. The per-frame ray budget is Monte-Carlo and only the
+// still's accumulator converges it; an interactive frame would show ray banding.
+// The renderer gates the dispatch on `rtaoActive` (photo lane + a live TLAS); a
+// frame with no TLAS yet falls back to GTAO.
+struct RTAOUniforms {
+    float4x4 invViewProjection;   // depth → world position
+    float     radius;             // occlusion reach, WORLD metres (ray max_distance)
+    float     intensity;          // 0..1 AO strength (matches ssaoIntensity semantics)
+    uint      rayCount;           // cosine-hemisphere rays per pixel per frame
+    uint      frameSeed;          // per-frame jitter walk (0 = frozen)
+    float     rayTMin;            // self-intersection guard, world metres
+    uint      transportRayMask;   // 0x01 opaque | 0x04 invisible occluder (glass excluded)
+    uint      fullWidth;          // full-res G-buffer dims (AO is half-res)
+    uint      fullHeight;
+};
+
+kernel void illumi_rtao_tlas(
+    depth2d<float, access::read>      gDepth   [[texture(0)]],   // full-res
+    texture2d<half,  access::read>    gNormal  [[texture(1)]],   // full-res oct-normal.xy
+    texture2d<half,  access::write>   outAO    [[texture(2)]],   // half-res AO out
+    instance_acceleration_structure   accel    [[buffer(0)]],
+    constant RTAOUniforms&            u        [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint outW = outAO.get_width();
+    uint outH = outAO.get_height();
+    if (gid.x >= outW || gid.y >= outH) return;
+
+    // Disabled ⇒ neutral 1.0, so the lighting kernel reads unconditionally.
+    if (u.intensity <= 0.0) { outAO.write(half4(1.0h), gid); return; }
+
+    // Half-res gid → full-res G-buffer texel (2×2 top-left; matches illumi_ssao).
+    uint fullW = u.fullWidth, fullH = u.fullHeight;
+    uint2 fullGid = min(gid * 2, uint2(fullW - 1, fullH - 1));
+
+    float depth = gDepth.read(fullGid);
+    if (depth >= 0.99999) { outAO.write(half4(1.0h), gid); return; }   // sky — no surface
+
+    float2 ndc = (float2(fullGid) + 0.5) / float2(fullW, fullH) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    float3 P = worldPosFromDepth(ndc, depth, u.invViewProjection);
+    float3 N = octDecode(float2(gNormal.read(fullGid).rg));
+    float3 Pofs = P + N * max(u.rayTMin, 1e-3);
+
+    // Triangle-only traversal against the instance AS. NO curve assume block — foliage
+    // (curve geometry) is not a near-field contact occluder, and omitting it keeps this
+    // kernel free of the kRTCurvesEnabled function constant (one un-specialized pipeline).
+    intersector<triangle_data, instancing, curve_data> isect;
+    isect.set_triangle_cull_mode(triangle_cull_mode::none);
+    isect.accept_any_intersection(true);   // occlusion-only
+
+    // STRATIFIED, not white: the i-th ray takes the i-th point of the R2 low-discrepancy
+    // sequence, rotated per pixel (Cranley–Patterson) by a hash and walked per frame by the
+    // seed. White noise at 8–12 rays left a crust the bilateral could not clean (the DH-0528
+    // gate measured 1.15 in-band against GTAO's 0.47); a stratified estimator's error falls as
+    // ~1/N rather than 1/√N, and the per-pixel rotation keeps neighbouring texels decorrelated
+    // so the spatial filter still averages independent estimates.
+    uint seed = pcgHash(gid.x + gid.y * outW + u.frameSeed * 9781u);
+    float2 cp = float2(rnd(seed), rnd(seed));                 // per-pixel/per-frame rotation
+    uint rays = max(1u, u.rayCount);
+    float radius = max(1e-3, u.radius);
+    uint hits = 0u;
+    const float g = 1.32471795724474602596;                    // plastic constant (R2)
+    const float a1 = 1.0 / g, a2 = 1.0 / (g * g);
+    for (uint i = 0; i < rays; ++i) {
+        float2 q = fract(cp + float2(a1, a2) * float(i + 1));
+        ray r;
+        r.origin = Pofs;
+        r.direction = cosineSample(N, q.x, q.y);
+        r.min_distance = max(u.rayTMin, 1e-3);
+        r.max_distance = radius;   // world-space reach — beyond this is not an occluder
+        if (isect.intersect(r, accel, u.transportRayMask).type != intersection_type::none) hits++;
+    }
+    // Cosine weighting is in the sampling, so the occlusion estimate is just the hit
+    // fraction; visibility = 1 − occlusion. Same final form as illumi_ssao's `ao`.
+    float occlusion = float(hits) / float(rays);
+    float ao = 1.0 - occlusion * u.intensity;
+    outAO.write(half4(half(clamp(ao, 0.0, 1.0))), gid);
 }

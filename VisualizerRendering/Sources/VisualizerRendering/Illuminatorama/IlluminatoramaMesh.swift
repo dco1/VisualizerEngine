@@ -96,6 +96,61 @@ public final class IlluminatoramaMesh {
         return r
     }
 
+    /// Object-space bounding sphere (centre, radius), computed ONCE from the vertex buffer on first
+    /// ask (DH-0637). nil when the buffer is `.private` (GPU-only vertices) — callers must then
+    /// treat the mesh as unbounded. Used by the spot-shadow reuse to ask "can this swaying
+    /// instance swing through that cone?", and by visibility culling (DH-0534) to bound every
+    /// draw group — so a mesh whose CPU-visible positions are rewritten in place after the first
+    /// ask would be culled against stale bounds. GPU-rewritten meshes are built with
+    /// `init(vertexBuffer:…)` (`cpuAuthoredVertices == false`), which the culler treats as unbounded.
+    public var boundingSphere: (center: SIMD3<Float>, radius: Float)? {
+        if let cached = cachedBoundingSphere { return cached }
+        guard vertexBuffer.storageMode != .private, vertexCount > 0 else { return nil }
+        let stride = MemoryLayout<IlluminatoramaVertex>.stride
+        let base = vertexBuffer.contents()
+        var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+        var hi = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+        for v in 0..<vertexCount {
+            let p = base.load(fromByteOffset: v * stride, as: SIMD3<Float>.self)
+            lo = simd_min(lo, p); hi = simd_max(hi, p)
+        }
+        let c = (lo + hi) * 0.5
+        let sphere = (center: c, radius: simd_length(hi - c))
+        cachedBoundingSphere = sphere
+        return sphere
+    }
+    private var cachedBoundingSphere: (center: SIMD3<Float>, radius: Float)?
+
+    /// The largest positive vegetation-wind weights packed in this mesh's tangents — `sway` is
+    /// `tangent.x`, `flutter` is `tangent.z`, exactly what `applyTreeWind` reads — so visibility
+    /// culling (DH-0534) can bound how far the gust moves a vertex. Floored at 1: a tangent the
+    /// GPU synthesis pass writes later is a unit vector, and a scan taken before it lands must not
+    /// under-bound it. nil for GPU-only vertices (the caller then treats the draw as unbounded).
+    public var windAttributeMax: (sway: Float, flutter: Float)? {
+        if let cached = cachedWindAttributeMax { return cached }
+        guard vertexBuffer.storageMode != .private, vertexCount > 0 else { return nil }
+        let stride = MemoryLayout<IlluminatoramaVertex>.stride
+        let offset = MemoryLayout<IlluminatoramaVertex>.offset(of: \.tangent) ?? 48
+        let base = vertexBuffer.contents()
+        var sway: Float = 1, flutter: Float = 1
+        for v in 0..<vertexCount {
+            let t = base.load(fromByteOffset: v * stride + offset, as: SIMD4<Float>.self)
+            sway = max(sway, t.x); flutter = max(flutter, t.z)
+        }
+        let result = (sway: sway, flutter: flutter)
+        cachedWindAttributeMax = result
+        return result
+    }
+    private var cachedWindAttributeMax: (sway: Float, flutter: Float)?
+
+    /// True when the engine COPIED this mesh's vertices out of CPU arrays (every `vertices:` init
+    /// and the primitives built on them) — the CPU-side bounds are then the truth. False for the
+    /// GPU-direct `init(vertexBuffer:…)`, whose buffer a compute kernel may rewrite at any time;
+    /// visibility culling (DH-0534) never trusts a bound of such a mesh. Keyed on provenance, not
+    /// on `registerMesh`: Daydream Home registers its CPU-built house, furniture and trees through
+    /// that API, and a registration-based rule left every one of them unculled.
+    public private(set) var cpuAuthoredVertices: Bool = true
+
     public init(device: MTLDevice, vertices: [IlluminatoramaVertex], indices: [UInt16]) {
         guard let vb = device.makeBuffer(
             bytes: vertices,
@@ -203,6 +258,7 @@ public final class IlluminatoramaMesh {
         self.indexCount   = indexCount
         self.indexType    = indexType
         self.vertexCount  = vertexBuffer.length / MemoryLayout<IlluminatoramaVertex>.stride
+        self.cpuAuthoredVertices = false
     }
 
     // ── Procedural primitives ────────────────────────────────────────────────
@@ -298,10 +354,26 @@ public final class IlluminatoramaMesh {
     //   • If a normal source is missing, normals are computed by averaging
     //     per-triangle face normals around each vertex (cheap; gives smooth
     //     shading on welded meshes, faceted shading on unwelded ones).
-    //   • Texture-coordinate source is optional — `(0, 0)` is used as a
-    //     stand-in. UVs only show up in the renderer today as a passthrough
-    //     to the fragment shader (which doesn't sample textures yet), so a
-    //     missing UV is harmless.
+    //   • Texture-coordinate source is optional. A missing texcoord source
+    //     used to fall back to a bare `(0, 0)` for every vertex on the
+    //     reasoning that "the renderer doesn't sample textures yet" — no
+    //     longer true (the material system samples real albedo/roughness/
+    //     normal textures at `in.uv`), and a single shared UV meant a
+    //     textured material sampled ONE texel for the whole mesh: a wood
+    //     grain, a tile pattern, anything with real texture variation
+    //     rendered as a flat, uniform colour (Danny, 2026-09-10, an
+    //     imported custom object with a wood finish showing no grain at
+    //     all). `triplanarUV(position:normal:)` synthesises a box-projected
+    //     UV instead — one texture repeat per metre, the SAME "prebaked at
+    //     1 m" convention every instanced placeable's own procedurally-
+    //     generated mesh already bakes (`ElementUVScale.furnitureSlice` /
+    //     `SurfaceTiling.prebaked(1.0)`), so a custom object tiles a wood/
+    //     tile/stone material at the same real-world scale a piece of
+    //     built-in furniture does. It is a hard per-vertex box projection,
+    //     not blended triplanar sampling — visible seams at the projection's
+    //     axis boundaries are the honest cost of a real per-pixel texture
+    //     where the source file authored none, and a strict improvement
+    //     over one flat colour.
     //   • Multi-element geometries collapse to their FIRST element. This
     //     means a multi-material `SCNGeometry` only renders its first
     //     submesh's material — workable for the common case where a node
@@ -397,35 +469,82 @@ public final class IlluminatoramaMesh {
         // → default white (no-op multiply at shading time).
         let colors  = floatColors(from: geometry.sources(for: .color).first)
 
-        // Build per-vertex IlluminatoramaVertex. If we synthesise normals
-        // we'll fill them in after we have the index buffer.
-        var verts: [IlluminatoramaVertex] = []
-        verts.reserveCapacity(positions.count)
-        let needsSynthNormals = (normals == nil)
-        let normalArray = normals ?? Array(repeating: SIMD3<Float>(0, 1, 0),
-                                            count: positions.count)
-        let uvArray     = uvs     ?? Array(repeating: SIMD2<Float>(0, 0),
-                                            count: positions.count)
-        let colorArray  = colors  ?? Array(repeating: SIMD4<Float>(1, 1, 1, 1),
-                                            count: positions.count)
-        let uvCount = uvArray.count
-        let normalCount = normalArray.count
-        let colorCount = colorArray.count
-        for i in 0..<positions.count {
-            let n = i < normalCount ? normalArray[i] : SIMD3<Float>(0, 1, 0)
-            let uv = i < uvCount ? uvArray[i] : SIMD2<Float>(0, 0)
-            let c  = i < colorCount ? colorArray[i] : SIMD4<Float>(1, 1, 1, 1)
-            verts.append(IlluminatoramaVertex(position: positions[i],
+        // DH-0742 — detect SceneKit's "split-vertex" element layout. When a
+        // geometry's sources have DIFFERENT `vectorCount`s (the common USD/
+        // Blender-import case: position is vertex-varying/shared, while normal
+        // is authored FACEVARYING — one value per TRIANGLE CORNER, for a hard
+        // edge), SceneKit widens each corner's index entry to one index PER
+        // DISTINCT vectorCount group, interleaved per corner — [posIndex,
+        // cornerIndex, posIndex, cornerIndex, …] — instead of the single shared
+        // index every hand-built/procedural mesh in this engine has always had.
+        // Reading that as one flat index stream (this code did, before this
+        // fix) pairs arbitrary position indices with what are actually
+        // per-corner counters, wiring triangles to essentially random vertices.
+        // A real `.usdz` side table (Blender export, DH-0742) rendered as a
+        // shredded, torn mess because of exactly this — verified against the
+        // raw USD stage (`usdcat`) and SceneKit's own reported index buffer:
+        // `elementData.count / bytesPerIndex` was 2× `primitiveCount * 3`, and
+        // de-interleaving it by 2 recovered the real per-face-vertex indices
+        // (matching the USD file's own `faceVertexIndices` exactly) alongside a
+        // trivial 0…N corner counter (matching the facevarying normal count).
+        // Detected purely by entry-count arithmetic — no SceneKit SPI needed.
+        let cornerCount = element.primitiveCount * 3
+        let indexEntryWidth = element.bytesPerIndex
+        let totalIndexEntries = indexEntryWidth > 0 ? element.data.count / indexEntryWidth : 0
+        let streamsPerCorner = (cornerCount > 0 && totalIndexEntries > 0
+                                 && totalIndexEntries % cornerCount == 0)
+            ? totalIndexEntries / cornerCount : 1
+
+        let verts: [IlluminatoramaVertex]
+        let needsSynthNormals: Bool
+        let rawIndex: (data: Data, count: Int, type: MTLIndexType)?
+
+        if streamsPerCorner > 1,
+           let expanded = expandSplitVertexElement(
+               element: element, cornerCount: cornerCount, streamsPerCorner: streamsPerCorner,
+               positions: positions, normals: normals, uvs: uvs, colors: colors,
+               geometryLabel: "\(type(of: geometry))") {
+            verts = expanded.verts
+            needsSynthNormals = expanded.needsSynthNormals
+            rawIndex = (expanded.indexData, expanded.indexCount, .uint32)
+        } else {
+            // The overwhelmingly common case: one shared index per corner.
+            // Build per-vertex IlluminatoramaVertex. If we synthesise normals
+            // we'll fill them in after we have the index buffer.
+            var v: [IlluminatoramaVertex] = []
+            v.reserveCapacity(positions.count)
+            needsSynthNormals = (normals == nil)
+            let normalArray = normals ?? Array(repeating: SIMD3<Float>(0, 1, 0),
+                                                count: positions.count)
+            // No texcoord source at all: synthesise a box-projected UV from each vertex's own
+            // position + normal rather than stamping the same (0,0) on every vertex — see the
+            // header comment above this method. A *short* per-vertex source (uvs.count <
+            // positions.count) is left to fall back to (0,0) below as before; that is a rarer,
+            // differently-shaped defect (a malformed source) this fix isn't aimed at.
+            let uvArray     = uvs
+            let colorArray  = colors  ?? Array(repeating: SIMD4<Float>(1, 1, 1, 1),
+                                                count: positions.count)
+            let uvCount = uvArray?.count ?? 0
+            let normalCount = normalArray.count
+            let colorCount = colorArray.count
+            for i in 0..<positions.count {
+                let n = i < normalCount ? normalArray[i] : SIMD3<Float>(0, 1, 0)
+                let uv = uvArray == nil ? triplanarUV(position: positions[i], normal: n)
+                    : (i < uvCount ? uvArray![i] : SIMD2<Float>(0, 0))
+                let c  = i < colorCount ? colorArray[i] : SIMD4<Float>(1, 1, 1, 1)
+                v.append(IlluminatoramaVertex(position: positions[i],
                                                normal: n,
                                                uv: uv,
                                                color: c))
+            }
+            verts = v
+            // Read indices into a `Data` blob in whatever format the renderer
+            // will dispatch. SceneKit elements can be 1/2/4 bytes per index;
+            // promote 1-byte → 2-byte (no MTLIndexType.uint8) and keep 2/4
+            // verbatim.
+            rawIndex = readIndexData(element: element)
         }
-
-        // Read indices into a `Data` blob in whatever format the renderer
-        // will dispatch. SceneKit elements can be 1/2/4 bytes per index;
-        // promote 1-byte → 2-byte (no MTLIndexType.uint8) and keep 2/4
-        // verbatim.
-        guard let raw = readIndexData(element: element) else {
+        guard let raw = rawIndex else {
             log.debug("SCNGeometry \(type(of: geometry)) has unsupported index width (\(element.bytesPerIndex) bytes)")
             return nil
         }
@@ -680,7 +799,113 @@ public final class IlluminatoramaMesh {
         return out.count == count ? out : nil
     }
 
+    /// A box-projected UV for one vertex with no authored texcoord: pick the plane orthogonal to
+    /// the DOMINANT axis of `normal` and use the other two position components, directly in the
+    /// mesh's own local-space metres. That matches — deliberately, with no extra scale factor —
+    /// the "one texture repeat per metre" convention every instanced placeable's own procedurally-
+    /// generated mesh already bakes its UV at (`ElementUVScale.furnitureSlice`, `SurfaceTiling
+    /// .prebaked(1.0)`): a custom object with no UV of its own now tiles a picked material at the
+    /// same real-world scale a piece of built-in furniture does, rather than at an arbitrary one.
+    ///
+    /// This is a hard per-vertex projection, not blended triplanar sampling: two faces meeting
+    /// across a dominant-axis boundary can show a seam in the texture, same as it would with any
+    /// single-sample box projection. That is the honest cost of a real per-pixel texture on a
+    /// surface the source file never gave a UV unwrap — strictly better than the flat, textureless
+    /// colour every vertex sharing `(0, 0)` produced before.
+    private static func triplanarUV(position p: SIMD3<Float>, normal n: SIMD3<Float>) -> SIMD2<Float> {
+        let a = simd_abs(n)
+        if a.x >= a.y, a.x >= a.z { return SIMD2(p.z, p.y) }   // dominant ±X: project onto ZY
+        if a.y >= a.x, a.y >= a.z { return SIMD2(p.x, p.z) }   // dominant ±Y: project onto XZ
+        return SIMD2(p.x, p.y)                                  // dominant ±Z: project onto XY
+    }
+
     // ── Index conversion ──────────────────────────────────────────────────────
+
+    /// DH-0742 — expand a "split-vertex" element (see the call site's comment) into a
+    /// flat per-corner vertex list plus a trivial sequential index buffer. `streamsPerCorner`
+    /// interleaved index values per triangle corner are de-interleaved into that many
+    /// candidate streams; each attribute source (position/normal/uv/color) is matched to
+    /// whichever stream its OWN values validly index into (every value `< source.count`),
+    /// preferring the tightest fit so a smaller source's range can't be mismatched onto a
+    /// wider stream that happens to also cover it. Returns `nil` only if no stream fits the
+    /// position source — the one attribute every mesh must have.
+    private static func expandSplitVertexElement(
+        element: SCNGeometryElement, cornerCount: Int, streamsPerCorner: Int,
+        positions: [SIMD3<Float>], normals: [SIMD3<Float>]?, uvs: [SIMD2<Float>]?,
+        colors: [SIMD4<Float>]?, geometryLabel: String
+    ) -> (verts: [IlluminatoramaVertex], needsSynthNormals: Bool,
+          indexData: Data, indexCount: Int)? {
+        let bpi = element.bytesPerIndex
+        let totalEntries = cornerCount * streamsPerCorner
+        var raw: [UInt32] = []
+        raw.reserveCapacity(totalEntries)
+        element.data.withUnsafeBytes { buf in
+            switch bpi {
+            case 1:
+                let p = buf.bindMemory(to: UInt8.self)
+                guard p.count >= totalEntries else { return }
+                for i in 0..<totalEntries { raw.append(UInt32(p[i])) }
+            case 2:
+                let p = buf.bindMemory(to: UInt16.self)
+                guard p.count >= totalEntries else { return }
+                for i in 0..<totalEntries { raw.append(UInt32(p[i])) }
+            case 4:
+                let p = buf.bindMemory(to: UInt32.self)
+                guard p.count >= totalEntries else { return }
+                for i in 0..<totalEntries { raw.append(p[i]) }
+            default:
+                break
+            }
+        }
+        guard raw.count == totalEntries else {
+            log.debug("Illuminatorama mesh \(geometryLabel): split-vertex element — couldn't read \(totalEntries) index entries at \(bpi) bytes each; skipping")
+            return nil
+        }
+
+        // De-interleave into `streamsPerCorner` per-corner arrays.
+        var streams = Array(repeating: [UInt32](repeating: 0, count: cornerCount), count: streamsPerCorner)
+        for k in 0..<cornerCount {
+            for s in 0..<streamsPerCorner { streams[s][k] = raw[k * streamsPerCorner + s] }
+        }
+
+        // Tightest fit = the stream whose max value is CLOSEST to (but still under) the
+        // source's own count — i.e. the LARGEST valid max, not the smallest. A smaller
+        // source's index range (e.g. position, welded to fewer unique points) can be
+        // coincidentally in-range for a larger source's slot too (every value < count still
+        // passes the bounds check), so picking the smallest max would wrongly prefer the
+        // narrower stream and under-utilize the wider source it doesn't actually belong to.
+        func bestStream(for count: Int) -> Int? {
+            var best: Int? = nil
+            var bestMax: Int = -1
+            for (s, values) in streams.enumerated() {
+                guard let m = values.max(), Int(m) < count else { continue }
+                if Int(m) > bestMax { bestMax = Int(m); best = s }
+            }
+            return best
+        }
+        guard let posStream = bestStream(for: positions.count) else {
+            log.debug("Illuminatorama mesh \(geometryLabel): split-vertex element — no index stream fits the position source (count \(positions.count)); skipping")
+            return nil
+        }
+        let normalStream = normals.flatMap { bestStream(for: $0.count) }
+        let uvStream = uvs.flatMap { bestStream(for: $0.count) }
+        let colorStream = colors.flatMap { bestStream(for: $0.count) }
+
+        var verts: [IlluminatoramaVertex] = []
+        verts.reserveCapacity(cornerCount)
+        for k in 0..<cornerCount {
+            let p = positions[Int(streams[posStream][k])]
+            let n = normalStream.map { normals![Int(streams[$0][k])] } ?? SIMD3<Float>(0, 1, 0)
+            // No texcoord stream at all: same box-projected fallback as the shared-index path
+            // above, not a shared (0,0) — see the header comment on `from(scnGeometry:...)`.
+            let uv = uvStream.map { uvs![Int(streams[$0][k])] } ?? triplanarUV(position: p, normal: n)
+            let c = colorStream.map { colors![Int(streams[$0][k])] } ?? SIMD4<Float>(1, 1, 1, 1)
+            verts.append(IlluminatoramaVertex(position: p, normal: n, uv: uv, color: c))
+        }
+        let indexArray: [UInt32] = (0..<cornerCount).map { UInt32($0) }
+        let indexData = indexArray.withUnsafeBufferPointer { Data(buffer: $0) }
+        return (verts, normals == nil, indexData, cornerCount)
+    }
 
     /// Pull the raw index `Data` blob out of an `SCNGeometryElement`, promote
     /// 1-byte indices to 2-byte (Metal has no `MTLIndexType.uint8`), and
@@ -904,6 +1129,51 @@ public final class IlluminatoramaMesh {
             }
             for i in [idx.0, idx.1, idx.2] {
                 out.append(vbase.load(fromByteOffset: i * stride + uvOffset, as: SIMD2<Float>.self))
+            }
+        }
+        return out
+    }
+
+    /// Per-triangle-CORNER object-space vertex normals — 3 per triangle, in the EXACT
+    /// triangle order `objectFaceNormals()` uses — so a ray-traced hit can barycentric-
+    /// interpolate the SHADING normal the rasteriser uses instead of the flat face normal.
+    ///
+    /// The glass bounce loop needs this and nothing else does: a dielectric boundary's
+    /// normal IS its refraction, so a smooth-shaded moulded pane (a glass block's pillow,
+    /// a ripple) traced against its face normals refracts as a set of flat prisms — every
+    /// facet prints its own sharp, displaced copy of the scene behind it. Returns `[]` if the
+    /// buffers aren't CPU-readable; the shader then falls back to the face normal.
+    public func objectCornerNormals() -> [SIMD4<Float>] {
+        let triCount = indexCount / 3
+        guard triCount > 0 else { return [] }
+        guard vertexBuffer.storageMode != .private else { return [] }
+        let stride = MemoryLayout<IlluminatoramaVertex>.stride
+        let nOffset = MemoryLayout<IlluminatoramaVertex>.offset(of: \.normal) ?? 16
+        let vcount = vertexCount
+        let vbase = vertexBuffer.contents()
+        let ibase = indexBuffer.contents()
+        var out = [SIMD4<Float>](); out.reserveCapacity(triCount * 3)
+        for t in 0..<triCount {
+            var idx = (0, 0, 0)
+            if indexType == .uint16 {
+                let o = t * 3 * 2
+                idx = (Int(ibase.load(fromByteOffset: o,     as: UInt16.self)),
+                       Int(ibase.load(fromByteOffset: o + 2, as: UInt16.self)),
+                       Int(ibase.load(fromByteOffset: o + 4, as: UInt16.self)))
+            } else {
+                let o = t * 3 * 4
+                idx = (Int(ibase.load(fromByteOffset: o,     as: UInt32.self)),
+                       Int(ibase.load(fromByteOffset: o + 4, as: UInt32.self)),
+                       Int(ibase.load(fromByteOffset: o + 8, as: UInt32.self)))
+            }
+            // Same guard as objectFaceUVs: the array MUST stay exactly 3×triCount long. A zero
+            // normal is the shader's "use the face normal" signal.
+            guard idx.0 < vcount, idx.1 < vcount, idx.2 < vcount else {
+                out.append(.zero); out.append(.zero); out.append(.zero); continue
+            }
+            for i in [idx.0, idx.1, idx.2] {
+                let n = vbase.load(fromByteOffset: i * stride + nOffset, as: SIMD3<Float>.self)
+                out.append(SIMD4<Float>(n, 0))
             }
         }
         return out

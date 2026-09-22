@@ -49,14 +49,46 @@ struct ExposureState {
 // For a 1920×1080 image that's 1 in ~250 pixels — plenty for a stable
 // luminance estimate that doesn't trigger on outlier bright pixels.
 
+// ── DH-0655 — the luminance HISTOGRAM and percentile metering ─────────────────
+//
+// The mean below answers "how bright is this scene", never "will anything clip", and a
+// percentile needs a distribution the reduction never had. So: 64 bins over the kernel's own
+// [−8, +8] log2 clamp (0.25 EV a bin), filled from the SAME cached samples the mean averages —
+// mean and percentile then describe one population, so the two are directly comparable.
+// Threadgroup atomics: 8 K increments over 64 bins is nothing, and it needs no 32 KB per-thread
+// scratch. Built only when the instrument or percentile metering asks (a uniform, so every
+// thread takes the same barriers); both default OFF, which leaves the shipped meter untouched.
+constant uint  kExposureHistBins  = 64;
+constant float kExposureHistMinLL = -8.0;
+constant float kExposureHistBinEV = 0.25;
+
+/// The log-luminance below which `pct` of the samples lie, linearly interpolated inside the
+/// bin that crosses it. Runs on one thread over the reduced counts.
+static inline float exposureHistPercentile(threadgroup atomic_uint* hist, uint total, float pct) {
+    float want = clamp(pct, 0.0, 1.0) * float(total);
+    float run = 0.0;
+    for (uint b = 0; b < kExposureHistBins; ++b) {
+        float c = float(atomic_load_explicit(&hist[b], memory_order_relaxed));
+        if (run + c >= want && c > 0.0) {
+            float f = (want - run) / c;
+            return kExposureHistMinLL + (float(b) + f) * kExposureHistBinEV;
+        }
+        run += c;
+    }
+    return kExposureHistMinLL + float(kExposureHistBins) * kExposureHistBinEV;
+}
+
 kernel void illumi_exposure_estimate(
     texture2d<half, access::sample> inHDR     [[texture(0)]],
     device ExposureState&           state     [[buffer(0)]],
     constant uint2&                 imgSize   [[buffer(1)]],
     constant float4&                params    [[buffer(2)]],  // x=targetEV, y=halfLife, z=maxBoost, w=minBoost
-    constant float4&                params2   [[buffer(3)]],  // x=highlightProtection, y=highlightEV, zw reserved
+    constant float4&                params2   [[buffer(3)]],  // x=highlightProtection, y=highlightEV, z=histogram instrument ON, w reserved
+    constant float4&                params3   [[buffer(4)]],  // x=metering (0 mean, 1 percentile), y=key pct, z=guard pct (0 off), w=guard EV
+    device float*                   histOut   [[buffer(5)]],  // kExposureHistBins counts + total, p50, p95, p99, mean, key
     threadgroup float*              sharedAcc [[threadgroup(0)]],
     threadgroup uint*               sharedCnt [[threadgroup(1)]],
+    threadgroup atomic_uint*        hist      [[threadgroup(2)]],
     uint                            tid       [[thread_position_in_threadgroup]],
     uint                            tgSize    [[threads_per_threadgroup]]
 ) {
@@ -154,6 +186,23 @@ kernel void illumi_exposure_estimate(
     float frameMean = (sharedCnt[0] > 0u)
                     ? (sharedAcc[0] / float(sharedCnt[0]))
                     : state.prevTargetLogLum;
+    // The sample total, read with the mean — the highlight pass below reuses `sharedCnt`.
+    const uint sharedCntTotal = sharedCnt[0];
+
+    const bool percentileMeter = params3.x > 0.5;
+    const bool histogramOn = percentileMeter || params2.z > 0.5;
+    if (histogramOn) {
+        for (uint b = tid; b < kExposureHistBins; b += tgSize) {
+            atomic_store_explicit(&hist[b], 0u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k = 0; k < thisKept; ++k) {
+            uint b = uint(clamp((thisLL[k] - kExposureHistMinLL) / kExposureHistBinEV,
+                                0.0, float(kExposureHistBins - 1)));
+            atomic_fetch_add_explicit(&hist[b], 1u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     float hiAcc = 0.0;
     uint  hiCnt = 0u;
@@ -181,6 +230,24 @@ kernel void illumi_exposure_estimate(
         // to `state.prevTargetLogLum` when no sample landed in the valid range),
         // because the highlight pass has to see the same number the mean pass did.
         float target = frameMean;
+        float guardLL = 0.0;
+        if (histogramOn) {
+            uint total = sharedCntTotal;
+            float key = exposureHistPercentile(hist, total, params3.y);
+            if (percentileMeter && total > 0u) {
+                target = key;
+                if (params3.z > 0.0) guardLL = exposureHistPercentile(hist, total, params3.z);
+            }
+            for (uint b = 0; b < kExposureHistBins; ++b) {
+                histOut[b] = float(atomic_load_explicit(&hist[b], memory_order_relaxed));
+            }
+            histOut[kExposureHistBins + 0] = float(total);
+            histOut[kExposureHistBins + 1] = exposureHistPercentile(hist, total, 0.50);
+            histOut[kExposureHistBins + 2] = exposureHistPercentile(hist, total, 0.95);
+            histOut[kExposureHistBins + 3] = exposureHistPercentile(hist, total, 0.99);
+            histOut[kExposureHistBins + 4] = frameMean;
+            histOut[kExposureHistBins + 5] = key;
+        }
         // Auto-exposure: we want the target luminance to land at
         // `2^targetEV`. So the exposure scalar is `2^(targetEV - target)`.
         // Negative target log lum (scene is dim) → positive exposure
@@ -193,6 +260,11 @@ kernel void illumi_exposure_estimate(
         if (protect > 0.0) {
             float hiWanted = exp2(params2.y - hiMean);
             wantedExposure = mix(wantedExposure, min(wantedExposure, hiWanted), protect);
+        }
+        // Percentile highlight GUARD: cap exposure so the guard percentile lands at `guardEV`.
+        // A `min`, never a boost — like the upper-half cap above.
+        if (percentileMeter && params3.z > 0.0 && sharedCntTotal > 0u) {
+            wantedExposure = min(wantedExposure, exp2(params3.w - guardLL));
         }
         // EMA toward `wantedExposure` with a half-life set by
         // `params.y` seconds. Convert half-life + dt into a per-frame
@@ -231,20 +303,128 @@ static inline float3 aces(float3 x) {
     return saturate((x * (a * x + b)) / (x * (c * x + d) + e));
 }
 
+// ── The display transform is a CHOICE now (DH-0881) ──────────────────────────
+//
+// `aces()` above is Narkowicz's fitted RRT+ODT curve applied PER CHANNEL to whatever
+// primaries the render is already in — Rec.709/sRGB. There is no AP0/AP1 transform anywhere
+// in this file, which makes it ACES in name only, and the consequence is not subtle: a
+// per-channel curve desaturates by driving the dominant channel into its shoulder FIRST, so
+// hue rotates as intensity rises. Saturated blue goes purple, a hot red goes orange, a bright
+// green goes yellow. It is a large part of what makes a render read as CG rather than as a
+// photograph, and three knobs downstream (`tonemapSaturation`, `highlightChromaRolloff`, the
+// split tone) exist mostly to pay for it.
+//
+// Two alternatives, selected by `frame.displayTransform`. 0 is the shipped curve and is
+// byte-identical, so nothing moves until a host asks.
+
+// Rec.709/sRGB (D65) ⇄ ACEScg AP1. Metal's float3x3 takes COLUMNS.
+constant float3x3 kSRGBtoAP1 = float3x3(float3(0.6131, 0.0702, 0.0206),
+                                        float3(0.3395, 0.9164, 0.1096),
+                                        float3(0.0474, 0.0134, 0.8698));
+constant float3x3 kAP1toSRGB = float3x3(float3( 1.7050, -0.1302, -0.0240),
+                                        float3(-0.6217,  1.1408, -0.1290),
+                                        float3(-0.0832, -0.0106,  1.1529));
+
+/// **1 — the AP1 sandwich. MEASURED, THIS DOES NOT WORK — kept as a recorded negative.**
+///
+/// The idea is the obvious minimal fix: evaluate the same fitted curve in ACEScg instead of
+/// Rec.709, so its per-channel clipping happens in a wide gamut and a colour cannot have one
+/// 709 channel slammed into the shoulder alone. On the fixture house it made the artefact
+/// WORSE — hue rotation over +2 stops went 2.48° → 3.45°, with chroma down too (0.53 → 0.43).
+///
+/// Why, as far as the measurement shows: `aces()` ends in a `saturate`, and `kAP1toSRGB` has
+/// large negative off-diagonal terms, so the round trip lands a great many pixels outside
+/// [0,1] in sRGB and the final clamp is itself a per-channel clip — the very thing the
+/// sandwich was supposed to avoid, just moved one step later. A real ACES pipeline avoids it
+/// with a gamut compression before the inverse matrix, which this is not.
+///
+/// It stays in the switch, and the gate keeps printing its number, so the next person to have
+/// this idea finds the result instead of re-deriving it. Use `agx` for the actual fix.
+static inline float3 acesAP1(float3 x) {
+    return saturate(kAP1toSRGB * aces(kSRGBtoAP1 * max(x, 0.0)));
+}
+
+// AgX (Troy Sobotka's transform, in the form Blender ships). The published inset/outset
+// matrices — rows as documented, transposed here into Metal's column order.
+constant float3x3 kAgXInset  = float3x3(float3(0.8424790622530940, 0.0423282422610123, 0.0423756549057051),
+                                        float3(0.0784335999999992, 0.8784686364697720, 0.0784336000000000),
+                                        float3(0.0792237451477643, 0.0791661274605434, 0.8791429737931040));
+constant float3x3 kAgXOutset = float3x3(float3( 1.1968790051201738, -0.0528968517574562, -0.0529716355144438),
+                                        float3(-0.0980208811401368,  1.1519031299041727, -0.0980434501171241),
+                                        float3(-0.0990297440797205, -0.0989611768448433,  1.1510736726411610));
+
+/// The published 6th-order polynomial fit of AgX's default contrast sigmoid.
+static inline float3 agxContrast(float3 x) {
+    float3 x2 = x * x;
+    float3 x4 = x2 * x2;
+    return  15.5    * x4 * x2
+          - 40.14   * x4 * x
+          + 31.96   * x4
+          -  6.868  * x2 * x
+          +  0.4298 * x2
+          +  0.1191 * x
+          -  0.00232;
+}
+
+/// **2 — AgX.** Two things make it hold up where a naive per-channel curve does not. An
+/// INSET matrix desaturates before the curve, so no single channel is pushed into the
+/// shoulder alone — that is the notorious blue-light case, where a saturated blue lamp turns
+/// violet — and the matching outset restores the chroma afterwards. And the sigmoid acts on
+/// log2 STOPS over a fixed latitude rather than on linear light, which is why its highlights
+/// roll off like film rather than clamping. Blender moved to it for exactly these reasons.
+///
+/// Its sigmoid emits a display-encoded value, so the `pow(2.2)` at the end returns the chain
+/// to the linear display-referred convention everything downstream here assumes.
+static inline float3 agx(float3 v) {
+    const float minEv = -12.47393, maxEv = 4.026069;
+    v = kAgXInset * max(v, 0.0);
+    v = clamp(log2(max(v, 1e-10)), minEv, maxEv);
+    v = (v - minEv) / (maxEv - minEv);
+    v = agxContrast(saturate(v));
+    // ── The 'punchy' look, and it is not optional ────────────────────────────────
+    // The inset that buys AgX its hue stability also costs chroma: measured on the fixture
+    // house, bare AgX came back at 0.317 mean saturation against the shipped curve's 0.526.
+    // That is why Blender ships AgX WITH a look transform rather than bare, and its published
+    // 'punchy' figures are these: slope 1, power 1.35, saturation 1.4, applied in the
+    // sigmoid's own output domain (before the outset and the EOTF), so the contrast lift acts
+    // on the curve's result rather than on linear light.
+    {
+        const float3 lw = float3(0.2126, 0.7152, 0.0722);
+        v = pow(max(v, 0.0), float3(1.35));
+        float luma = dot(v, lw);
+        v = luma + 1.4 * (v - luma);
+    }
+    v = kAgXOutset * v;
+    return saturate(pow(max(v, 0.0), float3(2.2)));
+}
+
+/// The scene → display rendering this frame asked for. 0 keeps the shipped per-channel
+/// Rec.709 curve exactly, so every existing baseline is untouched.
+static inline float3 displayTransform(float3 scene, uint which) {
+    switch (which) {
+        case 1:  return acesAP1(scene);
+        case 2:  return agx(scene);
+        default: return aces(scene);
+    }
+}
+
 // ── Color-grade: white-balance gain from a Kelvin temperature ───────────────
 // Maps a correlated colour temperature (~2000–10000 K) to a normalized linear
-// RGB channel gain that, when MULTIPLIED into a neutral scene, warms it (low K)
-// or cools it (high K). 6500 K → (1,1,1) exactly (no-op default). We use a
+// RGB channel gain that, when MULTIPLIED into a neutral scene, warms it (HIGH K)
+// or cools it (LOW K). 6500 K → (1,1,1) exactly (no-op default). We use a
 // cheap polynomial approximation of the daylight locus' channel response
 // rather than a full Planckian/CIE conversion — it only has to read tasteful
 // across the slider, not be colorimetrically exact. Normalized so the green
 // channel (and the luma) stays ≈1, i.e. the grade tints rather than dims.
 static inline float3 whiteBalanceGain(float kelvin) {
-    // Reference is 6500 K (D65). Below → push red, pull blue (warm); above →
-    // push blue, pull red (cool). A smooth, monotonic curve in 1000s-of-K.
-    float t = (kelvin - 6500.0) / 6500.0;        // 0 at D65; ~-0.69 at 2000 K; ~+0.54 at 10000 K
-    float r = 1.0 - 0.45 * t;                    // warmer (low K) → more red
-    float b = 1.0 + 0.55 * t;                    // warmer (low K) → less blue
+    // Photo-tool convention (Lightroom / in-camera WB dial), NOT the physical
+    // blackbody sign: HIGHER K warms the image, LOWER K cools it — the way every
+    // WB-correction control a photographer knows runs (drag toward the low number
+    // to cool, toward the high number to warm). 6500 K = D65 = no-op. A smooth,
+    // monotonic curve in 1000s-of-K. See DH-0453.
+    float t = (6500.0 - kelvin) / 6500.0;        // 0 at D65; ~+0.69 at 2000 K; ~-0.54 at 10000 K
+    float r = 1.0 - 0.45 * t;                    // warmer (high K) → more red
+    float b = 1.0 + 0.55 * t;                    // warmer (high K) → less blue
     float g = 1.0 - 0.04 * t * t;                // slight green dip away from D65
     float3 gain = float3(max(r, 0.0), max(g, 0.0), max(b, 0.0));
     // Renormalize to unit luma so the white-balance only shifts hue, not exposure.
@@ -267,11 +447,29 @@ static inline float3 tintGain(float tint) {
 //   • highlights lifts/rolls the high-luma end (1.0 = no-op)
 // Shadows/highlights are luma-weighted so mid-tones stay put and the two ends
 // move independently. All three default to 1.0 → an exact no-op.
+//
+// CONTRAST IS A MID-TONE S-CURVE — slope k at the pivot, slope 1 at black and at white.
+//
+// It was first `(c − 0.18)·k + 0.18` then `max(·, 0)`, which sends every value below
+// 0.18·(1 − 1/k) to EXACT black (k = 1.31 ⇒ ≈ sRGB 58/255): 70 % of the window-night hero went
+// black under the AgX presets (DH-0890). A power law around the pivot fixed the clamp but not the
+// shape: `p·(c/p)^k` stretches the EV distance below the pivot by k, so the deeper the shadow the
+// harder it is pushed — 1.6 stops at display 0.01 for k = 1.39 — and dim scenes rendered two
+// stops darker than the look they were matched to (DH-0891: realtor's p50 at −4 EV, 12.8 → 3.9).
+//
+// Now each side is the cubic Hermite g(x) = x + (k − 1)·x²·(x − 1) on its own normalised span:
+// g(0) = 0, g(1) = 1, g′(1) = k (the mid-tone punch), g′(0) = 1 (the ends keep their own
+// ratios — neither crushed nor lifted). Monotone for any k < 4. k = 1 is an exact no-op.
+static inline float3 midtoneContrast(float3 x, float k) {
+    return x + (k - 1.0) * x * x * (x - 1.0);
+}
 static inline float3 toneCurve(float3 c, float contrast, float shadows, float highlights) {
-    // Contrast around mid-grey pivot.
     const float pivot = 0.18;
-    c = (c - pivot) * contrast + pivot;
-    c = max(c, 0.0);
+    const float k = clamp(contrast, 0.0, 3.9);
+    c = saturate(c);
+    float3 lo = pivot * midtoneContrast(c / pivot, k);
+    float3 hi = 1.0 - (1.0 - pivot) * midtoneContrast((1.0 - c) / (1.0 - pivot), k);
+    c = select(hi, lo, c <= pivot);
     // Per-pixel luma drives the shadow/highlight weights.
     float lum = dot(c, float3(0.2126, 0.7152, 0.0722));
     // Smooth low/high masks: shadowW ≈ 1 in blacks → 0 by mid; highW the inverse.
@@ -714,6 +912,112 @@ fragment float4 illumi_tonemap_fs(
             mixed += flare * gain;
         }
     }
+
+    // ── DH-0715: live-lane look-match ──────────────────────────────────────────
+    // Cheap approximation of the photo lane's RT bounce-GI + RTAO passes for
+    // hosts that can't afford them live (Daydream Home measured +17–155% frame
+    // time for live RTAO alone, scaling with the ray count needed to look
+    // clean — see DH-0715/DH-0709). Applied HERE, in the HDR domain, BEFORE
+    // white-balance/exposure/ACES/the post-tonemap grade below — deliberately,
+    // so this reads as just more (or less) linear light and gets reshaped by
+    // whatever Visuals settings a scene has (exposure, white balance, contrast,
+    // shadows/highlights, saturation, split-tone) exactly the way real bounce
+    // light would, instead of this term overriding or double-applying on top
+    // of those controls. `liveLookMatchStrength` is 0 (default) for every
+    // scene that never opts in, and the host zeroes it whenever a still is
+    // being captured — the export always sees the real RT terms, never this.
+    if (frame.liveLookMatchStrength > 0.0) {
+        float lum = dot(mixed, float3(0.2126, 0.7152, 0.0722));
+
+        // ── Two adaptive normalizers, so a FIXED calibration doesn't ship as a flat
+        // constant (DH-0715, validated 2026-09-11 across 3 real Views × 4 Visuals
+        // presets — a constant closed anywhere from 101% to 1668% of the measured
+        // gap depending on scene and preset, including one scene/preset pair where
+        // the real gap was near zero and the constant still darkened it). Both read
+        // FrameUniforms fields already flowing into this exact shader — no new
+        // plumbing, no new pass.
+        //
+        // 1. GRADE normalizer — a preset's OWN saturation already does some of this
+        //    term's job, and `tonemapSaturation` re-amplifies whatever chroma this
+        //    term injects (the post-ACES saturation lerp above), so a punchier
+        //    preset (Cinematic 1.35, Dreamy 1.20) was compounding on top of an
+        //    already-strong grade while Moody (0.80, the one preset that landed
+        //    near 100% at the flat constant) barely got amplified at all. 0.80 is
+        //    Moody's own saturation — the fixed point where this normalizer is a
+        //    no-op, because that is the one preset the flat constant already fit.
+        float gradeNorm = clamp(0.80 / max(frame.tonemapSaturation, 0.3), 0.3, 1.6);
+
+        // 2. SCENE normalizer — how much light is actually IN this shot to bounce.
+        //    The auto-exposure system already computes exactly that signal: a
+        //    naturally bright room needs little gain (`smoothedExposure` low) and
+        //    has plenty of light for GI to redistribute; a naturally dim room needs
+        //    a big gain and has little to bounce. Reading it here (rather than
+        //    deriving a new frame-mean) is why this costs nothing extra — the
+        //    estimator kernel already ran this frame. Falls back to a no-op (1.0)
+        //    when auto-exposure is off, matching the read used below for `exposure`.
+        float sceneBrightness = (frame.autoExposureEnabled != 0u)
+                                ? expoState.smoothedExposure : 1.0;
+        float sceneNorm = clamp(1.0 / max(sceneBrightness, 0.15), 0.3, 2.2);
+
+        float adapt = gradeNorm * sceneNorm;
+
+        // GI's share. Measured (DH-0715): the still's real bounce pass reads
+        // DARKER at the SAME exposure, not brighter — ACES's shoulder
+        // compresses the wider dynamic range the bounce adds — and warmer,
+        // across essentially the WHOLE frame (a broad tonal shift, not just the
+        // deep shadows), a little more so in shadow/mid tones than in the very
+        // brightest pixels (bounce fills dark corners; it adds less to what's
+        // already lit). The 0.55 floor is load-bearing: a mask that fully
+        // vanishes toward highlights can't reach the measured (largely uniform)
+        // luma/warmth shift no matter how extreme `liveLookGIDarken` /
+        // `liveLookGIWarmth` go — calibration against DH-0715's target frame
+        // is what set this floor, not a physical derivation.
+        //
+        // `blownGuard` is a SEPARATE, much higher-range cutoff from the 0…1.5 shape above,
+        // and it is load-bearing for a different reason: `HouseRenderBridgeGPUTests
+        // _BloomProfile` caught the 0.55 floor applying to a directly-EMISSIVE, deliberately
+        // blown lamp shade too — this term approximates INDIRECT bounce, which is a small
+        // addition on top of already-intense direct/emissive light, not a discount on the
+        // source itself.
+        //
+        // A first cut thresholded raw pre-exposure `lum` and still failed that gate — this
+        // fixture blows its lamp out through EXPOSURE, not through an extreme raw HDR
+        // magnitude, so "is this pixel headed for white" cannot be judged before exposure is
+        // even applied. `exposedLum` estimates the value ACES will actually see (lum ×
+        // whatever this frame's exposure is, auto or manual — same read `sceneNorm` already
+        // uses, so no new cost), and the guard is keyed to THAT instead: ACES's shoulder
+        // starts compressing meaningfully around 1.0 (the 18%-grey reference) and a source
+        // pushing several stops past it is unambiguously headed for a clip regardless of
+        // scene/grade, which is the scale-invariant version of "is this blown".
+        float exposedLum = lum * sceneBrightness * frame.exposure;
+        // Empirically re-tuned against `HouseRenderBridgeGPUTests_BloomProfile`: a
+        // blownGuard(1.2, 3.0) diagnostic came back byte-identical to blownGuard=0 — the
+        // deliberately-blown lamp's own `exposedLum` sits BELOW 1.2, not above 3.0, so that
+        // range never engaged at all. `frame.bloomThreshold` (the actual "is this blown"
+        // dial every preset ships, 0.7–1.2) is the right scale to anchor to instead of a
+        // guessed multiple of the 18%-grey reference.
+        float blownGuard = 1.0 - smoothstep(0.5 * frame.bloomThreshold, 1.0 * frame.bloomThreshold, exposedLum);
+        float giMask = frame.liveLookMatchStrength * adapt * blownGuard
+                     * mix(0.55, 1.0, 1.0 - smoothstep(0.0, 1.5, lum));
+        mixed *= mix(1.0, max(frame.liveLookGIDarken, 0.0), giMask);
+        // Warmth is a GAIN spread (not a blend toward a fixed tilt) so its strength scales
+        // continuously with `liveLookGIWarmth` rather than saturating once fully blended —
+        // calibration against DH-0715's target needed the R/B separation to go well past
+        // what a fixed small tilt could reach at blend 1.0.
+        float3 warmGain = float3(1.0 + 0.15 * frame.liveLookGIWarmth, 1.0,
+                                 1.0 - 0.15 * frame.liveLookGIWarmth);
+        mixed = mix(mixed, mixed * warmGain, giMask);
+        // RTAO's share: extra darkening keyed by the EXISTING AO visibility
+        // buffer (already bound below for the debug view; 1 = unoccluded) —
+        // shaped by real occlusion geometry, not a flat screen-wide tint. Gets the
+        // same two normalizers: less contact grounding to fake in a scene/grade
+        // that already reads rich, more where it reads flat.
+        constexpr sampler llmAO(filter::linear, address::clamp_to_edge, coord::normalized);
+        float occ = 1.0 - float(inAO.sample(llmAO, in.uv).r);
+        float aoMask = frame.liveLookMatchStrength * adapt * blownGuard * occ;
+        mixed *= mix(1.0, max(frame.liveLookAODarken, 0.0), aoMask);
+    }
+
     // Phase 4.21 — read the GPU-computed smoothed exposure from the
     // auto-exposure buffer when the host has the feature on; otherwise
     // fall back to the static scalar in FrameUniforms. The estimator
@@ -735,7 +1039,70 @@ fragment float4 illumi_tonemap_fs(
     // sensor/illuminant shift), so they go in before exposure + ACES. Defaults
     // (whiteBalanceK = 6500, tint = 0) make both gains exactly (1,1,1) → no-op.
     float3 graded = mixed * whiteBalanceGain(frame.whiteBalanceK) * tintGain(frame.tint);
-    float3 mapped = aces(graded * exposure);
+    // The SCENE-referred exposed radiance — the last value before any display
+    // transform. Held in a named local because the film stock below is a second,
+    // ALTERNATIVE display transform of this same value, not a grade layered on the
+    // output of the first one (DH-0878).
+    float3 exposedScene = graded * exposure;
+
+    // ── Natural (cos⁴) vignetting — the LENS losing light off-axis ─────────────
+    // Illuminance falls as cos⁴ of the field angle, and tan(angle) = r/f, so
+    // cos⁴ = 1/(1 + (r/f)²)². With ρ the radius as a fraction of the half-diagonal,
+    // (r/f)² = K·ρ² for K = (halfDiagonalMM / f)² — one scalar the host computes from the
+    // lens it is already projecting with. A 16 mm therefore darkens its corners visibly and
+    // a 100 mm barely at all, which is the whole point: `vignetteStrength` further down is a
+    // free artistic dial that knows nothing about the lens, and this is the physics.
+    //
+    // It multiplies the SCENE, before exposure's meter and before the tonemap, because that
+    // is where a lens actually takes the light: the shoulder is then free to recover some of
+    // it, exactly as a real negative does. A post-tonemap multiply can only crush.
+    // 0 ⇒ the branch never runs ⇒ byte-identical.
+    if (frame.naturalVignetteK > 0.0) {
+        float2 d   = in.uv - 0.5;
+        float  r2  = dot(d, d) * 2.0;                 // 0 at centre → 1 at the corner
+        float  cos2 = 1.0 / (1.0 + frame.naturalVignetteK * r2);
+        exposedScene *= cos2 * cos2;                  // cos⁴
+    }
+
+    float3 mapped = displayTransform(exposedScene, frame.displayTransform);
+
+    // ── Film stock — a second DISPLAY TRANSFORM, not a grade on top of one ─────
+    //
+    // The Resolve Film Look cubes declare their domain: input Cineon printing-
+    // density log, output the stock's 'look' in Rec.709 gamma 2.4. The cube IS a
+    // scene → print rendering. It used to be evaluated on `mapped` — the ACES
+    // output, already `saturate`d into [0,1] — and that is wrong twice over
+    // (DH-0878):
+    //
+    //  • Cineon reference white is code 685, i.e. axis 0.6696. A display value can
+    //    never exceed 1.0, so the top 33 % of the cube's own input axis — the print
+    //    stock's SHOULDER, the part that makes film look like film — was never
+    //    addressed at all. The stock could only ever act as a midtone tint.
+    //  • It was a double tone map: ACES rolls the shoulder, then a stock whose whole
+    //    job is to BE the shoulder rolls what is left of it again.
+    //
+    // Evaluating it on `exposedScene` instead puts the scene's real highlight
+    // headroom on the axis (scene 1.0 → 0.6696; ~3.7 stops over white reaches 1.0),
+    // and makes `filmLUTStrength` a coherent blend between two display transforms of
+    // ONE scene — 0 = pure ACES, 1 = pure print stock — rather than a partial second
+    // pass over the first one's output. Everything downstream (saturation, tone
+    // curve, split tone, the creative LUT, vignette, grain, dither) then grades the
+    // chosen transform, which is the order a real DI runs in; the stock used to sit
+    // after all of them, grading an image already dithered to 8 bits.
+    if (frame.filmLUTStrength > 0.001) {
+        constexpr sampler lutSampler(filter::linear, address::clamp_to_edge);
+        // Cineon forward: cv = (685 + 300·log10(linear)) / 1023 — 10-bit printing
+        // density, reference white at code 685, 300 code values per decade.
+        float3 logc = saturate((685.0 + 300.0 * log10(max(exposedScene, float3(1e-4)))) / 1023.0);
+        // Half-texel inset: coord = (logc·(N−1) + 0.5)/N. N comes from the TEXTURE
+        // (`filmLUTSize`), not a constant — the stocks are authored as 33-cubes and the
+        // app ships them as such (DH-0879); a hardcoded 16 here would sample a 33³ cube
+        // on 16-cell coordinates and read as a grade rather than as a bug.
+        float  n   = max(frame.filmLUTSize, 2.0);
+        float3 uvw = (logc * (n - 1.0) + 0.5) / n;
+        float3 stock = pow(saturate(float3(filmLUT.sample(lutSampler, uvw).rgb)), float3(2.4));
+        mapped = saturate(mix(mapped, stock, frame.filmLUTStrength));
+    }
     // Phase 4.15 — post-tonemap saturation boost. Narkowicz's fitted ACES
     // famously compresses midtone chroma harder than SCN's HDR chain, so
     // the deferred pipeline reads consistently flatter than the SCN
@@ -768,6 +1135,38 @@ fragment float4 illumi_tonemap_fs(
     // act on display-referred values. Defaults (contrast = shadows = highlights
     // = 1.0) make this an exact no-op.
     mapped = saturate(toneCurve(mapped, frame.contrast, frame.shadows, frame.highlights));
+
+    // ── Photographic finish: highlight chroma roll-off ────────────────────────
+    // A camera's brightest values lose colour on the way to white — dye layers and
+    // sensor channels clip in turn, so a hot warm surface arrives as pale cream, not
+    // as saturated yellow. ACES gives us that for free, and then the FLAT
+    // `tonemapSaturation` multiply above takes it straight back out (it lerps away
+    // from luma by the same factor at 0.95 as at 0.2). Roll the chroma back off, but
+    // only at the top of the scale, so the midtone chroma that multiply exists for
+    // survives. 0 (DEFAULT) ⇒ the branch never runs ⇒ byte-identical.
+    if (frame.highlightChromaRolloff > 0.0) {
+        float hl = dot(mapped, float3(0.2126, 0.7152, 0.0722));
+        // Weight starts at mid-grey and reaches full at white, so a correctly-exposed
+        // midtone is untouched and only the shoulder loses colour.
+        float w = smoothstep(0.45, 1.0, hl) * frame.highlightChromaRolloff;
+        mapped = max(mix(mapped, float3(hl), w), 0.0);
+    }
+    // ── Photographic finish: split tone (shadow / highlight temperature) ──────
+    // Two temperatures on one image, masked by luma. Real interiors read as
+    // photographs partly because their shadows are lit by a DIFFERENT illuminant
+    // from their highlights (skylight in the shadow, tungsten in the pool), and a
+    // renderer whose whole frame rides one white balance has no way to say that.
+    // Reuses `whiteBalanceGain` — the same curve as the global control, normalized to
+    // unit luma, so this shifts hue without changing exposure. 6500/6500 (DEFAULTS)
+    // ⇒ both gains are exactly (1,1,1) ⇒ the branch never runs ⇒ byte-identical.
+    if (frame.shadowTemperatureK != 6500.0 || frame.highlightTemperatureK != 6500.0) {
+        float sl = dot(mapped, float3(0.2126, 0.7152, 0.0722));
+        float shadowW = 1.0 - smoothstep(0.0, 0.5, sl);
+        float highW   = smoothstep(0.5, 1.0, sl);
+        float3 g = mix(float3(1.0), whiteBalanceGain(frame.shadowTemperatureK), shadowW)
+                 * mix(float3(1.0), whiteBalanceGain(frame.highlightTemperatureK), highW);
+        mapped = saturate(mapped * g);
+    }
 
     // ── Axial chromatic aberration ("purple fringing") ────────────────────────
     // Longitudinal CA: a real lens focuses wavelengths at slightly different
@@ -849,14 +1248,38 @@ fragment float4 illumi_tonemap_fs(
         // RAW IEEE BITS (`as_type`), which extracts the most decorrelation the host's
         // `float` clock can carry: any two frames whose `frame.time` differ at all reseed.
         uint2 gp = uint2(gpf);
-        uint  h  = (gp.x * 73856093u) ^ (gp.y * 19349663u) ^ (as_type<uint>(frame.time) * 83492791u);
-        h ^= h >> 16; h *= 0x7feb352du;
-        h ^= h >> 15; h *= 0x846ca68bu;
-        h ^= h >> 16;
-        float n = float(h) * (1.0 / 4294967296.0) - 0.5;   // uniform ∈ [-0.5, 0.5)
+        uint  t  = as_type<uint>(frame.time);
+        // FOUR draws from the same bit mix, salted per draw: one shared luminance term plus
+        // an independent term per channel. A salt of 0 reproduces the original hash exactly,
+        // so the shared term is the grain this used to emit.
+        float n[4];
+        for (uint c = 0; c < 4; ++c) {
+            uint h = (gp.x * 73856093u) ^ (gp.y * 19349663u) ^ (t * 83492791u)
+                   ^ (c * 2654435761u);
+            h ^= h >> 16; h *= 0x7feb352du;
+            h ^= h >> 15; h *= 0x846ca68bu;
+            h ^= h >> 16;
+            n[c] = float(h) * (1.0 / 4294967296.0) - 0.5;   // uniform ∈ [-0.5, 0.5)
+        }
+        // ── Grain has COLOUR (DH-0880) ───────────────────────────────────────────
+        // One scalar added to all three channels is pure luminance noise, which is what
+        // video noise looks like. Film grain is per-dye-layer: three emulsion layers with
+        // independent silver, only partly correlated, and that faint chroma shimmer is a
+        // large part of why grain reads as film. 0.80 shared leaves ~24 % of each channel's
+        // amplitude independent — present, not a party trick. The `norm` keeps the total
+        // per-channel variance equal to the old monochrome grain's, so the strength dial
+        // means what it always meant.
+        const float kShared = 0.80, kOwn = 1.0 - kShared;
+        const float norm = 1.0 / sqrt(kShared * kShared + kOwn * kOwn);
+        float3 nRGB = (kShared * n[0] + kOwn * float3(n[1], n[2], n[3])) * norm;
+        // ── …and it is not a symmetric parabola ──────────────────────────────────
+        // `4·l·(1−l)` peaks exactly at mid-grey and dies at both ends at the same rate.
+        // Negative grain is roughly constant in DENSITY, so through the print the visible
+        // granularity peaks in the mid-to-LOW tones with a long tail into the shadows and a
+        // short one into the highlights, where the dye is thin. Asymmetric on purpose.
         float lumG = dot(mapped, float3(0.2126, 0.7152, 0.0722));
-        float mask = 4.0 * lumG * (1.0 - lumG);       // parabola: 1 at mid-grey, 0 at ends
-        mapped = saturate(mapped + n * frame.filmGrainStrength * mask);
+        float mask = smoothstep(0.0, 0.12, lumG) * (1.0 - smoothstep(0.55, 1.0, lumG));
+        mapped = saturate(mapped + nRGB * frame.filmGrainStrength * mask);
     }
 
     // ── Colour-grade LUT (issue #65) ──────────────────────────────────────────
@@ -898,23 +1321,6 @@ fragment float4 illumi_tonemap_fs(
         float tpdf = (n0 + n1) - 1.0;                    // ∈ [-1, 1], triangular
         srgb += tpdf * (1.0 / 255.0);                    // ±1 LSB at 8-bit
         mapped = pow(saturate(srgb), float3(2.2));       // decode back to linear
-    }
-
-    // Phase 9 — film-stock LUT colour grade. Samples a 16×16×16 3D LUT
-    // (stored as a 256×16 PNG strip: 16 blue slices, each 16×16, laid left
-    // to right; the Swift host unpacks this into a proper MTLTexture3D).
-    // The LUT expects Cineon log input but we apply it post-ACES-tonemapper
-    // for a film-inspired grade (not technically accurate emulation — per spec).
-    // `filmLUTStrength` blends between ungraded and graded result.
-    if (frame.filmLUTStrength > 0.001) {
-        constexpr sampler lutSampler(filter::linear, address::clamp_to_edge);
-        // Remap `mapped` from [0,1] linear into LUT normalised coords. A 16-cell
-        // LUT needs a half-texel inset so the sample lands at the cell centre:
-        // coord = (mapped * (N-1) + 0.5) / N  where N = 16.
-        float3 uvw = (mapped * 15.0 + 0.5) / 16.0;
-        float3 graded = filmLUT.sample(lutSampler, uvw).rgb;
-        mapped = mix(mapped, graded, frame.filmLUTStrength);
-        mapped = saturate(mapped);
     }
 
     // ── Diagram cross-fade ───────────────────────────────────────────────────
