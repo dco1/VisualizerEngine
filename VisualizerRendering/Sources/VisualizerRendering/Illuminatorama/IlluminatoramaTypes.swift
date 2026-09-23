@@ -1185,6 +1185,16 @@ public struct IlluminatoramaInstance {
     //   w = target: 0 = emission only · 1 = albedo + emission
     public var uvWarp: SIMD4<Float> = .zero
 
+    /// **Animated hue cycle of TAGGED vertex colour** (offsets 352–367; stride 352 → 368). The
+    /// G-buffer rotates the vertex colour's hue on vertices whose `tangent.w > 0.5` — a host tag;
+    /// foliage wind meshes pack (sway, phase, flutter, tag) in tangent — so a flower's petals
+    /// change colour while leaves and stems do not, animated on the GPU by frame time: set once,
+    /// no per-frame instance upload.
+    ///   x = strength 0…1 (0 = off: the default and an exact no-op for every existing host)
+    ///   y = phase (radians) · z = speed (radians/second)
+    ///   w = spatial wave (radians per metre along world (x, z)·(0.6, 0.8)) — a travelling band
+    public var hueCycle: SIMD4<Float> = .zero
+
     public init(
         modelMatrix: simd_float4x4,
         albedo: SIMD3<Float> = SIMD3(0.8, 0.8, 0.8),
@@ -1217,10 +1227,10 @@ public struct IlluminatoramaInstance {
         self.normalMatrix = Self.normalMatrix(from: m)
     }
 
-    /// Compile-time guard: Swift and Metal structs must agree on 352 bytes.
+    /// Compile-time guard: Swift and Metal structs must agree on 368 bytes.
     /// If this fires, either a Swift field was added without the matching Metal
     /// field (or vice versa), or alignment changed unexpectedly.
-    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 352, "IlluminatoramaInstance stride must be 352") }()
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 368, "IlluminatoramaInstance stride must be 368") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //

@@ -513,6 +513,16 @@ fragment GBufferOut illumi_fs(
     // .color)) actually paints the fragment. SceneKit convention is
     // multiplicative: vertex colour and material diffuse compose.
     albedo *= in.vertexColor.rgb;
+    // Animated hue cycle on host-TAGGED vertices (Instance.hueCycle; tangent.w > 0.5 is the tag).
+    // Rodrigues rotation about the grey axis: hue turns, brightness and saturation hold.
+    if (inst.hueCycle.x > 0.0f && in.worldTangent.w > 0.5f) {
+        float theta = inst.hueCycle.y + frame.time * inst.hueCycle.z
+                    + dot(in.worldPos.xz, float2(0.6f, 0.8f)) * inst.hueCycle.w;
+        const float3 k = float3(0.57735027f);
+        float c = cos(theta), s = sin(theta);
+        float3 rotated = albedo * c + cross(k, albedo) * s + k * dot(k, albedo) * (1.0f - c);
+        albedo = mix(albedo, max(rotated, 0.0f), saturate(inst.hueCycle.x));
+    }
     // Per-INSTANCE macro tone (the MACRO tier — a slight achromatic per-object lighten/darken so
     // two pieces wearing the same material id don't read as the same pixels twice). Identity (1)
     // by default ⇒ an exact no-op for every instance and host that never opts in.

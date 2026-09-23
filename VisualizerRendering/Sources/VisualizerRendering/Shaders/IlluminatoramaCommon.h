@@ -797,12 +797,21 @@ struct Instance {
     //   z = temporal speed in radians/second
     //   w = target: 0 = emission only, 1 = albedo + emission
     float4   uvWarp;
+
+    // ── Animated HUE CYCLE of tagged vertex colour (see IlluminatoramaGBuffer.metal) ──
+    // NEW 16-byte cluster (offsets 352-367): stride 352 -> 368. Rotates the hue of the vertex
+    // colour on vertices whose tangent.w > 0.5 (a host tag — foliage wind meshes pack
+    // (sway, phase, flutter, TAG) in tangent), so a flower's petals can change colour while its
+    // leaves and stems stay green, animated by frame time on the GPU (no per-frame upload).
+    //   x = strength 0…1 (0 = off — the default, an exact no-op)
+    //   y = phase (rad) · z = speed (rad/s) · w = spatial wave (rad per metre along (0.6, 0.8))
+    float4   hueCycle;
 };
 
 // The Swift mirror (`IlluminatoramaInstance._assertStride240`) has always asserted this
 // side of the contract; this is the other side, and it costs a compile. A Swift field
 // added without its Metal twin used to be caught only by a wrong-looking render.
-static_assert(sizeof(Instance) == 352, "Instance must match IlluminatoramaInstance (352 bytes)");
+static_assert(sizeof(Instance) == 368, "Instance must match IlluminatoramaInstance (368 bytes)");
 
 // ── Anisotropy base tangent (DH-0478) ─────────────────────────────────────────────────────
 // The in-plane direction the grain lobe measures its stretch along when a material has no
