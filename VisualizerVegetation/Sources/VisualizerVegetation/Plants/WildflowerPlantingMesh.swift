@@ -306,7 +306,7 @@ public enum WildflowerPlantingMesh {
                 out.append(Plant(kind: kind, variant: Int(rng.next() % UInt64(variantCount(kind))), position: p,
                                  heading: rng.unit() * 2 * Double.pi,
                                  // Height varies a LOT in a sown bed — a few plants stand well above the sward.
-                                 scale: 0.6 + rng.unit() * rng.unit() * 1.2))
+                                 scale: 0.75 + rng.unit() * rng.unit() * 1.2))
             }
         }
         return out
