@@ -2407,6 +2407,16 @@ public final class IlluminatoramaRenderer {
     /// `encodeTonemapPass`; chosen by `acquireWriteTarget()` each frame.
     private var tonemapWriteTarget: MTLTexture
     private let presentSync = IlluminatoramaPresentSync()
+    /// **Latency-tolerant pipelining.** The adaptive frames-in-flight guard drops to ONE frame
+    /// in flight once the GPU frame passes ~36 ms, because a second queued frame on a heavy scene
+    /// only adds a frame of INPUT latency to a drag. A host whose camera is not driven by input —
+    /// an autonomous flythrough, a recorder, a screensaver — has no such latency to protect, and at
+    /// 30–45 ms GPU frames the single-frame depth quantises delivery to the 60 Hz tick (a 37 ms
+    /// frame shows every 50 ms). `true` keeps two frames in flight regardless of GPU time.
+    /// Default `false` = the adaptive guard, byte-identical for every existing host.
+    public var pipelineLatencyTolerant: Bool = false {
+        didSet { presentSync.setLatencyTolerant(pipelineLatencyTolerant) }
+    }
     private let gpuMeter = IlluminatoramaGPUMeter()
     // #60 task 4 / #6 — per-compute-pass GPU timer (env-gated). Assigned in init
     // once `device` exists. Off by default; no-ops without VIZ_ILLUMI_PASS_PROFILE.
@@ -15042,6 +15052,9 @@ private final class IlluminatoramaPresentSync: @unchecked Sendable {
     private var retired = false
     /// Current effective depth target, with hysteresis so it doesn't flap.
     private var depth: Int = IlluminatoramaRenderer.maxFramesInFlight
+    /// Host opted out of the latency guard (`pipelineLatencyTolerant`): always full depth.
+    private var latencyTolerant = false
+    func setLatencyTolerant(_ on: Bool) { lock.lock(); latencyTolerant = on; lock.unlock() }
     /// Hysteresis band (~2 ticks): pipeline only while the GPU frame is light.
     private static let pipelineEnterMs = 30.0   // drop to 1→2 when EMA below this
     private static let pipelineExitMs  = 36.0   // rise to 2→1 when EMA above this
@@ -15056,7 +15069,9 @@ private final class IlluminatoramaPresentSync: @unchecked Sendable {
         if gpuMs > 0 {
             gpuMsEMA = gpuMsEMA == 0 ? gpuMs : gpuMsEMA * 0.9 + gpuMs * 0.1
         }
-        if depth >= IlluminatoramaRenderer.maxFramesInFlight {
+        if latencyTolerant {
+            depth = IlluminatoramaRenderer.maxFramesInFlight
+        } else if depth >= IlluminatoramaRenderer.maxFramesInFlight {
             if gpuMsEMA > Self.pipelineExitMs { depth = 1 }
         } else {
             if gpuMsEMA < Self.pipelineEnterMs { depth = IlluminatoramaRenderer.maxFramesInFlight }
