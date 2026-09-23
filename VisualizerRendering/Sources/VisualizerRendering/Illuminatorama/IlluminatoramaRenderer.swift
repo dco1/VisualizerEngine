@@ -2414,6 +2414,10 @@ public final class IlluminatoramaRenderer {
     /// 30–45 ms GPU frames the single-frame depth quantises delivery to the 60 Hz tick (a 37 ms
     /// frame shows every 50 ms). `true` keeps two frames in flight regardless of GPU time.
     /// Default `false` = the adaptive guard, byte-identical for every existing host.
+    /// GPU time (ms) of the most recently COMPLETED frame — a host-side hitch hunt without the
+    /// pass profiler (per-frame, thread-safe; 0 before the first frame completes).
+    public var lastGPUFrameMs: Double { presentSync.lastGpuMs }
+
     public var pipelineLatencyTolerant: Bool = false {
         didSet { presentSync.setLatencyTolerant(pipelineLatencyTolerant) }
     }
@@ -4484,6 +4488,8 @@ public final class IlluminatoramaRenderer {
     private struct CloudInViewUniforms {
         var invViewProjection: simd_float4x4
         var cameraWorldPos: SIMD4<Float>
+        /// x = frame time (s) — per-frame sky animation (lava lamp) in the in-view pass.
+        var extra: SIMD4<Float> = .zero
     }
     private let cloudInViewPipeline: MTLComputePipelineState?
     private let cloudInViewUniformBuffer: MTLBuffer
@@ -12789,7 +12795,8 @@ public final class IlluminatoramaRenderer {
         }
         let f = lowRes == nil ? 1 : factor
         var u = CloudInViewUniforms(invViewProjection: fu.invViewProjection,
-                                    cameraWorldPos: SIMD4<Float>(fu.cameraWorldPos, f > 1 ? Float(f) : 0))
+                                    cameraWorldPos: SIMD4<Float>(fu.cameraWorldPos, f > 1 ? Float(f) : 0),
+                                    extra: SIMD4<Float>(time, 0, 0, 0))
         memcpy(cloudInViewUniformBuffer.contents(), &u, MemoryLayout<CloudInViewUniforms>.stride)
         guard let enc = timedComputeEncoder(cb, "cloudInView") else { return }
         enc.label = "Illuminatorama.cloudInView"
@@ -12813,6 +12820,7 @@ public final class IlluminatoramaRenderer {
             enc2.setTexture(lowRes, index: 1)
             enc2.setTexture(depthTexture, index: 2)
             enc2.setBuffer(cloudInViewUniformBuffer, offset: 0, index: 0)
+            enc2.setBuffer(skyU, offset: 0, index: 1)
             dispatch(enc2, pipeline: up, width: width, height: height)
             enc2.endEncoding()
         } else {
@@ -15064,8 +15072,16 @@ private final class IlluminatoramaPresentSync: @unchecked Sendable {
     /// this frame's permit normally or HOLDS it to converge the effective in-flight
     /// capacity to that depth. Deadlock-free: `heldPermits` is capped at
     /// `maxFramesInFlight - 1`, so a permit always remains in circulation.
+    /// The most recent completed frame's GPU time (ms), for hosts' own diagnostics.
+    private(set) var lastGpuMs: Double {
+        get { lock.lock(); defer { lock.unlock() }; return _lastGpuMs }
+        set { _lastGpuMs = newValue }
+    }
+    private var _lastGpuMs: Double = 0
+
     func frameCompletedAdaptive(gpuMs: Double, semaphore: DispatchSemaphore) {
         lock.lock()
+        _lastGpuMs = gpuMs
         if gpuMs > 0 {
             gpuMsEMA = gpuMsEMA == 0 ? gpuMs : gpuMsEMA * 0.9 + gpuMs * 0.1
         }

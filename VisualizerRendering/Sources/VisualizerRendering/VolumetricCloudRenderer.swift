@@ -411,6 +411,29 @@ public final class VolumetricCloudRenderer {
         public var cirrusStretch: Float = 6
         /// Drift speed relative to the deck's wind (the jet is faster aloft).
         public var cirrusDrift: Float = 2
+        /// THREADS mode: denser, strongly curled filaments that flow — they stream along the jet
+        /// while the curl field drifts and morphs, as if blown. Off = the plain veil.
+        public var cirrusThreads: Bool = false
+        /// Threads: flow speed (1 ≈ a gentle stream).
+        public var cirrusFlow: Float = 1
+        /// Threads: spatial frequency multiplier (higher = finer, more numerous threads).
+        public var cirrusFrequency: Float = 1
+        /// Tint multiplied into the veil's radiance (white = the physical colour).
+        public var cirrusTint: SIMD3<Float> = SIMD3<Float>(1, 1, 1)
+
+        // ── Lava-lamp sky (opt-in) ───────────────────────────────────────
+        /// Replace the atmosphere with a lava lamp: metaball wax rising over a glowing gradient,
+        /// emissive HDR (it lights the scene through the IBL like any sky). Off = byte-identical.
+        public var lavaLamp: Bool = false
+        /// Blob size multiplier (1 = a handful of big blobs across the dome).
+        public var lavaScale: Float = 1
+        /// Radiance of the lamp (HDR scale).
+        public var lavaGlow: Float = 6
+        public var lavaBackground: SIMD3<Float> = SIMD3<Float>(0.35, 0.04, 0.10)
+        /// Speed multiplier on the wax's rise and wander (1 = a slow, lava-lamp pace).
+        public var lavaSpeed: Float = 1
+        public var lavaBlobA: SIMD3<Float> = SIMD3<Float>(1.0, 0.35, 0.05)
+        public var lavaBlobB: SIMD3<Float> = SIMD3<Float>(1.0, 0.12, 0.25)
 
         /// The flag as the kernels honour it: atmosphere-lit clouds need the nishita sky.
         var physicalCloudLighting: Bool { cloudLightingFromAtmosphere && atmosphere == .nishita }
@@ -870,6 +893,13 @@ struct SkyUniforms {
     /// Cirrus veil — see the Metal mirror.
     var cirrusA: SIMD4<Float>
     var cirrusB: SIMD4<Float>
+    var cirrusC: SIMD4<Float>
+    var cirrusTint: SIMD4<Float>
+    /// Lava-lamp sky — see the Metal mirror.
+    var lavaA: SIMD4<Float>
+    var lavaBG: SIMD4<Float>
+    var lavaBlobA: SIMD4<Float>
+    var lavaBlobB: SIMD4<Float>
     /// GPU-WRITTEN by `volSkyCloudLight` (never by the host upload — see `hostPrefixLength`).
     var cloudLitSun: SIMD4<Float>
     var cloudLitAmbient: SIMD4<Float>
@@ -957,6 +987,12 @@ struct SkyUniforms {
         self.cirrusA = SIMD4<Float>(max(0, min(1, params.cirrusCoverage)), max(0, params.cirrusOpacity),
                                     params.cirrusAltitude, max(1e-6, params.cirrusScale))
         self.cirrusB = SIMD4<Float>(cd.x, cd.y, max(1, params.cirrusStretch), params.cirrusDrift)
+        self.cirrusC = SIMD4<Float>(params.cirrusThreads ? 1 : 0, params.cirrusFlow, max(0.05, params.cirrusFrequency), 0)
+        self.cirrusTint = SIMD4<Float>(simd_max(params.cirrusTint, .zero), 0)
+        self.lavaA = SIMD4<Float>(params.lavaLamp ? 1 : 0, time, max(0.2, params.lavaScale), max(0, params.lavaGlow))
+        self.lavaBG = SIMD4<Float>(params.lavaBackground, max(0.001, params.lavaSpeed))
+        self.lavaBlobA = SIMD4<Float>(params.lavaBlobA, 0)
+        self.lavaBlobB = SIMD4<Float>(params.lavaBlobB, 0)
         self.cloudLitSun = .zero
         self.cloudLitAmbient = .zero
     }

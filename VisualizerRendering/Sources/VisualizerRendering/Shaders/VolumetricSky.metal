@@ -197,6 +197,17 @@ struct SkyUniforms {
     // cirrusB: xy = streak direction (xz, unit), z = along-streak stretch, w = drift multiplier
     float4 cirrusA;
     float4 cirrusB;
+    // cirrusC: x = THREADS mode (>0.5), y = flow speed, z = frequency multiplier, w = unused
+    // cirrusTint: rgb multiplies the veil's radiance (white = physical), w unused
+    float4 cirrusC;
+    float4 cirrusTint;
+    // ── Lava-lamp sky (Params.lavaLamp*) — host-owned ───────────────────────────────────────
+    // lavaA: x = on (>0.5), y = time (s, the dome's clock), z = blob scale, w = glow (radiance)
+    // lavaBG / lavaBlobA / lavaBlobB: rgb palette; lavaBG.w = speed multiplier (0 → treated as 1)
+    float4 lavaA;
+    float4 lavaBG;
+    float4 lavaBlobA;
+    float4 lavaBlobB;
     // ── Cloud lighting from the atmosphere — GPU-WRITTEN, never by the host ─────────────────
     // `volSkyCloudLight` fills these from the nishita march itself (the SAME `nishitaScatter`
     // the sky pixels use), so the deck is lit in the sky's own units. The host packs only the
@@ -801,6 +812,48 @@ inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u) {
     return mix(horizonHaze, u.groundColor.xyz, ground);
 }
 
+// ── Lava-lamp sky (Params.lavaLamp) ──────────────────────────────────────────────────────
+// Metaball "wax" on the sky dome: blobs rise slowly up the sphere, wander sideways, swell and
+// shrink, and merge where their fields overlap (Σ r²/d² over chord distance on the unit sphere),
+// over a glowing vertical gradient — a lamp's warm base fading to a darker top. Emissive HDR, so
+// it lights whatever the dome feeds (IBL) as well as filling the view.
+inline float3 lavaLampSky(float3 rd, float tIn, constant SkyUniforms &u) {
+    float t = tIn * (u.lavaBG.w > 0.0f ? u.lavaBG.w : 1.0f);
+    float scale = max(u.lavaA.z, 0.2f);
+    float field = 0.0f, wA = 0.0f;
+    // Enough wax that any view of the sky holds several blobs: they live in the band a camera
+    // actually sees (from just below the horizon to ~75°), rise through it and wrap around.
+    // The wax lives where a camera looks: from just below the horizon to ~37° up (a flight or
+    // eye-level camera sees 0–25°); spreading it to the zenith left ~1 blob per view.
+    constexpr int N = 48;
+    for (int i = 0; i < N; ++i) {
+        float fi = float(i);
+        float speed = 0.018f + 0.02f * fract(fi * 0.618f);
+        float el = -0.10f + fract(fi * 0.371f + t * speed) * 0.75f;
+        float az = fi * 2.3999f + 0.5f * sin(t * 0.05f + fi * 1.7f);
+        float3 c = float3(cos(az) * cos(el), sin(el), sin(az) * cos(el));
+        float R = scale * (0.21f + 0.07f * sin(t * 0.17f + fi * 2.1f)) * (0.6f + 0.4f * fract(fi * 0.83f));
+        float3 d = rd - c;
+        // COMPACT metaball kernel (Wyvill, zero beyond R): blobs stay distinct until they touch,
+        // then merge. The 1/d² kernel's long tails summed over every blob flooded the whole
+        // sky above threshold — one wax, no blobs (tuned against a CPU preview of this exact
+        // field over 40 random headings × times: never an empty view — 36 blobs over 0–47° left
+        // a 4 % minimum; 48 over −6…37° keeps the minimum near 15 %, the median near 40 %).
+        float k = max(0.0f, 1.0f - dot(d, d) / (R * R));
+        k *= k;
+        field += k;
+        wA += k * step(0.5f, fract(fi * 0.5f + 0.25f));   // alternate blobs take colour B
+    }
+    float blob = smoothstep(0.30f, 0.45f, field);
+    float3 wax = mix(u.lavaBlobA.rgb, u.lavaBlobB.rgb, saturate(wA / max(field, 1e-4f)));
+    // Hot core where the wax is thick or two blobs pile up.
+    wax *= 1.0f + 0.5f * smoothstep(0.6f, 1.4f, field);
+    float base = 1.0f - smoothstep(-0.2f, 0.9f, rd.y);
+    // The fluid behind the wax: darker than the wax so the blobs read, glowing at the lamp's base.
+    float3 bg = u.lavaBG.rgb * (0.12f + 0.55f * base);
+    return mix(bg, wax, blob) * max(u.lavaA.w, 0.0f);
+}
+
 // ── Cirrus: a thin, high ice veil (Params.cirrusCoverage) ────────────────────────────────
 // The cumulus march is a slab of rounded volumes; the fibrous "mares' tails" that streak a
 // clear California sky are a different object — ice at 7–10 km, optically THIN (τ ≈ 0.05–0.5),
@@ -817,7 +870,7 @@ inline float3 cloudAmbientBase(constant SkyUniforms &u) {
     return (u.skyGrade.z > 0.5f) ? u.cloudLitAmbient.xyz : u.skyZenith.xyz;
 }
 
-inline float3 applyCirrus(float3 sky, float3 ro, float3 rayDir, constant SkyUniforms &u,
+inline float3 applyCirrus(float3 sky, float3 ro, float3 rayDir, float time, constant SkyUniforms &u,
                           texture3d<float, access::sample> noiseVol) {
     float cov = u.cirrusA.x;
     if (cov <= 0.0f || rayDir.y <= 0.004f) return sky;
@@ -829,37 +882,52 @@ inline float3 applyCirrus(float3 sky, float3 ro, float3 rayDir, constant SkyUnif
     float2 along = normalize(u.cirrusB.xy + float2(1e-6f, 0.0f));
     float2 across = float2(-along.y, along.x);
     float tile = float(noiseVol.get_width());
-    float2 q = float2(dot(p, along) / max(u.cirrusB.z, 1.0f), dot(p, across)) * u.cirrusA.w;
-    // Curve and fork the fibres: a slow warp ACROSS the streak direction.
-    q.y += (noiseVol.sample(volSampler, float3(q * 0.31f, 0.37f) / tile).r - 0.5f) * 3.0f;
+    float stretch = max(u.cirrusB.z, 1.0f);
+    // P: noise-texel space, x along the jet, y across it.
+    // THREADS mode: denser, more strongly curled filaments that FLOW — the fibres stream along the
+    // jet and the curl field itself drifts and morphs, so the threads undulate as if blown.
+    bool threads = u.cirrusC.x > 0.5f;
+    float freq = threads ? max(u.cirrusC.z, 0.05f) : 1.0f;
+    float2 P = float2(dot(p, along), dot(p, across)) * (u.cirrusA.w * freq);
+    float flow = threads ? time * u.cirrusC.y : 0.0f;
+    P.x -= flow * 1.6f;                                   // stream along the jet
+    float2 warpShift = float2(flow * 0.45f, flow * 0.08f); // the curl field drifts slower …
+    float morph = threads ? flow * 0.004f : 0.0f;          // … and slowly changes shape
+    // Hooks and curls: a two-level warp ACROSS the streaks, slow then finer.
+    float warpA = threads ? 6.0f : 4.0f, warpB = threads ? 1.8f : 1.0f;
+    P.y += (noiseVol.sample(volSampler, float3((P + warpShift) * 0.18f, 0.37f + morph) / tile).r - 0.5f) * warpA;
+    P.y += (noiseVol.sample(volSampler, float3((P + warpShift * 1.7f) * float2(0.35f, 0.9f), 0.91f + morph) / tile).r - 0.5f) * warpB;
+    // BANDS: broad, very elongated sheets — the veils that sweep across a whole sky.
+    float bands = noiseVol.sample(volSampler, float3(P.x / (stretch * 2.2f), P.y * 0.30f, 0.53f) / tile).r;
+    bands = 0.7f * bands + 0.3f * noiseVol.sample(volSampler, float3(P.x / (stretch * 1.1f), P.y * 0.62f, 0.61f) / tile).r;
+    // FIBRES within them: stretched mid-scale streaks, three octaves, finer = more stretched.
     float n = 0.0f, amp = 0.55f, sumA = 0.0f;
-    float2 qq = q;
+    float2 qq = float2(P.x / stretch, P.y);
     for (int o = 0; o < 3; ++o) {
         n += amp * noiseVol.sample(volSampler, float3(qq, 0.13f + 0.29f * float(o)) / tile).r;
         sumA += amp; amp *= 0.5f;
-        qq = float2(qq.x * 1.7f, qq.y * 2.9f) + float2(17.3f, 5.1f);   // finer = more stretched
+        qq = float2(qq.x * 1.7f, qq.y * 3.1f) + float2(17.3f, 5.1f);
     }
     n /= sumA;
-    // Cirrus comes in PATCHES — bands and hooks of fibres with open blue between — so coverage
-    // is gated by a slow, barely-stretched mask an order of magnitude larger than the fibres.
-    float2 mq = float2(dot(p, along), dot(p, across)) * u.cirrusA.w * 0.11f;
-    float mask = noiseVol.sample(volSampler, float3(mq, 0.53f) / tile).r;
-    mask = 0.65f * mask + 0.35f * noiseVol.sample(volSampler, float3(mq * 2.3f + 11.0f, 0.61f) / tile).r;
-    float localCov = cov * smoothstep(0.38f, 0.68f, mask);
-    float d = smoothstep(1.0f - localCov, 1.0f - localCov + 0.35f, n) * step(1e-3f, localCov);
+    // Coverage over a WIDE soft band, so a sheet feathers out rather than ending on a line.
+    float body = bands * 0.62f + n * 0.38f;
+    float d = smoothstep(1.0f - cov, 1.0f - cov + 0.42f, body);
+    // Striations: fine, hard-stretched texture along the jet, carving the sheet into fibres.
+    float fib = noiseVol.sample(volSampler, float3(P.x * 0.9f, P.y * 9.0f, 0.71f) / tile).g;
+    d *= mix(0.35f, 1.0f, smoothstep(0.25f, 0.85f, fib));
+    // Thickness: slow variation — dense bright cores, thin translucent edges.
+    float thick = noiseVol.sample(volSampler, float3(P * float2(0.06f, 0.4f) + 13.0f, 0.44f) / tile).r;
+    d *= 0.35f + 1.3f * thick * thick;
     // Toward the horizon the plane's texels foreshorten to less than a pixel and the fibres alias
     // into dashes; the veil also sinks into the haze there. Fade it out over the last ~6°.
     d *= smoothstep(0.02f, 0.11f, rayDir.y);
-    // Fine fibre striations along the streak (the erosion channel, stretched).
-    float fib = noiseVol.sample(volSampler, float3(q.x * 1.6f, q.y * 6.0f, 0.71f) / tile).g;
-    d *= mix(0.55f, 1.0f, fib);
     if (d <= 1e-4f) return sky;
     float tau = u.cirrusA.y * d / max(rayDir.y, 0.07f);
     float cosT = clamp(dot(rayDir, -u.sunDir.xyz), -1.0f, 1.0f);
     float phase = 0.6f * hg(cosT, 0.75f) + 0.4f * (1.0f / (4.0f * M_PI_F));
     float3 amb = cloudAmbientBase(u);
     float  ambL = dot(amb, float3(0.2126f, 0.7152f, 0.0722f));
-    float3 L = cloudSunIrradiance(u) * phase + float3(ambL) * 1.6f;
+    float3 L = (cloudSunIrradiance(u) * phase + float3(ambL) * 1.6f) * u.cirrusTint.rgb;
     float a = 1.0f - exp(-tau);
     return sky * (1.0f - a) + L * a;
 }
@@ -1003,6 +1071,40 @@ inline float3 starField(float3 rayDir, float brightness) {
         }
     }
     return result * brightness * 2.2f;
+}
+
+// The SAME stars as `starField` (same 0.8° hashed cells, positions, magnitudes and tints —
+// so the view agrees with the dome the IBL sees), drawn for a camera instead of a 360° dome:
+// each star a Gaussian ~`pixelAngle` wide, so it lands on a pixel or two and stays a point.
+// `starField`'s soft halo exists only to survive the dome texture's bilinear filter; seen
+// through a lens it turned every star into a ~10 px blob.
+inline float3 starFieldSharp(float3 rayDir, float brightness, float pixelAngle) {
+    if (brightness <= 0.0f) return float3(0.0f);
+    float az = atan2(rayDir.z, rayDir.x);
+    float el = asin(clamp(rayDir.y, -1.0f, 1.0f));
+    float2 cellsPerRad = float2(450.0f / (2.0f * M_PI_F), 225.0f / M_PI_F);
+    float2 uv = float2(az + M_PI_F, el + M_PI_F * 0.5f) * cellsPerRad;
+    int2 ip = int2(floor(uv));
+    float2 fp = uv - float2(ip);
+    // Star radius in CELL units: ~0.75 px, the azimuth axis stretched by 1/cos(el).
+    float2 sigma = max(float2(pixelAngle * 0.75f) * cellsPerRad * float2(1.0f / max(cos(el), 0.05f), 1.0f),
+                       float2(1e-4f));
+    float3 result = float3(0.0f);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            int2 cell = ip + int2(dx, dy);
+            uint h = hash3(int3(cell.x, cell.y, 17));
+            if ((h & 0xFFu) < 10u) {
+                float2 starPos = float2(float((h >> 8u) & 0xFFu) / 255.0f, float((h >> 16u) & 0xFFu) / 255.0f);
+                float2 d = (fp - (float2(dx, dy) + starPos)) / sigma;
+                float  lum = exp(-0.5f * dot(d, d));
+                float  mag = 1.0f - float((h >> 28u) & 0xFu) / 15.0f;
+                float3 col = mix(float3(1.0f, 0.92f, 0.72f), float3(0.78f, 0.87f, 1.0f), mag * mag);
+                result += col * lum * (0.25f + 0.75f * mag);
+            }
+        }
+    }
+    return result * brightness * 6.0f;
 }
 
 // Moon disk with simple phase shading. The moon direction (moonParams.xyz)
@@ -1238,6 +1340,7 @@ kernel void volSkyRender(
             ? nishitaAtmosphereColor(rayDir, u)
             : atmosphereColor(rayDir, u);
         sky += sunDisk(rayDir, u);
+        if (u.lavaA.x > 0.5f) sky = lavaLampSky(rayDir, u.lavaA.y, u);
 
         // ── Night sky: stars + moon (additive, gated by nightBlend) ──
         // Skipped when the host renders the analytic screen-res night sky
@@ -1248,7 +1351,7 @@ kernel void volSkyRender(
             sky += starField(rayDir, u.nightParams.x) * nightBlend;
             sky += moonDisk(rayDir, u) * nightBlend;
         }
-        sky = applyCirrus(sky, u.cameraPos.xyz, rayDir, u, noiseVol);
+        sky = applyCirrus(sky, u.cameraPos.xyz, rayDir, u.lavaA.y, u, noiseVol);
     }
 
     // Compute ray–slab entry and exit (slab is infinite in XZ). Rays
@@ -1558,6 +1661,7 @@ kernel void volSkyRender(
 struct CloudInViewUniforms {
     float4x4 invViewProjection;  // host clip → world (jittered VP inverse)
     float4   cameraWorldPos;     // xyz = ray origin, w = downsample factor (≤1 = full res)
+    float4   extra;              // x = the renderer's frame time (s) — animates the lava lamp per frame
 };
 
 kernel void illumi_cloud_inview(
@@ -1610,14 +1714,19 @@ kernel void illumi_cloud_inview(
             ? nishitaAtmosphereColor(rayDir, u)
             : atmosphereColor(rayDir, u);
         sky += sunDisk(rayDir, u);
+        // The lava lamp animates on the RENDERER's frame clock here (every frame), not the
+        // dome's (host-throttled) — its blobs would otherwise step visibly.
+        if (u.lavaA.x > 0.5f) sky = lavaLampSky(rayDir, cv.extra.x, u);
         // Same analytic-night-sky skip as volSkyRender (cloudExtra2.y).
         float nightBlend = u.nightParams.w;
         if (nightBlend > 0.0f && rayDir.y > -0.05f && u.cloudExtra2.y > 0.5f) {
             sky += starField(rayDir, u.nightParams.x) * nightBlend;
             sky += moonDisk(rayDir, u) * nightBlend;
         }
-        sky = applyCirrus(sky, ro, rayDir, u, noiseVol);
+        sky = applyCirrus(sky, ro, rayDir, cv.extra.x, u, noiseVol);
     }
+    // Alpha for a texel with no deck in the way: fully transmissive (see the tail write).
+    float clearA = f > 1u ? 2.0f : 1.0f;
 
     float yCos = rayDir.y;
     float baseY = u.cloudSlab.x;
@@ -1625,7 +1734,7 @@ kernel void illumi_cloud_inview(
 
     float tEnter, tExit;
     if (ro.y < baseY) {
-        if (yCos < 0.01f) { outTex.write(float4(sky, 1.0f), gid); return; }
+        if (yCos < 0.01f) { outTex.write(float4(sky, clearA), gid); return; }
         tEnter = (baseY - ro.y) / yCos;
         tExit  = (topY  - ro.y) / yCos;
     } else if (ro.y <= topY) {
@@ -1634,12 +1743,12 @@ kernel void illumi_cloud_inview(
         else if (yCos < -0.001f) tExit = (baseY - ro.y) / yCos;
         else                     tExit = (topY - baseY) * 4.0f;
     } else {
-        if (yCos > -0.01f) { outTex.write(float4(sky, 1.0f), gid); return; }
+        if (yCos > -0.01f) { outTex.write(float4(sky, clearA), gid); return; }
         tEnter = (topY  - ro.y) / yCos;
         tExit  = (baseY - ro.y) / yCos;
     }
     tEnter = max(tEnter, 0.0f);
-    if (tExit <= tEnter) { outTex.write(float4(sky, 1.0f), gid); return; }
+    if (tExit <= tEnter) { outTex.write(float4(sky, clearA), gid); return; }
 
     // ── Cloud march (identical math to volSkyRender) ─────────────────
     int   steps     = max(1, int(u.marchBudgets.x));
@@ -1778,7 +1887,9 @@ kernel void illumi_cloud_inview(
     float effTrans = mix(1.0f, trans, blend);
     float3 col = sky * effTrans + lum * blend;
     // NO Reinhard here — the host tonemaps the HDR scene-colour once downstream.
-    outTex.write(float4(col, 1.0f), gid);
+    // Downsampled: alpha = 1 + transmittance, so the full-res upsample can put pixel-sharp
+    // stars BEHIND the clouds (alpha ≥ 1 still marks "marched"). Full-res: alpha 1, as before.
+    outTex.write(float4(col, f > 1u ? 1.0f + effTrans : 1.0f), gid);
 }
 
 // Depth-aware upsample of a downsampled in-view cloud march into the HDR composite. Sky pixels
@@ -1790,6 +1901,7 @@ kernel void illumi_cloud_upsample(
     texture2d<float, access::read>  lowRes [[texture(1)]],
     depth2d<float,   access::read>  gDepth [[texture(2)]],
     constant CloudInViewUniforms &cv       [[buffer(0)]],
+    constant SkyUniforms &u                [[buffer(1)]],
     uint2 gid                              [[thread_position_in_grid]]
 ) {
     if (gid.x >= outTex.get_width() || gid.y >= outTex.get_height()) return;
@@ -1800,21 +1912,40 @@ kernel void illumi_cloud_upsample(
     int2 p0 = int2(floor(p));
     float2 t = p - float2(p0);
     float3 acc = float3(0.0f);
-    float wsum = 0.0f;
+    float wsum = 0.0f, tr = 0.0f;
     for (int j = 0; j < 2; ++j) {
         for (int i = 0; i < 2; ++i) {
             int2 q = clamp(p0 + int2(i, j), int2(0), lmax);
             float4 s = lowRes.read(uint2(q));
-            float w = (i == 0 ? 1.0f - t.x : t.x) * (j == 0 ? 1.0f - t.y : t.y) * s.a;
+            float marched = step(0.5f, s.a);
+            float w = (i == 0 ? 1.0f - t.x : t.x) * (j == 0 ? 1.0f - t.y : t.y) * marched;
             acc += s.rgb * w;
+            tr += max(s.a - 1.0f, 0.0f) * w;
             wsum += w;
         }
     }
     if (wsum <= 1e-5f) {
         // Every neighbour was geometry-only (a sky pixel inside a thin gap): the texel that
         // contains this pixel marched it (its block had sky), so read that one.
-        acc = lowRes.read(uint2(clamp(int2(float2(gid) / f), int2(0), lmax))).rgb;
-        wsum = 1.0f;
+        float4 s = lowRes.read(uint2(clamp(int2(float2(gid) / f), int2(0), lmax)));
+        acc = s.rgb; tr = max(s.a - 1.0f, 0.0f); wsum = 1.0f;
     }
-    outTex.write(float4(acc / wsum, 1.0f), gid);
+    float3 col = acc / wsum;
+    // Night sky at FULL resolution, behind the clouds (when the host keeps celestials out of the
+    // dome): pixel-sharp stars and the moon disc, attenuated by the deck's transmittance.
+    float nightBlend = u.nightParams.w;
+    if (nightBlend > 0.0f && u.cloudExtra2.y <= 0.5f && u.atmosphereParams.z <= 0.5f) {
+        uint W = outTex.get_width(), H = outTex.get_height();
+        float2 uv = (float2(gid) + 0.5f) / float2(W, H);
+        float4 wp = cv.invViewProjection * float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 1.0f, 1.0f);
+        float3 rd = normalize(wp.xyz / wp.w - cv.cameraWorldPos.xyz);
+        float2 uv1 = (float2(gid) + float2(0.5f, 1.5f)) / float2(W, H);
+        float4 wp1 = cv.invViewProjection * float4(uv1.x * 2.0f - 1.0f, 1.0f - uv1.y * 2.0f, 1.0f, 1.0f);
+        float pixelAngle = acos(clamp(dot(rd, normalize(wp1.xyz / wp1.w - cv.cameraWorldPos.xyz)), -1.0f, 1.0f));
+        if (rd.y > -0.05f) {
+            float trans = tr / wsum;
+            col += (starFieldSharp(rd, u.nightParams.x, pixelAngle) + moonDisk(rd, u)) * nightBlend * trans;
+        }
+    }
+    outTex.write(float4(col, 1.0f), gid);
 }
