@@ -347,8 +347,9 @@ public enum WildflowerPlantingMesh {
             layersScratch = Mesh3()
             for _ in 0 ..< (1 + index % 3) {
                 let az = rng.unit() * 2 * Double.pi, reach = 0.02 + rng.unit() * 0.10
-                let s = stem(to: Vec3(cos(az) * reach, 0.40 + rng.unit() * 0.22, sin(az) * reach), radius: 0.0022)
-                umbel(at: s.tip + s.tangent * 0.012, radius: 0.0125 + rng.unit() * 0.003)
+                // Heads clear ABOVE the poppy cups (≈0.3–0.45 m): the pom-poms ride over the bloom.
+                let s = stem(to: Vec3(cos(az) * reach, 0.48 + rng.unit() * 0.22, sin(az) * reach), radius: 0.0024)
+                umbel(at: s.tip + s.tangent * 0.015, radius: 0.016 + rng.unit() * 0.003)
             }
 
         case .wildOat:
@@ -440,8 +441,8 @@ public enum WildflowerPlantingMesh {
             return [(.tuft, 0.30 * crowd),
                     (.wildOat, 0.035 * crowd),
                     (.poppy, 0.04 + 0.95 * orange),
-                    (.blueDicks, 0.02 + 0.80 * purple),
-                    (.goldfields, 0.10 + 0.12 * (1 - orange) * (1 - purple)),
+                    (.blueDicks, 0.05 + 0.80 * purple),     // a sprinkle everywhere, a swath in a drift
+                    (.goldfields, 0.16 + 0.12 * (1 - orange) * (1 - purple)),
                     (.lupine, 0.02 + 0.05 * purple),
                     (.popcorn, 0.015)]
         }

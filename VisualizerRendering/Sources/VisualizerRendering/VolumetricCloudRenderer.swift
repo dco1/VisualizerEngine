@@ -538,8 +538,15 @@ public final class VolumetricCloudRenderer {
         withUnsafeBytes(of: &u) { raw in
             uniformsBuffer.contents().copyMemory(from: raw.baseAddress!, byteCount: SkyUniforms.hostPrefixLength)
         }
-        guard params.physicalCloudLighting, let lightPipeline = cloudLightPipeline,
+        guard params.physicalCloudLighting else { lastCloudLightInputs = nil; return }
+        // The prepass is a pure function of these; its results persist in the GPU-owned tail,
+        // so a sky whose sun, atmosphere and deck base hold still needs no re-dispatch.
+        let inputs: [Float] = [u.sunDir.x, u.sunDir.y, u.sunDir.z, u.atmosphereParams.y,
+                               u.skyGrade.x, u.skyGrade.y, u.cloudSlab.x,
+                               u.skyHorizon.x, u.skyHorizon.y, u.skyHorizon.z]
+        guard inputs != lastCloudLightInputs, let lightPipeline = cloudLightPipeline,
               let cmd = commandQueue.makeCommandBuffer(), let enc = cmd.makeComputeCommandEncoder() else { return }
+        lastCloudLightInputs = inputs
         cmd.label = "volSkyCloudLight"
         enc.setComputePipelineState(lightPipeline)
         enc.setBuffer(uniformsBuffer, offset: 0, index: 0)
@@ -762,6 +769,8 @@ public final class VolumetricCloudRenderer {
     private let pipeline: MTLComputePipelineState?
     private let uniformsBuffer: MTLBuffer
     private let cloudLightPipeline: MTLComputePipelineState?
+    /// Inputs of the last `volSkyCloudLight` dispatch (nil = never / flag off).
+    private var lastCloudLightInputs: [Float]?
 
     /// Zeroed single-entry BurstLight buffer bound at index 1 whenever the
     /// host hasn't supplied `burstLights` — keeps the binding valid for the

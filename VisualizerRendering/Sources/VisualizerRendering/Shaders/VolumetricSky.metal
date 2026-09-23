@@ -847,6 +847,9 @@ inline float3 applyCirrus(float3 sky, float3 ro, float3 rayDir, constant SkyUnif
     mask = 0.65f * mask + 0.35f * noiseVol.sample(volSampler, float3(mq * 2.3f + 11.0f, 0.61f) / tile).r;
     float localCov = cov * smoothstep(0.38f, 0.68f, mask);
     float d = smoothstep(1.0f - localCov, 1.0f - localCov + 0.35f, n) * step(1e-3f, localCov);
+    // Toward the horizon the plane's texels foreshorten to less than a pixel and the fibres alias
+    // into dashes; the veil also sinks into the haze there. Fade it out over the last ~6°.
+    d *= smoothstep(0.02f, 0.11f, rayDir.y);
     // Fine fibre striations along the streak (the erosion channel, stretched).
     float fib = noiseVol.sample(volSampler, float3(q.x * 1.6f, q.y * 6.0f, 0.71f) / tile).g;
     d *= mix(0.55f, 1.0f, fib);
