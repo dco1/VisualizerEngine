@@ -503,7 +503,15 @@ struct FrameUniforms {
     float    liveLookGIDarken;        // multiplier the fake-bounce term mixes toward, <1
     float    liveLookGIWarmth;        // 0..1 blend toward the fake-bounce warm tilt
     float    liveLookAODarken;        // multiplier the fake-AO term mixes toward, <1
+    // Glow of TAGGED vertices — the frame-level gain on `Instance.tagGlow.x` (a static per-instance
+    // weight), so a host glides or modulates a glow with one float instead of re-uploading every
+    // instance. ONE new 16-byte cluster (stride 1568 → 1584).
+    float    tagGlowGain;
+    float    _padTagGlow0;
+    float    _padTagGlow1;
+    float    _padTagGlow2;
 };
+static_assert(sizeof(FrameUniforms) == 1584, "FrameUniforms must match IlluminatoramaFrameUniforms (1584 bytes)");
 
 // Secondary directional light (#60 task 5). Mirror of Swift
 // IlluminatoramaDirectionalLight. `dir` points TOWARD the light (world space,
@@ -806,12 +814,46 @@ struct Instance {
     //   x = strength 0…1 (0 = off — the default, an exact no-op)
     //   y = phase (rad) · z = speed (rad/s) · w = spatial wave (rad per metre along (0.6, 0.8))
     float4   hueCycle;
+
+    // ── GLOW of tagged vertex colour ──
+    // NEW 16-byte cluster (offsets 368-383): stride 368 -> 384. Same host tag as hueCycle
+    // (tangent.w ≈ 1): tagged vertices add their own final albedo (post hue cycle) × x ×
+    // FrameUniforms.tagGlowGain to the emission — a flower's petals glow in their own colour
+    // while leaves and stems do not.
+    //   x = static per-instance weight (0 = off — the default, an exact no-op) · yzw reserved (0)
+    float4   tagGlow;
 };
 
 // The Swift mirror (`IlluminatoramaInstance._assertStride240`) has always asserted this
 // side of the contract; this is the other side, and it costs a compile. A Swift field
 // added without its Metal twin used to be caught only by a wrong-looking render.
-static_assert(sizeof(Instance) == 368, "Instance must match IlluminatoramaInstance (368 bytes)");
+static_assert(sizeof(Instance) == 384, "Instance must match IlluminatoramaInstance (384 bytes)");
+
+// Every field at the Swift mirror's default (`IlluminatoramaInstance`'s property initialisers).
+// A GPU kernel that WRITES instances must start from this, not from `Instance inst;` — a local
+// struct is uninitialised in MSL, so any field the kernel does not name (every one added after
+// it was written: macroTone, layer, hueCycle, tagGlow…) shipped whatever the registers held.
+inline Instance illumiDefaultInstance() {
+    Instance d;
+    d.modelMatrix = float4x4(1.0f);  d.normalMatrix = float4x4(1.0f);
+    d.albedo = float3(0.8f);         d.metallic = 0.0f;
+    d.clearcoat = 0.0f;              d.clearcoatRoughness = 0.08f;   d.sheen = 0.0f;
+    d.emission = float3(0.0f);       d.roughness = 0.5f;
+    d.albedoTextureSlice = -1;       d.metallicTextureSlice = -1;    d.roughnessTextureSlice = -1;
+    d.normalTextureSlice = -1;       d.emissionTextureSlice = -1;    d.emissionIntensity = 1.0f;
+    d._padSlice1 = 0;
+    d.detailNormalTextureSlice = -1; d.detailNormalUVScale = 8.0f;   d.anisotropy = 0.0f;
+    d.highlight = 0;                 d.swayMode = 0;  d.swayLean = 0.0f;  d.swayJostle = 0.0f;
+    d.layer = 0xFFFFFFFFu;           d.antiTilingScale = 1.0f;
+    d.detailOcclusionStrength = 0.0f; d.detailRoughnessStrength = 0.0f; d.detailOcclusionUVScale = 0.0f;
+    d.patternCells = float2(0.0f);   d.patternJitter = 0.0f;         d.windScale = 0.0f;
+    d.woodKnots = float4(0.0f);      d.macroTone = 1.0f;             d.macroRoughnessDelta = 0.0f;
+    d.uvPhase = float2(0.0f);        d.sheenRoughness = 0.30f;       d.carpetMacro = float2(0.0f);
+    d.grainTangentTextureSlice = -1; d.thinTransmission = 0.0f;
+    d._padGrain1 = 0;                d._padGrain2 = 0;
+    d.uvWarp = float4(0.0f);         d.hueCycle = float4(0.0f);      d.tagGlow = float4(0.0f);
+    return d;
+}
 
 // ── Anisotropy base tangent (DH-0478) ─────────────────────────────────────────────────────
 // The in-plane direction the grain lobe measures its stretch along when a material has no

@@ -71,7 +71,7 @@ kernel void eggs_write_instances(
         tint = (sum / mag) * min(mag * U.tintScale, U.tintCap);
     }
 
-    Instance inst;
+    Instance inst = illumiDefaultInstance();
     inst.modelMatrix           = model;
     inst.normalMatrix          = normalMat;
     inst.albedo                = colors[i].xyz;
@@ -118,7 +118,7 @@ kernel void bulbs_write_instances(
     float  s   = lit ? U.displayRadius : 0.0;          // dark → scale 0 → invisible
     float  invS = (s > 1e-6) ? (1.0 / s) : 0.0;
 
-    Instance inst;
+    Instance inst = illumiDefaultInstance();
     inst.modelMatrix  = float4x4(float4(s,0,0,0), float4(0,s,0,0),
                                  float4(0,0,s,0), float4(p, 1.0));
     inst.normalMatrix = float4x4(float4(invS,0,0,0), float4(0,invS,0,0),
@@ -175,7 +175,7 @@ kernel void glow_write_instances(
     bool glowing = U.bloomScale > 0.0;
     float g = glowing ? 1.0 : 0.0;
 
-    Instance inst;
+    Instance inst = illumiDefaultInstance();
     inst.modelMatrix           = float4x4(float4(g,0,0,0), float4(0,g,0,0),
                                           float4(0,0,g,0), float4(0,0,0,1));
     inst.normalMatrix          = float4x4(float4(1,0,0,0), float4(0,1,0,0),

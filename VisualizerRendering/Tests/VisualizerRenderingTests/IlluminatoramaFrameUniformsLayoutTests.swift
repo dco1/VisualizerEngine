@@ -31,13 +31,15 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
     /// to a vector, one per light-layer bit, plus the enable word); 1536 → 1552 with the
     /// photographic-finish cluster (`highlightChromaRolloff` + the split-tone shadow /
     /// highlight temperatures + a pad); 1552 → 1568 with the DH-0715 live-lane look-match
-    /// cluster (`liveLookMatchStrength/GIDarken/GIWarmth/AODarken`).
+    /// cluster (`liveLookMatchStrength/GIDarken/GIWarmth/AODarken`); 1568 → 1584 with the
+    /// tagged-vertex glow gain cluster (`tagGlowGain` + 3 pads), pinned by the source's own
+    /// `static_assert(sizeof(FrameUniforms) == 1584)` in IlluminatoramaCommon.h.
     /// Verified against Metal by compiling a scratch kernel carrying
     /// `static_assert(sizeof(FrameUniforms) == 1568)`, which holds while the same assert at
     /// 1552 fails — i.e. the assert is live, not a tautology. (`offsetof` is not available
     /// in Metal; the tail offsets below are the Swift-side half of the check, and the fields
     /// are APPENDED, so stride pins them.)
-    private static let metalStride = 1568
+    private static let metalStride = 1584
 
     func testFrameUniformsStrideMatchesMetal() {
         XCTAssertEqual(MemoryLayout<IlluminatoramaFrameUniforms>.stride,
@@ -92,7 +94,9 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
         assertOffset(\.liveLookMatchStrength, 1552, "liveLookMatchStrength")
         assertOffset(\.liveLookGIDarken,      1556, "liveLookGIDarken")
         assertOffset(\.liveLookGIWarmth,      1560, "liveLookGIWarmth")
-        assertOffset(\.liveLookAODarken,      1564, "liveLookAODarken")    }
+        assertOffset(\.liveLookAODarken,      1564, "liveLookAODarken")
+        assertOffset(\.tagGlowGain,           1568, "tagGlowGain")
+    }
 
     /// The packing the shader's `gains[b >> 2][b & 3]` assumes, held on the Swift side that
     /// writes it. A table whose lanes are laid out differently from the way they are read is

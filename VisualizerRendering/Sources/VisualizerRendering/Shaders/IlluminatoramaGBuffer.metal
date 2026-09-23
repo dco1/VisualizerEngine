@@ -1248,6 +1248,13 @@ fragment GBufferOut illumi_fs(
         // HDR brightness (Pizza's heat coils were flat at intensity 1).
         emission += tx.rgb * inst.emissionIntensity;
     }
+    // Glow of host-TAGGED vertices (Instance.tagGlow; same tangent.w ≈ 1 tag as the hue cycle):
+    // the petal emits its own final albedo, so a hue-cycling flower glows in its current colour.
+    // Static per-instance weight × the frame's live gain.
+    float tagGlow = inst.tagGlow.x * frame.tagGlowGain;
+    if (tagGlow > 0.0f && in.worldTangent.w > 0.5f && in.worldTangent.w < 1.5f) {
+        emission += albedo * tagGlow;
+    }
     // Phase 7 — pack clearcoat (≥0) OR cloth sheen (<0) into emission.alpha (was always 1.0,
     // unused). A surface is polished OR cloth, never both, so one channel carries either: > 0 =
     // polished/lacquered second GGX lobe; < 0 = velvet/wool grazing-Fresnel sheen.

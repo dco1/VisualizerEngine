@@ -4495,6 +4495,16 @@ public final class IlluminatoramaRenderer {
     /// composites crisp camera-ray clouds into the HDR target (issue #61). OFF
     /// by default → every scene + the dome/IBL path is byte-identical.
     public var inViewCloudsEnabled = false
+    /// The clock the in-view sky animates by (the lava lamp's wax, the cirrus threads' flow) —
+    /// `nil` (the default) = `time`, byte-identical. A host that lets those speeds change live
+    /// passes its own INTEGRATED phase (Σ speed·dt) and sets the sky's speed factors to 1: the
+    /// shader multiplies clock × speed, so a speed step on the frame clock jumps the pattern by
+    /// time·Δspeed — hundreds of seconds of animation after a few minutes.
+    public var inViewSkyTime: Float? = nil
+    /// Frame-level gain on every instance's `tagGlow.x` weight (petal glow). 1 by default, so a
+    /// host that only sets per-instance weights still glows; instances with weight 0 — every
+    /// host that never opts in — are untouched by any value.
+    public var tagGlowGain: Float = 1
     /// Resolution the in-view cloud + atmosphere march runs at, as a fraction of the canvas
     /// (1 = full res, the default — byte-identical). 0.5 marches a quarter of the rays into an
     /// off-screen target and depth-aware-upsamples it into the sky pixels: clouds and the
@@ -5463,6 +5473,7 @@ public final class IlluminatoramaRenderer {
         timing.mark("render targets (internal \(self.width)×\(self.height) + LDR pool)")
 
         // ── Buffers ──────────────────────────────────────────────────────
+        _ = IlluminatoramaInstance._assertStride240   // the Swift half of the layout guard (a lazy static never ran unreferenced)
         let initInstCap = 64
         let initLightCap = 16
         guard let iba = device.makeBuffer(
@@ -12788,7 +12799,7 @@ public final class IlluminatoramaRenderer {
         let f = lowRes == nil ? 1 : factor
         var u = CloudInViewUniforms(invViewProjection: fu.invViewProjection,
                                     cameraWorldPos: SIMD4<Float>(fu.cameraWorldPos, f > 1 ? Float(f) : 0),
-                                    extra: SIMD4<Float>(time, 0, 0, 0))
+                                    extra: SIMD4<Float>(inViewSkyTime ?? time, 0, 0, 0))
         // setBytes, not a shared MTLBuffer: with two frames in flight a single buffer was overwritten by frame N+1 while frame N's kernels could still read it (the
         // camera matrix the rays — and the upsample's stars — are rebuilt from).
         let uStride = MemoryLayout<CloudInViewUniforms>.stride
@@ -13964,6 +13975,7 @@ public final class IlluminatoramaRenderer {
         u.liveLookGIDarken = liveLookGIDarken
         u.liveLookGIWarmth = max(0, min(4, liveLookGIWarmth))
         u.liveLookAODarken = effectiveLiveLookAODarken   // DH-0785 — never on top of traced AO
+        u.tagGlowGain = max(0, tagGlowGain)
         // Interior day-light separation. Mask 0 (default) ⇒ the kernel's factors stay
         // exactly 1.0 ⇒ byte-identical for every scene that never opts in.
         u.interiorMask = interiorLayerMask

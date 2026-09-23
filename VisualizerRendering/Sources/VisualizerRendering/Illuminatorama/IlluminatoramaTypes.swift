@@ -582,6 +582,12 @@ public struct IlluminatoramaFrameUniforms {
     public var liveLookGIDarken: Float = 0
     public var liveLookGIWarmth: Float = 0
     public var liveLookAODarken: Float = 0
+    /// Frame-level gain on `IlluminatoramaInstance.tagGlow.x` (see the renderer's `tagGlowGain`).
+    /// ONE new 16-byte cluster (stride 1568 → 1584).
+    public var tagGlowGain: Float = 0
+    public var _padTagGlow0: Float = 0
+    public var _padTagGlow1: Float = 0
+    public var _padTagGlow2: Float = 0
 
     /// Fill the eight gain vectors from a flat 32-entry table, and stamp the enable.
     public mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
@@ -1195,6 +1201,15 @@ public struct IlluminatoramaInstance {
     ///   w = spatial wave (radians per metre along world (x, z)·(0.6, 0.8)) — a travelling band
     public var hueCycle: SIMD4<Float> = .zero
 
+    /// **Glow of TAGGED vertex colour** (offsets 368–383; stride 368 → 384). Same host tag as
+    /// `hueCycle` (vertex `tangent.w` ≈ 1): a tagged vertex adds its own final albedo (after the
+    /// hue cycle) × `x` × the renderer's `tagGlowGain` to its emission, so a flower's petals glow
+    /// in their own — possibly cycling — colour while its leaves and stems do not. `x` is a
+    /// STATIC weight set once at assembly; the live amount is the frame-level gain, so gliding
+    /// or modulating a glow costs one float per frame, not an instance re-upload.
+    ///   x = weight (0 = off: the default and an exact no-op for every existing host) · yzw reserved
+    public var tagGlow: SIMD4<Float> = .zero
+
     public init(
         modelMatrix: simd_float4x4,
         albedo: SIMD3<Float> = SIMD3(0.8, 0.8, 0.8),
@@ -1227,10 +1242,10 @@ public struct IlluminatoramaInstance {
         self.normalMatrix = Self.normalMatrix(from: m)
     }
 
-    /// Compile-time guard: Swift and Metal structs must agree on 368 bytes.
+    /// Compile-time guard: Swift and Metal structs must agree on 384 bytes.
     /// If this fires, either a Swift field was added without the matching Metal
     /// field (or vice versa), or alignment changed unexpectedly.
-    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 368, "IlluminatoramaInstance stride must be 368") }()
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 384, "IlluminatoramaInstance stride must be 384") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //
