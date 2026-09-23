@@ -250,6 +250,51 @@ public final class VolumetricCloudRenderer {
         /// exactly the "stars are gaussian blobs" artifact.
         public var celestialsInDome: Bool = true
 
+        // ── Physical night sky (opt-in; IlluminatoramaNightSky.h) ─────
+        /// `.legacy` (default) keeps the original dome night sky byte-for-byte — the
+        /// lat-long star grid and a ~3° moon (whose Pac-Man wedge terminator IS fixed for
+        /// every host: the dome moon now lights a real sphere, phase from `moonPhase`).
+        /// `.physical` switches every night-sky path this renderer feeds to the shared
+        /// physical model: an equal-area, magnitude-distributed, extinguished, twinkling
+        /// star field with the Milky Way; the moon at its true size with the near side's
+        /// maria, a real terminator from `sunDir`, earthshine and an aureole; and the SKY
+        /// GLOW — the atmosphere lit by the moon (the nishita march with the moon as its
+        /// light), airglow and zodiacal light — so a moonlit sky is deep blue, not black.
+        /// The physical model reads the moon's phase from the GEOMETRY (`moonDir` vs the
+        /// true `sunDir`) unless `moonPhaseOverride` is set.
+        public enum NightSkyModel: Int, Sendable {
+            case legacy = 0
+            case physical = 1
+        }
+        public var nightSkyModel: NightSkyModel = .legacy
+        /// Moon angular RADIUS (radians). 0 = the model's default: ≈3.2° for `.legacy` (its
+        /// historical dome size), the real 0.00452 (0.26°) for `.physical`.
+        public var moonAngularRadius: Float = 0
+        /// `.physical` only: nil = phase from the true sun/moon geometry (the default);
+        /// a value (0 new … 1 full, illuminated fraction) lights the moon as if at that
+        /// phase — the fixed-phase behaviour of `.legacy`, for a host that places the moon
+        /// by hand.
+        public var moonPhaseOverride: Float? = nil
+        /// `.physical` only — gains, 1 = physical: the lunar aureole (raise it for haze /
+        /// thin cirrus), earthshine, the Milky Way, stellar scintillation, airglow and
+        /// zodiacal light.
+        public var moonHalo: Float = 1
+        public var earthshine: Float = 1
+        public var milkyWay: Float = 1
+        public var starTwinkle: Float = 1
+        public var airglow: Float = 1
+        public var zodiacalLight: Float = 1
+        /// `.physical` only — the ONE radiance scale of the night: scene radiance of a
+        /// magnitude-0 flux spread over one steradian. Stars, Milky Way, airglow, zodiacal
+        /// light, the aureole AND the moonlit sky (full moon ≈ 2690 of these at the zenith)
+        /// all derive from it, so they stay in their real proportions to each other. The
+        /// moon DISK keeps `moonIntensity` (its true contrast can't be displayed).
+        public var nightRadiance: Float = 1.5e-5
+        /// `.physical` only — world → J2000-equatorial rotation (quaternion ix, iy, iz, r),
+        /// from `NightSkyEphemeris`. Turns the stars about the pole with the hour, orients
+        /// the Milky Way and the moon's face. Identity by default.
+        public var celestialOrientation: SIMD4<Float> = SIMD4(0, 0, 0, 1)
+
         // ── Atmosphere model ───────────────────────────────────────────
         /// Which atmosphere to bake under the clouds.
         ///
@@ -913,6 +958,11 @@ struct SkyUniforms {
     var lavaBG: SIMD4<Float>
     var lavaBlobA: SIMD4<Float>
     var lavaBlobB: SIMD4<Float>
+    /// Night sky — see the Metal mirror (`nightSkyA…D`).
+    var nightSkyA: SIMD4<Float>
+    var nightSkyB: SIMD4<Float>
+    var nightSkyC: SIMD4<Float>
+    var nightSkyD: SIMD4<Float>
     /// GPU-WRITTEN by `volSkyCloudLight` (never by the host upload — see `hostPrefixLength`).
     var cloudLitSun: SIMD4<Float>
     var cloudLitAmbient: SIMD4<Float>
@@ -1008,6 +1058,22 @@ struct SkyUniforms {
         self.lavaBG = SIMD4<Float>(params.lavaBackground, max(0.001, params.lavaSpeed))
         self.lavaBlobA = SIMD4<Float>(params.lavaBlobA, 0)
         self.lavaBlobB = SIMD4<Float>(params.lavaBlobB, 0)
+        // Night sky. nightSkyC.xyz is the direction the MOON is lit from: the true sun
+        // (physical, geometric phase) or an effective sun placed to give `moonPhase`'s
+        // illuminated fraction (legacy, and a physical host's `moonPhaseOverride`).
+        let physical = params.nightSkyModel == .physical
+        let trueToSun = -sun
+        let phase: Float? = physical ? params.moonPhaseOverride : params.moonPhase
+        let moonLight = phase.map { NightSkyEphemeris.effectiveSun(moonDir: moonN, trueToSun: trueToSun, illuminatedFraction: $0) }
+            ?? trueToSun
+        let angR = params.moonAngularRadius > 0 ? params.moonAngularRadius
+            : (physical ? NightSkyEphemeris.moonAngularRadius : NightSkyEphemeris.legacyDomeMoonAngularRadius)
+        self.nightSkyA = SIMD4<Float>(physical ? 1 : 0, angR, max(0, params.moonHalo), max(0, params.earthshine))
+        self.nightSkyB = SIMD4<Float>(max(0, params.milkyWay), max(0, params.starTwinkle),
+                                      max(0, params.nightRadiance), max(0, params.airglow))
+        self.nightSkyC = SIMD4<Float>(moonLight, max(0, params.zodiacalLight))
+        let q = params.celestialOrientation
+        self.nightSkyD = simd_length(q) > 1e-6 ? q / simd_length(q) : SIMD4<Float>(0, 0, 0, 1)
         self.cloudLitSun = .zero
         self.cloudLitAmbient = .zero
     }

@@ -512,8 +512,22 @@ struct FrameUniforms {
     float    fieldSink;
     float    prevFieldSink;
     float    _padTagGlow2;
+    // ── Physical night sky (IlluminatoramaNightSky.h, model 1) ──────────────
+    // nightSkyExtra:  x = model (0 = legacy — the default, byte-identical; 1 = physical),
+    //                 y = moon aureole gain, z = earthshine gain, w = Milky Way gain.
+    // nightSkyExtra2: x = scintillation gain, y = night radiance (scene radiance of a
+    //                 magnitude-0 flux over 1 sr), z = scintillation clock (s), w reserved.
+    // nightCelestial: world → J2000-equatorial quaternion (xyz imaginary, w real); 0 = identity.
+    // scotopicParams: x = scotopic knee (display luma where the night desaturation has
+    //                 faded out; 0 ⇒ the legacy 0.08), yzw = Purkinje tint the rod-vision
+    //                 grey is pulled toward (0 ⇒ neutral — the legacy behaviour).
+    // FOUR new 16-byte clusters (stride 1584 → 1648); mirror of IlluminatoramaFrameUniforms.
+    float4   nightSkyExtra;
+    float4   nightSkyExtra2;
+    float4   nightCelestial;
+    float4   scotopicParams;
 };
-static_assert(sizeof(FrameUniforms) == 1584, "FrameUniforms must match IlluminatoramaFrameUniforms (1584 bytes)");
+static_assert(sizeof(FrameUniforms) == 1648, "FrameUniforms must match IlluminatoramaFrameUniforms (1648 bytes)");
 
 // Secondary directional light (#60 task 5). Mirror of Swift
 // IlluminatoramaDirectionalLight. `dir` points TOWARD the light (world space,
@@ -1085,6 +1099,14 @@ static inline NightSkyParams frameNightSky(constant FrameUniforms& f) {
     p.moonAngRadius  = f.nightSkyParams.z;
     p.moonDir        = f.nightMoonDir.xyz;
     p.toSun          = f.nightSunDir.xyz;
+    p.model          = f.nightSkyExtra.x;
+    p.moonHalo       = f.nightSkyExtra.y;
+    p.earthshine     = f.nightSkyExtra.z;
+    p.milkyWay       = f.nightSkyExtra.w;
+    p.twinkle        = f.nightSkyExtra2.x;
+    p.radiance       = f.nightSkyExtra2.y;
+    p.clock          = f.nightSkyExtra2.z;
+    p.celestial      = f.nightCelestial;
     return p;
 }
 

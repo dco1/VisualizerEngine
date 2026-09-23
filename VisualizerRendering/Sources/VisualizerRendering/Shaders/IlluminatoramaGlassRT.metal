@@ -135,6 +135,11 @@ struct GlassRTUniforms {
     // Carried here so a room seen THROUGH a pane is scaled like the room beside it.
     float4 interiorRoomGain[8];
     float4 interiorRoomGainMeta;
+    // Physical night sky — mirror of FrameUniforms.nightSkyExtra / nightSkyExtra2 /
+    // nightCelestial (IlluminatoramaNightSky.h). All-zero ⇒ the legacy model.
+    float4 nightSkyExtra;
+    float4 nightSkyExtra2;
+    float4 nightCelestial;
 };
 
 /// This pass's view of the shared night-sky currency — the mirror of
@@ -146,6 +151,14 @@ static inline NightSkyParams glassNightSky(constant GlassRTUniforms& u) {
     p.moonAngRadius  = u.nightSkyParams.z;
     p.moonDir        = u.nightMoonDir.xyz;
     p.toSun          = u.nightSunDir.xyz;
+    p.model          = u.nightSkyExtra.x;
+    p.moonHalo       = u.nightSkyExtra.y;
+    p.earthshine     = u.nightSkyExtra.z;
+    p.milkyWay       = u.nightSkyExtra.w;
+    p.twinkle        = u.nightSkyExtra2.x;
+    p.radiance       = u.nightSkyExtra2.y;
+    p.clock          = u.nightSkyExtra2.z;
+    p.celestial      = u.nightCelestial;
     return p;
 }
 

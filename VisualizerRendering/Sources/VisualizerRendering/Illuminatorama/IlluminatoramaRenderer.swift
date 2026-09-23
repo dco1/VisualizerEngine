@@ -1427,6 +1427,44 @@ public final class IlluminatoramaRenderer {
     /// Moon angular RADIUS in radians. The real moon is ≈0.0047 (0.27°); the
     /// default is ~2× that for a photographic read. Taste knob.
     public var nightSkyMoonAngularRadius: Float = 0.0095
+    /// Which analytic night sky (IlluminatoramaNightSky.h). `.legacy` (default) is the
+    /// byte-identical hashed grid + sphere-lit disk; `.physical` is the equal-area,
+    /// magnitude-distributed, extinguished, twinkling star field with a Milky Way, the
+    /// real-sized maria-mapped moon with earthshine and an aureole. In the physical model
+    /// the brightnesses are NOT pre-faded by nightBlend: stars wash out against the sky
+    /// behind them on their own, so pass `nightSkyStarBrightness` unscaled. Set
+    /// `nightSkyMoonAngularRadius` to 0 for the real 0.26°.
+    public var nightSkyModel: VolumetricCloudRenderer.Params.NightSkyModel = .legacy
+    /// Physical model only — gains (1 = physical) on the lunar aureole (raise for haze /
+    /// thin cloud), earthshine, the Milky Way and stellar scintillation.
+    public var nightSkyMoonHalo: Float = 1
+    public var nightSkyEarthshine: Float = 1
+    public var nightSkyMilkyWay: Float = 1
+    public var nightSkyTwinkle: Float = 1
+    /// Physical model only — scene radiance of a magnitude-0 flux spread over one steradian:
+    /// the ONE scale that puts stars, Milky Way and aureole in their real proportions. Match
+    /// the sky dome's `Params.nightRadiance` so the moonlit sky and the stars agree.
+    public var nightSkyRadiance: Float = 1.5e-5
+    /// Physical model only — world → J2000-equatorial rotation as a quaternion
+    /// (ix, iy, iz, r); see `NightSkyEphemeris.celestialOrientation`. Identity by default.
+    public var nightSkyCelestialOrientation: SIMD4<Float> = SIMD4(0, 0, 0, 1)
+    /// Scotopic tonemap shaping (see `scotopicDesaturation`): the display luma by which the
+    /// night desaturation has faded out (0 = the legacy 0.08) and the Purkinje tint rod
+    /// vision is pulled toward (.zero = the legacy neutral grey).
+    public var scotopicKnee: Float = 0
+    public var scotopicTint: SIMD3<Float> = .zero
+
+    /// The physical-night-sky uniform clusters, packed ONCE for the frame and the glass pass
+    /// (so a window and the sky beside it cannot disagree). `.legacy` ⇒ all zero ⇒ the
+    /// shader's legacy branch, byte-identical.
+    private func physicalNightSkyClusters() -> (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>) {
+        guard nightSkyModel == .physical else { return (.zero, .zero, .zero) }
+        let q = nightSkyCelestialOrientation
+        let qn = simd_length(q) > 1e-6 ? q / simd_length(q) : SIMD4<Float>(0, 0, 0, 1)
+        return (SIMD4(1, max(0, nightSkyMoonHalo), max(0, nightSkyEarthshine), max(0, nightSkyMilkyWay)),
+                SIMD4(max(0, nightSkyTwinkle), max(0, nightSkyRadiance), time, 0),
+                qn)
+    }
     // DEFAULTS LESSON (PR #33 fix): the initial Phase 2.5 defaults were
     // shadowBias = 0.0008 and shadowSlopeBias = 0.005 — both too aggressive.
     // The shadow pass uses front-face culling, which already shifts stored
@@ -4494,6 +4532,9 @@ public final class IlluminatoramaRenderer {
         /// z = cirrus clock override (≥ 0), or −1 = x.
         /// w = cirrus threads weight override (0…1), or −1 = SkyUniforms.cirrusC.x.
         var extra: SIMD4<Float> = .zero
+        /// x = the renderer's frame clock (s) — stellar scintillation in the physical night
+        /// sky (per frame, so a twinkle never steps at the host's sky-update rate).
+        var night: SIMD4<Float> = .zero
     }
     private let cloudInViewPipeline: MTLComputePipelineState?
     /// When true AND the three handles below are set, the in-view cloud pass
@@ -11240,6 +11281,7 @@ public final class IlluminatoramaRenderer {
                                ? SIMD3<Float>(0, 1, 0) : simd_normalize(nightSkyMoonDirection), 0)
         u.nightSunDir = SIMD4(nightSkySunDirection == .zero
                               ? SIMD3<Float>(0, -1, 0) : simd_normalize(nightSkySunDirection), 0)
+        (u.nightSkyExtra, u.nightSkyExtra2, u.nightCelestial) = physicalNightSkyClusters()
         // One pixel's angular size, derived exactly as the primary branch derives it
         // (tan(fovY/2) = 1/P[1][1], over the render height) so a star is the same size
         // seen directly and seen through a pane.
@@ -12826,7 +12868,8 @@ public final class IlluminatoramaRenderer {
                                     cameraWorldPos: SIMD4<Float>(fu.cameraWorldPos, f > 1 ? Float(f) : 0),
                                     extra: SIMD4<Float>(inViewSkyTime ?? time, inViewLavaFade.map { min(max($0, 0), 1) } ?? -1,
                                                          inViewCirrusTime.map { max($0, 0) } ?? -1,
-                                                         inViewCirrusThreads.map { min(max($0, 0), 1) } ?? -1))
+                                                         inViewCirrusThreads.map { min(max($0, 0), 1) } ?? -1),
+                                    night: SIMD4<Float>(time, 0, 0, 0))
         // setBytes, not a shared MTLBuffer: with two frames in flight a single buffer was overwritten by frame N+1 while frame N's kernels could still read it (the
         // camera matrix the rays — and the upsample's stars — are rebuilt from).
         let uStride = MemoryLayout<CloudInViewUniforms>.stride
@@ -14052,6 +14095,8 @@ public final class IlluminatoramaRenderer {
             ? SIMD3<Float>(0, -1, 0) : simd_normalize(nightSkySunDirection)
         u.nightMoonDir = SIMD4(moonDirSafe, 0)
         u.nightSunDir = SIMD4(sunDirSafe, 0)
+        (u.nightSkyExtra, u.nightSkyExtra2, u.nightCelestial) = physicalNightSkyClusters()
+        u.scotopicParams = SIMD4<Float>(max(0, scotopicKnee), max(0, scotopicTint.x), max(0, scotopicTint.y), max(0, scotopicTint.z))
         // Lens flare: project the primary sun's direction to screen uv. w carries the
         // on-screen weight — a smooth fade as the sun leaves the frame, hard 0 behind
         // the camera (clip.w ≤ 0). Strength 0 (default) leaves the whole cluster zero,

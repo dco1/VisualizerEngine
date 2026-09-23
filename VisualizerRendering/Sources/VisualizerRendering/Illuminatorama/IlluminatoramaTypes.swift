@@ -589,6 +589,13 @@ public struct IlluminatoramaFrameUniforms {
     public var fieldSink: Float = 0
     public var prevFieldSink: Float = 0
     public var _padTagGlow2: Float = 0
+    /// Physical night sky (IlluminatoramaNightSky.h) — see the Metal `FrameUniforms`.
+    /// FOUR new 16-byte clusters (stride 1584 → 1648). All-zero ⇒ the legacy night sky and
+    /// the legacy scotopic knee/tint — byte-identical for every host that never opts in.
+    public var nightSkyExtra: SIMD4<Float> = .zero
+    public var nightSkyExtra2: SIMD4<Float> = .zero
+    public var nightCelestial: SIMD4<Float> = .zero
+    public var scotopicParams: SIMD4<Float> = .zero
 
     /// Fill the eight gain vectors from a flat 32-entry table, and stamp the enable.
     public mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
@@ -1495,6 +1502,11 @@ struct IlluminatoramaGlassRTUniforms {
     var interiorRoomGain6: SIMD4<Float> = .one
     var interiorRoomGain7: SIMD4<Float> = .one
     var interiorRoomGainMeta: SIMD4<Float> = .zero
+    /// Physical night sky through the glass — mirror of the Metal GlassRTUniforms tail
+    /// (and of the frame's `nightSkyExtra` / `nightSkyExtra2` / `nightCelestial`).
+    var nightSkyExtra: SIMD4<Float> = .zero
+    var nightSkyExtra2: SIMD4<Float> = .zero
+    var nightCelestial: SIMD4<Float> = .zero
 
     mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
         let p = InteriorRoomGains.pack(gains, enabled: enabled)

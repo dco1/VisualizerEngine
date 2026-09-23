@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include "IlluminatoramaNightSky.h"
 using namespace metal;
 
 // ── VolumetricSky.metal ──────────────────────────────────────────────────────
@@ -208,6 +209,18 @@ struct SkyUniforms {
     float4 lavaBG;
     float4 lavaBlobA;
     float4 lavaBlobB;
+    // ── Night sky (Params.nightSkyModel / moon* / star* / nightRadiance…) — host-owned ──────
+    // nightSkyA: x = model (0 legacy, 1 physical), y = moon angular radius (rad),
+    //            z = aureole gain, w = earthshine gain
+    // nightSkyB: x = Milky Way gain, y = scintillation gain, z = night radiance (scene radiance
+    //            of a magnitude-0 flux per sr), w = airglow gain
+    // nightSkyC: xyz = direction the moon is lit FROM (true sun, or the effective sun that
+    //            gives `moonPhase`), w = zodiacal-light gain
+    // nightSkyD: world → J2000-equatorial quaternion (xyz imaginary, w real)
+    float4 nightSkyA;
+    float4 nightSkyB;
+    float4 nightSkyC;
+    float4 nightSkyD;
     // ── Cloud lighting from the atmosphere — GPU-WRITTEN, never by the host ─────────────────
     // `volSkyCloudLight` fills these from the nishita march itself (the SAME `nishitaScatter`
     // the sky pixels use), so the deck is lit in the sky's own units. The host packs only the
@@ -784,11 +797,59 @@ inline float3 skyGraded(float3 s, float sat, float blueLift) {
     return (l2 > 1e-6f) ? g * (l / l2) : g;
 }
 
+// Night SKY GLOW (physical model) — the atmosphere's own light after dark, added to the
+// nishita sky: (1) the MOONLIT SKY — the same single-scatter march with the moon as the
+// light, normalised so a full moon's zenith is kFullMoonSkyF0 (≈18 mag/arcsec²) in the
+// night's radiance unit and scaled by the lunar phase law; (2) AIRGLOW — the ~90 km
+// emission layer, brighter toward the horizon by the van Rhijn path-length factor, dimmed
+// by extinction; (3) ZODIACAL LIGHT — sunlight off interplanetary dust, a cone along the
+// ecliptic that fades with elongation from the (below-horizon) sun.
+constant float kNishitaZenithRef = 0.010f;   // nishitaScatter zenith luminance, sun at ~50°, intensity 1
+inline float3 nightSkyGlow(float3 rayDir, constant SkyUniforms &u) {
+    float rad = u.nightSkyB.z;
+    if (u.nightSkyA.x < 0.5f || rad <= 0.0f || u.nightParams.w <= 0.0f) return float3(0.0f);
+    float sinEl = max(rayDir.y, 0.0f);
+    float3 g = float3(0.0f);
+    if (u.nightParams.y > 0.0f) {
+        float3 moonD = normalize(u.moonParams.xyz);
+        float flux = nightMoonPhaseFlux(dot(normalize(u.nightSkyC.xyz), -moonD));
+        // Under civil/nautical twilight the sun's own scatter is thousands of times brighter
+        // than the moon's, so its march is skipped until the sun is ~6° down and cross-faded
+        // in by ~10° (then the sun's march itself is skipped past 18°: never two at full cost).
+        float w = smoothstep(0.10f, 0.17f, u.sunDir.y);
+        if (moonD.y > -0.3f && w > 0.0f)
+            g += nishitaScatter(rayDir, -moonD, 1.0f) * (w * kFullMoonSkyF0 * rad * flux / kNishitaZenithRef);
+    }
+    float3 ext = nightExtinction(sinEl);
+    float ag = u.nightSkyB.w;
+    if (ag > 0.0f) {
+        float cos2 = 1.0f - sinEl * sinEl;
+        float vanRhijn = rsqrt(max(1.0f - 0.9723f * cos2, 1e-4f));
+        g += float3(0.78f, 1.0f, 0.80f) * (ag * rad * kDarkSkyF0 * vanRhijn) * ext;
+    }
+    float zl = u.nightSkyC.w;
+    if (zl > 0.0f) {
+        float3 toSun = -normalize(u.sunDir.xyz);
+        float3 pole = nightQuatRotateInverse(u.nightSkyD, float3(0.0f, -0.39777f, 0.91748f));
+        float elong = acos(clamp(dot(rayDir, toSun), -1.0f, 1.0f));
+        float beta = asin(clamp(dot(rayDir, pole), -1.0f, 1.0f));
+        float w = 0.17f + 0.2f * elong;
+        float z = 2.5f * pow(max(elong, 0.35f) / 0.7f, -2.2f) * exp(-(beta * beta) / (w * w));
+        g += float3(1.0f, 0.95f, 0.85f) * (zl * rad * kDarkSkyF0 * z) * ext;
+    }
+    return g;
+}
+
 inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u) {
     float intensity = max(0.0f, u.atmosphereParams.y);
     float sat = u.skyGrade.x;
+    // Physical night sky: once the sun is 18° down (astronomical night) its single-scatter
+    // march is exactly black — the whole 60 km shell is in the Earth's shadow — so skip it
+    // and spend the budget on the moon's march instead (`nightSkyGlow`).
+    bool sunMarch = !(u.nightSkyA.x > 0.5f && u.sunDir.y > 0.309f);
     if (rayDir.y >= 0.0f) {
-        float3 s = nishitaScatter(rayDir, u.sunDir.xyz, intensity);
+        float3 s = (sunMarch ? nishitaScatter(rayDir, u.sunDir.xyz, intensity) : float3(0.0f))
+                 + nightSkyGlow(rayDir, u);
         // Chroma about luma, luma preserved — the sky's exposure does not move with it.
         return skyGraded(s, sat, u.skyGrade.y);
     }
@@ -801,7 +862,8 @@ inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u) {
     float hlen = length(hxz);
     float3 grazing = (hlen > 1e-5f) ? float3(hxz.x / hlen, 0.0f, hxz.y / hlen)
                                     : float3(1.0f, 0.0f, 0.0f);
-    float3 horizonHaze = nishitaScatter(grazing, u.sunDir.xyz, intensity);
+    float3 horizonHaze = (sunMarch ? nishitaScatter(grazing, u.sunDir.xyz, intensity) : float3(0.0f))
+                       + nightSkyGlow(grazing, u);
     horizonHaze = skyGraded(horizonHaze, sat, u.skyGrade.y);
     // Airlight scale in radians of depression: the 1/e point of the haze->ground
     // handover. 0.0035 rad (~0.2 deg) is one eye-height in ~3 km of haze, which is
@@ -929,6 +991,21 @@ inline float3 cirrusLayer(float3 sky, float3 ro, float3 rayDir, float time, cons
     float3 amb = cloudAmbientBase(u);
     float  ambL = dot(amb, float3(0.2126f, 0.7152f, 0.0722f));
     float3 L = (cloudSunIrradiance(u) * phase + float3(ambL) * 1.6f) * u.cirrusTint.rgb;
+    // Physical night sky: the veil scatters MOONLIGHT too — in the moonlit sky's own units
+    // (the irradiance whose Rayleigh single-scatter is `nightSkyGlow`'s moonlit zenith), with
+    // the moonlit sky as its fill. Without it the ice after dark was lit by nothing and
+    // printed as dark bands across the moonlit blue; with it the fibres glow silver around
+    // the moon — the real aureole-through-cirrus.
+    if (u.nightSkyA.x > 0.5f && u.nightParams.y > 0.0f && u.nightParams.w > 0.0f && u.nightSkyB.z > 0.0f) {
+        float3 moonD = normalize(u.moonParams.xyz);
+        if (moonD.y > -0.05f) {
+            float E = kFullMoonSkyF0 * u.nightSkyB.z * nightMoonPhaseFlux(dot(normalize(u.nightSkyC.xyz), -moonD));
+            float cosM = clamp(dot(rayDir, moonD), -1.0f, 1.0f);
+            float phaseM = 0.6f * hg(cosM, 0.75f) + 0.4f * (1.0f / (4.0f * M_PI_F));
+            L += (E / kNishitaZenithRef * phaseM * nightExtinction(moonD.y) + float3(1.6f * 1.5f * E))
+               * u.cirrusTint.rgb;
+        }
+    }
     float a = 1.0f - exp(-tau);
     return sky * (1.0f - a) + L * a;
 }
@@ -1086,84 +1163,56 @@ inline float3 starField(float3 rayDir, float brightness) {
     return result * brightness * 2.2f;
 }
 
-// The SAME stars as `starField` (same 0.8° hashed cells, positions, magnitudes and tints —
-// so the view agrees with the dome the IBL sees), drawn for a camera instead of a 360° dome:
-// each star a Gaussian ~`pixelAngle` wide, so it lands on a pixel or two and stays a point.
-// `starField`'s soft halo exists only to survive the dome texture's bilinear filter; seen
-// through a lens it turned every star into a ~10 px blob.
-inline float3 starFieldSharp(float3 rayDir, float brightness, float pixelAngle) {
-    if (brightness <= 0.0f) return float3(0.0f);
-    float az = atan2(rayDir.z, rayDir.x);
-    float el = asin(clamp(rayDir.y, -1.0f, 1.0f));
-    float2 cellsPerRad = float2(450.0f / (2.0f * M_PI_F), 225.0f / M_PI_F);
-    float2 uv = float2(az + M_PI_F, el + M_PI_F * 0.5f) * cellsPerRad;
-    int2 ip = int2(floor(uv));
-    float2 fp = uv - float2(ip);
-    // Star radius in CELL units: ~0.75 px, the azimuth axis stretched by 1/cos(el).
-    float2 sigma = max(float2(pixelAngle * 0.75f) * cellsPerRad * float2(1.0f / max(cos(el), 0.05f), 1.0f),
-                       float2(1e-4f));
-    float3 result = float3(0.0f);
-    for (int dy = -1; dy <= 1; ++dy) {
-        for (int dx = -1; dx <= 1; ++dx) {
-            int2 cell = ip + int2(dx, dy);
-            uint h = hash3(int3(cell.x, cell.y, 17));
-            if ((h & 0xFFu) < 10u) {
-                float2 starPos = float2(float((h >> 8u) & 0xFFu) / 255.0f, float((h >> 16u) & 0xFFu) / 255.0f);
-                float2 d = (fp - (float2(dx, dy) + starPos)) / sigma;
-                float  lum = exp(-0.5f * dot(d, d));
-                float  mag = 1.0f - float((h >> 28u) & 0xFu) / 15.0f;
-                float3 col = mix(float3(1.0f, 0.92f, 0.72f), float3(0.78f, 0.87f, 1.0f), mag * mag);
-                result += col * lum * (0.25f + 0.75f * mag);
-            }
-        }
-    }
-    return result * brightness * 6.0f;
-}
-
-// Moon disk with simple phase shading. The moon direction (moonParams.xyz)
-// is the unit vector pointing FROM the scene TOWARD the moon. Phase (w=0
-// = new/dark, w=1 = full/lit). Self-shadowed via the sun direction.
-inline float3 moonDisk(float3 rayDir, constant SkyUniforms &u) {
+// The dome's moon — the SHARED sphere-lit disk (IlluminatoramaNightSky.h `nightMoonDisk`),
+// replacing a private copy whose phase shading used the ANGLE around the disc centre
+// instead of position across it (a pie-slice "Pac-Man" terminator with a flat dot where
+// the angle was undefined). Lit from nightSkyC.xyz: the effective sun that shows the
+// host's `moonPhase` — so legacy hosts keep their phase and size, on a real sphere.
+inline float3 moonDisk(float3 rayDir, constant SkyUniforms &u, float pixAngle) {
     float intensity = u.nightParams.y;
     if (intensity <= 0.0f) return float3(0.0f);
-    float3 mDir = normalize(u.moonParams.xyz);
-    float  phase = clamp(u.moonParams.w, 0.0f, 1.0f);
+    return nightMoonDisk(rayDir, normalize(u.moonParams.xyz), u.nightSkyC.xyz,
+                         u.nightSkyA.y, intensity, pixAngle);
+}
 
-    float cosT = dot(rayDir, mDir);
-    // Angular radius ~3° for comfortable visibility at 1024×512 equirect
-    // (cos 3° ≈ 0.9986). We give it a soft edge via smoothstep.
-    float disk = smoothstep(0.9976f, 0.9992f, cosT);
-    if (disk <= 0.0f) return float3(0.0f);
+/// This renderer's view of the shared night-sky currency — the ONE place that knows
+/// SkyUniforms' packing (the twin of `frameNightSky` / `glassNightSky`).
+inline NightSkyParams skyNightParams(constant SkyUniforms &u, float clock) {
+    NightSkyParams p;
+    p.moonDir        = normalize(u.moonParams.xyz);
+    p.toSun          = u.nightSkyC.xyz;
+    p.starBrightness = u.nightParams.x;
+    p.moonIntensity  = u.nightParams.y;
+    p.moonAngRadius  = u.nightSkyA.y;
+    p.model          = u.nightSkyA.x;
+    p.moonHalo       = u.nightSkyA.z;
+    p.earthshine     = u.nightSkyA.w;
+    p.milkyWay       = u.nightSkyB.x;
+    p.twinkle        = u.nightSkyB.y;
+    p.radiance       = u.nightSkyB.z;
+    p.clock          = clock;
+    p.celestial      = u.nightSkyD;
+    return p;
+}
 
-    // Phase shading: the lit side faces the sun.  Project the sun-to-moon
-    // vector onto the disk plane and use it as the terminator tangent.
-    float3 toSun = normalize(-u.sunDir.xyz);   // direction from scene toward sun
-    float3 tgt   = toSun - dot(toSun, mDir) * mDir;
-    float  tlen  = length(tgt);
-
-    float phaseShading;
-    if (tlen > 0.01f) {
-        tgt /= tlen;
-        // Per-pixel disk position relative to moon centre.
-        float3 pDir = rayDir - dot(rayDir, mDir) * mDir;
-        float  plen = length(pDir);
-        // litness ∈ [-1, +1]: +1 = fully on the sun-facing side.
-        float litness = plen > 0.01f ? dot(pDir / plen, tgt) : 0.0f;
-        // Shift the terminator by `phase` so phase=1 → fully lit, phase=0 → dark.
-        phaseShading = clamp(litness + phase * 2.0f - 1.0f, 0.0f, 1.0f);
-    } else {
-        phaseShading = phase;
+/// Stars + moon for one sky ray, for every kernel in this file. Legacy: the dome's star
+/// grid (or the screen-res grid when `sharpStars`) and the moon, faded by nightBlend.
+/// Physical: the shared physical celestials — stars and the Milky Way only once the sun is
+/// down (they wash out against the twilight on their own, so they are NOT scaled by
+/// nightBlend), the moon always (a daytime moon is a pale disk, as it is outdoors).
+/// `background` = the sky radiance behind the celestials (the washout reference).
+inline float3 skyCelestials(float3 rayDir, constant SkyUniforms &u, float pixAngle,
+                            float3 background, float clock, bool sharpStars) {
+    float nightBlend = u.nightParams.w;
+    if (u.nightSkyA.x < 0.5f) {
+        if (nightBlend <= 0.0f || rayDir.y <= -0.05f) return float3(0.0f);
+        float3 stars = sharpStars ? nightStarField(rayDir, u.nightParams.x, pixAngle)
+                                  : starField(rayDir, u.nightParams.x);
+        return (stars + moonDisk(rayDir, u, pixAngle)) * nightBlend;
     }
-
-    // Subtle procedural "mare" texture — very low-amplitude Worley variation.
-    float3 offset = mDir * 3.7f;
-    float3 diskUV = (rayDir - dot(rayDir, mDir) * mDir) * 6.0f + offset;
-    float mare  = 1.0f - 0.18f * worley3(diskUV * 2.5f);
-    float crater = 1.0f - 0.08f * worley3(diskUV * 8.0f);
-
-    float3 moonColor = float3(0.88f, 0.90f, 1.0f)
-                     * intensity * disk * phaseShading * mare * crater;
-    return moonColor;
+    NightSkyParams p = skyNightParams(u, clock);
+    if (nightBlend <= 0.0f) { p.starBrightness = 0.0f; p.milkyWay = 0.0f; }
+    return nightCelestials(rayDir, p, pixAngle, background);
 }
 
 // ── Light march ─────────────────────────────────────────────────────────────
@@ -1368,11 +1417,9 @@ kernel void volSkyRender(
         // Skipped when the host renders the analytic screen-res night sky
         // instead (cloudExtra2.y = 0) — the dome-baked copies would only be
         // magnified into blobs behind the crisp ones.
-        float nightBlend = u.nightParams.w;
-        if (nightBlend > 0.0f && rayDir.y > -0.05f && u.cloudExtra2.y > 0.5f) {
-            sky += starField(rayDir, u.nightParams.x) * nightBlend;
-            sky += moonDisk(rayDir, u) * nightBlend;
-        }
+        // One dome texel's angular size sets the star point-spread / moon limb AA.
+        if (u.cloudExtra2.y > 0.5f)
+            sky += skyCelestials(rayDir, u, 2.0f * M_PI_F / float(W), sky, u.windTime.w, false);
         sky = applyCirrus(sky, u.cameraPos.xyz, rayDir, u.lavaA.y, u, noiseVol, u.cirrusC.x);
     }
 
@@ -1687,7 +1734,21 @@ struct CloudInViewUniforms {
                                  // y = per-frame lava weight override (≥ 0), −1 = SkyUniforms.lavaA.x
                                  // z = cirrus clock override (≥ 0), −1 = x
                                  // w = cirrus threads weight override (≥ 0), −1 = SkyUniforms.cirrusC.x
+    float4   night;              // x = the renderer's frame clock (s) — stellar scintillation; yzw reserved
 };
+
+/// Angular size (radians) of one output pixel of the camera the in-view pass reconstructs
+/// rays for — the vertical neighbour's ray, unprojected the same way. Sets the star
+/// point-spread and the moon's limb AA, as the deferred sky branch's `pixAngle` does.
+inline float inViewPixelAngle(constant CloudInViewUniforms &cv, float2 uv, float2 size, float3 rd) {
+    float2 uv1 = uv + float2(0.0f, 1.0f / size.y);
+    float4 wp1 = cv.invViewProjection * float4(uv1.x * 2.0f - 1.0f, 1.0f - uv1.y * 2.0f, 1.0f, 1.0f);
+    float3 rd1 = normalize(wp1.xyz / wp1.w - cv.cameraWorldPos.xyz);
+    // Chord form, NOT acos(dot): two rays a telephoto pixel apart (~6e-5 rad at 6° FOV) have
+    // a dot product within float32's last ulp of 1, so acos returned 0 or ~6× the true angle
+    // pixel by pixel — a jagged moon limb and mis-sized stars. 2·asin(|a−b|/2) is exact.
+    return 2.0f * asin(min(0.5f * length(rd - rd1), 1.0f));
+}
 
 kernel void illumi_cloud_inview(
     texture2d<float, access::write>  outTex      [[texture(0)]],
@@ -1753,11 +1814,9 @@ kernel void illumi_cloud_inview(
             sky += sunDisk(rayDir, u);
         }
         // Same analytic-night-sky skip as volSkyRender (cloudExtra2.y).
-        float nightBlend = u.nightParams.w;
-        if (nightBlend > 0.0f && rayDir.y > -0.05f && u.cloudExtra2.y > 0.5f) {
-            sky += starField(rayDir, u.nightParams.x) * nightBlend;
-            sky += moonDisk(rayDir, u) * nightBlend;
-        }
+        if (u.cloudExtra2.y > 0.5f)
+            sky += skyCelestials(rayDir, u, inViewPixelAngle(cv, uv, float2(W, H), rayDir),
+                                 sky, cv.night.x, false);
         sky = applyCirrus(sky, ro, rayDir, cv.extra.z >= 0.0f ? cv.extra.z : cv.extra.x, u, noiseVol,
                           cv.extra.w >= 0.0f ? cv.extra.w : u.cirrusC.x);   // w ≥ 0: per-frame threads weight
     }
@@ -1969,19 +2028,20 @@ kernel void illumi_cloud_upsample(
     float3 col = acc / wsum;
     // Night sky at FULL resolution, behind the clouds (when the host keeps celestials out of the
     // dome): pixel-sharp stars and the moon disc, attenuated by the deck's transmittance.
-    float nightBlend = u.nightParams.w;
-    if (nightBlend > 0.0f && u.cloudExtra2.y <= 0.5f && u.atmosphereParams.z <= 0.5f) {
+    // (The physical model draws the moon by day too — a pale daytime moon — so it runs
+    // whenever that model is on; the legacy one only after sunset, as before.)
+    bool physicalNight = u.nightSkyA.x > 0.5f;
+    if ((u.nightParams.w > 0.0f || physicalNight) && u.cloudExtra2.y <= 0.5f && u.atmosphereParams.z <= 0.5f) {
         uint W = outTex.get_width(), H = outTex.get_height();
         float2 uv = (float2(gid) + 0.5f) / float2(W, H);
         float4 wp = cv.invViewProjection * float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 1.0f, 1.0f);
         float3 rd = normalize(wp.xyz / wp.w - cv.cameraWorldPos.xyz);
-        float2 uv1 = (float2(gid) + float2(0.5f, 1.5f)) / float2(W, H);
-        float4 wp1 = cv.invViewProjection * float4(uv1.x * 2.0f - 1.0f, 1.0f - uv1.y * 2.0f, 1.0f, 1.0f);
-        float pixelAngle = acos(clamp(dot(rd, normalize(wp1.xyz / wp1.w - cv.cameraWorldPos.xyz)), -1.0f, 1.0f));
+        float pixelAngle = inViewPixelAngle(cv, uv, float2(W, H), rd);
         if (rd.y > -0.05f) {
             float trans = tr / wsum;
             // … and under the lava lamp's weight (the night sky fades out as the lamp fades in).
-            col += (starFieldSharp(rd, u.nightParams.x, pixelAngle) + moonDisk(rd, u)) * nightBlend * trans
+            // The washout background is the sky as marched (atmosphere + moonlit glow + deck).
+            col += skyCelestials(rd, u, pixelAngle, col, cv.night.x, true) * trans
                  * (1.0f - (cv.extra.y >= 0.0f ? saturate(cv.extra.y) : saturate(u.lavaA.x)));
         }
     }

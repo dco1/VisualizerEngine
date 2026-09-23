@@ -1123,8 +1123,28 @@ fragment float4 illumi_tonemap_fs(
     // byte-identical. Hosts fade the strength with nightBlend themselves.
     if (frame.scotopicDesaturation > 0.0) {
         float scotLum = dot(mapped, float3(0.2126, 0.7152, 0.0722));
-        float scot = frame.scotopicDesaturation * (1.0 - smoothstep(0.0, 0.08, scotLum));
-        mapped = max(mix(mapped, float3(scotLum), scot), 0.0);   // 0 → exact no-op
+        // Knee (scotopicParams.x): the display luma by which cone vision has fully taken
+        // over again — 0 keeps the legacy 0.08. Tint (yzw): the Purkinje blue shift a
+        // moonlit scene reads with (rods peak at 507 nm), luminance-normalised so it only
+        // moves hue; 0 keeps the legacy neutral grey.
+        float knee = frame.scotopicParams.x > 0.0 ? frame.scotopicParams.x : 0.08;
+        float scot = frame.scotopicDesaturation * (1.0 - smoothstep(0.0, knee, scotLum));
+        float3 rod = float3(scotLum);
+        if (any(frame.scotopicParams.yzw > 0.0)) {
+            // Rod vision weights the spectrum differently from cones (peak 507 nm): reds go DARK,
+            // blue-greens stay bright — a moonlit poppy is a dark grey, not a pale one. Scotopic
+            // luminance per Larson et al. (1997), V = Y·(1.33·(1 + (Y+Z)/X) − 1.68) from linear-
+            // sRGB XYZ, normalised so a neutral grey keeps its luminance (D65 white: V/Y ≈ 2.57).
+            float3 c = max(mapped, 0.0);
+            float X = dot(c, float3(0.4124, 0.3576, 0.1805));
+            float Y = dot(c, float3(0.2126, 0.7152, 0.0722));
+            float Z = dot(c, float3(0.0193, 0.1192, 0.9505));
+            float V = X > 1e-5 ? Y * (1.33 * (1.0 + (Y + Z) / X) - 1.68) : Y;
+            float rodLum = clamp(V / 2.57, 0.0, 4.0 * max(Y, 1e-4));
+            float3 tint = max(frame.scotopicParams.yzw, 0.0);
+            rod = rodLum * tint / max(dot(tint, float3(0.2126, 0.7152, 0.0722)), 1e-4);
+        }
+        mapped = max(mix(mapped, rod, scot), 0.0);   // 0 → exact no-op
     }
     // Clamp after the saturation push — boosting past 1.0 can take channels
     // negative on near-greys, and `pow(negative, 1/2.2)` returns NaN that

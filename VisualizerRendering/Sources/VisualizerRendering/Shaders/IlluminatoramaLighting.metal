@@ -991,7 +991,7 @@ kernel void illumi_lighting(
         // TAA's jittered projection supersamples the sub-pixel star cores.
         // Angular size of one pixel from the projection: tan(fovY/2) = 1/P[1][1].
         float pixAngle = (2.0f / frame.projection[1][1]) / float(h);
-        sky += nightCelestials(dir, frameNightSky(frame), pixAngle);
+        sky += nightCelestials(dir, frameNightSky(frame), pixAngle, sky);
         outHDR.write(half4(half3(sky), 1.0h), gid);
         // Issue #65 — sky is never SSS; clear its mask so the composite skips it.
         if (frame.sssStrength > 0.0) sssOut.write(half4(0.0h), gid);
