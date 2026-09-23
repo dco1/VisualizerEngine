@@ -1186,7 +1186,7 @@ public struct IlluminatoramaInstance {
     public var uvWarp: SIMD4<Float> = .zero
 
     /// **Animated hue cycle of TAGGED vertex colour** (offsets 352–367; stride 352 → 368). The
-    /// G-buffer rotates the vertex colour's hue on vertices whose `tangent.w > 0.5` — a host tag;
+    /// G-buffer rotates the vertex colour's hue on vertices whose `tangent.w` is ≈ 1 (0.5…1.5) — a host tag;
     /// foliage wind meshes pack (sway, phase, flutter, tag) in tangent — so a flower's petals
     /// change colour while leaves and stems do not, animated on the GPU by frame time: set once,
     /// no per-frame instance upload.

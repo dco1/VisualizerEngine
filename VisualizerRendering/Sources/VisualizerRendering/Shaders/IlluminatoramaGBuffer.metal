@@ -515,7 +515,9 @@ fragment GBufferOut illumi_fs(
     albedo *= in.vertexColor.rgb;
     // Animated hue cycle on host-TAGGED vertices (Instance.hueCycle; tangent.w > 0.5 is the tag).
     // Rodrigues rotation about the grey axis: hue turns, brightness and saturation hold.
-    if (inst.hueCycle.x > 0.0f && in.worldTangent.w > 0.5f) {
+    // Tag = tangent.w ≈ 1 exactly (0.5…1.5): a mesh's own tangent handedness (±1 on normal-mapped
+    // geometry) or other packed codes (forest species 2–5) must not be read as the tag.
+    if (inst.hueCycle.x > 0.0f && in.worldTangent.w > 0.5f && in.worldTangent.w < 1.5f) {
         float theta = inst.hueCycle.y + frame.time * inst.hueCycle.z
                     + dot(in.worldPos.xz, float2(0.6f, 0.8f)) * inst.hueCycle.w;
         const float3 k = float3(0.57735027f);

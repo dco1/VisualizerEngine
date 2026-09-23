@@ -2414,13 +2414,12 @@ public final class IlluminatoramaRenderer {
     /// 30–45 ms GPU frames the single-frame depth quantises delivery to the 60 Hz tick (a 37 ms
     /// frame shows every 50 ms). `true` keeps two frames in flight regardless of GPU time.
     /// Default `false` = the adaptive guard, byte-identical for every existing host.
-    /// GPU time (ms) of the most recently COMPLETED frame — a host-side hitch hunt without the
-    /// pass profiler (per-frame, thread-safe; 0 before the first frame completes).
-    public var lastGPUFrameMs: Double { presentSync.lastGpuMs }
-
     public var pipelineLatencyTolerant: Bool = false {
         didSet { presentSync.setLatencyTolerant(pipelineLatencyTolerant) }
     }
+    /// GPU time (ms) of the most recently COMPLETED frame — a host-side hitch hunt without the
+    /// pass profiler (per-frame, thread-safe; 0 before the first frame completes).
+    public var lastGPUFrameMs: Double { presentSync.lastGpuMs }
     private let gpuMeter = IlluminatoramaGPUMeter()
     // #60 task 4 / #6 — per-compute-pass GPU timer (env-gated). Assigned in init
     // once `device` exists. Off by default; no-ops without VIZ_ILLUMI_PASS_PROFILE.
@@ -4492,7 +4491,6 @@ public final class IlluminatoramaRenderer {
         var extra: SIMD4<Float> = .zero
     }
     private let cloudInViewPipeline: MTLComputePipelineState?
-    private let cloudInViewUniformBuffer: MTLBuffer
     /// When true AND the three handles below are set, the in-view cloud pass
     /// composites crisp camera-ray clouds into the HDR target (issue #61). OFF
     /// by default → every scene + the dome/IBL path is byte-identical.
@@ -5106,12 +5104,6 @@ public final class IlluminatoramaRenderer {
         } else {
             self.cloudInViewPipeline = nil
         }
-        guard let cloudUB = device.makeBuffer(length: MemoryLayout<CloudInViewUniforms>.stride,
-                                              options: .storageModeShared) else {
-            throw IlluminatoramaError.bufferAllocationFailed("cloudInViewUniforms")
-        }
-        cloudUB.label = "Illuminatorama.cloudInView.uniforms"
-        self.cloudInViewUniformBuffer = cloudUB
         // ExposureState is 16 bytes (4 floats). Storage `.shared` so
         // the renderer can seed it once and (if needed) read it for
         // diagnostics. The kernel updates it in place each frame.
@@ -12797,7 +12789,9 @@ public final class IlluminatoramaRenderer {
         var u = CloudInViewUniforms(invViewProjection: fu.invViewProjection,
                                     cameraWorldPos: SIMD4<Float>(fu.cameraWorldPos, f > 1 ? Float(f) : 0),
                                     extra: SIMD4<Float>(time, 0, 0, 0))
-        memcpy(cloudInViewUniformBuffer.contents(), &u, MemoryLayout<CloudInViewUniforms>.stride)
+        // setBytes, not a shared MTLBuffer: with two frames in flight a single buffer was overwritten by frame N+1 while frame N's kernels could still read it (the
+        // camera matrix the rays — and the upsample's stars — are rebuilt from).
+        let uStride = MemoryLayout<CloudInViewUniforms>.stride
         guard let enc = timedComputeEncoder(cb, "cloudInView") else { return }
         enc.label = "Illuminatorama.cloudInView"
         enc.setComputePipelineState(pipeline)
@@ -12807,7 +12801,7 @@ public final class IlluminatoramaRenderer {
         // geometry, so the deck can no longer paint over the building.
         enc.setTexture(depthTexture, index: 2)
         enc.setBuffer(skyU, offset: 0, index: 0)
-        enc.setBuffer(cloudInViewUniformBuffer, offset: 0, index: 1)
+        enc.setBytes(&u, length: uStride, index: 1)
         enc.setBuffer(lights, offset: 0, index: 2)
         if let lowRes {
             dispatch(enc, pipeline: pipeline, width: lowRes.width, height: lowRes.height)
@@ -12819,7 +12813,7 @@ public final class IlluminatoramaRenderer {
             enc2.setTexture(hdrCompositeTexture, index: 0)
             enc2.setTexture(lowRes, index: 1)
             enc2.setTexture(depthTexture, index: 2)
-            enc2.setBuffer(cloudInViewUniformBuffer, offset: 0, index: 0)
+            enc2.setBytes(&u, length: uStride, index: 0)
             enc2.setBuffer(skyU, offset: 0, index: 1)
             dispatch(enc2, pipeline: up, width: width, height: height)
             enc2.endEncoding()
@@ -15067,18 +15061,16 @@ private final class IlluminatoramaPresentSync: @unchecked Sendable {
     private static let pipelineEnterMs = 30.0   // drop to 1→2 when EMA below this
     private static let pipelineExitMs  = 36.0   // rise to 2→1 when EMA above this
 
+    /// The most recent completed frame's GPU time (ms), for hosts' own diagnostics. Written
+    /// under `lock` by `frameCompletedAdaptive` (completion-handler thread).
+    var lastGpuMs: Double { lock.lock(); defer { lock.unlock() }; return _lastGpuMs }
+    private var _lastGpuMs: Double = 0
+
     /// Called from the GPU completion handler in place of `semaphore.signal()`.
     /// Updates the GPU-time EMA, recomputes the target depth, and either releases
     /// this frame's permit normally or HOLDS it to converge the effective in-flight
     /// capacity to that depth. Deadlock-free: `heldPermits` is capped at
     /// `maxFramesInFlight - 1`, so a permit always remains in circulation.
-    /// The most recent completed frame's GPU time (ms), for hosts' own diagnostics.
-    private(set) var lastGpuMs: Double {
-        get { lock.lock(); defer { lock.unlock() }; return _lastGpuMs }
-        set { _lastGpuMs = newValue }
-    }
-    private var _lastGpuMs: Double = 0
-
     func frameCompletedAdaptive(gpuMs: Double, semaphore: DispatchSemaphore) {
         lock.lock()
         _lastGpuMs = gpuMs

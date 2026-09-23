@@ -1336,11 +1336,14 @@ kernel void volSkyRender(
         sky = neonDebugBackground(rayDir);
     } else {
         // Mode selects the faked gradient (0) or the physical Nishita march (1).
-        sky = (u.atmosphereParams.x > 0.5f)
-            ? nishitaAtmosphereColor(rayDir, u)
-            : atmosphereColor(rayDir, u);
-        sky += sunDisk(rayDir, u);
-        if (u.lavaA.x > 0.5f) sky = lavaLampSky(rayDir, u.lavaA.y, u);
+        if (u.lavaA.x > 0.5f) {
+            sky = lavaLampSky(rayDir, u.lavaA.y, u);   // the lamp replaces the atmosphere: skip it
+        } else {
+            sky = (u.atmosphereParams.x > 0.5f)
+                ? nishitaAtmosphereColor(rayDir, u)
+                : atmosphereColor(rayDir, u);
+            sky += sunDisk(rayDir, u);
+        }
 
         // ── Night sky: stars + moon (additive, gated by nightBlend) ──
         // Skipped when the host renders the analytic screen-res night sky
@@ -1710,13 +1713,17 @@ kernel void illumi_cloud_inview(
     if (debugBG) {
         sky = neonDebugBackground(rayDir);
     } else {
-        sky = (u.atmosphereParams.x > 0.5f)
-            ? nishitaAtmosphereColor(rayDir, u)
-            : atmosphereColor(rayDir, u);
-        sky += sunDisk(rayDir, u);
         // The lava lamp animates on the RENDERER's frame clock here (every frame), not the
-        // dome's (host-throttled) — its blobs would otherwise step visibly.
-        if (u.lavaA.x > 0.5f) sky = lavaLampSky(rayDir, cv.extra.x, u);
+        // dome's (host-throttled) — its blobs would otherwise step visibly. It replaces the
+        // atmosphere, so the nishita march is skipped rather than computed and discarded.
+        if (u.lavaA.x > 0.5f) {
+            sky = lavaLampSky(rayDir, cv.extra.x, u);
+        } else {
+            sky = (u.atmosphereParams.x > 0.5f)
+                ? nishitaAtmosphereColor(rayDir, u)
+                : atmosphereColor(rayDir, u);
+            sky += sunDisk(rayDir, u);
+        }
         // Same analytic-night-sky skip as volSkyRender (cloudExtra2.y).
         float nightBlend = u.nightParams.w;
         if (nightBlend > 0.0f && rayDir.y > -0.05f && u.cloudExtra2.y > 0.5f) {
