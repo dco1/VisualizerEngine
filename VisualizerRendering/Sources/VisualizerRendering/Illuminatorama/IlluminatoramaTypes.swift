@@ -966,7 +966,8 @@ public struct IlluminatoramaInstance {
     /// Mode 1: static lean angle (radians) about local-Z, pivoting at the base.
     /// Mode 2: pendulum AMPLITUDE (max swing, radians) — the shader animates the swing
     /// from the frame time, so the host sets this once (no per-frame drive).
-    /// Mode 3: the flap at full wind (radians); its SIGN is the direction it lifts.
+    /// Mode 3: the flap at full wind (radians), met square-on by it; its SIGN is the direction it
+    /// lifts (> 0 lifts the free edge up and back — it catches wind blowing into that edge).
     public var swayLean: Float = 0
     /// Vertical pop (metres) added in world space — a knock hops the object up.
     public var swayJostle: Float = 0

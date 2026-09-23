@@ -71,6 +71,36 @@ final class ToiletGeometryTests: XCTestCase {
                        "a hair before rest the lid is already inside the cistern")
     }
 
+    /// Up-facing area of the triangles lying wholly in the plane y = `y`.
+    private func planeArea(_ m: Mesh3, y: Double) -> (area: Double, allUp: Bool) {
+        var area = 0.0, allUp = true
+        for t in stride(from: 0, to: m.indices.count, by: 3) {
+            let a = m.positions[Int(m.indices[t])], b = m.positions[Int(m.indices[t + 1])], c = m.positions[Int(m.indices[t + 2])]
+            guard abs(a.y - y) < 1e-9, abs(b.y - y) < 1e-9, abs(c.y - y) < 1e-9 else { continue }
+            let n = cross3(b - a, c - a)
+            area += len3(n) / 2
+            if n.y <= 0 { allUp = false }
+            for k in 0 ..< 3 where m.normals[Int(m.indices[t + k])].y < 0.9999 { allUp = false }
+        }
+        return (area, allUp)
+    }
+
+    /// The cistern lid's deck is truly flat (every deck triangle faces straight up), and the tank
+    /// under it stops at the lid's underside: the cistern's top plane holds the lid's deck ALONE.
+    /// (Two coplanar tops, triangulated differently, z-fought as an X across the lid.)
+    func testCisternLidDeckIsFlatAndNotCoplanarWithTheTank() {
+        let slab = ToiletGeometry.roundedSlab(halfW: 0.206, halfD: 0.11, y0: 0, y1: 0.025,
+                                              topEdge: 0.010, planCorner: 0.014)
+        let deck = planeArea(slab, y: 0.025)
+        XCTAssertGreaterThan(deck.area, 0.05)
+        XCTAssertTrue(deck.allUp, "deck triangles must all face straight up")
+        XCTAssertLessThan(slab.indices.count / 3, 220, "facets sized by the corner radius, not the half-diagonal")
+        let topY = parts.cistern.positions.map(\.y).max()!
+        let top = planeArea(parts.cistern, y: topY)
+        // The lid deck alone: (2·(0.206−0.01)) × (2·(0.11−0.01)) ≈ 0.078 m², less its corners.
+        XCTAssertLessThan(top.area, 0.085, "a second surface shares the cistern's top plane (z-fight)")
+    }
+
     /// The hinge sits at the back of the seat stack, in front of the cistern.
     func testHingeLine() {
         XCTAssertLessThan(parts.hinge.z, parts.tankFrontZ)

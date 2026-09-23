@@ -10181,10 +10181,10 @@ public final class IlluminatoramaRenderer {
             enc.setVertexBytes(&lightVP,
                                length: MemoryLayout<simd_float4x4>.stride,
                                index: 3)
-            // Shader-animated sway (swayMode 2 pendant, 3 wind flap) reads (time, wind) so it casts
+            // Shader-animated sway (swayMode 2 pendant, 3 wind flap) reads (time, wind, heading) so it casts
             // its swung shadow in phase with the visible mesh; no-op for modes 0/1.
-            var shadowClock = SIMD2<Float>(time, treeWindStrength)   // (time, wind) — swayMode 2/3
-            enc.setVertexBytes(&shadowClock, length: MemoryLayout<SIMD2<Float>>.stride, index: 4)
+            var shadowClock = SIMD4<Float>(time, treeWindStrength, treeWindHeading, 0)   // (time, wind, heading) — swayMode 2/3
+            enc.setVertexBytes(&shadowClock, length: MemoryLayout<SIMD4<Float>>.stride, index: 4)
 
             // Phase 4.12 — instanced draw per mesh kind via the recipe
             // built in `uploadInstances`. Same win as the G-buffer pass:
@@ -10598,10 +10598,10 @@ public final class IlluminatoramaRenderer {
             enc.setVertexBytes(&lightVP,
                                length: MemoryLayout<simd_float4x4>.stride,
                                index: 3)
-            // Shader-animated sway (swayMode 2 pendant, 3 wind flap) reads (time, wind) so it casts
+            // Shader-animated sway (swayMode 2 pendant, 3 wind flap) reads (time, wind, heading) so it casts
             // its swung shadow in phase with the visible mesh; no-op for modes 0/1.
-            var shadowClock = SIMD2<Float>(time, treeWindStrength)   // (time, wind) — swayMode 2/3
-            enc.setVertexBytes(&shadowClock, length: MemoryLayout<SIMD2<Float>>.stride, index: 4)
+            var shadowClock = SIMD4<Float>(time, treeWindStrength, treeWindHeading, 0)   // (time, wind, heading) — swayMode 2/3
+            enc.setVertexBytes(&shadowClock, length: MemoryLayout<SIMD4<Float>>.stride, index: 4)
 
             // Phase 4.12 — instanced draw per mesh kind via the recipe
             // built in `uploadInstances`. Same win as the G-buffer pass:
@@ -10764,8 +10764,8 @@ public final class IlluminatoramaRenderer {
 
                 var lightVP = faces[slice]
                 enc.setVertexBytes(&lightVP, length: MemoryLayout<simd_float4x4>.stride, index: 3)
-                var shadowClock = SIMD2<Float>(time, treeWindStrength)   // (time, wind) — swayMode 2/3
-                enc.setVertexBytes(&shadowClock, length: MemoryLayout<SIMD2<Float>>.stride, index: 4)
+                var shadowClock = SIMD4<Float>(time, treeWindStrength, treeWindHeading, 0)   // (time, wind, heading) — swayMode 2/3
+                enc.setVertexBytes(&shadowClock, length: MemoryLayout<SIMD4<Float>>.stride, index: 4)
 
                 let cullClip = cullVolume(lightVP)   // DH-0534
                 for (gi, group) in meshGroups.enumerated() {

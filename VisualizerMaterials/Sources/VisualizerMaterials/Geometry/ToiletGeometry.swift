@@ -154,12 +154,15 @@ public enum ToiletGeometry {
         cistern.append(roundedPrism(halfW: bowlHalfW * 0.45, halfD: shelfHalfD, y0: lift, y1: tankBaseY,
                                     corner: cornerRadius)
                         .translated(by: Vec3(0, 0, shelfFrontZ + shelfHalfD)))
-        cistern.append(roundedPrism(halfW: thw, halfD: tankD / 2, y0: tankBaseY, y1: tankTopY,
+        // The tank stops at its lid's underside: the lid SITS on it. (Run up to the lid's top, as
+        // in Daydream's original, the two tops were coplanar caps triangulated differently —
+        // z-fighting that printed an X across the lid once the lid's rim shading differed.)
+        let tankLidBottomY = h - 0.025 + lift
+        cistern.append(roundedPrism(halfW: thw, halfD: tankD / 2, y0: tankBaseY, y1: tankLidBottomY,
                                     corner: cornerRadius)
                         .translated(by: Vec3(0, 0, hd - tankD / 2)))
         // Its lid: overhanging on all four edges, with a rolled top perimeter.
         let lidHalfD = tankD / 2 + 0.01
-        let tankLidBottomY = h - 0.025 + lift
         cistern.append(roundedSlab(halfW: thw + 0.01, halfD: lidHalfD, y0: tankLidBottomY, y1: tankTopY,
                                    topEdge: lidEdgeRadius, planCorner: cornerRadius)
                         .translated(by: Vec3(0, 0, hd + 0.01 - lidHalfD)))
@@ -238,31 +241,57 @@ public enum ToiletGeometry {
     }
 
     /// A slab whose TOP perimeter edge rolls over with radius `topEdge` (a quarter-round), on a
-    /// rounded-rectangle plan of corner `planCorner` — a cistern lid, a flush pill.
+    /// rounded-rectangle plan of corner `planCorner` — a cistern lid, a flush pill. Daydream's
+    /// `Mesh3.roundedTopSlab` construction (solid path): ONE rounded-rect perimeter shared by every
+    /// profile station, each band an outward-facing flat quad strip, the flat deck a fan inside
+    /// the roll, facets sized by the arc actually being tessellated (the corner radius, the roll
+    /// radius — not the slab's half-diagonal, which pinned the count at its cap). Flat-shaded, as
+    /// there: a smoothing pass averaged the deck's fan into the roll and printed an X across it.
     public static func roundedSlab(halfW: Double, halfD: Double, y0: Double, y1: Double,
                                    topEdge: Double, planCorner: Double) -> Mesh3 {
         guard halfW > 1e-4, halfD > 1e-4, y1 > y0 else { return Mesh3() }
-        let rr = max(0, min(topEdge, (y1 - y0) * 0.95, min(halfW, halfD) * 0.5))
-        let segs = cornerSegments(halfW: halfW, halfD: halfD)
-        var rings = [ring(halfW: halfW, halfD: halfD, corner: planCorner, y: y0, segs: segs)]
-        let steps = rr > 0 ? 5 : 1
-        for k in 0 ... steps {
-            let t = rr > 0 ? Double(k) / Double(steps) * .pi / 2 : .pi / 2
-            let inset = rr * (1 - cos(t)), y = y1 - rr + rr * sin(t)
-            rings.append(ring(halfW: halfW - inset, halfD: halfD - inset,
-                              corner: max(0.0002, planCorner - inset), y: y, segs: segs))
+        let rt = max(0, min(topEdge, min((y1 - y0) * 0.5, min(halfW, halfD) * 0.45)))
+        // The deck ring's corner is `cr − rt`: keep cr a clean margin above rt so it never
+        // collapses to a point (a non-manifold join).
+        let cr = max(rt + 0.004, min(planCorner, min(halfW, halfD) * 0.95))
+        let cornerSegs = max(4, (Mesh3.segmentsFor(radius: cr) + 3) / 4)
+        let ix = halfW - cr, iz = halfD - cr
+        var path: [(x: Double, z: Double, nx: Double, nz: Double)] = []
+        for c in [(ix, iz, 0.0), (-ix, iz, Double.pi / 2), (-ix, -iz, Double.pi), (ix, -iz, 3 * Double.pi / 2)] {
+            for k in 0 ..< cornerSegs {
+                let a = c.2 + (.pi / 2) * Double(k) / Double(cornerSegs)
+                path.append((c.0 + cr * cos(a), c.1 + cr * sin(a), cos(a), sin(a)))
+            }
         }
-        // A flat ring a few mm inside the roll: the cap then fans from HERE, so the roll's tilted
-        // normals (averaged into the rim within the smoothing crease) stay in a thin rim strip
-        // instead of being interpolated across whole fan triangles to the centre — which drew an
-        // X of shading corner-to-corner across the lid.
-        let flat = rr + min(0.006, min(halfW, halfD) * 0.25)
-        if halfW - flat > 1e-4, halfD - flat > 1e-4 {
-            rings.append(ring(halfW: halfW - flat, halfD: halfD - flat,
-                              corner: max(0.0002, planCorner - flat), y: y1, segs: segs))
+        let P = path.count
+        func ring(_ inset: Double, _ y: Double) -> [Vec3] {
+            path.map { Vec3($0.x - $0.nx * inset, y, $0.z - $0.nz * inset) }
+        }
+        // Cross-section bottom → top: flush wall, then the quarter-round over the top edge.
+        var prof: [(inset: Double, y: Double)] = [(0, y0), (0, y1 - rt)]
+        if rt > 1e-6 {
+            let arcSegs = max(2, (Mesh3.segmentsFor(radius: rt) + 3) / 4)
+            for k in 1 ... arcSegs {
+                let a = (.pi / 2) * Double(k) / Double(arcSegs)
+                prof.append((rt * (1 - cos(a)), (y1 - rt) + rt * sin(a)))
+            }
         }
         var m = Mesh3()
-        _ = m.loft(rings: rings)
-        return m.smoothed(creaseDegrees: smoothCrease)
+        for k in 0 ..< (prof.count - 1) {
+            let lo = prof[k], hi = prof[k + 1]
+            let r0 = ring(lo.inset, lo.y), r1 = ring(hi.inset, hi.y)
+            let dInset = hi.inset - lo.inset, dY = hi.y - lo.y
+            for i in 0 ..< P {
+                let j = (i + 1) % P
+                let outward = normalize3(Vec3(path[i].nx * dY, dInset, path[i].nz * dY))
+                m.addQuad(r0[i], r0[j], r1[j], r1[i], outward: outward)
+            }
+        }
+        let top = ring(rt, y1), bottom = ring(0, y0)
+        for i in 0 ..< P {
+            m.addTriangle(Vec3(0, y1, 0), top[i], top[(i + 1) % P], outward: Vec3(0, 1, 0))
+            m.addTriangle(Vec3(0, y0, 0), bottom[(i + 1) % P], bottom[i], outward: Vec3(0, -1, 0))
+        }
+        return m
     }
 }
