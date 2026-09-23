@@ -186,8 +186,23 @@ struct SkyUniforms {
     //     the sky got anywhere near a photograph's).
     // y = skyBlueLift: the blue channel scaled by this and the luma restored — a HUE pull toward
     //     blue. Saturation alone could not reach a photograph's sky: about its own luma the
-    //     march goes cyan (red falls, blue barely rises). 1 = untouched. z, w = unused.
+    //     march goes cyan (red falls, blue barely rises). 1 = untouched.
+    // z = cloudLightingFromAtmosphere flag (> 0.5 = the cloud march reads cloudLitSun /
+    //     cloudLitAmbient, written on the GPU by `volSkyCloudLight`; skyHorizon.xyz then carries
+    //     the ground ALBEDO for the bounce). w = unused.
     float4 skyGrade;
+    // ── Cirrus veil (Params.cirrus*) — host-owned ───────────────────────────────────────────
+    // cirrusA: x = coverage (0 = off, byte-identical), y = zenith optical depth of a full fibre,
+    //          z = altitude (m), w = feature frequency (noise texels per metre)
+    // cirrusB: xy = streak direction (xz, unit), z = along-streak stretch, w = drift multiplier
+    float4 cirrusA;
+    float4 cirrusB;
+    // ── Cloud lighting from the atmosphere — GPU-WRITTEN, never by the host ─────────────────
+    // `volSkyCloudLight` fills these from the nishita march itself (the SAME `nishitaScatter`
+    // the sky pixels use), so the deck is lit in the sky's own units. The host packs only the
+    // struct PREFIX before these two, so its per-frame write never clobbers them.
+    float4 cloudLitSun;      // xyz = solar irradiance at the deck base (intensity × T), w = 1
+    float4 cloudLitAmbient;  // xyz = mean sky + ground-bounce radiance around the deck, w = 1
 };
 
 // The cloud kernel reads the noise volume's tile size from its own width
@@ -786,6 +801,129 @@ inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u) {
     return mix(horizonHaze, u.groundColor.xyz, ground);
 }
 
+// ── Cirrus: a thin, high ice veil (Params.cirrusCoverage) ────────────────────────────────
+// The cumulus march is a slab of rounded volumes; the fibrous "mares' tails" that streak a
+// clear California sky are a different object — ice at 7–10 km, optically THIN (τ ≈ 0.05–0.5),
+// sheared by the jet into long fibres. Thin means single scattering is exact enough and no march
+// is needed: intersect the layer plane once, read wind-stretched fibre noise from the same baked
+// volume the deck uses, and composite L = (E_sun·phase + fill)·(1 − e^−τ) over the sky with the
+// path length through the layer growing toward the horizon (τ ∝ 1/sinθ). Ice's phase is sharply
+// forward (g ≈ 0.75) with an isotropic share, and its fill is WHITE: the veil is lit by the whole
+// bright hemisphere under it (haze, cloud, ground), not by the blue above.
+inline float3 cloudSunIrradiance(constant SkyUniforms &u) {
+    return (u.skyGrade.z > 0.5f) ? u.cloudLitSun.xyz : u.sunColor.xyz * u.sunColor.w;
+}
+inline float3 cloudAmbientBase(constant SkyUniforms &u) {
+    return (u.skyGrade.z > 0.5f) ? u.cloudLitAmbient.xyz : u.skyZenith.xyz;
+}
+
+inline float3 applyCirrus(float3 sky, float3 ro, float3 rayDir, constant SkyUniforms &u,
+                          texture3d<float, access::sample> noiseVol) {
+    float cov = u.cirrusA.x;
+    if (cov <= 0.0f || rayDir.y <= 0.004f) return sky;
+    float t = (u.cirrusA.z - ro.y) / rayDir.y;
+    if (t <= 0.0f) return sky;
+    float2 p = ro.xz + rayDir.xz * t;
+    // Same advection as the deck (the host folds any floating-origin shift into it), faster aloft.
+    p -= u.windTime.xy * u.windTime.z * u.windTime.w * u.cirrusB.w;
+    float2 along = normalize(u.cirrusB.xy + float2(1e-6f, 0.0f));
+    float2 across = float2(-along.y, along.x);
+    float tile = float(noiseVol.get_width());
+    float2 q = float2(dot(p, along) / max(u.cirrusB.z, 1.0f), dot(p, across)) * u.cirrusA.w;
+    // Curve and fork the fibres: a slow warp ACROSS the streak direction.
+    q.y += (noiseVol.sample(volSampler, float3(q * 0.31f, 0.37f) / tile).r - 0.5f) * 3.0f;
+    float n = 0.0f, amp = 0.55f, sumA = 0.0f;
+    float2 qq = q;
+    for (int o = 0; o < 3; ++o) {
+        n += amp * noiseVol.sample(volSampler, float3(qq, 0.13f + 0.29f * float(o)) / tile).r;
+        sumA += amp; amp *= 0.5f;
+        qq = float2(qq.x * 1.7f, qq.y * 2.9f) + float2(17.3f, 5.1f);   // finer = more stretched
+    }
+    n /= sumA;
+    // Cirrus comes in PATCHES — bands and hooks of fibres with open blue between — so coverage
+    // is gated by a slow, barely-stretched mask an order of magnitude larger than the fibres.
+    float2 mq = float2(dot(p, along), dot(p, across)) * u.cirrusA.w * 0.11f;
+    float mask = noiseVol.sample(volSampler, float3(mq, 0.53f) / tile).r;
+    mask = 0.65f * mask + 0.35f * noiseVol.sample(volSampler, float3(mq * 2.3f + 11.0f, 0.61f) / tile).r;
+    float localCov = cov * smoothstep(0.38f, 0.68f, mask);
+    float d = smoothstep(1.0f - localCov, 1.0f - localCov + 0.35f, n) * step(1e-3f, localCov);
+    // Fine fibre striations along the streak (the erosion channel, stretched).
+    float fib = noiseVol.sample(volSampler, float3(q.x * 1.6f, q.y * 6.0f, 0.71f) / tile).g;
+    d *= mix(0.55f, 1.0f, fib);
+    if (d <= 1e-4f) return sky;
+    float tau = u.cirrusA.y * d / max(rayDir.y, 0.07f);
+    float cosT = clamp(dot(rayDir, -u.sunDir.xyz), -1.0f, 1.0f);
+    float phase = 0.6f * hg(cosT, 0.75f) + 0.4f * (1.0f / (4.0f * M_PI_F));
+    float3 amb = cloudAmbientBase(u);
+    float  ambL = dot(amb, float3(0.2126f, 0.7152f, 0.0722f));
+    float3 L = cloudSunIrradiance(u) * phase + float3(ambL) * 1.6f;
+    float a = 1.0f - exp(-tau);
+    return sky * (1.0f - a) + L * a;
+}
+
+// ── Cloud lighting from the atmosphere (Params.cloudLightingFromAtmosphere) ─────────────
+// The cloud march's legacy sun (`sunColor·sunIntensity`) and fill (`skyZenith·ambient`) are
+// hand-set numbers in units unrelated to the nishita sky's `intensity·∫β·phase·T` — under a
+// physical sky that left every cloud several times DARKER than the blue behind it. This pass
+// lights the deck in the sky's own units, on the GPU, from the same march the sky pixels use:
+// the solar irradiance reaching the deck base through the air, and the mean radiance of the
+// graded sky above + the sun- and sky-lit ground below. One 16-thread threadgroup per sky
+// update; results land in `SkyUniforms.cloudLitSun/cloudLitAmbient`, which every later cloud
+// dispatch on the queue reads.
+
+inline float3 nishitaTransmittanceToSun(float altitude, float3 toSun) {
+    float3 o = float3(0.0f, kEarthRadius + max(altitude, 1.0f), 0.0f);
+    float tl = raySphereExit(o, toSun, kAtmosRadius);
+    if (tl <= 0.0f) return float3(1.0f);
+    constexpr int N = 16;
+    float seg = tl / float(N);
+    float3 od = float3(0.0f);
+    for (int j = 0; j < N; ++j) {
+        float3 p = o + toSun * ((float(j) + 0.5f) * seg);
+        float h = length(p) - kEarthRadius;
+        if (h < 0.0f) return float3(0.0f);          // the planet shades the deck
+        od += float3(exp(-h / kRayleighH), exp(-h / kMieH), ozoneDensity(h)) * seg;
+    }
+    return exp(-(kBetaR * od.x + kBetaM * 1.1f * od.y + kBetaO * od.z));
+}
+
+kernel void volSkyCloudLight(device SkyUniforms &u [[buffer(0)]],
+                             uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float3 radiance[16];
+    threadgroup float  weight[16];
+    float intensity = max(0.0f, u.atmosphereParams.y);
+    float3 s = float3(0.0f);
+    float  w = 0.0f;
+    // Thread 1 = zenith; 2…13 = two rings of six (low ring weighted up — it is most of
+    // the solid angle a deck's flank sees). Threads 0, 14, 15 contribute nothing.
+    if (tid >= 1u && tid <= 13u) {
+        float3 d = float3(0.0f, 1.0f, 0.0f);
+        w = 1.0f;
+        if (tid >= 2u) {
+            uint  k  = tid - 2u;
+            float a  = float(k % 6u) / 6.0f * 2.0f * M_PI_F;
+            float el = (k < 6u) ? 0.20f : 0.75f;
+            d = normalize(float3(cos(a) * cos(el), sin(el), sin(a) * cos(el)));
+            w = (k < 6u) ? 1.2f : 1.0f;
+        }
+        s = skyGraded(nishitaScatter(d, u.sunDir.xyz, intensity), u.skyGrade.x, u.skyGrade.y) * w;
+    }
+    radiance[tid] = s;
+    weight[tid] = w;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0u) return;
+    float3 sum = float3(0.0f);
+    float  wsum = 0.0f;
+    for (uint i = 0u; i < 16u; ++i) { sum += radiance[i]; wsum += weight[i]; }
+    float3 skyMean = sum / max(wsum, 1e-6f);
+    float3 toSun = -u.sunDir.xyz;
+    float3 sun = intensity * nishitaTransmittanceToSun(u.cloudSlab.x, toSun);
+    // Lambertian ground under the deck (albedo in skyHorizon.xyz in this mode).
+    float3 groundRad = u.skyHorizon.xyz * (sun * max(toSun.y, 0.0f) + M_PI_F * skyMean) / M_PI_F;
+    u.cloudLitSun     = float4(sun, 1.0f);
+    u.cloudLitAmbient = float4(0.5f * (skyMean + groundRad), 1.0f);
+}
+
 // Sun disk — a soft circular hotspot anchored to the sun's 3D direction.
 //
 // History note: an earlier revision drew this in equirect uv-space to dodge
@@ -1107,6 +1245,7 @@ kernel void volSkyRender(
             sky += starField(rayDir, u.nightParams.x) * nightBlend;
             sky += moonDisk(rayDir, u) * nightBlend;
         }
+        sky = applyCirrus(sky, u.cameraPos.xyz, rayDir, u, noiseVol);
     }
 
     // Compute ray–slab entry and exit (slab is infinite in XZ). Rays
@@ -1196,7 +1335,12 @@ kernel void volSkyRender(
     // Sun is "active" only if it has colour — night decks (sunColor ≈ 0) skip
     // the sun light-march entirely (it would contribute nothing but cost a
     // full secondary march per dense step).
-    bool sunActive = (u.sunColor.x + u.sunColor.y + u.sunColor.z) > 1e-3f;
+    // Atmosphere-lit deck (`cloudLightingFromAtmosphere`): the irradiance + fill the GPU
+    // derived from the nishita march; otherwise the host's hand-set sun and zenith.
+    bool   physLit = u.skyGrade.z > 0.5f;
+    float3 sunIrr  = physLit ? u.cloudLitSun.xyz : u.sunColor.xyz * u.sunColor.w;
+    float3 ambBase = physLit ? u.cloudLitAmbient.xyz : u.skyZenith.xyz;
+    bool sunActive = (sunIrr.x + sunIrr.y + sunIrr.z) > 1e-3f;
 
     // Moon as the deck's DIRECTIONAL light at night: a real lit near-face /
     // shadowed far-face is what makes a cloud read as cumulus rather than a
@@ -1278,7 +1422,7 @@ kernel void volSkyRender(
                 float lit = (msStrength > 0.0f)
                     ? msLight(od, cosT, gF, gB, absK, msStrength)
                     : exp(-od * absK) * phase;
-                sunContrib = u.sunColor.xyz * u.sunColor.w * lit * powder;
+                sunContrib = sunIrr * lit * powder;
             }
 
             // Moon directional (night decks) — gives the deck its form.
@@ -1299,8 +1443,8 @@ kernel void volSkyRender(
             // desaturates the fill toward a luminance-preserving neutral grey so
             // an overcast deck reads grey (DH-0585); 0 = the legacy blue fill.
             float  ambGrey = clamp(u.skyZenith.w, 0.0f, 1.0f);
-            float  ambLum  = dot(u.skyZenith.xyz, float3(0.2126f, 0.7152f, 0.0722f));
-            float3 ambCol  = mix(u.skyZenith.xyz, float3(ambLum), ambGrey);
+            float  ambLum  = dot(ambBase, float3(0.2126f, 0.7152f, 0.0722f));
+            float3 ambCol  = mix(ambBase, float3(ambLum), ambGrey);
             float3 ambientContrib = ambCol * ambient;
 
             // Fireworks: single-scattered radiance from the ray's culled
@@ -1410,7 +1554,7 @@ kernel void volSkyRender(
 
 struct CloudInViewUniforms {
     float4x4 invViewProjection;  // host clip → world (jittered VP inverse)
-    float4   cameraWorldPos;     // xyz = ray origin, w unused
+    float4   cameraWorldPos;     // xyz = ray origin, w = downsample factor (≤1 = full res)
 };
 
 kernel void illumi_cloud_inview(
@@ -1427,8 +1571,21 @@ kernel void illumi_cloud_inview(
     uint W = outTex.get_width();
     uint H = outTex.get_height();
     if (gid.x >= W || gid.y >= H) return;
-    // Opaque geometry owns this pixel — leave the deferred composite alone.
-    if (gDepth.read(gid) < 0.99999f) return;
+    // Downsampled march (`inViewCloudsResolutionScale` < 1): this texel covers an f×f block
+    // of the depth buffer and marches if ANY of it is sky; an all-geometry block writes alpha 0
+    // so the upsample never blends it in. At f = 1 this is the original full-res clip.
+    uint f = max(1u, uint(cv.cameraWorldPos.w + 0.5f));
+    if (f <= 1u) {
+        // Opaque geometry owns this pixel — leave the deferred composite alone.
+        if (gDepth.read(gid) < 0.99999f) return;
+    } else {
+        uint2 dmax = uint2(gDepth.get_width() - 1, gDepth.get_height() - 1);
+        bool anySky = false;
+        for (uint dy = 0u; dy < f && !anySky; ++dy)
+            for (uint dx = 0u; dx < f && !anySky; ++dx)
+                anySky = gDepth.read(min(gid * f + uint2(dx, dy), dmax)) >= 0.99999f;
+        if (!anySky) { outTex.write(float4(0.0f), gid); return; }
+    }
 
     // ── Reconstruct the world-space camera ray (the ONLY difference vs the
     // equirect kernel). NDC: x,y ∈ [-1,1] with +Y up (texture row 0 = top), z = 1
@@ -1456,6 +1613,7 @@ kernel void illumi_cloud_inview(
             sky += starField(rayDir, u.nightParams.x) * nightBlend;
             sky += moonDisk(rayDir, u) * nightBlend;
         }
+        sky = applyCirrus(sky, ro, rayDir, u, noiseVol);
     }
 
     float yCos = rayDir.y;
@@ -1504,7 +1662,12 @@ kernel void illumi_cloud_inview(
 
     float cosT = clamp(dot(rayDir, -u.sunDir.xyz), -1.0f, 1.0f);
     float phase = hg(cosT, gF) + 0.5f * hg(cosT, gB);
-    bool sunActive = (u.sunColor.x + u.sunColor.y + u.sunColor.z) > 1e-3f;
+    // Atmosphere-lit deck (`cloudLightingFromAtmosphere`): the irradiance + fill the GPU
+    // derived from the nishita march; otherwise the host's hand-set sun and zenith.
+    bool   physLit = u.skyGrade.z > 0.5f;
+    float3 sunIrr  = physLit ? u.cloudLitSun.xyz : u.sunColor.xyz * u.sunColor.w;
+    float3 ambBase = physLit ? u.cloudLitAmbient.xyz : u.skyZenith.xyz;
+    bool sunActive = (sunIrr.x + sunIrr.y + sunIrr.z) > 1e-3f;
 
     float  moonGain = u.atmosphereParams.w;
     bool   moonActive = moonGain > 1e-3f;
@@ -1557,7 +1720,7 @@ kernel void illumi_cloud_inview(
                 float lit = (msStrength > 0.0f)
                     ? msLight(od, cosT, gF, gB, absK, msStrength)
                     : exp(-od * absK) * phase;
-                sunContrib = u.sunColor.xyz * u.sunColor.w * lit * powder;
+                sunContrib = sunIrr * lit * powder;
             }
             float3 moonContrib = float3(0.0f);
             if (moonActive) {
@@ -1573,8 +1736,8 @@ kernel void illumi_cloud_inview(
             // desaturates the fill toward a luminance-preserving neutral grey so
             // an overcast deck reads grey (DH-0585); 0 = the legacy blue fill.
             float  ambGrey = clamp(u.skyZenith.w, 0.0f, 1.0f);
-            float  ambLum  = dot(u.skyZenith.xyz, float3(0.2126f, 0.7152f, 0.0722f));
-            float3 ambCol  = mix(u.skyZenith.xyz, float3(ambLum), ambGrey);
+            float  ambLum  = dot(ambBase, float3(0.2126f, 0.7152f, 0.0722f));
+            float3 ambCol  = mix(ambBase, float3(ambLum), ambGrey);
             float3 ambientContrib = ambCol * ambient;
             float3 burstContrib = float3(0.0f);
             for (uint li = 0u; li < rayLightCount; ++li) {
@@ -1613,4 +1776,42 @@ kernel void illumi_cloud_inview(
     float3 col = sky * effTrans + lum * blend;
     // NO Reinhard here — the host tonemaps the HDR scene-colour once downstream.
     outTex.write(float4(col, 1.0f), gid);
+}
+
+// Depth-aware upsample of a downsampled in-view cloud march into the HDR composite. Sky pixels
+// only; a manual bilinear over the four surrounding low-res texels weighted by their alpha
+// (1 = marched, 0 = an all-geometry block), so a silhouette never pulls in unmarched texels.
+// Clouds and the atmosphere are smooth at this scale — a quarter of the rays for the same sky.
+kernel void illumi_cloud_upsample(
+    texture2d<float, access::write> outTex [[texture(0)]],
+    texture2d<float, access::read>  lowRes [[texture(1)]],
+    depth2d<float,   access::read>  gDepth [[texture(2)]],
+    constant CloudInViewUniforms &cv       [[buffer(0)]],
+    uint2 gid                              [[thread_position_in_grid]]
+) {
+    if (gid.x >= outTex.get_width() || gid.y >= outTex.get_height()) return;
+    if (gDepth.read(gid) < 0.99999f) return;
+    float f = max(1.0f, cv.cameraWorldPos.w);
+    int2 lmax = int2(lowRes.get_width() - 1, lowRes.get_height() - 1);
+    float2 p = (float2(gid) + 0.5f) / f - 0.5f;
+    int2 p0 = int2(floor(p));
+    float2 t = p - float2(p0);
+    float3 acc = float3(0.0f);
+    float wsum = 0.0f;
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            int2 q = clamp(p0 + int2(i, j), int2(0), lmax);
+            float4 s = lowRes.read(uint2(q));
+            float w = (i == 0 ? 1.0f - t.x : t.x) * (j == 0 ? 1.0f - t.y : t.y) * s.a;
+            acc += s.rgb * w;
+            wsum += w;
+        }
+    }
+    if (wsum <= 1e-5f) {
+        // Every neighbour was geometry-only (a sky pixel inside a thin gap): the texel that
+        // contains this pixel marched it (its block had sky), so read that one.
+        acc = lowRes.read(uint2(clamp(int2(float2(gid) / f), int2(0), lmax))).rgb;
+        wsum = 1.0f;
+    }
+    outTex.write(float4(acc / wsum, 1.0f), gid);
 }

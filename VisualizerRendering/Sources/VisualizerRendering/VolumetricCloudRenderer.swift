@@ -379,6 +379,41 @@ public final class VolumetricCloudRenderer {
         /// A hue pull toward blue: the sky's blue channel scaled by this with the luma restored.
         /// 1 = untouched. What a deep-blue photographic sky needs that saturation cannot give.
         public var skyBlueLift: Float = 1.0
+        /// **Light the cloud deck in the atmosphere's own units** (`.nishita` only). The cloud
+        /// march's sun term is `sunColor · sunIntensity · phase` and its fill is `skyZenith ·
+        /// ambient` — hand-set numbers in units unrelated to the physical sky's `intensity ·
+        /// ∫β·phase·T`. Under a nishita sky that left every cloud several times DARKER than the
+        /// blue behind it: slate blobs instead of white volumes (Superbloom Hills, 2026-09-22).
+        /// On, the renderer derives both from the atmosphere (`NishitaAtmosphere.cloudLighting`):
+        /// the solar irradiance reaching `cloudBaseY` through the air, and the mean sky + ground
+        /// radiance around the deck (graded like the dome). `sunColor` / `sunIntensity` /
+        /// `skyZenith` are then ignored for clouds and the sun disc; `ambient` still scales the
+        /// fill (1 = physical). Off (the default) = byte-identical for every existing host.
+        public var cloudLightingFromAtmosphere: Bool = false
+        /// The ground's mean ALBEDO under the deck, for the sun + sky bounce that fills a cloud's
+        /// underside (read only with `cloudLightingFromAtmosphere`). Not `groundColor`, which is
+        /// the dome's below-horizon RADIANCE.
+        public var cloudGroundAlbedo: SIMD3<Float> = SIMD3<Float>(0.15, 0.16, 0.10)
+        // ── Cirrus veil (opt-in) ─────────────────────────────────────────
+        /// A thin, high ice veil ABOVE the cumulus deck — the fibrous, wind-streaked "mares'
+        /// tails" a slab of rounded volumes cannot make. Single-scatter, one plane intersection
+        /// per sky pixel (no march), lit by the same sun/fill as the deck. 0 = off: byte-identical.
+        public var cirrusCoverage: Float = 0
+        /// Zenith optical depth of a fully covered fibre (the veil is thicker toward the horizon).
+        public var cirrusOpacity: Float = 0.35
+        /// Altitude of the veil, m.
+        public var cirrusAltitude: Float = 8500
+        /// Feature frequency in noise texels per metre (0.004 ≈ 2 km patches).
+        public var cirrusScale: Float = 0.004
+        /// Streak direction in the ground plane (x, z).
+        public var cirrusDirection: SIMD2<Float> = SIMD2<Float>(1, 0.35)
+        /// How much longer than wide a fibre is.
+        public var cirrusStretch: Float = 6
+        /// Drift speed relative to the deck's wind (the jet is faster aloft).
+        public var cirrusDrift: Float = 2
+
+        /// The flag as the kernels honour it: atmosphere-lit clouds need the nishita sky.
+        var physicalCloudLighting: Bool { cloudLightingFromAtmosphere && atmosphere == .nishita }
 
         // ── Flat studio background (opt-in) ─────────────────────────────
         /// Replace the ENTIRE dome — atmosphere, sun disk, clouds, stars/moon — with a flat,
@@ -445,10 +480,15 @@ public final class VolumetricCloudRenderer {
             name: "volSkyRender",
             device: engine.device
         )
+        self.cloudLightPipeline = engine.pipelineCache.pipelineState(
+            name: "volSkyCloudLight",
+            device: engine.device
+        )
         guard let buf = engine.device.makeBuffer(length: MemoryLayout<SkyUniforms>.stride,
                                                  options: .storageModeShared) else {
             preconditionFailure("VolumetricCloudRenderer: failed to allocate uniforms buffer")
         }
+        memset(buf.contents(), 0, buf.length)   // the GPU-owned tail starts unlit, not garbage
         buf.label = "VolumetricCloudRenderer.uniforms"
         self.uniformsBuffer = buf
         // Zeroed single-entry fallback so buffer(1) is always bound even for
@@ -488,6 +528,27 @@ public final class VolumetricCloudRenderer {
     ///      builds anyway.
     ///
     /// Both dispatches use the same uniforms — they're packed once.
+    /// Upload the host-owned uniforms and, for atmosphere-lit clouds, queue the GPU pass that
+    /// derives the deck's sun + fill from the nishita march into the uniforms' GPU-owned tail —
+    /// ahead of every cloud dispatch on this queue (the IBL + dome, and the Illuminatorama
+    /// in-view pass, which shares the queue). Only the host PREFIX is copied, so the prepass's
+    /// results are never clobbered by the next frame's upload.
+    private func upload(_ uniforms: SkyUniforms, params: Params) {
+        var u = uniforms
+        withUnsafeBytes(of: &u) { raw in
+            uniformsBuffer.contents().copyMemory(from: raw.baseAddress!, byteCount: SkyUniforms.hostPrefixLength)
+        }
+        guard params.physicalCloudLighting, let lightPipeline = cloudLightPipeline,
+              let cmd = commandQueue.makeCommandBuffer(), let enc = cmd.makeComputeCommandEncoder() else { return }
+        cmd.label = "volSkyCloudLight"
+        enc.setComputePipelineState(lightPipeline)
+        enc.setBuffer(uniformsBuffer, offset: 0, index: 0)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 16, height: 1, depth: 1))
+        enc.endEncoding()
+        cmd.commit()
+    }
+
     public func render(params: Params) {
         guard let pipeline else { return }
 
@@ -498,9 +559,7 @@ public final class VolumetricCloudRenderer {
         let liveLightCount = burstLights == nil ? 0 : max(0, burstLightCount)
         uniforms.marchBudgets.z = Float(liveLightCount)
         uniforms.marchBudgets.w = burstLightGain
-        uniformsBuffer.contents()
-            .bindMemory(to: SkyUniforms.self, capacity: 1)
-            .pointee = uniforms
+        upload(uniforms, params: params)
 
         // ── IBL pass: cheap, every call ─────────────────────────────
         if iblSem.wait(timeout: .now()) == .success {
@@ -654,9 +713,7 @@ public final class VolumetricCloudRenderer {
         let liveLightCount = burstLights == nil ? 0 : max(0, burstLightCount)
         uniforms.marchBudgets.z = Float(liveLightCount)
         uniforms.marchBudgets.w = burstLightGain
-        uniformsBuffer.contents()
-            .bindMemory(to: SkyUniforms.self, capacity: 1)
-            .pointee = uniforms
+        upload(uniforms, params: params)
 
         guard let cmd = commandQueue.makeCommandBuffer(),
               let enc = cmd.makeComputeCommandEncoder() else { return }
@@ -704,6 +761,7 @@ public final class VolumetricCloudRenderer {
     private let commandQueue: MTLCommandQueue
     private let pipeline: MTLComputePipelineState?
     private let uniformsBuffer: MTLBuffer
+    private let cloudLightPipeline: MTLComputePipelineState?
 
     /// Zeroed single-entry BurstLight buffer bound at index 1 whenever the
     /// host hasn't supplied `burstLights` — keeps the binding valid for the
@@ -797,8 +855,15 @@ struct SkyUniforms {
     var cloudExtra: SIMD4<Float>
     var cloudExtra2: SIMD4<Float>
     var studioParams: SIMD4<Float>
-    /// x = `Params.skySaturation` — see the Metal mirror.
+    /// x = `Params.skySaturation`, y = `skyBlueLift`, z = atmosphere-lit clouds flag — see the
+    /// Metal mirror.
     var skyGrade: SIMD4<Float>
+    /// Cirrus veil — see the Metal mirror.
+    var cirrusA: SIMD4<Float>
+    var cirrusB: SIMD4<Float>
+    /// GPU-WRITTEN by `volSkyCloudLight` (never by the host upload — see `hostPrefixLength`).
+    var cloudLitSun: SIMD4<Float>
+    var cloudLitAmbient: SIMD4<Float>
 
     init(params: VolumetricCloudRenderer.Params, time: Float) {
         let sun = normalize(params.sunDir)
@@ -810,7 +875,10 @@ struct SkyUniforms {
         self.sunDir      = SIMD4<Float>(sun, 0)
         self.sunColor    = SIMD4<Float>(params.sunColor, params.sunIntensity)
         self.skyZenith   = SIMD4<Float>(params.skyZenith, params.cloudAmbientGrey)
-        self.skyHorizon  = SIMD4<Float>(params.skyHorizon, params.hazePower)
+        // In atmosphere-lit mode the (nishita-unused) horizon colour carries the ground albedo
+        // `volSkyCloudLight` bounces the sun and sky off.
+        self.skyHorizon  = SIMD4<Float>(params.physicalCloudLighting ? params.cloudGroundAlbedo : params.skyHorizon,
+                                        params.hazePower)
         self.groundColor = SIMD4<Float>(params.groundColor, params.groundBlend)
         self.cloudSlab   = SIMD4<Float>(params.cloudBaseY,
                                         params.cloudTopY,
@@ -874,6 +942,17 @@ struct SkyUniforms {
         // studioParams: xyz = flat background colour, w = enable flag (>0.5 = on).
         self.studioParams = SIMD4<Float>(params.flatBackgroundColor,
                                          params.flatBackground ? 1 : 0)
-        self.skyGrade = SIMD4<Float>(max(0, params.skySaturation), max(0, params.skyBlueLift), 0, 0)
+        self.skyGrade = SIMD4<Float>(max(0, params.skySaturation), max(0, params.skyBlueLift),
+                                     params.physicalCloudLighting ? 1 : 0, 0)
+        let cd = params.cirrusDirection == .zero ? SIMD2<Float>(1, 0) : simd_normalize(params.cirrusDirection)
+        self.cirrusA = SIMD4<Float>(max(0, min(1, params.cirrusCoverage)), max(0, params.cirrusOpacity),
+                                    params.cirrusAltitude, max(1e-6, params.cirrusScale))
+        self.cirrusB = SIMD4<Float>(cd.x, cd.y, max(1, params.cirrusStretch), params.cirrusDrift)
+        self.cloudLitSun = .zero
+        self.cloudLitAmbient = .zero
     }
+
+    /// Bytes the HOST owns — everything before the GPU-written cloud-lighting pair. The
+    /// per-frame upload copies only these, so `volSkyCloudLight`'s results survive it.
+    static var hostPrefixLength: Int { MemoryLayout<SkyUniforms>.offset(of: \SkyUniforms.cloudLitSun)! }
 }

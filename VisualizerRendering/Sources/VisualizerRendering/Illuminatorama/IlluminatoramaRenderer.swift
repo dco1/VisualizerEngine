@@ -4481,6 +4481,15 @@ public final class IlluminatoramaRenderer {
     /// composites crisp camera-ray clouds into the HDR target (issue #61). OFF
     /// by default → every scene + the dome/IBL path is byte-identical.
     public var inViewCloudsEnabled = false
+    /// Resolution the in-view cloud + atmosphere march runs at, as a fraction of the canvas
+    /// (1 = full res, the default — byte-identical). 0.5 marches a quarter of the rays into an
+    /// off-screen target and depth-aware-upsamples it into the sky pixels: clouds and the
+    /// nishita sky are smooth at that scale, and the march is the most expensive pass in an
+    /// outdoor scene (measured 30 ms of a 2880×1620 frame in Superbloom Hills).
+    public var inViewCloudsResolutionScale: Float = 1
+    private var cloudLowResTexture: MTLTexture?
+    private lazy var cloudUpsamplePipeline: MTLComputePipelineState? =
+        engine.pipelineCache.pipelineState(name: "illumi_cloud_upsample", device: device)
     /// Baked noise volume + packed SkyUniforms + burst-light buffer, supplied by
     /// the scene's `VolumetricCloudRenderer` (reused, not re-packed).
     public var cloudNoiseTexture: MTLTexture?
@@ -12752,13 +12761,30 @@ public final class IlluminatoramaRenderer {
               let skyU = cloudSkyUniforms,
               let lights = cloudBurstLights else { return }
         let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
+        // Downsample factor (1 = the original full-res pass, byte-identical).
+        let factor = inViewCloudsResolutionScale < 0.99
+            ? max(2, min(4, Int((1 / max(inViewCloudsResolutionScale, 0.25)).rounded()))) : 1
+        var lowRes: MTLTexture? = nil
+        if factor > 1 {
+            let lw = (width + factor - 1) / factor, lh = (height + factor - 1) / factor
+            if cloudLowResTexture?.width != lw || cloudLowResTexture?.height != lh {
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: lw, height: lh,
+                                                                 mipmapped: false)
+                d.usage = [.shaderRead, .shaderWrite]
+                d.storageMode = .private
+                cloudLowResTexture = device.makeTexture(descriptor: d)
+                cloudLowResTexture?.label = "Illuminatorama.cloudInView.lowRes"
+            }
+            lowRes = cloudUpsamplePipeline == nil ? nil : cloudLowResTexture
+        }
+        let f = lowRes == nil ? 1 : factor
         var u = CloudInViewUniforms(invViewProjection: fu.invViewProjection,
-                                    cameraWorldPos: SIMD4<Float>(fu.cameraWorldPos, 0))
+                                    cameraWorldPos: SIMD4<Float>(fu.cameraWorldPos, f > 1 ? Float(f) : 0))
         memcpy(cloudInViewUniformBuffer.contents(), &u, MemoryLayout<CloudInViewUniforms>.stride)
         guard let enc = timedComputeEncoder(cb, "cloudInView") else { return }
         enc.label = "Illuminatorama.cloudInView"
         enc.setComputePipelineState(pipeline)
-        enc.setTexture(hdrCompositeTexture, index: 0)
+        enc.setTexture(lowRes ?? hdrCompositeTexture, index: 0)
         enc.setTexture(noise, index: 1)
         // v2 depth clip — the kernel writes only where this says there is no
         // geometry, so the deck can no longer paint over the building.
@@ -12766,8 +12792,23 @@ public final class IlluminatoramaRenderer {
         enc.setBuffer(skyU, offset: 0, index: 0)
         enc.setBuffer(cloudInViewUniformBuffer, offset: 0, index: 1)
         enc.setBuffer(lights, offset: 0, index: 2)
-        dispatch(enc, pipeline: pipeline, width: width, height: height)
-        enc.endEncoding()
+        if let lowRes {
+            dispatch(enc, pipeline: pipeline, width: lowRes.width, height: lowRes.height)
+            enc.endEncoding()
+            guard let up = cloudUpsamplePipeline,
+                  let enc2 = timedComputeEncoder(cb, "cloudInView.upsample") else { return }
+            enc2.label = "Illuminatorama.cloudInView.upsample"
+            enc2.setComputePipelineState(up)
+            enc2.setTexture(hdrCompositeTexture, index: 0)
+            enc2.setTexture(lowRes, index: 1)
+            enc2.setTexture(depthTexture, index: 2)
+            enc2.setBuffer(cloudInViewUniformBuffer, offset: 0, index: 0)
+            dispatch(enc2, pipeline: up, width: width, height: height)
+            enc2.endEncoding()
+        } else {
+            dispatch(enc, pipeline: pipeline, width: width, height: height)
+            enc.endEncoding()
+        }
     }
 
     /// Phase 2.7 — TAA resolve. Reprojects last frame's accumulated HDR with
