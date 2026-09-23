@@ -959,11 +959,14 @@ public struct IlluminatoramaInstance {
     /// Sway kind: 0 none · 1 bottom-pivot lean (books, upright shelf contents) ·
     /// 2 top-pivot pendulum (a hanging pendant: rigid rotation about the model origin —
     /// the ceiling anchor — self-oscillating from the frame time; see `applySway` in
-    /// Illuminatorama.metal).
+    /// Illuminatorama.metal) · 3 wind hinge flap (rotation about the model origin's local +Z,
+    /// one-sided and gusty, scaled on the GPU by the frame's `treeWindStrength` — a toilet seat
+    /// or lid the wind lifts off its rest).
     public var swayMode: Int32 = 0
     /// Mode 1: static lean angle (radians) about local-Z, pivoting at the base.
     /// Mode 2: pendulum AMPLITUDE (max swing, radians) — the shader animates the swing
     /// from the frame time, so the host sets this once (no per-frame drive).
+    /// Mode 3: the flap at full wind (radians); its SIGN is the direction it lifts.
     public var swayLean: Float = 0
     /// Vertical pop (metres) added in world space — a knock hops the object up.
     public var swayJostle: Float = 0

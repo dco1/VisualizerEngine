@@ -1330,14 +1330,20 @@ kernel void volSkyRender(
     // ── Atmosphere + sun ─────────────────────────────────────────────
     bool debugBG = u.atmosphereParams.z > 0.5f;
     float3 sky;
+    float lavaW = 0.0f;
+    float3 lavaCol = float3(0.0f);
     if (debugBG) {
         // Neon tiled background BEHIND the clouds — isolates the deck
         // silhouette + density (sky gaps glow, cloud bodies occlude).
         sky = neonDebugBackground(rayDir);
     } else {
         // Mode selects the faked gradient (0) or the physical Nishita march (1).
-        if (u.lavaA.x > 0.5f) {
-            sky = lavaLampSky(rayDir, u.lavaA.y, u);   // the lamp replaces the atmosphere: skip it
+        // lavaA.x = the lamp's weight: 1 = the lamp alone (the atmosphere is skipped); between 0
+        // and 1 the full sky is rendered and cross-faded to the lamp at every write below.
+        lavaW = saturate(u.lavaA.x);
+        if (lavaW > 0.0f) lavaCol = lavaLampSky(rayDir, u.lavaA.y, u);
+        if (lavaW >= 1.0f) {
+            sky = lavaCol;   // the lamp replaces the atmosphere: skip it
         } else {
             sky = (u.atmosphereParams.x > 0.5f)
                 ? nishitaAtmosphereColor(rayDir, u)
@@ -1378,7 +1384,7 @@ kernel void volSkyRender(
     if (ro.y < baseY) {
         // Below the deck: only upward rays can reach it.
         if (yCos < 0.01f) {
-            outTex.write(float4(sky, 1.0f), gid);
+            outTex.write(float4(mix(sky, lavaCol, lavaW), 1.0f), gid);
             return;
         }
         tEnter = (baseY - ro.y) / yCos;
@@ -1397,7 +1403,7 @@ kernel void volSkyRender(
     } else {
         // Above the deck: only downward rays can reach it.
         if (yCos > -0.01f) {
-            outTex.write(float4(sky, 1.0f), gid);
+            outTex.write(float4(mix(sky, lavaCol, lavaW), 1.0f), gid);
             return;
         }
         tEnter = (topY  - ro.y) / yCos;
@@ -1405,7 +1411,7 @@ kernel void volSkyRender(
     }
     tEnter = max(tEnter, 0.0f);
     if (tExit <= tEnter) {
-        outTex.write(float4(sky, 1.0f), gid);
+        outTex.write(float4(mix(sky, lavaCol, lavaW), 1.0f), gid);
         return;
     }
 
@@ -1623,7 +1629,7 @@ kernel void volSkyRender(
     float horizonFade = smoothstep(fadeLo, fadeHi, abs(yCos));
     float blend = mix(0.0f, 1.0f, horizonFade);
     float effTrans = mix(1.0f, trans, blend);
-    float3 col = sky * effTrans + lum * blend;
+    float3 col = mix(sky * effTrans + lum * blend, lavaCol, lavaW);
 
     // Mild filmic-ish tone (just a soft Reinhard) so the HDR sun disk doesn't
     // bloom past representable float16 when bound as an environment map.
@@ -1665,6 +1671,8 @@ struct CloudInViewUniforms {
     float4x4 invViewProjection;  // host clip → world (jittered VP inverse)
     float4   cameraWorldPos;     // xyz = ray origin, w = downsample factor (≤1 = full res)
     float4   extra;              // x = the renderer's frame time (s) — animates the lava lamp per frame
+                                 // y = per-frame lava weight override (≥ 0), −1 = SkyUniforms.lavaA.x
+                                 // z = cirrus clock override (≥ 0), −1 = x
 };
 
 kernel void illumi_cloud_inview(
@@ -1710,14 +1718,20 @@ kernel void illumi_cloud_inview(
     // ── Atmosphere + sun (identical to volSkyRender) ─────────────────
     bool debugBG = u.atmosphereParams.z > 0.5f;
     float3 sky;
+    float lavaW = 0.0f;
+    float3 lavaCol = float3(0.0f);
     if (debugBG) {
         sky = neonDebugBackground(rayDir);
     } else {
         // The lava lamp animates on the RENDERER's frame clock here (every frame), not the
         // dome's (host-throttled) — its blobs would otherwise step visibly. It replaces the
         // atmosphere, so the nishita march is skipped rather than computed and discarded.
-        if (u.lavaA.x > 0.5f) {
-            sky = lavaLampSky(rayDir, cv.extra.x, u);
+        // lavaA.x = the lamp's weight (see volSkyRender): < 1 renders both and cross-fades.
+        // extra.y ≥ 0 = the host's per-frame weight (a fade must not step at the sky's rate).
+        lavaW = cv.extra.y >= 0.0f ? saturate(cv.extra.y) : saturate(u.lavaA.x);
+        if (lavaW > 0.0f) lavaCol = lavaLampSky(rayDir, cv.extra.x, u);
+        if (lavaW >= 1.0f) {
+            sky = lavaCol;
         } else {
             sky = (u.atmosphereParams.x > 0.5f)
                 ? nishitaAtmosphereColor(rayDir, u)
@@ -1730,7 +1744,7 @@ kernel void illumi_cloud_inview(
             sky += starField(rayDir, u.nightParams.x) * nightBlend;
             sky += moonDisk(rayDir, u) * nightBlend;
         }
-        sky = applyCirrus(sky, ro, rayDir, cv.extra.x, u, noiseVol);
+        sky = applyCirrus(sky, ro, rayDir, cv.extra.z >= 0.0f ? cv.extra.z : cv.extra.x, u, noiseVol);
     }
     // Alpha for a texel with no deck in the way: fully transmissive (see the tail write).
     float clearA = f > 1u ? 2.0f : 1.0f;
@@ -1741,7 +1755,7 @@ kernel void illumi_cloud_inview(
 
     float tEnter, tExit;
     if (ro.y < baseY) {
-        if (yCos < 0.01f) { outTex.write(float4(sky, clearA), gid); return; }
+        if (yCos < 0.01f) { outTex.write(float4(mix(sky, lavaCol, lavaW), clearA), gid); return; }
         tEnter = (baseY - ro.y) / yCos;
         tExit  = (topY  - ro.y) / yCos;
     } else if (ro.y <= topY) {
@@ -1750,12 +1764,12 @@ kernel void illumi_cloud_inview(
         else if (yCos < -0.001f) tExit = (baseY - ro.y) / yCos;
         else                     tExit = (topY - baseY) * 4.0f;
     } else {
-        if (yCos > -0.01f) { outTex.write(float4(sky, clearA), gid); return; }
+        if (yCos > -0.01f) { outTex.write(float4(mix(sky, lavaCol, lavaW), clearA), gid); return; }
         tEnter = (topY  - ro.y) / yCos;
         tExit  = (baseY - ro.y) / yCos;
     }
     tEnter = max(tEnter, 0.0f);
-    if (tExit <= tEnter) { outTex.write(float4(sky, clearA), gid); return; }
+    if (tExit <= tEnter) { outTex.write(float4(mix(sky, lavaCol, lavaW), clearA), gid); return; }
 
     // ── Cloud march (identical math to volSkyRender) ─────────────────
     int   steps     = max(1, int(u.marchBudgets.x));
@@ -1892,7 +1906,7 @@ kernel void illumi_cloud_inview(
     float horizonFade = smoothstep(fadeLo, fadeHi, abs(yCos));
     float blend = mix(0.0f, 1.0f, horizonFade);
     float effTrans = mix(1.0f, trans, blend);
-    float3 col = sky * effTrans + lum * blend;
+    float3 col = mix(sky * effTrans + lum * blend, lavaCol, lavaW);
     // NO Reinhard here — the host tonemaps the HDR scene-colour once downstream.
     // Downsampled: alpha = 1 + transmittance, so the full-res upsample can put pixel-sharp
     // stars BEHIND the clouds (alpha ≥ 1 still marks "marched"). Full-res: alpha 1, as before.
@@ -1951,7 +1965,9 @@ kernel void illumi_cloud_upsample(
         float pixelAngle = acos(clamp(dot(rd, normalize(wp1.xyz / wp1.w - cv.cameraWorldPos.xyz)), -1.0f, 1.0f));
         if (rd.y > -0.05f) {
             float trans = tr / wsum;
-            col += (starFieldSharp(rd, u.nightParams.x, pixelAngle) + moonDisk(rd, u)) * nightBlend * trans;
+            // … and under the lava lamp's weight (the night sky fades out as the lamp fades in).
+            col += (starFieldSharp(rd, u.nightParams.x, pixelAngle) + moonDisk(rd, u)) * nightBlend * trans
+                 * (1.0f - (cv.extra.y >= 0.0f ? saturate(cv.extra.y) : saturate(u.lavaA.x)));
         }
     }
     outTex.write(float4(col, 1.0f), gid);

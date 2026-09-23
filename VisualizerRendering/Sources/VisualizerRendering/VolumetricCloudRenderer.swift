@@ -425,6 +425,11 @@ public final class VolumetricCloudRenderer {
         /// Replace the atmosphere with a lava lamp: metaball wax rising over a glowing gradient,
         /// emissive HDR (it lights the scene through the IBL like any sky). Off = byte-identical.
         public var lavaLamp: Bool = false
+        /// How much of the sky the lamp is, 0…1, while `lavaLamp` is on: below 1 the kernels
+        /// render the full atmosphere + deck + night sky AND the lamp and cross-fade the final
+        /// colour, so a host can fade the lamp in and out. 1 (the default) is the lamp alone —
+        /// byte-identical to before; the host keeps the deck/cirrus/night params live until 1.
+        public var lavaFade: Float = 1
         /// Blob size multiplier (1 = a handful of big blobs across the dome).
         public var lavaScale: Float = 1
         /// Radiance of the lamp (HDR scale).
@@ -989,7 +994,7 @@ struct SkyUniforms {
         self.cirrusB = SIMD4<Float>(cd.x, cd.y, max(1, params.cirrusStretch), params.cirrusDrift)
         self.cirrusC = SIMD4<Float>(params.cirrusThreads ? 1 : 0, params.cirrusFlow, max(0.05, params.cirrusFrequency), 0)
         self.cirrusTint = SIMD4<Float>(simd_max(params.cirrusTint, .zero), 0)
-        self.lavaA = SIMD4<Float>(params.lavaLamp ? 1 : 0, time, max(0.2, params.lavaScale), max(0, params.lavaGlow))
+        self.lavaA = SIMD4<Float>(params.lavaLamp ? min(max(params.lavaFade, 0), 1) : 0, time, max(0.2, params.lavaScale), max(0, params.lavaGlow))
         self.lavaBG = SIMD4<Float>(params.lavaBackground, max(0.001, params.lavaSpeed))
         self.lavaBlobA = SIMD4<Float>(params.lavaBlobA, 0)
         self.lavaBlobB = SIMD4<Float>(params.lavaBlobB, 0)

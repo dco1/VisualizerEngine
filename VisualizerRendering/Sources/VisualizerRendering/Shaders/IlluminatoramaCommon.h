@@ -668,8 +668,8 @@ struct Instance {
     int      highlight;   // 0 none · 1 selected (blue halo) · 2 hover (yellow halo)
     // Drag/impact sway — generic vertex-shader secondary motion (see applySway).
     // New 16-byte cluster (offsets 224-239): stride grows 224 → 240.
-    int      swayMode;    // 0 none · 1 bottom-pivot lean · 2 top-pivot pendulum (hanging)
-    float    swayLean;    // mode 1: static lean angle (rad); mode 2: pendulum amplitude (rad)
+    int      swayMode;    // 0 none · 1 bottom-pivot lean · 2 top-pivot pendulum (hanging) · 3 wind hinge flap
+    float    swayLean;    // mode 1: static lean angle (rad); 2: pendulum amplitude; 3: flap at full wind (signed)
     float    swayJostle;  // vertical pop (metres), applied in world space
     // Light-layer bitfield (was `_padSway0`). Written into the gLayer G-buffer
     // target by the fragment shader; the deferred lighting kernel masks each light

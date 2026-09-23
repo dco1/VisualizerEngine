@@ -227,7 +227,7 @@ public final class IlluminatoramaRenderer {
     private var lastGlassFlat: [(kind: MeshKind, insts: [IlluminatoramaGlassInstance])] = []
     private var glassStableFrames: Int = 0
     /// True when any current instance self-oscillates in the vertex shader
-    /// (swayMode == 2, the top-pivot pendulum): its silhouette animates with
+    /// (swayMode 2, the top-pivot pendulum, or 3, the wind hinge flap): its silhouette animates with
     /// `time` even though the CPU data is static, so the shadow-skip must not
     /// engage. Modes 0/1 are static functions of per-instance data (a mode-1
     /// lean/jostle change rewrites the instance → resets stability anyway), so
@@ -288,7 +288,7 @@ public final class IlluminatoramaRenderer {
     private func rebuildSwayingSpheres() {
         swayingSpheres.removeAll(keepingCapacity: true)
         guard contentHasSway else { return }
-        for ref in instances where ref.data.swayMode == 2 {
+        for ref in instances where ref.data.swayMode >= 2 {
             let m = ref.data.modelMatrix
             guard let mesh = meshes[ref.meshKind], let local = mesh.boundingSphere else {
                 swayingSpheres.append((SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z), .infinity))
@@ -299,7 +299,9 @@ public final class IlluminatoramaRenderer {
                             simd_length(SIMD3(m.columns.1.x, m.columns.1.y, m.columns.1.z)),
                             simd_length(SIMD3(m.columns.2.x, m.columns.2.y, m.columns.2.z)))
             let r = local.radius * scale
-            let swing = abs(ref.data.swayLean) * 2 * r + abs(ref.data.swayJostle)
+            // Mode 3's flap scales with the frame's wind, which has no upper clamp.
+            let reach = ref.data.swayMode == 3 ? max(1, treeWindStrength) : 1
+            let swing = abs(ref.data.swayLean) * reach * 2 * r + abs(ref.data.swayJostle)
             swayingSpheres.append((SIMD3(c4.x, c4.y, c4.z), r + swing))
         }
     }
@@ -557,7 +559,7 @@ public final class IlluminatoramaRenderer {
     private var lastPostFXEaseTime: CFTimeInterval = 0
     /// The scene animation clock, in **seconds since the session started** — reaches the GPU as
     /// `FrameUniforms.time` and drives every shader oscillator (`applyTreeWind`, `applySway`
-    /// mode 2's self-oscillating pendant, the shadow passes' `shadowTime`, `applyCurveWind`,
+    /// modes 2/3 (pendant, wind flap), the shadow passes' `shadowClock.x`, `applyCurveWind`,
     /// the film-grain reseed) plus the `iblRebakeInterval` fallback.
     ///
     /// **It must be SESSION-relative, and it must stay small.** This is a `Float`, so its
@@ -4488,6 +4490,8 @@ public final class IlluminatoramaRenderer {
         var invViewProjection: simd_float4x4
         var cameraWorldPos: SIMD4<Float>
         /// x = frame time (s) — per-frame sky animation (lava lamp) in the in-view pass.
+        /// y = per-frame lava-lamp weight override (≥ 0), or −1 = use SkyUniforms.lavaA.x.
+        /// z = cirrus clock override (≥ 0), or −1 = x.
         var extra: SIMD4<Float> = .zero
     }
     private let cloudInViewPipeline: MTLComputePipelineState?
@@ -4501,6 +4505,13 @@ public final class IlluminatoramaRenderer {
     /// shader multiplies clock × speed, so a speed step on the frame clock jumps the pattern by
     /// time·Δspeed — hundreds of seconds of animation after a few minutes.
     public var inViewSkyTime: Float? = nil
+    /// Per-FRAME lava-lamp weight (0…1) for the in-view sky, overriding the cloud renderer's
+    /// `lavaFade` (which rides the host-throttled sky uniforms — a fade driven through those
+    /// would step at the sky's update rate). `nil` (the default) = the uniform's value.
+    public var inViewLavaFade: Float? = nil
+    /// The cirrus threads' own clock (≥ 0), for a host whose lava lamp and cirrus are on screen
+    /// at once (mid-fade) and animate at independent speeds. `nil` = `inViewSkyTime ?? time`.
+    public var inViewCirrusTime: Float? = nil
     /// Frame-level gain on every instance's `tagGlow.x` weight (petal glow). 1 by default, so a
     /// host that only sets per-instance weights still glows; instances with weight 0 — every
     /// host that never opts in — are untouched by any value.
@@ -9638,7 +9649,7 @@ public final class IlluminatoramaRenderer {
             instanceShapeStableFrames = shapeHeld ? instanceShapeStableFrames + 1 : 0
             instanceStableFrames = 0
             lastUploadedInstances = instances   // COW reference, no deep copy
-            contentHasSway = instances.contains { $0.data.swayMode == 2 }
+            contentHasSway = instances.contains { $0.data.swayMode >= 2 }
             rebuildSwayingSpheres()
         }
         if glassNow.count == lastGlassFlat.count,
@@ -10170,10 +10181,10 @@ public final class IlluminatoramaRenderer {
             enc.setVertexBytes(&lightVP,
                                length: MemoryLayout<simd_float4x4>.stride,
                                index: 3)
-            // Self-oscillating sway (swayMode 2) reads time so a swinging pendant casts
+            // Shader-animated sway (swayMode 2 pendant, 3 wind flap) reads (time, wind) so it casts
             // its swung shadow in phase with the visible mesh; no-op for modes 0/1.
-            var shadowTime = time
-            enc.setVertexBytes(&shadowTime, length: MemoryLayout<Float>.stride, index: 4)
+            var shadowClock = SIMD2<Float>(time, treeWindStrength)   // (time, wind) — swayMode 2/3
+            enc.setVertexBytes(&shadowClock, length: MemoryLayout<SIMD2<Float>>.stride, index: 4)
 
             // Phase 4.12 — instanced draw per mesh kind via the recipe
             // built in `uploadInstances`. Same win as the G-buffer pass:
@@ -10587,10 +10598,10 @@ public final class IlluminatoramaRenderer {
             enc.setVertexBytes(&lightVP,
                                length: MemoryLayout<simd_float4x4>.stride,
                                index: 3)
-            // Self-oscillating sway (swayMode 2) reads time so a swinging pendant casts
+            // Shader-animated sway (swayMode 2 pendant, 3 wind flap) reads (time, wind) so it casts
             // its swung shadow in phase with the visible mesh; no-op for modes 0/1.
-            var shadowTime = time
-            enc.setVertexBytes(&shadowTime, length: MemoryLayout<Float>.stride, index: 4)
+            var shadowClock = SIMD2<Float>(time, treeWindStrength)   // (time, wind) — swayMode 2/3
+            enc.setVertexBytes(&shadowClock, length: MemoryLayout<SIMD2<Float>>.stride, index: 4)
 
             // Phase 4.12 — instanced draw per mesh kind via the recipe
             // built in `uploadInstances`. Same win as the G-buffer pass:
@@ -10753,8 +10764,8 @@ public final class IlluminatoramaRenderer {
 
                 var lightVP = faces[slice]
                 enc.setVertexBytes(&lightVP, length: MemoryLayout<simd_float4x4>.stride, index: 3)
-                var shadowTime = time
-                enc.setVertexBytes(&shadowTime, length: MemoryLayout<Float>.stride, index: 4)
+                var shadowClock = SIMD2<Float>(time, treeWindStrength)   // (time, wind) — swayMode 2/3
+                enc.setVertexBytes(&shadowClock, length: MemoryLayout<SIMD2<Float>>.stride, index: 4)
 
                 let cullClip = cullVolume(lightVP)   // DH-0534
                 for (gi, group) in meshGroups.enumerated() {
@@ -12799,7 +12810,8 @@ public final class IlluminatoramaRenderer {
         let f = lowRes == nil ? 1 : factor
         var u = CloudInViewUniforms(invViewProjection: fu.invViewProjection,
                                     cameraWorldPos: SIMD4<Float>(fu.cameraWorldPos, f > 1 ? Float(f) : 0),
-                                    extra: SIMD4<Float>(inViewSkyTime ?? time, 0, 0, 0))
+                                    extra: SIMD4<Float>(inViewSkyTime ?? time, inViewLavaFade.map { min(max($0, 0), 1) } ?? -1,
+                                                         inViewCirrusTime.map { max($0, 0) } ?? -1, 0))
         // setBytes, not a shared MTLBuffer: with two frames in flight a single buffer was overwritten by frame N+1 while frame N's kernels could still read it (the
         // camera matrix the rays — and the upsample's stars — are rebuilt from).
         let uStride = MemoryLayout<CloudInViewUniforms>.stride

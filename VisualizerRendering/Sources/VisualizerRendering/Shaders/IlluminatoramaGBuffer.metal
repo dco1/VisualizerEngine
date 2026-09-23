@@ -126,17 +126,25 @@ constant bool kExtendedGBuffer [[function_constant(11)]];
 //                             step. Displacement is 0 at the top anchor and grows toward
 //                             the hanging bottom (pivot about the top) — the inverse of
 //                             mode 1 (which pivots at the box base y=-0.5).
+//   3 · wind hinge flap     — rigid rotation about the model ORIGIN about local +Z, like mode 2,
+//                             but ONE-SIDED and driven by the frame's wind: angle = `lean` ×
+//                             wind × gust(time, phase) with gust ∈ [0, 1] — a flap on a hinge
+//                             (a toilet seat or lid) that the wind lifts and lets fall back, never
+//                             swinging through what it rests on. `lean` = the flap at full wind
+//                             (radians); its SIGN is the direction it can lift. Phase comes from
+//                             the pivot, so parts sharing one hinge move together (a seat whose
+//                             lean is a fraction of its lid's stays under it).
 //
 // Returns the rotated world position; `worldN`/`worldT` are rotated in place by the
 // same rigid rotation so lighting/normal-mapping track the lean.
 static inline float3 applySway(float3 wp, float4x4 model, int mode,
-                               float lean, float jostle, float time,
+                               float lean, float jostle, float time, float wind,
                                thread float3& worldN, thread float3& worldT) {
     if (mode == 0) return wp;
     // Mode 1 pivots at the box base (y=-0.5) and applies `lean` directly. Mode 2 pivots
     // at the model origin (y=0) — the hanging pendant's ceiling anchor — and
     // self-oscillates `lean` (as amplitude) from `time`.
-    float  pivotY = (mode == 2) ? 0.0 : -0.5;
+    float  pivotY = (mode >= 2) ? 0.0 : -0.5;
     float3 pivot  = (model * float4(0.0, pivotY, 0.0, 1.0)).xyz;
     float3 axis   = normalize((model * float4(0.0, 0.0, 1.0, 0.0)).xyz);  // local +Z in world
     float  angle  = lean;
@@ -145,6 +153,13 @@ static inline float3 applySway(float3 wp, float4x4 model, int mode,
         // anchor's world XZ so a row of pendants doesn't swing in lock-step.
         float phase = pivot.x * 1.7 + pivot.z * 2.3;
         angle = lean * sin(time * 2.65 + phase);
+    } else if (mode == 3) {
+        // Gusts (~0.18 Hz, squared so a flap mostly rests and now and then lifts) carrying a
+        // faster flutter (~0.7 Hz) — both ≥ 0, so the flap only ever opens from its rest.
+        float phase = pivot.x * 1.7 + pivot.z * 2.3;
+        float gust = 0.5f + 0.5f * sin(time * 1.13f + phase);
+        float flutter = 0.5f + 0.5f * sin(time * 4.37f + phase * 1.9f);
+        angle = lean * max(wind, 0.0f) * gust * gust * (0.62f + 0.38f * flutter);
     }
     float  c = cos(angle), s = sin(angle);
     // Rodrigues rotation of (wp - pivot) about `axis`, then restore pivot.
@@ -214,16 +229,16 @@ vertex VSOut illumi_vs(
 
     // Drag/impact sway — rigid lean+hop driven by the host DragSwayTracker, no-op
     // unless swayMode != 0. worldN/worldT rotate with it so lighting + normal maps
-    // track the lean. The previous frame gets LAST frame's sway (prevInst) so the
-    // motion vector captures the swing (TAA/motion-blur correctness).
+    // track the lean. The previous frame gets LAST frame's sway: prevInst (a host-driven
+    // lean) at `prevWindTime` (a shader-animated swing — modes 2/3), so the motion vector
+    // captures the swing (TAA/motion-blur correctness).
     worldP.xyz = applySway(worldP.xyz, inst.modelMatrix, inst.swayMode,
-                           inst.swayLean, inst.swayJostle, frame.time, worldN, worldT);
+                           inst.swayLean, inst.swayJostle, frame.time, frame._padPhase2A, worldN, worldT);
     float3 prevN = worldN, prevT = worldT;   // throwaway: prev normal/tangent unused
-    // Prev frame uses the same `frame.time` as current (matching applyTreeWind above):
-    // during a settled headless capture time is frozen (static pose, no TAA smear); in
-    // the live app the per-frame swing delta is tiny, so the motion vector stays clean.
+    // Prev frame at `prevWindTime` (as applyTreeWind above): equal to frame.time in a settled
+    // capture (windPrevDelta 0 — static pose, byte-identical), the real previous clock live.
     prevWorldP.xyz = applySway(prevWorldP.xyz, prevInst.modelMatrix, prevInst.swayMode,
-                               prevInst.swayLean, prevInst.swayJostle, frame.time, prevN, prevT);
+                               prevInst.swayLean, prevInst.swayJostle, prevWindTime, frame._padPhase2A, prevN, prevT);
 
     VSOut o;
     o.clipPos      = frame.viewProjection * worldP;
@@ -273,18 +288,18 @@ vertex float4 illumi_shadow_vs(
     const device Vertex*        verts     [[buffer(0)]],
     const device Instance*      instances [[buffer(2)]],
     constant float4x4&          lightVP   [[buffer(3)]],
-    constant float&             shadowTime [[buffer(4)]]
+    constant float2&            shadowClock [[buffer(4)]]   // x = time, y = wind strength
 ) {
     Vertex v = verts[vid];
     Instance inst = instances[iid];
     float4 worldP = inst.modelMatrix * float4(v.position, 1.0);
     // Match the visible pose: a swaying object casts its leaned shadow (no-op unless
     // swayMode != 0). Position-only — the depth pass needs no normal/tangent.
-    // `shadowTime` mirrors frame.time so a self-oscillating pendulum (swayMode 2) casts
-    // its swung shadow in phase with the visible mesh.
+    // `shadowClock` mirrors frame.time + the frame's wind so a self-oscillating pendulum
+    // (swayMode 2) or a wind-lifted flap (3) casts its swung shadow in phase with the mesh.
     float3 nDummy = float3(0.0), tDummy = float3(0.0);
     worldP.xyz = applySway(worldP.xyz, inst.modelMatrix, inst.swayMode,
-                           inst.swayLean, inst.swayJostle, shadowTime, nDummy, tDummy);
+                           inst.swayLean, inst.swayJostle, shadowClock.x, shadowClock.y, nDummy, tDummy);
     return lightVP * worldP;
 }
 

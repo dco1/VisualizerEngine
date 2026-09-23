@@ -65,10 +65,10 @@ struct IlluminatoramaCullBounds: Equatable {
             radius += windStrength * (w.sway * (1.5 + 0.18) + w.flutter * (0.05 + 0.05 + 0.035))
         }
 
-        // applySway: rotation about a pivot (box base for mode 1, model origin for mode 2) by any
+        // applySway: rotation about a pivot (box base for mode 1, model origin for modes 2/3) by any
         // angle, then a vertical jostle. Applied after the wind, so it carries the wind's reach.
         if inst.swayMode != 0 {
-            let pivotY: Float = inst.swayMode == 2 ? 0 : -0.5
+            let pivotY: Float = inst.swayMode >= 2 ? 0 : -0.5
             let p4 = m * SIMD4<Float>(0, pivotY, 0, 1)
             let pivot = SIMD3<Float>(p4.x, p4.y, p4.z)
             radius = simd_length(center - pivot) + radius + abs(inst.swayJostle)
