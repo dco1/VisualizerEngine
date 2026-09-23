@@ -94,8 +94,10 @@ public enum WildflowerPlantingMesh {
     }()
 
     /// Enough of each that the eye stops finding the same plant twice in one view (the judge's
-    /// "repeated, uniform assets" at 5 / 4).
-    public static func variantCount(_ kind: Kind) -> Int { kind == .tuft ? 9 : 7 }
+    /// "repeated, uniform assets" at 5 / 4, still at 9 / 7). Tufts stop at 11: tuft 12+ spreads
+    /// past the 0.6 m footprint bound. Flower counts that grow with the index wrap at 7, so the
+    /// first seven variants of each kind are exactly what they were.
+    public static func variantCount(_ kind: Kind) -> Int { kind == .tuft ? 11 : 10 }
 
     public static let bladeSilhouette = LeafSilhouette(name: "wildflowerBlade",
                                                 hero: [(0.00, 0.00), (0.30, 1.00), (1.00, 0.00)])
@@ -311,7 +313,7 @@ public enum WildflowerPlantingMesh {
         case .goldfields:
             // A low cushion of small yellow daisies.
             tuft(blades: 14, height: 0.16, spread: 1.2, color: green)
-            for _ in 0 ..< (6 + index) {
+            for _ in 0 ..< (6 + index % 7) {
                 let az = rng.unit() * 2 * Double.pi, reach = 0.03 + rng.unit() * 0.13
                 let s = stem(to: Vec3(cos(az) * reach, 0.12 + rng.unit() * 0.10, sin(az) * reach), radius: 0.002)
                 flower(at: s.tip, axis: normalize3(s.tangent + up), petals: 5, length: 0.021, widthRatio: 0.7,
@@ -320,7 +322,7 @@ public enum WildflowerPlantingMesh {
 
         case .popcorn:
             tuft(blades: 14, height: 0.18, spread: 1.0, color: green)
-            for _ in 0 ..< (7 + index) {
+            for _ in 0 ..< (7 + index % 7) {
                 let az = rng.unit() * 2 * Double.pi, reach = 0.02 + rng.unit() * 0.12
                 let s = stem(to: Vec3(cos(az) * reach, 0.20 + rng.unit() * 0.12, sin(az) * reach), radius: 0.002)
                 flower(at: s.tip, axis: normalize3(s.tangent + up), petals: 5, length: 0.018, widthRatio: 0.9,
