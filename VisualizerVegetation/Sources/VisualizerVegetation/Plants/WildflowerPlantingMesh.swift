@@ -36,8 +36,10 @@ public enum WildflowerPlantingMesh {
 
     // MARK: palette (linear-ish albedo, as the species files state theirs)
 
-    /// What the bed's own ground is multiplied by under a planting — see `gardenGroups`.
-    public static let understoryTint = Vec3(0.30, 0.40, 0.26)
+    /// What the bed's own ground is multiplied by under a planting — see `gardenGroups`. Dry olive-brown
+    /// litter, not a green: on dirt it lands the bed's darkest 10 % at (35,30,9) against the goal
+    /// photograph's (35,30,7). The old green (0.30, 0.40, 0.26) read as blue-grey mud (31,33,21) between the plants.
+    public static let understoryTint = Vec3(0.33, 0.36, 0.13)
 
     public static let foliageGreens = [Vec3(0.25, 0.26, 0.05), Vec3(0.29, 0.28, 0.05), Vec3(0.21, 0.23, 0.04)]   // a spring sward's golden olive (hue ~0.16): the goal's parkway measured 58 % yellow-olive, 2 % green
     public static let stemGreen     = Vec3(0.24, 0.26, 0.06)
