@@ -170,3 +170,37 @@ final class WildflowerPlantingMeshTests: XCTestCase {
         }
     }
 }
+
+/// `.hero` petals are a level of detail of the SAME plants: every flower sits where the standard
+/// variant puts it, and the garden library is not touched by the hero build.
+final class WildflowerHeroPetalTests: XCTestCase {
+    typealias W = WildflowerPlantingMesh
+
+    func testHeroPetalsKeepEveryFlowerWhereItWas() {
+        for kind in W.Kind.allCases {
+            for i in 0 ..< W.variantCount(kind) {
+                let std = W.library[kind]![i], hero = W.heroLibrary[kind]![i]
+                XCTAssertEqual(std.layers.count, hero.layers.count, "\(kind) \(i)")
+                for (a, b) in zip(std.layers, hero.layers) {
+                    XCTAssertEqual(a.color, b.color)
+                    // Non-petal layers (foliage, stems) are byte-identical; petal layers keep their
+                    // centre of mass within 1 cm (same heads, re-shaped petals).
+                    if a.translucent || a.color == W.stemGreen {
+                        XCTAssertEqual(a.mesh, b.mesh, "\(kind) \(i) non-petal layer changed")
+                    } else {
+                        let ca = a.mesh.positions.reduce(Vec3(0, 0, 0), +) / Double(a.mesh.positions.count)
+                        let cb = b.mesh.positions.reduce(Vec3(0, 0, 0), +) / Double(b.mesh.positions.count)
+                        XCTAssertLessThan(len3(ca - cb), 0.01, "\(kind) \(i) flowers moved")
+                    }
+                }
+            }
+        }
+    }
+
+    func testHeroPoppyPetalsAreRoundedAndCupped() {
+        // More outline (rounded lip) than the kite petal, still a few hundred triangles per plant.
+        let std = W.library[.poppy]![0].triangleCount, hero = W.heroLibrary[.poppy]![0].triangleCount
+        XCTAssertGreaterThan(hero, std)
+        XCTAssertLessThan(hero, 1500)
+    }
+}

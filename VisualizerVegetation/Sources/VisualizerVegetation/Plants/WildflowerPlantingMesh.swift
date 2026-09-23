@@ -93,6 +93,31 @@ public enum WildflowerPlantingMesh {
         return out
     }()
 
+    /// How the petals are built. `.standard` is the shipped bed (three-control kite petals — what
+    /// every garden renders). `.hero` is for a camera among the flowers: a poppy petal with the
+    /// real outline (a narrow claw widening to a broad fan with a ROUNDED lip, cupped across and
+    /// faintly ruffled) and rounded daisy rays. Same plants, same flower positions — `.hero` only
+    /// changes how each petal is emitted and draws no extra random numbers, so a host can swap
+    /// between the two libraries as a level of detail without anything moving.
+    public enum PetalDetail: Sendable { case standard, hero }
+
+    /// The library at `.hero` petal detail — built on first use (a host that never asks never
+    /// pays for it; the garden `library` is untouched).
+    public static let heroLibrary: [Kind: [Variant]] = {
+        var out: [Kind: [Variant]] = [:]
+        for kind in Kind.allCases {
+            out[kind] = (0 ..< variantCount(kind)).map { buildVariant(kind, index: $0, petals: .hero) }
+        }
+        return out
+    }()
+
+    /// California poppy petal: narrow claw → broad fan → rounded lip (≈ as wide as it is long).
+    public static let poppyPetalSilhouette = LeafSilhouette(name: "wildflowerPoppyPetal",
+        hero: [(0.00, 0.00), (0.10, 0.34), (0.30, 0.74), (0.55, 0.96), (0.76, 1.00), (0.90, 0.84), (0.97, 0.50), (1.00, 0.00)])
+    /// A daisy ray (goldfields, popcorn): a strap with a rounded end.
+    public static let rayPetalSilhouette = LeafSilhouette(name: "wildflowerRay",
+        hero: [(0.00, 0.00), (0.18, 0.70), (0.62, 0.95), (0.88, 0.80), (1.00, 0.00)])
+
     /// Enough of each that the eye stops finding the same plant twice in one view (the judge's
     /// "repeated, uniform assets" at 5 / 4).
     public static func variantCount(_ kind: Kind) -> Int { kind == .tuft ? 9 : 7 }
@@ -106,7 +131,7 @@ public enum WildflowerPlantingMesh {
     public static let petalSilhouette = LeafSilhouette(name: "wildflowerPetal",
                                                 hero: [(0.00, 0.00), (0.72, 1.00), (1.00, 0.00)])
 
-    public static func buildVariant(_ kind: Kind, index: Int) -> Variant {
+    public static func buildVariant(_ kind: Kind, index: Int, petals detail: PetalDetail = .standard) -> Variant {
         var rng = PottedPlantMesh.SplitMix(UInt64(kind.rawValue + 1) &* 0x9E3779B97F4A7C15 &+ UInt64(index) &* 0xD1B54A32D192ED03)
         let up = Vec3(0, 1, 0)
         var layers: [Layer] = []
@@ -200,8 +225,20 @@ public enum WildflowerPlantingMesh {
                 let p = GardenPlantMesh.petalPlacement(center: center, axis: axis, radial: radial,
                                                        pitch: pitch + (k % 2 == 0 ? 0.07 : -0.07),
                                                        length: length, width: length * widthRatio)
-                LeafConstructor.emitBlade(into: &m, placement: p, silhouette: petalSilhouette, subdivisions: 1,
-                                          fold: 0.30, curl: -0.12, winding: .singleSided)
+                switch (detail, kind) {
+                case (.hero, .poppy):
+                    // Cupped across (fold), the lip turned very slightly out (curl), a soft ruffle
+                    // on the rim; the ripple's phase comes from the petal index, not the rng.
+                    LeafConstructor.emitBlade(into: &m, placement: p, silhouette: poppyPetalSilhouette, subdivisions: 1,
+                                              fold: 0.48, curl: -0.08, winding: .singleSided,
+                                              waveAmplitude: 0.05, waveFrequency: 2.5, wavePhase: Double(k) * 1.9 + phase)
+                case (.hero, .goldfields), (.hero, .popcorn):
+                    LeafConstructor.emitBlade(into: &m, placement: p, silhouette: rayPetalSilhouette, subdivisions: 1,
+                                              fold: 0.25, curl: -0.12, winding: .singleSided)
+                default:
+                    LeafConstructor.emitBlade(into: &m, placement: p, silhouette: petalSilhouette, subdivisions: 1,
+                                              fold: 0.30, curl: -0.12, winding: .singleSided)
+                }
             }
             // Petals are OPAQUE here: with the thin-sheet backlight a low sun turns a deep orange
             // poppy into a glowing yellow (the judge read the bed as "a yellow monoculture").
