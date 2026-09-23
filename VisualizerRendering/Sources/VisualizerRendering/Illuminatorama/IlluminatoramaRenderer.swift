@@ -1109,6 +1109,61 @@ public final class IlluminatoramaRenderer {
     public var volSpotBeamSteps: Int = 20
     public var volSpotBeamMaxDistance: Float = 60.0
 
+    /// A **self-luminous column** — a truncated cone of glowing medium (a sci-fi tractor beam,
+    /// a plasma jet) integrated along every view ray in the spot-beam pass. It EMITS rather
+    /// than scattering a light, so it has no phase function and no distance falloff: each
+    /// sample adds `radiance · dt`, which is exactly the emission integral of a thin,
+    /// non-absorbing medium. Brightest through the core (longest path), soft at the rim, and
+    /// depth-terminated like the beams (geometry in front hides it, a body inside it cuts it).
+    ///
+    /// It lights NOTHING by itself — pair it with real lights (a spot for the pool it throws,
+    /// points along its axis) so what it touches is lit by the colour it glows. Independent of
+    /// `volSpotBeamsEnabled` and of the haze knobs. `nil` (default) ⇒ the pass is exactly what
+    /// it was.
+    public struct EmissiveColumn: Equatable, Sendable {
+        /// Centre of the column's top disc (world).
+        public var top: SIMD3<Float>
+        /// Unit axis pointing from the top toward the bottom.
+        public var axis: SIMD3<Float>
+        /// Full length along `axis` (m) — the band coordinate spans this.
+        public var length: Float
+        public var topRadius: Float
+        public var bottomRadius: Float
+        /// How far down from `top` the medium currently reaches (m). `≥ length` = the whole
+        /// column; less = a column growing/receding from the top, with a soft leading edge.
+        public var front: Float
+        /// Soft rim width as a fraction of the local radius.
+        public var edgeFeather: Float = 0.3
+        /// Linear emitted radiance per metre of path for the solid colour.
+        public var solidRadiance: SIMD3<Float>
+        /// 0 = solid colour, 1 = hue bands along the axis.
+        public var rainbowMix: Float = 0
+        /// Linear radiance per metre of a full-saturation hue band.
+        public var rainbowRadiance: Float = 0
+        /// Hue cycles over `length`.
+        public var rainbowCycles: Float = 1
+        /// Hue offset: band hue = frac(up · cycles + scroll), up = 0 at the bottom, 1 at the top
+        /// (so a DEcreasing scroll carries the bands upward).
+        public var rainbowScroll: Float = 0
+        /// 0 = smooth ramp; > 0 = that many discrete swatches.
+        public var rainbowSteps: Int = 0
+        /// Samples per ray through the column (TAA accumulates the jitter).
+        public var steps: Int = 24
+
+        public init(top: SIMD3<Float>, axis: SIMD3<Float>, length: Float,
+                    topRadius: Float, bottomRadius: Float, front: Float,
+                    solidRadiance: SIMD3<Float>) {
+            self.top = top
+            self.axis = axis
+            self.length = length
+            self.topRadius = topRadius
+            self.bottomRadius = bottomRadius
+            self.front = front
+            self.solidRadiance = solidRadiance
+        }
+    }
+    public var volEmissiveColumn: EmissiveColumn? = nil
+
     // ── Phase 4.21 — auto-exposure ──────────────────────────────────
     /// Toggle the per-frame log-luminance estimator + EMA. When off,
     /// the tonemap falls back to the static `exposure` scalar above.
@@ -2983,6 +3038,19 @@ public final class IlluminatoramaRenderer {
     /// (≈4 % haze at 400 m) — this is the far-field cue that keeps a distant ground plane
     /// from arriving at the horizon fully saturated, not a fog effect.
     public var aerialPerspectiveDensity: Float = 0
+    /// Multiplier on the aerial-perspective AIRLIGHT (default 1 = unchanged). The airlight is a
+    /// coarse-mip sample of the prefiltered sky cube just above the horizon, so it averages in
+    /// the brighter sky (and any moon aureole) above — by day that is the right broad inscatter,
+    /// but under a physical night sky, whose horizon the renderer draws per pixel, it measured
+    /// ~2.5× the horizon the camera actually sees (UFO Ultra: haze on the far land glowed as a
+    /// lilac band under a black horizon). A host whose haze reads brighter than its own horizon
+    /// scales it down here until the airlight is sampled from the model the sky pass draws.
+    public var aerialPerspectiveAirlightScale: Float = 1
+    /// Take the airlight from the sky cube's SHARPEST mip just above the horizon — the colour the
+    /// camera sees at the horizon — instead of the coarse broad-inscatter mip. A scalar can't fix
+    /// a hue mismatch: under a moonlit physical sky the coarse mip is the blue zenith's average
+    /// while the horizon band is olive, so far land hazed to blue under an olive horizon.
+    public var aerialPerspectiveAirlightFromHorizon: Bool = false
     /// Screen-space subsurface scattering (issue #65). Jimenez-style separable SSS
     /// for skin / wax / marble / food. `sssStrength` 0 = OFF → the lighting pass
     /// skips the side-buffer write and the blur/composite passes aren't encoded →
@@ -4543,6 +4611,14 @@ public final class IlluminatoramaRenderer {
         var cameraWorldPos: SIMD3<Float>; var density: Float
         var anisotropy: Float; var strength: Float; var spotCount: UInt32; var steps: UInt32
         var maxDist: Float; var frameSeed: UInt32; var width: UInt32; var height: UInt32
+        // Emissive column — mirrors the Metal `colTop … colSteps` block (all zero ⇒ off).
+        var colTop: SIMD4<Float> = .zero
+        var colAxis: SIMD4<Float> = .zero
+        var colShape: SIMD4<Float> = .zero
+        var colSolid: SIMD4<Float> = .zero
+        var colBand: SIMD4<Float> = .zero
+        var colSteps: UInt32 = 0
+        var _colPad0: UInt32 = 0, _colPad1: UInt32 = 0, _colPad2: UInt32 = 0
     }
     private let volSpotPipeline: MTLComputePipelineState?
     private let volSpotUniformBuffer: MTLBuffer
@@ -12836,7 +12912,9 @@ public final class IlluminatoramaRenderer {
     /// haze-lit cone. Runs after the sun volumetric pass so both add into the
     /// same HDR composite; independent of `volumetricEnabled`.
     private func encodeSpotBeamPass(_ cb: MTLCommandBuffer) {
-        guard volSpotBeamsEnabled, !spotLights.isEmpty,
+        let spotsOn = volSpotBeamsEnabled && !spotLights.isEmpty
+        let column = volEmissiveColumn.flatMap { $0.front > 0 && $0.length > 0 ? $0 : nil }
+        guard spotsOn || column != nil,
               let pipeline = volSpotPipeline else { return }
         let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
         volFrameSeed &+= 1
@@ -12844,17 +12922,30 @@ public final class IlluminatoramaRenderer {
             invViewProjection: fu.invViewProjection,
             cameraWorldPos: fu.cameraWorldPos, density: max(0, volSpotBeamDensity),
             anisotropy: volSpotBeamAnisotropy, strength: max(0, volSpotBeamStrength),
-            spotCount: UInt32(spotLights.count),
+            spotCount: spotsOn ? UInt32(spotLights.count) : 0,
             steps: UInt32(max(4, min(48, volSpotBeamSteps))),
-            maxDist: volSpotBeamMaxDistance, frameSeed: volFrameSeed,
+            maxDist: max(volSpotBeamMaxDistance, column != nil ? 400 : 0),
+            frameSeed: volFrameSeed,
             width: UInt32(width), height: UInt32(height))
-        memcpy(volSpotUniformBuffer.contents(), &u, MemoryLayout<VolSpotUniforms>.stride)
+        if let c = column {
+            let axis = simd_length(c.axis) > 1e-6 ? simd_normalize(c.axis) : SIMD3<Float>(0, -1, 0)
+            u.colTop = SIMD4(c.top, 1)
+            u.colAxis = SIMD4(axis, c.length)
+            u.colShape = SIMD4(max(0, c.topRadius), max(0, c.bottomRadius), c.front, c.edgeFeather)
+            u.colSolid = SIMD4(simd_max(c.solidRadiance, .zero), min(1, max(0, c.rainbowMix)))
+            u.colBand = SIMD4(max(0, c.rainbowRadiance), c.rainbowCycles, c.rainbowScroll,
+                              Float(max(0, c.rainbowSteps)))
+            u.colSteps = UInt32(max(4, min(64, c.steps)))
+        }
         guard let enc = timedComputeEncoder(cb, "volumetricSpots") else { return }
         enc.label = "Illuminatorama.volumetricSpots"
         enc.setComputePipelineState(pipeline)
         enc.setTexture(depthTexture, index: 0)
         enc.setTexture(hdrCompositeTexture, index: 1)
-        enc.setBuffer(volSpotUniformBuffer, offset: 0, index: 0)
+        // Inline bytes, not the shared `volSpotUniformBuffer`: with 2 frames in flight a
+        // memcpy into one buffer overwrote the params the previous frame's kernel was still
+        // reading (the per-frame emissive column — its front, scroll, position — made that tear).
+        enc.setBytes(&u, length: MemoryLayout<VolSpotUniforms>.stride, index: 0)
         enc.setBuffer(spotLightBuffer, offset: 0, index: 1)
         dispatch(enc, pipeline: pipeline, width: width, height: height)
         enc.endEncoding()
@@ -13992,6 +14083,9 @@ public final class IlluminatoramaRenderer {
         u.contactShadowThickness = max(0, contactShadowThickness)
         // Aerial perspective. 0 → exact no-op (the lighting kernel skips the blend).
         u.aerialPerspectiveDensity = max(0, aerialPerspectiveDensity)
+        let apScale = max(1e-4, aerialPerspectiveAirlightScale)
+        u.aerialAirlightScale = aerialPerspectiveAirlightFromHorizon ? -apScale
+            : (abs(aerialPerspectiveAirlightScale - 1) < 1e-6 ? 0 : apScale)
         // Screen-space subsurface scattering (issue #65). 0 strength → no-op (the
         // lighting pass skips the side-buffer write; the blur/composite passes
         // aren't encoded). The env override (VIZ_ILLUMI_SSS) wins for headless verify.

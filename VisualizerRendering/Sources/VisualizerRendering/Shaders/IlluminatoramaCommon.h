@@ -511,7 +511,7 @@ struct FrameUniforms {
     // own depth (Instance.tagGlow.y) — a host's "slurp the field away / slide it back up".
     float    fieldSink;
     float    prevFieldSink;
-    float    _padTagGlow2;
+    float    aerialAirlightScale;   // was _padTagGlow2; 0 ⇒ default; >0 scale; <0 scale |v| + horizon-sharp sample
     // ── Physical night sky (IlluminatoramaNightSky.h, model 1) ──────────────
     // nightSkyExtra:  x = model (0 = legacy — the default, byte-identical; 1 = physical),
     //                 y = moon aureole gain, z = earthshine gain, w = Milky Way gain.

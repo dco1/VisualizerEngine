@@ -588,7 +588,11 @@ public struct IlluminatoramaFrameUniforms {
     /// Field sink progress 0…1 this frame and last (see the renderer's `fieldSinkProgress`).
     public var fieldSink: Float = 0
     public var prevFieldSink: Float = 0
-    public var _padTagGlow2: Float = 0
+    /// Aerial-perspective airlight override (was `_padTagGlow2`; same 4 bytes). 0 ⇒ default, so
+    /// every scene that never sets it is byte-identical; > 0 ⇒ scale; < 0 ⇒ scale |v| and sample the
+    /// horizon at the sharpest mip. See `IlluminatoramaRenderer.aerialPerspectiveAirlightScale` /
+    /// `aerialPerspectiveAirlightFromHorizon`.
+    public var aerialAirlightScale: Float = 0
     /// Physical night sky (IlluminatoramaNightSky.h) — see the Metal `FrameUniforms`.
     /// FOUR new 16-byte clusters (stride 1584 → 1648). All-zero ⇒ the legacy night sky and
     /// the legacy scotopic knee/tint — byte-identical for every host that never opts in.

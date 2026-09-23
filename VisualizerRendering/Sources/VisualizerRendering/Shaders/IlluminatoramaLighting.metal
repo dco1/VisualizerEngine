@@ -2017,11 +2017,18 @@ kernel void illumi_lighting(
                 constexpr sampler apSampler(filter::linear, mip_filter::linear);
                 // Just above the horizon (the below-horizon cube rows are ground fill),
                 // at a coarse mip: the broad inscatter colour, not a cloud texel.
-                float3 hDir = normalize(float3(vd.x / horiz, 0.03, vd.z / horiz));
+                // Host override (aerialAirlightScale): 0 ⇒ as above; > 0 ⇒ × that; < 0 ⇒ × |value|
+                // AND read the horizon at the SHARPEST mip — the colour the camera actually sees
+                // there (a coarse mip averages the whole sky above, e.g. a blue zenith over an
+                // olive moonlit horizon, and the haze on far land shows a hue seam against it).
+                float apK = frame.aerialAirlightScale;
+                bool  apHorizon = apK < 0.0;
+                float3 hDir = normalize(float3(vd.x / horiz, apHorizon ? 0.01 : 0.03, vd.z / horiz));
                 float  mips = float(max(frame.iblPrefilteredMipCount, 1u));
                 float3 airlight = float3(prefilteredCube.sample(apSampler, hDir,
-                                                                level(max(mips - 3.0, 0.0))).rgb)
-                                  * frame.iblIntensity;
+                                                                level(apHorizon ? 0.0 : max(mips - 3.0, 0.0))).rgb)
+                                  * frame.iblIntensity
+                                  * (apK != 0.0 ? abs(apK) : 1.0);
                 color = mix(airlight, color, t);
                 specIBLInComposite *= t;   // DH-0896 — what of it survives the extinction
                 diffSkyInComposite *= t;

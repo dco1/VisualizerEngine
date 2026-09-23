@@ -116,7 +116,10 @@ kernel void illumi_volumetric(
 // clamped to the G-buffer depth so geometry in front of a beam hides it.
 //
 // Mirrors the Swift `IlluminatoramaSpotLight` / lighting-kernel `SpotLight`
-// layout — keep in lockstep (stride 176).
+// layout — keep in lockstep (stride 192). The trailing `giVisible` matters even
+// though this kernel never reads it: it is what makes the stride 192 rather than
+// 176. Without it `spots[s]` walked the buffer 16 bytes short per light, so every
+// beam after the first read a neighbour's fields (fixed 2026-09-23, UFO Ultra).
 
 struct VolSpotLight {
     float3   position;
@@ -127,9 +130,10 @@ struct VolSpotLight {
     float    radius;
     float4x4 shadowMatrix;    // unused here
     int      shadowSliceIndex;
-    int      _padSpot0;
-    int      _padSpot1;
-    int      _padSpot2;
+    uint     layerMask;       // unused here
+    int      castsShadow;     // unused here
+    float    softRadius;      // unused here
+    uint     giVisible;       // unused here — present for the stride (see above)
 };
 
 struct VolSpotUniforms {
@@ -137,7 +141,86 @@ struct VolSpotUniforms {
     float3 cameraWorldPos; float density;
     float anisotropy; float strength; uint spotCount; uint steps;
     float maxDist; uint frameSeed; uint width; uint height;
+    // ── Emissive column (Swift `IlluminatoramaRenderer.EmissiveColumn`) ──
+    // colTop.w = 1 ⇒ on. A truncated cone of SELF-LUMINOUS medium from `colTop`
+    // down `colAxis` — it emits, it does not scatter a light, so it has no phase
+    // function and no distance falloff: each sample adds radiance·dt.
+    float4 colTop;       // xyz top centre (world), w enabled
+    float4 colAxis;      // xyz unit axis top→bottom, w full length L (m)
+    float4 colShape;     // x top radius, y bottom radius, z front (m from top), w edge feather (× radius)
+    float4 colSolid;     // xyz solid radiance per metre (linear), w rainbow mix 0…1
+    float4 colBand;      // x rainbow radiance per metre, y cycles over L, z scroll, w steps (0 = smooth)
+    uint colSteps; uint _colPad0; uint _colPad1; uint _colPad2;
 };
+
+/// Hue swatch (full saturation, full value) as LINEAR rgb. `steps > 0` snaps the
+/// hue to that many discrete swatches — the stepped rainbow.
+static inline float3 volColumnHue(float h, float steps) {
+    h = h - floor(h);
+    if (steps > 0.5) h = floor(h * steps) / steps;
+    float3 rgb = clamp(abs(fract(h + float3(1.0, 2.0 / 3.0, 1.0 / 3.0)) * 6.0 - 3.0) - 1.0, 0.0, 1.0);
+    return pow(rgb, float3(2.2));
+}
+
+/// Integrates the emissive column along one view ray over [0, tEnd]. Bounded by the
+/// ray's intersection with the column's enclosing cylinder and axial slab, so dead
+/// air costs nothing and every sample lands where the column can be.
+static inline float3 volEmissiveColumn(constant VolSpotUniforms& u, float3 ro, float3 rd,
+                                       float tEnd, thread uint& seed) {
+    float3 T = u.colTop.xyz;
+    float3 A = u.colAxis.xyz;
+    float  L = max(1e-3, u.colAxis.w);
+    float  r0 = max(1e-3, u.colShape.x), r1 = max(1e-3, u.colShape.y);
+    float  front = min(u.colShape.z, L);
+    float  feather = clamp(u.colShape.w, 0.02, 0.9);
+    if (front <= 0.0) return float3(0.0);
+    float R = max(r0, r1);
+
+    float3 oc = ro - T;
+    float rdA = dot(rd, A), ocA = dot(oc, A);
+    float3 dP = rd - rdA * A, oP = oc - ocA * A;
+    float a = dot(dP, dP), b = dot(oP, dP), c = dot(oP, oP) - R * R;
+    float t0 = 0.0, t1 = tEnd;
+    if (a < 1e-7) {
+        if (c > 0.0) return float3(0.0);          // parallel to the axis, outside the cylinder
+    } else {
+        float disc = b * b - a * c;
+        if (disc <= 0.0) return float3(0.0);
+        float sq = sqrt(disc);
+        t0 = (-b - sq) / a;
+        t1 = (-b + sq) / a;
+    }
+    if (abs(rdA) > 1e-6) {
+        float ta = -ocA / rdA, tb = (front - ocA) / rdA;
+        t0 = max(t0, min(ta, tb));
+        t1 = min(t1, max(ta, tb));
+    } else if (ocA < 0.0 || ocA > front) {
+        return float3(0.0);
+    }
+    t0 = max(t0, 0.0);
+    t1 = min(t1, tEnd);
+    if (t1 <= t0) return float3(0.0);
+
+    uint NC = max(4u, min(u.colSteps, 64u));
+    float dt = (t1 - t0) / float(NC);
+    bool growing = front < L - 1e-3;
+    float3 acc = float3(0.0);
+    for (uint i = 0; i < NC; ++i) {
+        seed = pcgHash(seed + i * 747796405u);
+        float t = t0 + (float(i) + float(seed) * (1.0 / 4294967296.0)) * dt;
+        float3 q = ro + rd * t - T;
+        float ax = dot(q, A);
+        float rho = length(q - ax * A);
+        float rad = mix(r0, r1, clamp(ax / L, 0.0, 1.0));
+        float m = 1.0 - smoothstep(rad * (1.0 - feather), rad, rho);
+        if (growing) m *= 1.0 - smoothstep(front - min(0.4, 0.5 * front), front, ax);
+        if (m <= 0.0) continue;
+        float up = 1.0 - clamp(ax / L, 0.0, 1.0);             // 0 at the bottom, 1 at the top
+        float3 band = u.colBand.x * volColumnHue(up * u.colBand.y + u.colBand.z, u.colBand.w);
+        acc += mix(u.colSolid.xyz, band, u.colSolid.w) * m;
+    }
+    return acc * dt;
+}
 
 kernel void illumi_volumetric_spots(
     texture2d<float, access::read>       gDepth [[texture(0)]],
@@ -170,6 +253,8 @@ kernel void illumi_volumetric_spots(
     // offset left visible per-pixel speckle that TAA alone couldn't settle).
     uint seed = pcgHash(gid.x + gid.y * u.width + u.frameSeed * 2654435761u);
     float g = clamp(u.anisotropy, -0.95, 0.95);
+
+    float3 column = (u.colTop.w > 0.5) ? volEmissiveColumn(u, ro, rd, tEnd, seed) : float3(0.0);
 
     float3 accum = float3(0.0);
     for (uint s = 0; s < u.spotCount; ++s) {
@@ -246,6 +331,7 @@ kernel void illumi_volumetric_spots(
     }
 
     accum *= u.density * u.strength;
+    accum += column;                      // self-luminous: independent of the haze knobs
     if ((accum.x + accum.y + accum.z) <= 0.0) return;
     half4 prev = outHDR.read(gid);
     outHDR.write(half4(prev.rgb + half3(accum), prev.a), gid);
