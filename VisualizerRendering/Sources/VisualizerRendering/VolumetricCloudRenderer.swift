@@ -414,6 +414,14 @@ public final class VolumetricCloudRenderer {
         /// THREADS mode: denser, strongly curled filaments that flow — they stream along the jet
         /// while the curl field drifts and morphs, as if blown. Off = the plain veil.
         public var cirrusThreads: Bool = false
+        /// How much of the cirrus is THREADS while `cirrusThreads` is on, 0…1: between, the kernels
+        /// render the veil AND the threads and blend them, so a host can fade one into the other.
+        /// 1 (the default) = threads alone, byte-identical to before.
+        public var cirrusThreadsWeight: Float = 1
+        /// Coverage multiplier the THREADS layer applies to `cirrusCoverage` (clamped to 1) — so a
+        /// host that wants denser threads than veil does not have to step the coverage uniform
+        /// mid-fade. 1 (the default) = the same coverage, as before.
+        public var cirrusThreadsCoverageGain: Float = 1
         /// Threads: flow speed (1 ≈ a gentle stream).
         public var cirrusFlow: Float = 1
         /// Threads: spatial frequency multiplier (higher = finer, more numerous threads).
@@ -992,7 +1000,9 @@ struct SkyUniforms {
         self.cirrusA = SIMD4<Float>(max(0, min(1, params.cirrusCoverage)), max(0, params.cirrusOpacity),
                                     params.cirrusAltitude, max(1e-6, params.cirrusScale))
         self.cirrusB = SIMD4<Float>(cd.x, cd.y, max(1, params.cirrusStretch), params.cirrusDrift)
-        self.cirrusC = SIMD4<Float>(params.cirrusThreads ? 1 : 0, params.cirrusFlow, max(0.05, params.cirrusFrequency), 0)
+        self.cirrusC = SIMD4<Float>(params.cirrusThreads ? min(max(params.cirrusThreadsWeight, 0), 1) : 0,
+                                    params.cirrusFlow, max(0.05, params.cirrusFrequency),
+                                    max(0, params.cirrusThreadsCoverageGain))
         self.cirrusTint = SIMD4<Float>(simd_max(params.cirrusTint, .zero), 0)
         self.lavaA = SIMD4<Float>(params.lavaLamp ? min(max(params.lavaFade, 0), 1) : 0, time, max(0.2, params.lavaScale), max(0, params.lavaGlow))
         self.lavaBG = SIMD4<Float>(params.lavaBackground, max(0.001, params.lavaSpeed))

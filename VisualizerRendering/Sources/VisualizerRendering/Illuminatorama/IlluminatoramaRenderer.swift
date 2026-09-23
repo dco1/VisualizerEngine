@@ -4492,6 +4492,7 @@ public final class IlluminatoramaRenderer {
         /// x = frame time (s) — per-frame sky animation (lava lamp) in the in-view pass.
         /// y = per-frame lava-lamp weight override (≥ 0), or −1 = use SkyUniforms.lavaA.x.
         /// z = cirrus clock override (≥ 0), or −1 = x.
+        /// w = cirrus threads weight override (0…1), or −1 = SkyUniforms.cirrusC.x.
         var extra: SIMD4<Float> = .zero
     }
     private let cloudInViewPipeline: MTLComputePipelineState?
@@ -4512,10 +4513,23 @@ public final class IlluminatoramaRenderer {
     /// The cirrus threads' own clock (≥ 0), for a host whose lava lamp and cirrus are on screen
     /// at once (mid-fade) and animate at independent speeds. `nil` = `inViewSkyTime ?? time`.
     public var inViewCirrusTime: Float? = nil
+    /// Per-FRAME cirrus threads weight (0 veil … 1 threads) for the in-view sky, overriding the
+    /// cloud renderer's `cirrusThreadsWeight` (throttled sky uniforms). `nil` = the uniform.
+    public var inViewCirrusThreads: Float? = nil
     /// Frame-level gain on every instance's `tagGlow.x` weight (petal glow). 1 by default, so a
     /// host that only sets per-instance weights still glows; instances with weight 0 — every
     /// host that never opts in — are untouched by any value.
     public var tagGlowGain: Float = 1
+    /// Field sink, 0…1: instances with a sink depth (`tagGlow.y`) slide that far below ground at 1
+    /// — a host fades a whole field of objects into / out of the ground with one float per frame
+    /// (see `fieldSinkOffset` in IlluminatoramaGBuffer.metal). 0 (the default) is an exact no-op.
+    /// Applied in the G-buffer and shadow vertex stages only: RT scene data, glass, selection and
+    /// impostor paths still see the UN-sunk pose (as with wind sway) — an RT host would reflect
+    /// a sunk field. Give a sunk object's parts one `tagGlow.z` key built from WORLD coordinates:
+    /// the fallback hash reads the (render-space) origin, which a floating origin moves.
+    public var fieldSinkProgress: Float = 0
+    /// Last frame's value, for motion vectors.
+    private var lastFieldSinkProgress: Float = 0
     /// Resolution the in-view cloud + atmosphere march runs at, as a fraction of the canvas
     /// (1 = full res, the default — byte-identical). 0.5 marches a quarter of the rays into an
     /// off-screen target and depth-aware-upsamples it into the sky pixels: clouds and the
@@ -10183,7 +10197,7 @@ public final class IlluminatoramaRenderer {
                                index: 3)
             // Shader-animated sway (swayMode 2 pendant, 3 wind flap) reads (time, wind, heading) so it casts
             // its swung shadow in phase with the visible mesh; no-op for modes 0/1.
-            var shadowClock = SIMD4<Float>(time, treeWindStrength, treeWindHeading, 0)   // (time, wind, heading) — swayMode 2/3
+            var shadowClock = SIMD4<Float>(time, treeWindStrength, treeWindHeading, fieldSinkProgress)   // (time, wind, heading, sink)
             enc.setVertexBytes(&shadowClock, length: MemoryLayout<SIMD4<Float>>.stride, index: 4)
 
             // Phase 4.12 — instanced draw per mesh kind via the recipe
@@ -10600,7 +10614,7 @@ public final class IlluminatoramaRenderer {
                                index: 3)
             // Shader-animated sway (swayMode 2 pendant, 3 wind flap) reads (time, wind, heading) so it casts
             // its swung shadow in phase with the visible mesh; no-op for modes 0/1.
-            var shadowClock = SIMD4<Float>(time, treeWindStrength, treeWindHeading, 0)   // (time, wind, heading) — swayMode 2/3
+            var shadowClock = SIMD4<Float>(time, treeWindStrength, treeWindHeading, fieldSinkProgress)   // (time, wind, heading, sink)
             enc.setVertexBytes(&shadowClock, length: MemoryLayout<SIMD4<Float>>.stride, index: 4)
 
             // Phase 4.12 — instanced draw per mesh kind via the recipe
@@ -10764,7 +10778,7 @@ public final class IlluminatoramaRenderer {
 
                 var lightVP = faces[slice]
                 enc.setVertexBytes(&lightVP, length: MemoryLayout<simd_float4x4>.stride, index: 3)
-                var shadowClock = SIMD4<Float>(time, treeWindStrength, treeWindHeading, 0)   // (time, wind, heading) — swayMode 2/3
+                var shadowClock = SIMD4<Float>(time, treeWindStrength, treeWindHeading, fieldSinkProgress)   // (time, wind, heading, sink)
                 enc.setVertexBytes(&shadowClock, length: MemoryLayout<SIMD4<Float>>.stride, index: 4)
 
                 let cullClip = cullVolume(lightVP)   // DH-0534
@@ -12811,7 +12825,8 @@ public final class IlluminatoramaRenderer {
         var u = CloudInViewUniforms(invViewProjection: fu.invViewProjection,
                                     cameraWorldPos: SIMD4<Float>(fu.cameraWorldPos, f > 1 ? Float(f) : 0),
                                     extra: SIMD4<Float>(inViewSkyTime ?? time, inViewLavaFade.map { min(max($0, 0), 1) } ?? -1,
-                                                         inViewCirrusTime.map { max($0, 0) } ?? -1, 0))
+                                                         inViewCirrusTime.map { max($0, 0) } ?? -1,
+                                                         inViewCirrusThreads.map { min(max($0, 0), 1) } ?? -1))
         // setBytes, not a shared MTLBuffer: with two frames in flight a single buffer was overwritten by frame N+1 while frame N's kernels could still read it (the
         // camera matrix the rays — and the upsample's stars — are rebuilt from).
         let uStride = MemoryLayout<CloudInViewUniforms>.stride
@@ -13988,6 +14003,9 @@ public final class IlluminatoramaRenderer {
         u.liveLookGIWarmth = max(0, min(4, liveLookGIWarmth))
         u.liveLookAODarken = effectiveLiveLookAODarken   // DH-0785 — never on top of traced AO
         u.tagGlowGain = max(0, tagGlowGain)
+        u.fieldSink = min(max(fieldSinkProgress, 0), 1)
+        u.prevFieldSink = lastFieldSinkProgress
+        lastFieldSinkProgress = u.fieldSink
         // Interior day-light separation. Mask 0 (default) ⇒ the kernel's factors stay
         // exactly 1.0 ⇒ byte-identical for every scene that never opts in.
         u.interiorMask = interiorLayerMask

@@ -507,8 +507,10 @@ struct FrameUniforms {
     // weight), so a host glides or modulates a glow with one float instead of re-uploading every
     // instance. ONE new 16-byte cluster (stride 1568 → 1584).
     float    tagGlowGain;
-    float    _padTagGlow0;
-    float    _padTagGlow1;
+    // FIELD SINK (was _padTagGlow0/1): 0…1 progress of instances sinking into the ground by their
+    // own depth (Instance.tagGlow.y) — a host's "slurp the field away / slide it back up".
+    float    fieldSink;
+    float    prevFieldSink;
     float    _padTagGlow2;
 };
 static_assert(sizeof(FrameUniforms) == 1584, "FrameUniforms must match IlluminatoramaFrameUniforms (1584 bytes)");
@@ -820,7 +822,11 @@ struct Instance {
     // (tangent.w ≈ 1): tagged vertices add their own final albedo (post hue cycle) × x ×
     // FrameUniforms.tagGlowGain to the emission — a flower's petals glow in their own colour
     // while leaves and stems do not.
-    //   x = static per-instance weight (0 = off — the default, an exact no-op) · yzw reserved (0)
+    //   x = static per-instance glow weight (0 = off — the default, an exact no-op)
+    //   y = FIELD-SINK depth (m): how far this instance slides below ground at
+    //       FrameUniforms.fieldSink = 1 (0 = never sinks — the default, an exact no-op)
+    //   z = field-sink stagger key (> 0: fract(z) is the delay, shared by an object's parts;
+    //       0 = hash of the instance origin) · w reserved
     float4   tagGlow;
 };
 

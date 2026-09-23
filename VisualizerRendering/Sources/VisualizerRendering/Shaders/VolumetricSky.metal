@@ -870,9 +870,11 @@ inline float3 cloudAmbientBase(constant SkyUniforms &u) {
     return (u.skyGrade.z > 0.5f) ? u.cloudLitAmbient.xyz : u.skyZenith.xyz;
 }
 
-inline float3 applyCirrus(float3 sky, float3 ro, float3 rayDir, float time, constant SkyUniforms &u,
-                          texture3d<float, access::sample> noiseVol) {
-    float cov = u.cirrusA.x;
+// One cirrus layer — the wind-streaked VEIL, or (threads) the dense curled filaments that flow.
+inline float3 cirrusLayer(float3 sky, float3 ro, float3 rayDir, float time, constant SkyUniforms &u,
+                          texture3d<float, access::sample> noiseVol, bool threads) {
+    // cirrusC.w: the threads' coverage gain over the veil (0 = legacy: same coverage).
+    float cov = threads ? min(1.0f, u.cirrusA.x * (u.cirrusC.w > 0.0f ? u.cirrusC.w : 1.0f)) : u.cirrusA.x;
     if (cov <= 0.0f || rayDir.y <= 0.004f) return sky;
     float t = (u.cirrusA.z - ro.y) / rayDir.y;
     if (t <= 0.0f) return sky;
@@ -886,7 +888,6 @@ inline float3 applyCirrus(float3 sky, float3 ro, float3 rayDir, float time, cons
     // P: noise-texel space, x along the jet, y across it.
     // THREADS mode: denser, more strongly curled filaments that FLOW — the fibres stream along the
     // jet and the curl field itself drifts and morphs, so the threads undulate as if blown.
-    bool threads = u.cirrusC.x > 0.5f;
     float freq = threads ? max(u.cirrusC.z, 0.05f) : 1.0f;
     float2 P = float2(dot(p, along), dot(p, across)) * (u.cirrusA.w * freq);
     float flow = threads ? time * u.cirrusC.y : 0.0f;
@@ -930,6 +931,18 @@ inline float3 applyCirrus(float3 sky, float3 ro, float3 rayDir, float time, cons
     float3 L = (cloudSunIrradiance(u) * phase + float3(ambL) * 1.6f) * u.cirrusTint.rgb;
     float a = 1.0f - exp(-tau);
     return sky * (1.0f - a) + L * a;
+}
+
+// The cirrus as the host asked for it: cirrusC.x (or the in-view per-frame override `threadsW`)
+// is how much of it is THREADS. 0 or 1 draws one layer (byte-identical to the old switch);
+// between, both are drawn and blended — only for the length of a fade.
+inline float3 applyCirrus(float3 sky, float3 ro, float3 rayDir, float time, constant SkyUniforms &u,
+                          texture3d<float, access::sample> noiseVol, float threadsW) {
+    float w = saturate(threadsW);
+    if (w <= 0.0f) return cirrusLayer(sky, ro, rayDir, time, u, noiseVol, false);
+    if (w >= 1.0f) return cirrusLayer(sky, ro, rayDir, time, u, noiseVol, true);
+    return mix(cirrusLayer(sky, ro, rayDir, time, u, noiseVol, false),
+               cirrusLayer(sky, ro, rayDir, time, u, noiseVol, true), w);
 }
 
 // ── Cloud lighting from the atmosphere (Params.cloudLightingFromAtmosphere) ─────────────
@@ -1360,7 +1373,7 @@ kernel void volSkyRender(
             sky += starField(rayDir, u.nightParams.x) * nightBlend;
             sky += moonDisk(rayDir, u) * nightBlend;
         }
-        sky = applyCirrus(sky, u.cameraPos.xyz, rayDir, u.lavaA.y, u, noiseVol);
+        sky = applyCirrus(sky, u.cameraPos.xyz, rayDir, u.lavaA.y, u, noiseVol, u.cirrusC.x);
     }
 
     // Compute ray–slab entry and exit (slab is infinite in XZ). Rays
@@ -1673,6 +1686,7 @@ struct CloudInViewUniforms {
     float4   extra;              // x = the renderer's frame time (s) — animates the lava lamp per frame
                                  // y = per-frame lava weight override (≥ 0), −1 = SkyUniforms.lavaA.x
                                  // z = cirrus clock override (≥ 0), −1 = x
+                                 // w = cirrus threads weight override (≥ 0), −1 = SkyUniforms.cirrusC.x
 };
 
 kernel void illumi_cloud_inview(
@@ -1744,7 +1758,8 @@ kernel void illumi_cloud_inview(
             sky += starField(rayDir, u.nightParams.x) * nightBlend;
             sky += moonDisk(rayDir, u) * nightBlend;
         }
-        sky = applyCirrus(sky, ro, rayDir, cv.extra.z >= 0.0f ? cv.extra.z : cv.extra.x, u, noiseVol);
+        sky = applyCirrus(sky, ro, rayDir, cv.extra.z >= 0.0f ? cv.extra.z : cv.extra.x, u, noiseVol,
+                          cv.extra.w >= 0.0f ? cv.extra.w : u.cirrusC.x);   // w ≥ 0: per-frame threads weight
     }
     // Alpha for a texel with no deck in the way: fully transmissive (see the tail write).
     float clearA = f > 1u ? 2.0f : 1.0f;

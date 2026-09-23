@@ -177,6 +177,24 @@ static inline float3 applySway(float3 wp, float4x4 model, int mode,
     return pivot + rot + float3(0.0, jostle, 0.0);
 }
 
+// ── Field sink ──────────────────────────────────────────────────────────────
+// A host's whole field of objects slurps into the ground and slides back out: each instance with
+// a sink depth (Instance.tagGlow.y, metres) drops by depth × p², p the frame's progress
+// (FrameUniforms.fieldSink), staggered per instance by a hash of its origin so the field goes
+// down in a ripple rather than as one plate. Squared: it ACCELERATES as it goes down and
+// DECELERATES as it comes up. Below the ground it is simply hidden by the (opaque) terrain.
+// depth 0 or progress 0 ⇒ exactly 0 — every instance and host that never opts in is untouched.
+// `key` (Instance.tagGlow.z) > 0 is an explicit stagger key, so the parts of ONE object placed by
+// different matrices (a toilet's body and its hinged lid) go down together; 0 = hash the origin.
+static inline float fieldSinkOffset(float depth, float progress, float key, float4x4 model) {
+    if (depth <= 0.0f || progress <= 0.0f) return 0.0f;
+    float2 o = model[3].xz;
+    float h = key > 0.0f ? fract(key) : fract(sin(dot(o, float2(12.9898f, 78.233f))) * 43758.5453f);
+    const float stagger = 0.35f;
+    float p = saturate(progress * (1.0f + stagger) - stagger * h);
+    return depth * p * p;
+}
+
 vertex VSOut illumi_vs(
     uint                       vid           [[vertex_id]],
     uint                       iid           [[instance_id]],
@@ -246,6 +264,9 @@ vertex VSOut illumi_vs(
     // capture (windPrevDelta 0 — static pose, byte-identical), the real previous clock live.
     prevWorldP.xyz = applySway(prevWorldP.xyz, prevInst.modelMatrix, prevInst.swayMode,
                                prevInst.swayLean, prevInst.swayJostle, prevWindTime, frame._padPhase2A, frame._padPhase2B, prevN, prevT);
+    // Field sink (a no-op unless the instance has a sink depth and the host is mid-transition).
+    worldP.y -= fieldSinkOffset(inst.tagGlow.y, frame.fieldSink, inst.tagGlow.z, inst.modelMatrix);
+    prevWorldP.y -= fieldSinkOffset(prevInst.tagGlow.y, frame.prevFieldSink, prevInst.tagGlow.z, prevInst.modelMatrix);
 
     VSOut o;
     o.clipPos      = frame.viewProjection * worldP;
@@ -295,7 +316,7 @@ vertex float4 illumi_shadow_vs(
     const device Vertex*        verts     [[buffer(0)]],
     const device Instance*      instances [[buffer(2)]],
     constant float4x4&          lightVP   [[buffer(3)]],
-    constant float4&            shadowClock [[buffer(4)]]   // x = time, y = wind strength, z = wind heading
+    constant float4&            shadowClock [[buffer(4)]]   // x = time, y = wind strength, z = wind heading, w = field sink
 ) {
     Vertex v = verts[vid];
     Instance inst = instances[iid];
@@ -307,6 +328,7 @@ vertex float4 illumi_shadow_vs(
     float3 nDummy = float3(0.0), tDummy = float3(0.0);
     worldP.xyz = applySway(worldP.xyz, inst.modelMatrix, inst.swayMode,
                            inst.swayLean, inst.swayJostle, shadowClock.x, shadowClock.y, shadowClock.z, nDummy, tDummy);
+    worldP.y -= fieldSinkOffset(inst.tagGlow.y, shadowClock.w, inst.tagGlow.z, inst.modelMatrix);
     return lightVP * worldP;
 }
 

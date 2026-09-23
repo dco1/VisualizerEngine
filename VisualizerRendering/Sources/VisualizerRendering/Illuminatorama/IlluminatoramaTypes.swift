@@ -585,8 +585,9 @@ public struct IlluminatoramaFrameUniforms {
     /// Frame-level gain on `IlluminatoramaInstance.tagGlow.x` (see the renderer's `tagGlowGain`).
     /// ONE new 16-byte cluster (stride 1568 → 1584).
     public var tagGlowGain: Float = 0
-    public var _padTagGlow0: Float = 0
-    public var _padTagGlow1: Float = 0
+    /// Field sink progress 0…1 this frame and last (see the renderer's `fieldSinkProgress`).
+    public var fieldSink: Float = 0
+    public var prevFieldSink: Float = 0
     public var _padTagGlow2: Float = 0
 
     /// Fill the eight gain vectors from a flat 32-entry table, and stamp the enable.
@@ -1211,7 +1212,11 @@ public struct IlluminatoramaInstance {
     /// in their own — possibly cycling — colour while its leaves and stems do not. `x` is a
     /// STATIC weight set once at assembly; the live amount is the frame-level gain, so gliding
     /// or modulating a glow costs one float per frame, not an instance re-upload.
-    ///   x = weight (0 = off: the default and an exact no-op for every existing host) · yzw reserved
+    ///   x = glow weight (0 = off: the default and an exact no-op for every existing host)
+    ///   y = FIELD-SINK depth (m): how far the instance slides below ground when the renderer's
+    ///       `fieldSinkProgress` is 1 (0 = never sinks — the default, an exact no-op)
+    ///   z = field-sink stagger key (> 0: its fraction is the delay, shared by an object's parts
+    ///       placed with different matrices; 0 = hash the instance's origin) · w reserved
     public var tagGlow: SIMD4<Float> = .zero
 
     public init(
