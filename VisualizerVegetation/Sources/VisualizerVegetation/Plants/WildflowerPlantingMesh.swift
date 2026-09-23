@@ -504,7 +504,7 @@ public enum WildflowerPlantingMesh {
                 out.append(Plant(kind: kind, variant: variant, position: p, heading: heading,
                                  // Height varies a LOT in a sown bed — a few plants stand well above the
                                  // sward. A native stand is more even (one season's germination).
-                                 scale: mix == .garden ? 0.6 + u * 1.2 : 0.72 + u * 0.62))
+                                 scale: mix == .garden ? 0.75 + u * 1.2 : 0.72 + u * 0.62))
             }
         }
         return out
