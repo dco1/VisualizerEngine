@@ -434,9 +434,10 @@ public enum WildflowerPlantingMesh {
             // which is what makes the hills read as alternating SWATHS rather than a blend.
             let orange = smoothstep(0.38, 0.62, a)
             let purple = smoothstep(0.42, 0.64, b) * (1 - orange * 0.85)
-            // Inside a strong drift the flowers crowd the grass out — the photo's solid swaths.
-            let crowd = 1 - 0.6 * max(orange, purple)
-            return [(.tuft, 0.20 * crowd),
+            // Inside a strong drift the flowers crowd the grass back — but a wet-spring sward
+            // still fills every gap between them (no bare soil in a superbloom).
+            let crowd = 1 - 0.35 * max(orange, purple)
+            return [(.tuft, 0.30 * crowd),
                     (.wildOat, 0.035 * crowd),
                     (.poppy, 0.04 + 0.95 * orange),
                     (.blueDicks, 0.02 + 0.80 * purple),
