@@ -56,6 +56,13 @@ final class NightSkyTests: XCTestCase {
         XCTAssertEqual(asin(dusk.sunENU.z) * 180 / .pi, 0, accuracy: 2.5)
     }
 
+    func testSolarHourRoundTripsTheEphemerisSun() {
+        for hour in stride(from: 0.5, to: 24, by: 1.75) {
+            let e = NightSkyEphemeris(latitudeDeg: 37.8, dayOfYear: 200, localSolarHour: hour, moonAgeDays: 3)
+            XCTAssertEqual(NightSkyEphemeris.solarHour(sunENU: e.sunENU, latitudeDeg: 37.8), hour, accuracy: 1e-6)
+        }
+    }
+
     func testCelestialPoleIsFixedAtTheLatitudeAndTheStarsTurnAboutIt() {
         let east = SIMD3<Float>(1, 0, 0), north = SIMD3<Float>(0, 0, -1), up = SIMD3<Float>(0, 1, 0)
         var previousRA0: SIMD3<Float>? = nil

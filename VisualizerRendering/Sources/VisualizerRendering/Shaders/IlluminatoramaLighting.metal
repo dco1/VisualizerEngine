@@ -985,13 +985,18 @@ kernel void illumi_lighting(
         float4 farClip = float4(ndc, 1.0, 1.0);
         float4 farWorld = frame.invViewProjection * farClip;
         float3 dir = normalize(farWorld.xyz / farWorld.w - frame.cameraWorldPos);
-        float3 sky = sampleSkyEquirect(skyEquirect, dir);
+        float4 skySample = sampleSkyEquirect4(skyEquirect, dir);
+        float3 sky = skySample.rgb;
         // Analytic night sky (opt-in): pixel-sharp stars + a phase-correct moon
         // composited over the (celestial-free) dome. Zero params ⇒ exact no-op.
         // TAA's jittered projection supersamples the sub-pixel star cores.
         // Angular size of one pixel from the projection: tan(fovY/2) = 1/P[1][1].
         float pixAngle = (2.0f / frame.projection[1][1]) / float(h);
-        sky += nightCelestials(dir, frameNightSky(frame), pixAngle, sky);
+        // Physical model: behind the dome's clouds (its alpha = cloud transmittance).
+        NightSkyParams night = frameNightSky(frame);
+        float3 celestials = nightCelestials(dir, night, pixAngle, sky);
+        if (night.model > 0.5f) celestials *= saturate(skySample.a);
+        sky += celestials;
         outHDR.write(half4(half3(sky), 1.0h), gid);
         // Issue #65 — sky is never SSS; clear its mask so the composite skips it.
         if (frame.sssStrength > 0.0) sssOut.write(half4(0.0h), gid);

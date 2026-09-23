@@ -1068,6 +1068,16 @@ static inline float3 sampleSkyEquirect(texture2d<float, access::sample> sky,
     return sky.sample(s, dirToEquirectUV(normalize(dir))).rgb;
 }
 
+// The same sample with alpha: a VolumetricCloudRenderer dome built for the PHYSICAL night sky
+// with celestials drawn analytically writes the cloud transmittance there (1 elsewhere), which
+// is how the per-pixel stars and moon go behind the clouds baked into the dome.
+static inline float4 sampleSkyEquirect4(texture2d<float, access::sample> sky, float3 dir) {
+    constexpr sampler s(filter::linear,
+                        s_address::repeat,
+                        t_address::clamp_to_edge);
+    return sky.sample(s, dirToEquirectUV(normalize(dir)));
+}
+
 // ── Analytic night sky — stars + moon at SCREEN resolution ──────────────────
 //
 // The equirect sky dome (VolumetricCloudRenderer, 2048×1024) is far coarser than

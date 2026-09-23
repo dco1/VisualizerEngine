@@ -1454,6 +1454,34 @@ public final class IlluminatoramaRenderer {
     public var scotopicKnee: Float = 0
     public var scotopicTint: SIMD3<Float> = .zero
 
+    /// Drive the analytic (screen-resolution) PHYSICAL night sky from the same
+    /// `VolumetricCloudRenderer.Params` the host renders its sky dome with — moon, stars,
+    /// gains and celestial frame in one call, so the dome (its moonlit glow and clouds) and
+    /// the per-pixel celestials cannot disagree. Pair it with `params.nightSkyModel =
+    /// .physical` and `params.celestialsInDome = false`: the dome then writes its cloud
+    /// transmittance to alpha and the stars / moon go behind the clouds. Stars and the Milky
+    /// Way are skipped while the sun is up (they would wash out anyway); the moon is always
+    /// drawn — a daytime moon is a pale disk.
+    public func setPhysicalNightSky(from p: VolumetricCloudRenderer.Params) {
+        let sunTravel = p.sunDir == .zero ? SIMD3<Float>(0, -1, 0) : simd_normalize(p.sunDir)
+        let moon = p.moonDir == .zero ? SIMD3<Float>(0.4, 0.6, -0.7) : simd_normalize(p.moonDir)
+        let night = VolumetricCloudRenderer.nightBlend(sunDir: sunTravel) > 0
+        nightSkyModel = .physical
+        nightSkyStarBrightness = night ? max(0, p.starBrightness) : 0
+        nightSkyMilkyWay = night ? max(0, p.milkyWay) : 0
+        nightSkyMoonIntensity = max(0, p.moonIntensity)
+        nightSkyMoonDirection = moon
+        nightSkySunDirection = p.moonPhaseOverride.map {
+            NightSkyEphemeris.effectiveSun(moonDir: moon, trueToSun: -sunTravel, illuminatedFraction: $0)
+        } ?? -sunTravel
+        nightSkyMoonAngularRadius = max(0, p.moonAngularRadius)   // 0 = the real 0.26°
+        nightSkyMoonHalo = max(0, p.moonHalo)
+        nightSkyEarthshine = max(0, p.earthshine)
+        nightSkyTwinkle = max(0, p.starTwinkle)
+        nightSkyRadiance = max(0, p.nightRadiance)
+        nightSkyCelestialOrientation = p.celestialOrientation
+    }
+
     /// The physical-night-sky uniform clusters, packed ONCE for the frame and the glass pass
     /// (so a window and the sky beside it cannot disagree). `.legacy` ⇒ all zero ⇒ the
     /// shader's legacy branch, byte-identical.

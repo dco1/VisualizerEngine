@@ -253,8 +253,12 @@ static inline float3 sampleSky(texture2d<float, access::sample> sky, float3 dir,
                                NightSkyParams night, float pixAngle) {
     constexpr sampler s(filter::linear, s_address::repeat, t_address::clamp_to_edge);
     float3 d = normalize(dir);
-    float3 dome = sky.sample(s, dirToEquirectUV(d)).rgb * scale;
-    return dome + nightCelestials(d, night, pixAngle, dome);
+    float4 domeA = sky.sample(s, dirToEquirectUV(d));
+    float3 dome = domeA.rgb * scale;
+    float3 celestials = nightCelestials(d, night, pixAngle, dome);
+    // Physical model: behind the dome's clouds (alpha = cloud transmittance — see volSkyRender).
+    if (night.model > 0.5f) celestials *= saturate(domeA.a);
+    return dome + celestials;
 }
 
 // ── The scatter cone: ONE definition of how wide it is, whether it is worth

@@ -1409,7 +1409,7 @@ kernel void volSkyRender(
         } else {
             sky = (u.atmosphereParams.x > 0.5f)
                 ? nishitaAtmosphereColor(rayDir, u)
-                : atmosphereColor(rayDir, u);
+                : atmosphereColor(rayDir, u) + (rayDir.y >= 0.0f ? nightSkyGlow(rayDir, u) : float3(0.0f));
             sky += sunDisk(rayDir, u);
         }
 
@@ -1695,7 +1695,12 @@ kernel void volSkyRender(
     // bloom past representable float16 when bound as an environment map.
     col = col / (1.0f + col * 0.10f);
 
-    outTex.write(float4(col, 1.0f), gid);
+    // Physical night sky drawn ANALYTICALLY by the host (celestialsInDome = false): alpha
+    // carries how much of what lies BEYOND the deck shows through this texel (the cloud
+    // transmittance, and none under the lava lamp), so the per-pixel stars / moon are hidden
+    // behind the clouds baked into this dome. Everyone else keeps alpha 1 (byte-identical).
+    float alpha = (u.nightSkyA.x > 0.5f && u.cloudExtra2.y <= 0.5f) ? effTrans * (1.0f - lavaW) : 1.0f;
+    outTex.write(float4(col, alpha), gid);
 }
 
 // ── In-view (perspective) cloud kernel ───────────────────────────────────────
@@ -1810,7 +1815,7 @@ kernel void illumi_cloud_inview(
         } else {
             sky = (u.atmosphereParams.x > 0.5f)
                 ? nishitaAtmosphereColor(rayDir, u)
-                : atmosphereColor(rayDir, u);
+                : atmosphereColor(rayDir, u) + (rayDir.y >= 0.0f ? nightSkyGlow(rayDir, u) : float3(0.0f));
             sky += sunDisk(rayDir, u);
         }
         // Same analytic-night-sky skip as volSkyRender (cloudExtra2.y).
@@ -1981,6 +1986,13 @@ kernel void illumi_cloud_inview(
     float blend = mix(0.0f, 1.0f, horizonFade);
     float effTrans = mix(1.0f, trans, blend);
     float3 col = mix(sky * effTrans + lum * blend, lavaCol, lavaW);
+    // Full-res march + the PHYSICAL night sky drawn analytically (celestialsInDome = false):
+    // this pass REPLACES the sky pixel, so it must draw the celestials itself — behind the
+    // deck (× its transmittance), as the downsampled path's upsample does.
+    if (f <= 1u && u.nightSkyA.x > 0.5f && u.cloudExtra2.y <= 0.5f && !debugBG && rayDir.y > -0.05f) {
+        col += skyCelestials(rayDir, u, inViewPixelAngle(cv, uv, float2(W, H), rayDir), col, cv.night.x, true)
+             * effTrans * (1.0f - lavaW);
+    }
     // NO Reinhard here — the host tonemaps the HDR scene-colour once downstream.
     // Downsampled: alpha = 1 + transmittance, so the full-res upsample can put pixel-sharp
     // stars BEHIND the clouds (alpha ≥ 1 still marks "marched"). Full-res: alpha 1, as before.

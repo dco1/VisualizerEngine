@@ -113,6 +113,20 @@ public struct NightSkyEphemeris: Sendable {
 
     // ── Shared helpers (also used by the renderer's uniform packing) ─────────
 
+    /// The apparent solar time (hours, 0–24) at which the sun stands at `sunENU` (east,
+    /// north, up) at latitude φ — the hour angle H from cos δ·sin H = −east and
+    /// cos δ·cos H = up·cos φ − north·sin φ. For a host with its own (e.g. NOAA) sun: feeding
+    /// this back as `localSolarHour` turns the stars to agree EXACTLY with that sun, whatever
+    /// its clock-time / longitude / equation-of-time conventions.
+    public static func solarHour(sunENU: SIMD3<Double>, latitudeDeg: Double) -> Double {
+        let phi = latitudeDeg * .pi / 180
+        let s = simd_normalize(sunENU)
+        let h = atan2(-s.x, s.z * cos(phi) - s.y * sin(phi))
+        var hour = 12 + h * 12 / .pi
+        hour = hour.truncatingRemainder(dividingBy: 24)
+        return hour < 0 ? hour + 24 : hour
+    }
+
     /// A direction to light the moon from so it shows `illuminatedFraction` (0 new … 1 full)
     /// while keeping its lit limb toward the true sun: the phase angle α has cos α = 2k − 1,
     /// and the light sits α away from the moon→Earth direction, rotated toward the sun.
