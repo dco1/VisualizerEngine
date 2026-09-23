@@ -39,8 +39,8 @@ public enum WildflowerPlantingMesh {
     /// What the bed's own ground is multiplied by under a planting — see `gardenGroups`.
     public static let understoryTint = Vec3(0.30, 0.40, 0.26)
 
-    public static let foliageGreens = [Vec3(0.19, 0.26, 0.09), Vec3(0.23, 0.30, 0.10), Vec3(0.16, 0.23, 0.08)]   // sun-dried olive, not blue-green
-    public static let stemGreen     = Vec3(0.22, 0.27, 0.10)
+    public static let foliageGreens = [Vec3(0.25, 0.26, 0.05), Vec3(0.29, 0.28, 0.05), Vec3(0.21, 0.23, 0.04)]   // a spring sward's golden olive (hue ~0.16): the goal's parkway measured 58 % yellow-olive, 2 % green
+    public static let stemGreen     = Vec3(0.24, 0.26, 0.06)
     /// Poppies vary flower to flower from deep orange to the paler orange-yellow coastal form.
     public static let poppyOranges  = [Vec3(0.90, 0.22, 0.02), Vec3(0.94, 0.32, 0.03), Vec3(0.97, 0.44, 0.05)]   // the judge read the paler ones as yellow
     public static let lupineViolet  = Vec3(0.34, 0.24, 0.72)
