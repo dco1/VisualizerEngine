@@ -125,6 +125,29 @@ extension GardenPlantMesh {
         return FleshyLeafBuild(mesh: m.smoothed(creaseDegrees: 100), triangleV: tv)
     }
 
+    /// Mesh one leaf PAINTED: `fleshyLeafBuild`'s solid, every vertex coloured by `paint` from its
+    /// place on the leaf (`v` 0 base → 1 tip; `u` 0 midline → 1 margin) and its face (`.rim` is the
+    /// thickness band). This is how a solid leaf wears a pattern with no colour groups — a snake
+    /// plant's bands, an echeveria's blush fading in rather than cut at a line (`split`).
+    ///
+    /// Same silhouette entry point as `fleshyLeafBuild`, for the same reason (see its note on the
+    /// resolved-`margin:` overload).
+    public static func fleshyLeafPainted(_ l: FleshyLeaf, silhouette: LeafSilhouette, tier: LeafSilhouette.Tier,
+                                         subdivisions: Int = 1,
+                                         paint: @escaping (LeafStripVertex<Double>, LeafFace) -> Vec3) -> PaintedMesh {
+        var sink = PaintingSink(upper: l.normal, paint: paint)
+        PadConstructor.emitPad(into: &sink,
+                               placement: .init(position: l.base + l.yAxis * (l.length * 0.46),
+                                                xAxis: l.xAxis, yAxis: l.yAxis, bentNormal: l.normal,
+                                                width: l.width, height: l.length),
+                               silhouette: silhouette, tier: tier, subdivisions: subdivisions,
+                               thickness: l.thickness, crown: l.crown, winding: .singleSided)
+        var p = sink.painted
+        p.mesh.positions = p.mesh.positions.map { fleshyLeafDisplace(l, $0) }
+        // A wide crease, as `fleshyLeafBuild`: the rim blends into both faces — the edge reads ROUNDED.
+        return p.smoothed(creaseDegrees: 100)
+    }
+
     /// Cut a built leaf at `vCut`: the triangles nearer the base, and the ones nearer the tip. The
     /// whole leaf was smoothed as ONE part first, so the shading is continuous across the cut.
     public static func split(_ b: FleshyLeafBuild, at vCut: Double) -> (base: Mesh3, tip: Mesh3) {

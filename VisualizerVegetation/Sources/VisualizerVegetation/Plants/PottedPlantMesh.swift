@@ -2,24 +2,18 @@ import Foundation
 import simd
 import VisualizerMaterials
 
-/// Procedural potted-plant mesh — a revolved pot + soil disc (the `body`) and a seeded,
-/// per-style plant of a tapered stem + **Forest-quality lobed/serrated leaf cards** (the
-/// `foliage`).
+/// Procedural potted-plant mesh — a revolved pot or vase with its soil/water disc, and the plant
+/// growing out of it.
 ///
-/// The leaf blades are the real Visualizer Forest tree-leaf silhouette, ported into DaydreamCore
-/// as `PlantLeafCard` (species-keyed lobed/serrated margin outline + taco cup + midrib gradient),
-/// arranged with the Forest scene's golden-angle phyllotaxis + tip-biased rosette placement.
-/// Each `PlantStyle` maps to a Forest leaf silhouette + houseplant-scale placement tuning, so a
-/// fiddle-leaf fig reads as broad oak-like leaves high on a stem, a monstera as palmate maple
-/// fronds, a snake plant as a rosette of upright sword blades, a fern as many small arching
-/// fronds, a succulent as a tight compact rosette. See `PlantLeafCard` for the port rationale
-/// (the leaf GEOMETRY ports; the Metal-coupled `Soup`→`IlluminatoramaVertex` bake does not).
+/// The five FOLIAGE houseplants are each grown by their own habit and painted leaf by leaf —
+/// `PottedPlantMesh+Houseplants` (fig, monstera, snake plant, fern, succulent), built on
+/// `LeafSheet` blades and `FleshyLeaf` solids; the bouquet styles and the Christmas tree build their
+/// own parts below and in `+ChristmasTree`.
 ///
-/// The two parts are returned **separately** because they render with different engine
-/// treatment: the body is an opaque painted vessel (vertex alpha 1), while every LEAF vertex
-/// is tagged with colour **alpha 0** at the render bridge — the engine's foliage-SSS flag that
-/// drives `leafTransmission` (backlit leaf glow), exactly like grass blades and tree leaf
-/// cards. Keeping them apart lets the bridge convert each with the right per-vertex colour.
+/// The parts are returned **separately** because they render with different treatment: the
+/// vessel takes the user's finish, the substrate (soil, trunk) fixed natural materials, the
+/// foliage its per-vertex paint (`Parts.foliageColors`) and the style's leaf roughness, and each
+/// bloom colour group its own albedo.
 ///
 /// **Single source of truth:** every dimension is read from `PottedPlantParams` — the pot from
 /// `potRadius`/`potHeight`, the foliage from `plantSize`/`plantStyle`/`foliageDensity`/`seed`.
@@ -30,9 +24,9 @@ import VisualizerMaterials
 ///
 /// **Avoids the four "tells"** (PROCEDURAL_GENERATORS §0): the pot is a real revolved solid
 /// with a soil disc (not a sealed hollow box), the stem is a real tapered revolve (positive
-/// volume), leaf cards are double-sided lobed blades with a genuine spread (not a coplanar
-/// decal), and the pot's rounded profile softens the rim arris so `PlaceableAudit`/`FacetingAudit`
-/// read curved rings, not a hard CAD cylinder.
+/// volume), leaves are curved two-faced sheets or closed solids with a genuine spread (not a
+/// coplanar decal), and the pot's rounded profile softens the rim arris so
+/// `PlaceableAudit`/`FacetingAudit` read curved rings, not a hard CAD cylinder.
 public enum PottedPlantMesh {
 
     /// A coloured sub-mesh — a group of leaf/petal/center cards that share ONE albedo. Used for
@@ -50,29 +44,30 @@ public enum PottedPlantMesh {
     /// applies to. `substrate` = the soil / water disc + the opaque stem — the growing medium and the
     /// plant's own trunk, which get FIXED natural materials (dark earth / woody), so choosing a
     /// marble pot doesn't turn the stem and soil to marble. Both are opaque (vertex alpha 1).
-    /// `foliage` = the GREEN cards (leaves / bouquet stems + stem-leaves), tagged alpha-0 for SSS by
-    /// the bridge with one green colour. `blooms` = per-colour petal/center groups (the `.flowers`
-    /// vivid bloom colours), each its own alpha-0 SSS colour group; empty for the foliage-only styles.
+    /// `foliage` = the leaves (and a bouquet's green stems), one draw group for the whole plant.
+    /// `blooms` = per-colour petal/center groups (the `.flowers` vivid bloom colours); empty for the
+    /// foliage-only styles.
     public struct Parts: Sendable {
         public var vessel: Mesh3
         public var substrate: Mesh3
         public var foliage: Mesh3
+        /// One albedo per `foliage` vertex, painted by the generator (`FoliagePaint`): leaf to leaf,
+        /// top to underside, rib to margin. EMPTY for a style that is not painted (the bouquet greens,
+        /// the fir canopy) — the bridge then stamps the style's one `leafColor`, as it always did.
+        public var foliageColors: [Vec3]
         public var blooms: [ColoredGroup]
-        /// A thin, pale ribbon riding proud of each leaf's own spine — the ONE structural, fixed
-        /// (not per-leaf-random) two-tone the flat per-style foliage stamp (DH-0645) can carry
-        /// without touching that architecture: a single extra `ColoredGroup`-style draw group for
-        /// the WHOLE plant, exactly like `blooms` already is, stamped one deterministic pale shade.
-        /// Empty for styles that don't opt in (`FoliagePlan.veinWidthFrac == 0`).
-        public var veins: Mesh3
         /// The string-light BULBS — the one self-lit part of any plant (`PlantStyle.hasStringLights`),
         /// so it is its own draw group: the bridge gives it emission when the string is on and a
         /// plain glass-bulb look when it is off. Empty for every other style.
         public var bulbs: Mesh3
 
-        public init(vessel: Mesh3, substrate: Mesh3, foliage: Mesh3, blooms: [ColoredGroup] = [],
-                    veins: Mesh3 = Mesh3(), bulbs: Mesh3 = Mesh3()) {
+        public init(vessel: Mesh3, substrate: Mesh3, foliage: Mesh3, foliageColors: [Vec3] = [],
+                    blooms: [ColoredGroup] = [], bulbs: Mesh3 = Mesh3()) {
+            precondition(foliageColors.isEmpty || foliageColors.count == foliage.vertexCount,
+                         "painted foliage needs one colour per vertex")
             self.vessel = vessel; self.substrate = substrate
-            self.foliage = foliage; self.blooms = blooms; self.veins = veins; self.bulbs = bulbs
+            self.foliage = foliage; self.foliageColors = foliageColors
+            self.blooms = blooms; self.bulbs = bulbs
         }
 
         /// The opaque solid the winding/volume auditors check: the vessel shell closed by the
@@ -108,7 +103,7 @@ public enum PottedPlantMesh {
         }
 
         // Foliage plant: a single trunk/stub stem (opaque — the plant's own woody trunk, so it's
-        // substrate, NOT the vessel finish) + green leaf cards.
+        // substrate, NOT the vessel finish) + the painted leaves.
         let stem = stemMesh(params: params, baseY: soilY)
         substrate.append(stem)
         if params.plantStyle == .christmasTree {
@@ -118,12 +113,9 @@ public enum PottedPlantMesh {
             return Parts(vessel: vessel, substrate: substrate, foliage: tree.canopy,
                          blooms: tree.baubles, bulbs: tree.bulbs)
         }
-        let (foliage, veins, petioles) = foliageMesh(params: params, soilY: soilY, rng: &rng)
-        // Petioles are the plant's own woody structural tissue continuing the trunk, not leaf
-        // material — they take the trunk's fixed natural substrate material, never the flat leaf
-        // green (Danny, 2026-09-11: a leaf-green petiole read as "a stray wire", the wrong color).
-        substrate.append(petioles)
-        return Parts(vessel: vessel, substrate: substrate, foliage: foliage, veins: veins)
+        let grown = foliage(params: params, soilY: soilY, rng: &rng)
+        substrate.append(grown.woody)
+        return Parts(vessel: vessel, substrate: substrate, foliage: grown.mesh, foliageColors: grown.colors)
     }
 
     /// Convenience: the whole plant as ONE mesh (vessel + substrate + leaves/blooms) — for the
@@ -133,10 +125,24 @@ public enum PottedPlantMesh {
         let p = parts(params: params, localBendDir: localBendDir)
         var m = p.opaqueBody
         m.append(p.foliage)
-        m.append(p.veins)
         for g in p.blooms { m.append(g.mesh) }
         m.append(p.bulbs)
         return m
+    }
+
+    /// A non-bouquet style's leaves, grown the way both the pot and the garden grow them: the five
+    /// houseplants painted leaf by leaf (`PottedPlantMesh+Houseplants`), the fir its tiered canopy
+    /// (unpainted — `colors` empty, the bridge stamps its one green).
+    public static func foliage(params: some PottedPlantGeometry, soilY: Double, rng: inout SplitMix)
+        -> (mesh: Mesh3, colors: [Vec3], woody: Mesh3) {
+        if params.plantStyle == .christmasTree {
+            let tiers = coniferTiers(params: params, soilY: soilY, rng: &rng)
+            return (coniferCanopy(tiers), [], Mesh3())
+        }
+        guard let grown = houseplantFoliage(params: params, soilY: soilY, rng: &rng) else {
+            return (Mesh3(), [], Mesh3())
+        }
+        return (grown.leaves.mesh, grown.leaves.colors, grown.woody)
     }
 
     // MARK: - Vessel: pot or vase (dispatch on the resolved vessel kind)
@@ -482,304 +488,7 @@ public enum PottedPlantMesh {
         return m
     }
 
-    // MARK: - Foliage: Forest-quality leaf cards on a phyllotaxis / rosette layout
-
-    /// Per-style placement + silhouette tuning — the single place that maps a `PlantStyle` to a
-    /// Forest leaf silhouette and houseplant-scale arrangement. Everything else in `foliageMesh`
-    /// is style-agnostic (the port of the Forest emitLeaves phyllotaxis loop).
-    public struct FoliagePlan {
-        public var silhouette: PlantLeafCard.Silhouette
-        public var baseCount: Int          // leaves before density scaling
-        public var leafLen: Double         // blade length as a fraction of plantSize
-        public var aspect: Double          // width / length
-        public var tilt: Double            // base pitch off vertical (0 = straight up), radians
-        public var tiltSpread: Double      // per-leaf ± tilt jitter
-        public var alongLow: Double        // fraction of stem span where leaves START (0 = soil)
-        public var alongHigh: Double       // fraction where leaves END (1 = stem top)
-        public var radiusFrac: Double      // petiole reach as a fraction of potRadius
-        public var rosette: Bool           // true = all leaves emerge near the soil (snake/succulent/fern)
-        // How much the OUTER ring(s) of a rosette lean toward horizontal relative to the inner
-        // ring (`ringFlatten` in the placement loop). Right for a splaying rosette (succulent) —
-        // wrong for a "stiff, almost no curl" upright sword blade (snake plant): a flattened outer
-        // ring on a LONG rigid blade swings its geometric base out and down far enough to visibly
-        // drape over the outside of the pot rim, contradicting the style's own upright character.
-        // Defaulted to the historical constant so every other style is unaffected.
-        public var ringFlattenAmount: Double = 0.18
-        // How many discrete height/tilt bands a rosette's leaves stack into (the `i % ringBands`
-        // terms below). 3 is the historical value every style shipped with. A rosette with a LOT
-        // of leaves (snake plant) stacked them all into the same 3 bands regardless of count, so
-        // raising `baseCount` alone just added more spokes around the same shallow 3-layer dome
-        // instead of building a taller, deeper one — closes gaps (azimuth) but not depth. Defaulted
-        // to the historical constant so every other style is unaffected.
-        public var ringBands: Int = 3
-        public var curl: Double            // longitudinal gravity-droop of each blade (0 = stiff/flat, 3D arch ↑)
-        public var understory: Double      // 0…1: fraction of extra shorter/lower "fill" leaves for a fuller silhouette
-        // DH-0628 — species fidelity:
-        public var subdivisions: Int = 3   // margin curve-smoothing steps (kills the shard/crystal read)
-        public var petiole: Bool = false   // hold each leaf out on a visible stalk (broadleaf: fig/monstera)
-        public var compound: Bool = false  // build a COMPOUND frond (a rachis + many leaflets) per unit — the fern
-        public var sizeGradient: Double = 0 // 0…1: how much bigger the LOWER (mature) leaves are vs the upper (young) ones
-        public var azimuthJitter: Double = 0.5 // per-leaf azimuth scatter (rad) — low = a legible crown, high = a bush
-        // Cross-blade taco-cup depth (`PlantLeafCard.emit`'s `fold`). TRIED raising this to 0.55 for
-        // the fiddle-leaf fig hoping a deeper valley would read as a midrib — it MEASURABLY DID NOT
-        // (two independent Ollama vision-model passes, gemma4:12b and gemma4:26b, both still scored
-        // "venation" 0/10 at 0.55, same as the Forest HERO default 0.30 — a shading valley across
-        // the WHOLE blade reads as "the leaf is cupped," not "the leaf has a vein down the middle").
-        // Worse, it silently broke `testInteriorPlantDoesNotOutglowRoom` (DH-0645-adjacent gate):
-        // the deeper cup changed enough backlit-pixel classification to flip a delicate photometric
-        // threshold — caught only because the FULL `HouseRenderBridgeGPUTests_PottedPlant` GPU suite
-        // was finally run, which the original fold change had NOT been checked against before it
-        // shipped. Reverted to the Forest default. The real venation fix is `veinWidthFrac` below.
-        public var fold: Double = LeafConstructor.defaultFold
-        // A gentle undulating ripple on the margin (`LeafConstructor.emitBlade`'s `waveAmplitude`)
-        // — a big SIMPLE entire leaf (fiddle-leaf fig) read as die-cut plastic without one; a
-        // realism pass scored this leaf's margin 3/10 ("too smooth/perfect"). 0 = the old
-        // razor-straight edge. Keep small — this is a ripple, not a lobe (DH-0628's shard lesson).
-        public var waveAmplitude: Double = 0
-        // Width (as a fraction of leaf length) of a thin, pale RIBBON riding proud of the spine —
-        // the actual fix for "venation," since `fold`'s shading valley alone doesn't read as one
-        // (see above). Built by `emitMidribVein` into its OWN mesh group (`Parts.veins`), stamped a
-        // paler shade than the leaf — a fixed two-tone, not per-leaf random colour, so it doesn't
-        // touch the DH-0645 architecture question. 0 (default) emits nothing.
-        public var veinWidthFrac: Double = 0
-    }
-
-    public static func foliagePlan(_ style: PlantStyle) -> FoliagePlan {
-        // DH-0488: counts raised and a per-style gravity `curl` added so every plant reads as a
-        // FULLER, 3D form (drooping, layered leaves) beside the solid furniture — not a sparse fan
-        // of flat cards. `understory` sprinkles shorter fill leaves lower on the plant to close the
-        // silhouette. All still ride `foliageDensity` and stay under the per-plant tri cap.
-        switch style {
-        case .fiddleLeafFig:
-            // A FEW huge SIMPLE glossy leaves on a tall bare cane — the fiddle-leaf fig's whole
-            // read (DH-0628 signal 1/8). Each leaf is one big violin/obovate sheet held out on a
-            // visible petiole, arching under its own weight. Lower leaves are larger (mature).
-            return FoliagePlan(silhouette: .fiddleLeafFig, baseCount: 10, leafLen: 0.52, aspect: 0.66,
-                               tilt: 0.52, tiltSpread: 0.14, alongLow: 0.40, alongHigh: 1.0,
-                               radiusFrac: 0.30, rosette: false, curl: 0.34, understory: 0.15,
-                               subdivisions: 3, petiole: true, sizeGradient: 0.35, azimuthJitter: 0.35,
-                               veinWidthFrac: 0.035)
-        case .monstera:
-            // A crown of a FEW big fenestrated leaves fanning out on long petioles (signal 1/3/4).
-            // The `.monstera` silhouette's deep rounded splits give the split-leaf read; a legible
-            // outward-and-up crown, not an omnidirectional tangle (low azimuth jitter + tiltSpread).
-            // `fold` at the shared 0.30 default left the blade nearly flat across its width —
-            // part of why it read as flat cut paper rather than a real leaf (the succulent pad
-            // fix above found the same lever). Nearly matching succulent's bump (0.30→0.48, a
-            // touch more conservative than succulent's 0.60 since this is a much bigger, near-
-            // circular blade where an equally deep fold would over-cup it into a taco).
-            return FoliagePlan(silhouette: .monstera, baseCount: 10, leafLen: 0.50, aspect: 0.98,
-                               tilt: 0.66, tiltSpread: 0.12, alongLow: 0.30, alongHigh: 1.0,
-                               radiusFrac: 0.40, rosette: false, curl: 0.40, understory: 0.20,
-                               subdivisions: 4, petiole: true, sizeGradient: 0.30, azimuthJitter: 0.30,
-                               fold: 0.48, veinWidthFrac: 0.032)
-        case .snakePlant:
-            // A dense rosette of tall upright sword blades erupting from the crown, ringed all the
-            // way around so no bare pot rim shows (signal 9). Stiff — almost no curl.
-            //
-            // `understory` WAS 0.30 — the "fuller silhouette" fill mechanism (DH-0488) tilts its
-            // extra leaves `+0.20` rad more horizontal and hangs them lower than the plan's own
-            // tilt, which is right for a SOFT drooping broadleaf (fig/monstera) but wrong for a
-            // "stiff, almost no curl" upright sword blade: those extra fill leaves visibly draped
-            // down over the OUTSIDE of the pot rim, contradicting the style's own description.
-            // `baseCount: 22` already rings the crown densely enough with the upright blades
-            // themselves — this style never needed the droopy fill in the first place.
-            return FoliagePlan(silhouette: .blade, baseCount: 30, leafLen: 0.94, aspect: 0.13,
-                               tilt: 0.11, tiltSpread: 0.09, alongLow: 0.0, alongHigh: 0.10,
-                               radiusFrac: 0.22, rosette: true, ringFlattenAmount: 0.0,
-                               ringBands: 4, curl: 0.05, understory: 0.0,
-                               subdivisions: 2, sizeGradient: 0.20, azimuthJitter: 0.35,
-                               veinWidthFrac: 0.020)
-        case .fern:
-            // A COMPOUND plant — each "leaf" is a whole feathered FROND: an arching rachis carrying
-            // many small leaflets, cascading over the pot rim (signal 1). Built by `emitFrond`.
-            return FoliagePlan(silhouette: .fernLeaflet, baseCount: 6, leafLen: 0.78, aspect: 0.16,
-                               tilt: 0.85, tiltSpread: 0.22, alongLow: 0.0, alongHigh: 0.16,
-                               radiusFrac: 0.14, rosette: true, curl: 0.55, understory: 0.0,
-                               subdivisions: 2, compound: true, azimuthJitter: 0.5)
-        case .succulent:
-            // A tight compact rosette of small FAT fleshy paddles near the soil (signal 1) —
-            // rounded, cupped, fuller. The `.succulentPad` silhouette reads as a thick leaf.
-            // `subdivisions: 2` read as faceted, angular "cut gemstone" paddles in a real render —
-            // exactly the low-subdivision "shard/crystal read" DH-0628 already names (fig/monstera
-            // use 3 for the same reason). A fleshy succulent paddle wants rounded margins more than
-            // most styles here, so match them. `baseCount` trimmed 24→20 to buy back the tri
-            // budget the extra subdivision spends (still the densest rosette of any style).
-            // `fold` (cross-blade cup depth) was left at the shared 0.30 default — right for a
-            // THIN leaf's shading valley, but a fleshy succulent paddle is a plump fat wedge, not
-            // a bent sheet of paper. Nearly doubling it gives the pad's cross-section a much
-            // stronger dome, which is the cheapest, zero-new-geometry lever toward "plump" instead
-            // of "flat card" (a real thickness extrusion is a bigger, riskier lift — see
-            // [[DH-0777]] — try this first).
-            return FoliagePlan(silhouette: .succulentPad, baseCount: 20, leafLen: 0.32, aspect: 0.66,
-                               tilt: 0.50, tiltSpread: 0.14, alongLow: 0.0, alongHigh: 0.06,
-                               radiusFrac: 0.16, rosette: true, curl: 0.20, understory: 0.25,
-                               subdivisions: 3, azimuthJitter: 0.5, fold: 0.60)
-        case .flowers, .driedSpray, .christmasTree:
-            // Never used for a bouquet style (handled by `bouquetMesh`) or the Christmas tree (its
-            // canopy is `coniferCanopy`, dispatched in `foliageMesh`), but the switch is exhaustive.
-            // A neutral small-blade plan so any accidental call still yields sane geometry.
-            return FoliagePlan(silhouette: .blade, baseCount: 6, leafLen: 0.40, aspect: 0.16,
-                               tilt: 0.10, tiltSpread: 0.10, alongLow: 0.0, alongHigh: 0.1,
-                               radiusFrac: 0.2, rosette: true, curl: 0.10, understory: 0.0,
-                               subdivisions: 1)
-        }
-    }
-
-    /// Build the leaf-card foliage: golden-angle phyllotaxis around the stem (ported from the
-    /// Forest scene's `emitLeaves` spiral + tip-biased station placement), each node emitting a
-    /// Forest-quality lobed/serrated blade (`PlantLeafCard`). Deterministic in `(seed, params)`.
-    public static func foliageMesh(params: some PottedPlantGeometry, soilY: Double, rng: inout SplitMix)
-        -> (foliage: Mesh3, veins: Mesh3, petioles: Mesh3) {
-        if params.plantStyle == .christmasTree {
-            // A fir has no leaf cards. The in-ground garden plant reaches its foliage through here,
-            // so it gets the same tiered canopy (and, having no pot, no baubles or string).
-            let tiers = coniferTiers(params: params, soilY: soilY, rng: &rng)
-            return (coniferCanopy(tiers), Mesh3(), Mesh3())
-        }
-        var m = Mesh3()
-        var veins = Mesh3()
-        var petioles = Mesh3()
-        let plan = foliagePlan(params.plantStyle)
-        let size = params.plantSize
-        let stemTop = soilY + max(0.02, size * stemFraction(params.plantStyle))
-        let density = Double(params.foliageDensity)
-        let count = max(3, Int((Double(plan.baseCount) * density).rounded()))
-
-        // Golden-angle phyllotaxis so leaves fan around the stem without clumping (Forest value).
-        let golden = Phyllotaxis.goldenAngle
-        let startAngle = rng.unit() * 2 * Double.pi
-
-        for i in 0 ..< count {
-            let t = count > 1 ? Double(i) / Double(count - 1) : 0     // 0 base → 1 top
-            // Tip-biased along-station placement (Forest emitLeaves): the shoot END carries the
-            // densest cluster (an apical rosette), the base stays sparse.
-            let tipBiased = pow(t, 1.35)
-            let along = plan.alongLow + (plan.alongHigh - plan.alongLow) * tipBiased
-            let originY = plan.rosette
-                ? soilY + size * 0.02 * Double(i % plan.ringBands)   // stacked rosette rings
-                : soilY + (stemTop - soilY) * along
-
-            let azimuth = startAngle + Double(i) * golden + (rng.unit() - 0.5) * plan.azimuthJitter
-            let lenJit = 0.82 + rng.unit() * 0.36            // 0.82–1.18 length variance
-            let ringFlatten = plan.rosette ? plan.ringFlattenAmount * Double(i % plan.ringBands) : 0.0   // outer rosette lies flatter
-            let tilt = plan.tilt + ringFlatten + (rng.unit() - 0.5) * plan.tiltSpread * 2
-
-            // Size/age gradient (signal 6): LOWER leaves (small `t`) run larger (mature), UPPER
-            // leaves smaller (young growth near the crown/tip). `sizeGradient` is the spread.
-            let ageScale = 1.0 + plan.sizeGradient * (0.5 - tipBiased)
-            let rosetteTaper = plan.rosette ? (1.0 - 0.10 * Double(i % plan.ringBands)) : 1.0
-            let leafLen = size * plan.leafLen * lenJit * ageScale * rosetteTaper
-            let leafW = leafLen * plan.aspect
-            // Per-leaf gravity droop: the plan's base curl ± a little variance, and a touch MORE
-            // droop the longer/lower the leaf hangs (a heavier cantilever bows further).
-            let curl = max(0, plan.curl * (0.85 + rng.unit() * 0.4))
-            let radius = params.potRadius * plan.radiusFrac
-
-            if plan.compound {
-                // A whole feathered frond (rachis + leaflets), not a single blade — the fern.
-                emitFrond(&m, originY: originY, radius: radius, azimuth: azimuth, tilt: tilt,
-                          length: leafLen, plan: plan, rng: &rng)
-            } else {
-                // Only draw from `rng` for the wave phase when this style actually uses waviness
-                // (`waveAmplitude > 0`) — every OTHER leaf's placement/size/curl for every
-                // SUBSEQUENT iteration is derived from this SAME shared stream, so an unconditional
-                // draw here would reshuffle geometry no wave was ever applied to. Measured: this
-                // exact leak was enough ON ITS OWN (independent of `waveAmplitude`'s actual value)
-                // to flip `testInteriorPlantDoesNotOutglowRoom`'s hardcoded photometric threshold.
-                let wavePhase = plan.waveAmplitude > 0 ? rng.unit() * 2 * Double.pi : 0
-                emitBlade(&m, petioles: &petioles, originY: originY, radius: radius,
-                          azimuth: azimuth, tilt: tilt, length: leafLen, width: leafW,
-                          silhouette: plan.silhouette, curl: curl,
-                          subdivisions: plan.subdivisions, petiole: plan.petiole,
-                          petioleStyle: params.plantStyle, petioleStemT: along,
-                          fold: plan.fold,
-                          waveAmplitude: plan.waveAmplitude, wavePhase: wavePhase)
-                if plan.veinWidthFrac > 0 {
-                    var vein = Mesh3()   // smooth PER vein before merging — see `emitBlade`'s doc
-                    emitMidribVein(&vein, originY: originY, radius: radius,
-                                   azimuth: azimuth, tilt: tilt, length: leafLen, curl: curl,
-                                   widthFrac: plan.veinWidthFrac, petiole: plan.petiole)
-                    veins.append(vein.smoothed())
-                }
-            }
-        }
-
-        // Understory fill: a scatter of SHORTER, lower, more-drooping leaves that close the gaps in
-        // the silhouette so the plant reads as a full mass, not a sparse fan (DH-0488 "fuller
-        // silhouettes"). They live on the same golden spiral (offset half a turn) but sit low and
-        // hang further, exactly where a real plant's inner leaves fill in.
-        let fillCount = plan.compound ? 0 : Int((Double(count) * plan.understory).rounded())
-        if fillCount > 0 {
-            let fillPhase = startAngle + golden * 0.5
-            let fillTop = plan.rosette ? 0.10 : 0.55        // fill stays in the lower/inner canopy
-            for j in 0 ..< fillCount {
-                let along = plan.alongLow + (fillTop - plan.alongLow) * rng.unit()
-                let originY = plan.rosette
-                    ? soilY + size * 0.015 * Double(j % 3)
-                    : soilY + (stemTop - soilY) * along
-                let azimuth = fillPhase + Double(j) * golden + (rng.unit() - 0.5) * 0.6
-                let leafLen = size * plan.leafLen * (0.55 + rng.unit() * 0.25)   // clearly shorter
-                let leafW = leafLen * plan.aspect
-                let tilt = plan.tilt + 0.20 + (rng.unit() - 0.5) * plan.tiltSpread * 2  // hangs lower
-                let curl = max(0, plan.curl * (1.0 + rng.unit() * 0.5))               // droops more
-                let wavePhase = plan.waveAmplitude > 0 ? rng.unit() * 2 * Double.pi : 0
-                emitBlade(&m, petioles: &petioles, originY: originY,
-                          radius: params.potRadius * plan.radiusFrac * 0.7,
-                          azimuth: azimuth, tilt: tilt, length: leafLen, width: leafW,
-                          silhouette: plan.silhouette, curl: curl, subdivisions: plan.subdivisions,
-                          petiole: false, fold: plan.fold,   // fill leaves sit inside the canopy — no visible stalk
-                          waveAmplitude: plan.waveAmplitude, wavePhase: wavePhase)
-            }
-        }
-        return (m, veins, petioles)
-    }
-
-    /// A thin, pale ribbon riding proud of ONE leaf's own spine — the actual venation fix (see
-    /// `FoliagePlan.veinWidthFrac`'s doc for why `fold`'s shading valley alone doesn't read as one).
-    /// Built from the SAME placement math `emitBlade` uses (base/tip along `yAxis`, the same
-    /// longitudinal `curl` droop) so it sits exactly on the real leaf's spine and stays glued to it
-    /// as the leaf arches, offset a few millimetres along the shading normal so it doesn't z-fight
-    /// the blade beneath it. Emitted into its OWN mesh, double-sided (matches the leaf cards'
-    /// `doubleSidedShell` convention) so it reads from either side.
-    public static func emitMidribVein(_ mesh: inout Mesh3,
-                               originY: Double, radius: Double,
-                               azimuth: Double, tilt: Double,
-                               length: Double, curl: Double,
-                               widthFrac: Double, petiole: Bool = true) {
-        let outX = cos(azimuth), outZ = sin(azimuth)
-        let up = cos(tilt), out = sin(tilt)
-        let yAxis = normalize3(Vec3(outX * out, up, outZ * out))
-        // Must match `emitBlade`'s own `reach` exactly (see its doc) or the vein drifts off the
-        // real leaf's spine for any future non-petiole style that opts into `veinWidthFrac`.
-        let reach = radius + length * (petiole ? 0.28 : 0.06)
-        let pos = Vec3(outX * reach, originY + up * length * 0.30, outZ * reach)
-        let xAxis = normalize3(Vec3(-outZ, 0, outX))
-        let outwardHint = normalize3(Vec3(outX * out, up * 0.5 + 0.45, outZ * out))
-        let cardN = normalize3(cross3(yAxis, xAxis))
-        let bentN = normalize3(outwardHint * 0.72 + cardN * 0.28)
-        let base = pos - yAxis * (length * 0.46)
-        let lift = bentN * max(0.0004, length * 0.003)     // a hair proud of the blade surface
-        let halfWidth = length * widthFrac * 0.5
-
-        func droop(_ v: Double) -> Vec3 { bentN * (-curl * length * v * v) }
-
-        let stations = 6
-        var prev: (l: Vec3, r: Vec3)? = nil
-        for i in 0 ... stations {
-            let v = Double(i) / Double(stations)
-            let w = halfWidth * (1.0 - 0.55 * v)           // tapers toward the tip
-            let center = base + yAxis * (length * v) + droop(v) + lift
-            let l = center - xAxis * w, r = center + xAxis * w
-            if let p = prev {
-                mesh.addQuad(p.l, p.r, r, l, outward: bentN)
-                mesh.addQuad(l, r, p.r, p.l, outward: Vec3(-bentN.x, -bentN.y, -bentN.z))
-            }
-            prev = (l, r)
-        }
-    }
-
-    private static func stemFraction(_ style: PlantStyle) -> Double {
+    static func stemFraction(_ style: PlantStyle) -> Double {
         switch style {
         case .fiddleLeafFig: return 0.75
         case .monstera:      return 0.30
@@ -1186,199 +895,6 @@ public enum PottedPlantMesh {
         PlantLeafCard.emit(&card, pos: pos, xAxis: xAxis, yAxis: yAxis, normal: bentN,
                            w: width, h: length, silhouette: silhouette)
         mesh.append(card.smoothed())
-    }
-
-    // MARK: - A single Forest-quality blade, placed on the plant
-
-    /// Place one `PlantLeafCard` blade growing from `(radius, originY)` on `azimuth`, pitched
-    /// `tilt` radians off vertical (0 = straight up). Builds the leaf's local basis (midrib =
-    /// growth direction, across = horizontal tangent, outward = up-and-out shading normal, exactly
-    /// as the Forest `emitLeaves` does), then hands off to the ported blade geometry.
-    public static func emitBlade(_ mesh: inout Mesh3, petioles: inout Mesh3,
-                          originY: Double, radius: Double,
-                          azimuth: Double, tilt: Double,
-                          length: Double, width: Double,
-                          silhouette: PlantLeafCard.Silhouette,
-                          curl: Double = 0,
-                          subdivisions: Int = 1,
-                          petiole: Bool = false,
-                          petioleStyle: PlantStyle = .fiddleLeafFig,
-                          petioleStemT: Double = 0,
-                          fold: Double = 0.30,
-                          waveAmplitude: Double = 0,
-                          wavePhase: Double = 0) {
-        let outX = cos(azimuth), outZ = sin(azimuth)
-        // Growth direction (yAxis / midrib): out = sin(tilt) horizontally, up = cos(tilt).
-        let up = cos(tilt), out = sin(tilt)
-        let yAxis = normalize3(Vec3(outX * out, up, outZ * out))
-        // The leaf centroid sits a little out from the stem along the growth direction so the
-        // stalk clears the stem (Forest `centerOffset`), lifted by half the blade length.
-        //
-        // The `length * 0.28` term holds a broad PETIOLE leaf's centroid out past a thin central
-        // trunk — correct for fig/monstera, where the leaf is far bigger than the stem it grows
-        // from. Applied to a NO-petiole rosette style with a long blade (snake plant: `leafLen`
-        // 0.94× plant size), the same fraction of a much longer blade pushed the centroid — and so
-        // the blade's geometric BASE, which sits back along -yAxis from it — out past the pot's
-        // own rim radius entirely, draping the blade's lower half over the outside of the pot
-        // (Danny, 2026-09-11/12: leaves "wrong position", confirmed by direct visual inspection
-        // after two other hypotheses — `understory`, `ringFlattenAmount` — measurably did NOT fix
-        // it). A rosette blade has no petiole to justify reaching out proportional to its own
-        // length; it should stay close to the crown it erupts from, fanning only a little.
-        let reach = radius + length * (petiole ? 0.28 : 0.06)
-        let pos = Vec3(outX * reach, originY + up * length * 0.30, outZ * reach)
-        // Across-blade axis (xAxis): the horizontal tangent 90° from the azimuth.
-        let xAxis = normalize3(Vec3(-outZ, 0, outX))
-        // Outward shading normal: up-and-out from the stem so the blade shades as a soft volume
-        // (Forest bent-normal). Blend toward the geometric card normal for per-leaf variation.
-        let outwardHint = normalize3(Vec3(outX * out, up * 0.5 + 0.45, outZ * out))
-        let cardN = normalize3(cross3(yAxis, xAxis))
-        let bentN = normalize3(outwardHint * 0.72 + cardN * 0.28)
-
-        // PETIOLE (signal 3): a visible stalk holding the blade out clear of the soil, from a
-        // point on the TRUNK'S OWN SURFACE to the blade's BASE (`pos − yAxis·h·0.46`, the same base
-        // the card is built from). Only the big broadleaf plants get one — a rosette/frond has
-        // none. `attach` used to sit at a fraction of the POT radius — unrelated to how thick the
-        // trunk actually is at this height, and the trunk tapers to under half its base radius by
-        // the top of the plant, so upper petioles floated 3-4× clear of the real trunk surface
-        // (Danny, 2026-09-11: "wrong position"). `stemRadius(petioleStyle, at:)` is the single
-        // source `stemMesh` itself revolves, so this is always exactly the trunk's real edge.
-        //
-        // Goes into its OWN accumulator (merged into `substrate`, NOT `foliage`, by the caller) —
-        // a petiole is the plant's own woody structural tissue continuing the trunk, not a leaf, so
-        // it takes the trunk's fixed natural material instead of getting stamped the flat leaf
-        // green it used to inherit by riding in the same mesh group (Danny, 2026-09-11: "wrong
-        // color" — a thin bright-leaf-green rod read as a stray wire, not a stem).
-        if petiole {
-            let leafBase = pos - yAxis * (length * 0.46)
-            // `attach` used to sit at the flat phyllotaxis STATION height (`originY`) — but the
-            // blade's real base (`leafBase`, above) sits `up·length·0.16` BELOW that, because `pos`
-            // only lifts the card 30% of its length while the base sits back 46% of it. Attaching
-            // the tube at the higher station height while its far end lands lower built a visible
-            // dip-then-rise hook: the petiole plunges down from the trunk, then the blade climbs
-            // back up through it (Danny, 2026-09-12: real fig petioles are short and just branch
-            // off the upward trunk — no down-and-back-up S-curve). Anchoring the tube at the
-            // blade's OWN base height instead makes it a short, level-to-rising stub straight into
-            // the leaf, and the whole assembly (trunk → petiole → blade) then rises monotonically.
-            // A petiole must read as clearly THINNER than the trunk it emerges from. Capping only
-            // by an absolute size let a big leaf's stalk grow to a 10 mm radius, which up near the
-            // CROWN — where the trunk itself has tapered to ~8 mm — made the petiole THICKER than
-            // the trunk it's supposed to be a stalk off of. Scale the cap to the trunk's own local
-            // radius instead. Also rounder (7-sided, then smoothed) — 4 flat facets read as an
-            // angular wooden wedge, not a stalk.
-            let trunkR = stemRadius(petioleStyle, at: petioleStemT)
-            let stalkR = min(trunkR * 0.55, max(0.003, length * 0.02))
-            let attach = Vec3(outX * trunkR, leafBase.y, outZ * trunkR)
-            var stalk = Mesh3()
-            appendStemTube(&stalk, from: attach, to: leafBase,
-                           rBase: stalkR, rTip: stalkR * 0.7, sides: 7)
-            petioles.append(stalk.smoothed())
-        }
-
-        // Build the blade into its OWN mesh and smooth it BEFORE merging (CLAUDE.md "smooth per
-        // PART, before parts are appended"): the card's curl droop + taco fold + margin wave are
-        // all genuine curvature, and left flat-shaded they read as a faceted "made of polygons"
-        // surface — measured directly (a realism pass scored surface finish 1-2/10, "flat matte
-        // paper/cardboard", independent of the material's own roughness). Smoothing PER leaf (not
-        // the whole merged `foliage` mesh at once) avoids blending normals across DIFFERENT leaves
-        // that happen to share a near-coincident base position — rosette styles (snake plant, fern,
-        // succulent) cluster leaf bases tightly enough that a whole-mesh smooth would bleed one
-        // leaf's shading into its neighbour's.
-        var card = Mesh3()
-        PlantLeafCard.emit(&card, pos: pos, xAxis: xAxis, yAxis: yAxis, normal: bentN,
-                           w: width, h: length, silhouette: silhouette, curl: curl,
-                           subdivisions: subdivisions, fold: fold,
-                           waveAmplitude: waveAmplitude, wavePhase: wavePhase)
-        mesh.append(card.smoothed())
-    }
-
-    // MARK: - A compound frond (fern): an arching rachis carrying many small leaflets
-
-    /// Build ONE feathered fern frond growing from `(radius, originY)` on `azimuth`: a thin GREEN
-    /// rachis that arches outward-and-up then droops over the pot rim, carrying paired leaflets
-    /// (`.fernLeaflet` cards) that alternate down its length and shorten toward the tip. This is the
-    /// species-correct read a single serrated blade could never give (DH-0628 signal 1) — a fern
-    /// leaf IS compound. Deterministic in `rng`; stays cheap (small leaflets, few segments).
-    public static func emitFrond(_ mesh: inout Mesh3,
-                          originY: Double, radius: Double,
-                          azimuth: Double, tilt: Double,
-                          length: Double, plan: FoliagePlan,
-                          rng: inout SplitMix) {
-        let outX = cos(azimuth), outZ = sin(azimuth)
-        let outDir = Vec3(outX, 0, outZ)
-        let base = Vec3(outX * radius, originY, outZ * radius)
-        let reach = length * 0.85              // how far out the frond tip lands
-        let rise = length * (0.55 - 0.25 * tilt / 1.2)   // more tilt ⇒ arches out flatter
-        let droop = plan.curl * length
-
-        // The arching rachis centreline: rises early (sin), then the droop (−v²) pulls the tip down.
-        func rachis(_ v: Double) -> Vec3 {
-            let horiz = outDir * (reach * v)
-            let y = rise * sin(v * 1.35) - droop * v * v
-            return base + horiz + Vec3(0, y, 0)
-        }
-
-        // Rachis as a few tapered tube segments (a thin green stalk).
-        let ribSteps = 4
-        var prev = rachis(0)
-        let ribR = max(0.003, length * 0.012)
-        for s in 1 ... ribSteps {
-            let v = Double(s) / Double(ribSteps)
-            let cur = rachis(v)
-            appendStemTube(&mesh, from: prev, to: cur,
-                           rBase: ribR * (1.0 - 0.6 * (v - 1.0 / Double(ribSteps))),
-                           rTip: ribR * (1.0 - 0.6 * v), sides: 4)
-            prev = cur
-        }
-
-        // Leaflets: a real pinnate frond carries OPPOSITE pairs — both a left AND a right pinnule
-        // at (nearly) the same point on the rachis — not one leaflet alternating sides station by
-        // station. The alternating-single layout put a whole rachis-length gap of bare stem between
-        // any two leaflets on the same side, and a real render showed exactly that: a wiry trailing
-        // vine (pothos/ivy) with occasional separated paddles, not a feathered fern frond. Emitting
-        // both sides at each station doubles the leaflets actually covering the rachis for the same
-        // station count, closing those gaps into a continuous feathery plume; a narrower lance
-        // shape (aspect 0.34 vs the old 0.5) plus `subdivisions: 1` (imperceptible at pinnule scale,
-        // half the triangles of the plan's default 2) pays for the doubling within the 6000-tri cap.
-        let nStation = 10
-        let up = Vec3(0, 1, 0)
-        for k in 0 ..< nStation {
-            let v = 0.08 + (0.94 - 0.08) * Double(k) / Double(nStation - 1)
-            let anchor = rachis(v)
-            // Rachis tangent (finite difference) → in-frond-plane leaflet basis.
-            let dv = 0.02
-            let tangent = normalize3(rachis(min(1, v + dv)) - rachis(max(0, v - dv)))
-            var acrossDir = cross3(tangent, up)
-            if len3(acrossDir) < 1e-5 { acrossDir = Vec3(-outZ, 0, outX) }
-            acrossDir = normalize3(acrossDir)
-            let taper = 1.0 - 0.5 * v                // tip leaflets are smaller
-            for side: Double in [1, -1] {
-                let sideDir = acrossDir * side
-                // Leaflet grows out to the side and a touch up; the card's across-axis follows the rachis.
-                let yAxis = normalize3(sideDir * 0.85 + up * 0.35)
-                let xAxis = normalize3(cross3(up, yAxis))
-                let bentN = normalize3(cross3(yAxis, xAxis) * 0.4 + up * 0.6)
-                let jit = 0.85 + rng.unit() * 0.3
-                let lLen = length * 0.20 * taper * jit
-                let lW = lLen * (plan.aspect / 0.16 * 0.34)  // narrow lance pinnule, from the plan aspect
-                let lpos = anchor + yAxis * (lLen * 0.42)    // card centroid sits out along its growth
-                var leaflet = Mesh3()   // smooth PER leaflet before merging — see `emitBlade`'s doc
-                PlantLeafCard.emit(&leaflet, pos: lpos, xAxis: xAxis, yAxis: yAxis, normal: bentN,
-                                   w: lW, h: lLen, silhouette: .fernLeaflet, curl: plan.curl * 0.3,
-                                   subdivisions: 1)
-                mesh.append(leaflet.smoothed())
-            }
-        }
-        // A small terminal leaflet closing the frond tip.
-        let tip = rachis(1.0)
-        let tTangent = normalize3(rachis(1.0) - rachis(0.9))
-        let tX = normalize3(cross3(up, tTangent))
-        var terminal = Mesh3()   // smooth PER leaflet before merging — see `emitBlade`'s doc
-        PlantLeafCard.emit(&terminal, pos: tip + tTangent * (length * 0.05),
-                           xAxis: tX.x.isFinite ? tX : Vec3(-outZ, 0, outX),
-                           yAxis: tTangent, normal: up,
-                           w: length * 0.06, h: length * 0.14, silhouette: .fernLeaflet,
-                           curl: plan.curl * 0.3, subdivisions: plan.subdivisions)
-        mesh.append(terminal.smoothed())
     }
 
     // MARK: - Seeded RNG (SplitMix64) — deterministic per (seed, params)

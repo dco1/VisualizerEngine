@@ -83,29 +83,34 @@ public extension PlantStyle {
         }
     }
 
-    /// The base leaf albedo for this style (linear-ish RGB). Distinct greens per style give the
-    /// five plants a readable identity. Seeded per-leaf jitter is applied in the mesh. Taste
-    /// (neutral defaults — flagged for Danny).
+    /// The MATURE leaf's upper-face albedo (linear RGB) — the anchor of the style's whole palette
+    /// (`foliagePalette`: the young flush, the underside, the rib are all set against it) and the one
+    /// source the photometric gates read.
+    ///
+    /// **Calibrated to the rendered picture, not to a spectrometer (2026-09-23).** Measured in the
+    /// daylit-room census (`HouseRenderBridgeGPUTests_PlantColorFidelity`, shipped grade, pinned
+    /// exposure): a real leaf's raw reflectance (~0.07 luma) renders NEAR-BLACK here — fig leaf
+    /// median luma 17 against its white pot's 201, a ratio of 0.09, where a photograph of a real
+    /// fig beside a white pot reads 0.27–0.36. This renderer lights foliage indoors more dimly than
+    /// a real room does (no transmission through an interior leaf, less bounce), and the albedo
+    /// carries the difference. What the old palette got WRONG was not its brightness — its fig
+    /// (0.18, 0.44, 0.10) rendered at a plausible 0.36 of the pot — but its SATURATION (a crayon
+    /// green, rendered saturation 0.80) and its sameness (one stamp over every leaf). So these keep
+    /// that brightness band and drop the saturation (green over red ~1.8 and over blue ~2.7, not 2.4 and 4.4); the variation
+    /// is the painted foliage's job.
+    ///
+    /// Still warm: green clearly dominant with red ABOVE blue (the 2026-07-11 cyan-cardboard fix,
+    /// gated by `leafColorIsWarmGreen`). The succulent is a farina-dusted sage, legitimately pale.
     public var leafColor: Vec3 {
-        // Brightened ~35% from the first pass — the realism audit read the leaves as
-        // "dark construction-paper cutouts"; front-lit houseplant foliage is far
-        // livelier than forest-canopy green (the SSS backlit glow rides on top).
-        //
-        // WARMED off cyan (2026-07-11): the earlier pass had blue ≥ red in 5 of 6 styles,
-        // which reads as an unnatural blue/cyan-green cardboard cutout (a real-Metal capture
-        // measured monstera leaves at R47.7 < B49.8). Natural front-lit foliage is a YELLOW-
-        // green — red sits ABOVE blue. Every style now keeps green clearly dominant but with
-        // R > B by a healthy margin (`PlantStyle.leafColorIsWarmGreen` gate). Same family of
-        // fix as the grass-blade / lawn de-saturation.
         switch self {
-        case .fiddleLeafFig: return Vec3(0.18, 0.44, 0.10)   // deep glossy green
-        case .monstera:      return Vec3(0.22, 0.50, 0.13)   // rich mid green
-        case .snakePlant:    return Vec3(0.26, 0.47, 0.16)   // grey-green blade
-        case .fern:          return Vec3(0.28, 0.57, 0.15)   // bright fresh green
-        case .succulent:     return Vec3(0.41, 0.56, 0.28)   // pale sage green
-        case .flowers:       return Vec3(0.24, 0.50, 0.13)   // bouquet stem/leaf green
-        case .driedSpray:    return Vec3(0.40, 0.46, 0.20)   // the few dried olive leaves
-        case .christmasTree: return Vec3(0.12, 0.27, 0.09)   // deep fir-needle green, still warm (R > B)
+        case .fiddleLeafFig: return Vec3(0.186, 0.336, 0.125)  // deep, glossy green
+        case .monstera:      return Vec3(0.158, 0.314, 0.130)  // rich deep green, a touch bluer
+        case .snakePlant:    return Vec3(0.112, 0.212, 0.095)  // dark sword green (its bands are paler)
+        case .fern:          return Vec3(0.240, 0.440, 0.130)  // bright fresh yellow-green
+        case .succulent:     return Vec3(0.450, 0.550, 0.400)  // farina-dusted pale sage
+        case .flowers:       return Vec3(0.120, 0.250, 0.070)  // cut-stem green, not a lime straw
+        case .driedSpray:    return Vec3(0.40, 0.46, 0.20)     // the few dried olive leaves
+        case .christmasTree: return Vec3(0.12, 0.27, 0.09)     // deep fir-needle green, still warm (R > B)
         }
     }
 
@@ -117,14 +122,19 @@ public extension PlantStyle {
         return c.y > c.x && c.y > c.z && c.x > c.z
     }
 
-    /// Leaf-surface roughness for the render instance — waxy broadleaf houseplants
-    /// (fig/monstera/succulent) are visibly GLOSSY (the audit's matte cards read as
-    /// paper); ferns stay matte, blades in between. Single source with `leafColor`.
+    /// Leaf-surface roughness for the render instance — the waxy broadleaf houseplants (fig,
+    /// monstera) are visibly GLOSSY (the audit's matte cards read as paper; a fig's leathery
+    /// cuticle is the glossiest, and at 0.30 its highlights barely registered in the room), a snake plant's
+    /// sword a satin, a fern matte. The succulent is the echeveria's farina — a powder bloom
+    /// that scatters, the garden echeveria's 0.82 — not a jade's gloss.
     public var leafRoughness: Float {
         switch self {
-        case .fiddleLeafFig, .monstera, .succulent: return 0.30
-        case .snakePlant:                           return 0.42
-        case .fern, .flowers:                       return 0.55
+        case .fiddleLeafFig:                        return 0.24   // a waxy cuticle: window highlights
+        case .monstera:                             return 0.30
+        case .snakePlant:                           return 0.38
+        case .succulent:                            return 0.78
+        case .fern:                                 return 0.62
+        case .flowers:                              return 0.55
         case .driedSpray:                           return 0.70   // papery, dead-matte
         case .christmasTree:                        return 0.78   // a mass of needles scatters — no sheen
         }

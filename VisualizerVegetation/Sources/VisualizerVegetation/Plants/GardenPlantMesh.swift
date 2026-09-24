@@ -2,12 +2,11 @@ import Foundation
 import simd
 import VisualizerMaterials
 
-/// Mesh generator for an in-ground garden plant (`PlacedGardenPlant`). Pure geometry — it REUSES
-/// the potted plant's Forest-quality foliage vocabulary (`PottedPlantMesh.foliageMesh` /
-/// `stemMesh` / `bouquetMesh`, all keyed by a synthesized `PottedPlantParams`) but grows the stem
-/// and leaf cards straight from the ground: there is **no vessel and no soil disc** — that is the
-/// whole difference from a potted plant. See `PottedPlantMesh` for the leaf-card / phyllotaxis /
-/// bloom mechanism this stands on; this file never re-derives that geometry.
+/// Mesh generator for an in-ground garden plant (`PlacedGardenPlant`). Pure geometry. A generic
+/// STYLE reuses the potted plant's growth (`PottedPlantMesh.foliage` / `stemMesh` / `bouquetMesh`,
+/// all keyed by a synthesized `PottedPlantParams`) but grows it straight from the ground: there is
+/// **no vessel and no soil disc** — that is the whole difference from a potted plant, and this file
+/// never re-derives that geometry. A real SPECIES builds by its own habit (the `+Species` files).
 ///
 /// **Local space:** X/Z plan (centred on the stem), Y up from the ground (y = 0 = ground). The
 /// render bridge seats it at the plant's world spot. Deterministic in `(seed, spec)`.
@@ -21,9 +20,16 @@ public enum GardenPlantMesh {
     public struct Parts: Sendable {
         public var stem: Mesh3
         public var foliage: Mesh3
+        /// One albedo per `foliage` vertex when the generator painted the leaves (a generic style
+        /// grows the potted plant's painted foliage); empty for a species, whose foliage part is its
+        /// own single-colour detail (teeth, spines, blush) — the bridge then stamps `leafColor`.
+        public var foliageColors: [Vec3]
         public var blooms: [PottedPlantMesh.ColoredGroup]
-        public init(stem: Mesh3, foliage: Mesh3, blooms: [PottedPlantMesh.ColoredGroup] = []) {
-            self.stem = stem; self.foliage = foliage; self.blooms = blooms
+        public init(stem: Mesh3, foliage: Mesh3, foliageColors: [Vec3] = [],
+                    blooms: [PottedPlantMesh.ColoredGroup] = []) {
+            precondition(foliageColors.isEmpty || foliageColors.count == foliage.vertexCount,
+                         "painted foliage needs one colour per vertex")
+            self.stem = stem; self.foliage = foliage; self.foliageColors = foliageColors; self.blooms = blooms
         }
     }
 
@@ -54,15 +60,12 @@ public enum GardenPlantMesh {
             return Parts(stem: Mesh3(), foliage: bouquet.greens, blooms: bouquet.blooms)
         }
 
-        // Foliage plant: a woody stalk + green leaf cards.
+        // Foliage plant: a woody stalk + the potted plant's own painted leaves, grown from the
+        // ground instead of a pot — the same habit and the same paint either way.
         var stem = PottedPlantMesh.stemMesh(params: params, baseY: soilY)
-        // A garden (outdoor, ground-planted) version of the same species — the vein-ribbon fix is
-        // scoped to potted plants (`PottedPlantMesh.Parts.veins`) for now; discard it here rather
-        // than plumbing a second render path through before it's proven worth the reach. Petioles
-        // DO carry over — same "woody tissue, not leaf" rationale as the potted-plant substrate.
-        let (foliage, _, petioles) = PottedPlantMesh.foliageMesh(params: params, soilY: soilY, rng: &rng)
-        stem.append(petioles)
-        return Parts(stem: stem, foliage: foliage)
+        let grown = PottedPlantMesh.foliage(params: params, soilY: soilY, rng: &rng)
+        stem.append(grown.woody)
+        return Parts(stem: stem, foliage: grown.mesh, foliageColors: grown.colors)
     }
 
     /// The whole plant as ONE mesh (stem + leaves/blooms) — for the auditors, which check the
