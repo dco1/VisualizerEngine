@@ -29,14 +29,20 @@ import VisualizerMaterials
 /// `PlaceableAudit`/`FacetingAudit` read curved rings, not a hard CAD cylinder.
 public enum PottedPlantMesh {
 
-    /// A coloured sub-mesh — a group of leaf/petal/center cards that share ONE albedo. Used for
-    /// the `.flowers` bloom parts (petals + centers) whose vivid, seed-varied colours can't ride
-    /// the single green `foliage` group. Each group is stamped with `color` (colour.rgb, alpha 0
-    /// for SSS) at the render bridge.
+    /// A coloured sub-mesh with its own draw group — the bouquet's blooms, a Christmas tree's
+    /// baubles, a dried spray's stems and sprigs. Either ONE albedo (`color`) stamped over the
+    /// group, or — for a PAINTED group (the bouquet's petals, `PottedPlantMesh+Bouquet`) — one
+    /// albedo per vertex in `colors`, which the bridge then stamps instead.
     public struct ColoredGroup: Sendable {
-        public var color: Vec3     // linear-ish albedo for this group
+        public var color: Vec3     // linear-ish albedo for this group (the flat stamp)
         public var mesh: Mesh3
-        public init(color: Vec3, mesh: Mesh3) { self.color = color; self.mesh = mesh }
+        /// One albedo per `mesh` vertex for a painted group; EMPTY for a flat `color` group.
+        public var colors: [Vec3]
+        public init(color: Vec3, mesh: Mesh3, colors: [Vec3] = []) {
+            precondition(colors.isEmpty || colors.count == mesh.vertexCount,
+                         "a painted group needs one colour per vertex")
+            self.color = color; self.mesh = mesh; self.colors = colors
+        }
     }
 
     /// The plant's mesh parts, split so a picked finish paints ONLY the vessel — never the plant.
@@ -94,12 +100,11 @@ public enum PottedPlantMesh {
         let soilY = vesselMouthY(params)
 
         if params.plantStyle.isBouquet {
-            // A cut-flower bouquet: green stems (foliage group) topped with vivid blooms (bloom
-            // groups). The stems are thin tapered revolves (foliage-green), the blooms are petal
-            // cards + a contrasting center disc, per-bloom colours from the seeded palette.
+            // A cut-flower bouquet: painted green stems + leaves (the foliage group) and painted
+            // flowers (ONE bloom group) — `PottedPlantMesh+Bouquet`.
             let bouquet = bouquetMesh(params: params, soilY: soilY, rng: &rng, localBendDir: localBendDir)
-            return Parts(vessel: vessel, substrate: substrate,
-                         foliage: bouquet.greens, blooms: bouquet.blooms)
+            return Parts(vessel: vessel, substrate: substrate, foliage: bouquet.greens,
+                         foliageColors: bouquet.greenColors, blooms: bouquet.blooms)
         }
 
         // Foliage plant: a single trunk/stub stem (opaque — the plant's own woody trunk, so it's
@@ -501,11 +506,11 @@ public enum PottedPlantMesh {
         }
     }
 
-    // MARK: - Bouquet (.flowers): green stems + vivid petal blooms
+    // MARK: - Bouquet (.flowers): painted stems + flowers (`PottedPlantMesh+Bouquet`)
 
-    /// The vivid bloom palette — a tasteful mixed cut-flower set. Seed picks a per-bloom colour so
-    /// one arrangement carries several hues (white / pink / yellow / red / purple / coral). Taste:
-    /// neutral defaults, flagged for Danny. Each entry is `(petal, center)`; the center contrasts.
+    /// The planter bed's flower palette (`PlanterMesh`'s seasonal indices point into it) — white /
+    /// pink / yellow / red / purple / coral, each `(petal, center)`. The bouquet's own palette,
+    /// `bouquetPalette`, runs in the same order. Taste: neutral defaults, flagged for Danny.
     public static let bloomPalette: [(petal: Vec3, center: Vec3)] = [
         (Vec3(0.96, 0.96, 0.94), Vec3(0.92, 0.78, 0.16)),   // white daisy, yellow eye
         (Vec3(0.95, 0.55, 0.70), Vec3(0.90, 0.72, 0.20)),   // pink, gold center
@@ -515,23 +520,27 @@ public enum PottedPlantMesh {
         (Vec3(0.96, 0.48, 0.28), Vec3(0.70, 0.28, 0.10)),   // coral, rust center
     ]
 
-    public struct BouquetParts { var greens: Mesh3; var blooms: [ColoredGroup] }
+    /// A bouquet's parts: the green stems and leaves (`greenColors` their paint, or empty for a
+    /// flat stamp) and the bloom groups.
+    public struct BouquetParts {
+        public var greens: Mesh3
+        public var greenColors: [Vec3] = []
+        public var blooms: [ColoredGroup]
+    }
 
-    /// Build a cut-flower bouquet rising from the vessel mouth at `soilY`:
-    ///  • several thin GREEN stems (tapered revolves) fanning slightly outward,
-    ///  • a few small GREEN leaves on the lower stems (leaf cards),
-    ///  • a BLOOM atop each stem — a ring (or two) of vivid petal cards around a contrasting center
-    ///    disc, colour chosen per-stem from the seeded palette.
-    /// Stem/leaf geometry goes in `greens` (one green SSS group); petals + centers go in `blooms`,
-    /// one `ColoredGroup` per distinct colour so the bridge can stamp each its own hue. All dims
-    /// derive from `params` (stem height from `plantSize`, count from `foliageDensity`).
+    /// Build a cut-flower bouquet rising from the vessel mouth at `soilY`: several thin green stems
+    /// fanning out and bowing (toward `localBendDir`, the nearest window, when there is one), a
+    /// leaf or two on the lower stems, and a FLOWER on each — a rose, tulip, daisy or anemone,
+    /// its form and colour drawn together from `bouquetPalette`, now and then a closed bud
+    /// (`PottedPlantMesh+Bouquet`). Stems and leaves are the painted `greens`; every flower is one
+    /// painted bloom group. Dimensions from `params` (stem height from `plantSize`, count from
+    /// `foliageDensity`).
     public static func bouquetMesh(params: some PottedPlantGeometry, soilY: Double, rng: inout SplitMix,
                             localBendDir: Vec3? = nil) -> BouquetParts {
         if params.plantStyle == .driedSpray { return driedSprayMesh(params: params, soilY: soilY, rng: &rng) }
-        var greens = Mesh3()
-        // Accumulate petals/centers per palette index, then emit one ColoredGroup per used colour.
-        var petalMeshes = [Int: Mesh3]()
-        var centerMeshes = [Int: Mesh3]()
+        var greens = PaintedMesh()
+        var flowers = PaintedMesh()
+        let palette = PlantStyle.flowers.foliagePalette
 
         let size = params.plantSize
         let density = Double(params.foliageDensity)
@@ -539,11 +548,10 @@ public enum PottedPlantMesh {
         let stemCount = max(3, min(12, Int((5.0 * density).rounded())))
         let stemTopFrac = 0.75                          // stems reach ~0.75 of plantSize on average
 
-        // Stem thickness SCALES with plantSize (was a fixed 6mm/4mm regardless of size, so a small
-        // bouquet kept "garden hose" stems while its bloom shrank — the "zucchini stalk" read).
-        // Clamped to a sane real-flower-stem range at both ends.
-        let stemRBase = min(0.005, max(0.0016, size * 0.013))
-        let stemRTip = stemRBase * 0.6
+        // A real cut stem is 3–6 mm across whatever the bunch; scaled a little with the size, and
+        // clamped — a small bouquet keeping "garden hose" stems read as a zucchini stalk.
+        let stemRBase = min(0.0032, max(0.0014, size * 0.009))
+        let stemRTip = stemRBase * 0.7
 
         // The vase's neck/lip pinch the opening well inside the belly — a stem that starts near
         // the water's edge and leans outward can otherwise punch through that pinch on its way up
@@ -551,9 +559,12 @@ public enum PottedPlantMesh {
         // single-sourced radii the per-stem lean clamp below checks against.
         let vp = params.resolvedVessel == .vase ? vaseProfile(params) : nil
         let mouthR = vp.map { $0.rWater * 0.82 } ?? params.potRadius * 0.6
+        // Leaves grow only ABOVE the vessel's lip: below it they would run through the vase's neck
+        // (and a florist strips a cut stem's lower leaves before it goes in the water anyway).
+        let lipY = vp?.h ?? params.potHeight
 
         // A stable per-arrangement palette rotation so seeds vary the colour mix.
-        let paletteStart = Int(rng.next() % UInt64(bloomPalette.count))
+        let paletteStart = Int(rng.next() % UInt64(bouquetPalette.count))
         let golden = Phyllotaxis.goldenAngle
         let startAngle = rng.unit() * 2 * Double.pi
 
@@ -602,49 +613,66 @@ public enum PottedPlantMesh {
             let ownOutward = Vec3(outX, 0, outZ)
             let bendDir = localBendDir.map { normalize3($0 * 0.75 + ownOutward * 0.25) } ?? ownOutward
 
-            // A real round, smoothly-shaded tapered tube (was a hard 5-gon prism flat-shaded into
-            // visible ridges — the "zucchini stalk" read) swept along the bent centerline.
+            // A real round, smoothly-shaded tapered tube swept along the bent centerline, painted
+            // one green per stem.
+            var stem = Mesh3()
             let (curvedTip, curvedTangent) = appendBentStemTube(
-                &greens, from: base, to: straightTip,
+                &stem, from: base, to: straightTip,
                 rBase: stemRBase, rTip: stemRTip, bendDir: bendDir, bendAmount: bendAmount)
+            let stemTone = FoliagePaint.tone(youth: 0.3, palette: palette, rng: &rng)
+            greens.append(stem, color: FoliagePaint.base(palette, stemTone, face: .upper))
 
-            // A couple of small leaves partway up the lower stems (green cards, SSS).
-            if rng.unit() < 0.7 {
-                let along = 0.30 + rng.unit() * 0.30
-                let lp = base + dir * (stemH2 * along)
-                let lAz = azimuth + Double.pi * (rng.unit() < 0.5 ? 0.5 : -0.5)
-                emitBladeAt(&greens, pos: lp, azimuth: lAz, tilt: 1.0 + rng.unit() * 0.3,
-                            length: size * 0.16, width: size * 0.05, silhouette: .blade)
+            // A leaf or two partway up (painted: a pale rib, a paler back), clear of the lip by a
+            // quarter of its own length, and seated ON the bent stem — the same centreline
+            // `appendBentStemTube` swept, not the straight line it bowed away from.
+            let leaves = rng.unit() < 0.75 ? 1 + Int(rng.next() % 2) : 0
+            for k in 0 ..< leaves {
+                let length = size * (0.15 + rng.unit() * 0.06)
+                let lowest = (lipY + length * 0.25 - base.y) / max(1e-6, dir.y * stemH2)
+                let along = max(0.30, lowest) + 0.26 * Double(k) + rng.unit() * 0.10
+                guard along < 0.80 else { break }
+                let lp = base + dir * (stemH2 * along) + normalize3(bendDir) * (stemH2 * bendAmount * along * along)
+                let lAz = azimuth + Double.pi * (k % 2 == 0 ? 0.5 : -0.5) + (rng.unit() - 0.5) * 0.6
+                emitStemLeaf(into: &greens, at: lp, azimuth: lAz, tilt: 0.95 + rng.unit() * 0.4,
+                             length: length, palette: palette, rng: &rng)
             }
 
-            // The bloom atop the stem — pick a palette colour for this stem. Sits at the CURVED tip
-            // (not the straight-line one) and faces along the bent stem's own tip tangent, so the
-            // flower reads as aiming the way its stem actually curved. Scaled up relative to the
-            // (now much thinner) stem so the bloom reads as the dominant element, not the stalk.
-            let pIdx = (paletteStart + i) % bloomPalette.count
-            var pm = petalMeshes[pIdx] ?? Mesh3()
-            var cm = centerMeshes[pIdx] ?? Mesh3()
-            emitBloom(petals: &pm, center: &cm, at: curvedTip, faceDir: curvedTangent,
-                      scale: size * (0.17 + rng.unit() * 0.06), rng: &rng)
-            petalMeshes[pIdx] = pm
-            centerMeshes[pIdx] = cm
+            // The flower sits at the CURVED tip (not the straight-line one) and faces along the bent
+            // stem's own tip tangent, so it aims the way its stem actually curved. Its form and colour
+            // are drawn together (a white daisy, a red anemone…), and now and then it is a closed bud.
+            let entry = bouquetPalette[(paletteStart + i) % bouquetPalette.count]
+            let form = entry.forms[Int(rng.next() % UInt64(entry.forms.count))]
+            let bud = rng.unit() < 0.18
+            let scale = size * (form == .daisy ? 0.13 : 0.12) * (0.85 + rng.unit() * 0.3)
+            emitBloom(into: &flowers, form: form, bud: bud, at: curvedTip, axis: curvedTangent,
+                      scale: scale, petal: entry.petal, center: entry.center, rng: &rng)
         }
 
-        // Emit one ColoredGroup per used palette colour (petals + its center share the mesh but
-        // carry different albedo → two groups per colour). Deterministic order by palette index.
-        var blooms = [ColoredGroup]()
-        for idx in petalMeshes.keys.sorted() {
-            if let pm = petalMeshes[idx], !pm.isEmpty {
-                blooms.append(ColoredGroup(color: bloomPalette[idx].petal, mesh: pm))
-            }
-            if let cm = centerMeshes[idx], !cm.isEmpty {
-                blooms.append(ColoredGroup(color: bloomPalette[idx].center, mesh: cm))
-            }
-        }
-        return BouquetParts(greens: greens, blooms: blooms)
+        let blooms = flowers.isEmpty ? [] : [ColoredGroup(color: Vec3(1, 1, 1), mesh: flowers.mesh, colors: flowers.colors)]
+        return BouquetParts(greens: greens.mesh, greenColors: greens.colors, blooms: blooms)
     }
 
-    /// A bloom = a ring (or two) of petal cards around a small center disc, all facing `faceDir`.
+    /// One painted stem leaf at `pos`: lanceolate, arching out, a pale rib, a paler back.
+    static func emitStemLeaf(into p: inout PaintedMesh, at pos: Vec3, azimuth: Double, tilt: Double,
+                             length: Double, palette: FoliagePalette, rng: inout SplitMix) {
+        let f = leafFrame(azimuth: azimuth, tilt: tilt, roll: (rng.unit() - 0.5) * 0.5)
+        var s = LeafSheet.Surface(base: pos, xAxis: f.x, yAxis: f.y, normal: f.n, length: length, halfWidth: 0.12)
+        s.cup = 0.04
+        s.droop = 0.12 + rng.unit() * 0.10
+        s.twist = (rng.unit() - 0.5) * 0.4
+        let tone = FoliagePaint.tone(youth: rng.unit() * 0.4, palette: palette, rng: &rng)
+        var leaf = PaintedMesh()
+        LeafSheet.emitBlade(into: &leaf, surface: s,
+                            margin: LeafSilhouette.stemLeaf.margin(atRows: [0, 0.08, 0.2, 0.34, 0.5, 0.66, 0.8, 0.92, 1]),
+                            aspect: 0.24, columns: [0.55], midribBand: 0.006) { site, face in
+            FoliagePaint.sheet(palette, tone, site: site, face: face, ribHalfWidth: 0.006)
+        }
+        p.append(leaf.smoothed())
+    }
+
+    /// The PLANTER's bloom (`PlanterMesh`) — a ring (or two) of petal cards round a small centre
+    /// disc, all facing `faceDir`, one flat colour per group. Cheap enough for a bed of twenty; the
+    /// bouquet grows real flower forms instead (`emitBloom(into:form:…)`, `PottedPlantMesh+Bouquet`).
     /// `scale` sets the bloom radius (petal length). Petals cup toward `faceDir` (an open flower).
     public static func emitBloom(petals: inout Mesh3, center: inout Mesh3,
                           at pos: Vec3, faceDir: Vec3, scale: Double, rng: inout SplitMix) {

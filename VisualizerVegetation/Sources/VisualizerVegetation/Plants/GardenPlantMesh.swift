@@ -57,7 +57,8 @@ public enum GardenPlantMesh {
         if params.plantStyle.isBouquet {
             // A flowering clump: green stems + vivid blooms, rising from the soil.
             let bouquet = PottedPlantMesh.bouquetMesh(params: params, soilY: soilY, rng: &rng)
-            return Parts(stem: Mesh3(), foliage: bouquet.greens, blooms: bouquet.blooms)
+            return Parts(stem: Mesh3(), foliage: bouquet.greens, foliageColors: bouquet.greenColors,
+                         blooms: bouquet.blooms)
         }
 
         // Foliage plant: a woody stalk + the potted plant's own painted leaves, grown from the
