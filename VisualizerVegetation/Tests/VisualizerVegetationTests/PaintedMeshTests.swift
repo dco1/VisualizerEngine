@@ -25,6 +25,39 @@ final class PaintedMeshTests: XCTestCase {
         }
     }
 
+    /// Real texture coordinates ride the same swap as the paint: each vertex keeps its OWN.
+    func testTextureCoordinatesFollowTheirVertexThroughTheWindingSwap() {
+        let a = Vec3(0, 0, 0), b = Vec3(1, 0, 0), c = Vec3(0, 1, 0)
+        let ua = Vec2(10.1, 0.1), ub = Vec2(10.3, 0.2), uc = Vec2(10.5, 0.3)
+        for outward in [Vec3(0, 0, 1), Vec3(0, 0, -1)] {           // as given, then rewound
+            var p = PaintedMesh()
+            p.addTriangle(a, b, c, colors: red, green, blue, uvs: (ua, ub, uc), outward: outward)
+            for (i, pos) in p.mesh.positions.enumerated() {
+                let want = pos == a ? ua : (pos == b ? ub : uc)
+                XCTAssertEqual(p.mesh.uvs[i], want, "vertex \(pos) carries \(p.mesh.uvs[i]) (outward \(outward))")
+            }
+        }
+    }
+
+    /// A sheet leaf carries its own FLAT blade coordinates, packed where a shader can tell them from
+    /// any other uv (`LeafSheet.bladeUVOrigin`), and they name the very point each vertex sits on.
+    func testSheetBladeCarriesItsBladeCoordinates() {
+        let s = LeafSheet.Surface(base: Vec3(0, 0, 0), xAxis: Vec3(1, 0, 0), yAxis: Vec3(0, 0, -1),
+                                  normal: Vec3(0, 1, 0), length: 0.3, halfWidth: 0.38)
+        var p = PaintedMesh()
+        LeafSheet.emitBlade(into: &p, surface: s,
+                            margin: LeafSilhouette.fiddleLeafFigBlade.margin(tier: .hero, subdivisions: 2),
+                            aspect: 0.76) { _, _ in self.green }
+        XCTAssertEqual(p.mesh.uvs.count, p.mesh.vertexCount)
+        for (i, uv) in p.mesh.uvs.enumerated() {
+            XCTAssertGreaterThanOrEqual(uv.x, LeafSheet.bladeUVOrigin - 0.5)
+            XCTAssertLessThan(uv.x, LeafSheet.bladeUVOrigin + 0.5)
+            let site = LeafSheet.Site(x: uv.x - LeafSheet.bladeUVOrigin, y: uv.y)
+            XCTAssertLessThan(simd_length(s.point(site) - p.mesh.positions[i]), 1e-9,
+                              "vertex \(i)'s blade coordinates must name its own point")
+        }
+    }
+
     /// A degenerate triangle adds nothing — no geometry and no paint — so the arrays stay parallel.
     func testADegenerateTriangleAddsNoPaint() {
         var p = PaintedMesh()

@@ -126,17 +126,32 @@ public enum LeafSheet {
     /// Paint for one vertex: its site and its face.
     public typealias Paint = (Site, LeafFace) -> Vec3
 
-    /// Emit one cell of the flat blade — corners in order round the cell — on BOTH faces.
+    /// Where a sheet leaf's FLAT blade coordinates ride in its texture coordinates: `u = origin + x`,
+    /// `v = y`, in blade lengths. Detail finer than any vertex grid can paint — a fig's lateral
+    /// veins, a millimetre or two on a quarter-metre blade — is drawn per pixel from them
+    /// (Illuminatorama `Instance.leafVenation`). The origin keeps them clear of every other
+    /// convention a G-buffer reads off `uv` — negative `u` is the procedural-soil marker, ordinary
+    /// materials tile up from 0 — so a shader knows a leaf's own coordinates by their range alone:
+    /// `u ∈ [origin − 0.5, origin + 0.5)`.
+    public static let bladeUVOrigin = 10.5
+
+    /// A site's blade coordinates, as `bladeUVOrigin` packs them.
+    public static func bladeUV(_ s: Site) -> Vec2 { Vec2(bladeUVOrigin + s.x, s.y) }
+
+    /// Emit one cell of the flat blade — corners in order round the cell — on BOTH faces, each
+    /// vertex carrying its paint and its blade coordinates (`bladeUV`).
     public static func emitCell(into p: inout PaintedMesh, _ q: [Site], surface: Surface, paint: Paint) {
         guard q.count == 4 else { return }
         let P = q.map { surface.point($0) }
         let centre = Site(x: (q[0].x + q[2].x) / 2, y: (q[0].y + q[2].y) / 2,
                           vein: (q[0].vein + q[2].vein) / 2)
         let up = surface.upper(at: centre)
+        let uv = q.map(bladeUV)
         for face in [LeafFace.upper, .lower] {
             let out = face == .upper ? up : Vec3(-up.x, -up.y, -up.z)
             let c = q.map { paint($0, face) }
-            p.addQuad(P[0], P[1], P[2], P[3], colors: c[0], c[1], c[2], c[3], outward: out)
+            p.addQuad(P[0], P[1], P[2], P[3], colors: c[0], c[1], c[2], c[3],
+                      uvs: (uv[0], uv[1], uv[2], uv[3]), outward: out)
         }
     }
 

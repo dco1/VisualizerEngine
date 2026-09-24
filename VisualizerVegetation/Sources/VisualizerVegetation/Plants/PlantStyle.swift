@@ -139,6 +139,43 @@ public extension PlantStyle {
         case .christmasTree:                        return 0.78   // a mass of needles scatters — no sheen
         }
     }
+
+    /// The fraction of the light reaching a leaf's FAR face that comes through it — why a leaf
+    /// between you and a bright window glows yellow-green instead of standing as a dark cut-out
+    /// (DH-0946). Measured leaf transmittance runs ~5–10 % for a leathery, cuticled leaf, 10–25 % for
+    /// a thin one, and a few percent for a succulent's water-filled pad; a petal is far thinner
+    /// again (`petalTranslucency`). The renderer's thin-sheet term (`IlluminatoramaInstance
+    /// .thinTransmission`) adds `albedo × light on the far face × this`, never more than arrives,
+    /// and only in the still — the live canvas keeps leaves opaque. Deliberately NOT the outdoor
+    /// grass lane (`leafTransmission`), whose 1.8 gain made an interior plant out-glow its room.
+    public var leafTranslucency: Float {
+        switch self {
+        case .fiddleLeafFig:                        return 0.08   // thick, leathery, waxed
+        case .monstera:                             return 0.10
+        case .snakePlant:                           return 0.04   // a fibrous, water-filled sword
+        case .succulent:                            return 0.03   // a fleshy pad
+        case .fern:                                 return 0.22   // paper-thin pinnae
+        case .flowers:                              return 0.18   // a cut stem's soft leaves
+        case .driedSpray:                           return 0.12   // dry, papery
+        case .christmasTree:                        return 0.02   // needles in depth — no glow
+        }
+    }
+
+    /// A petal's translucency — far thinner than a leaf, which is why a tulip lit from behind glows.
+    public static let petalTranslucency: Float = 0.35
+
+    /// The per-pixel VENATION the renderer draws on this style's leaves, from their flat blade
+    /// coordinates (`LeafSheet.bladeUVOrigin`; Illuminatorama `Instance.leafVenation`); 0 = none.
+    /// A fiddle-leaf fig's pale, looping lateral veins are its signature at arm's length, and a
+    /// millimetre-wide line on a quarter-metre blade is far finer than any vertex grid can paint
+    /// (DH-0947). The monstera's veins ride its own vein-coordinate grid, so they are painted per
+    /// vertex already; the other styles show none a camera resolves.
+    public var leafVenation: Int32 {
+        switch self {
+        case .fiddleLeafFig: return 1        // pinnate, looping toward the tip
+        default:             return 0
+        }
+    }
 }
 
 /// **What a potted plant's GEOMETRY reads** — the pot and plant dimensions, style and seed — so the

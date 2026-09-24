@@ -1182,7 +1182,12 @@ public struct IlluminatoramaInstance {
     /// `albedo × transmitted incident × t`); the live canvas renders the sheet opaque as it always
     /// has. 0 = opaque — the default, and byte-identical for every host that never sets it.
     public var thinTransmission: Float = 0
-    public var _padGrain1: Int32 = 0
+    /// DH-0947 — the per-pixel leaf VENATION the G-buffer draws from a leaf's own flat blade
+    /// coordinates, which the host packs into `uv` as (10.5 + x, y) in blade lengths
+    /// (VisualizerVegetation `LeafSheet.bladeUVOrigin` / `PlantStyle.leafVenation`). 0 = none — the
+    /// default, and an exact no-op for every host that never sets it; 1 = a pinnate, looping fig.
+    /// Was `_padGrain1`: same 4 bytes, the stride is unchanged. Mirrors `Instance.leafVenation`.
+    public var leafVenation: Int32 = 0
     public var _padGrain2: Int32 = 0
 
     // ── Animated UV DOMAIN WARP (per instance) ────────────────────────────────

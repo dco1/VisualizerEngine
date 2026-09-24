@@ -332,6 +332,43 @@ vertex float4 illumi_shadow_vs(
     return lightVP * worldP;
 }
 
+// ── Leaf venation (DH-0947) ─────────────────────────────────────────────────
+// A houseplant leaf's pale lateral veins are lines a millimetre or two across on a blade a
+// quarter-metre long — far finer than any vertex grid can paint — so they are drawn here, per
+// pixel, from the leaf's own FLAT blade coordinates (x across, y along, in blade lengths), which
+// the host packs into `uv` as (10.5 + x, y) (VisualizerVegetation `LeafSheet.bladeUVOrigin`).
+// Pattern 1, the fiddle-leaf fig: eight pairs of laterals leaving the midrib at ~60° and bending
+// toward the tip as they near the margin (the loop of a brochidodromous leaf), tapering outward
+// and fading before the edge. Each vein sits a little off the even ladder — differently on the
+// two sides — because an evenly ruled set reads as a ribbed banana leaf, not a fig. Returns 0…1,
+// 1 on a vein's centre line. A vein narrower than a pixel is widened to one and dimmed in
+// proportion, so a distant leaf fades to its mean tone instead of shimmering.
+static inline float leafVeinMask(float x, float y, float2 duvdx, float2 duvdy) {
+    const float pairs = 8.0f, from = 0.12f, to = 0.84f;
+    const float cotA = 0.58f;        // rise along the midrib per unit out (cot 60°)
+    const float sweep = 1.3f;        // the extra rise toward the margin — the loop toward the tip
+    float ax = fabs(x);
+    float side = x < 0.0f ? 7.7f : 3.1f;
+    float rise = ax * cotA + sweep * ax * ax;
+    float spacing = (to - from) / (pairs - 1.0f);
+    float k0 = clamp(round((y - rise - from) / spacing), 0.0f, pairs - 1.0f);
+    float d = 1e3f;
+    for (float k = max(k0 - 1.0f, 0.0f); k <= min(k0 + 1.0f, pairs - 1.0f); k += 1.0f) {
+        float jitter = fract(sin((k + 1.0f) * 12.9898f + side) * 43758.5453f) - 0.5f;
+        float yk = from + (k + 0.34f * jitter) * spacing;
+        d = min(d, fabs((y - rise) - yk));
+    }
+    float slope = cotA + 2.0f * sweep * ax;
+    d /= sqrt(1.0f + slope * slope);                            // perpendicular to the vein
+    float w = mix(0.0048f, 0.0026f, saturate(ax / 0.34f));      // half-width, tapering outward
+    float px = max(length(float2(duvdx.x, duvdy.x)), length(float2(duvdx.y, duvdy.y)));
+    float we = max(w, px);                                       // never under a pixel wide
+    float line = 1.0f - smoothstep(0.0f, we, d);
+    return line * (w / we)                                       // a widened line is dimmer
+         * smoothstep(0.016f, 0.045f, ax)                        // grows out of the painted rib
+         * (1.0f - smoothstep(0.22f, 0.36f, ax));                // and fades before the margin
+}
+
 fragment GBufferOut illumi_fs(
     VSOut                                       in              [[stage_in]],
     bool                                        frontFacing     [[front_facing]],
@@ -557,6 +594,15 @@ fragment GBufferOut illumi_fs(
     // .color)) actually paints the fragment. SceneKit convention is
     // multiplicative: vertex colour and material diffuse compose.
     albedo *= in.vertexColor.rgb;
+    // DH-0947 — the leaf's own pale lateral veins, drawn on top of its painted colour (the rib
+    // band, the underside and the leaf's age are already in the vertex paint). `leafVenation == 0`
+    // — every instance that never sets it — skips this entirely; the uv RANGE check keeps the
+    // pattern off the plant's petioles and anything else in the group that carries no blade
+    // coordinates.
+    if (inst.leafVenation == 1 && in.uv.x >= 10.0f && in.uv.x < 11.0f) {
+        float vein = leafVeinMask(in.uv.x - 10.5f, in.uv.y, duvdx, duvdy);
+        albedo = mix(albedo, albedo * 1.5f + float3(0.018f, 0.022f, 0.0f), vein * 0.6f);
+    }
     // Animated hue cycle on host-TAGGED vertices (Instance.hueCycle; tangent.w > 0.5 is the tag).
     // Rodrigues rotation about the grey axis: hue turns, brightness and saturation hold.
     // Tag = tangent.w ≈ 1 exactly (0.5…1.5): a mesh's own tangent handedness (±1 on normal-mapped

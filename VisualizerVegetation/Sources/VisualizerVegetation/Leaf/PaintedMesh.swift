@@ -20,8 +20,10 @@ import VisualizerMaterials
 /// triangle. A parallel colour array appended blindly would drift out of step on the first swap.
 /// So each triangle rides its corner index (0, 1, 2) in the `uv` channel — which `addTriangle`
 /// swaps together with the positions — and the colours are read back in the order the mesh actually
-/// stored them. The uvs are left holding those small indices; no host reads `Mesh3.uvs` for
-/// foliage (the Daydream bridge rebuilds planar UVs from position), and they cost nothing.
+/// stored them. A caller that has REAL texture coordinates for the corners (a sheet leaf's own
+/// flat blade coordinates, `LeafSheet.bladeUVOrigin`) passes them too, and they are written back in
+/// the same stored order; otherwise the uvs are left holding those small indices, which no host
+/// reads (the Daydream bridge rebuilds planar UVs from position, keeping only blade coordinates).
 ///
 /// Every operation that keeps vertex ORDER keeps the colours aligned: `append`, `smoothed`, and
 /// any in-place move of `mesh.positions`.
@@ -45,23 +47,32 @@ public struct PaintedMesh: Sendable, Equatable {
     public var isEmpty: Bool { mesh.isEmpty }
     public var triangleCount: Int { mesh.triangleCount }
 
-    /// Append one triangle whose three corners carry their own albedo, wound to face `outward`
-    /// (see the type doc for how the colours follow `addTriangle`'s swap).
+    /// Append one triangle whose three corners carry their own albedo — and, when given, their own
+    /// texture coordinates — wound to face `outward` (see the type doc for how both follow
+    /// `addTriangle`'s swap).
     public mutating func addTriangle(_ a: Vec3, _ b: Vec3, _ c: Vec3,
                                      colors ca: Vec3, _ cb: Vec3, _ cc: Vec3,
+                                     uvs: (Vec2, Vec2, Vec2)? = nil,
                                      outward: Vec3) {
         guard mesh.addTriangle(a, b, c, outward: outward,
                                uv: (Vec2(0, 0), Vec2(1, 0), Vec2(2, 0))) else { return }
         let corner = [ca, cb, cc]
-        for uv in mesh.uvs.suffix(3) { colors.append(corner[Int(uv.x)]) }
+        let first = mesh.uvs.count - 3
+        let stored = (0 ..< 3).map { Int(mesh.uvs[first + $0].x) }   // which corner landed where
+        for k in stored { colors.append(corner[k]) }
+        if let uvs {
+            let real = [uvs.0, uvs.1, uvs.2]
+            for (j, k) in stored.enumerated() { mesh.uvs[first + j] = real[k] }
+        }
     }
 
     /// Append a quad `a→b→c→d` (in order round the face) as two painted triangles.
     public mutating func addQuad(_ a: Vec3, _ b: Vec3, _ c: Vec3, _ d: Vec3,
                                  colors ca: Vec3, _ cb: Vec3, _ cc: Vec3, _ cd: Vec3,
+                                 uvs: (Vec2, Vec2, Vec2, Vec2)? = nil,
                                  outward: Vec3) {
-        addTriangle(a, b, c, colors: ca, cb, cc, outward: outward)
-        addTriangle(a, c, d, colors: ca, cc, cd, outward: outward)
+        addTriangle(a, b, c, colors: ca, cb, cc, uvs: uvs.map { ($0.0, $0.1, $0.2) }, outward: outward)
+        addTriangle(a, c, d, colors: ca, cc, cd, uvs: uvs.map { ($0.0, $0.2, $0.3) }, outward: outward)
     }
 
     public mutating func append(_ other: PaintedMesh) {

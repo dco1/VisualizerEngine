@@ -810,7 +810,12 @@ struct Instance {
     // kExtendedGBuffer fragment (→ `material.r`); the live lane renders the sheet opaque as before.
     // 0 (default) = opaque. Mirrors `IlluminatoramaInstance.thinTransmission`.
     float    thinTransmission;
-    int      _padGrain1;
+    // DH-0947 — per-pixel leaf VENATION pattern, drawn by the G-buffer from the leaf's own flat blade
+    // coordinates, which the host packs into `uv` as (10.5 + x, y) in blade lengths (VisualizerVegetation
+    // `LeafSheet.bladeUVOrigin`). 0 = none — the default, and an exact no-op; 1 = a pinnate, looping
+    // fig (`leafVeinMask`). Was `_padGrain1`: same 4 bytes, so the stride is unchanged.
+    // Mirrors `IlluminatoramaInstance.leafVenation`.
+    int      leafVenation;
     int      _padGrain2;
 
     // ── Animated UV DOMAIN WARP (see `warpUV` in IlluminatoramaGBuffer.metal) ──
@@ -870,7 +875,7 @@ inline Instance illumiDefaultInstance() {
     d.woodKnots = float4(0.0f);      d.macroTone = 1.0f;             d.macroRoughnessDelta = 0.0f;
     d.uvPhase = float2(0.0f);        d.sheenRoughness = 0.30f;       d.carpetMacro = float2(0.0f);
     d.grainTangentTextureSlice = -1; d.thinTransmission = 0.0f;
-    d._padGrain1 = 0;                d._padGrain2 = 0;
+    d.leafVenation = 0;              d._padGrain2 = 0;
     d.uvWarp = float4(0.0f);         d.hueCycle = float4(0.0f);      d.tagGlow = float4(0.0f);
     return d;
 }
