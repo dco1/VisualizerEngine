@@ -46,6 +46,12 @@ struct MLSUniforms {
     // Elastoplastic "droopy sauce" params (ignored when materialMode == 0).
     float4 plasticA;         // x = mu0, y = lambda0, z = xi (hardening), w = thetaC
     float4 plasticB;         // x = thetaS, y = materialMode (0=fluid,1=elastoplastic), zw = pad
+    // Axisymmetric VESSEL boundary (MLSMPMSolver.vessel) — off when vesselA.x == 0, and then
+    // every kernel is byte-identical to the box-only solver.
+    float4 vesselA;          // x = enabled (>0.5), y/z = axis (x, z), w = floor y
+    float4 vesselB;          // x = profile y0, y = 1/dy, z = profile samples, w = wall friction
+    float4 fluidC;           // x = J-from-density relaxation per substep (0 = off, byte-identical)
+                             // y = 1: no tension (pressure ≥ 0 — water does not pull itself together)
 };
 
 // ── Utilities ───────────────────────────────────────────────────────────────
@@ -61,6 +67,77 @@ inline float3 bspline_weights(float fx) {
 
 inline uint grid_idx(uint3 cell, uint3 res) {
     return cell.x + res.x * (cell.y + res.y * cell.z);
+}
+
+// ── Vessel of revolution (MLSMPMSolver.vessel) ─────────────────────────────
+//
+// The liquid region is { y ≥ floor, ρ ≤ R(y) } about a vertical axis — a coffee pot, a jug, a
+// glass — with R(y) the vessel's INNER radius from a table uniform in y (clamped at both ends,
+// so above the table it is a cylinder). f = R(y) − ρ is positive inside; ∇f = (−e_ρ, R′(y)), so
+// f/|∇f| is the signed distance to the wall to first order and ∇f/|∇f| the unit normal pointing
+// INTO the liquid. The floor is the plane y = floor. Wall and floor are two constraints, applied
+// independently (in the corner both hold — the nearer alone let particles slide down the wall
+// into the floor layer).
+inline float mls_vessel_wall(float3 x, constant MLSUniforms& U, constant float* prof,
+                             thread float3 &nIn) {
+    float2 d   = x.xz - U.vesselA.yz;
+    float  rho = length(d);
+    float2 er  = rho > 1e-6f ? d / rho : float2(1.0f, 0.0f);
+    int    n   = max(int(U.vesselB.z), 2);
+    float  f   = clamp((x.y - U.vesselB.x) * U.vesselB.y, 0.0f, float(n - 1) - 1e-3f);
+    int    i   = int(f);
+    float  t   = f - float(i);
+    float  r0  = prof[i], r1 = prof[min(i + 1, n - 1)];
+    float  R   = mix(r0, r1, t);
+    float  dR  = (r1 - r0) * U.vesselB.y;
+    float3 g   = float3(-er.x, dR, -er.y);
+    float  gl  = length(g);
+    nIn = g / gl;
+    return (R - rho) / gl;
+}
+
+// Keep only the velocity that does not run into the wall / floor wherever either is closer
+// than `band` (MPM's separating condition), with Coulomb friction `mu` on the slide.
+inline float3 mls_vessel_separate(float3 x, float3 v, float band, float mu,
+                                  constant MLSUniforms& U, constant float* prof) {
+    float3 nW;
+    float dW = mls_vessel_wall(x, U, prof, nW);
+    float dF = x.y - U.vesselA.w;
+    if (dW < band) {
+        float vn = dot(v, nW);
+        if (vn < 0.0f) {
+            float3 vt = v - vn * nW; float vtl = length(vt);
+            v = vtl > 1e-6f ? vt * max(0.0f, 1.0f - mu * (-vn) / vtl) : float3(0.0f);
+        }
+    }
+    if (dF < band && v.y < 0.0f) {
+        float vn = v.y;
+        float3 vt = float3(v.x, 0.0f, v.z); float vtl = length(vt);
+        v = vtl > 1e-6f ? vt * max(0.0f, 1.0f - mu * (-vn) / vtl) : float3(0.0f);
+    }
+    return v;
+}
+
+// Non-penetration without a band (particle side): a particle may approach the wall only as fast
+// as closes its remaining gap (less `skin`) this substep — a speculative contact — so it can
+// always come back to the glass. (A banded "separate" cannot: inside the band motion toward the
+// wall is forbidden outright, so whatever drains off an overhanging wall never climbs back.)
+// The floor keeps its band below `floorBand` (see the G2P call); above it, the same clamp.
+inline float3 mls_vessel_approach(float3 x, float3 v, float dt, float skin, float floorBand,
+                                  constant MLSUniforms& U, constant float* prof) {
+    float3 nW;
+    float dW = mls_vessel_wall(x, U, prof, nW);
+    float vn = dot(v, nW);                                  // + = leaving the wall
+    float limW = -max(0.0f, dW - skin) / dt;
+    if (vn < limW) v += (limW - vn) * nW;
+    float dF = x.y - U.vesselA.w;
+    if (dF < floorBand) {
+        if (v.y < 0.0f) v.y = 0.0f;
+    } else {
+        float limF = -max(0.0f, dF - skin) / dt;
+        if (v.y < limF) v.y = limF;
+    }
+    return v;
 }
 
 inline float3x3 outer3(float3 a, float3 b) {
@@ -217,14 +294,16 @@ inline float3x3 snow_return_map(float3x3 Ftotal, thread float &Jp,
 //   3.  mlsCellOffsetsScan  — exclusive prefix-sum cellCounts → cellOffsets;
 //                             *also* re-zeros cellCounts to serve as the
 //                             write cursor for the scatter pass
-//   4.  mlsScatterParticles — atomic-add a slot in cellCounts, write the
-//                             particle's index into sortedIndices at
-//                             cellOffsets[centre] + slot
+//   4.  mlsScatterParticles — atomic-add a slot in cellCounts; evaluate the
+//                             particle's stress + APIC affine ONCE and write
+//                             its compact 80 B P2G record at
+//                             cellOffsets[centre] + slot (bin order)
 //   5.  mlsP2GGather        — one thread per grid cell. Iterates the 27
-//                             neighbour bins, reads particles, contributes
+//                             neighbour bins' CONTIGUOUS records, contributes
 //                             via the same B-spline weights as the scatter
 //                             version, writes (not adds) into gridMass/Mom
-//   6.  mlsGridUpdate       — unchanged from the original pipeline
+//   6.  mlsGridUpdate       — also re-zeroes cellCounts for the next substep
+//                             (so step 1 runs only once, on the first step)
 //   7.  mlsG2P              — unchanged
 //
 // The atomic count drops from ~108 per particle to ~2 (one for counting,
@@ -235,7 +314,12 @@ inline float3x3 snow_return_map(float3x3 Ftotal, thread float &Jp,
 // Cells with no particles contribute nothing and exit early. The kernel's
 // per-cell cost is dominated by reading particles from neighbour bins —
 // memory-bound, not atomic-bound — and parallelises cleanly across the
-// 32k-cell grid.
+// 32k-cell grid. Hence the records: every particle is read by 27 cells, so the gather
+// used to re-read its full 144 B state from a SCATTERED address and re-evaluate
+// its stress (an SVD, for the elastoplastic model) 27 times; the scatter does
+// that once and lays the records out in bin order, so each bin is one
+// contiguous run. Same sums in the same (sorted) order; bit-identical for the
+// unit-mass particles every seeder writes.
 //
 // Comparison-only NOTE: the original scatter mlsP2G has been deleted; the
 // reference implementation lives in Visualizer/Reference/fluid-code/metal/
@@ -286,45 +370,86 @@ kernel void mlsCellCount(
 
 // ── KERNEL 3 — Exclusive prefix-sum of cellCounts → cellOffsets ────────────
 //
-// Single-thread sequential scan. Wasteful in parallelism terms but trivially
-// correct, and for ~32k cells (32 µs at ~1 ns/iter on Apple Silicon) it's
-// well under the noise floor of the rest of the pipeline.
+// ONE threadgroup (≤ 1024 threads) walks the grid in blocks of four cells per thread (each
+// simdgroup reading one contiguous run), scanned with simdgroup prefix sums and linked by a
+// running carry. Measured on Apple Silicon it replaced
+// a single-THREAD sequential scan that took 2.2–4.2 ms per call at 27k cells (the old comment's
+// "32 µs" was ~100× optimistic: one thread cannot hide a load's latency) — run once per SUBSTEP,
+// that loop was most of every MLS-MPM scene's frame.
 //
 // As a side effect, RE-ZEROES cellCounts so the scatter pass can reuse it
 // as a per-cell write cursor. Saves one extra kernel + one buffer.
-//
-// For larger grids (≫ 256k cells) a proper multi-pass parallel scan would
-// be worth it, but the cost wouldn't appear before then.
 
 kernel void mlsCellOffsetsScan(
     device uint*          cellCounts  [[ buffer(0) ]],
     device uint*          cellOffsets [[ buffer(1) ]],
     constant MLSUniforms& U           [[ buffer(2) ]],
-    uint                  gid         [[ thread_position_in_grid ]])
+    uint tid       [[ thread_position_in_threadgroup ]],
+    uint tcount    [[ threads_per_threadgroup ]],
+    uint lane      [[ thread_index_in_simdgroup ]],
+    uint simdWidth [[ threads_per_simdgroup ]],
+    uint sg        [[ simdgroup_index_in_threadgroup ]],
+    uint sgCount   [[ simdgroups_per_threadgroup ]])
 {
-    if (gid != 0) return;
+    threadgroup uint sgTotals[32];
+    threadgroup uint carry;
     uint total = U.gridRes.x * U.gridRes.y * U.gridRes.z;
-    uint sum = 0;
-    for (uint i = 0; i < total; i++) {
-        cellOffsets[i] = sum;
-        sum += cellCounts[i];
-        cellCounts[i] = 0;     // reused as write cursor by mlsScatterParticles
+    if (tid == 0) carry = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Blocks of 4·threads cells; each thread four consecutive cells (a simdgroup reads one
+    // contiguous run), the block scanned with simdgroup prefix sums + one pass over the
+    // simdgroup totals, a running carry linking the blocks.
+    for (uint base = 0; base < total; base += 4u * tcount) {
+        uint i0 = base + 4u * tid;
+        uint v0 = i0      < total ? cellCounts[i0]      : 0u;
+        uint v1 = i0 + 1u < total ? cellCounts[i0 + 1u] : 0u;
+        uint v2 = i0 + 2u < total ? cellCounts[i0 + 2u] : 0u;
+        uint v3 = i0 + 3u < total ? cellCounts[i0 + 3u] : 0u;
+        uint t = v0 + v1 + v2 + v3;
+        uint incl = simd_prefix_inclusive_sum(t);
+        if (lane == simdWidth - 1) sgTotals[sg] = incl;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            uint x = lane < sgCount ? sgTotals[lane] : 0u;
+            uint ex = simd_prefix_exclusive_sum(x);
+            if (lane < sgCount) sgTotals[lane] = ex;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint o = carry + sgTotals[sg] + incl - t;
+        // Counts re-zeroed: reused as the write cursor by mlsScatterParticles.
+        if (i0      < total) { cellOffsets[i0]      = o;                cellCounts[i0]      = 0u; }
+        if (i0 + 1u < total) { cellOffsets[i0 + 1u] = o + v0;           cellCounts[i0 + 1u] = 0u; }
+        if (i0 + 2u < total) { cellOffsets[i0 + 2u] = o + v0 + v1;      cellCounts[i0 + 2u] = 0u; }
+        if (i0 + 3u < total) { cellOffsets[i0 + 3u] = o + v0 + v1 + v2; cellCounts[i0 + 3u] = 0u; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == tcount - 1) carry = o + t;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    cellOffsets[total] = sum;
+    if (tid == 0) cellOffsets[total] = carry;
 }
 
-// ── KERNEL 4 — Scatter particle indices into per-cell bins ─────────────────
+// ── KERNEL 4 — Scatter particles into per-cell bins ────────────────────────
 //
-// For each particle: claim a slot via atomic-inc of its bin's cursor, write
-// the particle's flat index into `sortedIndices[cellOffsets[centre] + slot]`.
-// After this kernel completes, `sortedIndices[cellOffsets[c]..cellOffsets[c+1]]`
-// holds the indices of every particle whose centre cell is `c`.
+// For each particle: claim a slot via atomic-inc of its bin's cursor and write the particle's
+// P2G record (its stress + APIC affine, evaluated once) at `records[cellOffsets[centre] + slot]`.
+// After this kernel completes, `records[cellOffsets[c]..cellOffsets[c+1]]` holds every particle
+// whose centre cell is `c`, contiguously.
+
+// One particle's P2G contribution, in bin order (written by mlsScatterParticles, read by mlsP2GGather).
+struct MLSP2GRecord {
+    float4   posMass;        // xyz = position, w = mass
+    float4   momentum;       // xyz = mass · velocity
+    float3x3 affine;         // mass · (mass·C − dt·mass/ρ₀ · stress · D⁻¹) — the gather's
+                             // per-cell momentum is momentum + affine · (x_cell − x_p)
+};
+// The Swift side sizes the record buffer by the literal `MLSMPMSolver.p2gRecordStride`.
+static_assert(sizeof(MLSP2GRecord) == 80, "MLSP2GRecord must stay 80 bytes (MLSMPMSolver.p2gRecordStride)");
 
 kernel void mlsScatterParticles(
     device const MLSParticle* particles      [[ buffer(0) ]],
     device atomic_uint*       cellCursors    [[ buffer(1) ]],   // == cellCounts, zeroed by scan
     device const uint*        cellOffsets    [[ buffer(2) ]],
-    device uint*              sortedIndices  [[ buffer(3) ]],
+    device MLSP2GRecord*      records        [[ buffer(3) ]],
     constant MLSUniforms&     U              [[ buffer(4) ]],
     uint                      pid            [[ thread_position_in_grid ]])
 {
@@ -337,7 +462,28 @@ kernel void mlsScatterParticles(
     int3   centre = clamp(base + int3(1), int3(0), int3(U.gridRes.xyz) - 1);
     uint   binIdx = uint(centre.x) + U.gridRes.x * (uint(centre.y) + U.gridRes.y * uint(centre.z));
     uint   slot = atomic_fetch_add_explicit(&cellCursors[binIdx], 1u, memory_order_relaxed);
-    sortedIndices[cellOffsets[binIdx] + slot] = pid;
+
+    // The particle's P2G record, evaluated ONCE (its stress — an SVD, for the elastoplastic
+    // model — and APIC affine), written at its sorted slot so each bin is one contiguous run.
+    float pmass = p.positionMass.w;
+    float3x3 stress;
+    if (U.plasticB.y > 0.5f) {
+        stress = snow_stress(p.F, p.velocityJp.w, U.plasticA.x, U.plasticA.y, U.plasticA.z, U.matParams.w);
+    } else {
+        // No tension (opt-in): an expanded particle (J > 1: a splash, the free surface) reads
+        // as zero pressure, not suction — the weakly-compressible EOS's negative branch pulls
+        // surface particles into clumps (the tensile instability) and compacts the liquid.
+        float3x3 F = p.F;
+        if (U.fluidC.y > 0.5f && determinant(F) > 1.0f) F = float3x3(1.0f);
+        stress = fluid_stress(F, p.C, U.matParams.x, U.matParams.y, U.matParams.w);
+    }
+    float D_inv = 4.0f * U.dxParams.y * U.dxParams.y;
+    float3x3 affine = pmass * p.C - (U.dxParams.z * pmass / max(U.matParams.z, 1e-4f)) * stress * D_inv;
+    MLSP2GRecord r;
+    r.posMass  = p.positionMass;
+    r.momentum = float4(pmass * p.velocityJp.xyz, 0.0f);
+    r.affine   = pmass * affine;
+    records[cellOffsets[binIdx] + slot] = r;
 }
 
 // ── KERNEL 5 — Gather-mode P2G ─────────────────────────────────────────────
@@ -348,9 +494,9 @@ kernel void mlsScatterParticles(
 // gridMass + gridMom, so the previous-substep values are overwritten without
 // needing a separate clear pass.
 
+
 kernel void mlsP2GGather(
-    device const MLSParticle* particles      [[ buffer(0) ]],
-    device const uint*        sortedIndices  [[ buffer(1) ]],
+    device const MLSP2GRecord* records       [[ buffer(0) ]],
     device const uint*        cellOffsets    [[ buffer(2) ]],
     device float*             gridMass       [[ buffer(3) ]],
     device float*             gridMom        [[ buffer(4) ]],
@@ -362,11 +508,6 @@ kernel void mlsP2GGather(
 
     float dx     = U.dxParams.x;
     float invDx  = U.dxParams.y;
-    float dt     = U.dxParams.z;
-    float bulkK  = U.matParams.x;
-    float gammaP = U.matParams.y;
-    float rho0   = U.matParams.z;
-    float mu     = U.matParams.w;
 
     // Cell's world-space position (matching the convention in P2G/G2P:
     // grid origin lives at boundsMin, cells are indexed from 0).
@@ -386,16 +527,9 @@ kernel void mlsP2GGather(
         uint end    = cellOffsets[binIdx + 1];
 
         for (uint i = start; i < end; i++) {
-            uint pid = sortedIndices[i];
-            MLSParticle p = particles[pid];
-
-            // Re-derive the particle's stencil base from its world position.
-            // Reading the particle once and reusing all its fields beats
-            // pre-computing weights in a separate pass (which would need
-            // extra storage per particle).
-            float3 ppos = p.positionMass.xyz;
-            float  pmass = p.positionMass.w;
-            float3 pvel  = p.velocityJp.xyz;
+            MLSP2GRecord r = records[i];
+            float3 ppos  = r.posMass.xyz;
+            float  pmass = r.posMass.w;
 
             float3 fpos = (ppos - U.boundsMin.xyz) * invDx;
             int3   base = int3(floor(fpos - 0.5f));
@@ -411,28 +545,9 @@ kernel void mlsP2GGather(
             float3 wzV = bspline_weights(fx.z);
             float  w = wxV[rel.x] * wyV[rel.y] * wzV[rel.z];
 
-            // Same APIC stress + affine assembly as scatter P2G. Done inside
-            // the particle loop because each particle contributes to multiple
-            // cells; we have no per-particle cache to amortise it across the
-            // 27 cells without an extra pass.
-            //   • FLUID (materialMode 0): weakly-compressible Neo-Hookean.
-            //   • ELASTOPLASTIC (materialMode 1, "droopy sauce"): fixed-corotated
-            //     snow stress (SVD-based). The SVD runs per (particle, cell) here;
-            //     if profiling demands it, hoist to a per-particle precompute pass.
-            float3x3 stress;
-            if (U.plasticB.y > 0.5f) {
-                stress = snow_stress(p.F, p.velocityJp.w,        // Fe, Jp
-                                     U.plasticA.x, U.plasticA.y, // mu0, lambda0
-                                     U.plasticA.z,               // xi
-                                     mu);                        // viscosity
-            } else {
-                stress = fluid_stress(p.F, p.C, bulkK, gammaP, mu);
-            }
-            float D_inv = 4.0f * invDx * invDx;
-            float3x3 affine = pmass * p.C - (dt * pmass / max(rho0, 1e-4f)) * stress * D_inv;
-
+            // The particle's stress + APIC affine were evaluated once, in mlsScatterParticles.
             float3 offset = cellPosWorld - ppos;
-            float3 mv = pmass * (pvel + affine * offset);
+            float3 mv = r.momentum.xyz + r.affine * offset;
 
             massSum += w * pmass;
             momSum  += w * mv;
@@ -453,12 +568,17 @@ kernel void mlsGridUpdate(
     device const float*     gridMom  [[ buffer(1) ]],
     device MLSGridNode*     gridOut  [[ buffer(2) ]],
     constant MLSUniforms&   U        [[ buffer(3) ]],
+    constant float*         vesselR  [[ buffer(4) ]],
+    device uint*            cellCounts [[ buffer(5) ]],
     uint3                   gid      [[ thread_position_in_grid ]])
 {
     uint3 res = U.gridRes.xyz;
     if (any(gid >= res)) return;
 
     uint idx  = grid_idx(gid, res);
+    // The scatter is done with this bin's cursor: zero it for the next substep's count (so
+    // the per-substep clear pass is not needed).
+    cellCounts[idx] = 0u;
     float m   = gridMass[idx];
 
     MLSGridNode node;
@@ -475,6 +595,18 @@ kernel void mlsGridUpdate(
 
     // Gravity.
     vel += U.dxParams.z * U.gravity.xyz;
+
+    // Vessel wall + floor: a node in the glass, or within one cell of it, keeps only the
+    // velocity that leaves the wall (MPM's "separate" condition — the liquid can pull away,
+    // never pass through), with Coulomb friction on what slides along it. The one-cell band is
+    // the box walls' two-node rule: a particle AT the wall has its whole stencil constrained,
+    // so the grid itself stops it — with the band only behind the wall, particles were carried
+    // into the glass by the free nodes in front of it and piled up by the G2P projection, which
+    // J never sees (measured: a 0.55 m column settled at 0.41 m).
+    if (U.vesselA.x > 0.5f) {
+        vel = mls_vessel_separate(U.boundsMin.xyz + float3(gid) * U.dxParams.x, vel, U.dxParams.x,
+                                  U.vesselB.w, U, vesselR);
+    }
 
     // AABB-clamp velocity at the simulation bounds. Use cell indices directly
     // (more robust than comparing world positions to bounds — no FP-equality
@@ -529,6 +661,7 @@ kernel void mlsG2P(
     device MLSParticle*       particles [[ buffer(0) ]],
     device const MLSGridNode* grid      [[ buffer(1) ]],
     constant MLSUniforms&     U         [[ buffer(2) ]],
+    constant float*           vesselR   [[ buffer(3) ]],
     uint                      pid       [[ thread_position_in_grid ]])
 {
     uint pCount = U.gridRes.w;
@@ -588,6 +721,16 @@ kernel void mlsG2P(
         // matrix encoding only J. This is what makes a fluid actually flow
         // (otherwise the solver would remember its original orientation).
         float J = clamp(determinant(F_new), 0.5f, 2.0f);
+        // Volume drift correction (opt-in): J integrated from the grid's divergence loses
+        // track of the particles' real crowding under sustained agitation (measured: a sloshed
+        // vessel's density crept +15 % in 20 s while J held ~0.96 — the liquid compacted with
+        // no pressure to stop it). Relax J toward ρ₀/ρ from the density the particle just
+        // gathered, where that estimate is whole (ρ near or above rest — not at a free surface
+        // or a wall, whose half-empty stencils read light).
+        float relax = U.fluidC.x;
+        if (relax > 0.0f && density > 0.9f * U.matParams.z) {
+            J = mix(J, clamp(U.matParams.z / density, 0.5f, 2.0f), relax);
+        }
         float cbrtJ = pow(J, 1.0f / 3.0f);
         p.F  = cbrtJ * I;
         p.velocityJp.w = J;
@@ -603,11 +746,44 @@ kernel void mlsG2P(
     const float maxSpeed = 50.0f;
     if (speed > maxSpeed) vel_new *= maxSpeed / speed;
 
+    // Vessel, particle side. FLOOR: within one cell of it a particle keeps no velocity into it —
+    // the grid's band condition stops the nodes, but a particle there still interpolates a
+    // sliver from the free node a cell beyond the band (weight ~0.04), and under the column's
+    // weight that sliver walked the bottom layer into the glass, where the G2P projection
+    // pinned it without touching J: the layer packed silently and the column shortened
+    // (measured: +46 % particles in the bottom 2 cm and −5 % column height in 12 s at rest).
+    // WALL: no band — a particle may approach it by at most its remaining gap this substep
+    // (`mls_vessel_approach`). The same one-cell band on the wall was a ratchet: under a
+    // vessel's overhanging shoulder its "toward the wall" is up-and-out, so liquid that drained
+    // down off the glass could never climb back — a 6 cm gutter round a coffee pot's shoulder
+    // (VesselLiquidMeshTests.testBelliedVesselSurfaceStaysLevelToTheWall).
+    if (U.vesselA.x > 0.5f) {
+        vel_new = mls_vessel_approach(pos, vel_new, dt, 1e-3f, dx, U, vesselR);
+    }
+
     p.C            = C_new;
     p.velocityJp.xyz = vel_new;
     p.positionMass.xyz = pos + dt * vel_new;
     p.misc.x       = density;
     p.misc.y       = p.misc.y + dt;
+
+    // Vessel safety net: a particle the grid condition let through (a stencil straddling a
+    // thin wall, FP slop) goes back onto the liquid side, keeping only its outward velocity.
+    if (U.vesselA.x > 0.5f) {
+        const float skin = 1e-3f;
+        float3 nW;
+        float dW = mls_vessel_wall(p.positionMass.xyz, U, vesselR, nW);
+        if (dW < skin) {
+            p.positionMass.xyz += (skin - dW) * nW;
+            float vn = dot(p.velocityJp.xyz, nW);
+            if (vn < 0.0f) p.velocityJp.xyz -= vn * nW;
+        }
+        float dF = p.positionMass.y - U.vesselA.w;
+        if (dF < skin) {
+            p.positionMass.y += skin - dF;
+            p.velocityJp.y = max(p.velocityJp.y, 0.0f);
+        }
+    }
 
     // Hard-clamp position to the bounds (safety net — the grid velocity
     // boundary should already prevent escape, but FP slop at the bounds can

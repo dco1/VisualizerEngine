@@ -158,14 +158,18 @@ public struct CoinStaticCollider {
     /// axes are X/Y/Z with the given `halfExtents`. Resolved on the constraint
     /// path only (the path the ball/plank scenes use); proper sphere-vs-OBB
     /// contact for marbles rolling on a tilted plank. See CoinDEM.metal kind 3.
+    /// `velocity` is its kinematic surface velocity when the host moves it every frame
+    /// (a running character's body) — the constraint solve targets it, so a moving box
+    /// bats what it hits away at the right speed instead of only pushing it out of overlap.
     public static func orientedBox(center: SIMD3<Float>, halfExtents: SIMD3<Float>,
                                    orientation: simd_quatf,
+                                   velocity: SIMD3<Float> = .zero,
                                    friction: Float? = nil, restitution: Float? = nil) -> CoinStaticCollider {
         let q = orientation.normalized
         return CoinStaticCollider(
             a: SIMD4(center, Float(bitPattern: Kind.orientedBox.rawValue)),
             b: SIMD4(halfExtents, 0),
-            vel: .zero, meta: matMeta(0, friction: friction, restitution: restitution),
+            vel: SIMD4(velocity, 0), meta: matMeta(0, friction: friction, restitution: restitution),
             orient: SIMD4(q.imag.x, q.imag.y, q.imag.z, q.real))
     }
 }
@@ -651,19 +655,24 @@ public final class CoinDEMSolver: PenetrationProbing {
 
     /// Production init: pipelines come from the engine's memoised cache (the
     /// package's compiled metallib via `Bundle.module`).
+    /// `maxColliders` sizes the static/kinematic collider buffer (`setColliders`): a scene
+    /// whose surfaces are many facets (a lofted roof, polygon-prism poles) plus per-frame
+    /// moving colliders can need more than the default 256. The kernels loop over the live
+    /// count, so capacity costs only memory.
     public convenience init?(engine: SimEngine = .shared,
                              maxCoins: Int,
                              coinRadius: Float,
                              halfThickness: Float,
                              boundsMin: SIMD3<Float>,
-                             boundsMax: SIMD3<Float>) {
+                             boundsMax: SIMD3<Float>,
+                             maxColliders: Int = 256) {
         guard let pipelines = CoinDEMSolver.makePipelines({ engine.pipeline($0) }) else {
             CoinDEMSolver.log.error("Coin pipeline cache failed — check CoinDEM.metal is in VisualizerRendering/Shaders/")
             return nil
         }
         self.init(engine: engine, pipelines: pipelines, maxCoins: maxCoins,
                   coinRadius: coinRadius, halfThickness: halfThickness,
-                  boundsMin: boundsMin, boundsMax: boundsMax)
+                  boundsMin: boundsMin, boundsMax: boundsMax, maxColliders: maxColliders)
     }
 
     /// Test seam: pipelines built from a runtime-compiled library (the SwiftPM
@@ -688,7 +697,8 @@ public final class CoinDEMSolver: PenetrationProbing {
           coinRadius: Float,
           halfThickness: Float,
           boundsMin: SIMD3<Float>,
-          boundsMax: SIMD3<Float>) {
+          boundsMax: SIMD3<Float>,
+          maxColliders: Int = 256) {
         let p0 = pipelines.integrate, p1 = pipelines.cellClear, p2 = pipelines.cellCount
         let p4 = pipelines.scatter, p5 = pipelines.contact
         let p6 = pipelines.apply, p7 = pipelines.finalize, p8 = pipelines.orient
@@ -722,7 +732,7 @@ public final class CoinDEMSolver: PenetrationProbing {
         var hashCap = 1; while hashCap < contactCap * 2 { hashCap <<= 1 }   // next power of two ≥ 2·cap
         guard
             let coins = SimBuffer<CoinBody>(device: dev, capacity: maxCoins, label: "Coin.bodies"),
-            let cols  = SimBuffer<CoinStaticCollider>(device: dev, capacity: 256, label: "Coin.colliders"),
+            let cols  = SimBuffer<CoinStaticCollider>(device: dev, capacity: max(1, maxColliders), label: "Coin.colliders"),
             let xform = dev.makeBuffer(length: MemoryLayout<CoinTransform>.stride * maxCoins,
                                        options: .storageModeShared),
             // Four float4 per coin: [Δpos.xyz, contactCount], [Δrot.xyz, supportFlag],

@@ -439,6 +439,19 @@ public final class VolumetricCloudRenderer {
         /// underside (read only with `cloudLightingFromAtmosphere`). Not `groundColor`, which is
         /// the dome's below-horizon RADIANCE.
         public var cloudGroundAlbedo: SIMD3<Float> = SIMD3<Float>(0.15, 0.16, 0.10)
+        /// **Light the dome's GROUND from the sky as well** (needs `cloudLightingFromAtmosphere`
+        /// under `.nishita`). `groundColor` is one constant RADIANCE for every below-horizon ray —
+        /// right for the time of day it was tuned at and wrong for every other: a daylight value
+        /// left under a night sky mirrors a daylight-bright desert in every metal surface whose
+        /// reflection leaves the screen (Vintage Diner Ultra's stainless read as white fibreglass
+        /// at dusk, 2026-09-24), and fills every down-facing surface through the IBL. On, the
+        /// ground is `cloudGroundAlbedo` × the sky's own mean radiance — the sky-lit Lambertian
+        /// ground, from the same `volSkyCloudLight` march that lights the deck — so it dims through
+        /// twilight with the sky above it, and `groundColor` is ADDED on top as the share the sky
+        /// march does not carry: the host's DIRECT light on its ground (albedo / π × the key's
+        /// irradiance — the sun by day, the moon by night — in the host's lighting units), plus
+        /// anything else it lights the ground with. Off (the default) = byte-identical.
+        public var groundFromAtmosphere: Bool = false
         // ── Cirrus veil (opt-in) ─────────────────────────────────────────
         /// A thin, high ice veil ABOVE the cumulus deck — the fibrous, wind-streaked "mares'
         /// tails" a slab of rounded volumes cannot make. Single-scatter, one plane intersection
@@ -966,6 +979,7 @@ struct SkyUniforms {
     /// GPU-WRITTEN by `volSkyCloudLight` (never by the host upload — see `hostPrefixLength`).
     var cloudLitSun: SIMD4<Float>
     var cloudLitAmbient: SIMD4<Float>
+    var cloudLitGround: SIMD4<Float>
 
     init(params: VolumetricCloudRenderer.Params, time: Float) {
         let sun = normalize(params.sunDir)
@@ -1045,7 +1059,8 @@ struct SkyUniforms {
         self.studioParams = SIMD4<Float>(params.flatBackgroundColor,
                                          params.flatBackground ? 1 : 0)
         self.skyGrade = SIMD4<Float>(max(0, params.skySaturation), max(0, params.skyBlueLift),
-                                     params.physicalCloudLighting ? 1 : 0, 0)
+                                     params.physicalCloudLighting ? 1 : 0,
+                                     params.physicalCloudLighting && params.groundFromAtmosphere ? 1 : 0)
         let cd = params.cirrusDirection == .zero ? SIMD2<Float>(1, 0) : simd_normalize(params.cirrusDirection)
         self.cirrusA = SIMD4<Float>(max(0, min(1, params.cirrusCoverage)), max(0, params.cirrusOpacity),
                                     params.cirrusAltitude, max(1e-6, params.cirrusScale))
@@ -1076,9 +1091,10 @@ struct SkyUniforms {
         self.nightSkyD = simd_length(q) > 1e-6 ? q / simd_length(q) : SIMD4<Float>(0, 0, 0, 1)
         self.cloudLitSun = .zero
         self.cloudLitAmbient = .zero
+        self.cloudLitGround = .zero
     }
 
-    /// Bytes the HOST owns — everything before the GPU-written cloud-lighting pair. The
+    /// Bytes the HOST owns — everything before the GPU-written cloud-lighting tail. The
     /// per-frame upload copies only these, so `volSkyCloudLight`'s results survive it.
     static var hostPrefixLength: Int { MemoryLayout<SkyUniforms>.offset(of: \SkyUniforms.cloudLitSun)! }
 }
