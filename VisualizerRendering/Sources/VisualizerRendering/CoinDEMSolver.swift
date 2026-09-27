@@ -384,7 +384,7 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// and the asleep flag the solver kernels gate on (shared → host can read the count).
     private let islandLabelBuffer: MTLBuffer       // maxCoins UInt32
     private let islandMinBuffer: MTLBuffer         // maxCoins UInt32
-    private let sleepTimerBuffer: MTLBuffer        // maxCoins UInt32 (persists)
+    let sleepTimerBuffer: MTLBuffer                // maxCoins UInt32 (persists)
     public let asleepBuffer: MTLBuffer             // maxCoins UInt32 (0/1)
     /// Capacity of `contactBuffer`. A dense mixed pile emits up to ~tens of contacts
     /// per body (box manifolds + statics), so size generously (maxCoins × 64).
