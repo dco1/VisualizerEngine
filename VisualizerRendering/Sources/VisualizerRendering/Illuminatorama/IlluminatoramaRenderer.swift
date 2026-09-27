@@ -1108,6 +1108,18 @@ public final class IlluminatoramaRenderer {
     /// Jittered samples per spot interval (TAA accumulates the noise out).
     public var volSpotBeamSteps: Int = 20
     public var volSpotBeamMaxDistance: Float = 60.0
+    /// Carve the beams with the spot shadow maps: each march sample is compared against its
+    /// spot's shadow slice, so a beam stops where geometry blocks its light (a cone from inside
+    /// a mouth ends at the lips instead of glowing on through the face). Only spots that hold a
+    /// shadow slice are carved (`spotShadowsEnabled` + capacity). Default false ⇒ the pass is
+    /// byte-identical to before for every existing host.
+    public var volSpotBeamShadows: Bool = false
+    /// Only the first `volSpotBeamSpotLimit` entries of `spotLights` march as haze beams; the
+    /// rest light (and shadow) surfaces only. Lets a host carry studio fill / rim cones in
+    /// `spotLights` — for their shadow maps — without each one drawing a beam across the frame
+    /// (put the beam-worthy spots first). Default `Int.max` ⇒ every spot beams, byte-identical
+    /// for every existing host.
+    public var volSpotBeamSpotLimit: Int = .max
 
     /// A **self-luminous column** — a truncated cone of glowing medium (a sci-fi tractor beam,
     /// a plasma jet) integrated along every view ray in the spot-beam pass. It EMITS rather
@@ -4618,7 +4630,12 @@ public final class IlluminatoramaRenderer {
         var colSolid: SIMD4<Float> = .zero
         var colBand: SIMD4<Float> = .zero
         var colSteps: UInt32 = 0
-        var _colPad0: UInt32 = 0, _colPad1: UInt32 = 0, _colPad2: UInt32 = 0
+        /// 1 ⇒ each beam sample is tested against its spot's shadow slice (`volSpotBeamShadows`).
+        var beamShadows: UInt32 = 0
+        /// Depth bias for the beam shadow compare — the host's `spotShadowBias`, so beam and
+        /// surface shadow edges agree.
+        var beamShadowBias: Float = 0
+        var _colPad2: UInt32 = 0
     }
     private let volSpotPipeline: MTLComputePipelineState?
     private let volSpotUniformBuffer: MTLBuffer
@@ -12922,11 +12939,13 @@ public final class IlluminatoramaRenderer {
             invViewProjection: fu.invViewProjection,
             cameraWorldPos: fu.cameraWorldPos, density: max(0, volSpotBeamDensity),
             anisotropy: volSpotBeamAnisotropy, strength: max(0, volSpotBeamStrength),
-            spotCount: spotsOn ? UInt32(spotLights.count) : 0,
+            spotCount: spotsOn ? UInt32(min(spotLights.count, max(0, volSpotBeamSpotLimit))) : 0,
             steps: UInt32(max(4, min(48, volSpotBeamSteps))),
             maxDist: max(volSpotBeamMaxDistance, column != nil ? 400 : 0),
             frameSeed: volFrameSeed,
             width: UInt32(width), height: UInt32(height))
+        u.beamShadows = volSpotBeamShadows ? 1 : 0
+        u.beamShadowBias = spotShadowBias
         if let c = column {
             let axis = simd_length(c.axis) > 1e-6 ? simd_normalize(c.axis) : SIMD3<Float>(0, -1, 0)
             u.colTop = SIMD4(c.top, 1)
@@ -12942,6 +12961,7 @@ public final class IlluminatoramaRenderer {
         enc.setComputePipelineState(pipeline)
         enc.setTexture(depthTexture, index: 0)
         enc.setTexture(hdrCompositeTexture, index: 1)
+        enc.setTexture(spotShadowAtlas, index: 2)
         // Inline bytes, not the shared `volSpotUniformBuffer`: with 2 frames in flight a
         // memcpy into one buffer overwrote the params the previous frame's kernel was still
         // reading (the per-frame emissive column — its front, scroll, position — made that tear).

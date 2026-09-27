@@ -128,7 +128,7 @@ struct VolSpotLight {
     float    outerCone;
     float3   color;           // premultiplied intensity
     float    radius;
-    float4x4 shadowMatrix;    // unused here
+    float4x4 shadowMatrix;    // world → spot light-space clip (used when u.beamShadows)
     int      shadowSliceIndex;
     uint     layerMask;       // unused here
     int      castsShadow;     // unused here
@@ -150,7 +150,10 @@ struct VolSpotUniforms {
     float4 colShape;     // x top radius, y bottom radius, z front (m from top), w edge feather (× radius)
     float4 colSolid;     // xyz solid radiance per metre (linear), w rainbow mix 0…1
     float4 colBand;      // x rainbow radiance per metre, y cycles over L, z scroll, w steps (0 = smooth)
-    uint colSteps; uint _colPad0; uint _colPad1; uint _colPad2;
+    uint colSteps;
+    uint beamShadows;    // 1 ⇒ test each sample against its spot's shadow slice
+    float beamShadowBias; // the host's spotShadowBias (beam + surface edges agree)
+    uint _colPad2;
 };
 
 /// Hue swatch (full saturation, full value) as LINEAR rgb. `steps > 0` snaps the
@@ -225,10 +228,13 @@ static inline float3 volEmissiveColumn(constant VolSpotUniforms& u, float3 ro, f
 kernel void illumi_volumetric_spots(
     texture2d<float, access::read>       gDepth [[texture(0)]],
     texture2d<half,  access::read_write> outHDR [[texture(1)]],
+    depth2d_array<float, access::sample> spotShadowAtlas [[texture(2)]],
     constant VolSpotUniforms&            u      [[buffer(0)]],
     const device VolSpotLight*           spots  [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]])
 {
+    constexpr sampler beamShadowSampler(filter::linear, compare_func::less_equal,
+                                        address::clamp_to_edge);
     if (gid.x >= u.width || gid.y >= u.height) return;
 
     float2 ndc = (float2(gid) + 0.5) / float2(u.width, u.height) * 2.0 - 1.0;
@@ -312,6 +318,19 @@ kernel void illumi_volumetric_spots(
             // Soft cone edge: full inside innerCone, zero outside outerCone.
             float cone = smoothstep(sl.outerCone, sl.innerCone, dot(Ln, sl.direction));
             if (cone <= 0.0) continue;
+            // Volumetric shadow: this sample only scatters if the spot can see it. One
+            // hardware-filtered compare per sample; the per-step jitter + TAA soften the edge.
+            if (u.beamShadows != 0u && sl.shadowSliceIndex >= 0) {
+                float4 ls = sl.shadowMatrix * float4(P, 1.0);
+                float3 ln = ls.xyz / ls.w;
+                float2 suv = float2(ln.x * 0.5 + 0.5, -ln.y * 0.5 + 0.5);
+                if (ln.z > 0.0 && ln.z < 1.0 && all(suv >= 0.0) && all(suv <= 1.0)) {
+                    float vis = spotShadowAtlas.sample_compare(beamShadowSampler, suv,
+                                                               uint(sl.shadowSliceIndex), ln.z - u.beamShadowBias);
+                    if (vis <= 0.0) continue;
+                    cone *= vis;
+                }
+            }
             // Softened inverse-square: physically 1/d², but that kills a
             // beam a few metres out; stage haze reads better when the shaft
             // carries. The range-sphere fade below still ends it cleanly.

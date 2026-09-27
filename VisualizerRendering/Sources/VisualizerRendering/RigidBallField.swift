@@ -82,6 +82,9 @@ public final class RigidBallField {
         public var fixedDt: Float = 1.0 / 240.0
         public var maxSubsteps: Int = 8
         public var iterations: Int = 12
+        /// Capacity of the collider list (`setColliders`) — static surfaces plus any
+        /// per-frame moving colliders.
+        public var maxColliders: Int = 256
 
         public init(maxBodies: Int, bodyRadius: Float,
                     bounds: (min: SIMD3<Float>, max: SIMD3<Float>),
@@ -111,7 +114,8 @@ public final class RigidBallField {
                                     coinRadius: config.bodyRadius,
                                     halfThickness: config.bodyRadius,
                                     boundsMin: config.bounds.min,
-                                    boundsMax: config.bounds.max) else { return nil }
+                                    boundsMax: config.bounds.max,
+                                    maxColliders: config.maxColliders) else { return nil }
         self.solver = s
         s.gravity = config.gravity
         s.restitution = config.restitution

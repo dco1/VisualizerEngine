@@ -95,6 +95,10 @@ struct MLSUniforms {
     // Elastoplastic "droopy sauce" params (ignored when materialMode == 0).
     var plasticA:   SIMD4<Float>    // x = mu0, y = lambda0, z = xi, w = thetaC
     var plasticB:   SIMD4<Float>    // x = thetaS, y = materialMode, zw = pad
+    // Axisymmetric vessel boundary (`MLSMPMSolver.vessel`); x = 0 → off.
+    var vesselA:    SIMD4<Float> = .zero   // x = enabled, y/z = axis (x, z), w = floor y
+    var vesselB:    SIMD4<Float> = .zero   // x = profile y0, y = 1/dy, z = samples, w = friction
+    var fluidC:     SIMD4<Float> = .zero   // x = J-from-density relaxation per substep
 }
 
 // ── MLS-MPM SOLVER ───────────────────────────────────────────────────────────
@@ -182,12 +186,17 @@ public final class MLSMPMSolver {
     /// so the gather pass can clamp `end` to a valid index.
     private let cellOffsetsBuffer: MTLBuffer
 
-    /// Particle indices sorted by centre cell. The gather pass iterates
-    /// `sortedIndices[cellOffsets[c] ..< cellOffsets[c+1]]` to find every
-    /// particle whose centre is bin `c`.
-    private let sortedIndicesBuffer: MTLBuffer
 
-    private let uniformBuffer: MTLBuffer
+    /// The vessel's inner-radius table (`vesselProfileSamples` floats, uniform in y) — bound to
+    /// the grid-update and G2P kernels on every step (zeros while `vessel` is nil; the kernels
+    /// only read it when the vessel is on).
+    private let vesselBuffer: MTLBuffer
+    public static let vesselProfileSamples = 64
+
+    /// Per-particle P2G records in BIN order (`MLSP2GRecord`, 80 B): each particle's stress and
+    /// APIC affine evaluated once per substep by the scatter, read contiguously by the gather.
+    private let p2gRecordBuffer: MTLBuffer
+    private static let p2gRecordStride = 80
 
     /// Per-particle CAPTURED rest position for the kinematic-grip pass
     /// (xyz = rest pos at seed time, w = unused). Filled by
@@ -287,6 +296,19 @@ public final class MLSMPMSolver {
     /// smoothstep-blends damping out for fast cells so real splashes
     /// preserve momentum — only slow cells get damped.
     public var settleDamping: Float = 0.92
+    /// Fluid volume-drift correction: per substep, the fraction by which each bulk particle's J
+    /// relaxes toward ρ₀/ρ (the density it gathers). 0 (the default) = off, byte-identical. A
+    /// weakly-compressible MPM fluid under SUSTAINED agitation (a carried vessel sloshing for
+    /// minutes) otherwise compacts: its integrated J stops tracking the particles' real
+    /// crowding. ~0.05 holds the volume without adding pressure noise (MLSMPMVesselTests).
+    public var volumeCorrection: Float = 0
+
+    /// Fluid EOS without its negative branch: an expanded particle (a splash, the free surface)
+    /// feels zero pressure rather than suction. false (the default) = byte-identical. Water does
+    /// not pull itself together; the suction clumps surface particles (the tensile instability),
+    /// which compacts a long-sloshing liquid. Viscous / sticky sauces may want the suction.
+    public var noTension = false
+
     /// Substeps per visual frame. MLS-MPM is conditionally stable; 4 substeps
     /// at dt = 1/60 ≈ 4.2 ms per substep is the working compromise on Apple
     /// Silicon for the default (bulkModulus 50, dx 0.1) tuning.
@@ -518,6 +540,106 @@ public final class MLSMPMSolver {
 
     private var elapsed: Float = 0
 
+    // ── Vessel boundary ─────────────────────────────────────────────────────
+
+    /// A container of revolution about a vertical axis — a coffee pot, a jug, a glass — as the
+    /// fluid's boundary (in addition to the domain box): the liquid lives in { y ≥ floorY,
+    /// ρ ≤ r(y) }, with r(y) the vessel's INNER radius. The grid update keeps, at every node in
+    /// the glass, only the velocity that leaves the wall (MPM's separating condition, with
+    /// Coulomb `friction` on the slide), and G2P projects any particle that slipped through back
+    /// onto the liquid side. The profile is resampled to `vesselProfileSamples` rows uniform in
+    /// y between its first and last point and clamped beyond them (a cylinder above the top).
+    ///
+    /// Pair with a non-inertial frame to carry the liquid: simulate in the vessel's frame and
+    /// set `gravityDirection`·`gravity` to the EFFECTIVE gravity there, R⁻¹·(g − a) — the sim's
+    /// box never moves, and the liquid sloshes against the real inner wall.
+    public struct Vessel: Sendable {
+        /// The axis (x, z) in sim coordinates.
+        public var axis: SIMD2<Float>
+        /// The inner bottom the liquid sits on.
+        public var floorY: Float
+        /// (y, r) points of the inner wall, bottom to top (y rising).
+        public var profile: [SIMD2<Float>]
+        /// Coulomb friction coefficient at the wall (0 = free slip — water).
+        public var friction: Float
+        public init(axis: SIMD2<Float> = .zero, floorY: Float, profile: [SIMD2<Float>], friction: Float = 0) {
+            self.axis = axis; self.floorY = floorY; self.profile = profile; self.friction = friction
+        }
+        /// r(y), linear through the profile, clamped at both ends.
+        public func radius(at y: Float) -> Float {
+            guard let first = profile.first, let last = profile.last else { return 0 }
+            if y <= first.x { return first.y }
+            if y >= last.x { return last.y }
+            var k = 0
+            while k < profile.count - 2 && profile[k + 1].x < y { k += 1 }
+            let a = profile[k], b = profile[k + 1]
+            return a.y + (b.y - a.y) * max(0, min(1, (y - a.x) / max(b.x - a.x, 1e-6)))
+        }
+    }
+
+    /// The fluid's vessel (nil = the domain box alone, byte-identical to before). SETUP-ONLY:
+    /// setting it rewrites the shared profile buffer in place, so set it before the first
+    /// `encode` — changing it while a step is in flight races the GPU's read of the table.
+    public var vessel: Vessel? {
+        didSet { uploadVessel() }
+    }
+    private var vesselY0: Float = 0
+    private var vesselInvDY: Float = 1
+
+    private func uploadVessel() {
+        let n = Self.vesselProfileSamples
+        let ptr = vesselBuffer.contents().bindMemory(to: Float.self, capacity: n)
+        guard let v = vessel, v.profile.count >= 2 else {
+            for i in 0 ..< n { ptr[i] = 0 }
+            return
+        }
+        let y0 = v.profile.first!.x, y1 = v.profile.last!.x
+        let dy = max(1e-5, (y1 - y0) / Float(n - 1))
+        for i in 0 ..< n { ptr[i] = v.radius(at: y0 + dy * Float(i)) }
+        vesselY0 = y0
+        vesselInvDY = 1 / dy
+    }
+
+    /// Fill the vessel with particles up to `level` (sim y) on the `seedBox` lattice + jitter,
+    /// keeping a sample only where it is inside the vessel by at least `margin` of the lattice
+    /// spacing. Rest density is derived from the seed exactly as in `seedBox`. Returns the
+    /// particle count. Requires `vessel`.
+    @discardableResult
+    public func seedVessel(level: Float, particlesPerCellAxis: Int = 2, jitter: Float = 0.3,
+                           rngSeed: UInt64 = 0x12345678) -> Int {
+        guard let v = vessel else { return 0 }
+        var rng = SplitMix64(state: rngSeed)
+        let spacing = cellSize / Float(particlesPerCellAxis)
+        let rMax = v.profile.map(\.y).max() ?? 0
+        let lo = SIMD3<Float>(v.axis.x - rMax, v.floorY, v.axis.y - rMax)
+        let nx = Int((2 * rMax / spacing).rounded(.down))
+        let ny = Int(((level - v.floorY) / spacing).rounded(.down))
+        let nz = nx
+        var particles: [MLSParticle] = []
+        particles.reserveCapacity(max(0, nx * ny * nz))
+        let cap = particleBuffer.capacity
+        outer: for iy in 0 ..< max(0, ny) {
+            for ix in 0 ..< nx {
+                for iz in 0 ..< nz {
+                    if particles.count >= cap { break outer }
+                    let base = lo + spacing * SIMD3<Float>(Float(ix) + 0.5, Float(iy) + 0.5, Float(iz) + 0.5)
+                    let j = SIMD3<Float>(rng.nextFloat01() - 0.5, rng.nextFloat01() - 0.5, rng.nextFloat01() - 0.5)
+                        * jitter * spacing
+                    let pos = base + j
+                    let rho = simd_length(SIMD2(pos.x, pos.z) - v.axis)
+                    guard pos.y > v.floorY + 0.25 * spacing,
+                          rho < v.radius(at: pos.y) - 0.25 * spacing else { continue }
+                    particles.append(MLSParticle(position: pos))
+                }
+            }
+        }
+        particleBuffer.write(particles)
+        let particleMass: Float = 1.0
+        let ppc = Float(particlesPerCellAxis * particlesPerCellAxis * particlesPerCellAxis)
+        restDensity = particleMass * ppc
+        return particles.count
+    }
+
     // ── Init ─────────────────────────────────────────────────────────────────
 
     /// Build a solver for a box-bounded fluid simulation.
@@ -576,17 +698,17 @@ public final class MLSMPMSolver {
                                            options: .storageModePrivate),
             let cOff   = device.makeBuffer(length: MemoryLayout<UInt32>.stride * (cells + 1),
                                            options: .storageModePrivate),
-            let sIdx   = device.makeBuffer(length: MemoryLayout<UInt32>.stride * max(maxParticles, 1),
-                                           options: .storageModePrivate),
-            let uBuf  = device.makeBuffer(length: MemoryLayout<MLSUniforms>.stride,
-                                          options: .storageModeShared),
             let gripRest = SimBuffer<SIMD4<Float>>(device: device,
                                                    capacity: maxParticles,
                                                    label: "MLS.gripRest"),
             let gripU = device.makeBuffer(length: MemoryLayout<MLSGripUniforms>.stride,
                                           options: .storageModeShared),
             let recycleU = device.makeBuffer(length: MemoryLayout<MLSRecycleUniforms>.stride,
-                                             options: .storageModeShared)
+                                             options: .storageModeShared),
+            let vesselBuf = device.makeBuffer(length: MemoryLayout<Float>.stride * Self.vesselProfileSamples,
+                                              options: .storageModeShared),
+            let records = device.makeBuffer(length: Self.p2gRecordStride * max(maxParticles, 1),
+                                            options: .storageModePrivate)
         else {
             Self.log.error("MLS-MPM buffer allocation failed (cells = \(cells))")
             return nil
@@ -598,8 +720,6 @@ public final class MLSMPMSolver {
         gNode.label  = "MLS.gridNode"
         cCount.label = "MLS.cellCounts"
         cOff.label   = "MLS.cellOffsets"
-        sIdx.label   = "MLS.sortedIndices"
-        uBuf.label   = "MLS.uniforms"
 
         self.device                = device
         self.cellClearPipeline     = cellClear
@@ -607,6 +727,8 @@ public final class MLSMPMSolver {
         self.offsetsScanPipeline   = offsetsScan
         self.scatterPipeline       = scatter
         self.p2gGatherPipeline     = p2gGather
+        records.label              = "MLS.p2gRecords"
+        self.p2gRecordBuffer       = records
         self.gridUpdatePipeline    = gridUpdate
         self.g2pPipeline           = g2p
         self.collideCapsulesPipeline = collideCap
@@ -621,8 +743,9 @@ public final class MLSMPMSolver {
         self.gridNodeBuffer        = gNode
         self.cellCountsBuffer      = cCount
         self.cellOffsetsBuffer     = cOff
-        self.sortedIndicesBuffer   = sIdx
-        self.uniformBuffer         = uBuf
+        vesselBuf.label            = "MLS.vesselProfile"
+        memset(vesselBuf.contents(), 0, vesselBuf.length)
+        self.vesselBuffer          = vesselBuf
         self.gridResolution        = res
         self.cellSize              = cellSize
         self.boundsMin             = boundsMin
@@ -804,10 +927,19 @@ public final class MLSMPMSolver {
         guard particleBuffer.count > 0 else { return }
         let substeps = max(1, substepsPerFrame)
         let dt = wallDt / Float(substeps)
+        // Every pass of every substep in ONE serial compute encoder (dispatches run in order,
+        // each seeing the last one's writes) — a separate encoder per pass was ~9 encoder
+        // boundaries a substep, each a GPU drain.
+        stepEncoder = commandBuffer.makeComputeCommandEncoder()
+        stepEncoder?.label = "MLS.step"
+        boundBuffers.removeAll(keepingCapacity: true)
+        boundPipeline = nil
         for _ in 0..<substeps {
             encodeOneStep(into: commandBuffer, dt: dt)
             elapsed += dt
         }
+        stepEncoder?.endEncoding()
+        stepEncoder = nil
         // Conveyor recycle runs ONCE per frame (not per substep): teleport any
         // particle that cleared the lip back to the bottom band. No-op unless enabled.
         encodeConveyorRecycle(into: commandBuffer)
@@ -841,8 +973,10 @@ public final class MLSMPMSolver {
 
     private func encodeOneStep(into cb: MTLCommandBuffer, dt: Float) {
         // 1. Write uniforms (shared memory; cheap struct write).
-        let uPtr = uniformBuffer.contents().bindMemory(to: MLSUniforms.self, capacity: 1)
-        uPtr.pointee = MLSUniforms(
+        // Bound per dispatch with setBytes (`setUniforms`), so every substep carries its own
+        // values: through one shared buffer, the NEXT frame's write could land before this
+        // frame's command buffer ran, and its steps took that frame's dt / gravity / damping.
+        stepUniforms = MLSUniforms(
             gridRes:   SIMD4(gridResolution, UInt32(particleBuffer.count)),
             dxParams:  SIMD4(cellSize, 1.0 / cellSize, dt, elapsed),
             matParams: SIMD4(bulkModulus, gamma, restDensity, viscosity),
@@ -855,18 +989,25 @@ public final class MLSMPMSolver {
             plasticA:  SIMD4(lameMu, lameLambda, hardening, thetaCompress),
             plasticB:  SIMD4(thetaStretch,
                              material == .elastoplastic ? 1 : 0,
-                             0, 0)
+                             0, 0),
+            vesselA:   vessel.map { SIMD4(1, $0.axis.x, $0.axis.y, $0.floorY) } ?? .zero,
+            vesselB:   vessel.map { SIMD4(vesselY0, vesselInvDY, Float(Self.vesselProfileSamples),
+                                          max(0, $0.friction)) } ?? .zero,
+            fluidC:    SIMD4(max(0, min(1, volumeCorrection)), noTension ? 1 : 0, 0, 0)
         )
 
         // ── Binning pipeline (replaces the old scatter P2G) ──────────────
         // Steps 2-5 build the per-cell particle bins so step 6 can run a
         // gather-mode P2G without atomics. Steps 7-8 are unchanged.
 
-        // 2. Zero cellCounts.
-        encodeCellPass(into: cb,
-                       pipeline: cellClearPipeline,
-                       label: "MLS.cellClear",
-                       buffers: [(cellCountsBuffer, 0)])
+        // 2. Zero cellCounts — once: every grid update re-zeroes them for the next substep.
+        if countsNeedClear {
+            encodeCellPass(into: cb,
+                           pipeline: cellClearPipeline,
+                           label: "MLS.cellClear",
+                           buffers: [(cellCountsBuffer, 0)])
+            countsNeedClear = false
+        }
 
         // 3. Count particles per centre cell.
         encodeParticlePass(into: cb,
@@ -886,23 +1027,23 @@ public final class MLSMPMSolver {
                            extraBuffers: [
                                (cellCountsBuffer,    1),
                                (cellOffsetsBuffer,   2),
-                               (sortedIndicesBuffer, 3),
+                               (p2gRecordBuffer,     3),
                            ],
                            uniformIndex: 4)
 
-        // 6. Gather-mode P2G — one thread per grid cell, walks 27 neighbour
-        //    bins, writes mass + momentum directly (no atomics).
+        // 6. Gather-mode P2G — one thread per grid cell, walks the 27
+        //     neighbour bins' contiguous records, writes mass + momentum
+        //     directly (no atomics).
         encodeGridUpdate3D(into: cb,
                            pipeline: p2gGatherPipeline,
                            label: "MLS.p2gGather",
                            buffers: [
-                               (particleBuffer.buffer,  0),
-                               (sortedIndicesBuffer,    1),
+                               (p2gRecordBuffer,        0),
                                (cellOffsetsBuffer,      2),
                                (gridMassBuffer,         3),
                                (gridMomBuffer,          4),
-                               (uniformBuffer,          5),
-                           ])
+                           ],
+                           uniformIndex: 5)
 
         // 7. Grid update — unchanged. One thread per voxel.
         encodeGridUpdate(into: cb)
@@ -911,7 +1052,7 @@ public final class MLSMPMSolver {
         encodeParticlePass(into: cb,
                            pipeline: g2pPipeline,
                            label: "MLS.g2p",
-                           extraBuffers: [(gridNodeBuffer, 1)],
+                           extraBuffers: [(gridNodeBuffer, 1), (vesselBuffer, 3)],
                            uniformIndex: 2)
 
         // 9. Capsule push-out — if the host bound any colliders, push
@@ -928,12 +1069,11 @@ public final class MLSMPMSolver {
     private func encodeGripPin(into cb: MTLCommandBuffer) {
         guard gripEnabled,
               particleBuffer.count > 0,
-              let enc = cb.makeComputeCommandEncoder()
+              let enc = beginPass(cb, "MLS.gripPin")
         else { return }
-        enc.label = "MLS.gripPin"
-        enc.setComputePipelineState(gripPinPipeline)
-        enc.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
-        enc.setBuffer(gripRestBuffer.buffer, offset: 0, index: 1)
+        use(enc, gripPinPipeline)
+        bind(enc, particleBuffer.buffer, 0)
+        bind(enc, gripRestBuffer.buffer, 1)
         var u = MLSGripUniforms(
             particleCount: UInt32(particleBuffer.count),
             enabled: 1,
@@ -941,25 +1081,24 @@ public final class MLSMPMSolver {
             dispB: SIMD4(gripDispB, 0),
             velA:  SIMD4(gripVelA, 0),
             velB:  SIMD4(gripVelB, 0))
-        enc.setBytes(&u, length: MemoryLayout<MLSGripUniforms>.stride, index: 2)
+        enc.setBytes(&u, length: MemoryLayout<MLSGripUniforms>.stride, index: 2); boundBuffers[2] = nil
         let count = particleBuffer.count
         let w = min(count, gripPinPipeline.maxTotalThreadsPerThreadgroup)
         enc.dispatchThreads(
             MTLSize(width: count, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
-        enc.endEncoding()
+        endPass(enc)
     }
 
     private func encodeCapsuleCollide(into cb: MTLCommandBuffer) {
         guard let binding = colliders,
               binding.count > 0,
               particleBuffer.count > 0,
-              let enc = cb.makeComputeCommandEncoder()
+              let enc = beginPass(cb, "MLS.collideCapsules")
         else { return }
-        enc.label = "MLS.collideCapsules"
-        enc.setComputePipelineState(collideCapsulesPipeline)
-        enc.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
-        enc.setBuffer(binding.buffer,        offset: 0, index: 1)
+        use(enc, collideCapsulesPipeline)
+        bind(enc, particleBuffer.buffer, 0)
+        bind(enc, binding.buffer, 1)
         var u = MLSColliderUniforms(
             particleCount:   UInt32(particleBuffer.count),
             colliderCount:   UInt32(binding.count),
@@ -968,17 +1107,68 @@ public final class MLSMPMSolver {
             boost:           colliderDisplacementBoost,
             tangentFriction: colliderTangentFriction
         )
-        enc.setBytes(&u, length: MemoryLayout<MLSColliderUniforms>.stride, index: 2)
+        enc.setBytes(&u, length: MemoryLayout<MLSColliderUniforms>.stride, index: 2); boundBuffers[2] = nil
         let count = particleBuffer.count
         let w = min(count, collideCapsulesPipeline.maxTotalThreadsPerThreadgroup)
         enc.dispatchThreads(
             MTLSize(width: count, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1)
         )
-        enc.endEncoding()
+        endPass(enc)
     }
 
     // ── Encode helpers ───────────────────────────────────────────────────────
+
+    /// The bins' counts start undefined (private storage): cleared on the first step only.
+    private var countsNeedClear = true
+
+    /// The frame's shared encoder while `encode(to:wallDt:)` runs (nil otherwise).
+    private var stepEncoder: MTLComputeCommandEncoder?
+
+    /// The encoder a pass records into: the frame's shared one (the label becomes a debug
+    /// group), or a fresh one of its own outside `encode(to:wallDt:)`.
+    private func beginPass(_ cb: MTLCommandBuffer, _ label: String) -> MTLComputeCommandEncoder? {
+        if let e = stepEncoder { e.pushDebugGroup(label); return e }
+        let e = cb.makeComputeCommandEncoder()
+        e?.label = label
+        return e
+    }
+
+    /// What the shared encoder already has bound — re-binding the same buffer at the same
+    /// index is a redundant-state warning (fatal under the test wrapper's assert mode).
+    private var boundBuffers: [Int: ObjectIdentifier] = [:]
+    private var boundPipeline: ObjectIdentifier?
+
+    private func bind(_ enc: MTLComputeCommandEncoder, _ buffer: MTLBuffer, _ index: Int) {
+        if stepEncoder != nil {
+            let id = ObjectIdentifier(buffer)
+            if boundBuffers[index] == id { return }
+            boundBuffers[index] = id
+        }
+        enc.setBuffer(buffer, offset: 0, index: index)
+    }
+
+    /// This substep's uniforms, set by `encodeOneStep`.
+    private var stepUniforms = MLSUniforms(gridRes: .zero, dxParams: .zero, matParams: .zero, boundsMin: .zero,
+                                           boundsMax: .zero, gravity: .zero, plasticA: .zero, plasticB: .zero)
+
+    private func setUniforms(_ enc: MTLComputeCommandEncoder, _ index: Int) {
+        enc.setBytes(&stepUniforms, length: MemoryLayout<MLSUniforms>.stride, index: index)
+        boundBuffers[index] = nil
+    }
+
+    private func use(_ enc: MTLComputeCommandEncoder, _ pipeline: MTLComputePipelineState) {
+        if stepEncoder != nil {
+            let id = ObjectIdentifier(pipeline)
+            if boundPipeline == id { return }
+            boundPipeline = id
+        }
+        enc.setComputePipelineState(pipeline)
+    }
+
+    private func endPass(_ enc: MTLComputeCommandEncoder) {
+        if stepEncoder != nil { enc.popDebugGroup() } else { enc.endEncoding() }
+    }
 
     /// Dispatch a 1-D kernel over the cell count. Shared by the cell-clear
     /// pass and any other "one thread per cell, no extra inputs" kernel.
@@ -986,11 +1176,10 @@ public final class MLSMPMSolver {
                                 pipeline: MTLComputePipelineState,
                                 label: String,
                                 buffers: [(MTLBuffer, Int)]) {
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
-        enc.label = label
-        enc.setComputePipelineState(pipeline)
+        guard let enc = beginPass(cb, label) else { return }
+        use(enc, pipeline)
         for (buf, idx) in buffers {
-            enc.setBuffer(buf, offset: 0, index: idx)
+            bind(enc, buf, idx)
         }
         let count = gridCellCount
         let w = min(count, pipeline.maxTotalThreadsPerThreadgroup)
@@ -998,25 +1187,23 @@ public final class MLSMPMSolver {
             MTLSize(width: count, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1)
         )
-        enc.endEncoding()
+        endPass(enc)
     }
 
-    /// Single-threadgroup, single-thread prefix-sum scan. For 32k-cell grids
-    /// the sequential reduce is ~32 µs and well below the noise floor of
-    /// the rest of the pipeline. Bigger grids should swap in a multi-pass
-    /// parallel scan — see the PIPELINE NOTE in MLSMPM.metal.
+    /// One-threadgroup blocked prefix scan (simdgroup sums + a running carry) — see
+    /// `mlsCellOffsetsScan`. ~100× the single-thread loop it replaced at 27k cells.
     private func encodeScanPass(into cb: MTLCommandBuffer) {
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
-        enc.label = "MLS.cellOffsetsScan"
-        enc.setComputePipelineState(offsetsScanPipeline)
-        enc.setBuffer(cellCountsBuffer,  offset: 0, index: 0)
-        enc.setBuffer(cellOffsetsBuffer, offset: 0, index: 1)
-        enc.setBuffer(uniformBuffer,     offset: 0, index: 2)
-        enc.dispatchThreads(
+        guard let enc = beginPass(cb, "MLS.cellOffsetsScan") else { return }
+        use(enc, offsetsScanPipeline)
+        bind(enc, cellCountsBuffer, 0)
+        bind(enc, cellOffsetsBuffer, 1)
+        setUniforms(enc, 2)
+        let w = min(1024, offsetsScanPipeline.maxTotalThreadsPerThreadgroup)
+        enc.dispatchThreadgroups(
             MTLSize(width: 1, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1)
+            threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1)
         )
-        enc.endEncoding()
+        endPass(enc)
     }
 
     /// Dispatch a 3-D kernel over the cell grid with caller-specified
@@ -1025,29 +1212,31 @@ public final class MLSMPMSolver {
     private func encodeGridUpdate3D(into cb: MTLCommandBuffer,
                                     pipeline: MTLComputePipelineState,
                                     label: String,
-                                    buffers: [(MTLBuffer, Int)]) {
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
-        enc.label = label
-        enc.setComputePipelineState(pipeline)
+                                    buffers: [(MTLBuffer, Int)],
+                                    uniformIndex: Int) {
+        guard let enc = beginPass(cb, label) else { return }
+        use(enc, pipeline)
         for (buf, idx) in buffers {
-            enc.setBuffer(buf, offset: 0, index: idx)
+            bind(enc, buf, idx)
         }
+        setUniforms(enc, uniformIndex)
         let res = MTLSize(width:  Int(gridResolution.x),
                           height: Int(gridResolution.y),
                           depth:  Int(gridResolution.z))
         let tile = MTLSize(width: 4, height: 4, depth: 4)
         enc.dispatchThreads(res, threadsPerThreadgroup: tile)
-        enc.endEncoding()
+        endPass(enc)
     }
 
     private func encodeGridUpdate(into cb: MTLCommandBuffer) {
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
-        enc.label = "MLS.gridUpdate"
-        enc.setComputePipelineState(gridUpdatePipeline)
-        enc.setBuffer(gridMassBuffer,  offset: 0, index: 0)
-        enc.setBuffer(gridMomBuffer,   offset: 0, index: 1)
-        enc.setBuffer(gridNodeBuffer,  offset: 0, index: 2)
-        enc.setBuffer(uniformBuffer,   offset: 0, index: 3)
+        guard let enc = beginPass(cb, "MLS.gridUpdate") else { return }
+        use(enc, gridUpdatePipeline)
+        bind(enc, gridMassBuffer, 0)
+        bind(enc, gridMomBuffer, 1)
+        bind(enc, gridNodeBuffer, 2)
+        setUniforms(enc, 3)
+        bind(enc, vesselBuffer, 4)
+        bind(enc, cellCountsBuffer, 5)
         // 3-D dispatch — one thread per voxel.
         let res = MTLSize(width:  Int(gridResolution.x),
                           height: Int(gridResolution.y),
@@ -1055,7 +1244,7 @@ public final class MLSMPMSolver {
         // Modest tile size; the kernel is light (per-voxel arithmetic).
         let tile = MTLSize(width: 4, height: 4, depth: 4)
         enc.dispatchThreads(res, threadsPerThreadgroup: tile)
-        enc.endEncoding()
+        endPass(enc)
     }
 
     private func encodeParticlePass(into cb: MTLCommandBuffer,
@@ -1064,20 +1253,19 @@ public final class MLSMPMSolver {
                                     extraBuffers: [(MTLBuffer, Int)],
                                     uniformIndex: Int) {
         let count = particleBuffer.count
-        guard count > 0, let enc = cb.makeComputeCommandEncoder() else { return }
-        enc.label = label
-        enc.setComputePipelineState(pipeline)
-        enc.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
+        guard count > 0, let enc = beginPass(cb, label) else { return }
+        use(enc, pipeline)
+        bind(enc, particleBuffer.buffer, 0)
         for (buf, idx) in extraBuffers {
-            enc.setBuffer(buf, offset: 0, index: idx)
+            bind(enc, buf, idx)
         }
-        enc.setBuffer(uniformBuffer, offset: 0, index: uniformIndex)
+        setUniforms(enc, uniformIndex)
         let w = min(count, pipeline.maxTotalThreadsPerThreadgroup)
         enc.dispatchThreads(
             MTLSize(width: count, height: 1, depth: 1),
             threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1)
         )
-        enc.endEncoding()
+        endPass(enc)
     }
 }
 

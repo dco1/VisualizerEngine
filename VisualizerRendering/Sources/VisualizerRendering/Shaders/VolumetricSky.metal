@@ -190,7 +190,8 @@ struct SkyUniforms {
     //     march goes cyan (red falls, blue barely rises). 1 = untouched.
     // z = cloudLightingFromAtmosphere flag (> 0.5 = the cloud march reads cloudLitSun /
     //     cloudLitAmbient, written on the GPU by `volSkyCloudLight`; skyHorizon.xyz then carries
-    //     the ground ALBEDO for the bounce). w = unused.
+    //     the ground ALBEDO for the bounce). w = groundFromAtmosphere flag (> 0.5 = the dome's
+    //     below-horizon radiance is cloudLitGround + groundColor, not groundColor alone).
     float4 skyGrade;
     // ── Cirrus veil (Params.cirrus*) — host-owned ───────────────────────────────────────────
     // cirrusA: x = coverage (0 = off, byte-identical), y = zenith optical depth of a full fibre,
@@ -227,6 +228,7 @@ struct SkyUniforms {
     // struct PREFIX before these two, so its per-frame write never clobbers them.
     float4 cloudLitSun;      // xyz = solar irradiance at the deck base (intensity × T), w = 1
     float4 cloudLitAmbient;  // xyz = mean sky + ground-bounce radiance around the deck, w = 1
+    float4 cloudLitGround;   // xyz = the SKY-lit ground (albedo × mean sky radiance), w = 1
 };
 
 // The cloud kernel reads the noise volume's tile size from its own width
@@ -871,7 +873,9 @@ inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u) {
     const float kAirlightTheta = 0.0035f;
     float theta = max(-rayDir.y, 1e-6f);
     float ground = exp(-(kAirlightTheta / max(u.groundColor.w, 0.05f)) / theta);
-    return mix(horizonHaze, u.groundColor.xyz, ground);
+    float3 groundRad = u.groundColor.xyz
+                     + ((u.skyGrade.w > 0.5f) ? u.cloudLitGround.xyz : float3(0.0f));
+    return mix(horizonHaze, groundRad, ground);
 }
 
 // ── Lava-lamp sky (Params.lavaLamp) ──────────────────────────────────────────────────────
@@ -1083,6 +1087,9 @@ kernel void volSkyCloudLight(device SkyUniforms &u [[buffer(0)]],
     float3 groundRad = u.skyHorizon.xyz * (sun * max(toSun.y, 0.0f) + M_PI_F * skyMean) / M_PI_F;
     u.cloudLitSun     = float4(sun, 1.0f);
     u.cloudLitAmbient = float4(0.5f * (skyMean + groundRad), 1.0f);
+    // The dome's ground (Params.groundFromAtmosphere): the sky's share only. The direct share
+    // (sun or moon) arrives from the host in `groundColor`, in the units it lights with.
+    u.cloudLitGround  = float4(u.skyHorizon.xyz * skyMean, 1.0f);
 }
 
 // Sun disk — a soft circular hotspot anchored to the sun's 3D direction.

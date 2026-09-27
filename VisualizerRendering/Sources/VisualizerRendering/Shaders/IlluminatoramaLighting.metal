@@ -520,6 +520,35 @@ static inline float3 brdfDiffuse(
 // IlluminatoramaSecondary.h (DH-0718): the secondary path lights reflected and GI-bounce
 // hits with window portals by the SAME form factor, so there is one copy.
 
+// The area light's radiometric SCALE (VZ-0141). `ltcIntegrateEdge` is Hill & Heitz's rational
+// fit, and that fit returns θ/(2π·sin θ) — the polygon formula's 1/(2π) is already folded in
+// (at x = 1 it gives 1.3653/8.5793 = 0.1592 = 1/2π where θ/sin θ → 1). `ltcPolygonForm` and
+// the LTC branch below divide by 2π AGAIN, so `ff` and `ltcSpec` are the true clamped-cosine
+// integrals × 1/(2π) (measured on the GPU: 0.15913), i.e. an area light of colour L lights a
+// surface like an emitter of radiance L/(2π). Every shipped area-light level was set against
+// that. The MRP specular measures TRUE solid angles, so it rides this same scale to stay on
+// the diffuse's and the LTC lane's footing. Correcting the scale is VZ-0143: this constant
+// (→ 1), `ltcPolygonForm`'s 1/(2π) and the LTC line's move together, and hosts recalibrate.
+// IlluminatoramaAreaLightSpecularTests measures the scale from `ltcPolygonForm` and holds the
+// specular to it, so a partial fix fails the test.
+constant float kAreaLightFormScale = 1.0 / (2.0 * M_PI_F);
+
+// Solid angle (sr) the light rectangle subtends at the shaded point: Van Oosterom &
+// Strackee's closed form summed over the triangles (p0,p1,p2) + (p0,p2,p3). Unit vectors are
+// length-guarded as in `ltcPolygonForm` (a jamb fragment hands in p ≈ 0). The numerator floor
+// keeps atan2 off (0, 0) — a fragment ON a light edge, where two corners are antipodal, gives
+// exactly that — and settles it on π/2 per triangle, the edge-on limit; atan2 keeps a
+// receiver right against a large light (past π/2 per triangle) exact.
+static inline float areaRectSolidAngle(float3 p0, float3 p1, float3 p2, float3 p3) {
+    float3 a = p0 * rsqrt(max(dot(p0, p0), 1e-8));
+    float3 b = p1 * rsqrt(max(dot(p1, p1), 1e-8));
+    float3 c = p2 * rsqrt(max(dot(p2, p2), 1e-8));
+    float3 d = p3 * rsqrt(max(dot(p3, p3), 1e-8));
+    float t0 = atan2(max(abs(dot(a, cross(b, c))), 1e-12), 1.0 + dot(a, b) + dot(b, c) + dot(c, a));
+    float t1 = atan2(max(abs(dot(a, cross(c, d))), 1e-12), 1.0 + dot(a, c) + dot(c, d) + dot(d, a));
+    return 2.0 * (t0 + t1);
+}
+
 // Clip the LTC-space quad to z ≥ 0 — the shading horizon in clamped-cosine space —
 // before edge integration (Heitz et al. 2016, the reference implementation's 16-case
 // table; cases 5 and 10 are the impossible alternating configurations). Operates on
@@ -673,7 +702,8 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
         spec = ltcSpec * (F0 * t2.x + (1.0 - F0) * t2.y);
     } else {
         // Fallback — most-representative-point: the rect point closest to the
-        // reflection ray, as a punctual GGX sample weighted by the form factor.
+        // reflection ray, as a GGX sample there × the projected solid angle the lobe
+        // actually collects from the light (the energy normalisation below).
         float3 R = reflect(-V, N);
         float  denom = dot(R, nL);
         float  t = (abs(denom) > 1e-4) ? dot(al.center - worldPos, nL) / denom : 0.0;
@@ -693,7 +723,39 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
             float3 F     = fresnelSchlick(HdotV, F0);
             float  D     = distributionGGX(NdotH, roughness);
             float  G     = geometrySmith(NdotV, NdotLs, roughness);
-            spec = (D * G * F) / (4.0 * NdotV * NdotLs + 1e-7) * NdotLs * ff;
+            // ENERGY NORMALISATION (VZ-0141; the rect-light form of Karis 2013's
+            // representative-point normalisation). This used to be `… * NdotLs * ff`: the
+            // lobe's PEAK value times the light's whole form factor. That is exact only for a
+            // light much smaller than the lobe. Once the light covers the lobe, the true
+            // integral is the lobe's energy (≈ G·F), not peak × light size, and the error
+            // grows as the light gets larger, the lobe tighter and the view more grazing.
+            // Measured on Digital Clock's bezel lip (roughness 0.08) under its 1.0 × 1.2 m
+            // portal: 3.55 × colour where the integral is 0.022 × colour. That is 158 × too
+            // bright, and 22 × the kAreaLightFormScale × colour that no passive reflector can
+            // exceed. The highlight was ≈ 1 px wide, so it aliased into a dashed white line and
+            // halation spread it into a dot grid. On rough lobes under small lights the old form
+            // was also 2.5–5 × too DIM (an extra cosine and a missing π).
+            //
+            // The lobe's footprint: a unit-energy GGX lobe of peak D₁ spans
+            // Ω_lobe = 4·VoH / D₁ steradians of L-space (4·VoH is the H → L Jacobian). D₁ is
+            // taken from this kernel's own `distributionGGX` (its +1e-7 guard included), so
+            // peak × footprint is exactly one lobe's energy whatever that guard does to low
+            // roughness. The solid angle the lobe collects from a light of solid angle Ω is
+            // Ω·Ω_lobe / (Ω + Ω_lobe). That is exact for a centred cap under small-α GGX, whose
+            // cumulative distribution is t²/(α² + t²), and it is Karis's widened
+            // α'² = α² + Ω/(4π·VoH) in solid-angle form. It tends to Ω for a small light and to
+            // Ω_lobe for a covering one. Its projection takes the cosine at the representative
+            // point, capped by the exact projected solid angle π·ff (horizon-correct, and the
+            // exact small-light limit). ×kAreaLightFormScale keeps it on the diffuse's scale.
+            // Checked against a Monte-Carlo integral of this BRDF over the rect (GPU test
+            // IlluminatoramaAreaLightSpecularTests): within 1 % across the bezel's reflection
+            // band, never above the passive-reflector ceiling (max 0.14 of it), and within 4 %
+            // of the LTC lane where the light covers the lobe.
+            float  omega     = areaRectSolidAngle(p0, p1, p2, p3);
+            float  Dpeak     = distributionGGX(1.0, roughness);
+            float  collected = omega / (1.0 + omega * Dpeak / (4.0 * max(HdotV, 1e-4)));
+            float  projSA    = min(M_PI_F * ff, NdotLs * collected * kAreaLightFormScale);
+            spec = (D * G * F) / (4.0 * NdotV * NdotLs + 1e-7) * projSA;
         }
     }
 

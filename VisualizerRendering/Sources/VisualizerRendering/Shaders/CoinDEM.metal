@@ -188,12 +188,16 @@ inline float cdColliderE(device const CoinStaticCollider* colliders, uint idx, c
     return e >= 0.0 ? e : u.restitution;
 }
 
-/// Surface velocity of a KINEMATIC collider. Only the pusher plate (kind 2) moves; every
-/// other kind is world-fixed, and kind 4 (cylinder segment) reuses `vel.xyz` as its "up"
-/// axis, so this must switch on the kind rather than reading `vel` blindly.
+/// Surface velocity of a KINEMATIC collider: the pusher plate (kind 2) and host-moved
+/// boxes / oriented boxes (kinds 1, 3 — e.g. a running character's body re-placed every
+/// frame, which must hand its real velocity to what it hits, or a kick only ever shoves).
+/// Every existing box / oriented box carries vel = 0, so they are unchanged. Planes are
+/// world-fixed, and kind 4 (cylinder segment) reuses `vel.xyz` as its "up" axis, so this
+/// must switch on the kind rather than reading `vel` blindly.
 inline float3 cdColliderVelocity(device const CoinStaticCollider* colliders, uint idx) {
     CoinStaticCollider c = colliders[idx];
-    return (as_type<uint>(c.a.w) == 2u) ? c.vel.xyz : float3(0.0);
+    uint kind = as_type<uint>(c.a.w);
+    return (kind == 1u || kind == 2u || kind == 3u) ? c.vel.xyz : float3(0.0);
 }
 
 struct CoinTransform {

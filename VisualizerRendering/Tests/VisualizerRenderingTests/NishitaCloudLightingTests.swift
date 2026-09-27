@@ -17,8 +17,8 @@ final class NishitaCloudLightingTests: XCTestCase {
         XCTAssertEqual(lit.skyHorizon, SIMD4(p.cloudGroundAlbedo, p.hazePower))
         p.atmosphere = .proceduralGradient
         XCTAssertEqual(SkyUniforms(params: p, time: 0).skyGrade.z, 0, "needs the nishita sky")
-        // The host upload stops short of the GPU-written tail.
-        XCTAssertEqual(SkyUniforms.hostPrefixLength, MemoryLayout<SkyUniforms>.stride - 32)
+        // The host upload stops short of the GPU-written tail (sun, ambient, ground).
+        XCTAssertEqual(SkyUniforms.hostPrefixLength, MemoryLayout<SkyUniforms>.stride - 3 * MemoryLayout<SIMD4<Float>>.stride)
     }
 
     /// Run the real prepass and compare its numbers to the physics: a white Lambertian facing a
