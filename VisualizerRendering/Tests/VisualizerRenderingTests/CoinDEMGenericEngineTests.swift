@@ -695,15 +695,41 @@ final class CoinDEMGenericEngineTests: XCTestCase {
         }
         let strong = flap(z: -0.4, maxTorque: 50.0)
         let weak   = flap(z:  0.4, maxTorque: 0.02)
-        step(solver, queue, frames: 120)
+        // The weak flap is a pendulum (0.02 N·m motor vs a ~1.18 N·m gravity lever). Its
+        // INSTANTANEOUS ω at 2 s is a swing phase, not a verdict: this test used to read
+        // exactly 0 there only because the per-iteration motor clamp made the rated
+        // 0.02 N·m act as 8 × 0.02, and a saturated velocity motor dissipates ∝ its torque,
+        // so the swing had died out (VZ-0155 fixed the clamp). What "maxTorque genuinely
+        // bounds it" means is that the starved motor cannot LIFT the arm: released level,
+        // it can add at most maxTorque·Δθ ≈ 0.02·π J against m·g·l ≈ 1.18 J per radian, so
+        // the arm never rises more than ~0.05 rad above level (it falls and swings), while
+        // the strong motor drives its arm round ≈ target·t. Phase-independent, unlike ω(t).
+        // Unwrapped arm angle about +Z (0 = level, + = lifted), from the orientation.
+        func armAngle(_ b: Int) -> Float {
+            let x = simd_act(solver.orientation(of: b)!, SIMD3<Float>(1, 0, 0))
+            return atan2(x.y, x.x)
+        }
+        func unwrap(_ prev: Float, _ raw: Float) -> Float {
+            var d = raw - remainder(prev, 2 * Float.pi)
+            d = remainder(d, 2 * Float.pi)
+            return prev + d
+        }
+        var weakTurned = armAngle(weak), strongTurned = armAngle(strong)
+        var weakMaxLift = weakTurned
+        step(solver, queue, frames: 120) { _ in
+            weakTurned = unwrap(weakTurned, armAngle(weak))
+            weakMaxLift = max(weakMaxLift, weakTurned)
+            strongTurned = unwrap(strongTurned, armAngle(strong))
+        }
 
         let spinStrong = simd_dot(solver.angularVelocity(of: strong)!, axis)
         let spinWeak   = simd_dot(solver.angularVelocity(of: weak)!, axis)
-        print("JOINT_HINGE_MOTOR target=\(target) strong=\(spinStrong) weak=\(spinWeak)")
+        print("JOINT_HINGE_MOTOR target=\(target) strong=\(spinStrong) weak=\(spinWeak) weakMaxLift=\(weakMaxLift) rad weakNetTurn=\(weakTurned) rad strongNetTurn=\(strongTurned) rad")
         XCTAssertEqual(spinStrong, target, accuracy: 0.5,
                        "a strong-torque motor reaches its target angular velocity")
-        XCTAssertLessThan(abs(spinWeak), target * 0.3,
+        XCTAssertLessThan(weakMaxLift, 0.1,
                           "a torque-starved motor can't overcome gravity — maxTorque genuinely bounds it")
+        XCTAssertGreaterThan(strongTurned, 0.8 * target * 2, "the strong one turns ≈ target · 2 s")
     }
 
     // ── Joints: prismatic/slider (roadmap item 7) ───────────────────────────────

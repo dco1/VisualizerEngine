@@ -26,34 +26,34 @@ import simd
 //     `removeJoints(referencing:)` (S@HEAD:1515) would push that slot onto the
 //     solver's own free list, where a later add*Joint can claim it under the pool.
 //     Disable the slot first; a scene whose population is fixed never despawns.
-//   • Motor bounds are stored per VELOCITY ITERATION (see `setHingeMotor`), so
-//     re-issue every motor setter after changing `velocityIterations`.
-//   • Hinge LIMITS (and the prismatic twist lock) measure the ABSOLUTE relative
-//     orientation `qb·conj(qa)` (M@HEAD:4018–4019, 3863–3864), not the pose at
-//     creation, and the twist jumps by 4π when that quaternion's w goes negative. Use
-//     limits only between bodies spawned with the SAME orientation. `enableWeld`
-//     has no twist term at all, so it is safe at any relative orientation.
-//   • AXIS-ALIGNMENT SIGN (measured; see `enableHinge`). The kernel's hinge and
-//     prismatic axis-alignment BIAS (M@HEAD:3976/3989–3991 and 3837/3851–3853) drives
-//     a misalignment φ AWAY from parallel: axisErr = aW × bW = −φ for parallel axes, and
-//     jAb = (−β·errT/dt − bwrel)/k then rotates A by +β·φ per substep. Parallel axes are
-//     an UNSTABLE equilibrium (a 1° skew flips a world hinge 180° in < 0.4 s; float
-//     noise alone flips any hinge whose load is not exactly planar); ANTI-parallel axes
-//     are the stable one. So `enableHinge` / `enablePrismatic` store axisB = −axis, and
-//     every hinge or prismatic a scene needs — rig joints included — must be built from
-//     pooled slots through them, NOT with addHingeJoint / addPrismaticJoint (which store
-//     axisB = +axis). If the kernel sign is ever corrected (VZ-0147), flip `axisBSign`
-//     below in the same commit: `testAxisAlignmentConventionPooledHoldsAddFlips` pins
-//     the convention.
-//   • What the setters cannot override (measured, CoinDEMActuationTests #10a/#11):
-//     finalize dead-stops a body with |v| < sleepLinVel && |ω| < 0.6 (M@HEAD:3706), so
-//     a body turning about its OWN COM (its COM still) cannot turn slower than 0.6 rad/s
-//     — a motor or `setAngularVelocity` below that is zeroed every substep (VZ-0149).
-//     And a joint's rows are solved one after another (ball core, then the ⟂-rotation
-//     rows, M@HEAD:3945–3993), not as one block, from zero impulse every substep; the
-//     rows are coupled through the lever arm, so a joint carrying a LEVER load removes
-//     only ~I_com/I_pivot of its error per pass: the body keeps a residual velocity each
-//     substep (the §A1 jib: 1.8 mm/s at 6 iterations) and never falls asleep (VZ-0150).
+//   • Motor bounds are PHYSICAL per substep (N·m / N): the kernel clamps the motor
+//     impulse accumulated over the velocity iterations (VZ-0155, fixed), so they hold
+//     across a `velocityIterations` change without re-issuing the setter.
+//   • Hinge LIMITS and the prismatic / weld rotation lock are measured against the
+//     relative orientation captured when the joint is made (`CoinJoint.ref`,
+//     sign-canonicalised to w ≥ 0 — VZ-0156, fixed): the twist is zero at creation,
+//     spans (−π, π] and never jumps by 4π, so bodies at ANY relative orientation may
+//     be hinged with stops, slid or welded. (It used to read the ABSOLUTE relative
+//     orientation qb·conj(qa), so only bodies spawned with the same orientation worked.)
+//   • AXIS-ALIGNMENT SIGN (VZ-0147, fixed). The kernel's hinge / prismatic
+//     axis-alignment bias used to drive a misalignment φ AWAY from parallel (×(1 + β)
+//     per substep), so this file stored axisB anti-parallel as a workaround. The kernel
+//     now restores ×(1 − β) per substep and `axisBSign` is +1: pooled and
+//     addHingeJoint / addPrismaticJoint joints use the same, stable, parallel storage.
+//   • Dead-stop (VZ-0149, fixed): a body driven by a motor with a non-zero target is
+//     never dead-stopped by finalize nor counted as slow for sleep, so a slow slew is
+//     not frozen (unless the motor is pushing into a limit it has reached — then it is
+//     holding, and may rest and sleep). A body turning slowly about its own COM WITHOUT a motor (a carried
+//     bar on a braked wrist) still needs `scaleAwareDeadStop = true` on the solver, or
+//     the legacy |v| < sleepLinVel && |ω| < 0.6 test zeroes it.
+//   • Joints are BLOCK-solved and warm-started (VZ-0150, fixed): each joint's rows —
+//     ball core, axis rows, and its motor (or, at a stop, its limit) — are one LDLᵀ
+//     solve with the lever coupling through both bodies' inertia, and every row's
+//     impulse carries over to the next substep. A lever-loaded hinge (the §A1 jib, COM
+//     0.17 m off the pivot) is exact in one pass and sleeps; it used to keep 1.8 mm/s of
+//     residual velocity at 6 iterations and never sleep, because the rows were solved
+//     one after another from zero every substep. Joint-to-joint coupling along a chain
+//     is still Gauss–Seidel (serial, in slot order; see `jointInnerPasses`).
 
 // ── E1: ballasted egg ─────────────────────────────────────────────────────────
 
@@ -129,15 +129,12 @@ public struct CoinBodyState: Sendable {
     }
 }
 
-/// A rigid weld made of two joint slots: two unlimited hinges through the same
-/// anchor with perpendicular axes (see `enableWeld`).
+/// A pooled rigid weld: ONE joint slot enabled as a native WELD (type 4 — ball + all
+/// three rotations locked, one 6-row block; see `enableWeld`). It was two unlimited
+/// hinges (two slots, redundant rows) before VZ-0150.
 public struct CoinWeld: Sendable, Hashable {
-    public let hingeA: Int
-    public let hingeB: Int
-    public init(hingeA: Int, hingeB: Int) {
-        self.hingeA = hingeA
-        self.hingeB = hingeB
-    }
+    public let slot: Int
+    public init(slot: Int) { self.slot = slot }
 }
 
 // ── The extension ─────────────────────────────────────────────────────────────
@@ -404,42 +401,44 @@ extension CoinDEMSolver {
     /// `targetVelocity` (rad/s) with at most `maxTorque` (N·m); maxTorque ≤ 0 turns
     /// the motor off. A target of 0 with a torque is a brake/servo hold.
     ///
-    /// Lanes (M@HEAD:4002–4012): anchorA.w = target, anchorB.w = bound. The kernel
-    /// clamps each motor impulse to ±anchorB.w·dt and runs once per VELOCITY ITERATION
-    /// (the joint pass is inside that loop, S@HEAD:1867), so the per-substep ceiling
-    /// is iterations · anchorB.w · dt; this stores maxTorque / velocityIterations so the
-    /// ceiling is the physical maxTorque·dt. The kernel drives dot(ωB − ωA, aW) — B
-    /// relative to A about A's axis — so for a WORLD hinge the target is negated,
-    /// exactly as addHingeJoint does (S@HEAD:1427): `targetVelocity` is then A's own
-    /// spin about the axis. For a two-body hinge it is B's spin relative to A.
+    /// Lanes: anchorA.w = target, anchorB.w = bound (N·m, stored as given). The kernel
+    /// clamps the motor impulse ACCUMULATED over the substep's velocity iterations to
+    /// ±anchorB.w·dt (VZ-0155), so the per-substep ceiling is the physical maxTorque·dt
+    /// at any `velocityIterations` — no ÷ iterations here, and changing the iteration
+    /// count later does not change the motor's strength. The kernel drives
+    /// dot(ωB − ωA, aW) — B relative to A about A's axis — so for a WORLD hinge the
+    /// target is negated, exactly as addHingeJoint does: `targetVelocity` is then A's
+    /// own spin about the axis. For a two-body hinge it is B's spin relative to A.
+    /// A non-zero target keeps the joint's bodies out of the finalize dead-stop and the
+    /// sleep test (VZ-0149) — except while it pushes into a limit it has reached; set the
+    /// target to 0 (a brake) when the move is done.
     public func setHingeMotor(_ joint: Int, targetVelocity: Float, maxTorque: Float) {
         guard let j = liveJoint(joint, types: [1]) else { return }
         let world = j.meta.z == Self.worldBody
         let p = joints
         p[joint].anchorA.w = targetVelocity * (world ? -1 : 1)
-        p[joint].anchorB.w = max(maxTorque, 0) / Float(max(velocityIterations, 1))
+        p[joint].anchorB.w = max(maxTorque, 0)
         wakeBodies(of: j)
     }
 
     /// Prismatic motor in PHYSICAL units: drive the slide velocity toward
     /// `targetVelocity` (m/s along the joint axis) with at most `maxForce` (N);
-    /// maxForce ≤ 0 turns it off. Lanes (M@HEAD:3912–3915): anchorA.w = target,
-    /// anchorB.w = maxForce / velocityIterations (same per-iteration clamp as the
-    /// hinge). The kernel drives dot(vA − vB, aW), so NO world-case negation
-    /// (S@HEAD:1468): the target is A's velocity along the axis relative to B.
+    /// maxForce ≤ 0 turns it off. Lanes: anchorA.w = target, anchorB.w = maxForce
+    /// (accumulated per-substep clamp, as the hinge). The kernel drives dot(vA − vB, aW),
+    /// so NO world-case negation: the target is A's velocity along the axis relative to B.
     public func setPrismaticMotor(_ joint: Int, targetVelocity: Float, maxForce: Float) {
         guard let j = liveJoint(joint, types: [3]) else { return }
         let p = joints
         p[joint].anchorA.w = targetVelocity
-        p[joint].anchorB.w = max(maxForce, 0) / Float(max(velocityIterations, 1))
+        p[joint].anchorB.w = max(maxForce, 0)
         wakeBodies(of: j)
     }
 
     /// Distance-joint rest length (m): anchorA.w, read as `C = len − anchorA.w`
-    /// (M@HEAD:3801). The rod recovers a rest-length change through the split-impulse
-    /// BIAS only (M@HEAD:3813–3818) — its real part drives the anchors' velocity along
-    /// the rod to 0 (M@HEAD:3807–3812) — so a ramping winch lags its rest length by ≈ rate·dt/β and the
-    /// hoisted body reads as "slow" to the sleep test. This setter wakes both bodies,
+    /// (cdJointPrepareOne). The rod recovers a rest-length change through the
+    /// split-impulse BIAS only — its real row drives the anchors' velocity along the rod
+    /// to 0 — so a ramping winch lags its rest length by ≈ rate·dt/β and the hoisted
+    /// body reads as "slow" to the sleep test. This setter wakes both bodies,
     /// which is what keeps a hoist that is re-targeted every tick from falling asleep
     /// mid-move.
     public func setDistanceRestLength(_ joint: Int, _ rest: Float) {
@@ -448,12 +447,13 @@ extension CoinDEMSolver {
         wakeBodies(of: j)
     }
 
-    /// Hinge (radians) or prismatic (metres) limits: axisA.w = lo, axisB.w = hi
-    /// (M@HEAD:4014, 3923); nil (or lo == hi) turns them off — the kernels enable the
-    /// branch only for lo < hi. A PRISMATIC limit is measured as dot(pA − pB, aW)
-    /// (M@HEAD:3925), zero at creation. A HINGE limit is measured on the ABSOLUTE
-    /// relative orientation (M@HEAD:4018–4019) — see the T1 caveat at the top of this
-    /// file — which for a world hinge is the NEGATIVE of A's own angle.
+    /// Hinge (radians) or prismatic (metres) limits: axisA.w = lo, axisB.w = hi; nil (or
+    /// lo == hi) turns them off — the kernel enables them only for lo < hi. A PRISMATIC
+    /// limit bounds the slide dot(pA − pB, aW), zero at creation. A HINGE limit bounds
+    /// `hingeTwist` — the twist since the joint was made (VZ-0156), which for a world
+    /// hinge is the NEGATIVE of A's own turn. A stop is solved as a one-sided row of the
+    /// joint's block while it is within reach (speculative: the pair closes the gap and
+    /// no further), with the motor then a scalar row ahead of the block.
     public func setJointLimits(_ joint: Int, _ limits: ClosedRange<Float>?) {
         guard let j = liveJoint(joint, types: [1, 3]) else { return }
         let p = joints
@@ -468,9 +468,11 @@ extension CoinDEMSolver {
     // every sleep timer — one grip would wake every latched bar in the scene. A pooled
     // slot is instead RESERVED once (see CoinJointPool) and toggled here by writing the
     // whole CoinJoint, or just meta.w = 0, directly. Only the joint's own two bodies
-    // are woken. `slot` must be a reserved slot below the high-water mark (the kernels
-    // iterate 0..<jointCount, M@HEAD:3756; generate reads meta.w bits 0/1 at
-    // M@HEAD:2322–2323; the joint solve skips meta.w == 0 at M@HEAD:3758).
+    // are woken. `slot` must be a reserved slot below the high-water mark. The solver
+    // re-scans the table at every encode and hands the kernels only the ENABLED slots
+    // (the joint solve, generate's collideConnected check and the island union), and a
+    // slot enabled anew — or re-enabled between other bodies / at another anchor — starts
+    // with zero warm-start impulse (VZ-0150).
 
     /// A-local coordinates of a world point — the same maths as the private
     /// CoinDEMSolver.toLocal (S@HEAD:1363), re-derived from `coinBuffer`.
@@ -507,27 +509,32 @@ extension CoinDEMSolver {
                         Self.metaW(collideConnected)),
             anchorA: SIMD4(localPoint(bodyA, worldAnchor), 0),
             anchorB: SIMD4(bodyB.map { localPoint($0, worldAnchor) } ?? worldAnchor, 0),
-            axisA: SIMD4(0, 1, 0, 0), axisB: SIMD4(0, 1, 0, 0))
+            axisA: SIMD4(0, 1, 0, 0), axisB: SIMD4(0, 1, 0, 0),
+            ref: jointReference(bodyA, bodyB))
         wake(bodyB.map { [bodyA, $0] } ?? [bodyA])
     }
 
-    /// The sign `enableHinge` / `enablePrismatic` give axisB relative to axisA. −1 because
-    /// the kernel's axis-alignment bias is sign-inverted (header caveat): with axisB
-    /// anti-parallel, axisErr = aW × bW = +φ for a misalignment φ, and the SAME kernel
-    /// line (jAb = (−β·errT/dt − bwrel)/k, M@HEAD:3990 / 3852) then rotates A by −β·φ per
-    /// substep — restoring. Nothing else reads axisB.xyz: the ⟂ rows, motor, limits and
-    /// prismatic twist/slide all use aW = qa·axisA only (M@HEAD:3970–3975, 4002–4019;
-    /// 3832–3836, 3860–3925), so this lane changes the alignment term and nothing else.
-    static let axisBSign: Float = -1
+    /// The sign `enableHinge` / `enablePrismatic` give axisB relative to axisA: +1, the
+    /// same PARALLEL convention as addHingeJoint / addPrismaticJoint. It was −1 while the
+    /// kernel's axis-alignment bias was sign-inverted (VZ-0147: jAb = (−β·errT/dt −
+    /// bwrel)/k drove parallel axes apart, so anti-parallel was the stable storage); the
+    /// kernel now uses +β·errT/dt and parallel axes restore ×(1 − β) per substep.
+    /// Only the HINGE's two axis-alignment rows read axisB.xyz (their error is aW × bW);
+    /// its motor and limits use aW = qa·axisA and the twist from `ref`, and since VZ-0150
+    /// the prismatic does not read axisB at all (its rotation lock is the whole relative
+    /// orientation against `ref`). Flipping this back to −1 would make every pooled hinge
+    /// unstable — `testAxisAlignmentConventionPooledHoldsAddFlips` / CoinDEMCorrectnessTests
+    /// pin it.
+    static let axisBSign: Float = 1
 
     /// Enable a pooled slot as a free HINGE (no limits, no motor): ball at
-    /// `worldAnchor` + rotation only about `worldAxis`. Lanes (M@HEAD:3789–3790,
-    /// 3970–3976, 4002, 4014): meta = (1, A, B|world, 1 | cc<<1); anchorA = (A-local
-    /// anchor, motor target 0); anchorB = (B-local anchor or the world point, maxTorque
-    /// 0 ⇒ motor off); axisA = (A-local axis, lo 0); axisB = (`axisBSign` × the B-local
-    /// axis or the world axis, hi 0) — lo == hi ⇒ limit off, so no twist is ever
-    /// measured. Motor and limits can be added afterwards with `setHingeMotor` /
-    /// `setJointLimits` (the rig's slew and wrist). Wakes A and B.
+    /// `worldAnchor` + rotation only about `worldAxis`. Lanes: meta = (1, A, B|world,
+    /// 1 | cc<<1); anchorA = (A-local anchor, motor target 0); anchorB = (B-local anchor
+    /// or the world point, maxTorque 0 ⇒ motor off); axisA = (A-local axis, lo 0);
+    /// axisB = (`axisBSign` × the B-local axis or the world axis, hi 0) — lo == hi ⇒
+    /// limit off; ref = the relative orientation now, which the twist (and so any
+    /// limits added later) is measured from. Motor and limits can be added afterwards
+    /// with `setHingeMotor` / `setJointLimits` (the rig's slew and wrist). Wakes A and B.
     public func enableHinge(slot: Int, bodyA: Int, bodyB: Int?, worldAnchor: SIMD3<Float>,
                             worldAxis: SIMD3<Float>, collideConnected: Bool = false) {
         writePooledAxisJoint(type: 1, slot: slot, bodyA: bodyA, bodyB: bodyB, worldAnchor: worldAnchor,
@@ -536,15 +543,14 @@ extension CoinDEMSolver {
 
     /// Enable a pooled slot as a free PRISMATIC joint (no limits, no motor): A may only
     /// translate relative to B (or the world) along `worldAxis`, rotation fully locked.
-    /// Same lane layout as `enableHinge` with meta.x = 3 (M@HEAD:3832–3925): the slide
-    /// s = dot(pA − pB, aW) is 0 now, limits (`setJointLimits`, metres) are measured
-    /// from here, and the motor (`setPrismaticMotor`) drives A's velocity along aW
-    /// relative to B. The twist lock reads the ABSOLUTE relative orientation (T1): only
-    /// between bodies spawned with the same orientation. Wakes A and B.
+    /// Same lane layout as `enableHinge` with meta.x = 3: the slide s = dot(pA − pB, aW)
+    /// is 0 now, limits (`setJointLimits`, metres) are measured from here, and the motor
+    /// (`setPrismaticMotor`) drives A's velocity along aW relative to B. The rotation
+    /// lock holds the relative orientation captured now (`ref`, VZ-0156), whatever it
+    /// is. Wakes A and B.
     ///
-    /// Not in the §F.1 API: added because addPrismaticJoint stores the unstable
-    /// (parallel) axisB — see the header caveat — and the crane's trolley and plunger
-    /// are prismatic.
+    /// Not in the §F.1 API: added so the crane's trolley and plunger (prismatic) can be
+    /// pooled slots toggled without wakeAll, like the hinges.
     public func enablePrismatic(slot: Int, bodyA: Int, bodyB: Int?, worldAnchor: SIMD3<Float>,
                                 worldAxis: SIMD3<Float>, collideConnected: Bool = false) {
         writePooledAxisJoint(type: 3, slot: slot, bodyA: bodyA, bodyB: bodyB, worldAnchor: worldAnchor,
@@ -563,13 +569,14 @@ extension CoinDEMSolver {
             anchorA: SIMD4(localPoint(bodyA, worldAnchor), 0),
             anchorB: SIMD4(bodyB.map { localPoint($0, worldAnchor) } ?? worldAnchor, 0),
             axisA: SIMD4(localDir(bodyA, axis), 0),
-            axisB: SIMD4(Self.axisBSign * (bodyB.map { localDir($0, axis) } ?? axis), 0))
+            axisB: SIMD4(Self.axisBSign * (bodyB.map { localDir($0, axis) } ?? axis), 0),
+            ref: jointReference(bodyA, bodyB))
         wake(bodyB.map { [bodyA, $0] } ?? [bodyA])
     }
 
-    /// Disable a pooled slot in place: meta.w = 0 (the joint solve skips it,
-    /// M@HEAD:3758; generate treats it as absent, M@HEAD:2322; the island pass drops
-    /// its edge, M@HEAD:4065). NOT removeJoint (S@HEAD:1504), which would put the slot
+    /// Disable a pooled slot in place: meta.w = 0 (it leaves the next encode's active
+    /// list: the joint solve, generate's collideConnected check and the island union no
+    /// longer see it). NOT removeJoint (S@HEAD:1504), which would put the slot
     /// on the solver's own free list and wakeAll. Wakes the two bodies it joined, so
     /// a released body responds at once instead of hanging frozen.
     public func disableJoint(slot: Int) {
@@ -580,34 +587,29 @@ extension CoinDEMSolver {
         if Int(j.meta.y) < maxCoins { wakeBodies(of: j) }
     }
 
-    /// Enable a pooled RIGID WELD: two free hinges (`enableHinge`) through `worldAnchor`,
-    /// one about `axis1`, one about a perpendicular axis. Each hinge kills the relative
-    /// angular velocity perpendicular to its axis and bias-corrects its axis
-    /// misalignment (M@HEAD:3970–3993, restoring only because of the anti-parallel
-    /// axisB — see `axisBSign`); two perpendicular hinges therefore lock all three
-    /// rotational DOF, and both ball cores hold the same anchor (M@HEAD:3945–3966). The
-    /// axes are captured LOCALLY at enable time, so the weld holds the CURRENT relative
-    /// pose at any relative orientation — there is no twist term, hence no 4π wrap
-    /// (T1). Neither hinge has limits or a motor. Wakes A and B.
+    /// Enable a pooled RIGID WELD: the slot becomes a native WELD joint (type 4) holding
+    /// A and B (or A and the world) at their CURRENT relative pose — the ball core at
+    /// `worldAnchor` plus all three rotations, one 6-row block solve (VZ-0150). The
+    /// rotation lock is the vector part of the relative orientation against the one
+    /// captured now (`ref`), sign-canonicalised to w ≥ 0: it holds ANY relative
+    /// orientation, through any number of turns, and cannot wrap. Lanes: meta = (4, A,
+    /// B|world, 1 | cc<<1); anchorA/anchorB as `enableBall`; axes unused; ref. Wakes A
+    /// and B. (It was two perpendicular hinges on two slots before VZ-0150.)
     public func enableWeld(_ w: CoinWeld, bodyA: Int, bodyB: Int?, worldAnchor: SIMD3<Float>,
-                           axis1: SIMD3<Float>, collideConnected: Bool = false) {
-        guard poolSlotUsable(w.hingeA, bodyA, bodyB), poolSlotUsable(w.hingeB, bodyA, bodyB),
-              w.hingeA != w.hingeB else { return }
-        let l = simd_length(axis1)
-        let a1 = l > 1e-9 ? axis1 / l : SIMD3<Float>(0, 1, 0)
-        // Perpendicular: cross with the world axis least aligned with a1.
-        let e: SIMD3<Float> = abs(a1.x) <= abs(a1.y) && abs(a1.x) <= abs(a1.z) ? SIMD3(1, 0, 0)
-                            : (abs(a1.y) <= abs(a1.z) ? SIMD3(0, 1, 0) : SIMD3(0, 0, 1))
-        let a2 = simd_normalize(simd_cross(a1, e))
-        enableHinge(slot: w.hingeA, bodyA: bodyA, bodyB: bodyB, worldAnchor: worldAnchor,
-                    worldAxis: a1, collideConnected: collideConnected)
-        enableHinge(slot: w.hingeB, bodyA: bodyA, bodyB: bodyB, worldAnchor: worldAnchor,
-                    worldAxis: a2, collideConnected: collideConnected)
+                           collideConnected: Bool = false) {
+        guard poolSlotUsable(w.slot, bodyA, bodyB) else { return }
+        joints[w.slot] = CoinJoint(
+            meta: SIMD4(4, UInt32(bodyA), bodyB.map { UInt32($0) } ?? Self.worldBody,
+                        Self.metaW(collideConnected)),
+            anchorA: SIMD4(localPoint(bodyA, worldAnchor), 0),
+            anchorB: SIMD4(bodyB.map { localPoint($0, worldAnchor) } ?? worldAnchor, 0),
+            axisA: SIMD4(0, 1, 0, 0), axisB: SIMD4(0, 1, 0, 0),
+            ref: jointReference(bodyA, bodyB))
+        wake(bodyB.map { [bodyA, $0] } ?? [bodyA])
     }
 
     public func disableWeld(_ w: CoinWeld) {
-        disableJoint(slot: w.hingeA)
-        disableJoint(slot: w.hingeB)
+        disableJoint(slot: w.slot)
     }
 
     // ── E6: read-backs (idle only; the kernels' own formulas) ─────────────────
@@ -659,26 +661,27 @@ extension CoinDEMSolver {
         return (pA, pB)
     }
 
-    /// The kernel's twist for a hinge (or prismatic) joint — M@HEAD:4018–4019
-    /// (3863–3864): qrel = world ? conj(qa) : qb ⊗ conj(qa), aW = normalize(qa·axisA),
-    /// twist = 2·atan2(qrel.xyz·aW, qrel.w). This is the quantity `setJointLimits`
-    /// bounds: ABSOLUTE (not relative to creation), in (−2π, 2π], jumping by 4π when
-    /// qrel.w changes sign, and for a world hinge the NEGATIVE of A's own angle.
+    /// The kernel's twist for a hinge (or prismatic) joint (cdJointPrepareOne): the
+    /// relative orientation against the one at creation, qe = (conj(qa)·qb)·conj(ref)
+    /// (world: qb = identity), sign-canonicalised to w ≥ 0, and twist = 2·atan2(qe.xyz ·
+    /// axisA, qe.w) about the A-local axis. This is the quantity `setJointLimits` bounds:
+    /// 0 at creation, in (−π, π], no 4π jump (VZ-0156), and for a world hinge the
+    /// NEGATIVE of A's own turn since creation (B relative to A).
     public func hingeTwist(_ joint: Int) -> Float? {
         guard let j = liveJoint(joint, types: [1, 3]) else { return nil }
         let ia = Int(j.meta.y)
         guard isActiveBody(ia) else { return nil }
         let qa = bodies[ia].orient
-        let aW = simd_normalize(quatRotate(qa, SIMD3(j.axisA.x, j.axisA.y, j.axisA.z)))
-        let qrel: SIMD4<Float>
-        if j.meta.z == Self.worldBody {
-            qrel = SIMD4(-qa.x, -qa.y, -qa.z, qa.w)
-        } else {
+        var qb = SIMD4<Float>(0, 0, 0, 1)
+        if j.meta.z != Self.worldBody {
             let ib = Int(j.meta.z)
             guard isActiveBody(ib) else { return nil }
-            qrel = quatMul(bodies[ib].orient, SIMD4(-qa.x, -qa.y, -qa.z, qa.w))
+            qb = bodies[ib].orient
         }
-        return 2 * atan2(simd_dot(SIMD3(qrel.x, qrel.y, qrel.z), aW), qrel.w)
+        var qe = quatMul(quatMul(SIMD4(-qa.x, -qa.y, -qa.z, qa.w), qb), SIMD4(-j.ref.x, -j.ref.y, -j.ref.z, j.ref.w))
+        if qe.w < 0 { qe = -qe }
+        let axis = simd_normalize(SIMD3(j.axisA.x, j.axisA.y, j.axisA.z))
+        return 2 * atan2(simd_dot(SIMD3(qe.x, qe.y, qe.z), axis), qe.w)
     }
 
     /// Prismatic slide s = dot(pA − pB, aW), aW = normalize(qa·axisA) — M@HEAD:3832,
@@ -701,7 +704,9 @@ extension CoinDEMSolver {
     /// body in `slots` (contactBuffer / contactCountBuffer, S@HEAD:359–360; the count
     /// is clamped to capacity). meta.y == 0xFFFF_FFFF marks a static contact, whose
     /// meta.z is the collider index. A frame skipped because the whole world slept
-    /// leaves the previous frame's contacts in place.
+    /// leaves the previous frame's contacts in place. An ASLEEP body's contacts with
+    /// statics and with other asleep bodies are not generated (VZ-0152) — only its
+    /// contacts with awake bodies appear — so read resting contacts while it is awake.
     public func contacts(touching slots: Set<Int>) -> [CoinContact] {
         let n = contactCount
         guard n > 0, !slots.isEmpty else { return [] }
@@ -742,9 +747,8 @@ extension CoinDEMSolver {
 /// than `removeJoint`, so the slots stay below the solver's high-water mark and OFF
 /// its own free list: no later add*Joint can claim them, and toggling them through
 /// `enableBall` / `enableHinge` / `enableWeld` / `disableJoint` never calls wakeAll.
-/// Cost: every reserved slot is scanned by the serial joint pass and by the
-/// collideConnected check in contact generation, enabled or not — reserve what the
-/// scene needs, not the table.
+/// Cost: a reserved slot is one CPU check per encode while disabled; the GPU kernels
+/// read only enabled slots (VZ-0150 item 4c), so a generous reserve is free.
 @MainActor
 public final class CoinJointPool {
     public let solver: CoinDEMSolver
@@ -780,8 +784,7 @@ public final class CoinJointPool {
     }
 
     public func takeWeld() -> CoinWeld? {
-        guard free.count >= 2, let a = takeSlot(), let b = takeSlot() else { return nil }
-        return CoinWeld(hingeA: a, hingeB: b)
+        takeSlot().map { CoinWeld(slot: $0) }
     }
 
     /// Return a slot: disables it (waking its two bodies) if it is still enabled.
@@ -792,7 +795,6 @@ public final class CoinJointPool {
     }
 
     public func give(_ w: CoinWeld) {
-        give(w.hingeB)
-        give(w.hingeA)
+        give(w.slot)
     }
 }

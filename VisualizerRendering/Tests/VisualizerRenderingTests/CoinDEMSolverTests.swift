@@ -136,11 +136,16 @@ final class CoinDEMSolverTests: XCTestCase {
             }
         }
         for _ in 0..<400 { let cb = queue.makeCommandBuffer()!; solver.encode(to: cb, wallDt: 1.0/60.0); cb.commit(); cb.waitUntilCompleted() }  // gpu-ok: test harness
+        // The settled pile is ASLEEP, and asleep–asleep / asleep–static pairs generate no
+        // contacts (VZ-0152) — wake it so the one-shot generation sees the pile's whole
+        // contact graph, which is what this test measures the colour count of.
+        solver.wakeAll()
         let n = solver.generateContactsNow(color: true)
         let ptr = solver.contactBuffer.contents().bindMemory(to: CoinContact.self, capacity: max(1, n))
         var maxColor = -1, uncolored = 0
         for i in 0..<n { let c = Int(ptr[i].tan2.w); if c < 0 { uncolored += 1 } else { maxColor = max(maxColor, c) } }
         print("DENSE_COLORS contacts=\(n) maxColor=\(maxColor) colors=\(maxColor+1) uncolored=\(uncolored)")
+        XCTAssertGreaterThan(n, 300, "the settled dense pile's contact graph was generated (not vacuous)")
         XCTAssertLessThanOrEqual(maxColor + 1, CoinDEMSolver.maxColors, "colour count fits the colour cap")
         XCTAssertEqual(uncolored, 0, "every contact is coloured, so every contact is solved")
         // The denser shipped Pile of Mess settle reaches ~52 colours (RigidPileFieldTests);
