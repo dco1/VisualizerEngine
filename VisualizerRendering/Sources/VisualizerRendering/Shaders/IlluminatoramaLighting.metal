@@ -314,11 +314,19 @@ static inline float rtSunSoftVisibility(
     isect.set_triangle_cull_mode(triangle_cull_mode::none);
     isect.accept_any_intersection(true);   // shadow ray: any hit ends it
 
+    // Daydream DH-0887 — PROGRESSIVE: ray `s` of frame `rtSunShadowSeed` is point
+    // `seed·rays + s` of this pixel's own Owen-scrambled Sobol sequence, so an accumulated still
+    // averages one stratified set across all its frames (a frozen seed of 0 repeats one
+    // stratified set). It was a white-noise draw per ray, re-randomised each frame: an average
+    // over N frames converged only as 1/√N, and needed 4 rays a frame to do it.
+    uint sobolSeed = illumiPixelSeed(gid, 0x53554Eu);
+    (void)seed;
     uint hits = 0u;
     for (uint s = 0u; s < rays; ++s) {
+        float2 q = illumiSobolOwen2DShuffled(frame.rtSunShadowSeed * rays + s, sobolSeed);
         ray sr;
         sr.origin = origin;
-        sr.direction = coneSample(Ld, frame.rtSunShadowAngle, rnd(seed), rnd(seed));
+        sr.direction = coneSample(Ld, frame.rtSunShadowAngle, q.x, q.y);
         sr.min_distance = 2e-3;
         sr.max_distance = 1e4;
         if (isect.intersect(sr, accel, kRTSunShadowRayMask).type != intersection_type::none) {
@@ -359,10 +367,14 @@ static inline float rtAreaVisibility(
     isect.set_triangle_cull_mode(triangle_cull_mode::none);
     isect.accept_any_intersection(true);
 
+    // DH-0887 — progressive, as the sun above: one Owen-scrambled Sobol stream per portal.
+    uint sobolSeed = illumiPixelSeed(gid, 0x504F52u + lightIndex * 7919u);
+    (void)seed;
     uint hits = 0u;
     for (uint s = 0u; s < rays; ++s) {
-        float u = rnd(seed) * 2.0 - 1.0;
-        float v = rnd(seed) * 2.0 - 1.0;
+        float2 q = illumiSobolOwen2DShuffled(frame.rtSunShadowSeed * rays + s, sobolSeed);
+        float u = q.x * 2.0 - 1.0;
+        float v = q.y * 2.0 - 1.0;
         float3 target = al.center + al.ex * u + al.ey * v;
         float3 d = target - origin;
         float  len = length(d);
