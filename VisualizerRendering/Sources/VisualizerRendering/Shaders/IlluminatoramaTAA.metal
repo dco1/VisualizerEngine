@@ -295,7 +295,11 @@ kernel void illumi_taa_resolve(
     // edge must still converge/AA (that's the whole point of TAA). On a still
     // camera velMag ≈ 0 → specReject ≈ 0 → this is a no-op.
     float yH = historyYCoCg.x, yC = currentYCoCg.x;
-    float lumaDisagree = abs(yH - yC) / (max(yH, yC) + 0.2);
+    // HDR pre-exposure (`hdrPreExposure`, displayParams.x; 0 ⇒ 1): the absolute constants below
+    // (the +0.2 floor, the anti-flicker `1 + luma`) are in UNSCALED units.
+    float preK = frame.displayParams.x > 0.0 ? frame.displayParams.x : 1.0;
+    float invPreK = 1.0 / preK;
+    float lumaDisagree = abs(yH - yC) / (max(yH, yC) + 0.2 * preK);
     float specReject   = lumaDisagree * smoothstep(0.004, 0.02, velMag);
     alpha = clamp(mix(alpha, 1.0, 0.5 * specReject), 0.01, 1.0);
 
@@ -309,8 +313,8 @@ kernel void illumi_taa_resolve(
     // reduction in streaking on emissive / specular content, where reprojection
     // is least reliable. Reduces to the plain `mix` for dark pixels. (Karis
     // anti-flicker weighting; blend done in YCoCg, weighted by the Y term.)
-    float wC = alpha         * (1.0 / (1.0 + max(0.0, currentYCoCg.x)));
-    float wH = (1.0 - alpha) * (1.0 / (1.0 + max(0.0, historyYCoCg.x)));
+    float wC = alpha         * (1.0 / (1.0 + max(0.0, currentYCoCg.x) * invPreK));
+    float wH = (1.0 - alpha) * (1.0 / (1.0 + max(0.0, historyYCoCg.x) * invPreK));
     float3 resultYCoCg = (currentYCoCg * wC + historyYCoCg * wH) / max(1e-5, wC + wH);
 
     // ── Mild luma sharpen — DOWNSTREAM ONLY, never into the accumulator ───────

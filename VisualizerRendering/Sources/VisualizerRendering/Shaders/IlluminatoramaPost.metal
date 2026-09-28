@@ -93,7 +93,7 @@ static inline void illumiBloomFetch13(texture2d<half, access::sample> src,
 /// on the FIRST downsample ONLY: by mip1 every tap is already an average of 16+
 /// source pixels, so re-weighting them is no longer firefly rejection — it is a
 /// non-energy-conserving bias that drags the whole halo dark.
-static inline float3 illumiBloomCombine13(thread const float3 *t, bool karis) {
+static inline float3 illumiBloomCombine13(thread const float3 *t, bool karis, float invPre = 1.0) {
     float3 q0 = (t[9] + t[10] + t[11] + t[12]) * 0.25;   // inner ±1 quad
     float3 q1 = (t[0] + t[1] + t[3] + t[4]) * 0.25;      // top-left
     float3 q2 = (t[1] + t[2] + t[4] + t[5]) * 0.25;      // top-right
@@ -102,11 +102,11 @@ static inline float3 illumiBloomCombine13(thread const float3 *t, bool karis) {
     if (!karis) {
         return q0 * 0.5 + (q1 + q2 + q3 + q4) * 0.125;
     }
-    float w0 = 0.5   / (1.0 + illumiBloomLuma(q0));
-    float w1 = 0.125 / (1.0 + illumiBloomLuma(q1));
-    float w2 = 0.125 / (1.0 + illumiBloomLuma(q2));
-    float w3 = 0.125 / (1.0 + illumiBloomLuma(q3));
-    float w4 = 0.125 / (1.0 + illumiBloomLuma(q4));
+    float w0 = 0.5   / (1.0 + illumiBloomLuma(q0) * invPre);
+    float w1 = 0.125 / (1.0 + illumiBloomLuma(q1) * invPre);
+    float w2 = 0.125 / (1.0 + illumiBloomLuma(q2) * invPre);
+    float w3 = 0.125 / (1.0 + illumiBloomLuma(q3) * invPre);
+    float w4 = 0.125 / (1.0 + illumiBloomLuma(q4) * invPre);
     // Renormalised, so a FLAT input reproduces itself exactly (every weight
     // scales by the same 1/(1+L) and it cancels) — the suppression only bites
     // where the quads disagree, which is what a firefly is.
@@ -155,7 +155,10 @@ kernel void illumi_bloom_prefilter(
     for (int i = 0; i < 13; ++i) {
         t[i] = illumiBloomKnee(max(t[i], 0.0), threshold, knee);
     }
-    outMip0.write(half4(half3(illumiBloomCombine13(t, true)), 1.0h), gid);
+    // The Karis weight is 1/(1 + luma) of the UNSCALED frame: divide an HDR pre-exposure back
+    // out (`hdrPreExposure`; displayParams.x = 0 ⇒ 1 ⇒ the multiply by 1.0 is exact).
+    float invPre = frame.displayParams.x > 0.0 ? 1.0 / frame.displayParams.x : 1.0;
+    outMip0.write(half4(half3(illumiBloomCombine13(t, true, invPre)), 1.0h), gid);
 }
 
 /// Down-chain: mip N-1 → mip N. Plain 13-tap box, no threshold (mip0 already

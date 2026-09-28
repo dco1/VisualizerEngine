@@ -1515,6 +1515,9 @@ public final class IlluminatoramaRenderer {
     /// Physical model only — world → J2000-equatorial rotation as a quaternion
     /// (ix, iy, iz, r); see `NightSkyEphemeris.celestialOrientation`. Identity by default.
     public var nightSkyCelestialOrientation: SIMD4<Float> = SIMD4(0, 0, 0, 1)
+    /// Physical model only — the faintest star drawn (visual magnitude); 0 (default) = no limit
+    /// beyond the per-pixel washout. See `VolumetricCloudRenderer.Params.starLimitingMagnitude`.
+    public var nightSkyStarLimitingMagnitude: Float = 0
     /// Scotopic tonemap shaping (see `scotopicDesaturation`): the display luma by which the
     /// night desaturation has faded out (0 = the legacy 0.08) and the Purkinje tint rod
     /// vision is pulled toward (.zero = the legacy neutral grey).
@@ -1547,6 +1550,7 @@ public final class IlluminatoramaRenderer {
         nightSkyTwinkle = max(0, p.starTwinkle)
         nightSkyRadiance = max(0, p.nightRadiance)
         nightSkyCelestialOrientation = p.celestialOrientation
+        nightSkyStarLimitingMagnitude = max(0, p.starLimitingMagnitude)
     }
 
     /// The physical-night-sky uniform clusters, packed ONCE for the frame and the glass pass
@@ -1557,7 +1561,7 @@ public final class IlluminatoramaRenderer {
         let q = nightSkyCelestialOrientation
         let qn = simd_length(q) > 1e-6 ? q / simd_length(q) : SIMD4<Float>(0, 0, 0, 1)
         return (SIMD4(1, max(0, nightSkyMoonHalo), max(0, nightSkyEarthshine), max(0, nightSkyMilkyWay)),
-                SIMD4(max(0, nightSkyTwinkle), max(0, nightSkyRadiance), time, 0),
+                SIMD4(max(0, nightSkyTwinkle), max(0, nightSkyRadiance), time, max(0, nightSkyStarLimitingMagnitude)),
                 qn)
     }
     // DEFAULTS LESSON (PR #33 fix): the initial Phase 2.5 defaults were
@@ -1840,6 +1844,12 @@ public final class IlluminatoramaRenderer {
     /// compression to compensate, so 1.10 is enough. 1.0 = no change. Tunable
     /// per-scene if a scene's intentional pastel palette doesn't want the boost.
     public var tonemapSaturation: Float = 1.10
+    /// **Local tone mapping** — eye-like local adaptation of the scene-referred frame before the
+    /// display transform (edge-aware, bilateral-grid base layer; see
+    /// `IlluminatoramaLocalToneMapping`). Runs after DOF, before bloom / halation / tonemap, and
+    /// after the exposure meter (the meter never sees its own adaptation). `strength == 0`
+    /// (default) ⇒ not encoded ⇒ byte-identical frames for every scene that doesn't opt in.
+    public var localToneMapping = IlluminatoramaLocalToneMapping()
     // ── Tonemap colour-grade (white-balance / tint / contrast / shadows / highlights) ──
     /// White-balance colour temperature in Kelvin (~2000–10000). 6500 = neutral
     /// (channel gain (1,1,1) → exact no-op). Photo-tool convention (DH-0453):
@@ -2033,6 +2043,39 @@ public final class IlluminatoramaRenderer {
     /// 8-bit store. On = smooth gradients; off = raw 8-bit quantisation
     /// (exposes contour banding). Exposed for live A/B of gradient banding.
     public var debandDitherEnabled: Bool = true
+    /// Opt-in: dither in the TRUE sRGB encoding the 8-bit store applies (its linear toe
+    /// included) instead of the legacy `pow(1/2.2)` approximation. Near black the two diverge
+    /// — the approximation's slope is up to ~5× the real OETF's below code 4, so its "±1 LSB"
+    /// lands as ±0.2–0.5 of a real code and a dark gradient's lowest steps are barely
+    /// dithered. A night frame whose whole wall sits in codes 0–11 (Digital Clock) needs the
+    /// real ±1 LSB there. False (default) ⇒ the legacy dither, byte-identical.
+    public var debandDitherExactSRGB: Bool = false
+
+    // ── Display chain for a physically-scaled night (VZ-0170) ────────────
+    /// **HDR pre-exposure** (Frostbite / UE style). The lit frame is stored in rgba16Float, whose
+    /// normal range ends at 6.1e-5 and whose smallest subnormal step is 6e-8: a scene kept on a
+    /// real photometric scale anchored on a bright emitter (Digital Clock: 1 unit ≈ 1050 cd/m²)
+    /// puts a moonlit room at ~1e-7 — a handful of subnormal steps — and a moonless one at
+    /// exactly 0, before any exposure or local adaptation can see it. A host that sets this to
+    /// K promises it has scaled EVERY light, emission and sky radiance it feeds the frame by K
+    /// (the same scene, K times brighter in the buffer); the renderer then divides K back out
+    /// wherever an absolute level matters — the tonemap's and the local tone mapping's exposure,
+    /// the auto-exposure meter's samples, the bloom / halation thresholds, and the TAA / bloom
+    /// anti-firefly `1/(1+luma)` weights — so the printed frame is the unscaled one, with the
+    /// dim end kept in fp16's normal range. The HDR dump (`VIZ_ILLUMI_HDR_DUMP_PATH`) records the
+    /// K-scaled pixels with the matching exposure, so exposed levels read the same.
+    /// 1 (default) ⇒ every divide is by exactly 1 ⇒ byte-identical.
+    public var hdrPreExposure: Float = 1
+    /// **Hue-stable toe** — opt-in knee [lo, hi] in EXPOSED brightness (the meter's metric,
+    /// max(luma, ½·max channel), after exposure and local tone mapping). AgX's per-channel sigmoid
+    /// (and its 'punchy' power) behaves like a ~2.3-power in its toe, so every channel RATIO in
+    /// the dark end is raised to roughly that power — more with the post-tonemap saturation push
+    /// on top (measured on Digital Clock's 19:40 frame: a lavander sky, linear 1 : 0.66 : 1.63,
+    /// printed (14, 2, 53)). Below `lo` the display transform runs on the pixel's max-RGB norm
+    /// and rescales its colour (the scene's own linear ratios, no per-channel toe) and the
+    /// saturation push is off; above `hi` both are exactly the shipped ones; between, a
+    /// smoothstep blend. `.zero` (default, `hi == 0`) ⇒ off, byte-identical.
+    public var hueStableToe: SIMD2<Float> = .zero
 
     // ── Phase 9 — film-stock LUT (post-tonemap colour grade) ─────────
     /// The film stock's cube as an `MTLTexture3D`, N×N×N. `nil` = stock bypassed
@@ -4655,6 +4698,7 @@ public final class IlluminatoramaRenderer {
         var extra: SIMD4<Float> = .zero
         /// x = the renderer's frame clock (s) — stellar scintillation in the physical night
         /// sky (per frame, so a twinkle never steps at the host's sky-update rate).
+        /// y = 1 when the multiple-scattering kernel runs with the atmosphere LUTs at buffer(3).
         var night: SIMD4<Float> = .zero
     }
     private let cloudInViewPipeline: MTLComputePipelineState?
@@ -4701,6 +4745,9 @@ public final class IlluminatoramaRenderer {
     private var cloudLowResTexture: MTLTexture?
     private lazy var cloudUpsamplePipeline: MTLComputePipelineState? =
         engine.pipelineCache.pipelineState(name: "illumi_cloud_upsample", device: device)
+    /// The in-view kernel with the multiple-scattering sky (built on first use).
+    private lazy var cloudInViewPipelineMS: MTLComputePipelineState? =
+        engine.pipelineCache.pipelineState(name: "illumi_cloud_inview_ms", device: device)
     /// Baked noise volume + packed SkyUniforms + burst-light buffer, supplied by
     /// the scene's `VolumetricCloudRenderer` (reused, not re-packed).
     public var cloudNoiseTexture: MTLTexture?
@@ -10051,12 +10098,16 @@ public final class IlluminatoramaRenderer {
         // bloom + tonemap so the smoothed exposure is fresh by the time
         // the tonemap binds the exposure buffer.
         encodeExposureEstimate(cb)
+        localToneMapOutput = nil
         // Depth of field on the resolved HDR before bloom, so out-of-focus
         // bright dust motes bloom into soft bokeh. No-op unless enabled.
         encodeDOFPass(cb)
         // Feathered halo glow around selected objects. After DOF (outline stays
         // sharp even on out-of-focus geometry) and before bloom (halo blooms soft).
         encodeSelectionOutlinePass(cb)
+        // Local adaptation (opt-in) of the finished optical image; bloom / halation /
+        // tonemap read its output through `bloomTonemapSource`.
+        encodeLocalToneMap(cb)
         encodeBloomPasses(cb)
         // Film halation reads the same HDR source bloom does (post-TAA, post-DOF), so
         // a blown out-of-focus highlight halates as softly as it blooms. No-op — not
@@ -13003,18 +13054,24 @@ public final class IlluminatoramaRenderer {
             lowRes = cloudUpsamplePipeline == nil ? nil : cloudLowResTexture
         }
         let f = lowRes == nil ? 1 : factor
+        // Multiple scattering (`VolumetricCloudRenderer.Params.atmosphereMultipleScattering`):
+        // its LUTs live after the uniforms in the cloud renderer's uniforms buffer, so this pass
+        // draws the same sky as the dome and IBL with no extra wiring — `illumi_cloud_inview_ms`
+        // with the LUT region at buffer(3) (night.y = bound). Off: the unchanged kernel.
+        let msPipeline = VolumetricCloudRenderer.multipleScatteringRequested(in: skyU) ? cloudInViewPipelineMS : nil
+        let marchPipeline = msPipeline ?? pipeline   // threadgroups are sized from the bound kernel
         var u = CloudInViewUniforms(invViewProjection: fu.invViewProjection,
                                     cameraWorldPos: SIMD4<Float>(fu.cameraWorldPos, f > 1 ? Float(f) : 0),
                                     extra: SIMD4<Float>(inViewSkyTime ?? time, inViewLavaFade.map { min(max($0, 0), 1) } ?? -1,
                                                          inViewCirrusTime.map { max($0, 0) } ?? -1,
                                                          inViewCirrusThreads.map { min(max($0, 0), 1) } ?? -1),
-                                    night: SIMD4<Float>(time, 0, 0, 0))
+                                    night: SIMD4<Float>(time, msPipeline != nil ? 1 : 0, 0, 0))
         // setBytes, not a shared MTLBuffer: with two frames in flight a single buffer was overwritten by frame N+1 while frame N's kernels could still read it (the
         // camera matrix the rays — and the upsample's stars — are rebuilt from).
         let uStride = MemoryLayout<CloudInViewUniforms>.stride
         guard let enc = timedComputeEncoder(cb, "cloudInView") else { return }
         enc.label = "Illuminatorama.cloudInView"
-        enc.setComputePipelineState(pipeline)
+        enc.setComputePipelineState(marchPipeline)
         enc.setTexture(lowRes ?? hdrCompositeTexture, index: 0)
         enc.setTexture(noise, index: 1)
         // v2 depth clip — the kernel writes only where this says there is no
@@ -13023,8 +13080,9 @@ public final class IlluminatoramaRenderer {
         enc.setBuffer(skyU, offset: 0, index: 0)
         enc.setBytes(&u, length: uStride, index: 1)
         enc.setBuffer(lights, offset: 0, index: 2)
+        if msPipeline != nil { enc.setBuffer(skyU, offset: VolumetricCloudRenderer.atmosphereLUTOffset, index: 3) }
         if let lowRes {
-            dispatch(enc, pipeline: pipeline, width: lowRes.width, height: lowRes.height)
+            dispatch(enc, pipeline: marchPipeline, width: lowRes.width, height: lowRes.height)
             enc.endEncoding()
             guard let up = cloudUpsamplePipeline,
                   let enc2 = timedComputeEncoder(cb, "cloudInView.upsample") else { return }
@@ -13038,7 +13096,7 @@ public final class IlluminatoramaRenderer {
             dispatch(enc2, pipeline: up, width: width, height: height)
             enc2.endEncoding()
         } else {
-            dispatch(enc, pipeline: pipeline, width: width, height: height)
+            dispatch(enc, pipeline: marchPipeline, width: width, height: height)
             enc.endEncoding()
         }
     }
@@ -13138,8 +13196,36 @@ public final class IlluminatoramaRenderer {
     /// Source for bloom + tonemap: the DOF output when DOF ran this frame,
     /// otherwise the raw post-FX source. (Exposure estimate still reads the
     /// pre-DOF source so the blur doesn't perturb auto-exposure.)
+    /// `hdrPreExposure`, sanitised (non-finite / ≤ 0 ⇒ 1).
+    private var preExposureDivisor: Float {
+        hdrPreExposure.isFinite && hdrPreExposure > 0 ? hdrPreExposure : 1
+    }
+
     private var bloomTonemapSource: MTLTexture {
-        (dofApplied ? dofOutputTexture : nil) ?? displaySource
+        localToneMapOutput ?? (dofApplied ? dofOutputTexture : nil) ?? displaySource
+    }
+
+    // ── Local tone mapping (IlluminatoramaLocalToneMap.swift) ─────────────
+    private lazy var localToneMapPass = IlluminatoramaLocalToneMapPass(engine: engine)
+    private lazy var hdrDump = IlluminatoramaHDRDump()
+    /// This frame's adapted HDR (nil = the pass didn't run). Reset before DOF each frame.
+    private var localToneMapOutput: MTLTexture?
+
+    /// Local adaptation of the finished optical image (post-DOF, post-outline) — what bloom,
+    /// halation and the tonemap then read. No-op unless `localToneMapping.isEnabled`; the
+    /// `VIZ_ILLUMI_HDR_DUMP_PATH` diagnostic dumps the frame it would adapt either way. The
+    /// exposure it anchors on is the tonemap's own (`easedExposure` × the metered exposure).
+    private func encodeLocalToneMap(_ cb: MTLCommandBuffer) {
+        let source = bloomTonemapSource
+        if IlluminatoramaHDRDump.path != nil {
+            hdrDump.encode(cb, source: source, exposureBuffer: exposureBuffer,
+                           hostExposure: easedExposure / preExposureDivisor, autoExposure: autoExposureEnabled)
+        }
+        guard localToneMapping.isEnabled else { return }
+        localToneMapOutput = localToneMapPass.encode(
+            cb, source: source, exposureBuffer: exposureBuffer, hostExposure: easedExposure / preExposureDivisor,
+            autoExposure: autoExposureEnabled, settings: localToneMapping,
+            makeEncoder: { self.timedComputeEncoder(cb, $0) })
     }
 
     /// Lens-accurate depth-of-field on the resolved HDR. Runs after the exposure
@@ -13447,9 +13533,11 @@ public final class IlluminatoramaRenderer {
         // kernel), y = the EV the frame's bright half is asked to land at. See
         // `autoExposureHighlightProtection` for why the statistic is the upper-half
         // mean rather than a percentile.
+        // w = the HDR pre-exposure the samples are divided by (0 ⇒ none — `hdrPreExposure`).
         var params2 = SIMD4<Float>(max(0, min(1, autoExposureHighlightProtection)),
                                    autoExposureHighlightEV,
-                                   exposureHistogramEnabled ? 1 : 0, 0)
+                                   exposureHistogramEnabled ? 1 : 0,
+                                   preExposureDivisor == 1 ? 0 : preExposureDivisor)
         enc.setBytes(&params2, length: MemoryLayout<SIMD4<Float>>.stride, index: 3)
         // params3 (DH-0655): x = metering (0 mean, 1 percentile), y = key percentile,
         // z = guard percentile (0 = none), w = guard EV. Mean + instrument off ⇒ no histogram.
@@ -13981,8 +14069,8 @@ public final class IlluminatoramaRenderer {
             directionalLightDir: simd_normalize(directionalLightDirection),
             directionalLightColor: directionalLightColor,
             ambientColor: ambientColor,
-            exposure: easedExposure,
-            bloomThreshold: easedBloomThreshold,
+            exposure: easedExposure / preExposureDivisor,
+            bloomThreshold: easedBloomThreshold * preExposureDivisor,
             bloomIntensity: easedBloomIntensity,
             pointLightCount: UInt32(pointLights.count),
             time: time,
@@ -14023,7 +14111,7 @@ public final class IlluminatoramaRenderer {
             ssrTemporalBlend: ssrTemporalBlend,
             ssaoIsFirstFrame: aoNeedsFirstFrame ? 1 : 0,
             ssrIsFirstFrame: ssrNeedsFirstFrame ? 1 : 0,
-            debandDitherEnabled: debandDitherEnabled ? 1 : 0,
+            debandDitherEnabled: debandDitherEnabled ? (debandDitherExactSRGB ? 2 : 1) : 0,
             ddgiIrrCacheEnabled: (ddgiIrrCacheEnabled && ddgiEnabled) ? 1 : 0,
             ddgiIrrCacheBlend: max(0.0, min(1.0, ddgiIrrCacheBlend)),
             leafTransmission: max(0, leafTransmission),
@@ -14121,7 +14209,7 @@ public final class IlluminatoramaRenderer {
         // dispatch, so a non-opting scene is byte-identical. The radius floor of 1
         // keeps the shader's tap spacing from collapsing if a host sets radius 0.
         u.halationParams = SIMD4(max(0, easedHalationIntensity),
-                                 easedHalationThreshold,
+                                 easedHalationThreshold * preExposureDivisor,
                                  max(1, easedHalationRadius),
                                  0)
         u.halationTint = SIMD4(easedHalationTint.x, easedHalationTint.y, easedHalationTint.z, 0)
@@ -14239,6 +14327,10 @@ public final class IlluminatoramaRenderer {
         u.nightSunDir = SIMD4(sunDirSafe, 0)
         (u.nightSkyExtra, u.nightSkyExtra2, u.nightCelestial) = physicalNightSkyClusters()
         u.scotopicParams = SIMD4<Float>(max(0, scotopicKnee), max(0, scotopicTint.x), max(0, scotopicTint.y), max(0, scotopicTint.z))
+        // Pre-exposure + hue-stable toe (all zero by default ⇒ the shader's legacy paths).
+        let toeHi = max(0, hueStableToe.y)
+        u.displayParams = SIMD4<Float>(preExposureDivisor == 1 ? 0 : preExposureDivisor,
+                                       toeHi > 0 ? max(0, min(hueStableToe.x, toeHi * 0.999)) : 0, toeHi, 0)
         // Lens flare: project the primary sun's direction to screen uv. w carries the
         // on-screen weight — a smooth fade as the sun leaves the frame, hard 0 behind
         // the camera (clip.w ≤ 0). Strength 0 (default) leaves the whole cluster zero,

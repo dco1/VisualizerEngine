@@ -84,6 +84,7 @@ struct NightSkyParams {
     float  clock;          // seconds — drives scintillation
     float  radiance;       // scene radiance of a magnitude-0 flux over 1 sr
     float4 celestial;      // world → equatorial quaternion (xyz imaginary, w real); 0 ⇒ identity
+    float  limitMag;       // physical: stars fainter than this are not drawn (0 ⇒ no limit)
 };
 
 /// Zeroed params — the exact no-op every non-night scene gets.
@@ -93,6 +94,7 @@ static inline NightSkyParams nightSkyOff() {
     p.starBrightness = 0; p.moonIntensity = 0; p.moonAngRadius = 0;
     p.model = 0; p.moonHalo = 0; p.earthshine = 0; p.milkyWay = 0;
     p.twinkle = 0; p.clock = 0; p.radiance = 0; p.celestial = float4(0);
+    p.limitMag = 0;
     return p;
 }
 
@@ -461,8 +463,13 @@ constant float kStarMeanF0 = 11.0f;
 ///   pixAngle   angular size of one output pixel (radians) — the point-spread width
 ///   gain       scene radiance per F0/sr (`radiance × starBrightness`)
 ///   bgLum      luminance of the sky BEHIND the star (washout)
+///   limitMag   the faintest magnitude the observer can see (0 ⇒ no limit): a LIMITING
+///              MAGNITUDE the host derives from its sky brightness (a city's skyglow). The
+///              washout below is a per-PIXEL contrast — a point source on one pixel keeps a
+///              huge contrast against any diffuse sky, so it alone leaves m ≈ 12 stars visible
+///              under a city sky whose naked-eye limit is ≈ 4. Faded over ±0.5 mag.
 static inline float3 nightStarsPhysical(float3 dEq, float sinEl, float pixAngle, float gain,
-                                        float bgLum, float twinkle, float clock) {
+                                        float bgLum, float twinkle, float clock, float limitMag = 0.0f) {
     if (gain <= 0.0f || sinEl <= 0.0f) return float3(0.0f);
     float3 ext = nightExtinction(sinEl);
     // Point-spread: a gaussian of σ ≈ 0.75 px carries the star's whole flux, so the peak is
@@ -504,6 +511,7 @@ static inline float3 nightStarsPhysical(float3 dEq, float sinEl, float pixAngle,
             float peak = peakPerF * flux;
             // Visibility against the local sky: a star below ~4 % contrast is lost, full at 40 %.
             float vis = smoothstep(0.04f, 0.4f, peak * ext.g / max(bgLum, 1e-9f));
+            if (limitMag > 0.0f) vis *= 1.0f - smoothstep(limitMag - 0.5f, limitMag + 0.5f, s.mag);
             if (vis <= 0.0f) continue;
             float ph = nightU01(s.seed) * 97.0f;
             float fr = 2.5f + 2.0f * nightU01(nightPCG(s.seed));
@@ -770,7 +778,7 @@ static inline float3 nightCelestialsPhysical(float3 rayDir, NightSkyParams p, fl
         float bgLum = dot(max(background, 0.0f) + halo, kNightLuma);
         if (p.starBrightness > 0.0f)
             behind += nightStarsPhysical(dEq, rayDir.y, pixAngle, p.radiance * p.starBrightness,
-                                         bgLum, p.twinkle, p.clock);
+                                         bgLum, p.twinkle, p.clock, p.limitMag);
         if (p.milkyWay > 0.0f) {
             // Visibility from the PHYSICAL band against the sky behind it (a gibbous moon's sky
             // is ~5× the Milky Way's brightest clouds — it vanishes, as it does outdoors); the

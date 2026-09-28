@@ -159,6 +159,7 @@ static inline NightSkyParams glassNightSky(constant GlassRTUniforms& u) {
     p.radiance       = u.nightSkyExtra2.y;
     p.clock          = u.nightSkyExtra2.z;
     p.celestial      = u.nightCelestial;
+    p.limitMag       = u.nightSkyExtra2.w;
     return p;
 }
 

@@ -165,6 +165,34 @@ public struct NightSkyEphemeris: Sendable {
         return SIMD3<Float>(pow(10, -0.4 * k.x * x), pow(10, -0.4 * k.y * x), pow(10, -0.4 * k.z * x))
     }
 
+    // ── Sky brightness (light pollution) ─────────────────────────────────────
+
+    /// Square arcseconds in one steradian: (180/π · 3600)².
+    public static let squareArcsecondsPerSteradian: Double = 4.254_517_029_615_221e10
+
+    /// A sky surface brightness in visual magnitudes per square arcsecond (what an SQM meter
+    /// reads) as radiance in the physical night sky's unit — magnitude-0 flux per steradian
+    /// (`VolumetricCloudRenderer.Params.nightRadiance` multiplies it into scene radiance).
+    /// 21.8 (a natural dark zenith) → 81; 18.0 (a big city's zenith, ≈ a full moon's sky) → 2690.
+    public static func skyRadiance(magnitudesPerSquareArcsecond mu: Double) -> Float {
+        Float(squareArcsecondsPerSteradian * pow(10, -0.4 * mu))
+    }
+
+    /// Naked-eye limiting magnitude for a dark-adapted observer under a sky of `mu` visual
+    /// magnitudes per square arcsecond at the zenith: NELM = 7.93 − 5·log10(10^(4.316 − μ/5) + 1)
+    /// (the standard SQM → NELM conversion, fit to Schaefer's (1990) visibility model; ≈ 6.6 at a
+    /// pristine 22, ≈ 4.0 at a city's 18).
+    public static func nakedEyeLimitingMagnitude(skyMagnitudesPerSquareArcsecond mu: Double) -> Float {
+        Float(7.93 - 5 * log10(pow(10, 4.316 - mu / 5) + 1))
+    }
+
+    /// The exponent p of the skyglow's horizon gradient ((1 + a)/(sin el + a))^p, a = 0.15, that
+    /// makes the horizon `ratio` × the zenith (VolumetricSky.metal `nightAirglowAndZodiacal`).
+    public static func skyglowGradientExponent(horizonToZenith ratio: Float) -> Float {
+        let a: Float = 0.15
+        return max(0, log(max(ratio, 1))) / log((1 + a) / a)
+    }
+
     // ── Internals ────────────────────────────────────────────────────────────
 
     static func equatorialFromEcliptic(longitude l: Double) -> (ra: Double, dec: Double) {

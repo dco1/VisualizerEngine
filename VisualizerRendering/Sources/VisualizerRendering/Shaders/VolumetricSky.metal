@@ -222,6 +222,15 @@ struct SkyUniforms {
     float4 nightSkyB;
     float4 nightSkyC;
     float4 nightSkyD;
+    // ── Multiple scattering (Params.atmosphereMultipleScattering, VZ-0159) — host-owned ─────
+    // x = on (> 0.5; the kernels also need the LUT's ready flag, see `nishitaMSReady`),
+    // y = ground albedo the LUT is built for, zw = unused.
+    float4 msParams;
+    // ── Artificial skyglow + limiting magnitude (Params.artificialSkyglow…, physical night) ──
+    // x = zenith radiance of the skyglow in F0/sr (0 = off — every existing host), y = its
+    // horizon-gradient exponent p, z = its colour temperature (K), w = star limiting magnitude
+    // (0 = no limit).
+    float4 nightSkyE;
     // ── Cloud lighting from the atmosphere — GPU-WRITTEN, never by the host ─────────────────
     // `volSkyCloudLight` fills these from the nishita march itself (the SAME `nishitaScatter`
     // the sky pixels use), so the deck is lit in the sky's own units. The host packs only the
@@ -616,6 +625,12 @@ inline float3 atmosphereColor(float3 rayDir, constant SkyUniforms &u) {
 //     the right answer if many scenes want a live, cheap, physically-correct
 //     sky — revisit if Nishita becomes the default across scenes.
 //
+//     2026-09-27 (VZ-0159): the MULTIPLE-SCATTERING half of this now exists as an
+//     OPT-IN path — `Params.atmosphereMultipleScattering`, "Nishita multiple
+//     scattering" below: a transmittance LUT + an iterated multiple-scattering LUT
+//     built once on the GPU, read by the same per-pixel march. This single-scatter
+//     march is untouched (byte-identical) when the flag is off.
+//
 // Constants are SI metres. The viewer sits ~1 m above the planet surface at the
 // pole so world +Y == planet "up", matching the scene's up axis.
 
@@ -807,21 +822,12 @@ inline float3 skyGraded(float3 s, float sat, float blueLift) {
 // by extinction; (3) ZODIACAL LIGHT — sunlight off interplanetary dust, a cone along the
 // ecliptic that fades with elongation from the (below-horizon) sun.
 constant float kNishitaZenithRef = 0.010f;   // nishitaScatter zenith luminance, sun at ~50°, intensity 1
-inline float3 nightSkyGlow(float3 rayDir, constant SkyUniforms &u) {
-    float rad = u.nightSkyB.z;
-    if (u.nightSkyA.x < 0.5f || rad <= 0.0f || u.nightParams.w <= 0.0f) return float3(0.0f);
-    float sinEl = max(rayDir.y, 0.0f);
-    float3 g = float3(0.0f);
-    if (u.nightParams.y > 0.0f) {
-        float3 moonD = normalize(u.moonParams.xyz);
-        float flux = nightMoonPhaseFlux(dot(normalize(u.nightSkyC.xyz), -moonD));
-        // Under civil/nautical twilight the sun's own scatter is thousands of times brighter
-        // than the moon's, so its march is skipped until the sun is ~6° down and cross-faded
-        // in by ~10° (then the sun's march itself is skipped past 18°: never two at full cost).
-        float w = smoothstep(0.10f, 0.17f, u.sunDir.y);
-        if (moonD.y > -0.3f && w > 0.0f)
-            g += nishitaScatter(rayDir, -moonD, 1.0f) * (w * kFullMoonSkyF0 * rad * flux / kNishitaZenithRef);
-    }
+
+/// The night glow's NON-lunar light — AIRGLOW and ZODIACAL LIGHT (`nightSkyGlow`'s (2) and (3)),
+/// shared with the multiple-scattering path, which marches the moon itself. Accumulates onto
+/// `g` in the original order (moon, airglow, zodiacal) so the legacy sum is bit-for-bit the
+/// same. The caller has already checked the physical model is on and `rad` / nightBlend > 0.
+inline float3 nightAirglowAndZodiacal(float3 g, float3 rayDir, constant SkyUniforms &u, float rad, float sinEl) {
     float3 ext = nightExtinction(sinEl);
     float ag = u.nightSkyB.w;
     if (ag > 0.0f) {
@@ -839,10 +845,476 @@ inline float3 nightSkyGlow(float3 rayDir, constant SkyUniforms &u) {
         float z = 2.5f * pow(max(elong, 0.35f) / 0.7f, -2.2f) * exp(-(beta * beta) / (w * w));
         g += float3(1.0f, 0.95f, 0.85f) * (zl * rad * kDarkSkyF0 * z) * ext;
     }
+    // (4) ARTIFICIAL SKYGLOW — a city's upward light scattered back down by the lower
+    // atmosphere (Params.artificialSkyglow; 0 ⇒ skipped ⇒ bit-identical). Its zenith radiance is
+    // the host's (an SQM reading: San Francisco ≈ 18 mag/arcsec² ≈ 2700 F0/sr, ~30× the natural
+    // dark sky); toward the horizon it brightens along the longer, lower path through the lit
+    // air — an empirical gradient ((1 + a)/(sin el + a))^p with a = 0.15, the host setting p from
+    // its horizon/zenith ratio (all-sky surveys from inside a city: ~1–2 mag brighter at the
+    // horizon). No extinction factor: the gradient is the OBSERVED one, extinction included.
+    float sg = u.nightSkyE.x;
+    if (sg > 0.0f) {
+        const float a = 0.15f;
+        float grad = pow((1.0f + a) / (max(sinEl, 0.0f) + a), max(u.nightSkyE.y, 0.0f));
+        g += nightBlackbody(max(u.nightSkyE.z, 1667.0f)) * (sg * rad * grad);
+    }
     return g;
 }
 
-inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u) {
+inline float3 nightSkyGlow(float3 rayDir, constant SkyUniforms &u) {
+    float rad = u.nightSkyB.z;
+    if (u.nightSkyA.x < 0.5f || rad <= 0.0f || u.nightParams.w <= 0.0f) return float3(0.0f);
+    float sinEl = max(rayDir.y, 0.0f);
+    float3 g = float3(0.0f);
+    if (u.nightParams.y > 0.0f) {
+        float3 moonD = normalize(u.moonParams.xyz);
+        float flux = nightMoonPhaseFlux(dot(normalize(u.nightSkyC.xyz), -moonD));
+        // Under civil/nautical twilight the sun's own scatter is thousands of times brighter
+        // than the moon's, so its march is skipped until the sun is ~6° down and cross-faded
+        // in by ~10° (then the sun's march itself is skipped past 18°: never two at full cost).
+        // VZ-0159: with the single-scatter sun sky already black by −7.8°, this fixed window
+        // leaves the sky DIMMER than the moonlit sky between −6° and −8°; the opt-in
+        // multiple-scattering path (`nishitaScatterMS`) sums the two lights instead.
+        float w = smoothstep(0.10f, 0.17f, u.sunDir.y);
+        if (moonD.y > -0.3f && w > 0.0f)
+            g += nishitaScatter(rayDir, -moonD, 1.0f) * (w * kFullMoonSkyF0 * rad * flux / kNishitaZenithRef);
+    }
+    return nightAirglowAndZodiacal(g, rayDir, u, rad, sinEl);
+}
+
+// ── Nishita multiple scattering (opt-in: Params.atmosphereMultipleScattering, VZ-0159) ────────
+//
+// The single-scatter march above leaves out the light the air scatters more than once. By day
+// that is ~30 % of the blue zenith; in twilight it is the whole story: away from the sun the
+// sky is lit by sunlight scattered first in the still-sunlit upper air, which is what keeps
+// blue hour BLUE and luminous through nautical twilight. Single scatter alone reddens and then
+// goes exactly black once the shell above the viewer is in the Earth's shadow (−7.8° for a
+// 60 km shell), and prints the anti-solar sky a flat black under the Belt of Venus.
+//
+// Production approach (Hillaire 2020, "A Scalable and Production Ready Sky and Atmosphere
+// Rendering Technique", EGSR), built from the SAME constants as the march above — kBetaR/M/O,
+// the scale heights, the ozone tent, the planet radius — with three measured corrections:
+//
+//   • TRANSMITTANCE LUT τ(r, μ) (256 × 64, Bruneton's mapping), the per-sample sun-ray march
+//     replaced by one lookup + an ANALYTIC planet-shadow test.
+//   • MULTIPLE-SCATTERING LUT Ψ(h, μs) (64 cos-sun-zenith × 32 altitudes): the mean radiance of
+//     every order ≥ 2 arriving at a point, per unit solar irradiance. Hillaire's LUT is order 2
+//     × a LOCAL geometric series 1/(1 − f_ms). Against a brute-force path-traced reference
+//     (NishitaMultipleScatteringTests) that local series is what fails in deep twilight: the
+//     order-2 field grows by decades with altitude there, so the 3rd order at the ground comes
+//     from the sunlit air ABOVE it, not from its own neighbourhood (at −12° the anti-solar
+//     horizon's orders ≥ 3 are 8× its 2nd order in blue; Hillaire's LUT was 1.6–3.6 stops dark
+//     and red there). So orders 2…5 are iterated NON-LOCALLY — order n+1 integrates Ψₙ looked
+//     up at every point along every direction — with the local geometric tail only past 5.
+//   • The first scatter (order 2) uses the true Rayleigh + Mie phase, not isotropic; and the
+//     field's QUADRUPOLE is stored beside Ψ so the last scatter toward the camera uses the exact
+//     Rayleigh phase (P0 + ½P2: forward/back-scatter 1.5×, 90° 0.75× — isotropic was the rest of
+//     Hillaire's error). Mie's last scatter stays isotropic (a lobe cannot hold the bimodal
+//     twilight field; measured best).
+//   • The atmosphere top is 100 km on this path (kMSAtmosRadius): the 60 km shell's shadow
+//     height passes its top at −7.8°, a 100 km top at −10.1° — twilight that the real mesosphere
+//     does produce. The 60–100 km air is 0.06 % of the column: the day sky does not see it.
+//
+// Result vs the double-precision reference (orders 1…6, same atmosphere, sun +10° … −15°):
+// zenith within ±0.06 stops, the VZ-0159 window (30° up, 90° from the sun) within 0.09, the
+// anti-solar horizon within 0.41 — see docs/illuminatorama/nishita-multiple-scattering.md.
+//
+// The LUTs live in the SkyUniforms BUFFER, after the struct (`VolumetricCloudRenderer`
+// allocates it; offsets below): every kernel that binds the uniforms — the dome, the IBL,
+// `volSkyCloudLight`, Illuminatorama's in-view pass — reaches them without new host wiring,
+// and they are built once, on the GPU, in the first command buffer after the flag turns on
+// (and again only if the ground albedo changes). The build writes the header's ready flag
+// last; a kernel that sees the flag on but no ready LUT (a frame in flight across the switch)
+// falls back to the single-scatter sky.
+
+constant constexpr float kMSAtmosRadius   = 6460e3f;  // m — 100 km top on this path
+constant constexpr int   kMSTransW        = 256;      // transmittance LUT: x_μ …
+constant constexpr int   kMSTransH        = 64;       // … × x_r (Bruneton), node-aligned
+constant constexpr int   kMSTransSteps    = 40;
+constant constexpr int   kMSLutW          = 64;       // Ψ LUT: cos(sun zenith) −1…1 …
+constant constexpr int   kMSLutH          = 32;       // … × altitude kMSHeightOffset…100 km
+constant constexpr float kMSHeightOffset  = 1.0f;     // m — the viewer's altitude
+constant constexpr int   kMSLastOrder     = 5;        // orders 2…5 non-local, then the tail
+constant constexpr int   kMSDirAz         = 8;        // directions per texel: 8 azimuths over the
+constant constexpr int   kMSDirEl         = 16;       //   mirror half-circle × 16 bands in sin(el)
+constant constexpr float kMSDirWarp       = 2.0f;     //   packed toward the horizon (z = u|u|)
+constant constexpr int   kMSDirThreads    = 64;       // threads per texel in the order kernel
+constant constexpr int   kMSStepsOrder2   = 40;
+constant constexpr int   kMSStepsHigher   = 32;
+constant constexpr int   kMSViewSteps     = 32;       // per-pixel march (quadratic spacing)
+
+// LUT region, in float4s from its base (mirrored by `VolumetricCloudRenderer.atmosphereLUT*`).
+constant constexpr int kMSLutTexels = kMSLutW * kMSLutH;
+constant constexpr int kLUTHeader   = 0;   // x = ready, y = albedo, z = zenith ref (sun 50°, E 1), w = length
+constant constexpr int kLUTTrans    = 1;                                    // xyz = optical depth
+constant constexpr int kLUTMS       = kLUTTrans + kMSTransW * kMSTransH;    // 2 per texel: (ln Ψ.rgb, Q_uu), (Q_ss, Q_us, 0, 0)
+constant constexpr int kLUTLnPsiA   = kLUTMS + 2 * kMSLutTexels;            // build scratch: ln Ψₙ (ping) …
+constant constexpr int kLUTLnPsiB   = kLUTLnPsiA + kMSLutTexels;            // … (pong)
+constant constexpr int kLUTAccA     = kLUTLnPsiB + kMSLutTexels;            // Σ Ψₙ.rgb, Σ Q_uu
+constant constexpr int kLUTAccB     = kLUTAccA + kMSLutTexels;              // Σ Q_ss, Σ Q_us
+constant constexpr int kLUTAccF     = kLUTAccB + kMSLutTexels;              // f_ms.rgb of the last order
+constant constexpr int kLUTLength   = kLUTAccF + kMSLutTexels;
+
+inline float msRayleighPhase(float mu) { return 3.0f / (16.0f * M_PI_F) * (1.0f + mu * mu); }
+inline float msMiePhase(float mu) {
+    float g2 = kMieG * kMieG;
+    return 3.0f / (8.0f * M_PI_F) * ((1.0f - g2) * (1.0f + mu * mu))
+         / ((2.0f + g2) * pow(max(1.0f + g2 - 2.0f * kMieG * mu, 1e-4f), 1.5f));
+}
+
+/// ∫₀^dt e^(−σt·s) ds per channel — (1 − e^(−x))/σt, with its series where x is too small for
+/// float (at 60–100 km, where deep twilight's light is scattered, x ~ 1e-6 per segment).
+inline float3 msSegmentIntegral(float3 sT, float dt, float3 Tseg) {
+    float3 x = sT * dt;
+    return select((1.0f - Tseg) / max(sT, float3(1e-30f)), dt * (1.0f - 0.5f * x), x < 1e-3f);
+}
+
+/// Distance from radius r along zenith-cosine μ to the 100 km top, cancellation-free.
+inline float msDistToTop(float r, float mu) {
+    float rmu = r * mu;
+    float c = (kMSAtmosRadius - r) * (kMSAtmosRadius + r);
+    float sq = sqrt(max(rmu * rmu + c, 0.0f));
+    return (rmu > 0.0f) ? c / (rmu + sq) : sq - rmu;
+}
+
+/// Optical depth to the top from (r, μ) — bilinear in the transmittance LUT (rays that clear
+/// the planet only; `msSunTransmittance` tests the shadow first).
+inline float3 msOpticalDepth(device const float4* lut, float r, float mu) {
+    const float Hh = sqrt((kMSAtmosRadius - kEarthRadius) * (kMSAtmosRadius + kEarthRadius));
+    float h = max(r - kEarthRadius, 0.0f);
+    float rho = sqrt(h * (r + kEarthRadius));
+    float d = msDistToTop(r, mu);
+    float dmin = kMSAtmosRadius - r, dmax = rho + Hh;
+    float fx = ((dmax > dmin) ? saturate((d - dmin) / (dmax - dmin)) : 0.0f) * float(kMSTransW - 1);
+    float fy = saturate(rho / Hh) * float(kMSTransH - 1);
+    int ix = min(int(fx), kMSTransW - 2), iy = min(int(fy), kMSTransH - 2);
+    float ax = fx - float(ix), ay = fy - float(iy);
+    device const float4* t = lut + kLUTTrans + iy * kMSTransW + ix;
+    return mix(mix(t[0].xyz, t[1].xyz, ax), mix(t[kMSTransW].xyz, t[kMSTransW + 1].xyz, ax), ay);
+}
+
+/// Direct light (sun or moon) reaching radius r where the light's zenith cosine is μ: 0 when
+/// the ray toward it meets the planet (the Earth's shadow), else exp(−τ).
+inline float3 msSunTransmittance(device const float4* lut, float r, float mu) {
+    if (mu < 0.0f && r * sqrt(max(1.0f - mu * mu, 0.0f)) < kEarthRadius) return float3(0.0f);
+    return exp(-msOpticalDepth(lut, min(r, kMSAtmosRadius), mu));
+}
+
+inline float2 msLutCoord(float h, float mus) {
+    return float2((clamp(mus, -1.0f, 1.0f) + 1.0f) * 0.5f * float(kMSLutW - 1),
+                  saturate((h - kMSHeightOffset) / (kMSAtmosRadius - kEarthRadius - kMSHeightOffset))
+                  * float(kMSLutH - 1));
+}
+
+/// ln Ψ from one of the build's scratch tables (log-bilinear: Ψ falls by decades per texel near
+/// the terminator, which linear interpolation would overshoot).
+inline float3 msScratchPsi(device const float4* lut, int base, float h, float mus) {
+    float2 f = msLutCoord(h, mus);
+    int ix = min(int(f.x), kMSLutW - 2), iy = min(int(f.y), kMSLutH - 2);
+    float ax = f.x - float(ix), ay = f.y - float(iy);
+    device const float4* t = lut + base + iy * kMSLutW + ix;
+    return exp(mix(mix(t[0].xyz, t[1].xyz, ax), mix(t[kMSLutW].xyz, t[kMSLutW + 1].xyz, ax), ay));
+}
+
+struct MSField {
+    float3 psi;   // mean incoming radiance of orders ≥ 2 per unit irradiance
+    float3 q;     // its quadrupole (Q_uu, Q_ss, Q_us) in the local (up, sun-horizontal) frame
+};
+inline MSField msField(device const float4* lut, float h, float mus) {
+    float2 f = msLutCoord(h, mus);
+    int ix = min(int(f.x), kMSLutW - 2), iy = min(int(f.y), kMSLutH - 2);
+    float ax = f.x - float(ix), ay = f.y - float(iy);
+    device const float4* t = lut + kLUTMS + 2 * (iy * kMSLutW + ix);
+    const int row = 2 * kMSLutW;
+    float4 a = mix(mix(t[0], t[2], ax), mix(t[row], t[row + 2], ax), ay);
+    float4 b = mix(mix(t[1], t[3], ax), mix(t[row + 1], t[row + 3], ax), ay);
+    MSField m;
+    m.psi = exp(a.xyz);
+    m.q = float3(a.w, b.x, b.y);
+    return m;
+}
+
+/// The LUTs are usable: the host turned the path on AND the build has run (header ready).
+inline bool nishitaMSReady(constant SkyUniforms &u, device const float4* lut, bool lutBound) {
+    return u.msParams.x > 0.5f && lutBound && lut[kLUTHeader].x > 0.5f;
+}
+
+/// In-scattered radiance toward the camera (per unit irradiance of the light toward `toL`) at a
+/// march sample: the single scatter with the true phase, planet-shadowed; plus orders ≥ 2 —
+/// Rayleigh through its exact P0 + ½P2 phase against the field's quadrupole, Mie isotropic.
+inline float3 msInscatter(device const float4* lut, float3 p, float r, float h, float3 v, float3 toL,
+                          float3 sR, float sM, float pR, float pM) {
+    float3 up = p / r;
+    float mus = dot(up, toL);
+    float3 Tl = msSunTransmittance(lut, r, mus);
+    MSField f = msField(lut, h, mus);
+    float3 sh = toL - up * mus;
+    float shl = length(sh);
+    sh = (shl > 1e-6f) ? sh / shl : float3(0.0f);
+    float vu = dot(v, up), vs = dot(v, sh);
+    float vb2 = max(1.0f - vu * vu - vs * vs, 0.0f);
+    float vqv = f.q.x * vu * vu + f.q.y * vs * vs - (f.q.x + f.q.y) * vb2 + 2.0f * f.q.z * vu * vs;
+    float jr = max(1.0f + 0.5f * vqv, 0.0f);
+    return (sR * pR + sM * pM) * Tl + f.psi * (sR * jr + sM);
+}
+
+/// The multiply-scattered sky along `rayDir` from the viewer (1 m up at the pole): ONE march for
+/// the sun AND the moon — each light's single scatter + orders ≥ 2 — so the two sum as light
+/// does (no cross-fade window, no dip at the hand-off). `moonI` = 0 skips the moon's lookups.
+inline float3 nishitaScatterMS(float3 rayDir, float3 toSun, float sunI, float3 toMoon, float moonI,
+                               device const float4* lut) {
+    float3 orig = float3(0.0f, kEarthRadius + kMSHeightOffset, 0.0f);
+    float tTop = raySphereExit(orig, rayDir, kMSAtmosRadius);
+    if (tTop <= 0.0f) return float3(0.0f);
+    float tGround = rayGroundHit(orig, rayDir, kEarthRadius);
+    float tMax = (tGround > 0.0f) ? min(tTop, tGround) : tTop;
+    float muS = dot(rayDir, toSun), muM = dot(rayDir, toMoon);
+    float pRS = msRayleighPhase(muS), pMS = msMiePhase(muS);
+    float pRM = msRayleighPhase(muM), pMM = msMiePhase(muM);
+    float3 T = float3(1.0f);
+    float3 L = float3(0.0f);
+    float tPrev = 0.0f;
+    for (int i = 0; i < kMSViewSteps; ++i) {
+        // Quadratic spacing: fine near the viewer, where the air (and the Mie haze) is densest.
+        float a = float(i + 1) / float(kMSViewSteps);
+        float t = tMax * a * a;
+        float dt = t - tPrev;
+        float3 p = orig + rayDir * (tPrev + 0.5f * dt);
+        float r = length(p);
+        float h = r - kEarthRadius;
+        float dM = exp(-h / kMieH);
+        float3 sR = kBetaR * exp(-h / kRayleighH);
+        float sM = kBetaM.x * dM;
+        float3 sT = sR + kBetaM * (1.1f * dM) + kBetaO * ozoneDensity(h);
+        float3 Tseg = exp(-sT * dt);
+        float3 w = T * msSegmentIntegral(sT, dt, Tseg);
+        float3 S = sunI * msInscatter(lut, p, r, h, rayDir, toSun, sR, sM, pRS, pMS);
+        if (moonI > 0.0f) S += moonI * msInscatter(lut, p, r, h, rayDir, toMoon, sR, sM, pRM, pMM);
+        L += w * S;
+        T *= Tseg;
+        tPrev = t;
+    }
+    return L;
+}
+
+/// The moonlit sky's irradiance in the sky's units: calibrated like `nightSkyGlow` (a full moon
+/// ~50° up gives kFullMoonSkyF0 at the zenith), against THIS sky's zenith reference. 0 when the
+/// moon is down, the physical night model is off — or where the moonlit sky is below 1e-4 of
+/// the sunlit one (its mean multiply-scattered radiance at the ground as the yardstick for both
+/// lights), so daytime pays nothing for it and its entry is an unmeasurable 0.01 %.
+inline float nishitaMSMoonIntensity(constant SkyUniforms &u, device const float4* lut, float sunI,
+                                    thread float3 &toMoon) {
+    toMoon = normalize(u.moonParams.xyz);
+    float rad = u.nightSkyB.z;
+    if (u.nightSkyA.x < 0.5f || rad <= 0.0f || u.nightParams.y <= 0.0f || toMoon.y <= -0.3f) return 0.0f;
+    float flux = nightMoonPhaseFlux(dot(normalize(u.nightSkyC.xyz), -toMoon));
+    float moonI = kFullMoonSkyF0 * rad * flux / max(lut[kLUTHeader].z, 1e-30f);
+    const float3 kLuma = float3(0.2126f, 0.7152f, 0.0722f);
+    float gS = dot(msField(lut, kMSHeightOffset, -u.sunDir.y).psi, kLuma) * sunI;
+    float gM = dot(msField(lut, kMSHeightOffset, toMoon.y).psi, kLuma) * moonI;
+    return (gM > 1e-4f * gS) ? moonI : 0.0f;
+}
+
+/// `nishitaAtmosphereColor` with multiple scattering: the same structure (sky above the
+/// horizon; horizon haze + airlight handover to the ground below it; the same grade), the
+/// march replaced by `nishitaScatterMS` with the moon summed in and the night glow's
+/// non-lunar light (airglow, zodiacal) added as before.
+inline float3 nishitaAtmosphereColorMS(float3 rayDir, constant SkyUniforms &u, device const float4* lut) {
+    float intensity = max(0.0f, u.atmosphereParams.y);
+    float3 toSun = -u.sunDir.xyz;
+    float3 toMoon;
+    float moonI = nishitaMSMoonIntensity(u, lut, intensity, toMoon);
+    float rad = u.nightSkyB.z;
+    bool glow = u.nightSkyA.x > 0.5f && rad > 0.0f && u.nightParams.w > 0.0f;
+    float3 d = rayDir;
+    if (rayDir.y < 0.0f) {
+        float2 hxz = float2(rayDir.x, rayDir.z);
+        float hlen = length(hxz);
+        d = (hlen > 1e-5f) ? float3(hxz.x / hlen, 0.0f, hxz.y / hlen) : float3(1.0f, 0.0f, 0.0f);
+    }
+    float3 s = nishitaScatterMS(d, toSun, intensity, toMoon, moonI, lut);
+    if (glow) s = nightAirglowAndZodiacal(s, d, u, rad, max(d.y, 0.0f));
+    s = skyGraded(s, u.skyGrade.x, u.skyGrade.y);
+    if (rayDir.y >= 0.0f) return s;
+    const float kAirlightTheta = 0.0035f;
+    float theta = max(-rayDir.y, 1e-6f);
+    float ground = exp(-(kAirlightTheta / max(u.groundColor.w, 0.05f)) / theta);
+    float3 groundRad = u.groundColor.xyz
+                     + ((u.skyGrade.w > 0.5f) ? u.cloudLitGround.xyz : float3(0.0f));
+    return mix(s, groundRad, ground);
+}
+
+// ── LUT build (once per renderer; again only when the ground albedo changes) ──────────────
+// Encoded by `VolumetricCloudRenderer` into the first command buffer that needs it, in order:
+// volSkyTransmittanceLUT → volSkyMultiScatterOrder (orders 2…kMSLastOrder) →
+// volSkyMultiScatterFinalize → volSkyMultiScatterReady. `lut` is the region's base.
+
+kernel void volSkyTransmittanceLUT(device float4* lut [[buffer(0)]],
+                                   uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= uint(kMSTransW) || gid.y >= uint(kMSTransH)) return;
+    const float Hh = sqrt((kMSAtmosRadius - kEarthRadius) * (kMSAtmosRadius + kEarthRadius));
+    float rho = Hh * float(gid.y) / float(kMSTransH - 1);
+    float r = sqrt(rho * rho + kEarthRadius * kEarthRadius);
+    float dmin = kMSAtmosRadius - r, dmax = rho + Hh;
+    float d = dmin + float(gid.x) / float(kMSTransW - 1) * (dmax - dmin);
+    float mu = (d <= 0.0f) ? 1.0f : clamp((Hh * Hh - rho * rho - d * d) / (2.0f * r * d), -1.0f, 1.0f);
+    float3 o = float3(0.0f, r, 0.0f);
+    float3 dir = float3(sqrt(max(1.0f - mu * mu, 0.0f)), mu, 0.0f);
+    float dt = d / float(kMSTransSteps);
+    float3 od = float3(0.0f);
+    for (int i = 0; i < kMSTransSteps; ++i) {
+        float h = length(o + dir * ((float(i) + 0.5f) * dt)) - kEarthRadius;
+        od += kBetaR * exp(-h / kRayleighH) + kBetaM * (1.1f * exp(-h / kMieH)) + kBetaO * ozoneDensity(h);
+    }
+    lut[kLUTTrans + int(gid.y) * kMSTransW + int(gid.x)] = float4(od * dt, 0.0f);
+}
+
+/// One direction of an order pass from x: order 2 = the TRUE-phase single scatter of the light
+/// toward `s` arriving at x (planet-shadowed at every sample) + its direct reflection off the
+/// ground; order n > 2 = ∫ T σs Ψₙ₋₁ (isotropic re-scatter) + the ground under Ψₙ₋₁. `F` = the
+/// local transfer ∫ T σs (Hillaire's f_ms), for the tail.
+inline void msOrderRay(device const float4* lut, float3 x, float3 w, float3 s, int order, float albedo,
+                       int readBase, thread float3 &L, thread float3 &F) {
+    L = float3(0.0f);
+    F = float3(0.0f);
+    float tTop = raySphereExit(x, w, kMSAtmosRadius);
+    float tG = rayGroundHit(x, w, kEarthRadius);
+    bool hit = tG > 0.0f;
+    float tEnd = hit ? tG : max(tTop, 0.0f);
+    int steps = (order == 2) ? kMSStepsOrder2 : kMSStepsHigher;
+    float cy = dot(s, w);   // sunlight (travelling −s) turned toward x (travelling −w)
+    float pR = msRayleighPhase(cy), pM = msMiePhase(cy);
+    float3 T = float3(1.0f);
+    float tPrev = 0.0f;
+    for (int i = 0; i < steps; ++i) {
+        float a = float(i + 1) / float(steps);
+        float t = tEnd * a * a;
+        float dt = t - tPrev;
+        float3 p = x + w * (tPrev + 0.5f * dt);
+        float r = length(p);
+        float h = r - kEarthRadius;
+        float dM = exp(-h / kMieH);
+        float3 sR = kBetaR * exp(-h / kRayleighH);
+        float sM = kBetaM.x * dM;
+        float3 sT = sR + kBetaM * (1.1f * dM) + kBetaO * ozoneDensity(h);
+        float3 Tseg = exp(-sT * dt);
+        float3 wgt = T * msSegmentIntegral(sT, dt, Tseg);
+        float mus = dot(p, s) / r;
+        if (order == 2) L += wgt * (sR * pR + sM * pM) * msSunTransmittance(lut, r, mus);
+        else            L += wgt * (sR + sM) * msScratchPsi(lut, readBase, h, mus);
+        F += wgt * (sR + sM);
+        T *= Tseg;
+        tPrev = t;
+    }
+    if (hit && albedo > 0.0f) {
+        float3 n = normalize(x + w * tEnd);
+        float cs = dot(n, s);
+        if (order == 2) {
+            if (cs > 0.0f) L += T * (albedo / M_PI_F) * cs
+                              * msSunTransmittance(lut, kEarthRadius + kMSHeightOffset, cs);
+        } else {
+            L += T * albedo * msScratchPsi(lut, readBase, kMSHeightOffset, cs);   // E = πΨ, L = aE/π
+        }
+    }
+}
+
+/// One scattering order for every Ψ texel: one threadgroup per texel, kMSDirThreads threads
+/// over the kMSDirAz × kMSDirEl directions (the field is mirror-symmetric about the plane of
+/// the local up and the sun, so φ covers half a turn at double weight). Writes ln Ψₙ to the
+/// scratch the next order reads, and accumulates Ψₙ and its quadrupole into the totals.
+/// `bp.x` = order, `bp.y` = ground albedo.
+kernel void volSkyMultiScatterOrder(device float4* lut [[buffer(0)]],
+                                    constant float4 &bp [[buffer(1)]],
+                                    uint2 tg [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float4 sumA[kMSDirThreads];   // Σ L·w (rgb), Σ Lg·w·q_uu
+    threadgroup float4 sumB[kMSDirThreads];   // Σ Lg·w·q_ss, Σ Lg·w·q_us
+    threadgroup float4 sumF[kMSDirThreads];   // Σ F·w
+    int order = int(bp.x + 0.5f);
+    float albedo = bp.y;
+    int texel = int(tg.y) * kMSLutW + int(tg.x);
+    float mus = -1.0f + 2.0f * float(tg.x) / float(kMSLutW - 1);
+    float h = kMSHeightOffset + (kMSAtmosRadius - kEarthRadius - kMSHeightOffset) * float(tg.y) / float(kMSLutH - 1);
+    float3 x = float3(0.0f, kEarthRadius + h, 0.0f);
+    float3 s = float3(sqrt(max(1.0f - mus * mus, 0.0f)), mus, 0.0f);
+    bool odd = (order & 1) != 0;
+    int readBase = odd ? kLUTLnPsiA : kLUTLnPsiB;     // order n reads what n − 1 wrote
+    int writeBase = odd ? kLUTLnPsiB : kLUTLnPsiA;
+    float4 A = float4(0.0f), B = float4(0.0f), Fs = float4(0.0f);
+    for (int k = int(tid); k < kMSDirAz * kMSDirEl; k += kMSDirThreads) {
+        int j = k / kMSDirAz, i = k - j * kMSDirAz;
+        float uu = -1.0f + 2.0f * (float(j) + 0.5f) / float(kMSDirEl);
+        float z = sign(uu) * pow(abs(uu), kMSDirWarp);
+        float wt = kMSDirWarp * pow(abs(uu), kMSDirWarp - 1.0f) * (2.0f / float(kMSDirEl))
+                 * (2.0f * M_PI_F / float(kMSDirAz));
+        float phi = M_PI_F * (float(i) + 0.5f) / float(kMSDirAz);
+        float rxy = sqrt(max(1.0f - z * z, 0.0f));
+        float3 w = float3(rxy * cos(phi), z, rxy * sin(phi));   // x = sun-horizontal, y = up
+        float3 L, F;
+        msOrderRay(lut, x, w, s, order, albedo, readBase, L, F);
+        float lg = L.y * wt;
+        A += float4(L * wt, lg * (1.5f * w.y * w.y - 0.5f));
+        B += float4(lg * (1.5f * w.x * w.x - 0.5f), lg * (1.5f * w.x * w.y), 0.0f, 0.0f);
+        Fs += float4(F * wt, 0.0f);
+    }
+    sumA[tid] = A; sumB[tid] = B; sumF[tid] = Fs;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = uint(kMSDirThreads) / 2u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            sumA[tid] += sumA[tid + stride];
+            sumB[tid] += sumB[tid + stride];
+            sumF[tid] += sumF[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid != 0u) return;
+    const float inv4pi = 1.0f / (4.0f * M_PI_F);
+    float4 a = sumA[0] * inv4pi, b = sumB[0] * inv4pi;
+    lut[writeBase + texel] = float4(log(max(a.xyz, float3(1e-37f))), 0.0f);
+    if (order == 2) { lut[kLUTAccA + texel] = a; lut[kLUTAccB + texel] = b; }
+    else            { lut[kLUTAccA + texel] += a; lut[kLUTAccB + texel] += b; }
+    if (order == kMSLastOrder) lut[kLUTAccF + texel] = sumF[0] * inv4pi;
+}
+
+/// Ψ = Σ Ψₙ + the local geometric tail Ψ_N·f/(1 − f) past the last order (isotropic), and the
+/// quadrupole normalised by Ψ (green): the table the per-pixel march reads.
+kernel void volSkyMultiScatterFinalize(device float4* lut [[buffer(0)]],
+                                       uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= uint(kMSLutW) || gid.y >= uint(kMSLutH)) return;
+    int texel = int(gid.y) * kMSLutW + int(gid.x);
+    int lastBase = ((kMSLastOrder & 1) != 0) ? kLUTLnPsiB : kLUTLnPsiA;
+    float4 a = lut[kLUTAccA + texel], b = lut[kLUTAccB + texel];
+    float3 f = min(lut[kLUTAccF + texel].xyz, float3(0.999f));
+    float3 psi = a.xyz + exp(lut[lastBase + texel].xyz) * f / (1.0f - f);
+    float inv = (psi.y > 1e-37f) ? 1.0f / psi.y : 0.0f;
+    lut[kLUTMS + 2 * texel]     = float4(log(max(psi, float3(1e-37f))), a.w * inv);
+    lut[kLUTMS + 2 * texel + 1] = float4(b.x * inv, b.y * inv, 0.0f, 0.0f);
+}
+
+/// Last step: this sky's zenith luminance with the sun 50° up at unit irradiance (the moonlit
+/// sky's calibration reference, as kNishitaZenithRef is the single-scatter march's), then the
+/// ready flag. One thread.
+kernel void volSkyMultiScatterReady(device float4* lut [[buffer(0)]],
+                                    constant float4 &bp [[buffer(1)]],
+                                    uint tid [[thread_position_in_grid]]) {
+    if (tid != 0u) return;
+    float3 toSun = float3(cos(50.0f * M_PI_F / 180.0f), sin(50.0f * M_PI_F / 180.0f), 0.0f);
+    float3 z = nishitaScatterMS(float3(0.0f, 1.0f, 0.0f), toSun, 1.0f, float3(0.0f, 1.0f, 0.0f), 0.0f, lut);
+    float ref = dot(z, float3(0.2126f, 0.7152f, 0.0722f));
+    lut[kLUTHeader] = float4(1.0f, bp.y, ref, float(kLUTLength));
+}
+
+/// The layout constants, for the Swift mirror's test.
+kernel void volSkyAtmosphereLUTLayout(device int4* out [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+    if (tid != 0u) return;
+    out[0] = int4(kLUTLength, kLUTTrans, kLUTMS, kLUTLnPsiA);
+    out[1] = int4(kMSTransW, kMSTransH, kMSLutW, kMSLutH);
+}
+
+inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u,
+                                     device const float4* skyLUT, bool lutBound) {
+    // Opt-in multiple scattering (VZ-0159): the LUT path, once its LUTs are built.
+    if (nishitaMSReady(u, skyLUT, lutBound)) return nishitaAtmosphereColorMS(rayDir, u, skyLUT);
     float intensity = max(0.0f, u.atmosphereParams.y);
     float sat = u.skyGrade.x;
     // Physical night sky: once the sun is 18° down (astronomical night) its single-scatter
@@ -938,7 +1410,7 @@ inline float3 cloudAmbientBase(constant SkyUniforms &u) {
 
 // One cirrus layer — the wind-streaked VEIL, or (threads) the dense curled filaments that flow.
 inline float3 cirrusLayer(float3 sky, float3 ro, float3 rayDir, float time, constant SkyUniforms &u,
-                          texture3d<float, access::sample> noiseVol, bool threads) {
+                          texture3d<float, access::sample> noiseVol, bool threads, float zenithRef) {
     // cirrusC.w: the threads' coverage gain over the veil (0 = legacy: same coverage).
     float cov = threads ? min(1.0f, u.cirrusA.x * (u.cirrusC.w > 0.0f ? u.cirrusC.w : 1.0f)) : u.cirrusA.x;
     if (cov <= 0.0f || rayDir.y <= 0.004f) return sky;
@@ -1006,7 +1478,7 @@ inline float3 cirrusLayer(float3 sky, float3 ro, float3 rayDir, float time, cons
             float E = kFullMoonSkyF0 * u.nightSkyB.z * nightMoonPhaseFlux(dot(normalize(u.nightSkyC.xyz), -moonD));
             float cosM = clamp(dot(rayDir, moonD), -1.0f, 1.0f);
             float phaseM = 0.6f * hg(cosM, 0.75f) + 0.4f * (1.0f / (4.0f * M_PI_F));
-            L += (E / kNishitaZenithRef * phaseM * nightExtinction(moonD.y) + float3(1.6f * 1.5f * E))
+            L += (E / zenithRef * phaseM * nightExtinction(moonD.y) + float3(1.6f * 1.5f * E))
                * u.cirrusTint.rgb;
         }
     }
@@ -1018,12 +1490,23 @@ inline float3 cirrusLayer(float3 sky, float3 ro, float3 rayDir, float time, cons
 // is how much of it is THREADS. 0 or 1 draws one layer (byte-identical to the old switch);
 // between, both are drawn and blended — only for the length of a fade.
 inline float3 applyCirrus(float3 sky, float3 ro, float3 rayDir, float time, constant SkyUniforms &u,
-                          texture3d<float, access::sample> noiseVol, float threadsW) {
+                          texture3d<float, access::sample> noiseVol, float threadsW,
+                          device const float4* skyLUT, bool lutBound) {
     float w = saturate(threadsW);
-    if (w <= 0.0f) return cirrusLayer(sky, ro, rayDir, time, u, noiseVol, false);
-    if (w >= 1.0f) return cirrusLayer(sky, ro, rayDir, time, u, noiseVol, true);
-    return mix(cirrusLayer(sky, ro, rayDir, time, u, noiseVol, false),
-               cirrusLayer(sky, ro, rayDir, time, u, noiseVol, true), w);
+    if (nishitaMSReady(u, skyLUT, lutBound)) {
+        // Multiple-scattering sky: the moon's irradiance in sky units is normalised by THIS sky's
+        // zenith reference (`volSkyMultiScatterReady`), as the moonlit sky around the veil is.
+        // A separate branch, so the legacy one below keeps its compile-time constant divisor.
+        float zref = skyLUT[kLUTHeader].z;
+        if (w <= 0.0f) return cirrusLayer(sky, ro, rayDir, time, u, noiseVol, false, zref);
+        if (w >= 1.0f) return cirrusLayer(sky, ro, rayDir, time, u, noiseVol, true, zref);
+        return mix(cirrusLayer(sky, ro, rayDir, time, u, noiseVol, false, zref),
+                   cirrusLayer(sky, ro, rayDir, time, u, noiseVol, true, zref), w);
+    }
+    if (w <= 0.0f) return cirrusLayer(sky, ro, rayDir, time, u, noiseVol, false, kNishitaZenithRef);
+    if (w >= 1.0f) return cirrusLayer(sky, ro, rayDir, time, u, noiseVol, true, kNishitaZenithRef);
+    return mix(cirrusLayer(sky, ro, rayDir, time, u, noiseVol, false, kNishitaZenithRef),
+               cirrusLayer(sky, ro, rayDir, time, u, noiseVol, true, kNishitaZenithRef), w);
 }
 
 // ── Cloud lighting from the atmosphere (Params.cloudLightingFromAtmosphere) ─────────────
@@ -1052,11 +1535,14 @@ inline float3 nishitaTransmittanceToSun(float altitude, float3 toSun) {
     return exp(-(kBetaR * od.x + kBetaM * 1.1f * od.y + kBetaO * od.z));
 }
 
-kernel void volSkyCloudLight(device SkyUniforms &u [[buffer(0)]],
-                             uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup float3 radiance[16];
-    threadgroup float  weight[16];
+// Compiled twice, like `volSkyRenderImpl` (no MS code in `volSkyCloudLight`).
+template <bool kMS>
+inline void volSkyCloudLightImpl(device SkyUniforms &u, device const float4* skyLUT, uint tid,
+                                 threadgroup float3* radiance, threadgroup float* weight) {
     float intensity = max(0.0f, u.atmosphereParams.y);
+    // Multiple scattering (opt-in): the deck is lit by the same multiply-scattered sky the dome
+    // shows, and the sun through the same transmittance LUT (100 km top, analytic shadow).
+    bool ms = kMS && u.msParams.x > 0.5f && skyLUT[kLUTHeader].x > 0.5f;
     float3 s = float3(0.0f);
     float  w = 0.0f;
     // Thread 1 = zenith; 2…13 = two rings of six (low ring weighted up — it is most of
@@ -1071,7 +1557,9 @@ kernel void volSkyCloudLight(device SkyUniforms &u [[buffer(0)]],
             d = normalize(float3(cos(a) * cos(el), sin(el), sin(a) * cos(el)));
             w = (k < 6u) ? 1.2f : 1.0f;
         }
-        s = skyGraded(nishitaScatter(d, u.sunDir.xyz, intensity), u.skyGrade.x, u.skyGrade.y) * w;
+        float3 sky = ms ? nishitaScatterMS(d, -u.sunDir.xyz, intensity, float3(0.0f, 1.0f, 0.0f), 0.0f, skyLUT)
+                        : nishitaScatter(d, u.sunDir.xyz, intensity);
+        s = skyGraded(sky, u.skyGrade.x, u.skyGrade.y) * w;
     }
     radiance[tid] = s;
     weight[tid] = w;
@@ -1082,7 +1570,8 @@ kernel void volSkyCloudLight(device SkyUniforms &u [[buffer(0)]],
     for (uint i = 0u; i < 16u; ++i) { sum += radiance[i]; wsum += weight[i]; }
     float3 skyMean = sum / max(wsum, 1e-6f);
     float3 toSun = -u.sunDir.xyz;
-    float3 sun = intensity * nishitaTransmittanceToSun(u.cloudSlab.x, toSun);
+    float3 sun = intensity * (ms ? msSunTransmittance(skyLUT, kEarthRadius + max(u.cloudSlab.x, 1.0f), toSun.y)
+                                 : nishitaTransmittanceToSun(u.cloudSlab.x, toSun));
     // Lambertian ground under the deck (albedo in skyHorizon.xyz in this mode).
     float3 groundRad = u.skyHorizon.xyz * (sun * max(toSun.y, 0.0f) + M_PI_F * skyMean) / M_PI_F;
     u.cloudLitSun     = float4(sun, 1.0f);
@@ -1090,6 +1579,21 @@ kernel void volSkyCloudLight(device SkyUniforms &u [[buffer(0)]],
     // The dome's ground (Params.groundFromAtmosphere): the sky's share only. The direct share
     // (sun or moon) arrives from the host in `groundColor`, in the units it lights with.
     u.cloudLitGround  = float4(u.skyHorizon.xyz * skyMean, 1.0f);
+}
+
+kernel void volSkyCloudLight(device SkyUniforms &u [[buffer(0)]],
+                             uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float3 radiance[16];
+    threadgroup float  weight[16];
+    volSkyCloudLightImpl<false>(u, reinterpret_cast<device const float4*>(&u), tid, radiance, weight);
+}
+
+kernel void volSkyCloudLightMS(device SkyUniforms &u [[buffer(0)]],
+                               device const float4* skyLUT [[buffer(1)]],
+                               uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float3 radiance[16];
+    threadgroup float  weight[16];
+    volSkyCloudLightImpl<true>(u, skyLUT, tid, radiance, weight);
 }
 
 // Sun disk — a soft circular hotspot anchored to the sun's 3D direction.
@@ -1199,6 +1703,7 @@ inline NightSkyParams skyNightParams(constant SkyUniforms &u, float clock) {
     p.radiance       = u.nightSkyB.z;
     p.clock          = clock;
     p.celestial      = u.nightSkyD;
+    p.limitMag       = u.nightSkyE.w;
     return p;
 }
 
@@ -1366,13 +1871,18 @@ inline float3 burstLightEval(float3 worldPos, VSBurstLight L) {
 
 // ── Main kernel ─────────────────────────────────────────────────────────────
 
-kernel void volSkyRender(
-    texture2d<float, access::write>  outTex      [[texture(0)]],
-    texture3d<float, access::sample> noiseVol    [[texture(1)]],
-    constant SkyUniforms &u                      [[buffer(0)]],
-    device const VSBurstLight* burstLights       [[buffer(1)]],
-    uint2 gid                                    [[thread_position_in_grid]]
-) {
+// The dome / IBL kernel body, compiled twice (`kMS`): `volSkyRender` is the single-scatter sky
+// with NO multiple-scattering code in it at all — measured: a runtime branch to the MS path, even
+// one never taken, changes how the compiler schedules the rest of this kernel under fast-math
+// (last-bit differences in the cloud march), so only separate instantiations keep the flag-off
+// output bit-identical. `volSkyRenderMS` adds the LUT sky (`Params.atmosphereMultipleScattering`).
+template <bool kMS>
+inline void volSkyRenderImpl(texture2d<float, access::write>  outTex,
+                             texture3d<float, access::sample> noiseVol,
+                             constant SkyUniforms &u,
+                             device const VSBurstLight* burstLights,
+                             device const float4* skyLUT,
+                             uint2 gid) {
     uint W = outTex.get_width();
     uint H = outTex.get_height();
     if (gid.x >= W || gid.y >= H) return;
@@ -1415,7 +1925,7 @@ kernel void volSkyRender(
             sky = lavaCol;   // the lamp replaces the atmosphere: skip it
         } else {
             sky = (u.atmosphereParams.x > 0.5f)
-                ? nishitaAtmosphereColor(rayDir, u)
+                ? nishitaAtmosphereColor(rayDir, u, skyLUT, kMS)
                 : atmosphereColor(rayDir, u) + (rayDir.y >= 0.0f ? nightSkyGlow(rayDir, u) : float3(0.0f));
             sky += sunDisk(rayDir, u);
         }
@@ -1427,7 +1937,7 @@ kernel void volSkyRender(
         // One dome texel's angular size sets the star point-spread / moon limb AA.
         if (u.cloudExtra2.y > 0.5f)
             sky += skyCelestials(rayDir, u, 2.0f * M_PI_F / float(W), sky, u.windTime.w, false);
-        sky = applyCirrus(sky, u.cameraPos.xyz, rayDir, u.lavaA.y, u, noiseVol, u.cirrusC.x);
+        sky = applyCirrus(sky, u.cameraPos.xyz, rayDir, u.lavaA.y, u, noiseVol, u.cirrusC.x, skyLUT, kMS);
     }
 
     // Compute ray–slab entry and exit (slab is infinite in XZ). Rays
@@ -1710,6 +2220,30 @@ kernel void volSkyRender(
     outTex.write(float4(col, alpha), gid);
 }
 
+kernel void volSkyRender(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    // Never dereferenced when kMS is false: any valid pointer stands in for the LUT.
+    volSkyRenderImpl<false>(outTex, noiseVol, u, burstLights,
+                            reinterpret_cast<device const float4*>(burstLights), gid);
+}
+
+kernel void volSkyRenderMS(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    // The atmosphere LUT region of the SAME uniforms buffer (`VolumetricCloudRenderer`).
+    device const float4* skyLUT                  [[buffer(2)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    volSkyRenderImpl<true>(outTex, noiseVol, u, burstLights, skyLUT, gid);
+}
+
 // ── In-view (perspective) cloud kernel ───────────────────────────────────────
 //
 // Same atmosphere + volumetric cumulus + burst-lit march as volSkyRender, but
@@ -1746,7 +2280,8 @@ struct CloudInViewUniforms {
                                  // y = per-frame lava weight override (≥ 0), −1 = SkyUniforms.lavaA.x
                                  // z = cirrus clock override (≥ 0), −1 = x
                                  // w = cirrus threads weight override (≥ 0), −1 = SkyUniforms.cirrusC.x
-    float4   night;              // x = the renderer's frame clock (s) — stellar scintillation; yzw reserved
+    float4   night;              // x = the renderer's frame clock (s) — stellar scintillation;
+                                 // y = the atmosphere LUT is bound at buffer(3) (> 0.5); zw reserved
 };
 
 /// Angular size (radians) of one output pixel of the camera the in-view pass reconstructs
@@ -1762,17 +2297,17 @@ inline float inViewPixelAngle(constant CloudInViewUniforms &cv, float2 uv, float
     return 2.0f * asin(min(0.5f * length(rd - rd1), 1.0f));
 }
 
-kernel void illumi_cloud_inview(
-    texture2d<float, access::write>  outTex      [[texture(0)]],
-    texture3d<float, access::sample> noiseVol    [[texture(1)]],
-    // Scene depth — the v2 clip. Cleared to 1.0, so anything below that is
-    // opaque geometry this pass must not touch.
-    depth2d<float,   access::read>   gDepth      [[texture(2)]],
-    constant SkyUniforms &u                      [[buffer(0)]],
-    constant CloudInViewUniforms &cv             [[buffer(1)]],
-    device const VSBurstLight* burstLights       [[buffer(2)]],
-    uint2 gid                                    [[thread_position_in_grid]]
-) {
+// Compiled twice, like `volSkyRenderImpl`: `illumi_cloud_inview` has no multiple-scattering code;
+// `illumi_cloud_inview_ms` reads the LUTs at buffer(3) when cv.night.y says they are bound.
+template <bool kMS>
+inline void illumiCloudInViewImpl(texture2d<float, access::write>  outTex,
+                                  texture3d<float, access::sample> noiseVol,
+                                  depth2d<float,   access::read>   gDepth,
+                                  constant SkyUniforms &u,
+                                  constant CloudInViewUniforms &cv,
+                                  device const VSBurstLight* burstLights,
+                                  device const float4* skyLUT,
+                                  uint2 gid) {
     uint W = outTex.get_width();
     uint H = outTex.get_height();
     if (gid.x >= W || gid.y >= H) return;
@@ -1821,7 +2356,7 @@ kernel void illumi_cloud_inview(
             sky = lavaCol;
         } else {
             sky = (u.atmosphereParams.x > 0.5f)
-                ? nishitaAtmosphereColor(rayDir, u)
+                ? nishitaAtmosphereColor(rayDir, u, skyLUT, kMS && cv.night.y > 0.5f)
                 : atmosphereColor(rayDir, u) + (rayDir.y >= 0.0f ? nightSkyGlow(rayDir, u) : float3(0.0f));
             sky += sunDisk(rayDir, u);
         }
@@ -1830,7 +2365,8 @@ kernel void illumi_cloud_inview(
             sky += skyCelestials(rayDir, u, inViewPixelAngle(cv, uv, float2(W, H), rayDir),
                                  sky, cv.night.x, false);
         sky = applyCirrus(sky, ro, rayDir, cv.extra.z >= 0.0f ? cv.extra.z : cv.extra.x, u, noiseVol,
-                          cv.extra.w >= 0.0f ? cv.extra.w : u.cirrusC.x);   // w ≥ 0: per-frame threads weight
+                          cv.extra.w >= 0.0f ? cv.extra.w : u.cirrusC.x,   // w ≥ 0: per-frame threads weight
+                          skyLUT, kMS && cv.night.y > 0.5f);
     }
     // Alpha for a texel with no deck in the way: fully transmissive (see the tail write).
     float clearA = f > 1u ? 2.0f : 1.0f;
@@ -2004,6 +2540,35 @@ kernel void illumi_cloud_inview(
     // Downsampled: alpha = 1 + transmittance, so the full-res upsample can put pixel-sharp
     // stars BEHIND the clouds (alpha ≥ 1 still marks "marched"). Full-res: alpha 1, as before.
     outTex.write(float4(col, f > 1u ? 1.0f + effTrans : 1.0f), gid);
+}
+
+kernel void illumi_cloud_inview(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    // Scene depth — the v2 clip. Cleared to 1.0, so anything below that is
+    // opaque geometry this pass must not touch.
+    depth2d<float,   access::read>   gDepth      [[texture(2)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    constant CloudInViewUniforms &cv             [[buffer(1)]],
+    device const VSBurstLight* burstLights       [[buffer(2)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    illumiCloudInViewImpl<false>(outTex, noiseVol, gDepth, u, cv, burstLights,
+                                 reinterpret_cast<device const float4*>(burstLights), gid);
+}
+
+kernel void illumi_cloud_inview_ms(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    depth2d<float,   access::read>   gDepth      [[texture(2)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    constant CloudInViewUniforms &cv             [[buffer(1)]],
+    device const VSBurstLight* burstLights       [[buffer(2)]],
+    // The atmosphere LUT region of the sky-uniforms buffer (cv.night.y > 0.5 = bound).
+    device const float4* skyLUT                  [[buffer(3)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    illumiCloudInViewImpl<true>(outTex, noiseVol, gDepth, u, cv, burstLights, skyLUT, gid);
 }
 
 // Depth-aware upsample of a downsampled in-view cloud march into the HDR composite. Sky pixels

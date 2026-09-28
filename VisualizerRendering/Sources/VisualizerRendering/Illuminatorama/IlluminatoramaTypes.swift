@@ -600,6 +600,10 @@ public struct IlluminatoramaFrameUniforms {
     public var nightSkyExtra2: SIMD4<Float> = .zero
     public var nightCelestial: SIMD4<Float> = .zero
     public var scotopicParams: SIMD4<Float> = .zero
+    /// Display chain for a physically-scaled night — see the Metal `FrameUniforms`: x = HDR
+    /// pre-exposure (0 ⇒ 1), yz = the hue-stable toe knee [lo, hi] (z = 0 ⇒ off). ONE new
+    /// 16-byte cluster (stride 1648 → 1664). All-zero ⇒ byte-identical.
+    public var displayParams: SIMD4<Float> = .zero
 
     /// Fill the eight gain vectors from a flat 32-entry table, and stamp the enable.
     public mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {

@@ -516,7 +516,8 @@ struct FrameUniforms {
     // nightSkyExtra:  x = model (0 = legacy — the default, byte-identical; 1 = physical),
     //                 y = moon aureole gain, z = earthshine gain, w = Milky Way gain.
     // nightSkyExtra2: x = scintillation gain, y = night radiance (scene radiance of a
-    //                 magnitude-0 flux over 1 sr), z = scintillation clock (s), w reserved.
+    //                 magnitude-0 flux over 1 sr), z = scintillation clock (s), w = star limiting
+    //                 magnitude (0 ⇒ none — the default).
     // nightCelestial: world → J2000-equatorial quaternion (xyz imaginary, w real); 0 = identity.
     // scotopicParams: x = scotopic knee (display luma where the night desaturation has
     //                 faded out; 0 ⇒ the legacy 0.08), yzw = Purkinje tint the rod-vision
@@ -526,8 +527,22 @@ struct FrameUniforms {
     float4   nightSkyExtra2;
     float4   nightCelestial;
     float4   scotopicParams;
+    // ── Display chain for a physically-scaled night (VZ-0170 / Digital Clock) ────────────
+    // displayParams: x = HDR PRE-EXPOSURE K — the host has scaled every light, emission and
+    //                sky it feeds the frame by K so a physically dim night sits in fp16's normal
+    //                range instead of its subnormals; the renderer divides K back out wherever
+    //                an ABSOLUTE level matters (tonemap / LTM exposure, the meter, the bloom and
+    //                halation thresholds, the TAA and bloom anti-firefly weights). 0 ⇒ 1.
+    //                y, z = HUE-STABLE TOE knee [lo, hi] in EXPOSED brightness (max(luma,
+    //                ½·max channel), the meter's metric): below lo the display transform runs
+    //                on the pixel's max-RGB norm and rescales its colour (the scene's linear
+    //                ratios kept, no per-channel toe) and the post-tonemap saturation push is
+    //                off; above hi the transform and the push are the shipped ones. z = 0 ⇒ off.
+    //                w = reserved.
+    // ONE new 16-byte cluster (stride 1648 → 1664); mirror of IlluminatoramaFrameUniforms.
+    float4   displayParams;
 };
-static_assert(sizeof(FrameUniforms) == 1648, "FrameUniforms must match IlluminatoramaFrameUniforms (1648 bytes)");
+static_assert(sizeof(FrameUniforms) == 1664, "FrameUniforms must match IlluminatoramaFrameUniforms (1664 bytes)");
 
 // Secondary directional light (#60 task 5). Mirror of Swift
 // IlluminatoramaDirectionalLight. `dir` points TOWARD the light (world space,
@@ -1117,6 +1132,7 @@ static inline NightSkyParams frameNightSky(constant FrameUniforms& f) {
     p.radiance       = f.nightSkyExtra2.y;
     p.clock          = f.nightSkyExtra2.z;
     p.celestial      = f.nightCelestial;
+    p.limitMag       = f.nightSkyExtra2.w;
     return p;
 }
 

@@ -83,7 +83,7 @@ kernel void illumi_exposure_estimate(
     device ExposureState&           state     [[buffer(0)]],
     constant uint2&                 imgSize   [[buffer(1)]],
     constant float4&                params    [[buffer(2)]],  // x=targetEV, y=halfLife, z=maxBoost, w=minBoost
-    constant float4&                params2   [[buffer(3)]],  // x=highlightProtection, y=highlightEV, z=histogram instrument ON, w reserved
+    constant float4&                params2   [[buffer(3)]],  // x=highlightProtection, y=highlightEV, z=histogram instrument ON, w=HDR pre-exposure (0 ⇒ none)
     constant float4&                params3   [[buffer(4)]],  // x=metering (0 mean, 1 percentile), y=key pct, z=guard pct (0 off), w=guard EV
     device float*                   histOut   [[buffer(5)]],  // kExposureHistBins counts + total, p50, p95, p99, mean, key
     threadgroup float*              sharedAcc [[threadgroup(0)]],
@@ -138,6 +138,10 @@ kernel void illumi_exposure_estimate(
         float lum  = dot(rgb, float3(0.2126, 0.7152, 0.0722));
         float maxc = max(rgb.r, max(rgb.g, rgb.b));
         lum = max(lum, 0.5 * maxc);
+        // HDR pre-exposure (`hdrPreExposure`, VZ-0170): the host scaled the frame by K, so the
+        // meter reads the UNSCALED level — its clamps, target and bounds keep their meaning.
+        // 0 (the default) ⇒ the branch never runs ⇒ bit-identical.
+        if (params2.w > 0.0) lum /= params2.w;
         if (isfinite(lum) && lum > 0.0) {
             float ll = log2(lum);
             ll = clamp(ll, minLogLum, maxLogLum);
@@ -406,6 +410,36 @@ static inline float3 displayTransform(float3 scene, uint which) {
         case 2:  return agx(scene);
         default: return aces(scene);
     }
+}
+
+// ── Hue-stable toe (opt-in: `IlluminatoramaRenderer.hueStableToe`, displayParams.yz) ─────────
+//
+// A per-channel tone curve maps each channel by its OWN level. In the shoulder that is the
+// point (a hot colour rolls toward white); in the TOE it is a distortion: AgX's log-domain
+// sigmoid and its 'punchy' power act like a ~2.3-power there, so a pixel several stops under
+// mid-grey has every channel ratio raised to about that power — its minor channels crushed to
+// 0, its hue pushed to the primary — and a post-tonemap saturation push multiplies it again.
+// A night frame lifted by local adaptation lives exactly there: a lavender sky (linear 1 : 0.66
+// : 1.63) printed near-pure violet (14, 2, 53).
+//
+// The toe below `lo` keeps the transform's result for the pixel's DOMINANT channel — its
+// brightness, with AgX's own contrast, black level and look (a saturated red keeps the level
+// AgX gives it, which is more than a grey of the same peak would get) — and restores the SCENE's
+// linear channel ratios under it: out = x / max(x) · max(T(x)). Hue-preserving tone mapping by
+// max-RGB ratio restoration; never out of gamut (every channel ≤ the peak), and a grey is the
+// shipped transform exactly. Above `hi` the shipped transform; between, a smoothstep blend — the
+// weight is returned so the caller fades the saturation push in with it.
+static inline float hueStableToeWeight(float3 exposed, float lo, float hi) {
+    float lum  = dot(exposed, float3(0.2126, 0.7152, 0.0722));
+    float maxc = max(exposed.r, max(exposed.g, exposed.b));
+    return smoothstep(lo, hi, max(lum, 0.5 * maxc));
+}
+static inline float3 hueStableDisplay(float3 exposed, float3 mapped) {
+    float3 c = max(exposed, 0.0);
+    float n = max(c.r, max(c.g, c.b));
+    if (!(n > 0.0)) return float3(0.0);
+    float t = max(mapped.r, max(mapped.g, mapped.b));
+    return saturate(c * (t / n));
 }
 
 // ── Color-grade: white-balance gain from a Kelvin temperature ───────────────
@@ -1065,6 +1099,14 @@ fragment float4 illumi_tonemap_fs(
     }
 
     float3 mapped = displayTransform(exposedScene, frame.displayTransform);
+    // Hue-stable toe (opt-in; displayParams.z = 0 ⇒ skipped ⇒ bit-identical). `chromaW` 1 =
+    // the shipped transform and saturation push; 0 = the ratio-preserving toe, no push.
+    float chromaW = 1.0;
+    if (frame.displayParams.z > 0.0) {
+        chromaW = hueStableToeWeight(exposedScene, frame.displayParams.y, frame.displayParams.z);
+        if (chromaW < 1.0)
+            mapped = mix(hueStableDisplay(exposedScene, mapped), mapped, chromaW);
+    }
 
     // ── Film stock — a second DISPLAY TRANSFORM, not a grade on top of one ─────
     //
@@ -1112,7 +1154,9 @@ fragment float4 illumi_tonemap_fs(
     // the per-pixel luminance, which preserves the filmic shoulder while
     // restoring tint. Rec.709 luminance weights are the standard choice.
     float lum = dot(mapped, float3(0.2126, 0.7152, 0.0722));
-    mapped = max(mix(float3(lum), mapped, frame.tonemapSaturation), 0.0);
+    // `chromaW` is exactly 1 unless the hue-stable toe is on — then the push fades out with it.
+    float satPush = (chromaW < 1.0) ? mix(1.0, frame.tonemapSaturation, chromaW) : frame.tonemapSaturation;
+    mapped = max(mix(float3(lum), mapped, satPush), 0.0);
     // ── Scotopic (Purkinje) desaturation ──────────────────────────────────────
     // Human rods are colour-blind, so in dim light real vision loses chroma: a
     // moonlit lawn reads neutral-dark, not green — but the green ALBEDO × dim
@@ -1333,14 +1377,25 @@ fragment float4 illumi_tonemap_fs(
     // TPDF = (two independent uniform randoms) differenced → triangular noise,
     // which is the optimal dither distribution (flat error, no noise modulation).
     if (frame.debandDitherEnabled != 0u) {
-        float3 srgb = pow(mapped, float3(1.0 / 2.2));   // approx sRGB encode
         // Interleaved-gradient-noise hashes for two decorrelated uniform samples.
         float2 px = in.position.xy;
         float n0 = fract(52.9829189 * fract(dot(px, float2(0.06711056, 0.00583715))));
         float n1 = fract(52.9829189 * fract(dot(px + 113.0, float2(0.06711056, 0.00583715))));
         float tpdf = (n0 + n1) - 1.0;                    // ∈ [-1, 1], triangular
-        srgb += tpdf * (1.0 / 255.0);                    // ±1 LSB at 8-bit
-        mapped = pow(saturate(srgb), float3(2.2));       // decode back to linear
+        if (frame.debandDitherEnabled == 2u) {
+            // Opt-in (`debandDitherExactSRGB`): dither in the store's REAL sRGB encoding. The
+            // legacy pow(1/2.2) below is up to ~5× steeper than the OETF's linear toe, so its
+            // ±1 LSB shrinks to ±0.2–0.5 of a real code in the lowest codes — exactly where a
+            // night frame's walls live.
+            float3 m = saturate(mapped);
+            float3 srgb = select(1.055 * pow(m, float3(1.0 / 2.4)) - 0.055, m * 12.92, m <= 0.0031308);
+            srgb = saturate(srgb + tpdf * (1.0 / 255.0));
+            mapped = select(pow((srgb + 0.055) / 1.055, float3(2.4)), srgb / 12.92, srgb <= 0.04045);
+        } else {
+            float3 srgb = pow(mapped, float3(1.0 / 2.2));   // approx sRGB encode
+            srgb += tpdf * (1.0 / 255.0);                    // ±1 LSB at 8-bit
+            mapped = pow(saturate(srgb), float3(2.2));       // decode back to linear
+        }
     }
 
     // ── Diagram cross-fade ───────────────────────────────────────────────────

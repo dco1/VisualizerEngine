@@ -35,13 +35,14 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
     /// tagged-vertex glow gain cluster (`tagGlowGain` + 3 pads), pinned by the source's own
     /// `static_assert(sizeof(FrameUniforms) == 1584)` in IlluminatoramaCommon.h; 1584 → 1648
     /// with the physical night sky + scotopic shaping (`nightSkyExtra`, `nightSkyExtra2`,
-    /// `nightCelestial`, `scotopicParams`), pinned by the same static_assert at 1648.
+    /// `nightCelestial`, `scotopicParams`), pinned by the same static_assert at 1648; 1648 → 1664
+    /// with the display-chain cluster (`displayParams`: HDR pre-exposure + hue-stable toe).
     /// Verified against Metal by compiling a scratch kernel carrying
     /// `static_assert(sizeof(FrameUniforms) == 1568)`, which holds while the same assert at
     /// 1552 fails — i.e. the assert is live, not a tautology. (`offsetof` is not available
     /// in Metal; the tail offsets below are the Swift-side half of the check, and the fields
     /// are APPENDED, so stride pins them.)
-    private static let metalStride = 1648
+    private static let metalStride = 1664
 
     func testFrameUniformsStrideMatchesMetal() {
         XCTAssertEqual(MemoryLayout<IlluminatoramaFrameUniforms>.stride,
@@ -103,6 +104,7 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
         assertOffset(\.nightSkyExtra2,        1600, "nightSkyExtra2")
         assertOffset(\.nightCelestial,        1616, "nightCelestial")
         assertOffset(\.scotopicParams,        1632, "scotopicParams")
+        assertOffset(\.displayParams,         1648, "displayParams")
     }
 
     /// The packing the shader's `gains[b >> 2][b & 3]` assumes, held on the Swift side that
