@@ -296,7 +296,7 @@ final class NishitaMultipleScatteringTests: XCTestCase {
     func testLUTLayoutMirrorMatchesTheShader() throws {
         let engine = SimEngine.shared
         guard let pso = engine.pipeline("volSkyAtmosphereLUTLayout"),
-              let out = engine.device.makeBuffer(length: 32, options: .storageModeShared),
+              let out = engine.device.makeBuffer(length: 64, options: .storageModeShared),
               let cb = engine.commandQueue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else {
             return XCTFail("volSkyAtmosphereLUTLayout missing")
         }
@@ -306,9 +306,15 @@ final class NishitaMultipleScatteringTests: XCTestCase {
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()  // gpu-ok: test harness
-        let v = out.contents().bindMemory(to: SIMD4<Int32>.self, capacity: 2)
+        let v = out.contents().bindMemory(to: SIMD4<Int32>.self, capacity: 4)
         let L = VolumetricCloudRenderer.AtmosphereLUT.self
-        XCTAssertEqual(Int(v[0].x), L.float4Count, "kLUTLength")
+        XCTAssertEqual(Int(v[0].x), L.builtinFloat4Count, "kLUTLength")
+        // The aerosol medium's Mie table after it (`NishitaAerosol`), inside the same region.
+        XCTAssertEqual(Int(v[2].x), L.builtinFloat4Count, "kLUTJ")
+        XCTAssertEqual(Int(v[2].y), L.float4Count, "kLUTLengthAerosol")
+        XCTAssertEqual(Int(v[2].z), L.mieTableEl); XCTAssertEqual(Int(v[2].w), L.mieTableAz)
+        XCTAssertEqual(Int(v[3].x), L.builtinFloat4Count + L.mieTableSize, "kLUTJB")
+        XCTAssertEqual(Int(v[3].y), L.mieTableSize, "kJSize")
         XCTAssertEqual(Int(v[0].y), 1, "kLUTTrans")
         XCTAssertEqual(Int(v[0].z), 1 + L.transW * L.transH, "kLUTMS")
         XCTAssertEqual(Int(v[1].x), L.transW); XCTAssertEqual(Int(v[1].y), L.transH)
@@ -530,15 +536,18 @@ final class NishitaMultipleScatteringTests: XCTestCase {
         return try MetalSourceLoader.makeLibrary(device: device, contentsOf: dir.appendingPathComponent("VolumetricSky.metal"))
     }
 
-    /// The old struct is this one without `msParams` and the later `nightSkyE` (the skyglow +
-    /// limiting-magnitude cluster), which sit together just before the GPU-owned tail.
+    /// The old struct is this one without `msParams` and the later clusters (`nightSkyE` — the
+    /// skyglow + limiting-magnitude cluster — and the aerosol's `aerosolA/B`), which sit together
+    /// just before the GPU-owned tail.
     static func preVZ0159Bytes(_ u: SkyUniforms) -> [UInt8] {
         var u = u
         let all = withUnsafeBytes(of: &u) { Array($0) }
         let off = MemoryLayout<SkyUniforms>.offset(of: \SkyUniforms.msParams)!
         let tail = MemoryLayout<SkyUniforms>.offset(of: \SkyUniforms.cloudLitSun)!
-        precondition(MemoryLayout<SkyUniforms>.offset(of: \SkyUniforms.nightSkyE)! == off + 16 && tail == off + 32,
-                     "msParams + nightSkyE must be the two clusters right before the GPU-written tail")
+        precondition(MemoryLayout<SkyUniforms>.offset(of: \SkyUniforms.nightSkyE)! == off + 16
+                     && MemoryLayout<SkyUniforms>.offset(of: \SkyUniforms.aerosolA)! == off + 32
+                     && MemoryLayout<SkyUniforms>.offset(of: \SkyUniforms.aerosolB)! == off + 48 && tail == off + 64,
+                     "msParams, nightSkyE, aerosolA/B must be the clusters right before the GPU-written tail")
         return Array(all[0..<off]) + Array(all[tail...])
     }
 

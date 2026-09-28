@@ -377,6 +377,35 @@ public final class VolumetricCloudRenderer {
         /// the LUTs (a GPU-only, ≈2–3 ms step), so don't animate it.
         public var atmosphereGroundAlbedo: Float = 0.1
 
+        // ── Aerosols (opt-in, `.nishita` only) ─────────────────────────────────────────
+        /// **The air's aerosol — the haze that makes a low sun golden** (`NishitaAerosol`:
+        /// optical depth at 550 nm, Ångström exponent, scale height, single-scattering albedo,
+        /// Cornette–Shanks g). `.builtin` (the default) is the sky's historical aerosol exactly —
+        /// τ550 0.0277, grey, H 1.2 km, ω₀ 0.909, g 0.76 — and every kernel stays bit-identical.
+        ///
+        /// Anything else switches every consumer of the sky to that aerosol at once, from these
+        /// numbers alone: the single-scatter march, the multiple-scattering transmittance and
+        /// scattering LUTs (rebuilt once when it changes — never per frame; don't animate it),
+        /// the per-pixel march, the moonlit sky, `cloudLightingFromAtmosphere` (the sun reaching
+        /// the deck and its sky fill), the cirrus lit by those, the IBL and radiance probes (the
+        /// dome) and Illuminatorama's in-view sky. The sun DISC and a host's directional light
+        /// are the host's colours: give them `sunTransmittance()` (this sky's own direct-beam
+        /// transmittance) so they redden with it.
+        ///
+        /// For a golden low sun and a twilight arch use `.hazySuburban` (τ550 0.25, Preetham
+        /// turbidity ≈ 3.5) with `atmosphereMultipleScattering`. More aerosol makes the day sky
+        /// whiter and brighter near the horizon and adds diffuse light: re-measure the exposure
+        /// (the noon up-hemisphere E/π rises 2.4× for `.hazySuburban` — see
+        /// docs/illuminatorama/nishita-multiple-scattering.md, "Aerosols").
+        ///
+        /// With multiple scattering the aerosol medium also carries the field's Mie SHAPE (the
+        /// forward-scattered light of the bright sunward sky — the aureole, the twilight arch)
+        /// through the last bounce and the higher orders: within 0.15 stop of a path-traced
+        /// reference at τ550 0.2–0.4, sun +79° … −6°. Cost (M1 Max): a ≈6 ms GPU rebuild once per
+        /// change; the per-pixel march ≈1.4× the built-in air's (a 4-D table lookup per sample
+        /// where the aerosol is); the tables add 2.3 MB to `skyUniformsBuffer`.
+        public var atmosphereAerosol: NishitaAerosol = .builtin
+
         // ── Night directional moonlight (cloud form) ───────────────────
         /// Strength of the moon as the cloud deck's DIRECTIONAL light. 0 =
         /// clouds lit only by flat sky-ambient (no lit/shadow face → reads as
@@ -569,6 +598,9 @@ public final class VolumetricCloudRenderer {
         var physicalCloudLighting: Bool { cloudLightingFromAtmosphere && atmosphere == .nishita }
         /// The flag as the kernels honour it: multiple scattering is a property of the nishita sky.
         var physicalMultipleScattering: Bool { atmosphereMultipleScattering && atmosphere == .nishita }
+        /// The aerosol as the kernels honour it: a property of the nishita sky; `.builtin` keeps
+        /// the unchanged kernels.
+        var physicalAerosol: Bool { atmosphere == .nishita && atmosphereAerosol != .builtin }
 
         // ── Flat studio background (opt-in) ─────────────────────────────
         /// Replace the ENTIRE dome — atmosphere, sun disk, clouds, stars/moon — with a flat,
@@ -704,11 +736,17 @@ public final class VolumetricCloudRenderer {
         let inputs: [Float] = [u.sunDir.x, u.sunDir.y, u.sunDir.z, u.atmosphereParams.y,
                                u.skyGrade.x, u.skyGrade.y, u.cloudSlab.x,
                                u.skyHorizon.x, u.skyHorizon.y, u.skyHorizon.z,
-                               u.msParams.x, u.msParams.y]
+                               u.msParams.x, u.msParams.y,
+                               u.aerosolA.x, u.aerosolA.y, u.aerosolA.z, u.aerosolA.w,
+                               u.aerosolB.x, u.aerosolB.y, u.aerosolB.z, u.aerosolB.w]
         let ms = u.msParams.x > 0.5
+        // The built-in aerosol keeps the unchanged kernels; any other takes the `…Aerosol` twin.
+        let aerosol = u.aerosolB.w > 0
+        let lightPipeline = aerosol
+            ? pipelineCache.pipelineState(name: ms ? "volSkyCloudLightMSAerosol" : "volSkyCloudLightAerosol", device: device)
+            : (ms ? pipelineCache.pipelineState(name: "volSkyCloudLightMS", device: device) : cloudLightPipeline)
         guard inputs != lastCloudLightInputs,
-              let lightPipeline = ms ? pipelineCache.pipelineState(name: "volSkyCloudLightMS", device: device)
-                                     : cloudLightPipeline,
+              let lightPipeline,
               let cmd = commandQueue.makeCommandBuffer() else { return }
         // A pending atmosphere-LUT build goes FIRST: the prepass reads the LUTs when on.
         encodePendingAtmosphereLUT(into: cmd)
@@ -798,7 +836,7 @@ public final class VolumetricCloudRenderer {
         // Burst lights — fallback zero buffer when the host set none, so the
         // binding is always valid (count 0 → kernel never reads it).
         enc.setBuffer(burstLights ?? fallbackLightBuffer, offset: 0, index: 1)
-        if pipeline === pipelineMS { enc.setBuffer(uniformsBuffer, offset: Self.atmosphereLUTOffset, index: 2) }
+        if readsAtmosphereLUT(pipeline) { enc.setBuffer(uniformsBuffer, offset: Self.atmosphereLUTOffset, index: 2) }
 
         let tgw = min(pipeline.threadExecutionWidth, resolution.x)
         let tgh = max(1, pipeline.maxTotalThreadsPerThreadgroup / max(1, tgw))
@@ -909,7 +947,7 @@ public final class VolumetricCloudRenderer {
         enc.setTexture(noiseVolume.texture, index: 1)
         enc.setBuffer(uniformsBuffer, offset: 0, index: 0)
         enc.setBuffer(burstLights ?? fallbackLightBuffer, offset: 0, index: 1)
-        if pipeline === pipelineMS { enc.setBuffer(uniformsBuffer, offset: Self.atmosphereLUTOffset, index: 2) }
+        if readsAtmosphereLUT(pipeline) { enc.setBuffer(uniformsBuffer, offset: Self.atmosphereLUTOffset, index: 2) }
         let tgw = min(pipeline.threadExecutionWidth, resolution.x)
         let tgh = max(1, pipeline.maxTotalThreadsPerThreadgroup / max(1, tgw))
         enc.dispatchThreads(
@@ -952,8 +990,18 @@ public final class VolumetricCloudRenderer {
         nonisolated static let msW = 64, msH = 32          // Ψ LUT: cos(sun zenith) × altitude
         nonisolated static let lastOrder = 5               // orders 2…5 iterated, then the tail
         nonisolated static let dirThreads = 64             // threads per Ψ texel in the order kernel
-        /// Float4s in the region: header + transmittance + Ψ (2 per texel) + 5 scratch tables.
-        nonisolated static let float4Count = 1 + transW * transH + 2 * msW * msH + 5 * msW * msH
+        nonisolated static let mieTableEl = 14, mieTableAz = 10   // the aerosol Mie table's view directions
+        /// Float4s the built-in medium uses (`kLUTLength`): header + transmittance + Ψ (2 per
+        /// texel) + 5 scratch tables.
+        nonisolated static let builtinFloat4Count = 1 + transW * transH + 2 * msW * msH + 5 * msW * msH
+        /// Float4s of one of the aerosol medium's Mie shape tables (`kJSize`): every Ψ column ×
+        /// every other Ψ row × the view directions, a half4 each (two per float4).
+        nonisolated static let mieTableSize = msW * (msH / 2) * mieTableEl * mieTableAz / 2
+        /// Both of them, after the built-in region (`kLUTJ`, the final one, then `kLUTJB`, the
+        /// build's ping-pong partner) — written only by the `…Aerosol` build (zeros otherwise).
+        nonisolated static let mieTableFloat4Count = 2 * mieTableSize
+        /// Float4s in the region (`kLUTLengthAerosol`).
+        nonisolated static let float4Count = builtinFloat4Count + mieTableFloat4Count
     }
     /// Byte offset of the atmosphere LUT region in `skyUniformsBuffer` (after the uniforms).
     nonisolated static var atmosphereLUTOffset: Int { (MemoryLayout<SkyUniforms>.stride + 255) & ~255 }
@@ -965,13 +1013,23 @@ public final class VolumetricCloudRenderer {
 
     /// The dome / IBL kernel for these params: `volSkyRender` has no multiple-scattering code in
     /// it at all (so the flag-off output is bit-identical to before — a never-taken branch still
-    /// changed the compiled cloud march); `volSkyRenderMS` is the same body with the LUT sky.
+    /// changed the compiled cloud march); `volSkyRenderMS` is the same body with the LUT sky; the
+    /// `…Aerosol` twins are those two with the host's aerosol as the Mie medium
+    /// (`Params.atmosphereAerosol` ≠ `.builtin`).
     private func domePipeline(for params: Params) -> MTLComputePipelineState? {
-        guard params.physicalMultipleScattering else { return pipeline }
-        if pipelineMS == nil { pipelineMS = pipelineCache.pipelineState(name: "volSkyRenderMS", device: device) }
-        return pipelineMS ?? pipeline
+        let ms = params.physicalMultipleScattering, aerosol = params.physicalAerosol
+        guard ms || aerosol else { return pipeline }
+        let name = ms ? (aerosol ? "volSkyRenderMSAerosol" : "volSkyRenderMS") : "volSkyRenderAerosol"
+        if let p = variantPipelines[name] { return p }
+        guard let p = pipelineCache.pipelineState(name: name, device: device) else { return pipeline }
+        variantPipelines[name] = p
+        if ms { lutPipelines.append(ObjectIdentifier(p)) }
+        return p
     }
-    private var pipelineMS: MTLComputePipelineState?
+    /// The dome kernel variants built so far, by name, and which of them read the LUT at buffer(2).
+    private var variantPipelines: [String: MTLComputePipelineState] = [:]
+    private var lutPipelines: [ObjectIdentifier] = []
+    private func readsAtmosphereLUT(_ p: MTLComputePipelineState) -> Bool { lutPipelines.contains(ObjectIdentifier(p)) }
 
     /// Whether the uniforms in `buffer` (a `skyUniformsBuffer`) ask for multiple scattering — how
     /// Illuminatorama's in-view pass, which only ever gets the buffer, picks its kernel variant.
@@ -982,46 +1040,77 @@ public final class VolumetricCloudRenderer {
         return buffer.contents().load(fromByteOffset: off, as: Float.self) > 0.5
     }
 
-    /// Ground albedo the atmosphere LUTs were last built for (nil = never built).
-    private var atmosphereLUTAlbedo: Float?
-    /// A build this update still has to encode (its albedo), or nil.
-    private var pendingAtmosphereLUT: Float?
+    /// Whether the uniforms in `buffer` (a `skyUniformsBuffer`) carry an aerosol other than the
+    /// built-in one (`Params.atmosphereAerosol`) — how Illuminatorama's in-view pass picks its
+    /// `_aerosol` kernel. Host-written (the scale height, `aerosolB.w`), so a CPU read is race-free.
+    nonisolated static func aerosolRequested(in buffer: MTLBuffer) -> Bool {
+        guard buffer.length >= MemoryLayout<SkyUniforms>.stride else { return false }
+        let off = MemoryLayout<SkyUniforms>.offset(of: \SkyUniforms.aerosolB)! + 3 * MemoryLayout<Float>.stride
+        return buffer.contents().load(fromByteOffset: off, as: Float.self) > 0
+    }
 
-    /// Queue a (re)build when the flag is on and the LUTs are missing or stale (albedo changed).
-    /// Never per frame: the LUTs depend only on compile-time constants and the albedo.
+    /// What the LUTs depend on besides compile-time constants: the ground albedo and the aerosol
+    /// (its two uniform float4s; zeros = the built-in aerosol, built by the unchanged kernels).
+    struct AtmosphereLUTKey: Equatable {
+        var albedo: Float
+        var aerosolA: SIMD4<Float> = .zero
+        var aerosolB: SIMD4<Float> = .zero
+        var hasAerosol: Bool { aerosolB.w > 0 }
+    }
+    /// What the atmosphere LUTs were last built for (nil = never built).
+    private var atmosphereLUTKey: AtmosphereLUTKey?
+    /// A build this update still has to encode, or nil.
+    private var pendingAtmosphereLUT: AtmosphereLUTKey?
+
+    /// Queue a (re)build when the flag is on and the LUTs are missing or stale (albedo or aerosol
+    /// changed). Never per frame: the LUTs depend only on compile-time constants and these.
     private func scheduleAtmosphereLUT(_ uniforms: SkyUniforms) {
-        guard uniforms.msParams.x > 0.5, atmosphereLUTAlbedo != uniforms.msParams.y else { return }
-        pendingAtmosphereLUT = uniforms.msParams.y
+        guard uniforms.msParams.x > 0.5 else { return }
+        let key = AtmosphereLUTKey(albedo: uniforms.msParams.y, aerosolA: uniforms.aerosolA, aerosolB: uniforms.aerosolB)
+        guard atmosphereLUTKey != key else { return }
+        pendingAtmosphereLUT = key
     }
 
     /// Encode a pending build at the head of `cmd` — the first command buffer of this update, so
     /// every later dispatch on the queue (this update's prepass, IBL and dome, and the in-view
     /// pass after it) reads complete LUTs. GPU-only: no wait, no readback.
     private func encodePendingAtmosphereLUT(into cmd: MTLCommandBuffer) {
-        guard let albedo = pendingAtmosphereLUT else { return }
+        guard let key = pendingAtmosphereLUT else { return }
         pendingAtmosphereLUT = nil
-        if encodeAtmosphereLUTBuild(into: cmd, albedo: albedo) { atmosphereLUTAlbedo = albedo }
+        let aerosol = key.hasAerosol ? (key.aerosolA, key.aerosolB) : nil
+        if encodeAtmosphereLUTBuild(into: cmd, albedo: key.albedo, aerosol: aerosol) { atmosphereLUTKey = key }
     }
 
     /// Encode the whole LUT build (transmittance → orders 2…N → finalize → ready flag) into
-    /// `cmd`. Internal so a test can time it on a command buffer of its own.
-    func encodeAtmosphereLUTBuild(into cmd: MTLCommandBuffer, albedo: Float) -> Bool {
-        guard let trans = pipelineCache.pipelineState(name: "volSkyTransmittanceLUT", device: device),
-              let order = pipelineCache.pipelineState(name: "volSkyMultiScatterOrder", device: device),
-              let finalize = pipelineCache.pipelineState(name: "volSkyMultiScatterFinalize", device: device),
-              let ready = pipelineCache.pipelineState(name: "volSkyMultiScatterReady", device: device) else {
+    /// `cmd`. Internal so a test can time it on a command buffer of its own. `aerosol` = the two
+    /// `SkyUniforms.aerosolA/B` float4s of a non-built-in aerosol (the `…Aerosol` kernels build
+    /// through it), nil = the built-in aerosol (the unchanged kernels).
+    func encodeAtmosphereLUTBuild(into cmd: MTLCommandBuffer, albedo: Float,
+                                  aerosol: (SIMD4<Float>, SIMD4<Float>)? = nil) -> Bool {
+        let suffix = aerosol == nil ? "" : "Aerosol"
+        guard let trans = pipelineCache.pipelineState(name: "volSkyTransmittanceLUT" + suffix, device: device),
+              let order = pipelineCache.pipelineState(name: "volSkyMultiScatterOrder" + suffix, device: device),
+              let finalize = pipelineCache.pipelineState(name: "volSkyMultiScatterFinalize" + suffix, device: device),
+              let ready = pipelineCache.pipelineState(name: "volSkyMultiScatterReady" + suffix, device: device) else {
             Self.log.error("atmosphere LUT pipelines missing — multiple scattering stays single-scatter")
             return false
         }
         let offset = Self.atmosphereLUTOffset
         let L = AtmosphereLUT.self
         var bp = SIMD4<Float>(0, albedo, 0, 0)
-        // One encoder per stage: each reads what the previous one wrote.
-        func stage(_ label: String, _ pso: MTLComputePipelineState, _ body: (MTLComputeCommandEncoder) -> Void) {
+        var medium = [aerosol?.0 ?? .zero, aerosol?.1 ?? .zero]
+        // One encoder per stage: each reads what the previous one wrote. The aerosol medium goes to
+        // buffer(2) of the three `…Aerosol` stages that declare it (finalize's twin only finishes
+        // the Mie table the order stages accumulated — it takes no medium).
+        func stage(_ label: String, _ pso: MTLComputePipelineState, medium readsMedium: Bool = true,
+                   _ body: (MTLComputeCommandEncoder) -> Void) {
             guard let enc = cmd.makeComputeCommandEncoder() else { return }
             enc.label = label
             enc.setComputePipelineState(pso)
             enc.setBuffer(uniformsBuffer, offset: offset, index: 0)
+            if aerosol != nil && readsMedium {
+                medium.withUnsafeMutableBytes { enc.setBytes($0.baseAddress!, length: $0.count, index: 2) }
+            }
             body(enc)
             enc.endEncoding()
         }
@@ -1037,7 +1126,7 @@ public final class VolumetricCloudRenderer {
                                          threadsPerThreadgroup: MTLSize(width: L.dirThreads, height: 1, depth: 1))
             }
         }
-        stage("volSkyMultiScatterFinalize", finalize) { enc in
+        stage("volSkyMultiScatterFinalize", finalize, medium: false) { enc in
             enc.dispatchThreads(MTLSize(width: L.msW, height: L.msH, depth: 1),
                                 threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))
         }
@@ -1194,6 +1283,11 @@ struct SkyUniforms {
     /// Artificial skyglow (x zenith F0/sr, y gradient exponent, z CCT) + star limiting
     /// magnitude (w) — see the Metal mirror.
     var nightSkyE: SIMD4<Float>
+    /// Aerosol medium (`Params.atmosphereAerosol`): (τ550, Ångström α, ω₀, Cornette–Shanks g) and
+    /// (0, 0, 0, H_M m); zeros for the built-in aerosol — see the Metal mirror and
+    /// `NishitaAerosol.uniforms`.
+    var aerosolA: SIMD4<Float>
+    var aerosolB: SIMD4<Float>
     /// GPU-WRITTEN by `volSkyCloudLight` (never by the host upload — see `hostPrefixLength`).
     var cloudLitSun: SIMD4<Float>
     var cloudLitAmbient: SIMD4<Float>
@@ -1314,6 +1408,9 @@ struct SkyUniforms {
                                       NightSkyEphemeris.skyglowGradientExponent(horizonToZenith: params.artificialSkyglowHorizonRatio),
                                       min(max(params.artificialSkyglowTemperature, 1667), 25000),
                                       physical ? max(0, params.starLimitingMagnitude) : 0)
+        let aerosol = params.physicalAerosol ? params.atmosphereAerosol.uniforms : (a: SIMD4<Float>.zero, b: SIMD4<Float>.zero)
+        self.aerosolA = aerosol.a
+        self.aerosolB = aerosol.b
         self.cloudLitSun = .zero
         self.cloudLitAmbient = .zero
         self.cloudLitGround = .zero

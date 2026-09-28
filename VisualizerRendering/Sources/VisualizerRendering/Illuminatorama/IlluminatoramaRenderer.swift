@@ -4814,6 +4814,12 @@ public final class IlluminatoramaRenderer {
     /// The in-view kernel with the multiple-scattering sky (built on first use).
     private lazy var cloudInViewPipelineMS: MTLComputePipelineState? =
         engine.pipelineCache.pipelineState(name: "illumi_cloud_inview_ms", device: device)
+    /// The two in-view kernels with the host's aerosol as the Mie medium
+    /// (`VolumetricCloudRenderer.Params.atmosphereAerosol` ≠ `.builtin`; built on first use).
+    private lazy var cloudInViewPipelineAerosol: MTLComputePipelineState? =
+        engine.pipelineCache.pipelineState(name: "illumi_cloud_inview_aerosol", device: device)
+    private lazy var cloudInViewPipelineMSAerosol: MTLComputePipelineState? =
+        engine.pipelineCache.pipelineState(name: "illumi_cloud_inview_ms_aerosol", device: device)
     /// Baked noise volume + packed SkyUniforms + burst-light buffer, supplied by
     /// the scene's `VolumetricCloudRenderer` (reused, not re-packed).
     public var cloudNoiseTexture: MTLTexture?
@@ -13184,8 +13190,14 @@ public final class IlluminatoramaRenderer {
         // its LUTs live after the uniforms in the cloud renderer's uniforms buffer, so this pass
         // draws the same sky as the dome and IBL with no extra wiring — `illumi_cloud_inview_ms`
         // with the LUT region at buffer(3) (night.y = bound). Off: the unchanged kernel.
-        let msPipeline = VolumetricCloudRenderer.multipleScatteringRequested(in: skyU) ? cloudInViewPipelineMS : nil
-        let marchPipeline = msPipeline ?? pipeline   // threadgroups are sized from the bound kernel
+        // An aerosol other than the built-in one (`Params.atmosphereAerosol`) rides in the same
+        // uniforms: the `_aerosol` twins read it as the Mie medium (the unchanged kernels keep the
+        // built-in constants — bit-identical for every host that never sets one).
+        let aerosol = VolumetricCloudRenderer.aerosolRequested(in: skyU)
+        let msPipeline = VolumetricCloudRenderer.multipleScatteringRequested(in: skyU)
+            ? (aerosol ? cloudInViewPipelineMSAerosol : cloudInViewPipelineMS) : nil
+        let marchPipeline = msPipeline ?? (aerosol ? (cloudInViewPipelineAerosol ?? pipeline) : pipeline)
+        // (threadgroups are sized from the bound kernel)
         var u = CloudInViewUniforms(invViewProjection: fu.invViewProjection,
                                     cameraWorldPos: SIMD4<Float>(fu.cameraWorldPos, f > 1 ? Float(f) : 0),
                                     extra: SIMD4<Float>(inViewSkyTime ?? time, inViewLavaFade.map { min(max($0, 0), 1) } ?? -1,
