@@ -796,6 +796,28 @@ public final class IlluminatoramaRenderer {
     /// Whether the LAST encoded AO pass was the traced one — a gate's proof that RTAO fired
     /// rather than silently falling back to the screen-space march.
     public private(set) var rtaoDidRunLastFrame: Bool = false
+
+    // ── AO v2 — accumulated RTAO for a frozen camera (Daydream DH-0887) ─────────────────────
+    /// Host opt-in for a still / settled canvas: while RTAO runs, trace it with progressive
+    /// blue-noise sampling from the geometric surface with a `1 − (t/R)²` falloff, average it in
+    /// its OWN fp32 running mean (no clamp), and denoise the mean with a filter that fades as it
+    /// converges — instead of blurring every frame and leaving the average to the colour TAA.
+    /// See `IlluminatoramaAOAccumulator`. Default `false`: nothing is allocated or encoded and
+    /// every host is byte-identical. Turning it off resets the mean.
+    public var aoAccumulationEnabled: Bool = false {
+        didSet { if !aoAccumulationEnabled { aoAccumulator?.reset() } }
+    }
+    /// Test-only: offsets the progressive sequence's streams so two otherwise identical settles
+    /// sample independently (production sampling is deterministic). 0 = production.
+    public var aoAccumulationScramble: UInt32 = 0
+    /// Frames in the current accumulated AO mean (0 = none; the per-frame path is in use).
+    public var aoAccumulatedFrames: Int { aoAccumulator?.frames ?? 0 }
+    /// Restart the accumulated AO mean — for a host that changed the scene without moving the
+    /// camera or the scene's topology (e.g. moved an object) and keeps accumulation on.
+    public func resetAOAccumulation() { aoAccumulator?.reset() }
+    /// Whether THIS frame's AO came from the accumulator (the selector's switch).
+    public private(set) var aoAccumulatorOwnsAO: Bool = false
+    private var aoAccumulator: IlluminatoramaAOAccumulator?
     /// Mirror of the Metal `RTAOUniforms` (IlluminatoramaRTInstanced.metal) — field for field.
     private struct RTAOUniforms {
         var invViewProjection: simd_float4x4
@@ -925,6 +947,33 @@ public final class IlluminatoramaRenderer {
     /// Current-frame weight in steady state. 0.06 ≈ a 16-frame exponential
     /// window. Smaller = cleaner/slower to react; larger = noisier/faster.
     public var rtGITemporalBlend: Float = 0.06
+    /// Daydream DH-0887 — STILL mode for the GI accumulator: with the camera frozen (a photo, the
+    /// settled canvas's refine) average every frame's GI as an unbiased running mean (α = 1/N,
+    /// no clamp) instead of the moving-camera EMA, which forgets samples and clamps toward each
+    /// noisy frame. The host must reset (`resetTemporalHistory`, or toggle `rtGITemporalEnabled`)
+    /// when the picture changes. Default `false`: byte-identical for every other host.
+    public var rtGIStaticAccumulation: Bool = false
+    /// Restart the RT GI accumulation on the next frame (its history reprojects against nothing),
+    /// WITHOUT `resetTemporalHistory`'s exposure re-seed. For a host whose still discards warm-up
+    /// frames: in `rtGIStaticAccumulation` mode nothing forgets them otherwise (DH-0887).
+    public func resetRTGIAccumulation() { rtGINeedsFirstFrame = true }
+    /// Daydream DH-0887 — STILL mode for the colour TAA resolve: the camera is frozen, so average
+    /// (current weight `taaHistoryBlend`) with NO neighbourhood clip, read the history at the same
+    /// pixel instead of re-sampling it, and take the display sharpen from the accumulation rather
+    /// than the current noisy frame. See `illumi_taa_resolve`. Only valid while the camera and the
+    /// scene are frozen — the host's contract. Default `false`: byte-identical for every host.
+    public var taaStillAccumulation: Bool = false
+    /// With `taaStillAccumulation`: keep the Karis 1/(1+Y) sample weights (damps fireflies at the
+    /// cost of a slight darkening bias in noisy highlights). Default `false`.
+    public var taaStillKarisWeights: Bool = false
+    /// The unjittered view-projection of the last frozen-camera resolve (see the camera-cut guard
+    /// in `render`); nil while still mode is off.
+    private var lastStillViewProjection: simd_float4x4?
+    private var previousRTGIStatic = false
+    /// Mirror of `TAAStillParams` (IlluminatoramaTAA.metal), 16 bytes.
+    private struct TAAStillParams {
+        var still: UInt32; var karis: UInt32; var reserved0: UInt32 = 0; var reserved1: UInt32 = 0
+    }
     /// Neighborhood clamp width (sigmas). WIDE on purpose (~4): a tight clamp
     /// re-injects low-frequency crawl by yanking clean history toward the noisy
     /// current 3×3 mean. Only meant to catch gross on-screen disocclusions.
@@ -3450,7 +3499,15 @@ public final class IlluminatoramaRenderer {
     }()
     /// The SVGF toggle after applying the env A/B override. Use this in the
     /// render path; `svgfEnabled` stays the plain stored property the panel sets.
-    var effectiveSVGFEnabled: Bool { Self.svgfEnvOverride ?? svgfEnabled }
+    var effectiveSVGFEnabled: Bool { Self.svgfEnvOverride ?? (svgfEnabled || svgfStillForced) }
+    /// Daydream DH-0887 — SVGF for a frozen-camera accumulation (a still, the settled canvas's
+    /// refine) regardless of the process-wide `IlluminatoramaSharedSettings.svgfEnabled`, which
+    /// is re-read every frame and shared by every window. Runs `svgfStillLevels` levels.
+    /// Default `false`: byte-identical for every other host.
+    public var svgfStillForced: Bool = false
+    /// À-trous levels while `svgfStillForced` (2: the still lane's measured trade between
+    /// residual noise and edge ringing, DH-0858).
+    public var svgfStillLevels: Int = 2
     /// Number of à-trous cascade levels (1–5). Three levels cover a spatial
     /// reach of 1+2+4 = 7px radius; five levels cover 1+2+4+8+16 = 31px.
     public var svgfLevels: Int = 3
@@ -3489,7 +3546,7 @@ public final class IlluminatoramaRenderer {
               let i = Int(v) else { return nil }
         return i
     }()
-    private var effectiveSVGFLevels: Int { Self.svgfLevelsEnv ?? svgfLevels }
+    private var effectiveSVGFLevels: Int { Self.svgfLevelsEnv ?? (svgfStillForced ? svgfStillLevels : svgfLevels) }
 
     // ── Phase 4.39: denoiser source selectors ────────────────────────
     // These let the lighting and composite passes bind the right texture
@@ -3500,6 +3557,8 @@ public final class IlluminatoramaRenderer {
         // not be allocated (correctness over the saving — `encodeSSAOPass` runs
         // the real passes in that case too).
         if !ssaoActive, let neutral = aoNeutralTexture { return neutral }
+        // AO v2 — the accumulated, denoised traced mean, when it produced this frame's AO.
+        if aoAccumulatorOwnsAO, let accumulated = aoAccumulator?.outputTexture { return accumulated }
         // Three-way, not two: before the split, "denoise off" fell all the way back
         // to the RAW AO, so escaping the temporal half also cost the spatial filter.
         // `aoFilteredTexture` is the spatial-only result and is the right source
@@ -3777,7 +3836,7 @@ public final class IlluminatoramaRenderer {
     /// Mirror of `RTGITemporalUniforms` in Illuminatorama.metal (stride 32, 16-aligned).
     private struct RTGITemporalUniforms {
         var width: UInt32; var height: UInt32; var enabled: UInt32; var isFirstFrame: UInt32
-        var blend: Float; var gammaClamp: Float; var _pad0: Float = 0; var _pad1: Float = 0
+        var blend: Float; var gammaClamp: Float; var staticAccumulation: UInt32 = 0; var _pad1: Float = 0
     }
     private let rtPipeline: MTLComputePipelineState?
     private var rtAccel: MTLAccelerationStructure?
@@ -4195,6 +4254,9 @@ public final class IlluminatoramaRenderer {
         var interiorRoomGain6: SIMD4<Float> = .one
         var interiorRoomGain7: SIMD4<Float> = .one
         var interiorRoomGainMeta: SIMD4<Float> = .zero
+        // DH-0887 — the GI directions' contiguous progressive index (Metal twin appended last).
+        var giProgressiveIndex: UInt32 = 0
+        var padProg0: UInt32 = 0, padProg1: UInt32 = 0, padProg2: UInt32 = 0
 
         mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
             let p = InteriorRoomGains.pack(gains, enabled: enabled)
@@ -4465,6 +4527,10 @@ public final class IlluminatoramaRenderer {
     private var curveDbgPrinted = false   // VIZ_CURVE_DEBUG one-shot
     private let rtInstUniformBuffer: MTLBuffer
     private var rtInstFrameSeed: UInt32 = 0
+    /// DH-0887 — +1 per TLAS lighting dispatch, never by any other pass, so the GI's Sobol index
+    /// is contiguous (`rtInstFrameSeed` also advances in the glass pass, and every-other Sobol
+    /// index covers only half of the unit square).
+    private var rtGIProgressiveIndex: UInt32 = 0
     /// RTAO's own per-dispatch seed. It rotates EVERY frame, TAA or not: the AO temporal
     /// accumulator (`encodeSSAOTemporalPass`) exists to converge a per-frame estimator, and a
     /// seed frozen at 0 hands it the same 32-ray realisation every frame — 42 settled frames
@@ -9121,6 +9187,9 @@ public final class IlluminatoramaRenderer {
             reflRoughnessCutoff: max(0, rtReflRoughnessCutoff),
             reflRays: UInt32(max(1, min(8, rtReflRays))),
             reflEnabled: rtReflectionsEnabled ? 1 : 0)
+        // DH-0887 — the GI's progressive sample index: contiguous per dispatch of THIS pass.
+        u.giProgressiveIndex = rtGIProgressiveIndex
+        rtGIProgressiveIndex &+= 1
         // DH-0896 — a reflection hit REPLACES the sky the deferred pass put there.
         let specIBLOn = rtReflectionsEnabled && specIBLWrittenThisFrame && specIBLTexture != nil
         u.reflReplacesIBL = specIBLOn ? 1 : 0
@@ -9658,6 +9727,7 @@ public final class IlluminatoramaRenderer {
         aoNeedsFirstFrame   = true
         ssrNeedsFirstFrame  = true
         rtGINeedsFirstFrame = true
+        aoAccumulator?.reset()
 
         // S3.2 — a document swap throws away accumulated frames; force the DDGI
         // settle gate to re-trace next frame even if the new scene happens to hash
@@ -9800,6 +9870,21 @@ public final class IlluminatoramaRenderer {
         // Track enable-transitions so a re-enable re-primes each temporal history.
         if taaEnabled && !previousTaaEnabled { taaNeedsFirstFrame = true }
         previousTaaEnabled = taaEnabled
+        // DH-0887 — the frozen-camera resolve reads the same pixel's history with no reprojection
+        // and no clip, so a CAMERA CUT inside a still (an angle sheet stepping yaw/pitch in one
+        // capture, a Go To mid-export) must re-prime it, or every shot double-exposes the last.
+        // Keyed on the UNJITTERED view-projection: the jitter moves every frame on purpose.
+        // Entering STILL mode for the GI restarts its mean: the history it would continue is a
+        // moving-camera EMA (different weights, clamped), not a sum of this picture's samples.
+        if rtGIStaticAccumulation && !previousRTGIStatic { rtGINeedsFirstFrame = true }
+        previousRTGIStatic = rtGIStaticAccumulation
+        if taaStillAccumulation {
+            let vp = camera.projectionMatrix * camera.viewMatrix
+            if let last = lastStillViewProjection, last != vp { taaNeedsFirstFrame = true }
+            lastStillViewProjection = vp
+        } else {
+            lastStillViewProjection = nil
+        }
         if ssaoTemporalEnabled && !previousSsaoEnabled { aoNeedsFirstFrame  = true }
         previousSsaoEnabled = ssaoTemporalEnabled
         // SSAO is skipped entirely while `ssaoIntensity <= 0` (the chain gate
@@ -12260,9 +12345,11 @@ public final class IlluminatoramaRenderer {
     private func encodeSSAOPass(_ cb: MTLCommandBuffer) {
         // Skip the whole SSAO chain when it can only produce 1.0. The lighting
         // pass reads `aoNeutralTexture` instead (see `aoSourceTexture`).
+        aoAccumulatorOwnsAO = false
         if !ssaoActive, ensureNeutralAOTexture(cb) { return }
         let halfW = max(1, width / 2)
         let halfH = max(1, height / 2)
+        if encodeAccumulatedRTAO(cb, halfW: halfW, halfH: halfH) { return }
         // RTAO (DH-0528): with a live TLAS and the host opted in, trace the near field against
         // the real geometry into the SAME raw AO texture, so the bilateral + temporal chain and
         // the lighting kernel's read are untouched. A frame without a TLAS (frame 1, a tripped
@@ -12315,8 +12402,45 @@ public final class IlluminatoramaRenderer {
         enc.endEncoding()
     }
 
+    /// AO v2 (Daydream DH-0887): the accumulated traced AO, when the host opted in and a TLAS is
+    /// live. Returns false — encoding nothing — otherwise, and the per-frame path runs as before.
+    /// A frame that falls back to GTAO (no TLAS yet) is not accumulated and does not count.
+    private func encodeAccumulatedRTAO(_ cb: MTLCommandBuffer, halfW: Int, halfH: Int) -> Bool {
+        guard aoAccumulationEnabled, rtaoActive, let tlas = rtTLAS else { return false }
+        if aoAccumulator == nil {
+            aoAccumulator = IlluminatoramaAOAccumulator(device: device, cache: engine.pipelineCache)
+        }
+        guard let acc = aoAccumulator, acc.isAvailable else { return false }
+        let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
+        let rays = max(1, min(4096, rtaoRays))
+        let radius = max(0.02, rtaoRadius)
+        let intensity = max(0, min(1, rtaoIntensity))
+        let key = IlluminatoramaAOAccumulator.Key(
+            unjitteredViewProjection: camera.projectionMatrix * camera.viewMatrix,
+            halfWidth: halfW, halfHeight: halfH, radius: radius,
+            sceneTopology: rtTLASTopologyHash, scramble: aoAccumulationScramble)
+        let u = IlluminatoramaAOAccumulator.RTAOv2Uniforms(
+            invViewProjection: fu.invViewProjection,
+            cameraWorldPos: SIMD4(fu.cameraWorldPos, 1),
+            radius: radius, intensity: intensity, rayTMin: 0.001,
+            rayCount: UInt32(rays), sampleBase: 0, scramble: aoAccumulationScramble,
+            transportRayMask: 0x01 | 0x04,
+            fullWidth: UInt32(width), fullHeight: UInt32(height))
+        let encoded = acc.encode(device: device,
+                                 encoder: { [unowned self] label in self.timedComputeEncoder(cb, label) },
+                                 dispatch: { [unowned self] enc, p, w, h in self.dispatch(enc, pipeline: p, width: w, height: h) },
+                                 depth: depthTexture, rawAO: aoTexture, tlas: tlas,
+                                 key: key, shapeChanged: instanceShapeStableFrames == 0,
+                                 rays: rays, intensity: intensity,
+                                 uniforms: u, invProjection: fu.invProjection)
+        guard encoded else { return false }
+        rtaoDidRunLastFrame = true
+        aoAccumulatorOwnsAO = true
+        return true
+    }
+
     private func encodeSSAOSpatialFilter(_ cb: MTLCommandBuffer) {
-        guard ssaoSpatialRuns, ssaoChainEncodes else { return }
+        guard ssaoSpatialRuns, ssaoChainEncodes, !aoAccumulatorOwnsAO else { return }
         let halfW = max(1, width / 2)
         let halfH = max(1, height / 2)
         guard let enc = timedComputeEncoder(cb, "ssao.spatial") else { return }
@@ -12332,7 +12456,7 @@ public final class IlluminatoramaRenderer {
     }
 
     private func encodeSSAOTemporalPass(_ cb: MTLCommandBuffer) {
-        guard ssaoTemporalEnabled, ssaoChainEncodes else { return }
+        guard ssaoTemporalEnabled, ssaoChainEncodes, !aoAccumulatorOwnsAO else { return }
         let halfW = max(1, width / 2)
         let halfH = max(1, height / 2)
         guard let enc = timedComputeEncoder(cb, "ssao.temporal") else { return }
@@ -12809,8 +12933,8 @@ public final class IlluminatoramaRenderer {
             enabled: 1,
             isFirstFrame: rtGINeedsFirstFrame ? 1 : 0,
             blend: max(0.01, min(1.0, rtGITemporalBlend)),
-            gammaClamp: max(1.0, rtGITemporalClamp))
-        memcpy(rtGITemporalUniformBuffer.contents(), &u, MemoryLayout<RTGITemporalUniforms>.stride)
+            gammaClamp: max(1.0, rtGITemporalClamp),
+            staticAccumulation: rtGIStaticAccumulation ? 1 : 0)
         guard let enc = timedComputeEncoder(cb, "rt.giTemporal") else { return }
         enc.label = "Illuminatorama.rt.giTemporal"
         enc.setComputePipelineState(rtGITemporalPipeline)
@@ -12819,7 +12943,9 @@ public final class IlluminatoramaRenderer {
         enc.setTexture(velocityTexture,            index: 2)
         enc.setTexture(currentRTGIHistoryTexture,  index: 3)  // accumulated write
         enc.setTexture(giSampleCount,              index: 4)  // adaptive count (read_write)
-        enc.setBuffer(rtGITemporalUniformBuffer, offset: 0, index: 0)
+        // `setBytes`, not the shared single buffer: with two frames in flight a memcpy into one
+        // buffer can hand the GPU the NEXT frame's `isFirstFrame` / mode (DH-0887 audit).
+        enc.setBytes(&u, length: MemoryLayout<RTGITemporalUniforms>.stride, index: 0)
         dispatch(enc, pipeline: rtGITemporalPipeline, width: width, height: height)
         enc.endEncoding()
     }
@@ -13126,6 +13252,8 @@ public final class IlluminatoramaRenderer {
         // compounding inside the history every frame.
         enc.setTexture(taaResolvedTexture,      index: 6)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
+        var still = TAAStillParams(still: taaStillAccumulation ? 1 : 0, karis: taaStillKarisWeights ? 1 : 0)
+        enc.setBytes(&still, length: MemoryLayout<TAAStillParams>.stride, index: 1)
         dispatch(enc, pipeline: taaResolvePipeline, width: width, height: height)
         enc.endEncoding()
     }

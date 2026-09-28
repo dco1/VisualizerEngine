@@ -134,6 +134,10 @@ struct RTInstUniforms {
     // Carried here so a room seen THROUGH a pane is scaled like the room beside it.
     float4 interiorRoomGain[8];
     float4 interiorRoomGainMeta;
+    // Daydream DH-0887 — the GI directions' progressive index: +1 per TLAS lighting dispatch,
+    // CONTIGUOUS (unlike `frameSeed`, which the glass pass also advances). Ray `g` of a dispatch is
+    // point `giProgressiveIndex·giRays + g` of the pixel's own Owen-scrambled Sobol sequence.
+    uint  giProgressiveIndex; uint _padProg0; uint _padProg1; uint _padProg2;
 };
 
 // ── Curve primitives (#60 item 7) ────────────────────────────────────────────
@@ -482,8 +486,10 @@ kernel void illumi_rt_lighting_tlas(
     float3 cacheGI = float3(0.0), cacheRefl = float3(0.0), cacheTerms = float3(0.0);
     if (u.giRays > 0 && u.giStrength > 0.0) {
         isect.accept_any_intersection(false);
+        uint giSobolSeed = illumiPixelSeed(gid, 0x4749u);
         for (uint g = 0; g < u.giRays; ++g) {
-            float3 dir = cosineSample(N, rnd(seed), rnd(seed));
+            float2 gq = illumiSobolOwen2DShuffled(u.giProgressiveIndex * u.giRays + g, giSobolSeed);
+            float3 dir = illumiCosineHemisphereAxisSafe(N, gq);
             ray r; r.origin = Pofs; r.direction = dir;
             r.min_distance = max(u.rayTMin, 1e-3); r.max_distance = u.maxGIDist;
             // C3: transport mask — opaque + curve + INVISIBLE OCCLUDER. Without
