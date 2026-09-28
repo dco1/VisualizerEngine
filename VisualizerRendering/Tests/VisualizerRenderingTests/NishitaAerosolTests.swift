@@ -461,8 +461,11 @@ final class NishitaAerosolTests: XCTestCase {
 
     // MARK: - 3. No pop at the built-in values
 
-    /// Any change to the aerosol switches to the `…Aerosol` kernels. Single scatter: the same march
-    /// on runtime numbers — at the built-in values the sky is the built-in sky. Multiple scattering:
+    /// Any change to the aerosol switches to the `…Aerosol` kernels. Single scatter: the same
+    /// integrand, but the aerosol medium's march resolves the haze (t ∝ u² samples, midpoint optical
+    /// depth — see `testSingleScatterResolvesTheHaze`), so at the built-in values the step off
+    /// `.builtin` is the uniform march's own horizon error being corrected (up to ~1 stop at the
+    /// sunward / anti-solar horizon, toward the converged integral; ≤ 0.1 stop above ~20°). Multiple scattering:
     /// the aerosol path adds its refinements (order-2 phase renormalisation, the Mie last bounce
     /// and higher-order re-scatter through the field's own Mie shape, a finer altitude axis and
     /// transmittance march), so at the
@@ -496,7 +499,7 @@ final class NishitaAerosolTests: XCTestCase {
             // MS: the step off `.builtin` is the built-in kernels' own error being corrected (VZ-0159:
             // they sit 0.41 stop bright on the anti-solar horizon at −6°, 0.33 dark on the sunward
             // horizon at −3° — the rows below pin that the step goes TOWARD the reference).
-            XCTAssertLessThan(worstAll, ms ? 0.5 : 1e-3, "MS \(ms): the aerosol kernels at the built-in values")
+            XCTAssertLessThan(worstAll, ms ? 0.5 : 1.25, "MS \(ms): the aerosol kernels at the built-in values")
         }
         // Against the reference, the built-in rows: the aerosol path at the built-in values is at
         // least as close as the built-in kernels (the switch is a correction, not a drift).
@@ -516,6 +519,100 @@ final class NishitaAerosolTests: XCTestCase {
         report += String(format: "Σ|stops|: built-in kernels %.2f, aerosol kernels %.2f\n", errBuiltin, errAerosol)
         XCTAssertLessThanOrEqual(errAerosol, errBuiltin * 0.5, "the aerosol path at the built-in values is closer to the reference")
         print("── Aerosol kernels at the built-in values vs the built-in kernels ──\n" + report)
+    }
+
+    /// The single-scatter march with an aerosol (no multiple scattering) against a converged
+    /// double-precision single-scatter integral of the same medium (600 × 300 samples, derived here
+    /// from τ550, α, H, ω₀, g — independent of the shader). The uniform 16 × 8 march the built-in
+    /// kernels keep cannot hold a haze layer: on the hazy-suburban air it put the noon horizon
+    /// 1.5–3 stops dark and 2–3.4 stops too red (urban: −14 stops). The aerosol medium's march
+    /// (same sample count) must stay within 0.25 stop in luminance and in r/b for the hazy, rural
+    /// and maritime presets, sun +40° … −3°, horizon to zenith (measured: ≤ 0.12 hazy / rural,
+    /// ≤ 0.20 maritime with the sun 1° up).
+    @MainActor
+    func testSingleScatterResolvesTheHaze() throws {
+        let h = try MS.Harness()
+        let views: [(String, Float, Float)] = [("zenith", 89.9, 0), ("sun 1°", 1, 0), ("sun 5°", 5, 0), ("sun 20°", 20, 0),
+                                               ("side 2°", 2, 90), ("side 30°", 30, 90), ("anti 0.5°", 0.5, 180),
+                                               ("anti 3°", 3, 180), ("anti 20°", 20, 180)]
+        var report = ""
+        var worst: Float = 0, worstRB: Float = 0
+        for (name, a) in [("hazy", NishitaAerosol.hazySuburban), ("rural", .rural), ("maritime", .cleanMaritime)] {
+            for el: Float in [40, 6, 1, -3] {
+                let dirs = views.map { View.dir(el: $0.1, az: $0.2) }
+                let gpu = try h.sky(Self.sky(el: el, ms: false, aerosol: a), dirs)
+                var line = String(format: "%-8@ sun %+3.0f°:", name, el)
+                for (i, v) in views.enumerated() {
+                    let ref = Self.convergedSingleScatter(SIMD3<Double>(dirs[i]), toSun: SIMD3<Double>(MS.toSun(el)), aerosol: a)
+                    let yr = simd_dot(ref, SIMD3<Double>(Self.luma))
+                    guard yr > 1e-12 else { continue }     // the Earth's shadow (sun −3°, anti-solar)
+                    let g = SIMD3<Double>(gpu[i])
+                    let st = Float(log2(simd_dot(g, SIMD3<Double>(Self.luma)) / yr))
+                    let rb = Float(log2((g.x / g.z) / (ref.x / ref.z)))
+                    worst = max(worst, abs(st)); worstRB = max(worstRB, abs(rb))
+                    line += String(format: "  %@ %+.2f/%+.2f", v.0, st, rb)
+                }
+                report += line + "\n"
+            }
+        }
+        print("── Single scatter with aerosols vs a converged integral (stops: luminance / r·b) ──\n" + report)
+        XCTAssertLessThan(worst, 0.25, "single-scatter luminance vs the converged integral")
+        XCTAssertLessThan(worstRB, 0.25, "single-scatter r/b vs the converged integral")
+    }
+
+    /// Converged single scatter (per unit irradiance, viewer 1 m up at the pole, 60 km top — the
+    /// single-scatter shell): Rayleigh + aerosol + ozone tent, the planet's shadow exact.
+    static func convergedSingleScatter(_ d: SIMD3<Double>, toSun s: SIMD3<Double>, aerosol a: NishitaAerosol,
+                                       steps: Int = 600, lightSteps: Int = 300) -> SIMD3<Double> {
+        let Re = NishitaAtmosphere.earthRadius, Rt = Re + NishitaAtmosphere.singleScatterTop
+        let bR = NishitaAtmosphere.rayleighScattering, HR = NishitaAtmosphere.rayleighScaleHeight
+        let bO = NishitaAtmosphere.ozoneAbsorption
+        let q = a.sanitized
+        let H = Double(q.scaleHeight), gM = Double(q.phaseG)
+        let lam = SIMD3<Double>(680, 550, 440), alpha = Double(q.angstromExponent)
+        let bE = Double(q.opticalDepth) / H * SIMD3(pow(lam.x / 550, -alpha), pow(lam.y / 550, -alpha), pow(lam.z / 550, -alpha))
+        let bS = Double(q.singleScatteringAlbedo) * bE
+        func exitT(_ o: SIMD3<Double>, _ v: SIMD3<Double>, _ R: Double) -> Double {
+            let b = simd_dot(o, v), c = simd_dot(o, o) - R * R
+            return -b + max(b * b - c, 0).squareRoot()
+        }
+        func blocked(_ o: SIMD3<Double>, _ v: SIMD3<Double>) -> Bool {
+            let b = simd_dot(o, v), c = simd_dot(o, o) - Re * Re
+            return b < 0 && b * b - c >= 0
+        }
+        func dens(_ p: SIMD3<Double>) -> SIMD3<Double> {
+            let h = simd_length(p) - Re
+            return SIMD3(exp(-h / HR), exp(-h / H), max(0, 1 - abs(h - NishitaAtmosphere.ozoneCenter) / NishitaAtmosphere.ozoneHalfWidth))
+        }
+        let o = SIMD3<Double>(0, Re + 1, 0)
+        let tMax = exitT(o, d, Rt)
+        var od = SIMD3<Double>(repeating: 0), sR = SIMD3<Double>(repeating: 0), sM = SIMD3<Double>(repeating: 0)
+        var tPrev = 0.0
+        for i in 1...steps {
+            let u = Double(i) / Double(steps), t = tMax * u * u, seg = t - tPrev
+            let p = o + d * (0.5 * (tPrev + t))
+            tPrev = t
+            let n = dens(p)
+            let odAt = od + n * (0.5 * seg)
+            od += n * seg
+            if blocked(p, s) { continue }
+            let tl = exitT(p, s, Rt)
+            var odL = SIMD3<Double>(repeating: 0), lPrev = 0.0
+            for j in 1...lightSteps {
+                let v = Double(j) / Double(lightSteps), x = tl * v * v
+                odL += dens(p + s * (0.5 * (lPrev + x))) * (x - lPrev)
+                lPrev = x
+            }
+            let col = odAt + odL
+            let tau = bR * col.x + bE * col.y + bO * col.z
+            let att = SIMD3(exp(-tau.x), exp(-tau.y), exp(-tau.z))
+            sR += att * (n.x * seg); sM += att * (n.y * seg)
+        }
+        let mu = simd_dot(d, s)
+        let pR = 3 / (16 * Double.pi) * (1 + mu * mu)
+        let g2 = gM * gM
+        let pM = 3 / (8 * Double.pi) * (1 - g2) * (1 + mu * mu) / ((2 + g2) * pow(max(1 + g2 - 2 * gM * mu, 1e-4), 1.5))
+        return sR * bR * pR + sM * bS * pM
     }
 
     // MARK: - 4. Against the brute-force reference

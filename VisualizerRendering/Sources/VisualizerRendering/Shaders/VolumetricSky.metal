@@ -831,6 +831,71 @@ inline float3 nishitaScatter(float3 rayDir, float3 sunDir, float intensity, M m)
     return intensity * (sumR * kBetaR * phaseR + m.scatteringOfColumn(sumM) * phaseM);
 }
 
+/// The single-scatter march for the AEROSOL medium (every `…Aerosol` kernel's single scatter: the
+/// dome and in-view sky without multiple scattering, the moonlit sky, the deck's sky fill). Same
+/// integrand and the same kPrimary × kLight samples as the built-in march above (which keeps its
+/// discretisation — bit-identical), but placed so a haze layer is resolved:
+///   • view and sun samples crowd toward their start (t ∝ u²) — a grazing view ray is ~900 km
+///     long but its aerosol sits in the first ~30 km, where 16 uniform ~55 km segments put ONE
+///     sample;
+///   • each sample is attenuated by the optical depth to its midpoint (the uniform march adds the
+///     whole segment first — with a dense haze in a 55 km segment that alone is several stops);
+///   • the Earth's shadow is the exact sun-below-local-horizon test, not a sample dipping under.
+/// Against a converged double-precision single scatter (NishitaAerosolTests), the uniform march
+/// put the hazy-suburban horizon 1.5–3 stops dark and 2–3.4 stops too red at noon (urban haze:
+/// −14 stops); this one is within 0.12 stop (hazy, rural; maritime 0.2 with the sun 1° up; sun
+/// +40° … −3°) at the same cost. Urban haze (τ550 0.64) with a low sun stays ~0.5 stop off.
+inline float3 nishitaScatter(float3 rayDir, float3 sunDir, float intensity, NishitaMieAerosol m) {
+    float3 orig = float3(0.0f, kEarthRadius + 1.0f, 0.0f); // viewer at the pole
+    float3 toSun = -sunDir.xyz;                            // sunDir = travel dir
+    float tShell = raySphereExit(orig, rayDir, kAtmosRadius);
+    if (tShell <= 0.0f) return float3(0.0f);
+    float tGround = rayGroundHit(orig, rayDir, kEarthRadius);
+    float tMax = (tGround > 0.0f) ? min(tShell, tGround) : tShell;
+
+    float mu = dot(rayDir, toSun);
+    float phaseR = 3.0f / (16.0f * 3.14159265f) * (1.0f + mu * mu);
+    float gM = m.g();
+    float g2 = gM * gM;
+    float phaseM = 3.0f / (8.0f * 3.14159265f)
+                 * ((1.0f - g2) * (1.0f + mu * mu))
+                 / ((2.0f + g2) * pow(max(1.0f + g2 - 2.0f * gM * mu, 1e-4f), 1.5f));
+
+    float3 od = float3(0.0f);          // view-ray columns: Rayleigh, aerosol, ozone density × m
+    float3 sumR = float3(0.0f), sumM = float3(0.0f);
+    float tPrev = 0.0f;
+    for (int i = 0; i < kPrimary; ++i) {
+        float u = float(i + 1) / float(kPrimary);
+        float t = tMax * u * u;
+        float seg = t - tPrev;
+        float3 sp = orig + rayDir * (0.5f * (tPrev + t));
+        tPrev = t;
+        float r = length(sp);
+        float h = r - kEarthRadius;
+        float3 dens = float3(exp(-h / kRayleighH), m.density(h), ozoneDensity(h));
+        float3 odAt = od + dens * (0.5f * seg);
+        od += dens * seg;
+        // The planet's shadow: the sun below this sample's geometric horizon.
+        if (dot(sp, toSun) / r < -sqrt(max(h * (2.0f * kEarthRadius + h), 0.0f)) / r) continue;
+        float tLight = raySphereExit(sp, toSun, kAtmosRadius);
+        float3 odL = float3(0.0f);
+        float lPrev = 0.0f;
+        for (int j = 0; j < kLight; ++j) {
+            float v = float(j + 1) / float(kLight);
+            float tl = tLight * v * v;
+            float hl = max(length(sp + toSun * (0.5f * (lPrev + tl))) - kEarthRadius, 0.0f);
+            odL += float3(exp(-hl / kRayleighH), m.density(hl), ozoneDensity(hl)) * (tl - lPrev);
+            lPrev = tl;
+        }
+        float3 tau = kBetaR * (odAt.x + odL.x) + m.extinctionOfColumn(odAt.y + odL.y)
+                   + kBetaO * (odAt.z + odL.z);
+        float3 atten = exp(-tau);
+        sumR += atten * (dens.x * seg);
+        sumM += atten * (dens.y * seg);
+    }
+    return intensity * (sumR * kBetaR * phaseR + m.scatteringOfColumn(sumM) * phaseM);
+}
+
 // Wrapper matching atmosphereColor()'s role: physical sky above the horizon,
 // horizon haze + art-directed ground colour below it.
 //
