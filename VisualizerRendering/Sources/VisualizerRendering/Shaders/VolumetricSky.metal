@@ -955,6 +955,60 @@ constant constexpr int kLUTAccB     = kLUTAccA + kMSLutTexels;              // �
 constant constexpr int kLUTAccF     = kLUTAccB + kMSLutTexels;              // f_ms.rgb of the last order
 constant constexpr int kLUTLength   = kLUTAccF + kMSLutTexels;
 
+// ── Spectral bake (opt-in: Params.atmosphereSpectral → msParams.z; fix for the magenta twilight) ──
+//
+// The march above evaluates β at ONE wavelength per channel (680 / 550 / 440 nm) and writes the
+// result straight to linear sRGB. That is exact only while the spectrum is smooth across each
+// primary's band — and at twilight it is not: the sun's light has crossed ~40 air masses of the
+// ozone layer, whose Chappuis band peaks near 600 nm, INSIDE the sRGB red primary's response,
+// where the 680 nm sample sees a third of its absorption (β_O red/green = 0.35 at the samples,
+// ≥ 1 averaged over the red primary). Green is then over-absorbed relative to red and the
+// twilight sky prints mauve. Measured against an offline spectral reference (same atmosphere,
+// single scatter, 380–720 nm at 10 nm, CIE 1931 → sRGB, sun white-balanced; scratchpad
+// sky/r3/spectral.py): sun −4.2°, 90° from it, 30° up — 3 wavelengths (1.00, 0.55, 0.93)
+// magenta, spectral (0.47, 0.60, 1.00) blue; sun 48°: within 4 % per channel.
+//
+// With the flag the SAME march runs at 12 wavelengths (380–720 nm in 28.3 nm bins, four triples:
+// every LUT exists once per triple) and each triple's radiance is converted to linear sRGB by a
+// 3×3 of its bins' ∫ CIE 1931 CMF × solar spectrum (Bruneton's table), white-balanced so the sun
+// above the atmosphere is (1, 1, 1) — the 3-wavelength path's convention, so `atmosphereIntensity`
+// keeps its meaning. β_R = 1.24062e-6 · λ[µm]⁻⁴ (the kBetaR fit), β_O = Bruneton's ozone cross
+// section (bin mean) × 300 DU in the same 15 km tent. 12 samples match the 35-sample reference
+// within 1–4 % in channel ratios from sun +48° to −7°.
+constant constexpr int kSpecBands = 4;
+constant float3 kSpecBetaR[kSpecBands] = {
+    float3(5.1395e-05, 3.8934e-05, 3.0031e-05),   // 394, 422, 451 nm
+    float3(2.3534e-05, 1.8702e-05, 1.5049e-05),   // 479, 507, 536
+    float3(1.2246e-05, 1.0067e-05, 8.3510e-06),   // 564, 592, 621
+    float3(6.9858e-06, 5.8885e-06, 4.9984e-06) }; // 649, 677, 706
+constant float3 kSpecBetaO[kSpecBands] = {
+    float3(6.1616e-09, 3.5641e-08, 1.3872e-07),
+    float3(3.8442e-07, 8.7885e-07, 1.5668e-06),
+    float3(2.2978e-06, 2.5305e-06, 2.0039e-06),
+    float3(1.2356e-06, 6.8961e-07, 3.7334e-07) };
+// Column i = the linear-sRGB contribution of the band's i-th wavelength per unit (white-balanced)
+// spectral radiance; the 12 columns sum to (1, 1, 1).
+constant float3x3 kSpecToRGB[kSpecBands] = {
+    float3x3(float3(0.001131, -0.001320, 0.012759), float3(0.030220, -0.031001, 0.236923), float3(0.035871, -0.051016, 0.548737)),
+    float3x3(float3(-0.077427, 0.056624, 0.286298), float3(-0.183751, 0.237692, 0.032761), float3(-0.160448, 0.405376, -0.038132)),
+    float3x3(float3(0.170906, 0.326844, -0.044765), float3(0.506805, 0.100838, -0.024563), float3(0.468394, -0.025277, -0.007598)),
+    float3x3(float3(0.179585, -0.018066, -0.001843), float3(0.027025, -0.001122, -0.000481), float3(0.001689, 0.000429, -0.000094)) };
+/// Float4s one band's LUTs occupy (everything but the shared header); band b's tables start
+/// b × this after the legacy offsets.
+constant constexpr int kLUTBandStride = kLUTLength - 1;
+
+/// The scattering coefficients and LUT offset a march uses: the legacy 3-wavelength set (band 0
+/// of a non-spectral build, which is exactly the original constants and offsets) or spectral
+/// triple `b`.
+struct MSBand { float3 bR; float3 bO; int base; };
+inline MSBand msBand(int b, bool spectral) {
+    MSBand m;
+    if (spectral) { m.bR = kSpecBetaR[b]; m.bO = kSpecBetaO[b]; m.base = b * kLUTBandStride; }
+    else          { m.bR = kBetaR;        m.bO = kBetaO;        m.base = 0; }
+    return m;
+}
+inline bool msSpectral(constant SkyUniforms &u) { return u.msParams.z > 0.5f; }
+
 inline float msRayleighPhase(float mu) { return 3.0f / (16.0f * M_PI_F) * (1.0f + mu * mu); }
 inline float msMiePhase(float mu) {
     float g2 = kMieG * kMieG;
@@ -979,7 +1033,7 @@ inline float msDistToTop(float r, float mu) {
 
 /// Optical depth to the top from (r, μ) — bilinear in the transmittance LUT (rays that clear
 /// the planet only; `msSunTransmittance` tests the shadow first).
-inline float3 msOpticalDepth(device const float4* lut, float r, float mu) {
+inline float3 msOpticalDepth(device const float4* lut, float r, float mu, int band) {
     const float Hh = sqrt((kMSAtmosRadius - kEarthRadius) * (kMSAtmosRadius + kEarthRadius));
     float h = max(r - kEarthRadius, 0.0f);
     float rho = sqrt(h * (r + kEarthRadius));
@@ -989,15 +1043,15 @@ inline float3 msOpticalDepth(device const float4* lut, float r, float mu) {
     float fy = saturate(rho / Hh) * float(kMSTransH - 1);
     int ix = min(int(fx), kMSTransW - 2), iy = min(int(fy), kMSTransH - 2);
     float ax = fx - float(ix), ay = fy - float(iy);
-    device const float4* t = lut + kLUTTrans + iy * kMSTransW + ix;
+    device const float4* t = lut + band + kLUTTrans + iy * kMSTransW + ix;
     return mix(mix(t[0].xyz, t[1].xyz, ax), mix(t[kMSTransW].xyz, t[kMSTransW + 1].xyz, ax), ay);
 }
 
 /// Direct light (sun or moon) reaching radius r where the light's zenith cosine is μ: 0 when
 /// the ray toward it meets the planet (the Earth's shadow), else exp(−τ).
-inline float3 msSunTransmittance(device const float4* lut, float r, float mu) {
+inline float3 msSunTransmittance(device const float4* lut, float r, float mu, int band = 0) {
     if (mu < 0.0f && r * sqrt(max(1.0f - mu * mu, 0.0f)) < kEarthRadius) return float3(0.0f);
-    return exp(-msOpticalDepth(lut, min(r, kMSAtmosRadius), mu));
+    return exp(-msOpticalDepth(lut, min(r, kMSAtmosRadius), mu, band));
 }
 
 inline float2 msLutCoord(float h, float mus) {
@@ -1020,11 +1074,11 @@ struct MSField {
     float3 psi;   // mean incoming radiance of orders ≥ 2 per unit irradiance
     float3 q;     // its quadrupole (Q_uu, Q_ss, Q_us) in the local (up, sun-horizontal) frame
 };
-inline MSField msField(device const float4* lut, float h, float mus) {
+inline MSField msField(device const float4* lut, float h, float mus, int band = 0) {
     float2 f = msLutCoord(h, mus);
     int ix = min(int(f.x), kMSLutW - 2), iy = min(int(f.y), kMSLutH - 2);
     float ax = f.x - float(ix), ay = f.y - float(iy);
-    device const float4* t = lut + kLUTMS + 2 * (iy * kMSLutW + ix);
+    device const float4* t = lut + band + kLUTMS + 2 * (iy * kMSLutW + ix);
     const int row = 2 * kMSLutW;
     float4 a = mix(mix(t[0], t[2], ax), mix(t[row], t[row + 2], ax), ay);
     float4 b = mix(mix(t[1], t[3], ax), mix(t[row + 1], t[row + 3], ax), ay);
@@ -1043,11 +1097,11 @@ inline bool nishitaMSReady(constant SkyUniforms &u, device const float4* lut, bo
 /// march sample: the single scatter with the true phase, planet-shadowed; plus orders ≥ 2 —
 /// Rayleigh through its exact P0 + ½P2 phase against the field's quadrupole, Mie isotropic.
 inline float3 msInscatter(device const float4* lut, float3 p, float r, float h, float3 v, float3 toL,
-                          float3 sR, float sM, float pR, float pM) {
+                          float3 sR, float sM, float pR, float pM, int band = 0) {
     float3 up = p / r;
     float mus = dot(up, toL);
-    float3 Tl = msSunTransmittance(lut, r, mus);
-    MSField f = msField(lut, h, mus);
+    float3 Tl = msSunTransmittance(lut, r, mus, band);
+    MSField f = msField(lut, h, mus, band);
     float3 sh = toL - up * mus;
     float shl = length(sh);
     sh = (shl > 1e-6f) ? sh / shl : float3(0.0f);
@@ -1061,8 +1115,8 @@ inline float3 msInscatter(device const float4* lut, float3 p, float r, float h, 
 /// The multiply-scattered sky along `rayDir` from the viewer (1 m up at the pole): ONE march for
 /// the sun AND the moon — each light's single scatter + orders ≥ 2 — so the two sum as light
 /// does (no cross-fade window, no dip at the hand-off). `moonI` = 0 skips the moon's lookups.
-inline float3 nishitaScatterMS(float3 rayDir, float3 toSun, float sunI, float3 toMoon, float moonI,
-                               device const float4* lut) {
+inline float3 nishitaScatterMSBand(float3 rayDir, float3 toSun, float sunI, float3 toMoon, float moonI,
+                                   device const float4* lut, MSBand bd) {
     float3 orig = float3(0.0f, kEarthRadius + kMSHeightOffset, 0.0f);
     float tTop = raySphereExit(orig, rayDir, kMSAtmosRadius);
     if (tTop <= 0.0f) return float3(0.0f);
@@ -1083,18 +1137,44 @@ inline float3 nishitaScatterMS(float3 rayDir, float3 toSun, float sunI, float3 t
         float r = length(p);
         float h = r - kEarthRadius;
         float dM = exp(-h / kMieH);
-        float3 sR = kBetaR * exp(-h / kRayleighH);
+        float3 sR = bd.bR * exp(-h / kRayleighH);
         float sM = kBetaM.x * dM;
-        float3 sT = sR + kBetaM * (1.1f * dM) + kBetaO * ozoneDensity(h);
+        float3 sT = sR + kBetaM * (1.1f * dM) + bd.bO * ozoneDensity(h);
         float3 Tseg = exp(-sT * dt);
         float3 w = T * msSegmentIntegral(sT, dt, Tseg);
-        float3 S = sunI * msInscatter(lut, p, r, h, rayDir, toSun, sR, sM, pRS, pMS);
-        if (moonI > 0.0f) S += moonI * msInscatter(lut, p, r, h, rayDir, toMoon, sR, sM, pRM, pMM);
+        float3 S = sunI * msInscatter(lut, p, r, h, rayDir, toSun, sR, sM, pRS, pMS, bd.base);
+        if (moonI > 0.0f) S += moonI * msInscatter(lut, p, r, h, rayDir, toMoon, sR, sM, pRM, pMM, bd.base);
         L += w * S;
         T *= Tseg;
         tPrev = t;
     }
     return L;
+}
+
+/// `nishitaScatterMSBand` in linear sRGB: the legacy 3-wavelength march, or (spectral) the four
+/// triples each converted through its CMF matrix.
+inline float3 nishitaScatterMS(float3 rayDir, float3 toSun, float sunI, float3 toMoon, float moonI,
+                               device const float4* lut, bool spectral = false) {
+    if (!spectral) return nishitaScatterMSBand(rayDir, toSun, sunI, toMoon, moonI, lut, msBand(0, false));
+    float3 s = float3(0.0f);
+    for (int b = 0; b < kSpecBands; ++b)
+        s += kSpecToRGB[b] * nishitaScatterMSBand(rayDir, toSun, sunI, toMoon, moonI, lut, msBand(b, true));
+    return max(s, 0.0f);
+}
+/// Direct light's transmittance in linear sRGB (the sun's colour through the air).
+inline float3 msSunTransmittanceRGB(device const float4* lut, float r, float mu, bool spectral) {
+    if (!spectral) return msSunTransmittance(lut, r, mu);
+    float3 t = float3(0.0f);
+    for (int b = 0; b < kSpecBands; ++b) t += kSpecToRGB[b] * msSunTransmittance(lut, r, mu, b * kLUTBandStride);
+    return max(t, 0.0f);
+}
+/// Luma of the multiply-scattered field Ψ at (h, μs), in linear sRGB.
+inline float msFieldPsiLuma(device const float4* lut, float h, float mus, bool spectral) {
+    const float3 kLuma = float3(0.2126f, 0.7152f, 0.0722f);
+    if (!spectral) return dot(msField(lut, h, mus).psi, kLuma);
+    float3 p = float3(0.0f);
+    for (int b = 0; b < kSpecBands; ++b) p += kSpecToRGB[b] * msField(lut, h, mus, b * kLUTBandStride).psi;
+    return dot(p, kLuma);
 }
 
 /// The moonlit sky's irradiance in the sky's units: calibrated like `nightSkyGlow` (a full moon
@@ -1109,9 +1189,9 @@ inline float nishitaMSMoonIntensity(constant SkyUniforms &u, device const float4
     if (u.nightSkyA.x < 0.5f || rad <= 0.0f || u.nightParams.y <= 0.0f || toMoon.y <= -0.3f) return 0.0f;
     float flux = nightMoonPhaseFlux(dot(normalize(u.nightSkyC.xyz), -toMoon));
     float moonI = kFullMoonSkyF0 * rad * flux / max(lut[kLUTHeader].z, 1e-30f);
-    const float3 kLuma = float3(0.2126f, 0.7152f, 0.0722f);
-    float gS = dot(msField(lut, kMSHeightOffset, -u.sunDir.y).psi, kLuma) * sunI;
-    float gM = dot(msField(lut, kMSHeightOffset, toMoon.y).psi, kLuma) * moonI;
+    const bool spectral = msSpectral(u);
+    float gS = msFieldPsiLuma(lut, kMSHeightOffset, -u.sunDir.y, spectral) * sunI;
+    float gM = msFieldPsiLuma(lut, kMSHeightOffset, toMoon.y, spectral) * moonI;
     return (gM > 1e-4f * gS) ? moonI : 0.0f;
 }
 
@@ -1132,7 +1212,7 @@ inline float3 nishitaAtmosphereColorMS(float3 rayDir, constant SkyUniforms &u, d
         float hlen = length(hxz);
         d = (hlen > 1e-5f) ? float3(hxz.x / hlen, 0.0f, hxz.y / hlen) : float3(1.0f, 0.0f, 0.0f);
     }
-    float3 s = nishitaScatterMS(d, toSun, intensity, toMoon, moonI, lut);
+    float3 s = nishitaScatterMS(d, toSun, intensity, toMoon, moonI, lut, msSpectral(u));
     if (glow) s = nightAirglowAndZodiacal(s, d, u, rad, max(d.y, 0.0f));
     s = skyGraded(s, u.skyGrade.x, u.skyGrade.y);
     if (rayDir.y >= 0.0f) return s;
@@ -1150,7 +1230,9 @@ inline float3 nishitaAtmosphereColorMS(float3 rayDir, constant SkyUniforms &u, d
 // volSkyMultiScatterFinalize → volSkyMultiScatterReady. `lut` is the region's base.
 
 kernel void volSkyTransmittanceLUT(device float4* lut [[buffer(0)]],
+                                   constant float4 &bp [[buffer(1)]],   // z = band, w = spectral
                                    uint2 gid [[thread_position_in_grid]]) {
+    const MSBand bd = msBand(int(bp.z + 0.5f), bp.w > 0.5f);
     if (gid.x >= uint(kMSTransW) || gid.y >= uint(kMSTransH)) return;
     const float Hh = sqrt((kMSAtmosRadius - kEarthRadius) * (kMSAtmosRadius + kEarthRadius));
     float rho = Hh * float(gid.y) / float(kMSTransH - 1);
@@ -1164,9 +1246,9 @@ kernel void volSkyTransmittanceLUT(device float4* lut [[buffer(0)]],
     float3 od = float3(0.0f);
     for (int i = 0; i < kMSTransSteps; ++i) {
         float h = length(o + dir * ((float(i) + 0.5f) * dt)) - kEarthRadius;
-        od += kBetaR * exp(-h / kRayleighH) + kBetaM * (1.1f * exp(-h / kMieH)) + kBetaO * ozoneDensity(h);
+        od += bd.bR * exp(-h / kRayleighH) + kBetaM * (1.1f * exp(-h / kMieH)) + bd.bO * ozoneDensity(h);
     }
-    lut[kLUTTrans + int(gid.y) * kMSTransW + int(gid.x)] = float4(od * dt, 0.0f);
+    lut[bd.base + kLUTTrans + int(gid.y) * kMSTransW + int(gid.x)] = float4(od * dt, 0.0f);
 }
 
 /// One direction of an order pass from x: order 2 = the TRUE-phase single scatter of the light
@@ -1174,7 +1256,7 @@ kernel void volSkyTransmittanceLUT(device float4* lut [[buffer(0)]],
 /// ground; order n > 2 = ∫ T σs Ψₙ₋₁ (isotropic re-scatter) + the ground under Ψₙ₋₁. `F` = the
 /// local transfer ∫ T σs (Hillaire's f_ms), for the tail.
 inline void msOrderRay(device const float4* lut, float3 x, float3 w, float3 s, int order, float albedo,
-                       int readBase, thread float3 &L, thread float3 &F) {
+                       int readBase, MSBand bd, thread float3 &L, thread float3 &F) {
     L = float3(0.0f);
     F = float3(0.0f);
     float tTop = raySphereExit(x, w, kMSAtmosRadius);
@@ -1194,14 +1276,14 @@ inline void msOrderRay(device const float4* lut, float3 x, float3 w, float3 s, i
         float r = length(p);
         float h = r - kEarthRadius;
         float dM = exp(-h / kMieH);
-        float3 sR = kBetaR * exp(-h / kRayleighH);
+        float3 sR = bd.bR * exp(-h / kRayleighH);
         float sM = kBetaM.x * dM;
-        float3 sT = sR + kBetaM * (1.1f * dM) + kBetaO * ozoneDensity(h);
+        float3 sT = sR + kBetaM * (1.1f * dM) + bd.bO * ozoneDensity(h);
         float3 Tseg = exp(-sT * dt);
         float3 wgt = T * msSegmentIntegral(sT, dt, Tseg);
         float mus = dot(p, s) / r;
-        if (order == 2) L += wgt * (sR * pR + sM * pM) * msSunTransmittance(lut, r, mus);
-        else            L += wgt * (sR + sM) * msScratchPsi(lut, readBase, h, mus);
+        if (order == 2) L += wgt * (sR * pR + sM * pM) * msSunTransmittance(lut, r, mus, bd.base);
+        else            L += wgt * (sR + sM) * msScratchPsi(lut, bd.base + readBase, h, mus);
         F += wgt * (sR + sM);
         T *= Tseg;
         tPrev = t;
@@ -1211,9 +1293,9 @@ inline void msOrderRay(device const float4* lut, float3 x, float3 w, float3 s, i
         float cs = dot(n, s);
         if (order == 2) {
             if (cs > 0.0f) L += T * (albedo / M_PI_F) * cs
-                              * msSunTransmittance(lut, kEarthRadius + kMSHeightOffset, cs);
+                              * msSunTransmittance(lut, kEarthRadius + kMSHeightOffset, cs, bd.base);
         } else {
-            L += T * albedo * msScratchPsi(lut, readBase, kMSHeightOffset, cs);   // E = πΨ, L = aE/π
+            L += T * albedo * msScratchPsi(lut, bd.base + readBase, kMSHeightOffset, cs);   // E = πΨ, L = aE/π
         }
     }
 }
@@ -1232,6 +1314,7 @@ kernel void volSkyMultiScatterOrder(device float4* lut [[buffer(0)]],
     threadgroup float4 sumF[kMSDirThreads];   // Σ F·w
     int order = int(bp.x + 0.5f);
     float albedo = bp.y;
+    const MSBand bd = msBand(int(bp.z + 0.5f), bp.w > 0.5f);   // z = band, w = spectral
     int texel = int(tg.y) * kMSLutW + int(tg.x);
     float mus = -1.0f + 2.0f * float(tg.x) / float(kMSLutW - 1);
     float h = kMSHeightOffset + (kMSAtmosRadius - kEarthRadius - kMSHeightOffset) * float(tg.y) / float(kMSLutH - 1);
@@ -1251,7 +1334,7 @@ kernel void volSkyMultiScatterOrder(device float4* lut [[buffer(0)]],
         float rxy = sqrt(max(1.0f - z * z, 0.0f));
         float3 w = float3(rxy * cos(phi), z, rxy * sin(phi));   // x = sun-horizontal, y = up
         float3 L, F;
-        msOrderRay(lut, x, w, s, order, albedo, readBase, L, F);
+        msOrderRay(lut, x, w, s, order, albedo, readBase, bd, L, F);
         float lg = L.y * wt;
         A += float4(L * wt, lg * (1.5f * w.y * w.y - 0.5f));
         B += float4(lg * (1.5f * w.x * w.x - 0.5f), lg * (1.5f * w.x * w.y), 0.0f, 0.0f);
@@ -1270,17 +1353,20 @@ kernel void volSkyMultiScatterOrder(device float4* lut [[buffer(0)]],
     if (tid != 0u) return;
     const float inv4pi = 1.0f / (4.0f * M_PI_F);
     float4 a = sumA[0] * inv4pi, b = sumB[0] * inv4pi;
-    lut[writeBase + texel] = float4(log(max(a.xyz, float3(1e-37f))), 0.0f);
-    if (order == 2) { lut[kLUTAccA + texel] = a; lut[kLUTAccB + texel] = b; }
-    else            { lut[kLUTAccA + texel] += a; lut[kLUTAccB + texel] += b; }
-    if (order == kMSLastOrder) lut[kLUTAccF + texel] = sumF[0] * inv4pi;
+    device float4* lb = lut + bd.base;
+    lb[writeBase + texel] = float4(log(max(a.xyz, float3(1e-37f))), 0.0f);
+    if (order == 2) { lb[kLUTAccA + texel] = a; lb[kLUTAccB + texel] = b; }
+    else            { lb[kLUTAccA + texel] += a; lb[kLUTAccB + texel] += b; }
+    if (order == kMSLastOrder) lb[kLUTAccF + texel] = sumF[0] * inv4pi;
 }
 
 /// Ψ = Σ Ψₙ + the local geometric tail Ψ_N·f/(1 − f) past the last order (isotropic), and the
 /// quadrupole normalised by Ψ (green): the table the per-pixel march reads.
-kernel void volSkyMultiScatterFinalize(device float4* lut [[buffer(0)]],
+kernel void volSkyMultiScatterFinalize(device float4* lutAll [[buffer(0)]],
+                                       constant float4 &bp [[buffer(1)]],   // z = band, w = spectral
                                        uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= uint(kMSLutW) || gid.y >= uint(kMSLutH)) return;
+    device float4* lut = lutAll + msBand(int(bp.z + 0.5f), bp.w > 0.5f).base;
     int texel = int(gid.y) * kMSLutW + int(gid.x);
     int lastBase = ((kMSLastOrder & 1) != 0) ? kLUTLnPsiB : kLUTLnPsiA;
     float4 a = lut[kLUTAccA + texel], b = lut[kLUTAccB + texel];
@@ -1299,7 +1385,8 @@ kernel void volSkyMultiScatterReady(device float4* lut [[buffer(0)]],
                                     uint tid [[thread_position_in_grid]]) {
     if (tid != 0u) return;
     float3 toSun = float3(cos(50.0f * M_PI_F / 180.0f), sin(50.0f * M_PI_F / 180.0f), 0.0f);
-    float3 z = nishitaScatterMS(float3(0.0f, 1.0f, 0.0f), toSun, 1.0f, float3(0.0f, 1.0f, 0.0f), 0.0f, lut);
+    float3 z = nishitaScatterMS(float3(0.0f, 1.0f, 0.0f), toSun, 1.0f, float3(0.0f, 1.0f, 0.0f), 0.0f, lut,
+                                bp.w > 0.5f);
     float ref = dot(z, float3(0.2126f, 0.7152f, 0.0722f));
     lut[kLUTHeader] = float4(1.0f, bp.y, ref, float(kLUTLength));
 }
@@ -1309,6 +1396,7 @@ kernel void volSkyAtmosphereLUTLayout(device int4* out [[buffer(0)]], uint tid [
     if (tid != 0u) return;
     out[0] = int4(kLUTLength, kLUTTrans, kLUTMS, kLUTLnPsiA);
     out[1] = int4(kMSTransW, kMSTransH, kMSLutW, kMSLutH);
+    out[2] = int4(kSpecBands, kLUTBandStride, 0, 0);
 }
 
 inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u,
@@ -1557,7 +1645,8 @@ inline void volSkyCloudLightImpl(device SkyUniforms &u, device const float4* sky
             d = normalize(float3(cos(a) * cos(el), sin(el), sin(a) * cos(el)));
             w = (k < 6u) ? 1.2f : 1.0f;
         }
-        float3 sky = ms ? nishitaScatterMS(d, -u.sunDir.xyz, intensity, float3(0.0f, 1.0f, 0.0f), 0.0f, skyLUT)
+        float3 sky = ms ? nishitaScatterMS(d, -u.sunDir.xyz, intensity, float3(0.0f, 1.0f, 0.0f), 0.0f, skyLUT,
+                                           u.msParams.z > 0.5f)
                         : nishitaScatter(d, u.sunDir.xyz, intensity);
         s = skyGraded(sky, u.skyGrade.x, u.skyGrade.y) * w;
     }
@@ -1570,7 +1659,8 @@ inline void volSkyCloudLightImpl(device SkyUniforms &u, device const float4* sky
     for (uint i = 0u; i < 16u; ++i) { sum += radiance[i]; wsum += weight[i]; }
     float3 skyMean = sum / max(wsum, 1e-6f);
     float3 toSun = -u.sunDir.xyz;
-    float3 sun = intensity * (ms ? msSunTransmittance(skyLUT, kEarthRadius + max(u.cloudSlab.x, 1.0f), toSun.y)
+    float3 sun = intensity * (ms ? msSunTransmittanceRGB(skyLUT, kEarthRadius + max(u.cloudSlab.x, 1.0f), toSun.y,
+                                                         u.msParams.z > 0.5f)
                                  : nishitaTransmittanceToSun(u.cloudSlab.x, toSun));
     // Lambertian ground under the deck (albedo in skyHorizon.xyz in this mode).
     float3 groundRad = u.skyHorizon.xyz * (sun * max(toSun.y, 0.0f) + M_PI_F * skyMean) / M_PI_F;

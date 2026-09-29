@@ -402,6 +402,18 @@ static inline float3 agx(float3 v) {
     return saturate(pow(max(v, 0.0), float3(2.2)));
 }
 
+/// AgX's sigmoid WITHOUT the 'punchy' look (Blender's bare AgX): the hue-stable toe's optional
+/// level source (`displayParams.w`). Same inset, log latitude, contrast fit, outset and EOTF.
+static inline float3 agxWithoutLook(float3 v) {
+    const float minEv = -12.47393, maxEv = 4.026069;
+    v = kAgXInset * max(v, 0.0);
+    v = clamp(log2(max(v, 1e-10)), minEv, maxEv);
+    v = (v - minEv) / (maxEv - minEv);
+    v = agxContrast(saturate(v));
+    v = kAgXOutset * v;
+    return saturate(pow(max(v, 0.0), float3(2.2)));
+}
+
 /// The scene → display rendering this frame asked for. 0 keeps the shipped per-channel
 /// Rec.709 curve exactly, so every existing baseline is untouched.
 static inline float3 displayTransform(float3 scene, uint which) {
@@ -1104,8 +1116,14 @@ fragment float4 illumi_tonemap_fs(
     float chromaW = 1.0;
     if (frame.displayParams.z > 0.0) {
         chromaW = hueStableToeWeight(exposedScene, frame.displayParams.y, frame.displayParams.z);
-        if (chromaW < 1.0)
-            mapped = mix(hueStableDisplay(exposedScene, mapped), mapped, chromaW);
+        if (chromaW < 1.0) {
+            // displayParams.w (opt-in, AgX only): the toe's LEVEL from AgX's own sigmoid without
+            // the 'punchy' look — the look's 1.35 power is a ~2.3-power toe that prints anything
+            // 5 stops under mid-grey black, which is where a locally-adapted night room lives.
+            float3 toeLevel = (frame.displayParams.w > 0.5 && frame.displayTransform == 2u)
+                            ? agxWithoutLook(exposedScene) : mapped;
+            mapped = mix(hueStableDisplay(exposedScene, toeLevel), mapped, chromaW);
+        }
     }
 
     // ── Film stock — a second DISPLAY TRANSFORM, not a grade on top of one ─────

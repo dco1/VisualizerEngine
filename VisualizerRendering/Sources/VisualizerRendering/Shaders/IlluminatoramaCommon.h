@@ -67,7 +67,12 @@ struct FrameUniforms {
     // Repurposes the former `_padDir` slot — same 4 bytes, same offset, stride unchanged.
     float    extendedGBuffer;            // was _padDir
     float3   directionalLightColor;
-    float    _padColor;
+    // DEFOCUS-AWARE SHADING RATE (opt-in `lightingDefocusShadingMinCoC`, VZ-0197): the least
+    // |CoC| (px, radius) a 16×16 tile's geometry must have for the lighting pass to shade its
+    // one-surface 2×2 quads once each (the coarse lighting variants only). Repurposes the former
+    // `_padColor` slot — same 4 bytes, same offset, stride unchanged; 0 (every host that never
+    // opts in) and never read by the default variant.
+    float    lightingCoarseMinCoC;
     float3   ambientColor;
     float    exposure;
     float    bloomThreshold;
@@ -538,7 +543,8 @@ struct FrameUniforms {
     //                on the pixel's max-RGB norm and rescales its colour (the scene's linear
     //                ratios kept, no per-channel toe) and the post-tonemap saturation push is
     //                off; above hi the transform and the push are the shipped ones. z = 0 ⇒ off.
-    //                w = reserved.
+    //                w = 1 ⇒ the toe's level from AgX's bare sigmoid, not its 'punchy' look
+    //                (`hueStableToeBareLevel`); 0 ⇒ the shipped transform's level.
     // ONE new 16-byte cluster (stride 1648 → 1664); mirror of IlluminatoramaFrameUniforms.
     float4   displayParams;
 };

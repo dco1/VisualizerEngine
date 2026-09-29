@@ -117,6 +117,27 @@ final class CoinDEMContactGenerationTests: XCTestCase {
         return best
     }
 
+    /// `generateWallMs` for several configurations of ONE solver, measured round-robin: each
+    /// round applies every configuration in turn and times one pass of it, and each keeps its
+    /// minimum. A slow stretch of the shared GPU (another session's frames, a clock ramp) then
+    /// lands on every configuration alike instead of on whichever one it happened to overlap —
+    /// sequential minima once made the FIRST configuration measured 2.3 ms against 0.67 ms for
+    /// the same pass plus 134 statics.
+    private func generateWallMsInterleaved(_ s: CoinDEMSolver, _ configs: [() -> Void], reps: Int = 41) -> [Double] {
+        for apply in configs { apply(); for _ in 0..<3 { s.generateContactsNow() } }
+        var best = [Double](repeating: .greatestFiniteMagnitude, count: configs.count)
+        for _ in 0..<reps {
+            for (k, apply) in configs.enumerated() {
+                apply()
+                s.generateContactsNow()          // the configuration's first pass after the switch, untimed
+                let t0 = CFAbsoluteTimeGetCurrent()
+                s.generateContactsNow()
+                best[k] = min(best[k], (CFAbsoluteTimeGetCurrent() - t0) * 1000)
+            }
+        }
+        return best
+    }
+
     // ══════════════════════════════════════════════════════════════════════════
     // 2a — VZ-0151: per-collider bounding reject in the static loop
     // ══════════════════════════════════════════════════════════════════════════
@@ -293,21 +314,45 @@ final class CoinDEMContactGenerationTests: XCTestCase {
             }
         }
         let box = s.spawnBox(at: SIMD3(0.2, 0.8, 0.4), halfExtents: SIMD3(0.005, 0.005, 0.005), mass: 0.01)!
-        _ = box
-        s.setColliders([])
-        let floor = generateWallMs(s)          // 21 awake bars, no statics
-        s.setColliders(T.clockStatics().all)
-        let awake = generateWallMs(s)
+        let statics = T.clockStatics().all
         let a = s.asleepBuffer.contents().bindMemory(to: UInt32.self, capacity: s.maxCoins)
-        for b in bars { a[b] = 1 }
-        let asleep = generateWallMs(s)
-        s.setColliders([])
-        let asleepNoStatics = generateWallMs(s)
-        print(String(format: "A2_2b 21 seated bars, generate pass (min wall): awake, no statics %.3f | awake + 134 statics %.3f | ASLEEP + 134 statics %.3f | asleep, no statics %.3f ms",
-                     floor, awake, asleep, asleepNoStatics))
+        // (statics on, bars asleep, the box asleep) — the bars' and the box's flags written directly.
+        func config(_ withStatics: Bool, barsAsleep: Bool, boxAsleep: Bool = false) -> () -> Void {
+            { s.setColliders(withStatics ? statics : []); for b in bars { a[b] = barsAsleep ? 1 : 0 }; a[box] = boxAsleep ? 1 : 0 }
+        }
+        let t = generateWallMsInterleaved(s, [
+            config(false, barsAsleep: false),                   // 21 awake bars, no statics
+            config(true, barsAsleep: false),                    // … + 134 statics
+            config(true, barsAsleep: true),                     // ASLEEP bars (+ the awake box) + 134 statics
+            config(false, barsAsleep: true),                    // … no statics
+            config(true, barsAsleep: true, boxAsleep: true),    // every body asleep + 134 statics
+            config(false, barsAsleep: true, boxAsleep: true),   // … no statics
+        ])
+        let (floor, awake, asleep, asleepNoStatics, allAsleep, allAsleepNoStatics) = (t[0], t[1], t[2], t[3], t[4], t[5])
+        print(String(format: "A2_2b 21 seated bars, generate pass (min wall, interleaved): awake, no statics %.3f | awake + 134 statics %.3f | ASLEEP + 134 statics %.3f | asleep, no statics %.3f | all asleep + statics %.3f | all asleep, no statics %.3f ms → static-loop share: awake %.3f, asleep bars + awake box %.3f, asleep bodies %.3f",
+                     floor, awake, asleep, asleepNoStatics, allAsleep, allAsleepNoStatics,
+                     awake - floor, asleep - asleepNoStatics, allAsleep - allAsleepNoStatics))
         XCTAssertLessThan(asleep - asleepNoStatics, 0.15, "asleep bars skip the static loop")
-        XCTAssertLessThan(asleep, awake * 0.5, "asleep bars cost a fraction of awake ones")
-        XCTAssertEqual(s.contacts(touching: Set(bars)).count, 0)
+        // The static loop's share of each state, above its own no-statics floor. (Stage B1:
+        // the polytope narrowphase made the AWAKE pass ~44 % cheaper — 1.63 → 0.92 ms here,
+        // SAT + clipping one thread per pair instead of per-vertex probing — and added a fixed
+        // ~0.05 ms (two dispatches) to every pass, so the ratio of the raw totals, 0.48 vs
+        // 0.46, stopped measuring the skip it tests.)
+        //
+        // Stage B3: the ASLEEP bodies' share is measured with every body asleep. With the box awake
+        // that share is the box's OWN static loop — one GPU thread walking all 134 colliders,
+        // ≈ 0.05–0.09 ms of latency — while the 21 awake bars' loops run as 21 parallel threads, so
+        // the awake share is about ONE such loop plus the touching bar–pad pairs' polytope work.
+        // Once B1 and B3 (VZ-0198, the SAT on a SIMD group) made that pair work ≈ 5× cheaper, the
+        // awake share fell to ≈ 0.19 ms and the box's loop alone was ≈ 0.35 of it (0.18–0.47
+        // measured): noise flipped the claim, which is about the BARS. With every body asleep the
+        // share is 0.004–0.017 ms (the per-thread asleep check), and it would be the awake share
+        // again if asleep bars walked their loop and emitted their pad contacts. The box-awake
+        // case keeps its absolute bound above (the scene's case: a sleeping bar beside awake bodies).
+        XCTAssertLessThan(allAsleep - allAsleepNoStatics, (awake - floor) * 0.5, "asleep bodies' statics cost a fraction of awake ones'")
+        config(true, barsAsleep: true)()
+        s.generateContactsNow()
+        XCTAssertEqual(s.contacts(touching: Set(bars)).count, 0, "asleep bars emit no contact, even seated on their pads")
     }
 
     // ══════════════════════════════════════════════════════════════════════════
@@ -356,8 +401,11 @@ final class CoinDEMContactGenerationTests: XCTestCase {
     /// WHERE the host splits the sweep cannot change the result: a tumbling mixed pile
     /// stepped with the normal sweep and with the sweep forced to 0 every frame (every
     /// colour solved by the one-threadgroup tail) ends bit-identical — with and without
-    /// warm starting (whose apply pass has its own tail).
+    /// warm starting (whose apply pass has its own tail), and with the default contact rows
+    /// and the prepared ones (stage B3's opt-in `preparedContactSolve`, whose sweep and tail
+    /// are their own pair of kernels).
     func testColourTailIsExactWhereverTheSweepSplits() throws {
+        for prepared in [false, true] {
         for warm in [false, true] {
             var poses: [[SIMD4<Float>]] = []
             var beyond: [Int] = [], maxColor = 0, uncolored = 0
@@ -366,6 +414,20 @@ final class CoinDEMContactGenerationTests: XCTestCase {
                                             colliders: RigidPileField.bin(innerHalf: SIMD2(0.05, 0.05), floorY: 0))
                 s.warmStart = warm
                 s.sleepEnabled = false
+                // The sweep / tail split is the multi-dispatch path's (the small-world kernel solves
+                // every colour in one loop): pinned there, whatever VIZ_COINDEM_SMALLWORLD says. The
+                // row mode is pinned per run too, so VIZ_COINDEM_PREPARED never changes what this checks.
+                s.smallWorldPath = false
+                s.preparedContactSolve = prepared
+                // The colouring budget: enough Jones–Plassmann rounds that EVERY contact of either
+                // trajectory is coloured (the `uncolored == 0` precondition below — an uncoloured
+                // contact rides the tail in both runs, so it would not exercise the split). The
+                // engine's default, 24: the prepared rows' trajectory (the same rows, regrouped
+                // arithmetic, so a different pile by frame 90) left 2 contacts over its 270 substeps
+                // uncoloured at the harness's 16 (JP colours one contact per body per round —
+                // VZ-0160). Rounds past a complete colouring colour nothing, so the default rows
+                // step bit-identically at 16 and 24 (measured: same final-pose hash at 16/24/32/48).
+                s.colorRounds = 24
                 var seed: UInt64 = 0x3A_0154
                 func rnd() -> Float { seed = seed &* 6364136223846793005 &+ 1442695040888963407; return Float(seed >> 40) / Float(1 << 24) }
                 for i in 0..<36 {
@@ -387,11 +449,12 @@ final class CoinDEMContactGenerationTests: XCTestCase {
             let identical = poses[0] == poses[1]
             var worst: Float = 0
             for (x, y) in zip(poses[0], poses[1]) { worst = max(worst, simd_reduce_max(simd_abs(x - y))) }
-            print("A2_3a warmStart=\(warm): maxColorUsed=\(maxColor) uncolored=\(uncolored) beyondSweep normal=\(beyond[0]) forced-tail(last frame)=\(beyond[1]) identical=\(identical) worst|Δ|=\(worst)")
+            print("A2_3a prepared=\(prepared) warmStart=\(warm): maxColorUsed=\(maxColor) uncolored=\(uncolored) beyondSweep normal=\(beyond[0]) forced-tail(last frame)=\(beyond[1]) identical=\(identical) worst|Δ|=\(worst)")
             XCTAssertGreaterThan(maxColor, 4, "precondition: a pile that needs several colours")
             XCTAssertEqual(uncolored, 0)
             XCTAssertGreaterThan(beyond[1], 0, "precondition: the forced run really solved in the tail")
-            XCTAssertTrue(identical, "tail-solved and sweep-solved piles are bit-identical (warmStart \(warm)); worst |Δ| \(worst)")
+            XCTAssertTrue(identical, "tail-solved and sweep-solved piles are bit-identical (prepared \(prepared), warmStart \(warm)); worst |Δ| \(worst)")
+        }
         }
     }
 

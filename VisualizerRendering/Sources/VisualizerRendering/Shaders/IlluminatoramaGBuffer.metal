@@ -96,6 +96,76 @@ constant bool kUsePrevVerts [[function_constant(10)]];
 // that "would cost every pixel of every frame" is built for the highest-quality preset and
 // Photo Export only, and the interactive path pays nothing.
 constant bool kExtendedGBuffer [[function_constant(11)]];
+// Opt-in INTERIOR MAPPING (van Dongen 2008) for the mesh kinds a host lists in
+// `IlluminatoramaRenderer.interiorMappedMeshKinds`: the pane's emission becomes the radiance of
+// a lamp-lit ROOM BOX behind it, ray-traced analytically per fragment (one draw, no geometry).
+// Only the dedicated pipeline variant compiles it true; every other draw is unchanged.
+constant bool kInteriorMap [[function_constant(12)]];
+
+/// Host mirror: `IlluminatoramaInteriorMapping.GPU`. Metres, in the PANE's frame: u along the
+/// mesh tangent (the pane's width), v world-up, w into the room (−normal).
+struct InteriorMapParams {
+    float4 room;     // x width, y height, z depth (mean; ±depthJitter per window), w sill height (floor → pane bottom)
+    float4 pane;     // x pane width, y pane height, z uv bias subtracted from uv.x, w depth jitter (fraction)
+    float4 wall;     // rgb wall albedo (linear), w floor albedo scale
+    float4 lamp;     // x lamp height above the floor, y lamp inset from the back wall, z ceiling albedo scale, w ambient (one-bounce) fraction
+};
+
+/// A fast per-window hash in [0, 1)³ from the window's world origin.
+static inline float3 imapHash3(float3 p) {
+    uint3 q = uint3(int3(floor(p * 4.0f)) + 100000);
+    q = q * 1664525u + 1013904223u;
+    q.x += q.y * q.z; q.y += q.z * q.x; q.z += q.x * q.y;
+    q ^= q >> 16u;
+    q.x += q.y * q.z; q.y += q.z * q.x; q.z += q.x * q.y;
+    return float3(q & 0xFFFFu) / 65536.0f;
+}
+
+/// Radiance (per unit lamp emission) leaving the room box behind a pane, along the camera ray
+/// through the pane point: the ray is intersected analytically with the box's floor, ceiling,
+/// side and back walls (the nearest exit plane), and that Lambertian surface is lit by a point
+/// lamp inside the room (exact inverse-square × cosine — an empty convex box has no
+/// occluders) plus a uniform one-bounce term. Normalised so the back wall facing a lamp one
+/// room-depth away reads ≈ 1: `inst.emission` then sets the room's luminance directly.
+static inline float3 interiorMapRadiance(float3 P, float3 N, float4 T, float2 uv, float3 cam,
+                                         constant InteriorMapParams& m) {
+    float3 up = float3(0.0f, 1.0f, 0.0f);
+    float3 tu = normalize(T.xyz - N * dot(T.xyz, N));
+    float3 win = -N;                                    // into the room
+    float pu = clamp(uv.x - m.pane.z, 0.0f, 1.0f) * m.pane.x;   // metres from the pane's left edge
+    float pv = clamp(uv.y, 0.0f, 1.0f) * m.pane.y;              // metres above the pane's bottom
+    float3 origin = P - tu * pu - up * pv;              // the pane's bottom-left corner (world)
+    float3 h = imapHash3(origin);
+    float W = m.room.x, H = m.room.y;
+    float D = m.room.z * (1.0f + m.pane.w * (2.0f * h.x - 1.0f));
+    // Room frame: x across (0…W), y up from the floor (0…H), z depth (0 at the pane … D).
+    float x0 = 0.5f * (W - m.pane.x) + (h.y - 0.5f) * 0.6f * (W - m.pane.x);   // pane offset along the wall
+    float3 ro = float3(x0 + pu, m.room.w + pv, 0.0f);
+    float3 dw = normalize(P - cam);
+    float3 rd = float3(dot(dw, tu), dot(dw, up), dot(dw, win));
+    if (rd.z <= 1e-4f) return float3(0.0f);
+    // Exit distance through the box (the ray starts on the front face, inside the box).
+    float tx = rd.x > 0.0f ? (W - ro.x) / rd.x : (rd.x < 0.0f ? -ro.x / rd.x : 1e9f);
+    float ty = rd.y > 0.0f ? (H - ro.y) / rd.y : (rd.y < 0.0f ? -ro.y / rd.y : 1e9f);
+    float tz = (D - ro.z) / rd.z;
+    float t = max(min(tx, min(ty, tz)), 0.0f);
+    float3 hit = ro + rd * t;
+    float3 n; float3 alb = m.wall.rgb;
+    if (t == tz)      { n = float3(0.0f, 0.0f, -1.0f); }
+    else if (t == ty) { n = rd.y > 0.0f ? float3(0.0f, -1.0f, 0.0f) : float3(0.0f, 1.0f, 0.0f);
+                        alb *= rd.y > 0.0f ? m.lamp.z : m.wall.w; }
+    else              { n = rd.x > 0.0f ? float3(-1.0f, 0.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f); }
+    // The lamp: a point at a hashed spot near the back of the room.
+    float3 lp = float3(W * (0.2f + 0.6f * h.z), m.lamp.x, max(D - m.lamp.y, 0.3f * D));
+    float3 l = lp - hit;
+    float r2 = max(dot(l, l), 0.04f);
+    float cosI = max(dot(n, l * rsqrt(r2)), 0.0f);
+    float direct = cosI / r2;
+    // Normalisation: the back wall straight across from the lamp, at the lamp's inset.
+    float ref = 1.0f / max(m.lamp.y * m.lamp.y, 0.04f);
+    return alb / max(dot(m.wall.rgb, float3(0.2126f, 0.7152f, 0.0722f)), 1e-3f)
+         * (direct / ref + m.lamp.w);
+}
 
 // ── Drag/impact sway (generic rigid secondary motion) ────────────────────────
 // The non-foliage sibling of applyTreeWind: a placed object the host is dragging
@@ -355,6 +425,8 @@ fragment GBufferOut illumi_fs(
     // never registers a slice through the host path is unaffected.
     const device float4*                        albedoSliceMean [[buffer(7)]],
     const device float4*                        nonColorSliceMean [[buffer(8)]],
+    // Interior mapping (only the kInteriorMap pipeline declares it).
+    constant InteriorMapParams&                 imap            [[buffer(9), function_constant(kInteriorMap)]],
     // Phase 4.0 — atlas of diffuse-albedo textures. Each slice is the
     // 512×512 BGRA8-sRGB upload from `IlluminatoramaTextureAtlas`; the
     // texture-format's sRGB→linear decode happens automatically inside
@@ -1291,6 +1363,12 @@ fragment GBufferOut illumi_fs(
         // `emission.intensity` so a texture-driven glow reads at its tuned
         // HDR brightness (Pizza's heat coils were flat at intensity 1).
         emission += tx.rgb * inst.emissionIntensity;
+    }
+    // Interior mapping: the pane's emission is the lamp-lit room behind it (inst.emission = the
+    // lamp's colour × the room's luminance), seen along this fragment's camera ray.
+    if (kInteriorMap) {
+        emission = inst.emission * interiorMapRadiance(in.worldPos, n, in.worldTangent, in.uv,
+                                                       frame.cameraWorldPos, imap);
     }
     // Glow of host-TAGGED vertices (Instance.tagGlow; same tangent.w ≈ 1 tag as the hue cycle):
     // the petal emits its own final albedo, so a hue-cycling flower glows in its current colour.

@@ -400,4 +400,298 @@ final class IlluminatoramaLocalToneMapTests: XCTestCase {
         let red16 = SIMD3<Float>(Float(Float16(red.x)), Float(Float16(red.y)), Float(Float16(red.z)))
         XCTAssertEqual(off, red16, "mesopic 0 leaves the (fp16) input exactly as it was")
     }
+
+    // ── Round 3: adaptation from the frame ─────────────────────────────────
+
+    /// A frame exposed within the tolerance of the key is copied EXACTLY (no lift, no mesopic);
+    /// an under-exposed one is lifted, with the lift bounded by gain × (deficit − tolerance).
+    func testAdaptationFromFrameIsExactWithinToleranceAndBoundedByTheDeficit() throws {
+        let h = try makeHarness()
+        var s = settings
+        s.maxLift = 14
+        s.adaptationFromFrame = true
+        s.adaptationTargetEV = -2.2
+        s.adaptationTolerance = 1
+        s.mesopic = 1
+        s.mesopicNitsPerUnit = 1e-3            // deep mesopic — would shift colour if it ran
+        // Half the frame at −1.5, half at −4 (log-mean −2.75): 0.55 stop under the key < tolerance.
+        let lit = makeImage(h, width: 128, height: 96) { x, _ in x < 64 ? grey(-1.5) : SIMD3(0.01, 0.02, 0.06) * 0.0625 / 0.0197 }
+        let out = try XCTUnwrap(run(h, lit, s))
+        let ref = (0..<(128 * 96)).map { i -> SIMD3<Float> in
+            let x = i % 128
+            let c = x < 64 ? grey(-1.5) : SIMD3<Float>(0.01, 0.02, 0.06) * 0.0625 / 0.0197
+            return SIMD3(Float(Float16(c.x)), Float(Float16(c.y)), Float(Float16(c.z)))
+        }
+        XCTAssertEqual(out, ref, "within tolerance the pass is an exact copy")
+        XCTAssertEqual(h.pass.lastLiftCeiling, 0, "within tolerance the host sees a zero ceiling")
+        // A uniformly dark frame at −12, tolerance 5: ceiling 9.8 − 5 = 4.8 stops, under the
+        // curve's own 5.28 ⇒ the deficit is what binds (through the 1-stop soft ceiling).
+        var t = s; t.mesopic = 0; t.adaptationTolerance = 5
+        let dark = makeImage(h, width: 128, height: 96) { _, _ in grey(-12) }
+        let o2 = try XCTUnwrap(run(h, dark, t))
+        let gain = log2(brightness(o2[48 * 128 + 64]) / brightness(grey(-12)))
+        let curve = t.lift(stopsUnderAnchor: log2(t.anchor) + 12)
+        XCTAssertGreaterThan(curve, 5, "precondition: the curve alone would lift past the ceiling")
+        let soft = curve - log(1 + exp(curve - 4.8))
+        XCTAssertEqual(gain, soft, accuracy: 0.05, "lift = the curve under the deficit's soft ceiling")
+        // With the default tolerance the same frame is lifted by the curve (ceiling 8.8 > 5.28).
+        var u = t; u.adaptationTolerance = 1
+        let o3 = try XCTUnwrap(run(h, dark, u))
+        let g3 = log2(brightness(o3[48 * 128 + 64]) / brightness(grey(-12)))
+        XCTAssertEqual(g3, curve - log(1 + exp(curve - 8.8)), accuracy: 0.05)
+        // The host reads that same adaptation state back (a shared-buffer load, no wait) — what a
+        // scene keys its print grade on instead of a second ramp.
+        XCTAssertEqual(h.pass.lastLiftCeiling, 8.8, accuracy: 0.02, "host-visible ceiling = gain·(deficit − tolerance)")
+        // A PHOTOPIC field (1 unit = 1e6 cd/m²: the −12 frame is ~244 cd/m²) with the photopic
+        // level at 10 cd/m²: +4.6 stops of tolerance ⇒ ceiling 4.2 < the curve's 5.28 — and at
+        // 1e9 cd/m²/unit the field is so bright the pass is an exact copy.
+        var v = u; v.adaptationPhotopicNits = 10; v.mesopicNitsPerUnit = 1e6
+        let o4 = try XCTUnwrap(run(h, dark, v))
+        let g4 = log2(brightness(o4[48 * 128 + 64]) / brightness(grey(-12)))
+        XCTAssertLessThan(g4, g3 - 0.8, "photopic tolerance lowers the ceiling: \(g4) vs \(g3)")
+        v.mesopicNitsPerUnit = 1e9
+        let o5 = try XCTUnwrap(run(h, dark, v))
+        XCTAssertEqual(o5[48 * 128 + 64], SIMD3(repeating: Float(Float16(Float(0.000244140625)))), "a bright field is left as printed")
+    }
+
+    // ── Round 3: histogram-adjusted tail ───────────────────────────────────
+
+    /// A bright key region, an EMPTY 8-stop gap, then two populated dim regions 2.6 stops apart
+    /// (a sky and a facade): the fixed tail squashes their difference to ~0.1 stop; the histogram
+    /// tail keeps most of it (populated bins keep slope ~1) and compresses the empty gap instead.
+    func testHistogramTailKeepsPopulatedContrastAndCompressesGaps() throws {
+        let h = try makeHarness()
+        let w = 192, hgt = 96
+        let src = makeImage(h, width: w, height: hgt) { x, _ in
+            x < 64 ? grey(-1) : (x < 128 ? grey(-12) : grey(-14.6))
+        }
+        var fixed = settings
+        fixed.strength = 0.95
+        fixed.maxLift = 14
+        var hist = fixed
+        hist.histogramTail = true
+        hist.gapSlope = 0.05
+        hist.populatedFraction = 0.05
+        func diff(_ o: [SIMD3<Float>]) -> Float {
+            log2(brightness(o[48 * w + 96]) / brightness(o[48 * w + 170]))
+        }
+        let a = diff(try XCTUnwrap(run(h, src, fixed)))
+        let b = diff(try XCTUnwrap(run(h, src, hist)))
+        XCTAssertLessThan(a, 0.5, "the fixed tail squashes the two dim regions: \(a)")
+        XCTAssertGreaterThan(b, 1.2, "the histogram tail keeps their contrast: \(b)")
+        // …and still lifts them (the gap is what got compressed).
+        let o = try XCTUnwrap(run(h, src, hist))
+        XCTAssertGreaterThan(log2(brightness(o[48 * w + 96]) / brightness(grey(-12))), 4)
+    }
+
+    /// The fit lands the floor luminance on the requested print level.
+    func testHistogramTailFitsTheFloorLuminanceOntoThePrintLevel() throws {
+        let h = try makeHarness()
+        let w = 192, hgt = 96
+        // Populated everywhere from −1 down to −20 (a ramp): the fit has to squeeze.
+        let src = makeImage(h, width: w, height: hgt) { x, _ in grey(-1 - 19 * Float(x) / Float(w - 1)) }
+        var s = settings
+        s.strength = 0.95
+        s.maxLift = 20
+        s.histogramTail = true
+        s.populatedFraction = 0.01
+        s.minPopulatedScale = 0.02
+        s.mesopicNitsPerUnit = 1          // 1 frame unit = 1 cd/m²
+        s.printFloorNits = pow(2, -20)    // the ramp's dark end
+        s.printFloorLevel = 0.18 / 16     // lands 4 stops under the anchor
+        let o = try XCTUnwrap(run(h, src, s))
+        let end = log2(brightness(o[48 * w + w - 1]))
+        XCTAssertEqual(end, log2(0.18 / 16), accuracy: 0.6, "the floor prints where it was aimed: \(end)")
+        // Monotone along the ramp.
+        var worst: Float = 0
+        for x in 1..<w { worst = min(worst, log2(brightness(o[48 * w + x - 1])) - log2(brightness(o[48 * w + x]))) }
+        XCTAssertGreaterThan(worst, -0.01)
+    }
+
+    // ── Round 3: blue-shift mesopic + pixel floor ──────────────────────────
+
+    /// Jensen et al. 2000: a neutral grey at scotopic luminance goes to the blue-shift tint; at
+    /// photopic luminance it is untouched; the red LED colour at scotopic luminance goes dark.
+    func testBlueShiftMesopicFollowsLogLuminance() throws {
+        let h = try makeHarness()
+        func out(_ c: SIMD3<Float>, nits: Float) throws -> SIMD3<Float> {
+            var s = IlluminatoramaLocalToneMapping(strength: 0.01, radius: 0.1, edgeStops: 1, detail: 1,
+                                                   anchor: 0.18, knee: 2, maxLift: 1)
+            s.mesopic = 1
+            s.mesopicModel = .blueShift
+            s.mesopicTint = IlluminatoramaLocalToneMapping.jensenBlueShiftTint
+            let Y = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z
+            s.mesopicNitsPerUnit = nits / Y
+            let src = makeImage(h, width: 96, height: 64) { _, _ in c }
+            let o = try XCTUnwrap(run(h, src, s))
+            let base = try XCTUnwrap(run(h, src, { var t = s; t.mesopic = 0; return t }()))
+            return o[32 * 96 + 48] / (brightness(base[32 * 96 + 48]) / brightness(c))
+        }
+        let grey = SIMD3<Float>(0.2, 0.2, 0.2)
+        let photopic = try out(grey, nits: 30)
+        XCTAssertEqual(photopic.x, 0.2, accuracy: 0.003); XCTAssertEqual(photopic.z, 0.2, accuracy: 0.003)
+        let scotopic = try out(grey, nits: 0.001)
+        XCTAssertGreaterThan(scotopic.z / scotopic.x, 2.4, "rod vision reads blue: \(scotopic)")
+        let red = try out(SIMD3(0.5, 0.0175, 0.006), nits: 0.001)
+        XCTAssertLessThan(0.2126 * red.x + 0.7152 * red.y + 0.0722 * red.z, 0.3 * 0.1316, "a red light goes dark")
+    }
+
+    /// Fix for the blue rim round a lit patch: with `mesopicPixelFloor` a pixel bright enough to be
+    /// photopic is never rod-tinted by a dark neighbourhood's base.
+    func testMesopicPixelFloorRemovesTheRimTint() throws {
+        let h = try makeHarness()
+        let w = 128, hgt = 64
+        // A bright patch (1 cd/m²-ish) beside a very dark floor.
+        let src = makeImage(h, width: w, height: hgt) { x, _ in x < 64 ? SIMD3(0.3, 0.29, 0.28) : SIMD3(0.0003, 0.0003, 0.0003) }
+        var s = IlluminatoramaLocalToneMapping(strength: 0.01, radius: 0.1, edgeStops: 1, detail: 1,
+                                               anchor: 0.18, knee: 2, maxLift: 1)
+        s.mesopic = 1
+        s.mesopicModel = .blueShift
+        s.mesopicTint = IlluminatoramaLocalToneMapping.jensenBlueShiftTint
+        s.mesopicNitsPerUnit = 10         // patch ≈ 2.9 cd/m², floor ≈ 0.003
+        func rimBR(_ floorOn: Bool) throws -> Float {
+            var t = s; t.mesopicPixelFloor = floorOn
+            let o = try XCTUnwrap(run(h, src, t))
+            // The patch's own pixels next to the edge: B − R relative to their level.
+            let c = o[32 * w + 62]
+            return (c.z - c.x) / max(c.x, 1e-6)
+        }
+        let without = try rimBR(false), with = try rimBR(true)
+        XCTAssertLessThan(with, without + 1e-4)
+        XCTAssertLessThan(with, 0.02, "a photopic pixel stays its own colour at the rim: \(with)")
+    }
+
+    // ── Round 4: the mesopic print is monotone across a red light's edge (VZ-0194) ─────────
+
+    /// A red LED's light falling off across a surface also lit by dim blue moonlight: radiance
+    /// rises steadily across the edge (ambient + t·red, t exponential), so the PRINT must too. The
+    /// old rod response (Larson et al. 1997's V = Y·[1.33(1 + (Y+Z)/X) − 1.68]) is not additive —
+    /// adding red raises X and the mixture's rod luminance falls BELOW the moonlight's own — so
+    /// where a pixel was already red-dominated but still mesopic it printed near-black (Digital
+    /// Clock 23:47: (21,26,40) · (2,2,4) · (31,6,11)). `mesopicRodModel = .additive` sums per-primary
+    /// rod responses (Larson's own at each primary), and the seam is gone.
+    private func mesopicRamp(_ model: IlluminatoramaLocalToneMapping.MesopicRodModel, floor: Bool = true) throws -> [Float] {
+        let h = try makeHarness()
+        let w = 256, hgt = 32
+        let ambient = SIMD3<Float>(0.0045, 0.006, 0.010)          // moonlit blue-grey, ≈ 0.006 cd/m²
+        let red = SIMD3<Float>(1, 0.035, 0.012)                    // the LED red
+        let src = makeImage(h, width: w, height: hgt) { x, _ in
+            ambient + red * (1e-3 * pow(10, 4 * Float(x) / Float(w - 1)))
+        }
+        var s = IlluminatoramaLocalToneMapping(strength: 0.01, radius: 0.1, edgeStops: 1, detail: 1,
+                                               anchor: 0.18, knee: 2, maxLift: 1)
+        s.mesopic = 1
+        s.mesopicModel = .blueShift
+        s.mesopicTint = IlluminatoramaLocalToneMapping.jensenBlueShiftTint
+        s.mesopicLogRange = SIMD2(-2, 0.6)
+        s.mesopicPixelFloor = floor
+        s.mesopicNitsPerUnit = 1
+        s.mesopicRodModel = model
+        let o = try XCTUnwrap(run(h, src, s))
+        return (0..<w).map { x in let c = o[16 * w + x]; return 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z }
+    }
+
+    /// Largest drop in printed luma along the ramp, relative to the level before it (0 = monotone),
+    /// and whether any pixel prints darker than both its neighbours by more than fp16 noise.
+    private func worstDip(_ luma: [Float]) -> (drop: Float, pit: Bool) {
+        var drop: Float = 0, pit = false
+        var peak: Float = 0
+        for (i, v) in luma.enumerated() {
+            peak = max(peak, v)
+            drop = max(drop, (peak - v) / max(peak, 1e-9))
+            if i > 0, i + 1 < luma.count, v < luma[i - 1] * 0.995, v < luma[i + 1] * 0.995 { pit = true }
+        }
+        return (drop, pit)
+    }
+
+    func testMesopicPrintIsMonotoneAcrossARedLightEdge() throws {
+        let larson = worstDip(try mesopicRamp(.larson))
+        // The probe is not vacuous: the old rod response prints a pit.
+        XCTAssertGreaterThan(larson.drop, 0.05, "the Larson rod response should dip across the edge (probe check)")
+        for floor in [true, false] {
+            let additive = worstDip(try mesopicRamp(.additive, floor: floor))
+            XCTAssertLessThan(additive.drop, 0.01, "additive rods: the print must rise with the radiance (floor \(floor))")
+            XCTAssertFalse(additive.pit, "no pixel darker than both neighbours (floor \(floor))")
+        }
+    }
+
+    /// A red light's TERMINATOR on a moonlit surface: the moonlight everywhere, the red light
+    /// switching on over 3 px and then a small brighter red feature — the Digital Clock toy's red
+    /// side. Radiance never falls left to right, so the print must not either; with the weight from
+    /// the surround's plain adaptation level (`mesopicSpatialAdaptation`), additive rods and the
+    /// cone-signal floor it does not.
+    func testRedTerminatorPrintsNoSeamWithSpatialAdaptation() throws {
+        let h = try makeHarness()
+        let w = 256, hgt = 64
+        let ambient = SIMD3<Float>(0.004, 0.0055, 0.0095)
+        let red = SIMD3<Float>(1, 0.035, 0.012)
+        let src = makeImage(h, width: w, height: hgt) { x, _ in
+            let t = max(0, min(1, Float(x - 120) / 3))
+            let feature: Float = (x >= 140 && x < 150) ? 3 : 1           // a small brighter ridge
+            return ambient + red * (0.02 * t * feature)
+        }
+        func row(_ spatial: Bool, _ cone: Bool, _ additive: Bool) throws -> [Float] {
+            var s = IlluminatoramaLocalToneMapping(strength: 0.01, radius: 0.1, edgeStops: 1, detail: 1,
+                                                   anchor: 0.18, knee: 2, maxLift: 1)
+            s.mesopic = 1
+            s.mesopicModel = .blueShift
+            s.mesopicTint = IlluminatoramaLocalToneMapping.jensenBlueShiftTint
+            s.mesopicLogRange = SIMD2(-2, 0.6)
+            s.mesopicPixelFloor = true
+            s.mesopicNitsPerUnit = 1
+            s.mesopicRodModel = additive ? .additive : .larson
+            s.mesopicConeFloor = cone
+            s.mesopicSpatialAdaptation = spatial
+            let o = try XCTUnwrap(run(h, src, s))
+            return (0..<w).map { x in let c = o[32 * w + x]; return 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z }
+        }
+        // Pits in the band where the red light comes on: a pixel darker than both neighbours
+        // (beyond fp16 noise), or a print below the moonlit side's level after the red is on.
+        func pits(_ l: [Float]) -> (count: Int, worst: Float) {
+            let moon = l[100]
+            var n = 0, worst: Float = 1
+            for x in 118..<200 {
+                if l[x] < l[x - 1] * 0.99, l[x] < l[x + 1] * 0.99 { n += 1 }
+                if x > 124 { worst = min(worst, l[x] / moon) }
+            }
+            return (n, worst)
+        }
+        let old = pits(try row(false, false, false)), new = pits(try row(true, true, true))
+        print("red terminator: old (edge-aware weight, Larson) pits \(old.count) min/moon \(old.worst); new pits \(new.count) min/moon \(new.worst)")
+        XCTAssertLessThan(old.worst, 0.97, "probe: the old weight + Larson rods dip below the moonlit side")
+        XCTAssertEqual(new.count, 0, "no pixel prints darker than both neighbours")
+        XCTAssertGreaterThan(new.worst, 0.99, "once the red light is on, nothing prints darker than the moonlit side")
+    }
+
+    /// The additive rod response is Larson's exactly at each primary and at D65 grey (within
+    /// 0.3 %), so single-colour regions (a red LED face, a grey wall) print as before.
+    func testAdditiveRodMatchesLarsonOnPrimaries() {
+        for c in [SIMD3<Float>(1, 0, 0), SIMD3(0, 1, 0), SIMD3(0, 0, 1), SIMD3(1, 1, 1)] {
+            let l = IlluminatoramaLocalToneMapping.larsonRodLuminance(c)
+            let a = IlluminatoramaLocalToneMapping.additiveRodLuminance(c)
+            XCTAssertEqual(a, l, accuracy: 0.003 * max(l, 1e-3), "\(c)")
+        }
+        // …and additive where Larson is not: red added to moonlight never LOWERS the rod response.
+        let moon = SIMD3<Float>(0.0045, 0.006, 0.010), red = SIMD3<Float>(1, 0.035, 0.012) * 0.01
+        XCTAssertLessThan(IlluminatoramaLocalToneMapping.larsonRodLuminance(moon + red),
+                          IlluminatoramaLocalToneMapping.larsonRodLuminance(moon), "probe: Larson falls")
+        XCTAssertGreaterThanOrEqual(IlluminatoramaLocalToneMapping.additiveRodLuminance(moon + red),
+                                    IlluminatoramaLocalToneMapping.additiveRodLuminance(moon))
+    }
+
+    // ── Display inverse ─────────────────────────────────────────────────────
+
+    func testDisplayInverseRoundTrips() {
+        for look in [true, false] {
+            for code: Float in [3, 6, 20, 60, 120] {
+                let x = IlluminatoramaDisplayInverse.exposedLevel(printingAt: code, look: look)
+                XCTAssertEqual(IlluminatoramaDisplayInverse.printedCode(exposed: x, look: look), code, accuracy: 0.05)
+            }
+        }
+        // The punchy toe is the crushing one: sRGB 6 needs a brighter exposed level than bare AgX.
+        XCTAssertGreaterThan(IlluminatoramaDisplayInverse.exposedLevel(printingAt: 6, look: true),
+                             2 * IlluminatoramaDisplayInverse.exposedLevel(printingAt: 6, look: false))
+        // Mid-grey prints near sRGB 99 through punchy AgX (the table in DigitalClockLook).
+        XCTAssertEqual(IlluminatoramaDisplayInverse.printedCode(exposed: 0.18, look: true), 99, accuracy: 1.5)
+    }
 }

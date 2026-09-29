@@ -142,10 +142,60 @@ struct CoinUniforms {
     //                                    collider bounding reject, so a test can prove the
     //                                    reject never changes the contact set (VZ-0151)
     uint  solverFlags;
+    // Largest tight bounding radius of any body spawned so far (CoinDEMSolver.noteBodyBound):
+    // sizes the broadphase neighbourhood when a body outgrows the cell (VZ-0161).
+    float maxBodyBound;
+    // Gauss–Seidel passes over a grouped manifold's points per velocity iteration
+    // (CD_FLAG_MANIFOLD_SOLVE only; CoinDEMSolver.manifoldInnerPasses).
+    uint  manifoldPasses;
 };
 constant uint CD_FLAG_SCALE_AWARE_DEADSTOP = 1u;
 constant uint CD_FLAG_ACCUM_ROLLING        = 2u;
 constant uint CD_FLAG_NO_COLLIDER_CULL     = 4u;
+//   CD_FLAG_MANIFOLD_SOLVE — a multi-point manifold is emitted contiguously, coloured as
+//                            ONE unit and solved by one thread (cdSolveContactVelocity) —
+//                            VZ-0157 / VZ-0163. Off: every contact is its own unit, as ever.
+constant uint CD_FLAG_MANIFOLD_SOLVE       = 8u;
+//   CD_FLAG_TORSION        — torsional (point) friction rows about each contact normal, from the
+//                            per-body contact patch radius (engine plan 5a, stage B2; see
+//                            cdSolveContactTorsion). Set only while some body has a patch > 0.
+constant uint CD_FLAG_TORSION              = 16u;
+//   CD_FLAG_SEPARATING_BIAS — the split-impulse BIAS row only ever pushes a contact's bodies APART
+//                            (VZ-02xx, Digital Clock stock): its pseudo impulse is clamped ≥ 0, and a
+//                            speculative contact (depth < 0, a real gap) only resists a bias approach
+//                            that would close more than its gap this substep. Off: the row drives the
+//                            relative bias velocity to its target in BOTH directions — so a contact
+//                            that is merely within the speculative margin (two bars 0.5 mm apart, a
+//                            bar and a stake) or within the slop PULLS its bodies together whenever
+//                            another contact's recovery moves one of them away: a bilateral glue in
+//                            the position channel between bodies that do not touch. A 2 × 5 on-edge
+//                            bar stack on a dynamic stake pallet (margin 2.5 mm) never slept and
+//                            walked ≥ 1 mm (10 of 20 bars off their places in 10 s); at margins
+//                            below its 0.5 mm gaps it slept in 0.6 s. Opt-in (every other world is
+//                            bit-identical).
+constant uint CD_FLAG_SEPARATING_BIAS      = 128u;
+//   CD_FLAG_KEEP_ASLEEP_CONTACTS — a sleeping island keeps its warm start: every substep the
+//                            contacts whose ends are both inert (asleep, or asleep vs a static) are
+//                            CARRIED from the last substep's list into this one (coinCarryDormant —
+//                            copied, not regenerated: VZ-0152 still skips their narrowphase), marked
+//                            DORMANT (ext.z = 1): not coloured, not solved, kept only so that the
+//                            substep a touch wakes the island, its fresh contacts find their
+//                            converged impulses in the warm-start table. Without it every wake is
+//                            a cold start (Digital Clock's bar stock: a woken 2 × 5 stack sank at
+//                            14–48 mm/s in its first frame and crept 0.7–1.4 mm). Opt-in.
+constant uint CD_FLAG_KEEP_ASLEEP_CONTACTS = 256u;
+
+// The split-impulse bias row's pseudo impulse (see CD_FLAG_SEPARATING_BIAS): `legacy` is the
+// default row's (target − bvn)/kN, returned untouched unless the flag is set.
+static inline float cdSeparatingBias(float legacy, float depth, float bvn, float kN, constant CoinUniforms& u) {
+    if ((u.solverFlags & CD_FLAG_SEPARATING_BIAS) == 0u) return legacy;
+    float target = (depth < 0.0) ? depth / max(u.dt, 1e-6)
+                                 : u.baumgarteBeta * max(depth - u.contactSlop, 0.0) / max(u.dt, 1e-6);
+    return max((target - bvn) / kN, 0.0);
+}
+// colorContacts entries: contact index | (grouped-manifold point count << 28).
+constant uint CD_CC_SHIFT = 28u;
+constant uint CD_CC_MASK  = 0x0FFFFFFFu;
 
 // Per-body drag coefficient. Real aerodynamic drag-per-mass A/m ∝ r²/r³ = 1/r, so
 // a BIGGER body drags LESS (and falls/flies further) and a smaller one drags more.
@@ -227,7 +277,7 @@ struct CoinTransform {
 // shared buffer of these records, then runs a graph-colored sequential-impulse
 // VELOCITY solve + a split-impulse POSITION solve over them — real Gauss-Seidel
 // convergence, warm-startable, with restitution/friction as proper velocity
-// constraints. float4 lanes only (the ALIGNMENT RULE); 96 bytes.
+// constraints. float4 lanes only (the ALIGNMENT RULE); 128 bytes.
 struct CoinContact {
     uint4  meta;   // x=bodyA, y=bodyB (CD_STATIC=no dynamic B), z=colliderIdx|featureId, w=pairKey
     float4 nrm;    // xyz = world contact normal (points from B toward A), w = penetration depth (>0)
@@ -241,8 +291,23 @@ struct CoinContact {
     // velocity, gate restitution off, and unwind the bounce via the accumulated-
     // impulse clamp (a resting-stack feature, a bounce killer). yz = accumulated
     // rolling-resistance impulse in the (tan1, tan2) basis (CD_FLAG_ACCUM_ROLLING only).
+    // w BEFORE the first solve pass is the manifold marker (CD_FLAG_MANIFOLD_SOLVE): 0 an
+    // ungrouped contact, −n the HEAD of a grouped n-point manifold (its points are the n
+    // contiguous contacts from here), −0.25 a non-head point; the solve's capture then
+    // overwrites it with 1 (every value is < 0.5, so the capture test is unchanged).
     float4 aux;
+    // Stage B2 (engine plan 5a, CD_FLAG_TORSION): x = accumulated TORSIONAL impulse about n
+    // (N·m·s, + on A / − on B; warm-started with the other rows), y = the torsion capacity
+    // per unit normal impulse this contact was solved with, μ·r_patch·share (m; 0 = no
+    // torsion row), zw reserved. Written 0 by every emitter; nothing reads it with the flag
+    // clear. (128 bytes.)
+    float4 ext;
 };
+static uint cdManifoldCount(CoinContact c)  { return c.aux.w <= -0.5 ? uint(-c.aux.w + 0.5) : 1u; }
+static bool cdIsManifoldMember(CoinContact c) { return c.aux.w > -0.5 && c.aux.w < 0.0; }
+// A contact carried through a sleep (CD_FLAG_KEEP_ASLEEP_CONTACTS, coinCarryDormant — ext.z = 1):
+// only the warm start reads it (it is never coloured or solved; both its ends are inert).
+static bool cdIsDormant(CoinContact c) { return c.ext.z > 0.5; }
 
 // One generic constraint-path joint. Types (meta.x): 0 = BALL (anchors
 // coincide, 3-DOF point constraint), 1 = HINGE (ball + axis alignment +
@@ -262,8 +327,8 @@ struct CoinJoint {
     // weight (BALL has no use for it either).
     float4 anchorA;
     // xyz = anchor in B-local frame (WORLD if z==CD_STATIC). w: HINGE or
-    // PRISMATIC only, motor max torque/force (>0 enables the motor) —
-    // otherwise dead weight.
+    // PRISMATIC, motor max torque/force (>0 enables the motor); DISTANCE, the
+    // swing-friction arm c (m, VZ-0168 — 0 = a frictionless rod); otherwise dead weight.
     float4 anchorB;
     float4 axisA;    // xyz = hinge/slide axis in A-local frame;      w = limit lo (rad or m)
     float4 axisB;    // xyz = hinge/slide axis in B-local (WORLD if world); w = limit hi (rad or m)
@@ -342,7 +407,8 @@ static float3 cdBoxInvInertia(float3 he, float invMass) {
 }
 
 // Shape tags ride shapeExtents.w: 0 = disc/capped-cylinder, 1 = box, 2 = sphere,
-// 3 = capsule, 4 = convex hull, 5 = ovoid (egg). (Every predicate MUST be a
+// 3 = capsule, 4 = convex hull, 5 = ovoid (egg), 6 = compound of boxes (cdIsCompound,
+// CoinDEMNarrowphase.h). (Every predicate MUST be a
 // half-open band — a bare `> 0.5` box test would mis-collide every later tag as
 // a box, and the old bare `> 3.5` hull test would have read an ovoid's
 // hullRef.x — its fat-sphere offset — as a hull-table index.)
@@ -415,7 +481,10 @@ static float3 cdBodyInvInertia(CoinBody c, float invMass) {
     // integrated over the solid hull at registration and rides hullRef.yzw.
     // Ovoid: the same convention — integrated over the solid of revolution at
     // spawn (only hullRef.x differs: hull index vs fat-sphere offset).
-    if (cdIsHull(c) || cdIsEgg(c)) return invMass * c.hullRef.yzw;
+    // Compound (tag 6): the same convention — the parallel-axis sum over its boxes,
+    // diagonalized at registration (CoinCompound.swift). The band is spelled out here
+    // because cdIsCompound lives in CoinDEMNarrowphase.h, included further down.
+    if (cdIsHull(c) || cdIsEgg(c) || (c.shapeExtents.w > 5.5 && c.shapeExtents.w < 6.5)) return invMass * c.hullRef.yzw;
     if (cdIsSphere(c)) {
         // Solid sphere: I = (2/5) m R², isotropic ⇒ I⁻¹ = invMass / (0.4 R²) on every axis.
         float R = c.prevPos.w > 1e-4 ? c.prevPos.w : 0.12;
@@ -880,11 +949,23 @@ static bool cdOrientedBoxPushSpeculative(float3 pw, float3 cj, float4 qj, float3
         outDepth = push;
         return true;
     }
-    if (spec <= 0.0) return false;                // no margin ⇒ exact cdOrientedBoxPush behaviour
     float3 cl = clamp(lp, -heJ, heJ);
     float3 dl3 = lp - cl;
     float dist = length(dl3);
-    if (dist >= spec || dist < 1e-8) return false;
+    // Inclusive at both ends, with a rounding allowance (VZ-0163): a point exactly ON the
+    // surface (dist 0 — a box corner resting exactly on a face or edge) and a point
+    // exactly AT the margin are contacts. The old `dist >= spec || dist < 1e-8` dropped
+    // both, so two boxes stacked square (every corner exactly on the other's edge) had no
+    // corner contact at all.
+    float tolB = 1e-6 * (length(cj) + length(heJ)) + 1e-9;
+    if (dist > max(spec, 0.0) + tolB) return false;
+    if (dist < 1e-8) {                             // on the surface: the face it lies on
+        uint k = (d.x <= d.y && d.x <= d.z) ? 0u : ((d.y <= d.z) ? 1u : 2u);
+        float sk = lp[k] >= 0.0 ? 1.0 : -1.0;
+        outN = cdQuatRotate(qj, float3(k == 0u ? sk : 0.0, k == 1u ? sk : 0.0, k == 2u ? sk : 0.0));
+        outDepth = 0.0;
+        return true;
+    }
     outN = cdQuatRotate(qj, dl3 / dist);          // world normal, out of box j toward pw
     outDepth = -dist;                             // negative gap
     return true;
@@ -1544,11 +1625,8 @@ kernel void coinJointSolve(
 
 // ── KERNEL: derive per-coin render transform ──────────────────────────────────
 
-kernel void coinDeriveTransforms(
-    device const CoinBody* coins      [[ buffer(0) ]],
-    device CoinTransform*  transforms [[ buffer(1) ]],
-    constant CoinUniforms& u          [[ buffer(2) ]],
-    uint id [[ thread_position_in_grid ]])
+static inline void cdDeriveTransformBody(uint id, device const CoinBody* coins, device CoinTransform* transforms,
+                                         constant CoinUniforms& u)
 {
     if (id >= u.coinCount) return;
     CoinBody c = coins[id];
@@ -1580,6 +1658,15 @@ kernel void coinDeriveTransforms(
         float4(m[2], 0.0),
         float4(c.posInvMass.xyz, 1.0)
     };
+}
+
+kernel void coinDeriveTransforms(
+    device const CoinBody* coins      [[ buffer(0) ]],
+    device CoinTransform*  transforms [[ buffer(1) ]],
+    constant CoinUniforms& u          [[ buffer(2) ]],
+    uint id [[ thread_position_in_grid ]])
+{
+    cdDeriveTransformBody(id, coins, transforms, u);
 }
 
 // ── KERNEL: expand instances (clone of eggs_expand_instances) ─────────────────
@@ -1859,8 +1946,15 @@ static bool cdGJKEPA(CoinBody ci, CoinBody cj,
     outDepth = bestD;
     // Cross-check EPA against the exact face-axis probe: near-flat contacts sit at
     // EPA's numerical edge, and a shallower true axis means EPA's normal is off.
+    //
+    // An axis probe that finds a SEPARATING axis (best ≤ 0) PROVES the pair apart — GJK's
+    // tetrahedron test misclassifies a flat face–face Minkowski difference by rounding,
+    // and the EPA it seeds then invents a depth. The old `probe && pdepth < 0.9·bestD`
+    // silently kept that depth whenever the probe said "separated": two Digital Clock bars
+    // stacked 0.01 mm apart came back 0.2587 mm deep, were shoved apart, and toppled.
     float3 pn; float pdepth;
-    if (cdAxisProbe(ci, cj, hullVerts, hullRanges, pn, pdepth) && pdepth < bestD * 0.9) {
+    if (!cdAxisProbe(ci, cj, hullVerts, hullRanges, pn, pdepth)) return false;
+    if (pdepth < bestD * 0.9) {
         outN = pn;
         outDepth = pdepth;
     }
@@ -1868,181 +1962,6 @@ static bool cdGJKEPA(CoinBody ci, CoinBody cj,
 }
 
 
-
-// ─────────────────────────────────────────────────────────────────────────────
-// coinMeasurePenetration — DIAGNOSTIC pass (no resolution).
-//
-// Answers, in code, the recurring "these objects are interpenetrating" note for
-// GPU-simulated piles. It reuses coinContactSolve's EXACT broadphase (the 3×3×3
-// spatial-hash neighbourhood) and disk-vs-disk SAT, but instead of applying a
-// positional correction it records the overlap: atomic-max of the deepest
-// penetration and an atomic count of pairs deeper than `threshold`. Each pair is
-// counted once (`j > id`); joint partners (articulated frank segments, which
-// overlap by design) are skipped, exactly as the solver skips them.
-//
-// `result` is two atomic uints: [0] = max depth in MICROMETRES (depth·1e6, so a
-// uint atomic_max gives a correct float max for the small positive depths here),
-// [1] = penetrating-pair count. The host reads them back once after the sim has
-// settled — this is not a per-frame kernel.
-kernel void coinMeasurePenetration(
-    device const CoinBody*  coins         [[ buffer(0) ]],
-    device const uint*      sortedIndices [[ buffer(1) ]],
-    device const uint*      cellOffsets   [[ buffer(2) ]],
-    constant CoinUniforms&  u             [[ buffer(3) ]],
-    device const int2*      links         [[ buffer(4) ]],
-    device atomic_uint*     result        [[ buffer(5) ]],   // [0]=maxDepth µm, [1]=pairCount
-    constant float&         threshold     [[ buffer(6) ]],
-    device const float4*    hullVerts     [[ buffer(7) ]],
-    device const uint2*     hullRanges    [[ buffer(8) ]],
-    uint id [[ thread_position_in_grid ]])
-{
-    if (id >= u.coinCount) { return; }
-    CoinBody ci = coins[id];
-    if (ci.posInvMass.w == 0.0) { return; }
-    int jointPartner = links[id].x;
-
-    float3 xi = ci.posInvMass.xyz;
-    float4 qi = ci.orient;
-    float  Ri = cdRadiusOf(ci);
-    float  hi = cdHalfThickOf(ci);
-    float3 ni = normalize(cdQuatRotate(qi, float3(0,1,0)));
-
-    int3 base = int3(floor((xi - float3(u.gridMinX, u.gridMinY, u.gridMinZ)) * u.invCell));
-    int3 res  = int3(int(u.gridResX), int(u.gridResY), int(u.gridResZ));
-    for (int dz = -1; dz <= 1; ++dz)
-    for (int dy = -1; dy <= 1; ++dy)
-    for (int dx = -1; dx <= 1; ++dx) {
-        int3 c = base + int3(dx, dy, dz);
-        if (any(c < int3(0)) || any(c >= res)) continue;
-        uint cell = uint(c.x) + u.gridResX * (uint(c.y) + u.gridResY * uint(c.z));
-        uint start = cellOffsets[cell];
-        uint end   = cellOffsets[cell + 1u];
-        for (uint s = start; s < end; ++s) {
-            uint j = sortedIndices[s];
-            if (j <= id) continue;                  // count each pair ONCE
-            if (int(j) == jointPartner) continue;   // articulated partners overlap by design
-            CoinBody cj = coins[j];
-            if (cj.posInvMass.w == 0.0) continue;
-            float3 xj = cj.posInvMass.xyz;
-            float4 qj = cj.orient;
-            float  Rj = cdRadiusOf(cj);
-            float  hj = cdHalfThickOf(cj);
-            float3 D  = xi - xj;
-            float reach = sqrt(Ri*Ri + hi*hi) + sqrt(Rj*Rj + hj*hj);
-            if (dot(D, D) > reach * reach) continue;
-
-            float minDepth = 1e30;
-            bool  separated = false;
-            if (cdIsHull(ci) || cdIsHull(cj)) {
-                // Hull-involved pair: the same GJK/EPA depth the solver resolves with.
-                float3 nH;
-                if (!cdGJKEPA(ci, cj, hullVerts, hullRanges, nH, minDepth)) separated = true;
-            } else if (cdIsSphere(ci) || cdIsSphere(cj)) {
-                // Sphere-involved pair: the EXACT contact the constraint-path
-                // narrowphase (coinGenerateContacts) de-penetrates with — sphere↔sphere
-                // is centre distance; sphere↔box clamps the centre to the box, sphere↔disc
-                // clamps to the capped cylinder, sphere↔capsule clamps to the segment.
-                // (The old code used the box's *bounding sphere* here, which matched only
-                // the legacy Jacobi solver and grossly over-reported a sphere resting
-                // beside a box — a false positive for any constraint-path scene.)
-                bool iSphere = cdIsSphere(ci);
-                float3 cs = iSphere ? xi : xj;  float rs = iSphere ? Ri : Rj;
-                float3 co = iSphere ? xj : xi;  float4 qo = iSphere ? qj : qi;
-                CoinBody O = iSphere ? cj : ci;
-                if (cdIsSphere(O)) {
-                    minDepth = (Ri + Rj) - length(D);
-                } else {
-                    float3 lp = cdQuatRotateInv(qo, cs - co);
-                    float3 closestLocal;
-                    float extraR = 0.0;
-                    if (cdIsCapsule(O)) {
-                        float hlO = cdCapsuleHL(O);
-                        closestLocal = float3(0.0, clamp(lp.y, -hlO, hlO), 0.0);
-                        extraR = cdCapsuleR(O);
-                    } else if (cdIsEgg(O)) {
-                        // Sphere ↔ egg: the same swept-radius segment probe the
-                        // narrowphase (coinGenerateContacts) de-penetrates with.
-                        float yA = O.hullRef.x, yB = O.shapeExtents.z;
-                        float t = clamp((lp.y - yA) / max(yB - yA, 1e-6), 0.0, 1.0);
-                        closestLocal = float3(0.0, mix(yA, yB, t), 0.0);
-                        extraR = cdEggRadiusAt(O, t);
-                    } else {
-                        closestLocal = cdClosestInShapeLocal(O, lp);
-                    }
-                    minDepth = rs + extraR - length(lp - closestLocal);
-                }
-                if (minDepth <= 0.0) separated = true;
-            } else if (cdIsSwept(ci) || cdIsSwept(cj)) {
-                // Swept-involved pair (capsule or egg) — the same probe math the
-                // constraint narrowphase de-penetrates with (bounding-cylinder SAT
-                // here would over-report a capsule/egg resting beside anything: a
-                // false positive).
-                if (cdIsSwept(ci) && cdIsSwept(cj)) {
-                    float3 a0, a1, b0, b1; float rI0, rI1, rJ0, rJ1;
-                    cdSweptSegment(ci, a0, a1, rI0, rI1);
-                    cdSweptSegment(cj, b0, b1, rJ0, rJ1);
-                    float3 c1, c2; cdClosestSegSeg(a0, a1, b0, b1, c1, c2);
-                    minDepth = (cdSweptRadiusNear(a0, a1, rI0, rI1, c1)
-                              + cdSweptRadiusNear(b0, b1, rJ0, rJ1, c2)) - length(c1 - c2);
-                } else {
-                    bool iCap = cdIsSwept(ci);
-                    CoinBody C = iCap ? ci : cj;
-                    CoinBody O = iCap ? cj : ci;
-                    float3 s0, s1; float r0, r1;
-                    cdSweptSegment(C, s0, s1, r0, r1);
-                    float3 co2 = O.posInvMass.xyz; float4 qo2 = O.orient;
-                    minDepth = -1e30;
-                    for (int p = 0; p < 3; ++p) {
-                        float tS = float(p) * 0.5;
-                        float3 s = mix(s0, s1, tS);
-                        float rc = mix(r0, r1, tS);
-                        float3 lp = cdQuatRotateInv(qo2, s - co2);
-                        float3 cl = cdClosestInShapeLocal(O, lp);
-                        float dl = length(lp - cl);
-                        float pen;
-                        if (dl > 1e-6) {
-                            pen = rc - dl;
-                        } else if (cdIsBox(O)) {
-                            float3 dd = cdBodyHalfExtents(O) - abs(lp);
-                            pen = min(dd.x, min(dd.y, dd.z)) + rc;
-                        } else {
-                            float3 nL;
-                            pen = -cdCappedCylSDF(lp, cdRadiusOf(O), cdHalfThickOf(O), nL) + rc;
-                        }
-                        minDepth = max(minDepth, pen);
-                    }
-                }
-                if (minDepth <= 0.0) separated = true;
-            } else if (cdIsBox(ci) || cdIsBox(cj)) {
-                // Box-involved pair → the same oriented box–box SAT the solver
-                // de-penetrates with (disc as its bounding box).
-                float3 nB, cpB;
-                if (!cdBoxBoxSAT(xi, qi, cdBodyHalfExtents(ci),
-                                 xj, qj, cdBodyHalfExtents(cj), minDepth, nB, cpB)) separated = true;
-            } else {
-                // Identical SAT to coinContactSolve: face normals + centre line.
-                float3 nj = normalize(cdQuatRotate(qj, float3(0,1,0)));
-                float3 axes[3] = { ni, nj, float3(0,1,0) };
-                float dlen = length(D);
-                if (dlen > 1e-5) axes[2] = D / dlen;
-                for (int ax = 0; ax < 3; ++ax) {
-                    float3 a = axes[ax];
-                    float di = abs(dot(ni, a)), dj = abs(dot(nj, a));
-                    float ei = hi * di + Ri * sqrt(max(0.0, 1.0 - di*di));
-                    float ej = hj * dj + Rj * sqrt(max(0.0, 1.0 - dj*dj));
-                    float depth = (ei + ej) - abs(dot(D, a));
-                    if (depth <= 0.0) { separated = true; break; }
-                    if (depth < minDepth) { minDepth = depth; }
-                }
-            }
-            if (separated || minDepth <= threshold) continue;
-
-            atomic_fetch_max_explicit(&result[0],
-                uint(minDepth * 1e6), memory_order_relaxed);
-            atomic_fetch_add_explicit(&result[1], 1u, memory_order_relaxed);
-        }
-    }
-}
 
 // ══════════════════════════════════════════════════════════════════════════════
 // CONSTRAINT SOLVER — Stage 1: contact generation into a persistent buffer
@@ -2069,6 +1988,9 @@ static void cdContactTangents(float3 n, thread float3& t1, thread float3& t2) {
 // floor contact and its wall contact (both feature 0), so `coinWarmStartMatch` seeded
 // one with the other's converged impulse — and which one won the hash slot depended on
 // the racing insert order. Collider 0 keeps the historical key.
+// The pairKey feature byte reserved for polytope-narrowphase contacts (CoinDEMNarrowphase.h):
+// their key is the pair alone, and the warm start matches them by identity, else by position.
+constant uint CD_KEY_POSMATCH = 0xFFu << 24;
 static uint cdPairKey(uint a, uint b, uint feature, uint colliderIdx) {
     uint lo = min(a, b);
     uint hi = (b == CD_STATIC) ? (0xFFFu - min(colliderIdx, 0xFFFu)) : max(a, b);
@@ -2115,6 +2037,75 @@ static int cdReduceManifold(thread const float3* pos, thread const float* depth,
     return m;
 }
 
+// Write one contact record into `slot`. `auxW` is the manifold marker (0 ungrouped).
+static void cdWriteContact(device CoinContact* contacts, uint slot,
+                           uint a, uint b, uint feature, uint colliderIdx,
+                           float3 nBtoA, float3 cp, float3 xa, float3 xb, float depth, float auxW) {
+    float3 n = normalize(nBtoA);
+    float3 t1, t2; cdContactTangents(n, t1, t2);
+    CoinContact c;
+    c.meta = uint4(a, b, (b == CD_STATIC) ? colliderIdx : feature, cdPairKey(a, b, feature, colliderIdx));
+    c.nrm  = float4(n, depth);
+    c.rA   = float4(cp - xa, 0.0);
+    c.rB   = float4((b == CD_STATIC) ? float3(0.0) : (cp - xb), 0.0);
+    c.tan1 = float4(t1, 0.0);
+    c.tan2 = float4(t2, -1.0);                       // colour = −1 (uncoloured)
+    c.aux  = float4(0.0, 0.0, 0.0, auxW);            // vn₀ captured by the first solve pass
+    c.ext  = float4(0.0);                            // no torsional impulse yet
+    contacts[slot] = c;
+}
+
+// The order a GROUPED manifold's points are written in is the order the manifold solve
+// visits them (its Gauss–Seidel sweep), so it must be canonical — ascending feature id —
+// not the order the narrowphase happened to find them in. cdReduceManifold keeps the
+// deepest point first; on a flat face-to-face rest the four corner depths tie to float
+// noise, so which corner came first (and with it the sweep order, and the split of the
+// redundant 4-point system's impulse that the warm start then carries on) flipped with the
+// bodies' absolute position: a warm-started, manifold-solved 5-cube tower rocked by up to
+// 3.2° while awake at 2 of 24 spawn positions and 0.025° at the median one. BOTH emitters
+// use it — cdEmitGroup below and cdEmitGroupF (CoinDEMNarrowphase.h, every polytope
+// manifold); sorting only one of them measured worse than sorting neither (a three-bar
+// stack slid 10.8 mm at 1 of 12 positions). Both sorted, over 40 spawn positions each (sleep
+// off, 10 s): towers ≤ 0.019°, three-bar stacks ≤ 0.0003 mm / 0.00007°, and the fence's
+// 16 stocked bars ≤ 0.052° cold / 0.015° warm. `ord` gets the permutation (n ≤ CD_MANIFOLD_MAX).
+static void cdCanonicalManifoldOrder(thread const uint* feature, int n, thread int* ord) {
+    for (int i = 0; i < n; ++i) ord[i] = i;
+    for (int i = 1; i < n; ++i)
+        for (int j = i; j > 0 && feature[ord[j - 1]] > feature[ord[j]]; --j) { int t = ord[j]; ord[j] = ord[j - 1]; ord[j - 1] = t; }
+}
+
+// Append a MANIFOLD of n ≤ 4 points of one body pair. With CD_FLAG_MANIFOLD_SOLVE and
+// n > 1 it is allocated contiguously, in canonical order (cdCanonicalManifoldOrder), and
+// marked (head −n, points −0.25) so the colouring and the solve treat it as one unit;
+// otherwise each point is an independent contact, exactly as cdEmitContact appends it.
+static void cdEmitGroup(device CoinContact* contacts, device atomic_uint* contactCount, uint maxContacts,
+                        constant CoinUniforms& u, uint a, uint b, uint colliderIdx, int n,
+                        thread const uint* feature, thread const float3* nBtoA, thread const float3* cp,
+                        float3 xa, float3 xb, thread const float* depth) {
+    bool grouped = (u.solverFlags & CD_FLAG_MANIFOLD_SOLVE) != 0u && n > 1 && n <= CD_MANIFOLD_MAX;
+    if (grouped) {
+        for (int i = 0; i < n; ++i) if (isnan(depth[i])) return;
+        int ord[CD_MANIFOLD_MAX];
+        cdCanonicalManifoldOrder(feature, n, ord);
+        uint slot = atomic_fetch_add_explicit(contactCount, uint(n), memory_order_relaxed);
+        // Straddling the end of the buffer: the points that fit go in as ungrouped contacts
+        // (a slot inside the buffer is never left holding a stale contact).
+        bool fits = slot + uint(n) <= maxContacts;
+        for (int i = 0; i < n && slot + uint(i) < maxContacts; ++i) {
+            int k = ord[i];
+            cdWriteContact(contacts, slot + uint(i), a, b, feature[k], colliderIdx, nBtoA[k], cp[k], xa, xb, depth[k],
+                           !fits ? 0.0 : (i == 0 ? -float(n) : -0.25));
+        }
+        return;
+    }
+    for (int i = 0; i < n; ++i) {
+        if (isnan(depth[i])) continue;
+        uint slot = atomic_fetch_add_explicit(contactCount, 1u, memory_order_relaxed);
+        if (slot >= maxContacts) return;
+        cdWriteContact(contacts, slot, a, b, feature[i], colliderIdx, nBtoA[i], cp[i], xa, xb, depth[i], 0.0);
+    }
+}
+
 // Append one contact (atomic bump). nBtoA points from B's surface toward A.
 static void cdEmitContact(device CoinContact* contacts,
                           device atomic_uint* contactCount, uint maxContacts,
@@ -2135,6 +2126,7 @@ static void cdEmitContact(device CoinContact* contacts,
     c.tan1 = float4(t1, 0.0);
     c.tan2 = float4(t2, -1.0);                       // colour = −1 (uncoloured)
     c.aux  = float4(0.0);                            // vn₀ captured by the first solve pass
+    c.ext  = float4(0.0);                            // no torsional impulse yet
     contacts[slot] = c;
 }
 
@@ -2290,6 +2282,53 @@ static int cdClipConvex2D(thread float2* A, int nA, thread const float2* B, int 
 // dynamic bodies — the only kind that suppresses a contact pair in coinGenerateContacts.
 // Run once per frame (joints change only between frames, host-side), so the generate
 // kernel's per-pair joint scan runs only when BOTH bodies carry the bit (VZ-0153).
+// The joint-list scans below read the list EIGHT slots at a time (the index clamped to the last
+// slot, so a short tail re-reads it): the eight (list → joint) dependent device loads are then in
+// flight together instead of one pair after another — a scan used to cost ≈ 0.6 µs per listed
+// joint, and the Digital Clock lists 30 (9 crane joints + 21 latch welds), so a crane body pair
+// with no joint between them (the jib against the block, rail, puck, held bar) walked ≈ 18 µs of
+// loads in contact generation every substep (stage B3). The answer is the same boolean: any
+// listed joint that matches.
+static inline bool cdJointMarksBody(uint4 m, uint id) {
+    return (m.w & 1u) != 0u && (m.w & 2u) == 0u && m.z != CD_STATIC && (m.y == id || m.z == id);
+}
+static inline bool cdJointSuppressesPair(uint4 m, uint a, uint b) {
+    return (m.w & 1u) != 0u && (m.w & 2u) == 0u && ((m.y == a && m.z == b) || (m.y == b && m.z == a));
+}
+
+static inline void cdMarkJointedBody(uint id, device const CoinJoint* joints, uint jointCount,
+                                     device uint* jointedBody, constant CoinUniforms& u,
+                                     device const uint* jointList)
+{
+    if (id >= u.coinCount) return;
+    bool flag = false;
+    for (uint k = 0u; k < jointCount && !flag; k += 8u) {
+        uint last = jointCount - 1u;
+        uint sl[8];
+        #pragma clang loop unroll(full)
+        for (uint t = 0u; t < 8u; ++t) sl[t] = jointList[min(k + t, last)];
+        #pragma clang loop unroll(full)
+        for (uint t = 0u; t < 8u; ++t) flag = flag | cdJointMarksBody(joints[sl[t]].meta, id);
+    }
+    jointedBody[id] = flag ? 1u : 0u;
+}
+
+// Whether an enabled, non-collideConnected listed joint joins bodies a and b (see above).
+static inline bool cdJointScanPair(device const CoinJoint* joints, device const uint* jointList, uint jointCount,
+                                   uint a, uint b)
+{
+    bool hit = false;
+    for (uint k = 0u; k < jointCount && !hit; k += 8u) {
+        uint last = jointCount - 1u;
+        uint sl[8];
+        #pragma clang loop unroll(full)
+        for (uint t = 0u; t < 8u; ++t) sl[t] = jointList[min(k + t, last)];
+        #pragma clang loop unroll(full)
+        for (uint t = 0u; t < 8u; ++t) hit = hit | cdJointSuppressesPair(joints[sl[t]].meta, a, b);
+    }
+    return hit;
+}
+
 kernel void coinMarkJointedBodies(
     device const CoinJoint* joints      [[ buffer(0) ]],
     constant uint&          jointCount  [[ buffer(1) ]],   // ACTIVE joints (the list length)
@@ -2298,34 +2337,231 @@ kernel void coinMarkJointedBodies(
     device const uint*      jointList   [[ buffer(4) ]],   // enabled slots (coinJointListUpload)
     uint id [[ thread_position_in_grid ]])
 {
-    if (id >= u.coinCount) return;
-    uint flag = 0u;
-    for (uint k = 0; k < jointCount; ++k) {
-        uint4 m = joints[jointList[k]].meta;
-        if ((m.w & 1u) == 0u || (m.w & 2u) != 0u || m.z == CD_STATIC) continue;
-        if (m.y == id || m.z == id) { flag = 1u; break; }
-    }
-    jointedBody[id] = flag;
+    cdMarkJointedBody(id, joints, jointCount, jointedBody, u, jointList);
 }
 
-kernel void coinGenerateContacts(
-    device const CoinBody*           coins         [[ buffer(0) ]],
-    device const uint*               sortedIndices [[ buffer(1) ]],
-    device const uint*               cellOffsets   [[ buffer(2) ]],
-    device const CoinStaticCollider* colliders     [[ buffer(3) ]],
-    constant CoinUniforms&           u             [[ buffer(4) ]],
-    device const int2*               links         [[ buffer(5) ]],
-    device CoinContact*              contacts      [[ buffer(6) ]],
-    device atomic_uint*              contactCount  [[ buffer(7) ]],
-    constant uint&                   maxContacts   [[ buffer(8) ]],
-    device const float4*             hullVerts     [[ buffer(9) ]],
-    device const uint2*              hullRanges    [[ buffer(10) ]],
-    device const CoinJoint*          joints        [[ buffer(11) ]],
-    constant uint&                   jointCount    [[ buffer(12) ]],   // ACTIVE joints (the list length)
-    device const uint*               asleep        [[ buffer(13) ]],
-    device const uint*               jointedBody   [[ buffer(14) ]],   // coinMarkJointedBodies
-    device const uint*               jointList     [[ buffer(15) ]],   // enabled slots (coinJointListUpload)
+// The exact polytope narrowphase (boxes, topology hulls, compounds; swept spheres vs
+// polytopes) and its kernels coinWritePolyArgs / coinPolyNarrow — stage B1 (VZ-0163, T5,
+// T8, 5c).
+#include "CoinDEMNarrowphase.h"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// coinMeasurePenetration — DIAGNOSTIC pass (no resolution).
+//
+// Answers, in code, the recurring "these objects are interpenetrating" note for
+// GPU-simulated piles. It reuses coinContactSolve's EXACT broadphase (the 3×3×3
+// spatial-hash neighbourhood) and disk-vs-disk SAT, but instead of applying a
+// positional correction it records the overlap: atomic-max of the deepest
+// penetration and an atomic count of pairs deeper than `threshold`. Each pair is
+// counted once (`j > id`); joint partners (articulated frank segments, which
+// overlap by design) are skipped, exactly as the solver skips them.
+//
+// `result` is two atomic uints: [0] = max depth in MICROMETRES (depth·1e6, so a
+// uint atomic_max gives a correct float max for the small positive depths here),
+// [1] = penetrating-pair count. The host reads them back once after the sim has
+// settled — this is not a per-frame kernel.
+kernel void coinMeasurePenetration(
+    device const CoinBody*  coins         [[ buffer(0) ]],
+    device const uint*      sortedIndices [[ buffer(1) ]],
+    device const uint*      cellOffsets   [[ buffer(2) ]],
+    constant CoinUniforms&  u             [[ buffer(3) ]],
+    device const int2*      links         [[ buffer(4) ]],
+    device atomic_uint*     result        [[ buffer(5) ]],   // [0]=maxDepth µm, [1]=pairCount
+    constant float&         threshold     [[ buffer(6) ]],
+    device const float4*    hullVerts     [[ buffer(7) ]],
+    device const uint2*     hullRanges    [[ buffer(8) ]],
     uint id [[ thread_position_in_grid ]])
+{
+    if (id >= u.coinCount) { return; }
+    CoinBody ci = coins[id];
+    if (ci.posInvMass.w == 0.0) { return; }
+    int jointPartner = links[id].x;
+
+    float3 xi = ci.posInvMass.xyz;
+    float4 qi = ci.orient;
+    float  Ri = cdRadiusOf(ci);
+    float  hi = cdHalfThickOf(ci);
+    float3 ni = normalize(cdQuatRotate(qi, float3(0,1,0)));
+
+    int K = cdScanCells(ci, u);                  // the generate kernels' neighbourhood (VZ-0161)
+    int3 base = int3(floor((xi - float3(u.gridMinX, u.gridMinY, u.gridMinZ)) * u.invCell));
+    int3 res  = int3(int(u.gridResX), int(u.gridResY), int(u.gridResZ));
+    for (int dz = -K; dz <= K; ++dz)
+    for (int dy = -K; dy <= K; ++dy)
+    for (int dx = -K; dx <= K; ++dx) {
+        int3 c = base + int3(dx, dy, dz);
+        if (any(c < int3(0)) || any(c >= res)) continue;
+        uint cell = uint(c.x) + u.gridResX * (uint(c.y) + u.gridResY * uint(c.z));
+        uint start = cellOffsets[cell];
+        uint end   = cellOffsets[cell + 1u];
+        for (uint s = start; s < end; ++s) {
+            uint j = sortedIndices[s];
+            if (j <= id) continue;                  // count each pair ONCE
+            if (int(j) == jointPartner) continue;   // articulated partners overlap by design
+            CoinBody cj = coins[j];
+            if (cj.posInvMass.w == 0.0) continue;
+            float3 xj = cj.posInvMass.xyz;
+            float4 qj = cj.orient;
+            float  Rj = cdRadiusOf(cj);
+            float  hj = cdHalfThickOf(cj);
+            float3 D  = xi - xj;
+            float reach = sqrt(Ri*Ri + hi*hi) + sqrt(Rj*Rj + hj*hj);
+            if (dot(D, D) > reach * reach) continue;
+
+            float minDepth = 1e30;
+            bool  separated = false;
+            if (cdPairIsPoly(ci, cj, hullVerts, hullRanges)) {
+                // A pair the polytope narrowphase owns: the SAME exact geometry it resolves
+                // with (SAT for polytope pieces, the swept-sphere distance otherwise).
+                minDepth = cdPolyPairDepth(ci, cj, u, hullVerts, hullRanges);
+                if (minDepth <= 0.0) separated = true;
+            } else if (cdIsHull(ci) || cdIsHull(cj)) {
+                // Hull-involved pair: the same GJK/EPA depth the solver resolves with.
+                float3 nH;
+                if (!cdGJKEPA(ci, cj, hullVerts, hullRanges, nH, minDepth)) separated = true;
+            } else if (cdIsSphere(ci) || cdIsSphere(cj)) {
+                // Sphere-involved pair: the EXACT contact the constraint-path
+                // narrowphase (coinGenerateContacts) de-penetrates with — sphere↔sphere
+                // is centre distance; sphere↔box clamps the centre to the box, sphere↔disc
+                // clamps to the capped cylinder, sphere↔capsule clamps to the segment.
+                // (The old code used the box's *bounding sphere* here, which matched only
+                // the legacy Jacobi solver and grossly over-reported a sphere resting
+                // beside a box — a false positive for any constraint-path scene.)
+                bool iSphere = cdIsSphere(ci);
+                float3 cs = iSphere ? xi : xj;  float rs = iSphere ? Ri : Rj;
+                float3 co = iSphere ? xj : xi;  float4 qo = iSphere ? qj : qi;
+                CoinBody O = iSphere ? cj : ci;
+                if (cdIsSphere(O)) {
+                    minDepth = (Ri + Rj) - length(D);
+                } else {
+                    float3 lp = cdQuatRotateInv(qo, cs - co);
+                    float3 closestLocal;
+                    float extraR = 0.0;
+                    if (cdIsCapsule(O)) {
+                        float hlO = cdCapsuleHL(O);
+                        closestLocal = float3(0.0, clamp(lp.y, -hlO, hlO), 0.0);
+                        extraR = cdCapsuleR(O);
+                    } else if (cdIsEgg(O)) {
+                        // Sphere ↔ egg: the same swept-radius segment probe the
+                        // narrowphase (coinGenerateContacts) de-penetrates with.
+                        float yA = O.hullRef.x, yB = O.shapeExtents.z;
+                        float t = clamp((lp.y - yA) / max(yB - yA, 1e-6), 0.0, 1.0);
+                        closestLocal = float3(0.0, mix(yA, yB, t), 0.0);
+                        extraR = cdEggRadiusAt(O, t);
+                    } else {
+                        closestLocal = cdClosestInShapeLocal(O, lp);
+                    }
+                    minDepth = rs + extraR - length(lp - closestLocal);
+                }
+                if (minDepth <= 0.0) separated = true;
+            } else if (cdIsSwept(ci) || cdIsSwept(cj)) {
+                // Swept-involved pair (capsule or egg) — the same probe math the
+                // constraint narrowphase de-penetrates with (bounding-cylinder SAT
+                // here would over-report a capsule/egg resting beside anything: a
+                // false positive).
+                if (cdIsSwept(ci) && cdIsSwept(cj)) {
+                    float3 a0, a1, b0, b1; float rI0, rI1, rJ0, rJ1;
+                    cdSweptSegment(ci, a0, a1, rI0, rI1);
+                    cdSweptSegment(cj, b0, b1, rJ0, rJ1);
+                    float3 c1, c2; cdClosestSegSeg(a0, a1, b0, b1, c1, c2);
+                    minDepth = (cdSweptRadiusNear(a0, a1, rI0, rI1, c1)
+                              + cdSweptRadiusNear(b0, b1, rJ0, rJ1, c2)) - length(c1 - c2);
+                } else {
+                    bool iCap = cdIsSwept(ci);
+                    CoinBody C = iCap ? ci : cj;
+                    CoinBody O = iCap ? cj : ci;
+                    float3 s0, s1; float r0, r1;
+                    cdSweptSegment(C, s0, s1, r0, r1);
+                    float3 co2 = O.posInvMass.xyz; float4 qo2 = O.orient;
+                    minDepth = -1e30;
+                    for (int p = 0; p < 3; ++p) {
+                        float tS = float(p) * 0.5;
+                        float3 s = mix(s0, s1, tS);
+                        float rc = mix(r0, r1, tS);
+                        float3 lp = cdQuatRotateInv(qo2, s - co2);
+                        float3 cl = cdClosestInShapeLocal(O, lp);
+                        float dl = length(lp - cl);
+                        float pen;
+                        if (dl > 1e-6) {
+                            pen = rc - dl;
+                        } else if (cdIsBox(O)) {
+                            float3 dd = cdBodyHalfExtents(O) - abs(lp);
+                            pen = min(dd.x, min(dd.y, dd.z)) + rc;
+                        } else {
+                            float3 nL;
+                            pen = -cdCappedCylSDF(lp, cdRadiusOf(O), cdHalfThickOf(O), nL) + rc;
+                        }
+                        minDepth = max(minDepth, pen);
+                    }
+                }
+                if (minDepth <= 0.0) separated = true;
+            } else if (cdIsBox(ci) || cdIsBox(cj)) {
+                // Box-involved pair → the same oriented box–box SAT the solver
+                // de-penetrates with (disc as its bounding box).
+                float3 nB, cpB;
+                if (!cdBoxBoxSAT(xi, qi, cdBodyHalfExtents(ci),
+                                 xj, qj, cdBodyHalfExtents(cj), minDepth, nB, cpB)) separated = true;
+            } else {
+                // Identical SAT to coinContactSolve: face normals + centre line.
+                float3 nj = normalize(cdQuatRotate(qj, float3(0,1,0)));
+                float3 axes[3] = { ni, nj, float3(0,1,0) };
+                float dlen = length(D);
+                if (dlen > 1e-5) axes[2] = D / dlen;
+                for (int ax = 0; ax < 3; ++ax) {
+                    float3 a = axes[ax];
+                    float di = abs(dot(ni, a)), dj = abs(dot(nj, a));
+                    float ei = hi * di + Ri * sqrt(max(0.0, 1.0 - di*di));
+                    float ej = hj * dj + Rj * sqrt(max(0.0, 1.0 - dj*dj));
+                    float depth = (ei + ej) - abs(dot(D, a));
+                    if (depth <= 0.0) { separated = true; break; }
+                    if (depth < minDepth) { minDepth = depth; }
+                }
+            }
+            if (separated || minDepth <= threshold) continue;
+
+            atomic_fetch_max_explicit(&result[0],
+                uint(minDepth * 1e6), memory_order_relaxed);
+            atomic_fetch_add_explicit(&result[1], 1u, memory_order_relaxed);
+        }
+    }
+}
+
+
+// One body's contact generation (thread `id`): its dynamic pairs (each pair once, from the
+// lower index) and its static colliders. The body of coinGenerateContacts; the small-world
+// frame kernel calls it too, over a one-cell grid (every body in cell 0 — all pairs).
+//
+// `part` of `nParts`: the body's work split across threads — its dynamic partners j with
+// j % nParts == part, its colliders k ≡ part (mod nParts). Each pair / collider is still handled
+// entirely by one thread with the same code, and only the ORDER of the atomic appends changes,
+// which nothing downstream reads (colour priorities hash identities, manifolds are written in
+// canonical order, the uncoloured bucket is sorted) — so any split steps bit-identically. The
+// multi-dispatch kernel runs part 0 of 1; the small-world kernel spreads a body over the
+// threads it would otherwise leave idle (one thread per body left ~200 of 256 idle while the
+// busiest body walked every collider).
+static inline void cdGenerateContactsBody(
+    uint                             id,
+    uint                             part,
+    uint                             nParts,
+    device const CoinBody*           coins,
+    device const uint*               sortedIndices,
+    device const uint*               cellOffsets,
+    device const CoinStaticCollider* colliders,
+    constant CoinUniforms&           u,
+    device const int2*               links,
+    device CoinContact*              contacts,
+    device atomic_uint*              contactCount,
+    constant uint&                   maxContacts,
+    device const float4*             hullVerts,
+    device const uint2*              hullRanges,
+    device const CoinJoint*          joints,
+    constant uint&                   jointCount,    // ACTIVE joints (the list length)
+    device const uint*               asleep,
+    device const uint*               jointedBody,   // coinMarkJointedBodies
+    device const uint*               jointList,     // enabled slots (coinJointListUpload)
+    device uint4*                    polyPairs,     // the polytope narrowphase's pair list (coinPolyNarrow)
+    device atomic_uint*              polyPairCount,
+    constant uint&                   maxPolyPairs)  // 0 while no list is bound (no box / hull / compound)
 {
     if (id >= u.coinCount) return;
     CoinBody ci = coins[id];
@@ -2354,11 +2590,14 @@ kernel void coinGenerateContacts(
     float3 ni = normalize(cdQuatRotate(qi, float3(0,1,0)));
 
     // ── Dynamic–dynamic (each pair once: only j with index > id) ──────────────
+    // Neighbourhood: ±1 cell (the classic 3×3×3) whenever the cell covers the bodies;
+    // wider only for a body that outgrew it (cdScanCells, VZ-0161).
+    int K = cdScanCells(ci, u);
     int3 base = int3(floor((xi - float3(u.gridMinX, u.gridMinY, u.gridMinZ)) * u.invCell));
     int3 res  = int3(int(u.gridResX), int(u.gridResY), int(u.gridResZ));
-    for (int dz = -1; dz <= 1; ++dz)
-    for (int dy = -1; dy <= 1; ++dy)
-    for (int dx = -1; dx <= 1; ++dx) {
+    for (int dz = -K; dz <= K; ++dz)
+    for (int dy = -K; dy <= K; ++dy)
+    for (int dx = -K; dx <= K; ++dx) {
         int3 c = base + int3(dx, dy, dz);
         if (any(c < int3(0)) || any(c >= res)) continue;
         uint cell = uint(c.x) + u.gridResX * (uint(c.y) + u.gridResY * uint(c.z));
@@ -2366,6 +2605,7 @@ kernel void coinGenerateContacts(
         for (uint s = start; s < end; ++s) {
             uint j = sortedIndices[s];
             if (j <= id) continue;                       // pair once, lower index owns it
+            if (j % nParts != part) continue;            // another part of this body's work
             if (int(j) == jointPartner) continue;
             if (iAsleep && asleep[j] != 0u) continue;    // both inert — see iAsleep above
             CoinBody cj = coins[j];
@@ -2386,18 +2626,14 @@ kernel void coinGenerateContacts(
             // pair that passed the bounding reject above AND whose two bodies both
             // belong to such a joint (VZ-0153: it used to run first, for every
             // candidate j in the 3×3×3 cells — #bodies × #slots loads per thread).
-            if (iJointed && jointedBody[j] != 0u) {
-                bool jointSkip = false;
-                for (uint k = 0; k < jointCount; ++k) {
-                    CoinJoint jn = joints[jointList[k]];
-                    if ((jn.meta.w & 1u) == 0u) continue;        // disabled
-                    if ((jn.meta.w & 2u) != 0u) continue;        // collideConnected → keep contact
-                    if ((jn.meta.y == id && jn.meta.z == j) || (jn.meta.y == j && jn.meta.z == id)) {
-                        jointSkip = true;
-                        break;
-                    }
-                }
-                if (jointSkip) continue;
+            // (Disabled → no skip; collideConnected → keep the contact. cdJointScanPair.)
+            if (iJointed && jointedBody[j] != 0u && cdJointScanPair(joints, jointList, jointCount, id, j)) continue;
+
+            // Polytope pairs (box, topology hull, compound; and those against a swept
+            // sphere) go to the pair list — coinPolyNarrow generates them, exactly once.
+            if (cdPairIsPoly(ci, cj, hullVerts, hullRanges)) {
+                cdAppendPolyPairs(id, j, ci, cj, spec, hullVerts, hullRanges, polyPairs, polyPairCount, maxPolyPairs);
+                continue;
             }
 
             // ── Hull-involved pair: LIVE GJK + EPA + clipped manifold ──────
@@ -2504,6 +2740,7 @@ kernel void coinGenerateContacts(
                             if (haveB && dot(planeNB, n) < 0.0) { planeNB = -planeNB; offB = -offB; }
 
                             int emittedPts = 0;
+                            uint gF[4]; float3 gN[4], gP[4]; float gD[4];
                             for (int m = 0; m < nP; ++m) {
                                 float2 c2 = clipped[pick[m]];
                                 float3 cp = origin + c2.x * t1 + c2.y * t2;
@@ -2520,10 +2757,11 @@ kernel void coinGenerateContacts(
                                     }
                                 }
                                 if (pointDepth > -spec) {
-                                    cdEmitContact(contacts, contactCount, maxContacts, id, j, uint(m), 0u, n, cp, xi, xj, pointDepth);
+                                    gF[emittedPts] = uint(m); gN[emittedPts] = n; gP[emittedPts] = cp; gD[emittedPts] = pointDepth;
                                     emittedPts++;
                                 }
                             }
+                            cdEmitGroup(contacts, contactCount, maxContacts, u, id, j, 0u, emittedPts, gF, gN, gP, xi, xj, gD);
                             if (emittedPts == 0) {
                                 // Every corner read non-penetrating under the
                                 // tilted-plane fit (a rare near-equilibrium
@@ -2702,11 +2940,12 @@ kernel void coinGenerateContacts(
                 if (anyInside) {                 // ≤4 spread corners hold a resting box
                     int keepI[CD_MANIFOLD_MAX];
                     int mI = cdReduceManifold(iPos, iDep, nIn, keepI);
+                    uint gF[4]; float3 gN[4], gP[4]; float gD[4];
                     for (int i = 0; i < mI; ++i) {
                         int q = keepI[i];
-                        cdEmitContact(contacts, contactCount, maxContacts, id, j, uint(iFeat[q]), 0u,
-                                      iN[q], iPos[q], xi, xj, iDep[q]);
+                        gF[i] = uint(iFeat[q]); gN[i] = iN[q]; gP[i] = iPos[q]; gD[i] = iDep[q];
                     }
+                    cdEmitGroup(contacts, contactCount, maxContacts, u, id, j, 0u, mI, gF, gN, gP, xi, xj, gD);
                 }
                 if (!anyInside && nCand > 0) {
                     float tol = max(1e-6, min(abs(spec), min(Ri, hi)) * 0.05);
@@ -2758,6 +2997,10 @@ kernel void coinGenerateContacts(
     // differ (fat end vs tip); against a PLANE the two end probes are exact.
     // Probes are precomputed once here.
     if (iAsleep) return;                 // asleep vs static: inert on both sides (VZ-0152)
+    // A polytope body's static BOXES (kinds 1, 3) go to the pair list (SAT + clipping in
+    // coinPolyNarrow); a compound's planes / tubes / pusher are its children's corner probes.
+    bool iCompound = cdIsCompound(ci);
+    bool polyStatic = cdIsPolyBody(ci, hullVerts, hullRanges);
     bool iCapsule = cdIsSwept(ci);
     float3 capP[3];
     float capRs[3] = { 0.0, 0.0, 0.0 };
@@ -2797,6 +3040,8 @@ kernel void coinGenerateContacts(
     } else if (iHull) {
         rProbe = 0.0;
         for (int p = 0; p < nFP; ++p) rProbe = max(rProbe, length(float3(hullVerts[hRange.x + uint(p)].xyz)));
+    } else if (iCompound) {
+        rProbe = Ri;                                      // prevPos.w: the union's bounding radius
     } else {
         rProbe = 0.0;
         for (int p = 0; p < CD_NPTS; ++p) rProbe = max(rProbe, length(fp[p] - xi));
@@ -2804,7 +3049,7 @@ kernel void coinGenerateContacts(
     float rCull = rProbe * 1.0001 + 1e-6 + max(spec, 0.0);
     bool cull = (u.solverFlags & CD_FLAG_NO_COLLIDER_CULL) == 0u;
 
-    for (uint k = 0u; k < u.colliderCount; ++k) {
+    for (uint k = part; k < u.colliderCount; k += nParts) {
         CoinStaticCollider col = colliders[k];
         uint kind = as_type<uint>(col.a.w);
         if (cull) {
@@ -2827,6 +3072,14 @@ kernel void coinGenerateContacts(
             // kind 2 (the pusher plate) inflates disc/box probes by the legacy (Ri, hi)
             // margins, so it is never culled — it is one collider in one scene.
         }
+        if (polyStatic && (kind == 1u || kind == 3u)) {  // SAT + clipping, coinPolyNarrow
+            cdAppendStaticBoxPairs(id, ci, k, col, spec, hullVerts, hullRanges, polyPairs, polyPairCount, maxPolyPairs);
+            continue;
+        }
+        if (iCompound) {                                 // children's corners vs plane / tube / pusher
+            cdCompoundStaticProbes(id, ci, k, col, kind, u, hullVerts, hullRanges, contacts, contactCount, maxContacts);
+            continue;
+        }
         if (kind == 0u) {                                // plane n·p ≥ d
             float3 n = col.a.xyz; float d = col.b.w;
             if (cdIsSphere(ci)) {
@@ -2845,17 +3098,22 @@ kernel void coinGenerateContacts(
                 // (a flat coin otherwise emits all 14 of its samples against one plane).
                 float3 mPos[CD_MAX_STATIC_FP]; float mDep[CD_MAX_STATIC_FP]; int mFeat[CD_MAX_STATIC_FP];
                 int nc = 0;
+                // Inclusive margin with a rounding allowance (VZ-0163): a corner exactly ON the
+                // plane with no margin, or exactly AT the margin, is a contact.
+                float lim = spec + 1e-6 * (abs(d) + rProbe) + 1e-9;
                 for (int p = 0; p < nFP && nc < CD_MAX_STATIC_FP; ++p) {
                     float3 pw = CD_PROBE(p);
                     float pen = d - dot(n, pw);
-                    if (pen > -spec) { mPos[nc] = pw; mDep[nc] = pen; mFeat[nc] = p; nc++; }
+                    if (pen >= -lim) { mPos[nc] = pw; mDep[nc] = pen; mFeat[nc] = p; nc++; }
                 }
                 int keep[CD_MANIFOLD_MAX];
                 int m = cdReduceManifold(mPos, mDep, nc, keep);
+                uint gF[4]; float3 gN[4], gP[4]; float gD[4];
                 for (int i = 0; i < m; ++i) {
                     int q = keep[i];
-                    cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC, uint(mFeat[q]), k, n, mPos[q], xi, xi, mDep[q]);
+                    gF[i] = uint(mFeat[q]); gN[i] = n; gP[i] = mPos[q]; gD[i] = mDep[q];
                 }
+                cdEmitGroup(contacts, contactCount, maxContacts, u, id, CD_STATIC, k, m, gF, gN, gP, xi, xi, gD);
             }
         } else if (kind == 1u) {                         // axis-aligned box
             float3 ctr = col.a.xyz, he = col.b.xyz;
@@ -2947,11 +3205,12 @@ kernel void coinGenerateContacts(
                 if (anyInside) {                 // keep ≤4 spread points of the real manifold
                     int keepI[CD_MANIFOLD_MAX];
                     int mI = cdReduceManifold(iPos, iDep, nIn, keepI);
+                    uint gF[4]; float3 gN[4], gP[4]; float gD[4];
                     for (int i = 0; i < mI; ++i) {
                         int q = keepI[i];
-                        cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC,
-                                      uint(iFeat[q]), k, iN[q], iPos[q], xi, xi, iDep[q]);
+                        gF[i] = uint(iFeat[q]); gN[i] = iN[q]; gP[i] = iPos[q]; gD[i] = iDep[q];
                     }
+                    cdEmitGroup(contacts, contactCount, maxContacts, u, id, CD_STATIC, k, mI, gF, gN, gP, xi, xi, gD);
                 }
                 if (!anyInside) {
                     // Bounded by both the margin AND the querying body's own
@@ -3036,11 +3295,12 @@ kernel void coinGenerateContacts(
                 if (anyInside) {                 // keep ≤4 spread points of the real manifold
                     int keepI[CD_MANIFOLD_MAX];
                     int mI = cdReduceManifold(iPos, iDep, nIn, keepI);
+                    uint gF[4]; float3 gN[4], gP[4]; float gD[4];
                     for (int i = 0; i < mI; ++i) {
                         int q = keepI[i];
-                        cdEmitContact(contacts, contactCount, maxContacts, id, CD_STATIC,
-                                      uint(iFeat[q]), k, iN[q], iPos[q], xi, xi, iDep[q]);
+                        gF[i] = uint(iFeat[q]); gN[i] = iN[q]; gP[i] = iPos[q]; gD[i] = iDep[q];
                     }
+                    cdEmitGroup(contacts, contactCount, maxContacts, u, id, CD_STATIC, k, mI, gF, gN, gP, xi, xi, gD);
                 }
                 if (!anyInside) {
                     float tol = max(1e-6, min(abs(spec), min(Ri, hi)) * 0.05);
@@ -3117,6 +3377,35 @@ kernel void coinGenerateContacts(
 #undef CD_PROBE
 }
 
+kernel void coinGenerateContacts(
+    device const CoinBody*           coins         [[ buffer(0) ]],
+    device const uint*               sortedIndices [[ buffer(1) ]],
+    device const uint*               cellOffsets   [[ buffer(2) ]],
+    device const CoinStaticCollider* colliders     [[ buffer(3) ]],
+    constant CoinUniforms&           u             [[ buffer(4) ]],
+    device const int2*               links         [[ buffer(5) ]],
+    device CoinContact*              contacts      [[ buffer(6) ]],
+    device atomic_uint*              contactCount  [[ buffer(7) ]],
+    constant uint&                   maxContacts   [[ buffer(8) ]],
+    device const float4*             hullVerts     [[ buffer(9) ]],
+    device const uint2*              hullRanges    [[ buffer(10) ]],
+    device const CoinJoint*          joints        [[ buffer(11) ]],
+    constant uint&                   jointCount    [[ buffer(12) ]],   // ACTIVE joints (the list length)
+    device const uint*               asleep        [[ buffer(13) ]],
+    device const uint*               jointedBody   [[ buffer(14) ]],   // coinMarkJointedBodies
+    device const uint*               jointList     [[ buffer(15) ]],   // enabled slots (coinJointListUpload)
+    // The polytope narrowphase's pair list (coinPolyNarrow), and whether it is bound this
+    // substep (the host binds a real list only while boxes / hulls / compounds exist).
+    device uint4*                    polyPairs     [[ buffer(16) ]],
+    device atomic_uint*              polyPairCount [[ buffer(17) ]],
+    constant uint&                   maxPolyPairs  [[ buffer(18) ]],
+    uint id [[ thread_position_in_grid ]])
+{
+    cdGenerateContactsBody(id, 0u, 1u, coins, sortedIndices, cellOffsets, colliders, u, links, contacts, contactCount,
+                           maxContacts, hullVerts, hullRanges, joints, jointCount, asleep, jointedBody, jointList,
+                           polyPairs, polyPairCount, maxPolyPairs);
+}
+
 // ══════════════════════════════════════════════════════════════════════════════
 // CONSTRAINT SOLVER — Stage 2: graph colouring (for GPU Gauss-Seidel)
 // ══════════════════════════════════════════════════════════════════════════════
@@ -3153,6 +3442,7 @@ constant uint CD_MAX_BODY_CONTACTS = 64u;
 // colour, so the live colours are 0…maxUsed and the solve sweeps only that many.
 constant uint CD_MAX_COLORS        = 64u;
 constant uint CD_COLOR_NONE        = 0xFFFFFFFFu;   // "not yet coloured"
+constant uint CD_COLOR_SKIP        = 0xFFFFFFFEu;   // a grouped manifold's non-head point: solved with its head
 
 static uint cdHashU(uint x) {               // priority hash (deterministic, no RNG state)
     x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x;
@@ -3203,9 +3493,13 @@ static void cdAppendBodyContact(device atomic_uint* bodyContactCount,
 // its true contact graph needs ~13.
 kernel void coinClearContactCount(
     device atomic_uint* contactCount [[ buffer(0) ]],
+    device atomic_uint* pairCount    [[ buffer(1) ]],   // the polytope narrowphase's pair cursor (or buffer 0 again)
     uint id [[ thread_position_in_grid ]])
 {
-    if (id == 0) atomic_store_explicit(&contactCount[0], 0u, memory_order_relaxed);
+    if (id == 0) {
+        atomic_store_explicit(&contactCount[0], 0u, memory_order_relaxed);
+        atomic_store_explicit(&pairCount[0], 0u, memory_order_relaxed);
+    }
 }
 
 kernel void coinClearBodyContacts(
@@ -3213,6 +3507,18 @@ kernel void coinClearBodyContacts(
     uint id [[ thread_position_in_grid ]])
 {
     atomic_store_explicit(&bodyContactCount[id], 0u, memory_order_relaxed);
+}
+
+static inline void cdBuildBodyContactsBody(uint cid, uint n, device const CoinContact* contacts,
+                                           device uint* bodyContacts, device atomic_uint* bodyContactCount,
+                                           device atomic_uint* stats)
+{
+    if (cid >= n) return;
+    CoinContact c = contacts[cid];
+    if (cdIsManifoldMember(c)) return;            // a grouped manifold is one node: its head
+    if (cdIsDormant(c)) return;                   // carried through a sleep: not coloured (never solved)
+    cdAppendBodyContact(bodyContactCount, bodyContacts, c.meta.x, cid, stats);
+    if (c.meta.y != CD_STATIC) cdAppendBodyContact(bodyContactCount, bodyContacts, c.meta.y, cid, stats);
 }
 
 kernel void coinBuildBodyContacts(
@@ -3223,16 +3529,22 @@ kernel void coinBuildBodyContacts(
     device atomic_uint*       stats            [[ buffer(4) ]],
     uint cid [[ thread_position_in_grid ]])
 {
-    uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
-    if (cid >= n) return;
-    CoinContact c = contacts[cid];
-    cdAppendBodyContact(bodyContactCount, bodyContacts, c.meta.x, cid, stats);
-    if (c.meta.y != CD_STATIC) cdAppendBodyContact(bodyContactCount, bodyContacts, c.meta.y, cid, stats);
+    cdBuildBodyContactsBody(cid, atomic_load_explicit(&contactCount, memory_order_relaxed), contacts,
+                            bodyContacts, bodyContactCount, stats);
 }
 
 // Seed a colouring pass: every live contact starts uncoloured, with its priority
 // precomputed from its identity (so a round reads one uint per neighbour instead of
 // re-hashing four).
+static inline void cdColorInitBody(uint cid, uint n, device const CoinContact* contacts,
+                                   device uint* priority, device uint* color)
+{
+    if (cid >= n) return;
+    CoinContact c = contacts[cid];
+    priority[cid] = cdContactPriority(c.meta);
+    color[cid]    = (cdIsManifoldMember(c) || cdIsDormant(c)) ? CD_COLOR_SKIP : CD_COLOR_NONE;
+}
+
 kernel void coinColorInit(
     device const CoinContact* contacts     [[ buffer(0) ]],
     device const atomic_uint& contactCount [[ buffer(1) ]],
@@ -3240,10 +3552,7 @@ kernel void coinColorInit(
     device uint*              color        [[ buffer(3) ]],
     uint cid [[ thread_position_in_grid ]])
 {
-    uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
-    if (cid >= n) return;
-    priority[cid] = cdContactPriority(contacts[cid].meta);
-    color[cid]    = CD_COLOR_NONE;
+    cdColorInitBody(cid, atomic_load_explicit(&contactCount, memory_order_relaxed), contacts, priority, color);
 }
 
 // One colouring round, as a PURE FUNCTION of the previous round: it reads every
@@ -3258,17 +3567,14 @@ kernel void coinColorInit(
 //
 // A contact colours itself iff its priority is the strict max among still-uncoloured
 // neighbours, taking the lowest colour no coloured neighbour occupies.
-kernel void coinColorRound(
-    device const CoinContact* contacts         [[ buffer(0) ]],
-    device const atomic_uint& contactCount     [[ buffer(1) ]],
-    device const uint*        bodyContacts     [[ buffer(2) ]],
-    device const uint*        bodyContactCount [[ buffer(3) ]],
-    device const uint*        priority         [[ buffer(4) ]],
-    device const uint*        colorIn          [[ buffer(5) ]],
-    device uint*              colorOut         [[ buffer(6) ]],
-    uint cid [[ thread_position_in_grid ]])
+static inline void cdColorRoundBody(uint cid, uint n,
+    device const CoinContact* contacts,
+    device const uint*        bodyContacts,
+    device const uint*        bodyContactCount,
+    device const uint*        priority,
+    device const uint*        colorIn,
+    device uint*              colorOut)
 {
-    uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
     if (cid >= n) return;
     uint mine = colorIn[cid];
     if (mine != CD_COLOR_NONE) { colorOut[cid] = mine; return; }   // already coloured
@@ -3307,11 +3613,186 @@ kernel void coinColorRound(
     colorOut[cid] = (color < CD_MAX_COLORS) ? color : CD_COLOR_NONE;
 }
 
+kernel void coinColorRound(
+    device const CoinContact* contacts         [[ buffer(0) ]],
+    device const atomic_uint& contactCount     [[ buffer(1) ]],
+    device const uint*        bodyContacts     [[ buffer(2) ]],
+    device const uint*        bodyContactCount [[ buffer(3) ]],
+    device const uint*        priority         [[ buffer(4) ]],
+    device const uint*        colorIn          [[ buffer(5) ]],
+    device uint*              colorOut         [[ buffer(6) ]],
+    uint cid [[ thread_position_in_grid ]])
+{
+    cdColorRoundBody(cid, atomic_load_explicit(&contactCount, memory_order_relaxed), contacts, bodyContacts,
+                     bodyContactCount, priority, colorIn, colorOut);
+}
+
+// ── VZ-0160: speculative RANKED colouring (opt-in, CoinDEMSolver.coloringScheme = .speculative) ─
+//
+// Jones–Plassmann (above) colours a contact only when it outranks every still-uncoloured
+// neighbour, so a round colours at most ONE contact per body: a body of degree d needs ≥ d
+// rounds, and in practice the rounds follow the longest decreasing-priority chain through the
+// contact graph — ≈ 2.4 × the max degree (a graph model of VZ-0160's heaps: a 7 × 7 grid of
+// 10 mm cubes, degree 20: 51 rounds; egg heaps of degree 21–30: 48–63 rounds). At the usual
+// 16–24 rounds a Daydream-Home-sized heap leaves thousands of contacts to the uncoloured tail,
+// and past its 256 per substep they go unsolved: the DH-scale 800-egg rain at 24 rounds left
+// 2.15 M contacts unsolved over 1500 frames and ended with 170 pairs > 10 mm deep (44 mm).
+//
+// Here every round colours MANY contacts of a body at once, in two passes:
+//   • coinColorTentative — each uncoloured contact counts how many uncoloured contacts of each
+//     of its two bodies outrank it (the same priority / identity order as JP) and bids for the
+//     k-th colour that no COLOURED neighbour holds, k = the larger of the two counts: a body's
+//     contacts spread over distinct colours instead of all queueing for the lowest free one.
+//   • coinColorResolve — a contact keeps its bid unless an uncoloured neighbour bid the same
+//     colour and outranks it; losers bid again next round. Two neighbours can never both keep
+//     one colour (the higher-ranked one wins), so the colouring stays proper.
+// Both passes are pure functions of the previous round's colours (the bids live in their own
+// buffer; colours ping-pong as in JP), so the colouring is reproducible run to run. Measured
+// on the GPU (CoinDEMColoringTests): 6 rounds (12 dispatches) colour every contact of a
+// resting 7 × 7 cube grid (degree 24) and of a 300-egg heap (degree 40), of which JP leaves
+// 215 of 473 at 16 rounds and 2909 of 4333 at 24; the price is ≈ 15–35 % more colours than a
+// complete JP colouring
+// (28 for 24, 47 for 40) — each an extra dispatch per velocity iteration — and a colour set
+// that may skip a number (the sweep covers 0…max used, an empty colour is a 0-group dispatch).
+// The same 800-egg rain with it: 0 uncoloured, 0 unsolved, 49 colours, 49 pairs > 10 mm
+// (27 mm; not the colouring — VZ-0190), frame p50 +1.1 ms over JP at 24 rounds (which skips
+// what it cannot colour) and −4.7 ms against JP at 64 rounds (which still left 115 k unsolved).
+
+// ncid outranks cid in the colouring order (JP's rule: priority, then identity, then slot).
+static bool cdOutranks(uint ncid, uint cid, uint myPri, uint4 myId,
+                       device const uint* priority, device const CoinContact* contacts) {
+    uint nPri = priority[ncid];
+    if (nPri != myPri) return nPri > myPri;
+    uint4 nId = contacts[ncid].meta;
+    return all(nId == myId) ? (ncid > cid) : cdIdGreater(nId, myId);
+}
+
+static inline void cdColorTentativeBody(uint cid, uint n,
+    device const CoinContact* contacts,
+    device const uint*        bodyContacts,
+    device const uint*        bodyContactCount,
+    device const uint*        priority,
+    device const uint*        colorIn,
+    device uint*              bid)
+{
+    if (cid >= n) return;
+    if (colorIn[cid] != CD_COLOR_NONE) return;          // coloured, or a manifold's non-head point
+    uint4 myId = contacts[cid].meta;
+    uint myPri = priority[cid];
+    uint bodies[2]; int nb = 0;
+    bodies[nb++] = myId.x;
+    if (myId.y != CD_STATIC) bodies[nb++] = myId.y;
+    ulong usedMask = 0ul;
+    uint rank = 0u;
+    for (int bi = 0; bi < nb; ++bi) {
+        uint body = bodies[bi];
+        uint cnt = min(bodyContactCount[body], CD_MAX_BODY_CONTACTS);
+        uint r = 0u;
+        for (uint k = 0; k < cnt; ++k) {
+            uint ncid = bodyContacts[body * CD_MAX_BODY_CONTACTS + k];
+            if (ncid == cid) continue;
+            uint ncolor = colorIn[ncid];
+            if (ncolor == CD_COLOR_NONE) {
+                if (cdOutranks(ncid, cid, myPri, myId, priority, contacts)) r++;
+            } else if (ncolor < CD_MAX_COLORS) {
+                usedMask |= (1ul << ncolor);
+            }
+        }
+        rank = max(rank, r);
+    }
+    uint t = CD_COLOR_NONE;                              // the rank-th colour no coloured neighbour holds
+    for (uint col = 0u; col < CD_MAX_COLORS; ++col) {
+        if ((usedMask & (1ul << col)) != 0ul) continue;
+        if (rank == 0u) { t = col; break; }
+        rank--;
+    }
+    bid[cid] = t;
+}
+
+kernel void coinColorTentative(
+    device const CoinContact* contacts         [[ buffer(0) ]],
+    device const atomic_uint& contactCount     [[ buffer(1) ]],
+    device const uint*        bodyContacts     [[ buffer(2) ]],
+    device const uint*        bodyContactCount [[ buffer(3) ]],
+    device const uint*        priority         [[ buffer(4) ]],
+    device const uint*        colorIn          [[ buffer(5) ]],
+    device uint*              bid              [[ buffer(6) ]],
+    uint cid [[ thread_position_in_grid ]])
+{
+    cdColorTentativeBody(cid, atomic_load_explicit(&contactCount, memory_order_relaxed), contacts, bodyContacts,
+                         bodyContactCount, priority, colorIn, bid);
+}
+
+static inline void cdColorResolveBody(uint cid, uint n,
+    device const CoinContact* contacts,
+    device const uint*        bodyContacts,
+    device const uint*        bodyContactCount,
+    device const uint*        priority,
+    device const uint*        colorIn,
+    device const uint*        bid,
+    device uint*              colorOut)
+{
+    if (cid >= n) return;
+    uint mine = colorIn[cid];
+    if (mine != CD_COLOR_NONE) { colorOut[cid] = mine; return; }
+    uint t = bid[cid];
+    if (t == CD_COLOR_NONE) { colorOut[cid] = CD_COLOR_NONE; return; }
+    uint4 myId = contacts[cid].meta;
+    uint myPri = priority[cid];
+    uint bodies[2]; int nb = 0;
+    bodies[nb++] = myId.x;
+    if (myId.y != CD_STATIC) bodies[nb++] = myId.y;
+    for (int bi = 0; bi < nb; ++bi) {
+        uint body = bodies[bi];
+        uint cnt = min(bodyContactCount[body], CD_MAX_BODY_CONTACTS);
+        for (uint k = 0; k < cnt; ++k) {
+            uint ncid = bodyContacts[body * CD_MAX_BODY_CONTACTS + k];
+            if (ncid == cid || colorIn[ncid] != CD_COLOR_NONE || bid[ncid] != t) continue;
+            if (cdOutranks(ncid, cid, myPri, myId, priority, contacts)) { colorOut[cid] = CD_COLOR_NONE; return; }
+        }
+    }
+    colorOut[cid] = t;
+}
+
+kernel void coinColorResolve(
+    device const CoinContact* contacts         [[ buffer(0) ]],
+    device const atomic_uint& contactCount     [[ buffer(1) ]],
+    device const uint*        bodyContacts     [[ buffer(2) ]],
+    device const uint*        bodyContactCount [[ buffer(3) ]],
+    device const uint*        priority         [[ buffer(4) ]],
+    device const uint*        colorIn          [[ buffer(5) ]],
+    device const uint*        bid              [[ buffer(6) ]],
+    device uint*              colorOut         [[ buffer(7) ]],
+    uint cid [[ thread_position_in_grid ]])
+{
+    cdColorResolveBody(cid, atomic_load_explicit(&contactCount, memory_order_relaxed), contacts, bodyContacts,
+                       bodyContactCount, priority, colorIn, bid, colorOut);
+}
+
 // Publish the finished colouring onto the contacts (tan2.w keeps carrying the colour for
 // every other reader) and count anything left uncoloured — with enough rounds and
 // CD_MAX_COLORS clearing the real per-body degree this should be zero; what isn't is
 // solved by the tail pass (CD_UNCOLORED_BUCKET, up to CD_UNCOLORED_SUB_MAX per substep) and
 // shows in `CoinDEMSolver.colorStats.uncolored`.
+static inline void cdColorWritebackBody(uint cid, uint n, device CoinContact* contacts,
+                                        device const uint* color, device atomic_uint* stats,
+                                        uint dispatchedColors)
+{
+    if (cid >= n) return;
+    uint c = color[cid];
+    if (c == CD_COLOR_SKIP) { contacts[cid].tan2.w = -1.0; return; }   // solved with its manifold head
+    contacts[cid].tan2.w = (c == CD_COLOR_NONE) ? -1.0 : float(c);
+    if (c == CD_COLOR_NONE) { atomic_fetch_add_explicit(&stats[1], 1u, memory_order_relaxed); return; }
+    // stats[2] = highest colour ever used → the host sizes the next frame's colour sweep
+    // from it (Jones–Plassmann always takes the lowest free colour, so colours 0…maxUsed
+    // are exactly the non-empty ones; the speculative scheme can leave one of them empty,
+    // which costs a 0-group dispatch, never a contact). stats[3] counts contacts that fell
+    // beyond the per-colour dispatches the host encoded — they are solved by the serial
+    // tail pass (coinSolveVelocityTail), so it is a perf signal, not a loss (VZ-0154).
+    atomic_fetch_max_explicit(&stats[2], c + 1u, memory_order_relaxed);
+    if (c >= dispatchedColors) atomic_fetch_add_explicit(&stats[3], 1u, memory_order_relaxed);
+}
+
 kernel void coinColorWriteback(
     device CoinContact*       contacts     [[ buffer(0) ]],
     device const atomic_uint& contactCount [[ buffer(1) ]],
@@ -3320,18 +3801,8 @@ kernel void coinColorWriteback(
     constant uint&            dispatchedColors [[ buffer(4) ]],
     uint cid [[ thread_position_in_grid ]])
 {
-    uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
-    if (cid >= n) return;
-    uint c = color[cid];
-    contacts[cid].tan2.w = (c == CD_COLOR_NONE) ? -1.0 : float(c);
-    if (c == CD_COLOR_NONE) { atomic_fetch_add_explicit(&stats[1], 1u, memory_order_relaxed); return; }
-    // stats[2] = highest colour ever used → the host sizes the next frame's colour sweep
-    // from it (greedy colouring always takes the lowest free colour, so colours
-    // 0…maxUsed are exactly the non-empty ones). stats[3] counts contacts that fell
-    // beyond the per-colour dispatches the host encoded — they are solved by the serial
-    // tail pass (coinSolveVelocityTail), so it is a perf signal, not a loss (VZ-0154).
-    atomic_fetch_max_explicit(&stats[2], c + 1u, memory_order_relaxed);
-    if (c >= dispatchedColors) atomic_fetch_add_explicit(&stats[3], 1u, memory_order_relaxed);
+    cdColorWritebackBody(cid, atomic_load_explicit(&contactCount, memory_order_relaxed), contacts, color, stats,
+                         dispatchedColors);
 }
 
 // ── Compaction: bucket the contacts BY COLOUR ─────────────────────────────────
@@ -3363,26 +3834,27 @@ kernel void coinColorBucketClear(
     atomic_store_explicit(&colorCount[i], 0u, memory_order_relaxed);
 }
 
+static inline void cdColorBucketCountBody(uint cid, uint n, device const uint* color, device atomic_uint* colorCount)
+{
+    if (cid >= n) return;
+    uint c = color[cid];
+    if (c == CD_COLOR_SKIP) return;
+    atomic_fetch_add_explicit(&colorCount[min(c, CD_UNCOLORED_BUCKET)], 1u, memory_order_relaxed);
+}
+
 kernel void coinColorBucketCount(
     device const uint*        color        [[ buffer(0) ]],
     device const atomic_uint& contactCount [[ buffer(1) ]],
     device atomic_uint*       colorCount   [[ buffer(2) ]],
     uint cid [[ thread_position_in_grid ]])
 {
-    uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
-    if (cid >= n) return;
-    uint c = color[cid];
-    atomic_fetch_add_explicit(&colorCount[min(c, CD_UNCOLORED_BUCKET)], 1u, memory_order_relaxed);
+    cdColorBucketCountBody(cid, atomic_load_explicit(&contactCount, memory_order_relaxed), color, colorCount);
 }
 
 // Prefix-sum the 64 colour buckets + the uncoloured one, and re-zero the counts so
 // they serve as write cursors. colorOffset[CD_MAX_COLORS + 1] is the total.
-kernel void coinColorBucketScan(
-    device uint* colorCount  [[ buffer(0) ]],
-    device uint* colorOffset [[ buffer(1) ]],
-    uint gid [[ thread_position_in_grid ]])
+static inline void cdColorBucketScanBody(device uint* colorCount, device uint* colorOffset)
 {
-    if (gid != 0) return;
     uint sum = 0;
     for (uint c = 0; c <= CD_UNCOLORED_BUCKET; ++c) {
         colorOffset[c] = sum;
@@ -3392,19 +3864,57 @@ kernel void coinColorBucketScan(
     colorOffset[CD_UNCOLORED_BUCKET + 1u] = sum;
 }
 
+// The same scan on the FIRST SIMD group of a threadgroup (all of its lanes call it together;
+// `lane` = the thread's index in it, `w` its width): a lane per bucket, a SIMD prefix sum per
+// w buckets. Integer sums, so the offsets are the serial scan's exactly. (Stage B3: the serial
+// walk was one thread's dependent device loads and stores, ≈ 10 µs of the colouring per substep.)
+static inline void cdColorBucketScanSG(uint lane, uint w, device uint* colorCount, device uint* colorOffset)
+{
+    uint base = 0u;
+    for (uint c0 = 0u; c0 <= CD_UNCOLORED_BUCKET; c0 += w) {          // uniform across the group
+        uint c = c0 + lane;
+        bool in = c <= CD_UNCOLORED_BUCKET;
+        uint cnt = in ? colorCount[c] : 0u;
+        uint pre = simd_prefix_exclusive_sum(cnt);
+        if (in) { colorOffset[c] = base + pre; colorCount[c] = 0u; }   // (reused as the scatter cursor)
+        base += simd_sum(cnt);
+    }
+    if (lane == 0u) colorOffset[CD_UNCOLORED_BUCKET + 1u] = base;
+}
+
+kernel void coinColorBucketScan(
+    device uint* colorCount  [[ buffer(0) ]],
+    device uint* colorOffset [[ buffer(1) ]],
+    uint gid [[ thread_position_in_grid ]])
+{
+    if (gid != 0) return;
+    cdColorBucketScanBody(colorCount, colorOffset);
+}
+
+static inline void cdColorBucketScatterBody(uint cid, uint n, device const uint* color, device atomic_uint* colorCursor,
+                                            device const uint* colorOffset, device uint* colorContacts,
+                                            device const CoinContact* contacts)
+{
+    if (cid >= n) return;
+    uint col = color[cid];
+    if (col == CD_COLOR_SKIP) return;                // a manifold point rides its head's entry
+    uint c = min(col, CD_UNCOLORED_BUCKET);          // uncoloured → the serial bucket
+    uint slot = atomic_fetch_add_explicit(&colorCursor[c], 1u, memory_order_relaxed);
+    // The entry carries the manifold's point count for the solve (1 for an ungrouped contact).
+    colorContacts[colorOffset[c] + slot] = cid | (min(cdManifoldCount(contacts[cid]), 15u) << CD_CC_SHIFT);
+}
+
 kernel void coinColorBucketScatter(
     device const uint*        color         [[ buffer(0) ]],
     device const atomic_uint& contactCount  [[ buffer(1) ]],
     device atomic_uint*       colorCursor   [[ buffer(2) ]],
     device const uint*        colorOffset   [[ buffer(3) ]],
     device uint*              colorContacts [[ buffer(4) ]],
+    device const CoinContact* contacts      [[ buffer(5) ]],
     uint cid [[ thread_position_in_grid ]])
 {
-    uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
-    if (cid >= n) return;
-    uint c = min(color[cid], CD_UNCOLORED_BUCKET);   // uncoloured → the serial bucket
-    uint slot = atomic_fetch_add_explicit(&colorCursor[c], 1u, memory_order_relaxed);
-    colorContacts[colorOffset[c] + slot] = cid;
+    cdColorBucketScatterBody(cid, atomic_load_explicit(&contactCount, memory_order_relaxed), color, colorCursor,
+                             colorOffset, colorContacts, contacts);
 }
 
 // The uncoloured bucket (a round-budget shortfall: Jones–Plassmann colours a body's
@@ -3430,38 +3940,34 @@ kernel void coinColorBucketScatter(
 // that lands there is enough colouring rounds (VZ-0160), not a serial detour.
 constant uint CD_UNCOLORED_SUB_MAX = 256u;
 
-// One indirect-dispatch argument triple per colour, sized to that colour's slice.
-// An empty colour gets 0 threadgroups, so unused colours are free. The first
-// threadgroup also orders and sub-colours the uncoloured bucket (above).
-kernel void coinWriteColorArgs(
-    device uint*       colorOffset [[ buffer(0) ]],
-    device uint*       args        [[ buffer(1) ]],   // 4 uints per colour (16-B stride)
-    constant uint&     tgSize      [[ buffer(2) ]],
-    device uint*              colorContacts [[ buffer(3) ]],
-    device const uint*        priority      [[ buffer(4) ]],
-    device const CoinContact* contacts      [[ buffer(5) ]],
-    device uint*              uncolSub      [[ buffer(6) ]],   // sub-colour per bucket POSITION
-    device atomic_uint*       stats         [[ buffer(7) ]],   // colorStats; [4] = left unsolved
-    uint c    [[ thread_position_in_grid ]],
-    uint tid  [[ thread_index_in_threadgroup ]],
-    uint tgN  [[ threads_per_threadgroup ]],
-    uint tgId [[ threadgroup_position_in_grid ]])
+// Order + greedy sub-colour the uncoloured bucket (see COST BOUND above) — ONE threadgroup,
+// `tgN` threads, every thread must call it (it has barriers). The staging arrays are the
+// caller's threadgroup memory (coinWriteColorArgs declares them; the small-world frame
+// kernel carves them out of its shared scratch).
+static void cdUncolouredBucketTG(uint tid, uint tgN,
+    device uint*              colorOffset,
+    device uint*              colorContacts,
+    device const uint*        priority,
+    device const CoinContact* contacts,
+    device uint*              uncolSub,
+    device atomic_uint*       stats,
+    threadgroup uint*         sCid,     // [CD_UNCOLORED_SUB_MAX] staged, scatter order
+    threadgroup uint*         sPri,     // [CD_UNCOLORED_SUB_MAX]
+    threadgroup uint4*        sId,      // [CD_UNCOLORED_SUB_MAX]
+    threadgroup uint2*        sAB,      // [CD_UNCOLORED_SUB_MAX] the two bodies, SORTED order
+    threadgroup uint*         sSub,     // [CD_UNCOLORED_SUB_MAX] sub-colour, SORTED order
+    threadgroup atomic_uint*  sUsed,    // [4] greedy step i's used mask, [slot i&1][lo, hi]
+    threadgroup uint&         sFail)
 {
-    threadgroup uint  sCid[CD_UNCOLORED_SUB_MAX];   // staged, scatter order
-    threadgroup uint  sPri[CD_UNCOLORED_SUB_MAX];
-    threadgroup uint4 sId[CD_UNCOLORED_SUB_MAX];
-    threadgroup uint2 sAB[CD_UNCOLORED_SUB_MAX];    // the two bodies, SORTED order
-    threadgroup uint  sSub[CD_UNCOLORED_SUB_MAX];   // sub-colour, SORTED order
-    threadgroup atomic_uint sUsed[4];                // greedy step i's used mask, [slot i&1][lo, hi]
-    threadgroup uint  sFail;
-    if (tgId == 0u) {                                // uniform per threadgroup: barriers are safe
+    {
         uint b0 = colorOffset[CD_UNCOLORED_BUCKET], b1 = colorOffset[CD_UNCOLORED_BUCKET + 1u];
         uint n = b1 - b0;
         bool staged = n > 0u && n <= CD_UNCOLORED_SUB_MAX;
         if (staged) {
             for (uint i = tid; i < n; i += tgN) {
-                uint cid = colorContacts[b0 + i];
-                sCid[i] = cid; sPri[i] = priority[cid]; sId[i] = contacts[cid].meta;
+                uint e = colorContacts[b0 + i];
+                uint cid = e & CD_CC_MASK;
+                sCid[i] = e; sPri[i] = priority[cid]; sId[i] = contacts[cid].meta;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3531,6 +4037,35 @@ kernel void coinWriteColorArgs(
             if (n > 0u && nSub == 0u) atomic_fetch_add_explicit(&stats[4], n, memory_order_relaxed);
         }
     }
+}
+
+// One indirect-dispatch argument triple per colour, sized to that colour's slice.
+// An empty colour gets 0 threadgroups, so unused colours are free. The first
+// threadgroup also orders and sub-colours the uncoloured bucket (above).
+kernel void coinWriteColorArgs(
+    device uint*       colorOffset [[ buffer(0) ]],
+    device uint*       args        [[ buffer(1) ]],   // 4 uints per colour (16-B stride)
+    constant uint&     tgSize      [[ buffer(2) ]],
+    device uint*              colorContacts [[ buffer(3) ]],
+    device const uint*        priority      [[ buffer(4) ]],
+    device const CoinContact* contacts      [[ buffer(5) ]],
+    device uint*              uncolSub      [[ buffer(6) ]],   // sub-colour per bucket POSITION
+    device atomic_uint*       stats         [[ buffer(7) ]],   // colorStats; [4] = left unsolved
+    uint c    [[ thread_position_in_grid ]],
+    uint tid  [[ thread_index_in_threadgroup ]],
+    uint tgN  [[ threads_per_threadgroup ]],
+    uint tgId [[ threadgroup_position_in_grid ]])
+{
+    threadgroup uint  sCid[CD_UNCOLORED_SUB_MAX];   // staged, scatter order
+    threadgroup uint  sPri[CD_UNCOLORED_SUB_MAX];
+    threadgroup uint4 sId[CD_UNCOLORED_SUB_MAX];
+    threadgroup uint2 sAB[CD_UNCOLORED_SUB_MAX];    // the two bodies, SORTED order
+    threadgroup uint  sSub[CD_UNCOLORED_SUB_MAX];   // sub-colour, SORTED order
+    threadgroup atomic_uint sUsed[4];                // greedy step i's used mask, [slot i&1][lo, hi]
+    threadgroup uint  sFail;
+    if (tgId == 0u)                                  // uniform per threadgroup: barriers are safe
+        cdUncolouredBucketTG(tid, tgN, colorOffset, colorContacts, priority, contacts, uncolSub, stats,
+                             sCid, sPri, sId, sAB, sSub, sUsed, sFail);
     if (c >= CD_MAX_COLORS) return;
     uint count = colorOffset[c + 1] - colorOffset[c];
     args[c * 4 + 0] = (count + tgSize - 1u) / tgSize;   // threadgroupsPerGrid.x (0 when empty)
@@ -3564,12 +4099,11 @@ kernel void coinWriteColorArgs(
 // Per-body bias (pseudo) velocity: [0]=linear.xyz, [1]=angular.xyz. One pair per body.
 // (Separate buffer so the split-impulse recovery never aliases real velocity.)
 
-kernel void coinIntegrateVelocityCS(
-    device CoinBody*       coins  [[ buffer(0) ]],
-    device float4*         bias   [[ buffer(1) ]],
-    constant CoinUniforms& u      [[ buffer(2) ]],
-    device const uint*     asleep [[ buffer(3) ]],
-    uint id [[ thread_position_in_grid ]])
+// Each constraint-path kernel below is a thin wrapper around a `cd…Body` / `cd…TG` device
+// function, so the multi-dispatch path and the small-world frame kernel (CoinDEMSmallWorld.h,
+// stage B3) run ONE implementation of every step.
+static inline void cdIntegrateVelocityBody(uint id, device CoinBody* coins, device float4* bias,
+                                           constant CoinUniforms& u, device const uint* asleep)
 {
     if (id >= u.coinCount) return;
     bias[2*id] = float4(0.0); bias[2*id+1] = float4(0.0);
@@ -3590,6 +4124,16 @@ kernel void coinIntegrateVelocityCS(
     coins[id].prevOrient  = c.orient;
     coins[id].vel.xyz     = v;
     coins[id].angVel.xyz  = c.angVel.xyz * u.angDamping;
+}
+
+kernel void coinIntegrateVelocityCS(
+    device CoinBody*       coins  [[ buffer(0) ]],
+    device float4*         bias   [[ buffer(1) ]],
+    constant CoinUniforms& u      [[ buffer(2) ]],
+    device const uint*     asleep [[ buffer(3) ]],
+    uint id [[ thread_position_in_grid ]])
+{
+    cdIntegrateVelocityBody(id, coins, bias, u, asleep);
 }
 
 // Write the indirect-dispatch threadgroup count for the contact-iterating kernels:
@@ -3613,21 +4157,35 @@ kernel void coinWriteSolveArgs(
 // them launching over the whole buffer CAPACITY (12k) when a settled pile has ~2.7k —
 // which matters most for the colouring, whose rounds are the densest pass in the solver.
 kernel void coinWriteContactArgs(
-    device const atomic_uint& contactCount [[ buffer(0) ]],
+    device atomic_uint&       contactCount [[ buffer(0) ]],
     device uint*              args         [[ buffer(1) ]],
     constant uint&            tgSize       [[ buffer(2) ]],
+    constant uint&            maxContacts  [[ buffer(3) ]],
     uint id [[ thread_position_in_grid ]])
 {
     if (id != 0) return;
-    uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
+    // Clamp the append cursor to the buffer: every append past `maxContacts` was dropped,
+    // but the cursor kept counting, and every kernel after this one reads it as "contacts
+    // 0 ..< n" — past the end of the buffer on an overflow. This is the first dispatch
+    // after generation, so from here on the count is the number of contacts that exist.
+    uint n = min(atomic_load_explicit(&contactCount, memory_order_relaxed), maxContacts);
+    atomic_store_explicit(&contactCount, n, memory_order_relaxed);
     args[0] = (n + tgSize - 1u) / tgSize;
     args[1] = 1u;
     args[2] = 1u;
 }
 
-// The per-contact velocity solve, shared by the per-colour dispatch and the
-// serial tail pass below (a contact is solved identically by either).
-static inline void cdSolveContactVelocity(
+// The per-contact velocity solve of ONE contact — the pre-B1 function verbatim (its
+// collider index masked to meta.z's low 16 bits, where the polytope narrowphase folds a
+// feature id into the high half). Every ungrouped contact is solved by exactly this code.
+// It is kept as a separate straight-line copy on purpose: Metal compiles with fast math,
+// so the rounding follows the shape of the code, and folding it into the manifold loop
+// below (the same arithmetic, restructured) stepped a Daydream-Home-style egg rain
+// differently from frame 6 on. As it is, a world without the manifold solve steps
+// bit-identically to the pre-B1 engine (egg rain, a mixed sphere / capsule / disc / egg
+// pile: 240 frames, every body's state bit-for-bit). Change the arithmetic here and in
+// cdSolveContactVelocity's manifold loop together.
+static inline void cdSolveContactVelocityOne(
     uint                      cid,
     device CoinBody*          coins,
     device float4*            bias,
@@ -3662,7 +4220,7 @@ static inline void cdSolveContactVelocity(
     // the split-impulse position channel nudges bodies along — which is what the
     // accumulated duplicate contacts used to paper over (the nudge landed once per stale
     // copy still sitting in the buffer).
-    float3 vStatic = bStatic ? cdColliderVelocity(colliders, c.meta.z) : float3(0.0);
+    float3 vStatic = bStatic ? cdColliderVelocity(colliders, c.meta.z & 0xFFFFu) : float3(0.0);
     CoinBody b;
     if (!bStatic) {
         b = coins[B];
@@ -3697,8 +4255,8 @@ static inline void cdSolveContactVelocity(
     // the all-defaults case still reduces exactly to the global uniforms.
     float muA = cdBodyMu(material, A, u);
     float eA  = cdBodyE(material, A, u);
-    float muB = bStatic ? cdColliderMu(colliders, c.meta.z, u) : cdBodyMu(material, B, u);
-    float eB  = bStatic ? cdColliderE(colliders, c.meta.z, u) : cdBodyE(material, B, u);
+    float muB = bStatic ? cdColliderMu(colliders, c.meta.z & 0xFFFFu, u) : cdBodyMu(material, B, u);
+    float eB  = bStatic ? cdColliderE(colliders, c.meta.z & 0xFFFFu, u) : cdBodyE(material, B, u);
     float muC = sqrt(max(muA * muB, 0.0));      // geometric mean (Box2D convention)
     float eC  = max(eA, eB);                    // bounciest material wins
 
@@ -3730,7 +4288,7 @@ static inline void cdSolveContactVelocity(
     float3 bvpB = bStatic ? float3(0.0) : (bvB + cross(bwB, rB));
     float bvn = dot(bvpA - bvpB, n);
     float biasTarget = u.baumgarteBeta * max(depth - u.contactSlop, 0.0) / max(u.dt, 1e-6);
-    float dJb = (biasTarget - bvn) / kN;
+    float dJb = cdSeparatingBias((biasTarget - bvn) / kN, depth, bvn, kN, u);
     float3 Pb = dJb * n;
     bvA += invMa * Pb; bwA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, Pb));
     if (!bStatic) { bvB -= invMb * Pb; bwB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, Pb)); }
@@ -3834,6 +4392,343 @@ static inline void cdSolveContactVelocity(
     contacts[cid] = c;
 }
 
+// ── Torsional (point) friction — CD_FLAG_TORSION (engine plan 5a, stage B2) ───────────────
+//
+// A real contact is a small PATCH pressed with normal force N, and Coulomb friction across it
+// resists spin ABOUT THE NORMAL with a moment of order μ·N times the patch's radius (a
+// uniformly loaded disc of radius a: (2/3)·μ·N·a; a Hertzian patch: (3π/16)·μ·N·a). The
+// narrowphase's point contact has no lever about n, so a body spinning about its contact
+// normal — a Weeble given a yaw rate — never slowed (the rolling row leaves twist alone): > 70 %
+// of a 5 rad/s spin was left after 1 s (CoinDEMActuationTests #8). This is the row that stops
+// it: ONE angular row about n per contact, the relative spin (ω_A − ω_B)·n driven to 0 with the
+// effective mass 1 / (n·I_A⁻¹·n + n·I_B⁻¹·n) (world inverse inertia, movable ends only), its
+// impulse ACCUMULATED over the substep (ext.x, warm-started with the contact's other rows)
+// inside ±μ·r·Λn·share — Λn the contact's accumulated normal impulse, μ its combined Coulomb μ,
+// r = max(r_A, r_B) the per-body EFFECTIVE patch radius (the moment arm that multiplies μ·N; a
+// static side has no patch of its own), share = 1/n on each point of an n-point grouped
+// manifold (a flat face resists spin mostly through its spread points' tangential friction;
+// the patch term is shared across them, not multiplied — plan 5a). Like the accumulated
+// rolling row it runs while Λn > 0 OR it still holds an impulse, so a contact a later iteration
+// unloads hands back what it applied.
+//
+// The spring foot's pad row (CoinDEMFoot.h) is the same law — |Λ| ≤ μ_spin·r_patch·Λn_leg, its
+// OWN normal impulse — so a worker standing on its shell AND a preloaded pad has
+// μ·r·(Λn_shell + Λn_leg) = μ·r·m·g·dt of torsion in all: each patch counted once, by its own
+// share of the load (CoinDEMTorsionTests).
+//
+// An UNGROUPED contact runs this as its own step right after cdSolveContactVelocityOne, on the
+// velocities that function wrote back (race-free: the colour gives this thread both bodies),
+// so the pre-B2 single-contact code — and every world without a patch — is untouched.
+static inline void cdSolveContactTorsion(
+    uint                      cid,
+    device CoinBody*          coins,
+    device CoinContact*       contacts,
+    constant CoinUniforms&    u,
+    device const uint*        asleep,
+    device const float2*      material,
+    device const CoinStaticCollider* colliders,
+    device const float*       patch)
+{
+    CoinContact c = contacts[cid];
+    uint A = c.meta.x, B = c.meta.y;
+    bool bStatic = (B == CD_STATIC);
+    bool aSleep = (asleep[A] != 0u);
+    bool bSleep = bStatic || (asleep[B] != 0u);
+    if (aSleep && bSleep) return;
+    float r = max(patch[A], bStatic ? 0.0 : patch[B]);
+    float lamOld = c.ext.x;
+    if (!(r > 0.0) && lamOld == 0.0) return;
+    uint colIdx = c.meta.z & 0xFFFFu;
+    float muA = cdBodyMu(material, A, u);
+    float muB = bStatic ? cdColliderMu(colliders, colIdx, u) : cdBodyMu(material, B, u);
+    float cap = sqrt(max(muA * muB, 0.0)) * max(r, 0.0);      // torsion per unit normal impulse (m)
+    float3 n = c.nrm.xyz;
+    CoinBody a = coins[A];
+    float3 dA = cdApplyInvInertiaWorld(a.orient, aSleep ? float3(0.0) : cdBodyInvInertia(a, a.posInvMass.w), n);
+    float3 wA = a.angVel.xyz, wB = float3(0.0), dB = float3(0.0);
+    if (!bStatic) {
+        CoinBody b = coins[B];
+        dB = cdApplyInvInertiaWorld(b.orient, bSleep ? float3(0.0) : cdBodyInvInertia(b, b.posInvMass.w), n);
+        wB = b.angVel.xyz;
+    }
+    float k = dot(n, dA) + dot(n, dB);                         // n·I_A⁻¹·n + n·I_B⁻¹·n
+    if (!(k > 0.0)) return;
+    float bound = cap * max(c.rA.w, 0.0);
+    float lamNew = clamp(lamOld - dot(wA - wB, n) / k, -bound, bound);
+    float d = lamNew - lamOld;
+    if (!aSleep) coins[A].angVel.xyz = wA + d * dA;
+    if (!bSleep) coins[B].angVel.xyz = wB - d * dB;
+    contacts[cid].ext.xy = float2(lamNew, cap);
+}
+
+
+// The per-contact velocity solve, shared by the per-colour dispatch and the
+// serial tail pass below (a contact is solved identically by either).
+//
+// MANIFOLD SOLVE (CD_FLAG_MANIFOLD_SOLVE, opt-in). `entry` is a colorContacts entry: the
+// contact index, and in its top 4 bits the number of contiguous contacts of one grouped
+// manifold (cdEmitGroup) — 1 for every ungrouped contact, which goes to
+// cdSolveContactVelocityOne, the path it always took. A grouped manifold
+// (≤ 4 points of one body pair, allocated contiguously and coloured as ONE unit) is solved
+// by one thread with the pair's velocities in registers: `manifoldPasses` Gauss–Seidel
+// passes over its points' normal / bias / friction rows, then one rolling pass. Why: a
+// 4-point manifold is a REDUNDANT system (rank 3 on a rigid body), and one Gauss–Seidel
+// visit per point per iteration — the points in four different colours — leaves it
+// asymmetric: a 10 mm cube resting on a cube got ω = 0.48 rad/s from its very first
+// cold 6-iteration solve (0 at 30 iterations), so a 5-cube tower fell at frame 3 and a lone
+// resting box yawed ~1°/s (VZ-0157, VZ-0163). Solved as a unit, each manifold is (near)
+// exact on every visit; the colour count also drops (one node per manifold, not per point).
+static inline void cdSolveContactVelocity(
+    uint                      entry,
+    device CoinBody*          coins,
+    device float4*            bias,
+    device CoinContact*       contacts,
+    constant CoinUniforms&    u,
+    device const uint*        asleep,
+    device const float2*      material,   // per-body (μ, e); <0 = inherit
+    device const CoinStaticCollider* colliders,
+    device const float*       patch)      // per-body contact patch radius (m), CD_FLAG_TORSION
+{
+    uint cid0 = entry & CD_CC_MASK;
+    uint nPts = max(entry >> CD_CC_SHIFT, 1u);
+    if (nPts == 1u) {
+        cdSolveContactVelocityOne(cid0, coins, bias, contacts, u, asleep, material, colliders);
+        if ((u.solverFlags & CD_FLAG_TORSION) != 0u)
+            cdSolveContactTorsion(cid0, coins, contacts, u, asleep, material, colliders, patch);
+        return;
+    }
+    CoinContact c = contacts[cid0];
+
+    uint A = c.meta.x, B = c.meta.y;
+    bool bStatic = (B == CD_STATIC);
+    // A sleeping body acts as immovable (invMass 0) for an awake neighbour; if BOTH
+    // ends are inert there's nothing to solve — skip (the island-sleep perf win).
+    bool aSleep = (asleep[A] != 0u);
+    bool bSleep = bStatic || (asleep[B] != 0u);
+    if (aSleep && bSleep) return;
+
+    CoinBody a = coins[A];
+    float invMa = aSleep ? 0.0 : a.posInvMass.w;
+    float3 invIa = aSleep ? float3(0.0) : cdBodyInvInertia(a, a.posInvMass.w);
+    float4 qa = a.orient;
+    float3 vA = a.vel.xyz, wA = a.angVel.xyz;
+    float3 bvA = bias[2*A].xyz, bwA = bias[2*A+1].xyz;
+
+    float invMb = 0.0; float3 invIb = float3(0.0); float4 qb = float4(0,0,0,1);
+    float3 vB = float3(0.0), wB = float3(0.0), bvB = float3(0.0), bwB = float3(0.0);
+    // A static collider is immovable but not necessarily STILL: the kinematic pusher
+    // plate carries the pile forward, so a contact against it targets the PLATE's surface
+    // velocity, not zero. With zero, the plate is just a wall the pile leans on and only
+    // the split-impulse position channel nudges bodies along — which is what the
+    // accumulated duplicate contacts used to paper over (the nudge landed once per stale
+    // copy still sitting in the buffer).
+    // Static contacts carry the collider index in meta.z's low 16 bits (the polytope
+    // narrowphase folds a feature id into the high half; every other path leaves it 0).
+    uint colIdx = c.meta.z & 0xFFFFu;
+    float3 vStatic = bStatic ? cdColliderVelocity(colliders, colIdx) : float3(0.0);
+    CoinBody b;
+    if (!bStatic) {
+        b = coins[B];
+        invMb = bSleep ? 0.0 : b.posInvMass.w;
+        invIb = bSleep ? float3(0.0) : cdBodyInvInertia(b, b.posInvMass.w);
+        qb = b.orient;
+        vB = b.vel.xyz; wB = b.angVel.xyz; bvB = bias[2*B].xyz; bwB = bias[2*B+1].xyz;
+    }
+
+    // ── Per-contact material: combine the two sides' (μ, e). A static side
+    // reads the COLLIDER's own material (c.meta.z is the collider index for a
+    // static contact — see cdEmitContact/cdPairKey), not a mirror of A's — an
+    // icy ramp next to a rubber floor now actually differs. Same combine rule
+    // and "<0 = inherit the global uniform" convention as per-body material, so
+    // the all-defaults case still reduces exactly to the global uniforms.
+    float muA = cdBodyMu(material, A, u);
+    float eA  = cdBodyE(material, A, u);
+    float muB = bStatic ? cdColliderMu(colliders, colIdx, u) : cdBodyMu(material, B, u);
+    float eB  = bStatic ? cdColliderE(colliders, colIdx, u) : cdBodyE(material, B, u);
+    float muC = sqrt(max(muA * muB, 0.0));      // geometric mean (Box2D convention)
+    float eC  = max(eA, eB);                    // bounciest material wins
+    // Torsion (CD_FLAG_TORSION, cdSolveContactTorsion): each point of the n carries 1/n of
+    // the pair's patch term — μ·r·Λn_i/n — solved on the registers with the other rows.
+    bool torsionOn = (u.solverFlags & CD_FLAG_TORSION) != 0u;
+    float tCap = torsionOn ? muC * max(max(patch[A], bStatic ? 0.0 : patch[B]), 0.0) / float(nPts) : 0.0;
+
+    uint passes = (nPts == 1u) ? 1u : max(u.manifoldPasses, 1u);
+    for (uint pass = 0u; pass < passes; ++pass) {
+    for (uint k = 0u; k < nPts; ++k) {
+    if (nPts > 1u) c = contacts[cid0 + k];
+    bool lastPass = (pass + 1u == passes);
+    float3 n = c.nrm.xyz, rA = c.rA.xyz, rB = c.rB.xyz, t1 = c.tan1.xyz, t2 = c.tan2.xyz;
+    float depth = c.nrm.w;
+
+    // Effective mass along a unit direction d at this contact.
+    float3 raXn1 = cross(rA, t1), raXn2 = cross(rA, t2), raXnn = cross(rA, n);
+    float3 rbXn1 = cross(rB, t1), rbXn2 = cross(rB, t2), rbXnn = cross(rB, n);
+    float kN = invMa + invMb
+             + dot(raXnn, cdApplyInvInertiaWorld(qa, invIa, raXnn))
+             + (bStatic ? 0.0 : dot(rbXnn, cdApplyInvInertiaWorld(qb, invIb, rbXnn)));
+    kN = max(kN, 1e-8);
+
+    // n points from B toward A: contact-point relative velocity (A − B).
+    float3 vpA = vA + cross(wA, rA);
+    float3 vpB = bStatic ? vStatic : (vB + cross(wB, rB));
+    float3 vrel = vpA - vpB;
+    float vn = dot(vrel, n);                       // <0 = closing along the normal
+
+
+    // ── REAL normal impulse (restitution only above the threshold) ────────────
+    // The restitution target is anchored to the PRE-SOLVE approach speed vn₀,
+    // captured once on this contact's first solve pass — every later iteration
+    // then drives toward the same −e·vn₀ instead of re-deriving it from the
+    // already-reflected current velocity (which zeroed the bounce).
+    if (c.aux.w < 0.5) { c.aux.x = vn; c.aux.w = 1.0; }
+    float vn0 = c.aux.x;
+    float restE = (vn0 < -u.restThreshold) ? cdEffectiveCORBase(u, eC, -vn0) : 0.0;
+    // SPECULATIVE near-contact (depth < 0): don't stop the body at the current
+    // gap — only cap its approach so it can close AT MOST the gap this substep
+    // (vn ≥ depth/dt). A real contact (depth ≥ 0) keeps the plain vn → −e·vn₀.
+    float allowedVn = min(depth, 0.0) / max(u.dt, 1e-6);
+    float jnOld = c.rA.w;
+    float dJn = -(vn - allowedVn + restE * vn0) / kN;   // drive vn → allowedVn − e·vn₀
+    float jnNew = max(jnOld + dJn, 0.0);           // accumulated, non-adhesive
+    dJn = jnNew - jnOld;
+    float3 Pn = dJn * n;
+    vA += invMa * Pn; wA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, Pn));
+    if (!bStatic) { vB -= invMb * Pn; wB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, Pn)); }
+    c.rA.w = jnNew;
+
+    // ── SPLIT-IMPULSE bias: recover penetration beyond slop via pseudo velocity ─
+    // No per-contact accumulator (the per-body bias velocity carries convergence);
+    // the depth>slop target is ≥0, so the pseudo impulse stays separating.
+    float3 bvpA = bvA + cross(bwA, rA);
+    float3 bvpB = bStatic ? float3(0.0) : (bvB + cross(bwB, rB));
+    float bvn = dot(bvpA - bvpB, n);
+    float biasTarget = u.baumgarteBeta * max(depth - u.contactSlop, 0.0) / max(u.dt, 1e-6);
+    float dJb = cdSeparatingBias((biasTarget - bvn) / kN, depth, bvn, kN, u);
+    float3 Pb = dJb * n;
+    bvA += invMa * Pb; bwA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, Pb));
+    if (!bStatic) { bvB -= invMb * Pb; bwB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, Pb)); }
+
+    // ── Two-axis Coulomb friction (accumulated jt1→rB.w, jt2→tan1.w; |jt|≤μ·jn) ─
+    float mu = muC;
+    if (mu > 0.0) {
+        float kT1 = invMa + invMb + dot(raXn1, cdApplyInvInertiaWorld(qa, invIa, raXn1))
+                  + (bStatic ? 0.0 : dot(rbXn1, cdApplyInvInertiaWorld(qb, invIb, rbXn1)));
+        float kT2 = invMa + invMb + dot(raXn2, cdApplyInvInertiaWorld(qa, invIa, raXn2))
+                  + (bStatic ? 0.0 : dot(rbXn2, cdApplyInvInertiaWorld(qb, invIb, rbXn2)));
+        float bound = mu * c.rA.w;
+        // tangent 1
+        vrel = (vA + cross(wA, rA)) - (bStatic ? vStatic : (vB + cross(wB, rB)));
+        float jt1Old = c.rB.w;
+        float jt1New = clamp(jt1Old - dot(vrel, t1) / max(kT1, 1e-8), -bound, bound);
+        float3 Pt1 = (jt1New - jt1Old) * t1;
+        vA += invMa * Pt1; wA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, Pt1));
+        if (!bStatic) { vB -= invMb * Pt1; wB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, Pt1)); }
+        c.rB.w = jt1New;
+        // tangent 2
+        vrel = (vA + cross(wA, rA)) - (bStatic ? vStatic : (vB + cross(wB, rB)));
+        float jt2Old = c.tan1.w;
+        float jt2New = clamp(jt2Old - dot(vrel, t2) / max(kT2, 1e-8), -bound, bound);
+        float3 Pt2 = (jt2New - jt2Old) * t2;
+        vA += invMa * Pt2; wA += cdApplyInvInertiaWorld(qa, invIa, cross(rA, Pt2));
+        if (!bStatic) { vB -= invMb * Pt2; wB -= cdApplyInvInertiaWorld(qb, invIb, cross(rB, Pt2)); }
+        c.tan1.w = jt2New;
+    }
+
+    // ── Torsional friction (CD_FLAG_TORSION; the law of cdSolveContactTorsion, 1/n share) ─
+    if (torsionOn && (tCap > 0.0 || c.ext.x != 0.0)) {
+        float3 dA = cdApplyInvInertiaWorld(qa, invIa, n);
+        float3 dB = bStatic ? float3(0.0) : cdApplyInvInertiaWorld(qb, invIb, n);
+        float kT = dot(n, dA) + dot(n, dB);
+        if (kT > 0.0) {
+            float tBound = tCap * max(c.rA.w, 0.0);
+            float lamOld = c.ext.x;
+            float lamNew = clamp(lamOld - dot(wA - wB, n) / kT, -tBound, tBound);
+            float dl = lamNew - lamOld;
+            wA += dl * dA;
+            if (!bStatic) wB -= dl * dB;
+            c.ext.xy = float2(lamNew, tCap);
+        }
+    }
+
+    // ── Rolling resistance (constraint path): a physical angular constraint ────
+    // Opposes the RELATIVE rolling spin (ω ⟂ n) with an angular impulse bounded
+    // by μᵣ · jₙ · r (coefficient × normal impulse × contact lever) — so a ball
+    // rolls out and STOPS on a level floor instead of coasting forever, and the
+    // stopping torque scales with how hard the contact is loaded, exactly like
+    // real rolling friction. Twist ABOUT n is friction's job, not this.
+    //
+    // CD_FLAG_ACCUM_ROLLING (opt-in, VZ-0155): the bound applies to the ACCUMULATED
+    // rolling impulse of this contact over the substep (aux.yz, in the (t1, t2) basis;
+    // reset to 0 when the contact is generated), clamped to a disc of radius
+    // μᵣ·jₙ·|rA| — the standard sequential-impulse treatment the friction rows above
+    // already get. The legacy branch below clamps each ITERATION's impulse on its own,
+    // so its per-substep cap is velocityIterations × μᵣ·jₙ·|rA| (a Weeble parks at
+    // asin(iterations·μᵣ·h_c/d)); every shipping scene is tuned against that, so it
+    // stays the default.
+    if (!lastPass) {
+        // rolling resistance: once per outer iteration (the last manifold pass), so its
+        // per-iteration bound is what it always was
+    } else if ((u.solverFlags & CD_FLAG_ACCUM_ROLLING) != 0u) {
+        // Not gated on jₙ > 0 alone: when a later iteration unloads this contact to
+        // jₙ = 0 (a manifold point whose neighbours took the weight, a separating
+        // bounce) the bound is 0 and the clamp must hand back what earlier iterations
+        // applied — as the friction rows do. Gating on jₙ > 0 left that impulse on
+        // bodies the contact no longer pressed (A1 verifier: 76 of 7415 solved contacts
+        // in a tumbling box/sphere pile ended at jₙ = 0 still carrying up to 1.5e-7 N·m·s,
+        // ≈ 70 % of a resting 10 g body's whole per-substep rolling bound).
+        if (u.rollingResistance > 0.0 && (c.rA.w > 0.0 || any(c.aux.yz != 0.0))) {
+            float k1 = dot(t1, cdApplyInvInertiaWorld(qa, invIa, t1))
+                     + (bStatic ? 0.0 : dot(t1, cdApplyInvInertiaWorld(qb, invIb, t1)));
+            float k2 = dot(t2, cdApplyInvInertiaWorld(qa, invIa, t2))
+                     + (bStatic ? 0.0 : dot(t2, cdApplyInvInertiaWorld(qb, invIb, t2)));
+            if (k1 > 1e-9 && k2 > 1e-9) {
+                float3 wrel = wA - wB;
+                float2 accOld = c.aux.yz;
+                float2 acc = accOld - float2(dot(wrel, t1) / k1, dot(wrel, t2) / k2);
+                float bound = u.rollingResistance * c.rA.w * max(length(rA), 1e-4);
+                float al = length(acc);
+                if (al > bound) acc *= bound / al;
+                float2 d = acc - accOld;
+                float3 T = d.x * t1 + d.y * t2;
+                wA += cdApplyInvInertiaWorld(qa, invIa, T);
+                if (!bStatic) wB -= cdApplyInvInertiaWorld(qb, invIb, T);
+                c.aux.yz = acc;
+            }
+        }
+    } else if (u.rollingResistance > 0.0 && c.rA.w > 0.0) {
+        float3 wrel = wA - wB;
+        float3 wRoll = wrel - dot(wrel, n) * n;
+        float wl = length(wRoll);
+        if (wl > 1e-5) {
+            float3 axis = wRoll / wl;
+            float kR = dot(axis, cdApplyInvInertiaWorld(qa, invIa, axis))
+                     + (bStatic ? 0.0 : dot(axis, cdApplyInvInertiaWorld(qb, invIb, axis)));
+            if (kR > 1e-9) {
+                float lever = max(length(rA), 1e-4);
+                float jR = min(wl / kR, u.rollingResistance * c.rA.w * lever);
+                float3 T = -jR * axis;
+                wA += cdApplyInvInertiaWorld(qa, invIa, T);
+                if (!bStatic) wB -= cdApplyInvInertiaWorld(qb, invIb, T);
+            }
+        }
+    }
+
+    contacts[cid0 + k] = c;
+    }   // points
+    }   // passes
+
+    // Write back (an inert/asleep end carried no impulse, so leave it untouched).
+    // bias[2*i+1].w is the joint pass's motor-driven marker — carried through.
+    if (!aSleep) {
+        coins[A].vel.xyz = vA; coins[A].angVel.xyz = wA;
+        bias[2*A] = float4(bvA, 0.0); bias[2*A+1] = float4(bwA, bias[2*A+1].w);
+    }
+    if (!bSleep) {
+        coins[B].vel.xyz = vB; coins[B].angVel.xyz = wB;
+        bias[2*B] = float4(bvB, 0.0); bias[2*B+1] = float4(bwB, bias[2*B+1].w);
+    }
+}
+
 // Solve all contacts of one colour. The dispatch is sized to this colour's slice of the
 // compacted `colorContacts` list, so every thread has real work (no colour filtering).
 // `currentColor` is passed per-dispatch (setBytes).
@@ -3848,11 +4743,12 @@ kernel void coinSolveVelocityColor(
     device const float2*      material     [[ buffer(7) ]],   // per-body (μ, e); <0 = inherit
     device const CoinStaticCollider* colliders [[ buffer(8) ]],
     device const uint*        colorOffset  [[ buffer(9) ]],
+    device const float*       patch        [[ buffer(11) ]],  // per-body patch radius (CD_FLAG_TORSION)
     uint i [[ thread_position_in_grid ]])
 {
     uint start = colorOffset[currentColor], end = colorOffset[currentColor + 1u];
     if (start + i >= end) return;                // partial tail of the last threadgroup
-    cdSolveContactVelocity(colorContacts[start + i], coins, bias, contacts, u, asleep, material, colliders);
+    cdSolveContactVelocity(colorContacts[start + i], coins, bias, contacts, u, asleep, material, colliders, patch);
 }
 
 // The colour sweep's fail-safe (VZ-0154). The host dispatches one coinSolveVelocityColor
@@ -3865,20 +4761,18 @@ kernel void coinSolveVelocityColor(
 // costs serial time on one threadgroup instead, and nothing when it is empty (every
 // thread reads the same prefix-sum offsets, so the early-out and the barriers are
 // uniform across the threadgroup).
-kernel void coinSolveVelocityTail(
-    device CoinBody*          coins        [[ buffer(0) ]],
-    device float4*            bias         [[ buffer(1) ]],
-    device CoinContact*       contacts     [[ buffer(2) ]],
-    device const uint*        colorContacts [[ buffer(3) ]],
-    constant CoinUniforms&    u            [[ buffer(4) ]],
-    constant uint&            firstColor   [[ buffer(5) ]],
-    device const uint*        asleep       [[ buffer(6) ]],
-    device const float2*      material     [[ buffer(7) ]],
-    device const CoinStaticCollider* colliders [[ buffer(8) ]],
-    device const uint*        colorOffset  [[ buffer(9) ]],
-    device const uint*        uncolSub     [[ buffer(10) ]],
-    uint tid    [[ thread_index_in_threadgroup ]],
-    uint tgSize [[ threads_per_threadgroup ]])
+static void cdSolveVelocityTailTG(uint firstColor, uint tid, uint tgSize,
+    device CoinBody*          coins,
+    device float4*            bias,
+    device CoinContact*       contacts,
+    device const uint*        colorContacts,
+    constant CoinUniforms&    u,
+    device const uint*        asleep,
+    device const float2*      material,
+    device const CoinStaticCollider* colliders,
+    device const uint*        colorOffset,
+    device const uint*        uncolSub,
+    device const float*       patch)
 {
     uint first = min(firstColor, CD_UNCOLORED_BUCKET);
     if (colorOffset[first] >= colorOffset[CD_UNCOLORED_BUCKET + 1u]) return;
@@ -3896,22 +4790,48 @@ kernel void coinSolveVelocityTail(
     uint nPasses = nColourPasses + (b1 > b0 ? nSub : 0u);
     for (uint pass = 0u; pass < nPasses; ++pass) {
         uint start, end, sub = 0xFFFFFFFFu;
-        if (pass < nColourPasses) { start = colorOffset[first + pass]; end = colorOffset[first + pass + 1u]; }
-        else                      { start = b0; end = b1; sub = pass - nColourPasses; }
+        if (pass < nColourPasses) {
+            start = colorOffset[first + pass];
+            // Every coloured contact is behind us (the offsets are cumulative and b0 is where
+            // the coloured ones end), so every colour from here up is empty: go straight to the
+            // uncoloured bucket's passes. Stage B3: walking the empty colours cost two dependent
+            // device loads each — ≈ 20 µs per call on the in-order GPU, i.e. per velocity
+            // iteration for a world whose contacts fill colour 0 (the small-world kernel sweeps
+            // from colour 0; the multi-dispatch tail from its split). They did nothing — no work,
+            // no barrier — so skipping them changes no bit of the result.
+            if (start >= b0) { pass = nColourPasses - 1u; continue; }
+            end = colorOffset[first + pass + 1u];
+        } else { start = b0; end = b1; sub = pass - nColourPasses; }
         if (start >= end) continue;
         for (uint k = start + tid; k < end; k += tgSize)
             if (sub == 0xFFFFFFFFu || uncolSub[k] == sub)
-                cdSolveContactVelocity(colorContacts[k], coins, bias, contacts, u, asleep, material, colliders);
+                cdSolveContactVelocity(colorContacts[k], coins, bias, contacts, u, asleep, material, colliders, patch);
         threadgroup_barrier(mem_flags::mem_device);
     }
 }
 
-kernel void coinIntegratePositionCS(
-    device CoinBody*       coins  [[ buffer(0) ]],
-    device const float4*   bias   [[ buffer(1) ]],
-    constant CoinUniforms& u      [[ buffer(2) ]],
-    device const uint*     asleep [[ buffer(3) ]],
-    uint id [[ thread_position_in_grid ]])
+kernel void coinSolveVelocityTail(
+    device CoinBody*          coins        [[ buffer(0) ]],
+    device float4*            bias         [[ buffer(1) ]],
+    device CoinContact*       contacts     [[ buffer(2) ]],
+    device const uint*        colorContacts [[ buffer(3) ]],
+    constant CoinUniforms&    u            [[ buffer(4) ]],
+    constant uint&            firstColor   [[ buffer(5) ]],
+    device const uint*        asleep       [[ buffer(6) ]],
+    device const float2*      material     [[ buffer(7) ]],
+    device const CoinStaticCollider* colliders [[ buffer(8) ]],
+    device const uint*        colorOffset  [[ buffer(9) ]],
+    device const uint*        uncolSub     [[ buffer(10) ]],
+    device const float*       patch        [[ buffer(11) ]],  // per-body patch radius (CD_FLAG_TORSION)
+    uint tid    [[ thread_index_in_threadgroup ]],
+    uint tgSize [[ threads_per_threadgroup ]])
+{
+    cdSolveVelocityTailTG(firstColor, tid, tgSize, coins, bias, contacts, colorContacts, u, asleep, material,
+                          colliders, colorOffset, uncolSub, patch);
+}
+
+static inline void cdIntegratePositionBody(uint id, device CoinBody* coins, device const float4* bias,
+                                           constant CoinUniforms& u, device const uint* asleep)
 {
     if (id >= u.coinCount) return;
     CoinBody c = coins[id];
@@ -3922,6 +4842,16 @@ kernel void coinIntegratePositionCS(
     coins[id].posInvMass.xyz = c.posInvMass.xyz + v * u.dt;
     coins[id].orient = cdIntegrateQuat(c.orient, w, u.dt);
     // bias is discarded (zeroed next substep) — it never persists into real velocity.
+}
+
+kernel void coinIntegratePositionCS(
+    device CoinBody*       coins  [[ buffer(0) ]],
+    device const float4*   bias   [[ buffer(1) ]],
+    constant CoinUniforms& u      [[ buffer(2) ]],
+    device const uint*     asleep [[ buffer(3) ]],
+    uint id [[ thread_position_in_grid ]])
+{
+    cdIntegratePositionBody(id, coins, bias, u, asleep);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -3946,15 +4876,47 @@ kernel void coinClearHash(
 
 // Snapshot the solved contacts into `prev` (so they survive the next regeneration),
 // and insert each into the open-addressing hash (pairKey → prev slot).
-kernel void coinSnapshotContacts(
-    device const CoinContact*  contacts     [[ buffer(0) ]],
-    device const atomic_uint&  contactCount [[ buffer(1) ]],
-    device CoinContact*        prev         [[ buffer(2) ]],
-    device atomic_uint*        pairHash     [[ buffer(3) ]],
-    constant uint&             hashSize     [[ buffer(4) ]],
+// ── KERNEL: capture every contact's pre-solve approach speed (manifoldSolve) ─────────
+//
+// The restitution target −e·vn₀ is anchored to the approach speed vn₀ the contact had
+// BEFORE the solve. The solve captures it lazily, on the contact's own first visit — in
+// colour order, so every contact after the first on a body reads an approach speed its
+// predecessors have already cut. A 12 mm L dropped flat from 3 mm (0.24 m/s): its first
+// corner captured the full impact and bounced (e 0.15), later corners captured less than
+// the 0.14 m/s rest threshold and did not, and the one-sided bounce tipped the L 0.5° in
+// the impact frame — at 60 iterations as at 20 (the capture, not convergence). Under
+// CD_FLAG_MANIFOLD_SOLVE every contact captures here instead, from the velocities before
+// the warm start and the first colour (Box2D's prepare stage); the solve's lazy capture
+// then finds aux.w = 1 and keeps it. Runs after the colouring, which has consumed the
+// manifold marker aux.w carried until now (it is packed into the colour entries).
+static inline void cdCaptureApproachBody(uint cid, uint n, device CoinContact* contacts,
+                                         device const CoinBody* coins, device const CoinStaticCollider* colliders)
+{
+    if (cid >= n) return;
+    CoinContact c = contacts[cid];
+    uint A = c.meta.x, B = c.meta.y;
+    CoinBody a = coins[A];
+    float3 vpA = a.vel.xyz + cross(a.angVel.xyz, c.rA.xyz);
+    float3 vpB;
+    if (B == CD_STATIC) vpB = cdColliderVelocity(colliders, c.meta.z & 0xFFFFu);
+    else { CoinBody b = coins[B]; vpB = b.vel.xyz + cross(b.angVel.xyz, c.rB.xyz); }
+    contacts[cid].aux.x = dot(vpA - vpB, c.nrm.xyz);
+    contacts[cid].aux.w = 1.0;
+}
+
+kernel void coinCaptureApproach(
+    device CoinContact*               contacts     [[ buffer(0) ]],
+    device const atomic_uint&         contactCount [[ buffer(1) ]],
+    device const CoinBody*            coins        [[ buffer(2) ]],
+    device const CoinStaticCollider*  colliders    [[ buffer(3) ]],
     uint cid [[ thread_position_in_grid ]])
 {
-    uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
+    cdCaptureApproachBody(cid, atomic_load_explicit(&contactCount, memory_order_relaxed), contacts, coins, colliders);
+}
+
+static inline void cdSnapshotContactBody(uint cid, uint n, device const CoinContact* contacts,
+                                         device CoinContact* prev, device atomic_uint* pairHash, uint hashSize)
+{
     if (cid >= n) return;
     CoinContact c = contacts[cid];
     prev[cid] = c;
@@ -3968,47 +4930,198 @@ kernel void coinSnapshotContacts(
     }
 }
 
+// CD_FLAG_KEEP_ASLEEP_CONTACTS: carry one entry of the last substep's contact table into this
+// substep's list while BOTH its ends are inert now (asleep, or asleep vs a static — generation
+// skipped the pair, VZ-0152), marked dormant (ext.z = 1: never coloured, never solved). The
+// snapshot then carries it on to the next substep, so a sleeping island's converged impulses stay
+// in the warm-start table for as long as it sleeps; the substep a touch wakes it, its fresh
+// contacts match them. One thread per hash slot: the table indexes exactly the last snapshot.
+// A carried contact is the same record (identity, points, normal, impulses): nothing it touches
+// moved while asleep. Appends like an emitter; the colouring's cursor clamp covers an overflow.
+static inline void cdCarryDormantBody(uint slot, uint hashSize, device const uint* pairHash,
+                                      device const CoinContact* prev, device const CoinBody* coins,
+                                      device const uint* asleep, device CoinContact* contacts,
+                                      device atomic_uint* contactCount, uint maxContacts)
+{
+    if (slot >= hashSize) return;
+    uint idx = pairHash[slot];
+    if (idx == CD_HASH_EMPTY || idx >= maxContacts) return;
+    CoinContact c = prev[idx];
+    uint A = c.meta.x, B = c.meta.y;
+    if (A >= maxContacts || asleep[A] == 0u || coins[A].posInvMass.w == 0.0) return;
+    if (B != CD_STATIC && (asleep[B] == 0u || coins[B].posInvMass.w == 0.0)) return;
+    uint k = atomic_fetch_add_explicit(contactCount, 1u, memory_order_relaxed);
+    if (k >= maxContacts) return;                    // buffer full — dropped (the clamp follows)
+    c.ext.z = 1.0;                                   // dormant
+    c.tan2.w = -1.0;                                 // uncoloured
+    contacts[k] = c;
+}
+
+kernel void coinCarryDormant(
+    device const uint*         pairHash     [[ buffer(0) ]],
+    constant uint&             hashSize     [[ buffer(1) ]],
+    device const CoinContact*  prev         [[ buffer(2) ]],
+    device const CoinBody*     coins        [[ buffer(3) ]],
+    device const uint*         asleep       [[ buffer(4) ]],
+    device CoinContact*        contacts     [[ buffer(5) ]],
+    device atomic_uint*        contactCount [[ buffer(6) ]],
+    constant uint&             maxContacts  [[ buffer(7) ]],
+    uint slot [[ thread_position_in_grid ]])
+{
+    cdCarryDormantBody(slot, hashSize, pairHash, prev, coins, asleep, contacts, contactCount, maxContacts);
+}
+
+kernel void coinSnapshotContacts(
+    device const CoinContact*  contacts     [[ buffer(0) ]],
+    device const atomic_uint&  contactCount [[ buffer(1) ]],
+    device CoinContact*        prev         [[ buffer(2) ]],
+    device atomic_uint*        pairHash     [[ buffer(3) ]],
+    constant uint&             hashSize     [[ buffer(4) ]],
+    uint cid [[ thread_position_in_grid ]])
+{
+    cdSnapshotContactBody(cid, atomic_load_explicit(&contactCount, memory_order_relaxed), contacts, prev,
+                          pairHash, hashSize);
+}
+
 // For each FRESH contact, find last substep's matching contact by pairKey and copy its
 // converged impulses (normal→rA.w, friction1→rB.w, friction2→tan1.w) as the warm seed.
+// `torsionOn`: 1 while CD_FLAG_TORSION is set this substep. The torsion impulse (ext.x) is
+// carried only then: the torsion row is what clamps / hands back a carried impulse, so once
+// the last patch is cleared (the flag drops) a carried ext.x would be re-applied by the warm
+// start every substep and never re-solved — a resting sphere cleared mid-slide went from
+// ω 3.50 to −7.68 rad/s in 30 substeps (0.373 rad/s per substep, without end).
+static inline void cdWarmStartMatchBody(uint cid, uint n, device CoinContact* contacts,
+                                        device const CoinContact* prev, device const uint* pairHash,
+                                        uint hashSize, device const CoinBody* coins, uint torsionOn)
+{
+    if (cid >= n) return;
+    uint key = contacts[cid].meta.w;
+    uint h = cdHashU(key) & (hashSize - 1u);
+    CoinContact me = contacts[cid];
+    bool posMatch = (key & 0xFF000000u) == CD_KEY_POSMATCH;
+    // Position fallback (polytope contacts only): the old point of the SAME pair nearest to
+    // this one in A's frame offset, within a tenth of the smaller body's half-thickness,
+    // with the normal within ~18°. VZ-0163: a 10 mm cube stacked square on another puts
+    // its corners exactly on the other's side planes, so slight wobble swaps a corner for
+    // two clip points and back every substep — an exact-id match then cold-started the
+    // manifold every other substep and a warm-started 5-cube tower still fell (frame 33);
+    // with the fallback it stands (worst tilt < 0.1°).
+    float tolMatch = 1e30;
+    if (posMatch) {
+        float hA = cdHalfThickOf(coins[me.meta.x]);
+        float hB = (me.meta.y == CD_STATIC) ? hA : cdHalfThickOf(coins[me.meta.y]);
+        tolMatch = 0.1 * min(hA, hB);
+    }
+    uint best = CD_HASH_EMPTY; float bestD = tolMatch;
+    for (uint probe = 0; probe < 32u; ++probe) {
+        uint slot = pairHash[(h + probe) & (hashSize - 1u)];
+        if (slot == CD_HASH_EMPTY) break;
+        CoinContact o = prev[slot];
+        // The WHOLE identity must match, not just the 32-bit key: the key packs 12-bit
+        // body ids and an 8-bit feature (or, for a polytope contact, the pair alone), so
+        // two contacts can share it — and a key collision seeded one contact with
+        // ANOTHER's impulse, at a different point.
+        if (all(o.meta == me.meta)) { best = slot; break; }
+        if (posMatch && o.meta.w == key && o.meta.x == me.meta.x && o.meta.y == me.meta.y
+            && (me.meta.y != CD_STATIC || (o.meta.z & 0xFFFFu) == (me.meta.z & 0xFFFFu))
+            && dot(o.nrm.xyz, me.nrm.xyz) > 0.95) {
+            float d = distance(o.rA.xyz, me.rA.xyz);
+            if (d < bestD) { bestD = d; best = slot; }
+        }
+    }
+    if (best != CD_HASH_EMPTY) {
+        CoinContact o = prev[best];
+        if (posMatch) {
+            // Re-project the old friction impulse onto this contact's tangent basis.
+            float3 Pt = o.rB.w * o.tan1.xyz + o.tan1.w * o.tan2.xyz;
+            contacts[cid].rA.w   = o.rA.w * max(dot(o.nrm.xyz, me.nrm.xyz), 0.0);
+            contacts[cid].rB.w   = dot(Pt, me.tan1.xyz);
+            contacts[cid].tan1.w = dot(Pt, me.tan2.xyz);
+            contacts[cid].ext.x  = (torsionOn != 0u) ? o.ext.x * max(dot(o.nrm.xyz, me.nrm.xyz), 0.0) : 0.0;   // torsion about n
+        } else {
+            contacts[cid].rA.w   = o.rA.w;     // warm seed (the solve continues from here)
+            contacts[cid].rB.w   = o.rB.w;
+            contacts[cid].tan1.w = o.tan1.w;
+            contacts[cid].ext.x  = (torsionOn != 0u) ? o.ext.x : 0.0;    // torsion (CD_FLAG_TORSION only)
+        }
+    }
+}
+
 kernel void coinWarmStartMatch(
     device CoinContact*        contacts     [[ buffer(0) ]],
     device const atomic_uint&  contactCount [[ buffer(1) ]],
     device const CoinContact*  prev         [[ buffer(2) ]],
     device const uint*         pairHash     [[ buffer(3) ]],
     constant uint&             hashSize     [[ buffer(4) ]],
+    device const CoinBody*     coins        [[ buffer(5) ]],
+    constant uint&             torsionOn    [[ buffer(6) ]],   // see cdWarmStartMatchBody
     uint cid [[ thread_position_in_grid ]])
 {
-    uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
-    if (cid >= n) return;
-    uint key = contacts[cid].meta.w;
-    uint h = cdHashU(key) & (hashSize - 1u);
-    for (uint probe = 0; probe < 32u; ++probe) {
-        uint slot = pairHash[(h + probe) & (hashSize - 1u)];
-        if (slot == CD_HASH_EMPTY) break;
-        if (prev[slot].meta.w == key) {
-            contacts[cid].rA.w   = prev[slot].rA.w;     // warm seed (the solve continues from here)
-            contacts[cid].rB.w   = prev[slot].rB.w;
-            contacts[cid].tan1.w = prev[slot].tan1.w;
-            return;
-        }
-    }
+    cdWarmStartMatchBody(cid, atomic_load_explicit(&contactCount, memory_order_relaxed), contacts, prev, pairHash,
+                         hashSize, coins, torsionOn);
 }
 
 // Apply the warm-start impulses to the bodies' velocities (per colour, race-free).
-static inline void cdWarmStartApplyContact(uint cid, device CoinBody* coins, device CoinContact* contacts) {
+//
+// One contact's warm-start impulse, applied to its two bodies — the pre-B1 code, its two
+// body updates now guarded by the VZ-0162 asleep test and otherwise untouched. Kept in
+// this exact shape, and called on its own for a single contact: Metal compiles with fast
+// math, so the rounding follows the shape of the code, and a loop-restructured copy (the
+// same arithmetic) stepped a warm-started pile differently from the pre-B1 engine. As it
+// is, a warm-started world with no body asleep steps bit-identically to it (240 frames of
+// a sphere / capsule / disc / egg pile, every body's state bit for bit).
+//
+// An ASLEEP end is immovable here exactly as in the solve (VZ-0162): the warm start used
+// to add its impulse to an asleep body's velocity with the body's real inverse mass — a
+// velocity nothing integrates (the body is frozen) but that the solve then READ as that
+// body's motion (vB), so an awake neighbour resting on a sleeping pile was solved against
+// a pile that "moved"; and a host-held kinematic body (setKinematicHold) got kicked.
+static inline void cdWarmStartApplyOne(uint cid, device CoinBody* coins, device CoinContact* contacts,
+                                       device const uint* asleep) {
     CoinContact c = contacts[cid];
     float jn = c.rA.w, jt1 = c.rB.w, jt2 = c.tan1.w;
     if (jn == 0.0 && jt1 == 0.0 && jt2 == 0.0) return;
     uint A = c.meta.x, B = c.meta.y; bool bStatic = (B == CD_STATIC);
     float3 P = jn * c.nrm.xyz + jt1 * c.tan1.xyz + jt2 * c.tan2.xyz;
-    CoinBody a = coins[A]; float invMa = a.posInvMass.w; float3 invIa = cdBodyInvInertia(a, invMa);
-    coins[A].vel.xyz    += invMa * P;
-    coins[A].angVel.xyz += cdApplyInvInertiaWorld(a.orient, invIa, cross(c.rA.xyz, P));
-    if (!bStatic) {
+    if (asleep[A] == 0u) {
+        CoinBody a = coins[A]; float invMa = a.posInvMass.w; float3 invIa = cdBodyInvInertia(a, invMa);
+        coins[A].vel.xyz    += invMa * P;
+        coins[A].angVel.xyz += cdApplyInvInertiaWorld(a.orient, invIa, cross(c.rA.xyz, P));
+    }
+    if (!bStatic && asleep[B] == 0u) {
         CoinBody b = coins[B]; float invMb = b.posInvMass.w; float3 invIb = cdBodyInvInertia(b, invMb);
         coins[B].vel.xyz    -= invMb * P;
         coins[B].angVel.xyz -= cdApplyInvInertiaWorld(b.orient, invIb, cross(c.rB.xyz, P));
     }
+}
+
+// The torsion row's warm start (CD_FLAG_TORSION): its carried impulse about n onto the awake
+// ends' spin — a separate step after cdWarmStartApplyOne, so that code keeps its exact shape.
+// ext.x is 0 unless the torsion row ran (every emitter writes 0; the match carries it only while
+// CD_FLAG_TORSION is set), so in a world without a patch — including one whose last patch was
+// just cleared — this reads one float and returns.
+static inline void cdWarmStartTorsionOne(uint cid, device CoinBody* coins, device const CoinContact* contacts,
+                                         device const uint* asleep) {
+    float lam = contacts[cid].ext.x;
+    if (lam == 0.0) return;
+    uint A = contacts[cid].meta.x, B = contacts[cid].meta.y;
+    float3 L = lam * contacts[cid].nrm.xyz;
+    if (asleep[A] == 0u) {
+        CoinBody a = coins[A];
+        coins[A].angVel.xyz = a.angVel.xyz + cdApplyInvInertiaWorld(a.orient, cdBodyInvInertia(a, a.posInvMass.w), L);
+    }
+    if (B != CD_STATIC && asleep[B] == 0u) {
+        CoinBody b = coins[B];
+        coins[B].angVel.xyz = b.angVel.xyz - cdApplyInvInertiaWorld(b.orient, cdBodyInvInertia(b, b.posInvMass.w), L);
+    }
+}
+
+// `entry` is a colorContacts entry: a grouped manifold's points are applied together.
+static inline void cdWarmStartApplyContact(uint entry, device CoinBody* coins, device CoinContact* contacts,
+                                           device const uint* asleep) {
+    uint cid0 = entry & CD_CC_MASK, nPts = max(entry >> CD_CC_SHIFT, 1u);
+    if (nPts == 1u) { cdWarmStartApplyOne(cid0, coins, contacts, asleep); cdWarmStartTorsionOne(cid0, coins, contacts, asleep); return; }
+    for (uint k = 0u; k < nPts; ++k) { cdWarmStartApplyOne(cid0 + k, coins, contacts, asleep); cdWarmStartTorsionOne(cid0 + k, coins, contacts, asleep); }
 }
 
 kernel void coinWarmStartApply(
@@ -4017,23 +5130,22 @@ kernel void coinWarmStartApply(
     device const uint*        colorContacts [[ buffer(2) ]],
     device const uint*        colorOffset   [[ buffer(4) ]],
     constant uint&            currentColor  [[ buffer(5) ]],
+    device const uint*        asleep        [[ buffer(6) ]],
     uint i [[ thread_position_in_grid ]])
 {
     uint start = colorOffset[currentColor], end = colorOffset[currentColor + 1u];
     if (start + i >= end) return;
-    cdWarmStartApplyContact(colorContacts[start + i], coins, contacts);
+    cdWarmStartApplyContact(colorContacts[start + i], coins, contacts, asleep);
 }
 
 // Serial tail of the warm-start sweep — coinSolveVelocityTail's twin (VZ-0154).
-kernel void coinWarmStartApplyTail(
-    device CoinBody*          coins         [[ buffer(0) ]],
-    device CoinContact*       contacts      [[ buffer(1) ]],
-    device const uint*        colorContacts [[ buffer(2) ]],
-    device const uint*        colorOffset   [[ buffer(4) ]],
-    constant uint&            firstColor    [[ buffer(5) ]],
-    device const uint*        uncolSub      [[ buffer(10) ]],
-    uint tid    [[ thread_index_in_threadgroup ]],
-    uint tgSize [[ threads_per_threadgroup ]])
+static void cdWarmStartApplyTailTG(uint firstColor, uint tid, uint tgSize,
+    device CoinBody*          coins,
+    device CoinContact*       contacts,
+    device const uint*        colorContacts,
+    device const uint*        colorOffset,
+    device const uint*        asleep,
+    device const uint*        uncolSub)
 {
     uint first = min(firstColor, CD_UNCOLORED_BUCKET);
     if (colorOffset[first] >= colorOffset[CD_UNCOLORED_BUCKET + 1u]) return;
@@ -4043,13 +5155,30 @@ kernel void coinWarmStartApplyTail(
     uint nPasses = nColourPasses + (b1 > b0 ? nSub : 0u);   // nSub 0: bucket left unsolved
     for (uint pass = 0u; pass < nPasses; ++pass) {
         uint start, end, sub = 0xFFFFFFFFu;
-        if (pass < nColourPasses) { start = colorOffset[first + pass]; end = colorOffset[first + pass + 1u]; }
-        else                      { start = b0; end = b1; sub = pass - nColourPasses; }
+        if (pass < nColourPasses) {
+            start = colorOffset[first + pass];
+            if (start >= b0) { pass = nColourPasses - 1u; continue; }   // the colours above are empty (see cdSolveVelocityTailTG)
+            end = colorOffset[first + pass + 1u];
+        } else { start = b0; end = b1; sub = pass - nColourPasses; }
         if (start >= end) continue;
         for (uint k = start + tid; k < end; k += tgSize)
-            if (sub == 0xFFFFFFFFu || uncolSub[k] == sub) cdWarmStartApplyContact(colorContacts[k], coins, contacts);
+            if (sub == 0xFFFFFFFFu || uncolSub[k] == sub) cdWarmStartApplyContact(colorContacts[k], coins, contacts, asleep);
         threadgroup_barrier(mem_flags::mem_device);
     }
+}
+
+kernel void coinWarmStartApplyTail(
+    device CoinBody*          coins         [[ buffer(0) ]],
+    device CoinContact*       contacts      [[ buffer(1) ]],
+    device const uint*        colorContacts [[ buffer(2) ]],
+    device const uint*        colorOffset   [[ buffer(4) ]],
+    constant uint&            firstColor    [[ buffer(5) ]],
+    device const uint*        asleep        [[ buffer(6) ]],
+    device const uint*        uncolSub      [[ buffer(10) ]],
+    uint tid    [[ thread_index_in_threadgroup ]],
+    uint tgSize [[ threads_per_threadgroup ]])
+{
+    cdWarmStartApplyTailTG(firstColor, tid, tgSize, coins, contacts, colorContacts, colorOffset, asleep, uncolSub);
 }
 
 // A body's bounding radius about its COM for the surface-speed tests: prevPos.w is
@@ -4057,12 +5186,8 @@ kernel void coinWarmStartApplyTail(
 // a capsule's full half-height (hl + r) — so the larger of the two bounds every shape.
 static float cdBoundRadiusOf(CoinBody c) { return max(cdRadiusOf(c), cdHalfThickOf(c)); }
 
-kernel void coinFinalizeCS(
-    device CoinBody*       coins  [[ buffer(0) ]],
-    constant CoinUniforms& u      [[ buffer(1) ]],
-    device const uint*     asleep [[ buffer(2) ]],
-    device const float4*   bias   [[ buffer(3) ]],   // .w of [2*id+1] = motor-driven marker
-    uint id [[ thread_position_in_grid ]])
+static inline void cdFinalizeBody(uint id, device CoinBody* coins, constant CoinUniforms& u,
+                                  device const uint* asleep, device const float4* bias)
 {
     if (id >= u.coinCount) return;
     CoinBody c = coins[id];
@@ -4103,6 +5228,16 @@ kernel void coinFinalizeCS(
 
     coins[id].vel.xyz = v;
     coins[id].angVel.xyz = w;
+}
+
+kernel void coinFinalizeCS(
+    device CoinBody*       coins  [[ buffer(0) ]],
+    constant CoinUniforms& u      [[ buffer(1) ]],
+    device const uint*     asleep [[ buffer(2) ]],
+    device const float4*   bias   [[ buffer(3) ]],   // .w of [2*id+1] = motor-driven marker
+    uint id [[ thread_position_in_grid ]])
+{
+    cdFinalizeBody(id, coins, u, asleep, bias);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -4194,27 +5329,42 @@ struct CoinJointPrep {
 };
 static_assert(sizeof(CoinJointPrep) == 496, "CoinJointPrep must match CoinDEMSolver.jointPrepStride");
 
-// LDLᵀ of the leading n×n block of the row-major 6×6 symmetric K. A pivot that has lost
-// all but 1e-7 of its diagonal is a dependent row: it is dropped (invD 0, L column 0).
-// Works in the caller's threadgroup scratch (see coinJointPrepare).
-static void cdLDLFactor(threadgroup const float* K, int n, threadgroup float* Lp, threadgroup float* invD,
-                        threadgroup float* D) {
+// LDLᵀ of the leading n×n block of the symmetric 6×6 K (lower triangle read). A pivot that has
+// lost all but 1e-7 of its diagonal is a dependent row: it is dropped (invD 0, L column 0).
+//
+// Everything here is FULLY UNROLLED over the six row slots (`#pragma unroll`, constant trip
+// counts), so every array index is a compile-time constant and the arrays live in registers.
+// Stage B3 (VZ-0169): the rolled loops before indexed K / L / D / Y in threadgroup scratch with
+// runtime indices and kept nine private arrays (gl, ga, pw, pe, c, h, r5, sb, cb) as stack
+// allocas — 157 basic blocks, 139 φ-nodes, every step a dependent memory round trip on ONE
+// thread: ≈ 86 µs to prepare a single hinge (the one-joint pendulum, per substep), the joint
+// prepare's whole critical path. `n` (the row count) stays a runtime value: a slot ≥ n is
+// skipped by a uniform predicate, as before.
+#define CD_LP(i, k) ((i) * ((i) - 1) / 2 + (k))
+static inline void cdLDLFactorReg(thread const float (&K)[6][6], int n, thread float (&Lp)[15],
+                                  thread float (&invD)[6], thread float (&D)[6]) {
+    #pragma clang loop unroll(full)
     for (int i = 0; i < 6; ++i) D[i] = 0.0;
+    #pragma clang loop unroll(full)
     for (int i = 0; i < 15; ++i) Lp[i] = 0.0;
+    #pragma clang loop unroll(full)
     for (int j = 0; j < 6; ++j) {
         invD[j] = 0.0;
         if (j >= n) continue;
-        float kjj = K[j * 6 + j];
+        float kjj = K[j][j];
         float d = kjj;
-        for (int k = 0; k < 5; ++k) { if (k < j) { float l = Lp[j * (j - 1) / 2 + k]; d -= l * l * D[k]; } }
+        #pragma clang loop unroll(full)
+        for (int k = 0; k < 5; ++k) { if (k < j) { float l = Lp[CD_LP(j, k)]; d -= l * l * D[k]; } }
         bool ok = kjj > 0.0 && d > 1e-7 * kjj;
         D[j] = ok ? d : 0.0;
         invD[j] = ok ? 1.0 / d : 0.0;
+        #pragma clang loop unroll(full)
         for (int i = 1; i < 6; ++i) {
             if (i <= j || i >= n) continue;
-            float s = K[i * 6 + j];
-            for (int k = 0; k < 5; ++k) { if (k < j) s -= Lp[i * (i - 1) / 2 + k] * Lp[j * (j - 1) / 2 + k] * D[k]; }
-            Lp[i * (i - 1) / 2 + j] = ok ? s * invD[j] : 0.0;
+            float s = K[i][j];
+            #pragma clang loop unroll(full)
+            for (int k = 0; k < 5; ++k) { if (k < j) s -= Lp[CD_LP(i, k)] * Lp[CD_LP(j, k)] * D[k]; }
+            Lp[CD_LP(i, j)] = ok ? s * invD[j] : 0.0;
         }
     }
 }
@@ -4273,7 +5423,7 @@ static float4 cdJointRelErr(float4 qa, float4 qb, float4 ref) {
 // velocity), writes only prep[slot].
 static void cdJointPrepareOne(uint slot, device const CoinJoint* joints, device const CoinBody* coins,
                               constant CoinUniforms& u, device const uint* asleep,
-                              device CoinJointPrep* prep, threadgroup float* scratch)
+                              device CoinJointPrep* prep)
 {
     CoinJoint jn = joints[slot];
     device CoinJointPrep& P = prep[slot];
@@ -4281,6 +5431,11 @@ static void cdJointPrepareOne(uint slot, device const CoinJoint* joints, device 
     float4 oa0 = P.acc0, oa1 = P.acc1;
     float3 Pw = oa0.xyz, Lw = oa1.xyz;
     float lamM = oa0.w, lamL = oa1.w, sideOld = P.mCfg.z;
+    // A DISTANCE joint's swing-friction impulse (VZ-0168; rF1.xyz, a world vector ⟂ the fall).
+    // Every other type writes rF1 with its free-row data, a distance joint without friction
+    // writes 0, and the list upload zeroes it on a cold start — so a fall starts from 0.
+    float3 fricOld = P.rF1.xyz;
+    float fricArm = 0.0, fricLen = 1.0;
 
     uint A = jn.meta.y, B = jn.meta.z;
     bool bWorld = (B == CD_STATIC);
@@ -4320,6 +5475,7 @@ static void cdJointPrepareOne(uint slot, device const CoinJoint* joints, device 
 
     // Rows: gl[i] / ga[i] = the linear / angular part of row i (u_i = gl·dv + ga·dw).
     float3 gl[6], ga[6];
+    #pragma clang loop unroll(full)
     for (int i = 0; i < 6; ++i) { gl[i] = float3(0.0); ga[i] = float3(0.0); }
     float biasT[6] = { 0, 0, 0, 0, 0, 0 };
     int   nEq = 0;
@@ -4334,6 +5490,8 @@ static void cdJointPrepareOne(uint slot, device const CoinJoint* joints, device 
         gl[0] = d / len;
         biasT[0] = -beta * (len - jn.anchorA.w) * invDt;
         nEq = 1;
+        fricArm = max(jn.anchorB.w, 0.0);   // swing friction arm (m), VZ-0168; 0 = frictionless
+        fricLen = len;
     } else if (type == CD_JOINT_PRISMATIC) {
         float3 aW = normalize(cdQuatRotate(qa, jn.axisA.xyz));
         float3 b1, b2; cdPerpBasis(aW, b1, b2);
@@ -4451,70 +5609,81 @@ static void cdJointPrepareOne(uint slot, device const CoinJoint* joints, device 
     // The previous impulses projected onto this substep's equality rows (their directions
     // are orthonormal within the linear and within the angular block).
     float3 Pn = float3(0.0), Ln = float3(0.0);
+    #pragma clang loop unroll(full)
     for (int i = 0; i < 6; ++i) {
         if (i >= nEq) continue;
         float l = dot(gl[i], Pw) + dot(ga[i], Lw);
         Pn += l * gl[i]; Ln += l * ga[i];
     }
 
-    // K, its factor and Y live in this thread's threadgroup scratch: as local arrays they
-    // spilled to stack memory and the Y / W sums alone took ~45 µs a joint (measured).
-    threadgroup float* K = scratch;             // 36
-    threadgroup float* Lp = scratch + 36;       // 15
-    threadgroup float* invD = scratch + 51;     // 6
-    threadgroup float* Dd = scratch + 57;       // 6
-    threadgroup float* Y = scratch + 63;        // 36 (99 floats in all)
-
+    // K, its factor, Y and the sums below are registers: every loop is fully unrolled over
+    // the six row slots, so every index is a compile-time constant (see cdLDLFactorReg).
+    //
     // K = G·M̃·Gᵀ: row i's unit impulse → the body response → every row's velocity.
-    for (int i = 0; i < 36; ++i) K[i] = 0.0;
+    float K[6][6];
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 6; ++i) {
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 6; ++j) K[i][j] = 0.0;
+    }
+    #pragma clang loop unroll(full)
     for (int i = 0; i < 6; ++i) {
         if (i >= n) continue;
         float3 dvA = float3(0.0), dwA = float3(0.0), dvB = float3(0.0), dwB = float3(0.0);
         cdJApply(gl[i], ga[i], rA, rB, invMa, invMb, iA0, iA1, iB0, iB1, dvA, dwA, dvB, dwB);
         float3 rdv = (dvA + cross(dwA, rA)) - (dvB + cross(dwB, rB));
         float3 rdw = dwB - dwA;
+        #pragma clang loop unroll(full)
         for (int j = 0; j < 6; ++j) {
             if (j > i) continue;
             float k = dot(gl[j], rdv) + dot(ga[j], rdw);
-            K[i * 6 + j] = k; K[j * 6 + i] = k;
+            K[i][j] = k; K[j][i] = k;
         }
     }
-    float kMotor = K[35];
-    cdLDLFactor(K, n, Lp, invD, Dd);
+    float kMotor = K[5][5];
+    float Lp[15], invD[6], Dd[6];
+    cdLDLFactorReg(K, n, Lp, invD, Dd);
 
     // Y = L⁻¹·G (forward substitution down each of G's 6 columns; rows ≥ n are 0). Then,
     // with K⁻¹ = L⁻ᵀ·D⁻¹·L⁻¹ and the free row LAST:
     //   W   = Gᵀ·K⁻¹·G      = Σ_{i<n}   Yᵢ·Yᵢᵀ/Dᵢ      W_e = the same sum over i < nEq
     //   c   = Gᵀ·K⁻¹·(t₅e₅) = t₅/D₅·Y₅               (K⁻¹t)₅ = t₅/D₅
     //   (K⁻¹G)₅ = Y₅/D₅                                h = g₅ − G_eᵀK_ee⁻¹K_e5 = Y₅
+    float Y[6][6];
+    #pragma clang loop unroll(full)
     for (int i = 0; i < 6; ++i) {
-        Y[i * 6 + 0] = gl[i].x; Y[i * 6 + 1] = gl[i].y; Y[i * 6 + 2] = gl[i].z;
-        Y[i * 6 + 3] = ga[i].x; Y[i * 6 + 4] = ga[i].y; Y[i * 6 + 5] = ga[i].z;
+        Y[i][0] = gl[i].x; Y[i][1] = gl[i].y; Y[i][2] = gl[i].z;
+        Y[i][3] = ga[i].x; Y[i][4] = ga[i].y; Y[i][5] = ga[i].z;
     }
+    #pragma clang loop unroll(full)
     for (int i = 0; i < 6; ++i) {
+        #pragma clang loop unroll(full)
         for (int j = 0; j < 6; ++j) {
-            float s = (i < n) ? Y[i * 6 + j] : 0.0;
-            for (int k = 0; k < 5; ++k) { if (k < i && i < n) s -= Lp[i * (i - 1) / 2 + k] * Y[k * 6 + j]; }
-            Y[i * 6 + j] = s;
+            float s = (i < n) ? Y[i][j] : 0.0;
+            #pragma clang loop unroll(full)
+            for (int k = 0; k < 5; ++k) { if (k < i && i < n) s -= Lp[CD_LP(i, k)] * Y[k][j]; }
+            Y[i][j] = s;
         }
     }
     float pw[21], pe[21];
-    {
-        int idx = 0;
-        for (int k = 0; k < 6; ++k)
+    #pragma clang loop unroll(full)
+    for (int k = 0; k < 6; ++k) {
+        #pragma clang loop unroll(full)
         for (int j = 0; j < 6; ++j) {
             if (j < k) continue;
+            const int idx = k * 6 - k * (k - 1) / 2 + (j - k);   // row-major upper triangle
             float se = 0.0;
-            for (int i = 0; i < 6; ++i) { if (i < nEq) se += invD[i] * Y[i * 6 + k] * Y[i * 6 + j]; }
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 6; ++i) { if (i < nEq) se += invD[i] * Y[i][k] * Y[i][j]; }
             pe[idx] = se;
-            pw[idx] = se + (hasFree ? invD[5] * Y[30 + k] * Y[30 + j] : 0.0);
-            ++idx;
+            pw[idx] = se + (hasFree ? invD[5] * Y[5][k] * Y[5][j] : 0.0);
         }
     }
     float t5 = hasFree ? fTarget : 0.0;
     float c[6], h[6], r5[6];
+    #pragma clang loop unroll(full)
     for (int k = 0; k < 6; ++k) {
-        float y5k = hasFree ? Y[30 + k] : 0.0;
+        float y5k = hasFree ? Y[5][k] : 0.0;
         c[k] = t5 * invD[5] * y5k;
         r5[k] = invD[5] * y5k;
         h[k] = y5k;
@@ -4524,15 +5693,19 @@ static void cdJointPrepareOne(uint slot, device const CoinJoint* joints, device 
     bool bFull = !hasFree || fBiasOn;
     int  nb = bFull ? n : nEq;
     float sb[6] = { biasT[0], biasT[1], biasT[2], biasT[3], biasT[4], hasFree ? fBias : biasT[5] };
+    #pragma clang loop unroll(full)
     for (int i = 1; i < 6; ++i) {
         float s = sb[i];
-        for (int k = 0; k < 5; ++k) { if (k < i) s -= Lp[i * (i - 1) / 2 + k] * sb[k]; }
+        #pragma clang loop unroll(full)
+        for (int k = 0; k < 5; ++k) { if (k < i) s -= Lp[CD_LP(i, k)] * sb[k]; }
         sb[i] = s;
     }
     float cb[6];
+    #pragma clang loop unroll(full)
     for (int k = 0; k < 6; ++k) {
         float s = 0.0;
-        for (int i = 0; i < 6; ++i) { if (i < nb) s += invD[i] * Y[i * 6 + k] * sb[i]; }
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 6; ++i) { if (i < nb) s += invD[i] * Y[i][k] * sb[i]; }
         cb[k] = s;
     }
 
@@ -4558,6 +5731,48 @@ static void cdJointPrepareOne(uint slot, device const CoinJoint* joints, device 
     P.W[4] = float4(pw[16], pw[17], pw[18], pw[19]); P.We[4] = float4(pe[16], pe[17], pe[18], pe[19]);
     P.W[5] = float4(pw[20], c[0], c[1], c[2]);     P.We[5] = float4(pe[20], h[0], h[1], h[2]);
     P.W[6] = float4(c[3], c[4], c[5], 0.0);        P.We[6] = float4(h[3], h[4], h[5], 0.0);
+
+    // ── Swing friction of a DISTANCE joint (VZ-0168) ─────────────────────────────────
+    // A rope fall that runs over sheaves turns them as it swings (a hook block swinging by θ
+    // rolls the rope θ round every sheave in its plane), and each sheave's pin resists with a
+    // Coulomb moment μ_pin·r_pin·(pin load ≈ 2T). Lumped per fall as M = c·T (c = anchorB.w,
+    // the friction ARM, m): a force pair ⟂ the fall at its two anchors of up to M / L = (c/L)·T,
+    // i.e. two friction rows on the anchors' relative velocity ⟂ the fall, their ACCUMULATED
+    // impulse clamped to a disc of radius (c/L)·|Λ_axial| (Λ_axial the fall's own accumulated
+    // tension impulse) — the contact friction law with the rope tension as the normal load.
+    // Solved after the block each iteration (cdJointSolveReal); a free (distance) joint has no
+    // free row, so the free-row lanes carry it: gF0 = (fall direction, c/L), rF0.xyz = e1,
+    // gF1 = (K_t⁻¹: 11, 12, 22, on-flag), rF1.xyz = the accumulated impulse (world, ⟂ the fall).
+    if (type == CD_JOINT_DISTANCE && fricArm > 0.0) {
+        float3 dU = gl[0];
+        float3 e1, e2; cdPerpBasis(dU, e1, e2);
+        float k11, k12, k22;
+        {
+            float3 dvA = float3(0.0), dwA = float3(0.0), dvB = float3(0.0), dwB = float3(0.0);
+            cdJApply(e1, float3(0.0), rA, rB, invMa, invMb, iA0, iA1, iB0, iB1, dvA, dwA, dvB, dwB);
+            float3 rdv = (dvA + cross(dwA, rA)) - (dvB + cross(dwB, rB));
+            k11 = dot(e1, rdv); k12 = dot(e2, rdv);
+        }
+        {
+            float3 dvA = float3(0.0), dwA = float3(0.0), dvB = float3(0.0), dwB = float3(0.0);
+            cdJApply(e2, float3(0.0), rA, rB, invMa, invMb, iA0, iA1, iB0, iB1, dvA, dwA, dvB, dwB);
+            float3 rdv = (dvA + cross(dwA, rA)) - (dvB + cross(dwB, rB));
+            k22 = dot(e2, rdv);
+        }
+        float det = k11 * k22 - k12 * k12;
+        bool ok = det > 1e-12 * max(k11 * k22, 1e-30);
+        float muEff = fricArm / fricLen;
+        // Warm start: last substep's impulse, re-projected ⟂ this substep's fall and kept inside
+        // the disc of the fall's warm-started tension.
+        float3 Pf = fricOld - dot(fricOld, dU) * dU;
+        float cap = muEff * abs(dot(Pn, dU));
+        float pl = length(Pf);
+        if (pl > cap) Pf *= cap / max(pl, 1e-30);
+        P.gF0 = float4(dU, muEff);
+        P.rF0 = float4(e1, 0.0);
+        P.gF1 = ok ? float4(k22 / det, -k12 / det, k11 / det, 1.0) : float4(0.0);
+        P.rF1 = float4(ok ? Pf : float3(0.0), 0.0);
+    }
 }
 
 // Warm start one joint: its accumulated impulses onto the REAL velocities of its movable
@@ -4576,6 +5791,7 @@ static void cdJointWarmStartOne(uint slot, device CoinBody* coins, device float4
     float3 Pi = a0.xyz, Li = a1.xyz;
     if (fk != 0) { float l = (fk == 1) ? a0.w : a1.w; Pi += l * g0.xyz; Li += l * g1.xyz; }
     if (hdr.z > 0.5) { float l = a0.w * mc.z; Pi += l * g0.xyz; Li += l * g1.xyz; }   // motor pre-row (unsigned)
+    if (hdr.x < 1.5 && g1.w > 0.5) Pi += P.rF1.xyz;   // a DISTANCE joint's swing friction (VZ-0168), at the anchors
     float3 vA = coins[A].vel.xyz, wA = coins[A].angVel.xyz;
     float3 vB = float3(0.0), wB = float3(0.0);
     if (!bWorld) { vB = coins[B].vel.xyz; wB = coins[B].angVel.xyz; }
@@ -4591,30 +5807,89 @@ static void cdJointWarmStartOne(uint slot, device CoinBody* coins, device float4
     }
 }
 
-// Per substep, ONE threadgroup of ≤ CD_JPREP_TG threads: every thread prepares a share of
-// the active joints in parallel (independent per slot) in its own threadgroup scratch,
-// then thread 0 applies the warm starts serially (joints share bodies).
-constant uint CD_JPREP_TG = 32u;           // max threads per group (CoinDEMSolver.encodeJointPrepare)
-constant uint CD_JPREP_SCRATCH = 100u;     // floats of threadgroup scratch per thread
+// Per substep, ONE threadgroup: every thread prepares a share of the active joints in parallel
+// (independent per slot, all in registers — cdJointPrepareOne), then thread 0 applies the warm
+// starts serially (joints share bodies).
+// The joints ACTIVE this substep (the prepare's hdr.w — both ends live, not both asleep), in list
+// order: list[CD_JLIST_ACTIVE + i] = the list index of the i-th, list[CD_JLIST_NACTIVE] = how many.
+// Written by the prepare's serial warm-start pass, read by every velocity iteration's solve, which
+// then stages, walks and writes back only those — the Digital Clock's 21 latch welds hold bars
+// that are asleep for the whole job, and their blocks were staged, walked and written back every
+// iteration for no work. Measured on the clock world (stage B3): the saving is small — within the
+// run-to-run noise of the joint solve (≤ 0.15 ms of a 1/180 s × 6 frame); the solve's cost is the
+// ACTIVE joints' serial Gauss–Seidel walk. The Gauss–Seidel order of the active joints is the list
+// order either way, so the result is unchanged (bit-identical on every parity world).
+constant uint CD_JLIST_ACTIVE  = 3072u;
+constant uint CD_JLIST_NACTIVE = 4096u;
+
+// The prepare pass for one threadgroup: the active joints in parallel, then their warm starts.
+//
+// PARALLEL PREPARE. Joint k (list order) runs on SIMD group k mod G, lane k / G (G = the group's
+// SIMD groups): the first G joints each get a SIMD group of their own, the next G share them as
+// second lanes, and so on — so any frame with ≤ G·w joints prepares them in ONE round. The cost
+// model behind it (stage B3, measured on an M1 Max): the prepare is ~1 500 instructions of
+// straight-line code (cdJointPrepareOne, fully unrolled), executed once per substep, so it runs
+// COLD out of the instruction cache — ≈ 12–22 ns per instruction against ≈ 2–4 ns warm (a
+// straight-line probe: 512 instructions warm 1.8 ns, 1 024+ never warm) — and the cost of a
+// SIMD group's stream does not grow with its active lanes (one fetch serves all 32) while the
+// groups fetch the same code concurrently. What costs is a group running a SECOND joint after the
+// first: the Digital Clock crane's 9 active joints on 8 groups (one lane each) left group 0
+// preparing two, back to back — ≈ 25 µs per substep of the ≈ 52.
+//
+// WARM STARTS. Serial on one thread in list order (joints share bodies; the order of their adds
+// is the result's), but only over the ACTIVE joints: SIMD group 0 reads 32 joints' active flags
+// at once (a ballot), writes their active-list entries in parallel, and its first lane applies
+// the set ones in order. It used to walk every listed joint — the clock's 21 latch welds hold
+// asleep bars — paying two dependent device loads (list → block header) per inactive joint on
+// the serial path.
+//
+// Every thread of the group must call it (one barrier). `tid` / `tgs` as in the kernel; `w` the
+// SIMD width.
+static void cdJointPrepareTG(uint tid, uint tgs, uint w,
+    device CoinBody*        coins,
+    device float4*          bias,
+    device const CoinJoint* joints,
+    device uint*            list,
+    uint                    count,
+    constant CoinUniforms&  u,
+    device const uint*      asleep,
+    device CoinJointPrep*   prep)
+{
+    uint W = max(w, 1u), nsg = max(1u, tgs / W), sg = tid / W, lane = tid % W;
+    if (sg < nsg)
+        for (uint k = sg + nsg * lane; k < count; k += nsg * W)
+            cdJointPrepareOne(list[k], joints, coins, u, asleep, prep);
+    threadgroup_barrier(mem_flags::mem_device);
+    if (sg == 0u) {
+        uint nActive = 0u;
+        for (uint k0 = 0u; k0 < count; k0 += W) {             // uniform across the SIMD group
+            uint k = k0 + lane;
+            bool act = (k < count) && prep[list[k]].hdr.w > 0.5;
+            ulong m = static_cast<ulong>(static_cast<simd_vote::vote_t>(simd_ballot(act)));   // lane l → bit l (W ≤ 64)
+            if (act) list[CD_JLIST_ACTIVE + nActive + uint(popcount(m & ((1ul << lane) - 1ul)))] = k;
+            if (lane == 0u)
+                for (ulong mm = m; mm != 0ul; mm &= mm - 1ul)
+                    cdJointWarmStartOne(list[k0 + uint(ctz(mm))], coins, bias, prep);
+            nActive += uint(popcount(m));
+        }
+        if (lane == 0u) list[CD_JLIST_NACTIVE] = nActive;
+    }
+}
 
 kernel void coinJointPrepare(
     device CoinBody*        coins  [[ buffer(0) ]],
     device float4*          bias   [[ buffer(1) ]],
     device const CoinJoint* joints [[ buffer(2) ]],
-    device const uint*      list   [[ buffer(3) ]],
+    device uint*            list   [[ buffer(3) ]],   // + the substep's active list (CD_JLIST_ACTIVE)
     constant uint&          count  [[ buffer(4) ]],
     constant CoinUniforms&  u      [[ buffer(5) ]],
     device const uint*      asleep [[ buffer(6) ]],
     device CoinJointPrep*   prep   [[ buffer(7) ]],
     uint tid [[ thread_position_in_threadgroup ]],
-    uint tgs [[ threads_per_threadgroup ]])
+    uint tgs [[ threads_per_threadgroup ]],
+    uint w   [[ threads_per_simdgroup ]])
 {
-    threadgroup float scratch[CD_JPREP_TG * CD_JPREP_SCRATCH];
-    for (uint k = tid; k < count; k += tgs)
-        cdJointPrepareOne(list[k], joints, coins, u, asleep, prep, scratch + tid * CD_JPREP_SCRATCH);
-    threadgroup_barrier(mem_flags::mem_device);
-    if (tid != 0) return;
-    for (uint k = 0; k < count; ++k) cdJointWarmStartOne(list[k], coins, bias, prep);
+    cdJointPrepareTG(tid, tgs, w, coins, bias, joints, list, count, u, asleep, prep);
 }
 
 // One joint's velocity-iteration solve on register values: an exact block solve of its
@@ -4622,22 +5897,27 @@ kernel void coinJointPrepare(
 // two 6×6 mat-vecs from the substep's precomputed W / c (see the header above). `P` is
 // the joint's block (device or threadgroup memory); the body velocities and the two
 // accumulators are the caller's.
+//
+// TWO INDEPENDENT CHAINS (stage B3, VZ-0169). The real rows (with the motor pre-row and a
+// fall's swing friction) read and write only the REAL velocities and the accumulators; the
+// bias rows (split impulse) read and write only the BIAS velocities and read the block. So
+// the serial Gauss–Seidel walk over the joints is two walks that never exchange a value, and
+// cdJointSolveTG runs them on two SIMD groups at once — each chain the same instructions in
+// the same joint order as when one thread interleaved them, so the result is unchanged. (One
+// SIMD group on a core issues ≈ one instruction per 4 ns and waits ≈ 16 ns on a dependent
+// one — measured on an M1 Max — so the joint walk is instruction-bound: halving the stream
+// on the critical SIMD group is what makes it faster.)
 struct CdJBodies { float3 vA, wA, bvA, bwA, vB, wB, bvB, bwB; };
 
 template <typename PrepPtr>
-static inline void cdJointSolveCore(PrepPtr P, thread CdJBodies& b, thread float4& a0, thread float4& a1)
+static inline void cdJointSolveReal(PrepPtr P, thread CdJBodies& b, thread float4& a0, thread float4& a1)
 {
     float4 hdr = P->hdr, mass = P->mass, rA4 = P->rA, rB4 = P->rB;
-    float4 iA0 = P->iA0, iA1 = P->iA1, iB0 = P->iB0, iB1 = P->iB1, cb0 = P->cb0, cb1 = P->cb1;
+    float4 iA0 = P->iA0, iA1 = P->iA1, iB0 = P->iB0, iB1 = P->iB1;
     float4 w0 = P->W[0], w1 = P->W[1], w2 = P->W[2], w3 = P->W[3], w4 = P->W[4], w5 = P->W[5], w6 = P->W[6];
     int fk = int(hdr.y);
-    bool bFull = rA4.w > 0.5;
     float4 g0 = float4(0.0), g1 = float4(0.0), f0 = float4(0.0), f1 = float4(0.0), mc = float4(0.0);
-    float4 e0 = w0, e1 = w1, e2 = w2, e3 = w3, e4 = w4, e5 = w5, e6 = w6;
-    if (fk != 0) {
-        g0 = P->gF0; g1 = P->gF1; f0 = P->rF0; f1 = P->rF1; mc = P->mCfg;
-        e0 = P->We[0]; e1 = P->We[1]; e2 = P->We[2]; e3 = P->We[3]; e4 = P->We[4]; e5 = P->We[5]; e6 = P->We[6];
-    }
+    if (fk != 0) { g0 = P->gF0; g1 = P->gF1; f0 = P->rF0; f1 = P->rF1; mc = P->mCfg; }
     float invMa = mass.z, invMb = mass.w;
     float3 rA = rA4.xyz, rB = rB4.xyz;
 
@@ -4654,26 +5934,36 @@ static inline void cdJointSolveCore(PrepPtr P, thread CdJBodies& b, thread float
                  iA0, iA1, iB0, iB1, b.vA, b.wA, b.vB, b.wB);
     }
 
-    // (1) Real rows: z = c − W·y.
+    // (1) Real rows: z = c − W·y — or, when the free row's step would leave its bounds, the free
+    // row pinned at the bound and the equality rows absorbing the rest exactly: z = −W_e·y + h·Δλ.
+    // The free row's step x5 = t₅/D₅ − (K⁻¹G)₅·y does not depend on the block's product, so it is
+    // decided first and ONE of the two products is formed (the same values as forming W's and then
+    // replacing it); W_e is read only on that rare branch, so its 28 floats are never live across
+    // the rest of the chain (the serial walk runs on one thread: its registers are the budget).
     {
         float3 dv = (b.vA + cross(b.wA, rA)) - (b.vB + cross(b.wB, rB));
         float3 dw = b.wB - b.wA;
-        float3 zl, za;
-        cdSym6NegMul(w0, w1, w2, w3, w4, w5, dv, dw, zl, za);
-        zl += float3(w5.y, w5.z, w5.w); za += w6.xyz;
-        float3 El = zl, Ea = za;                            // the equality rows' share
+        float x5 = 0.0, got = 0.0;
+        bool pinned = false;
         if (fk != 0) {
-            float x5 = g0.w - (dot(f0.xyz, dv) + dot(f1.xyz, dw));
+            x5 = g0.w - (dot(f0.xyz, dv) + dot(f1.xyz, dw));
             float accF = (fk == 1) ? a0.w : a1.w;
             float want = accF + x5;
-            float got = clamp(want, f0.w, f1.w);
-            if (got != want) {
-                // Pin the free row at its bound; the equality rows absorb the rest
-                // exactly: z = −W_e·y + h·Δλ.
-                x5 = got - accF;
-                cdSym6NegMul(e0, e1, e2, e3, e4, e5, dv, dw, zl, za);
-                zl += x5 * float3(e5.y, e5.z, e5.w); za += x5 * e6.xyz;
-            }
+            got = clamp(want, f0.w, f1.w);
+            pinned = got != want;
+            if (pinned) x5 = got - accF;
+        }
+        float3 zl, za;
+        if (!pinned) {
+            cdSym6NegMul(w0, w1, w2, w3, w4, w5, dv, dw, zl, za);
+            zl += float3(w5.y, w5.z, w5.w); za += w6.xyz;
+        } else {
+            float4 e0 = P->We[0], e1 = P->We[1], e2 = P->We[2], e3 = P->We[3], e4 = P->We[4], e5 = P->We[5], e6 = P->We[6];
+            cdSym6NegMul(e0, e1, e2, e3, e4, e5, dv, dw, zl, za);
+            zl += x5 * float3(e5.y, e5.z, e5.w); za += x5 * e6.xyz;
+        }
+        float3 El = zl, Ea = za;                            // the equality rows' share
+        if (fk != 0) {
             if (fk == 1) a0.w = got; else a1.w = got;
             El = zl - x5 * g0.xyz; Ea = za - x5 * g1.xyz;
         }
@@ -4681,16 +5971,45 @@ static inline void cdJointSolveCore(PrepPtr P, thread CdJBodies& b, thread float
         cdJApply(zl, za, rA, rB, invMa, invMb, iA0, iA1, iB0, iB1, b.vA, b.wA, b.vB, b.wB);
     }
 
-    // (2) Bias rows (split impulse): z_b = c_b − W_b·y_b. Not accumulated.
-    {
-        float3 dv = (b.bvA + cross(b.bwA, rA)) - (b.bvB + cross(b.bwB, rB));
-        float3 dw = b.bwB - b.bwA;
-        float3 zl, za;
-        if (bFull) cdSym6NegMul(w0, w1, w2, w3, w4, w5, dv, dw, zl, za);
-        else       cdSym6NegMul(e0, e1, e2, e3, e4, e5, dv, dw, zl, za);
-        zl += cb0.xyz; za += cb1.xyz;
-        cdJApply(zl, za, rA, rB, invMa, invMb, iA0, iA1, iB0, iB1, b.bvA, b.bwA, b.bvB, b.bwB);
+    // (1b) A DISTANCE joint's swing friction (VZ-0168; see the prepare): the anchors' relative
+    // velocity ⟂ the fall driven to 0, the accumulated impulse inside the disc of radius
+    // (c/L)·|Λ_axial| — Λ_axial the tension impulse the block has just accumulated.
+    if (hdr.x < 1.5 && P->gF1.w > 0.5) {
+        float4 dm = P->gF0, kk = P->gF1;
+        float3 e1 = P->rF0.xyz, e2 = cross(dm.xyz, e1);
+        float3 dv = (b.vA + cross(b.wA, rA)) - (b.vB + cross(b.wB, rB));
+        float2 ut = float2(dot(e1, dv), dot(e2, dv));
+        float3 Pold = P->rF1.xyz;
+        float2 ln = float2(dot(e1, Pold), dot(e2, Pold)) - float2(kk.x * ut.x + kk.y * ut.y, kk.y * ut.x + kk.z * ut.y);
+        float cap = dm.w * abs(dot(a0.xyz, dm.xyz));
+        float l = length(ln);
+        if (l > cap) ln *= cap / max(l, 1e-30);
+        float3 Pnew = ln.x * e1 + ln.y * e2;
+        cdJApply(Pnew - Pold, float3(0.0), rA, rB, invMa, invMb, iA0, iA1, iB0, iB1, b.vA, b.wA, b.vB, b.wB);
+        P->rF1 = float4(Pnew, 0.0);
     }
+}
+
+// (2) Bias rows (split impulse): z_b = c_b − W_b·y_b. Not accumulated. W_b is the full W
+// unless the joint has a free row whose stop is not penetrated (then the equality rows' W_e).
+template <typename PrepPtr>
+static inline void cdJointSolveBias(PrepPtr P, thread CdJBodies& b)
+{
+    float4 hdr = P->hdr, mass = P->mass, rA4 = P->rA, rB4 = P->rB;
+    float4 iA0 = P->iA0, iA1 = P->iA1, iB0 = P->iB0, iB1 = P->iB1, cb0 = P->cb0, cb1 = P->cb1;
+    int fk = int(hdr.y);
+    bool bFull = rA4.w > 0.5;
+    float4 m0, m1, m2, m3, m4, m5;
+    if (bFull || fk == 0) { m0 = P->W[0];  m1 = P->W[1];  m2 = P->W[2];  m3 = P->W[3];  m4 = P->W[4];  m5 = P->W[5]; }
+    else                  { m0 = P->We[0]; m1 = P->We[1]; m2 = P->We[2]; m3 = P->We[3]; m4 = P->We[4]; m5 = P->We[5]; }
+    float invMa = mass.z, invMb = mass.w;
+    float3 rA = rA4.xyz, rB = rB4.xyz;
+    float3 dv = (b.bvA + cross(b.bwA, rA)) - (b.bvB + cross(b.bwB, rB));
+    float3 dw = b.bwB - b.bwA;
+    float3 zl, za;
+    cdSym6NegMul(m0, m1, m2, m3, m4, m5, dv, dw, zl, za);
+    zl += cb0.xyz; za += cb1.xyz;
+    cdJApply(zl, za, rA, rB, invMa, invMb, iA0, iA1, iB0, iB1, b.bvA, b.bwA, b.bvB, b.bwB);
 }
 
 // Threadgroup-cached solve: when the frame's active joints and the distinct bodies they
@@ -4711,8 +6030,200 @@ constant uint CD_JLIST_BODIES = 2048u;     // list[2048 + i] = cached body i's s
 constant uint CD_JLOCAL_WORLD = 0xFFFFu;   // "no body" (a world end)
 
 // One velocity iteration of every active joint: serial Gauss–Seidel over the list
-// (`passes` times). One threadgroup of up to 32 threads; `tgBodies` > 0 selects the
-// threadgroup-cached path, 0 the direct one (thread 0 alone, straight from device memory).
+// (`passes` times), as two chains (real / bias) on two SIMD groups. One threadgroup of 64
+// threads; `tgBodies` > 0 selects the threadgroup-cached path, 0 the direct one (straight
+// from device memory).
+// Threadgroup scratch of the cached pass: CD_JSOLVE_MAXJ blocks, then CD_JSOLVE_MAXB bodies × 4
+// float4 (v, ω, bias-v, bias-ω + marker) — 24 960 bytes.
+constant uint CD_JSOLVE_TG_BYTES = CD_JSOLVE_MAXJ * 496u + CD_JSOLVE_MAXB * 4u * 16u;
+
+// One velocity iteration of the joints for one threadgroup (see coinJointSolveCS); every
+// thread of the group must call it. `cached` is uniform across the group (read after a
+// barrier), so the early return of the direct path is taken by every thread together.
+//
+// RESIDENT BLOCKS (the small-world kernel, stage B3). Between two velocity iterations of one
+// substep nothing but this pass reads or writes a joint's block (the contact colours and the
+// feet touch bodies only), so a caller that keeps the threadgroup scratch across the iterations
+// passes `stageBlocks` only on the first and `writeBlocks` only on the last: the blocks (and the
+// stale check) stay in threadgroup memory, the accumulated impulses are written back once, and
+// each iteration re-stages only the bodies' velocities — the values the contacts changed. Every
+// joint still reads exactly the block values it would have read back from device memory, so the
+// result is the same bit for bit. The multi-dispatch kernel passes both on every call. A cached
+// body's slot rides in the .w of its first staged float4 (the solve reads .xyz only), so the later
+// iterations' staging and every write-back read it from threadgroup memory, not from the list.
+static void cdJointSolveTG(uint tid, uint tgs,
+    device CoinBody*       coins,
+    device float4*         bias,
+    device const uint*     list,
+    uint                   count,
+    device CoinJointPrep*  prep,
+    uint                   passes,
+    uint                   tgBodies,
+    threadgroup CoinJointPrep* tgP,      // [CD_JSOLVE_MAXJ]
+    threadgroup float4*        tgB,      // [CD_JSOLVE_MAXB * 4]
+    threadgroup atomic_uint&   tgStale,
+    bool                   stageBlocks = true,
+    bool                   writeBlocks = true)
+{
+    // Only the joints active this substep (CD_JLIST_ACTIVE, list order): tgP[i] holds the i-th.
+    uint nActive = list[CD_JLIST_NACTIVE];
+    if (nActive == 0u) return;                      // uniform: every thread reads the same count
+    device const uint* act = list + CD_JLIST_ACTIVE;
+    uint nb = tgBodies;
+    bool cached = nb != 0u && nb <= CD_JSOLVE_MAXB && count <= CD_JSOLVE_MAXJ;
+
+    if (cached && stageBlocks) {
+        // Threadgroup-cached path: stage …
+        if (tid == 0) atomic_store_explicit(&tgStale, 0u, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = tid; i < nActive; i += tgs) {
+            uint k = act[i];
+            tgP[i] = prep[list[k]];
+            // The body tables were built by the host from the joint table at ENCODE; the
+            // block was prepared from the table as it is NOW. A slot re-bound to other
+            // bodies in between (removeJoint + add*Joint re-using it while this frame was
+            // in flight) would get the OLD bodies' cached velocities: then this pass runs
+            // the direct path instead, which reads the bodies from the block itself.
+            if (tgP[i].hdr.w > 0.5) {
+                uint pr = list[CD_JLIST_PAIRS + k];
+                // The serial pass reads the pair word from here (mCfg.w is spare: the solve core
+                // reads mCfg.xyz, and the write-back never copies mCfg) instead of two dependent
+                // device loads (act[i] → list[…]) per joint per pass.
+                tgP[i].mCfg.w = as_type<float>(pr);
+                uint la = pr & 0xFFFFu, lb = pr >> 16;
+                uint A = as_type<uint>(tgP[i].mass.x), B = as_type<uint>(tgP[i].mass.y);
+                bool okB = (lb == CD_JLOCAL_WORLD) ? (B == CD_STATIC) : (list[CD_JLIST_BODIES + lb] == B);
+                if (list[CD_JLIST_BODIES + la] != A || !okB) atomic_store_explicit(&tgStale, 1u, memory_order_relaxed);
+            }
+        }
+        for (uint i = tid; i < nb; i += tgs) {
+            uint id = list[CD_JLIST_BODIES + i];
+            tgB[4*i]     = float4(coins[id].vel.xyz, as_type<float>(id));   // .w: the slot (see above)
+            tgB[4*i + 1] = float4(coins[id].angVel.xyz, 0.0);
+            tgB[4*i + 2] = bias[2*id];
+            tgB[4*i + 3] = bias[2*id + 1];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        cached = atomic_load_explicit(&tgStale, memory_order_relaxed) == 0u;   // uniform after the barrier
+    } else if (cached) {
+        // … or, the blocks resident from an earlier iteration of this substep, only the bodies
+        // (whose slots the first staging kept; its stale verdict stands — nothing re-binds a slot
+        // mid-frame).
+        for (uint i = tid; i < nb; i += tgs) {
+            uint id = as_type<uint>(tgB[4*i].w);
+            tgB[4*i].xyz = coins[id].vel.xyz;
+            tgB[4*i + 1] = float4(coins[id].angVel.xyz, 0.0);
+            tgB[4*i + 2] = bias[2*id];
+            tgB[4*i + 3] = bias[2*id + 1];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        cached = atomic_load_explicit(&tgStale, memory_order_relaxed) == 0u;
+    }
+
+    // The two chains (see cdJointSolveReal): the real one on thread 0, the bias one on the
+    // first thread of the NEXT SIMD group when the group has one (else thread 0 runs both, one
+    // after the other — the same values, since the chains never exchange one).
+    const uint realT = 0u, biasT = (tgs > 32u) ? 32u : 0u;
+
+    if (!cached) {
+        // Direct path: everything a joint needs is loaded before anything is stored.
+        if (tid == realT)
+        for (uint pass = 0; pass < passes; ++pass)
+        for (uint i = 0; i < nActive; ++i) {
+            device CoinJointPrep* P = &prep[list[act[i]]];
+            if (P->hdr.w < 0.5) continue;
+            float4 mass = P->mass, a0 = P->acc0, a1 = P->acc1;
+            uint A = as_type<uint>(mass.x), B = as_type<uint>(mass.y);
+            bool bWorld = (B == CD_STATIC);
+            CdJBodies bd;
+            bd.vA = coins[A].vel.xyz; bd.wA = coins[A].angVel.xyz;
+            bd.vB = float3(0.0); bd.wB = float3(0.0);
+            if (!bWorld) { bd.vB = coins[B].vel.xyz; bd.wB = coins[B].angVel.xyz; }
+            cdJointSolveReal(P, bd, a0, a1);
+            // Store: impulses, then the movable ends (an asleep or world end carried no impulse).
+            P->acc0 = a0; P->acc1 = a1;
+            if (mass.z > 0.0) { coins[A].vel.xyz = bd.vA; coins[A].angVel.xyz = bd.wA; }
+            if (!bWorld && mass.w > 0.0) { coins[B].vel.xyz = bd.vB; coins[B].angVel.xyz = bd.wB; }
+        }
+        if (tid == biasT)
+        for (uint pass = 0; pass < passes; ++pass)
+        for (uint i = 0; i < nActive; ++i) {
+            device CoinJointPrep* P = &prep[list[act[i]]];
+            if (P->hdr.w < 0.5) continue;
+            float4 mass = P->mass;
+            uint A = as_type<uint>(mass.x), B = as_type<uint>(mass.y);
+            bool bWorld = (B == CD_STATIC);
+            CdJBodies bd;
+            float4 bA0 = bias[2*A], bA1 = bias[2*A+1];
+            bd.bvA = bA0.xyz; bd.bwA = bA1.xyz;
+            float4 bB1 = float4(0.0);
+            bd.bvB = float3(0.0); bd.bwB = float3(0.0);
+            if (!bWorld) { bd.bvB = bias[2*B].xyz; bB1 = bias[2*B+1]; bd.bwB = bB1.xyz; }
+            cdJointSolveBias(P, bd);
+            // bias .w of [2·id + 1] is the motor-driven marker — carried through.
+            if (mass.z > 0.0) { bias[2*A] = float4(bd.bvA, 0.0); bias[2*A+1] = float4(bd.bwA, bA1.w); }
+            if (!bWorld && mass.w > 0.0) { bias[2*B] = float4(bd.bvB, 0.0); bias[2*B+1] = float4(bd.bwB, bB1.w); }
+        }
+        return;
+    }
+
+    // … solve serially out of threadgroup memory: the real chain …
+    if (tid == realT) {
+        for (uint pass = 0; pass < passes; ++pass)
+        for (uint i = 0; i < nActive; ++i) {
+            threadgroup CoinJointPrep* P = &tgP[i];
+            if (P->hdr.w < 0.5) continue;
+            uint pr = as_type<uint>(P->mCfg.w);             // staged above
+            uint la = pr & 0xFFFFu, lb = pr >> 16;
+            bool bWorld = (lb == CD_JLOCAL_WORLD);
+            float4 mass = P->mass, a0 = P->acc0, a1 = P->acc1;
+            CdJBodies bd;
+            bd.vA = tgB[4*la].xyz; bd.wA = tgB[4*la + 1].xyz;
+            bd.vB = float3(0.0); bd.wB = float3(0.0);
+            if (!bWorld) { bd.vB = tgB[4*lb].xyz; bd.wB = tgB[4*lb + 1].xyz; }
+            cdJointSolveReal(P, bd, a0, a1);
+            P->acc0 = a0; P->acc1 = a1;
+            if (mass.z > 0.0) { tgB[4*la].xyz = bd.vA; tgB[4*la + 1].xyz = bd.wA; }
+            if (!bWorld && mass.w > 0.0) { tgB[4*lb].xyz = bd.vB; tgB[4*lb + 1].xyz = bd.wB; }
+        }
+    }
+    // … and, at the same time, the bias chain.
+    if (tid == biasT) {
+        for (uint pass = 0; pass < passes; ++pass)
+        for (uint i = 0; i < nActive; ++i) {
+            threadgroup CoinJointPrep* P = &tgP[i];
+            if (P->hdr.w < 0.5) continue;
+            uint pr = as_type<uint>(P->mCfg.w);
+            uint la = pr & 0xFFFFu, lb = pr >> 16;
+            bool bWorld = (lb == CD_JLOCAL_WORLD);
+            float4 mass = P->mass;
+            CdJBodies bd;
+            bd.bvA = tgB[4*la + 2].xyz; bd.bwA = tgB[4*la + 3].xyz;
+            bd.bvB = float3(0.0); bd.bwB = float3(0.0);
+            if (!bWorld) { bd.bvB = tgB[4*lb + 2].xyz; bd.bwB = tgB[4*lb + 3].xyz; }
+            cdJointSolveBias(P, bd);
+            if (mass.z > 0.0) { tgB[4*la + 2] = float4(bd.bvA, 0.0); tgB[4*la + 3].xyz = bd.bwA; }   // .w: the marker, kept
+            if (!bWorld && mass.w > 0.0) { tgB[4*lb + 2] = float4(bd.bvB, 0.0); tgB[4*lb + 3].xyz = bd.bwB; }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // … and write back (an untouched body is rewritten with the values it had) — the blocks'
+    // impulses on the last iteration only when they stay resident.
+    if (writeBlocks)
+    for (uint i = tid; i < nActive; i += tgs) {
+        device CoinJointPrep* P = &prep[list[act[i]]];
+        P->acc0 = tgP[i].acc0; P->acc1 = tgP[i].acc1;
+        P->rF1 = tgP[i].rF1;   // a DISTANCE joint's swing-friction impulse (VZ-0168); else unchanged
+    }
+    for (uint i = tid; i < nb; i += tgs) {
+        uint id = as_type<uint>(tgB[4*i].w);
+        coins[id].vel.xyz = tgB[4*i].xyz;
+        coins[id].angVel.xyz = tgB[4*i + 1].xyz;
+        bias[2*id] = tgB[4*i + 2];
+        bias[2*id + 1] = tgB[4*i + 3];
+    }
+}
+
 kernel void coinJointSolveCS(
     device CoinBody*       coins    [[ buffer(0) ]],
     device float4*         bias     [[ buffer(1) ]],
@@ -4727,116 +6238,7 @@ kernel void coinJointSolveCS(
     threadgroup CoinJointPrep tgP[CD_JSOLVE_MAXJ];
     threadgroup float4        tgB[CD_JSOLVE_MAXB * 4];     // v, ω, bias-v, bias-ω (+ marker)
     threadgroup atomic_uint   tgStale;
-    uint nb = tgBodies;
-    bool cached = nb != 0u && nb <= CD_JSOLVE_MAXB && count <= CD_JSOLVE_MAXJ;
-
-    if (cached) {
-        // Threadgroup-cached path: stage …
-        if (tid == 0) atomic_store_explicit(&tgStale, 0u, memory_order_relaxed);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint k = tid; k < count; k += tgs) {
-            tgP[k] = prep[list[k]];
-            // The body tables were built by the host from the joint table at ENCODE; the
-            // block was prepared from the table as it is NOW. A slot re-bound to other
-            // bodies in between (removeJoint + add*Joint re-using it while this frame was
-            // in flight) would get the OLD bodies' cached velocities: then this pass runs
-            // the direct path instead, which reads the bodies from the block itself.
-            if (tgP[k].hdr.w > 0.5) {
-                uint pr = list[CD_JLIST_PAIRS + k];
-                uint la = pr & 0xFFFFu, lb = pr >> 16;
-                uint A = as_type<uint>(tgP[k].mass.x), B = as_type<uint>(tgP[k].mass.y);
-                bool okB = (lb == CD_JLOCAL_WORLD) ? (B == CD_STATIC) : (list[CD_JLIST_BODIES + lb] == B);
-                if (list[CD_JLIST_BODIES + la] != A || !okB) atomic_store_explicit(&tgStale, 1u, memory_order_relaxed);
-            }
-        }
-        for (uint i = tid; i < nb; i += tgs) {
-            uint id = list[CD_JLIST_BODIES + i];
-            tgB[4*i]     = float4(coins[id].vel.xyz, 0.0);
-            tgB[4*i + 1] = float4(coins[id].angVel.xyz, 0.0);
-            tgB[4*i + 2] = bias[2*id];
-            tgB[4*i + 3] = bias[2*id + 1];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        cached = atomic_load_explicit(&tgStale, memory_order_relaxed) == 0u;   // uniform after the barrier
-    }
-
-    if (!cached) {
-        // Direct path: everything a joint needs is loaded before anything is stored.
-        if (tid != 0) return;
-        for (uint pass = 0; pass < passes; ++pass)
-        for (uint k = 0; k < count; ++k) {
-            device CoinJointPrep* P = &prep[list[k]];
-            if (P->hdr.w < 0.5) continue;
-            float4 mass = P->mass, a0 = P->acc0, a1 = P->acc1;
-            uint A = as_type<uint>(mass.x), B = as_type<uint>(mass.y);
-            bool bWorld = (B == CD_STATIC);
-            CdJBodies bd;
-            bd.vA = coins[A].vel.xyz; bd.wA = coins[A].angVel.xyz;
-            float4 bA0 = bias[2*A], bA1 = bias[2*A+1];
-            bd.bvA = bA0.xyz; bd.bwA = bA1.xyz;
-            float4 bB1 = float4(0.0);
-            bd.vB = float3(0.0); bd.wB = float3(0.0); bd.bvB = float3(0.0); bd.bwB = float3(0.0);
-            if (!bWorld) {
-                bd.vB = coins[B].vel.xyz; bd.wB = coins[B].angVel.xyz;
-                bd.bvB = bias[2*B].xyz; bB1 = bias[2*B+1]; bd.bwB = bB1.xyz;
-            }
-            cdJointSolveCore(P, bd, a0, a1);
-            // Store: impulses, then the movable ends (an asleep or world end carried no
-            // impulse). bias .w is the motor-driven marker — carried through.
-            P->acc0 = a0; P->acc1 = a1;
-            if (mass.z > 0.0) {
-                coins[A].vel.xyz = bd.vA; coins[A].angVel.xyz = bd.wA;
-                bias[2*A] = float4(bd.bvA, 0.0); bias[2*A+1] = float4(bd.bwA, bA1.w);
-            }
-            if (!bWorld && mass.w > 0.0) {
-                coins[B].vel.xyz = bd.vB; coins[B].angVel.xyz = bd.wB;
-                bias[2*B] = float4(bd.bvB, 0.0); bias[2*B+1] = float4(bd.bwB, bB1.w);
-            }
-        }
-        return;
-    }
-
-    // … solve serially out of threadgroup memory …
-    if (tid == 0) {
-        for (uint pass = 0; pass < passes; ++pass)
-        for (uint k = 0; k < count; ++k) {
-            threadgroup CoinJointPrep* P = &tgP[k];
-            if (P->hdr.w < 0.5) continue;
-            uint pr = list[CD_JLIST_PAIRS + k];
-            uint la = pr & 0xFFFFu, lb = pr >> 16;
-            bool bWorld = (lb == CD_JLOCAL_WORLD);
-            float4 mass = P->mass, a0 = P->acc0, a1 = P->acc1;
-            CdJBodies bd;
-            bd.vA = tgB[4*la].xyz; bd.wA = tgB[4*la + 1].xyz; bd.bvA = tgB[4*la + 2].xyz; bd.bwA = tgB[4*la + 3].xyz;
-            bd.vB = float3(0.0); bd.wB = float3(0.0); bd.bvB = float3(0.0); bd.bwB = float3(0.0);
-            if (!bWorld) {
-                bd.vB = tgB[4*lb].xyz; bd.wB = tgB[4*lb + 1].xyz; bd.bvB = tgB[4*lb + 2].xyz; bd.bwB = tgB[4*lb + 3].xyz;
-            }
-            cdJointSolveCore(P, bd, a0, a1);
-            P->acc0 = a0; P->acc1 = a1;
-            if (mass.z > 0.0) {
-                tgB[4*la].xyz = bd.vA; tgB[4*la + 1].xyz = bd.wA;
-                tgB[4*la + 2] = float4(bd.bvA, 0.0); tgB[4*la + 3].xyz = bd.bwA;   // .w: the marker, kept
-            }
-            if (!bWorld && mass.w > 0.0) {
-                tgB[4*lb].xyz = bd.vB; tgB[4*lb + 1].xyz = bd.wB;
-                tgB[4*lb + 2] = float4(bd.bvB, 0.0); tgB[4*lb + 3].xyz = bd.bwB;
-            }
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    // … and write back (an untouched body is rewritten with the values it had).
-    for (uint k = tid; k < count; k += tgs) {
-        device CoinJointPrep* P = &prep[list[k]];
-        P->acc0 = tgP[k].acc0; P->acc1 = tgP[k].acc1;
-    }
-    for (uint i = tid; i < nb; i += tgs) {
-        uint id = list[CD_JLIST_BODIES + i];
-        coins[id].vel.xyz = tgB[4*i].xyz;
-        coins[id].angVel.xyz = tgB[4*i + 1].xyz;
-        bias[2*id] = tgB[4*i + 2];
-        bias[2*id + 1] = tgB[4*i + 3];
-    }
+    cdJointSolveTG(tid, tgs, coins, bias, list, count, prep, passes, tgBodies, tgP, tgB, tgStale);
 }
 
 // Once per frame: the host's compact list of ENABLED joint slots (setBytes, ≤ 4 KB) →
@@ -4868,17 +6270,14 @@ kernel void coinJointListUpload(
         prep[slot].acc0 = float4(0.0);
         prep[slot].acc1 = float4(0.0);
         prep[slot].mCfg = float4(0.0);
+        prep[slot].rF1 = float4(0.0);    // a DISTANCE joint's swing-friction impulse (VZ-0168)
     }
 }
 
 // Union the two bodies of each ACTIVE joint into one island, so an articulated
 // assembly sleeps and wakes as a unit (mirror of coinIslandUnion over contacts).
-kernel void coinIslandUnionJoints(
-    device atomic_uint*     label  [[ buffer(0) ]],
-    device const CoinJoint* joints [[ buffer(1) ]],
-    constant uint&          count  [[ buffer(2) ]],
-    device const uint*      list   [[ buffer(3) ]],
-    uint k [[ thread_position_in_grid ]])
+static inline void cdIslandUnionJointBody(uint k, device atomic_uint* label, device const CoinJoint* joints,
+                                          uint count, device const uint* list)
 {
     if (k >= count) return;
     CoinJoint jn = joints[list[k]];
@@ -4889,6 +6288,16 @@ kernel void coinIslandUnionJoints(
     uint lo = min(la, lb);
     atomic_fetch_min_explicit(&label[a], lo, memory_order_relaxed);
     atomic_fetch_min_explicit(&label[b], lo, memory_order_relaxed);
+}
+
+kernel void coinIslandUnionJoints(
+    device atomic_uint*     label  [[ buffer(0) ]],
+    device const CoinJoint* joints [[ buffer(1) ]],
+    constant uint&          count  [[ buffer(2) ]],
+    device const uint*      list   [[ buffer(3) ]],
+    uint k [[ thread_position_in_grid ]])
+{
+    cdIslandUnionJointBody(k, label, joints, count, list);
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -4918,18 +6327,33 @@ kernel void coinIslandUnionJoints(
 // asleep) never joins, so a despawn does not wake a heap (it didn't before either).
 constant uint CD_NO_KEY = 0xFFFFFFFFu;
 
-kernel void coinIslandInit(
-    device uint*           label    [[ buffer(0) ]],
-    constant CoinUniforms& u        [[ buffer(1) ]],
-    device uint*           sleepHub [[ buffer(2) ]],
-    uint id [[ thread_position_in_grid ]])
+static inline void cdIslandInitBody(uint id, device uint* label, constant CoinUniforms& u, device uint* sleepHub)
 {
     if (id >= u.coinCount) return;
     label[id] = id;
     sleepHub[id] = CD_NO_KEY;
 }
 
+kernel void coinIslandInit(
+    device uint*           label    [[ buffer(0) ]],
+    constant CoinUniforms& u        [[ buffer(1) ]],
+    device uint*           sleepHub [[ buffer(2) ]],
+    uint id [[ thread_position_in_grid ]])
+{
+    cdIslandInitBody(id, label, u, sleepHub);
+}
+
 // Hub of each sleep group = its smallest asleep, live member (after coinIslandInit).
+static inline void cdIslandSleepHubBody(uint id, device const CoinBody* coins, device const uint* asleep,
+                                        device const uint* sleepKey, device atomic_uint* sleepHub,
+                                        constant CoinUniforms& u)
+{
+    if (id >= u.coinCount) return;
+    uint key = sleepKey[id];
+    if (asleep[id] == 0u || key >= u.coinCount || coins[id].posInvMass.w == 0.0) return;
+    atomic_fetch_min_explicit(&sleepHub[key], id, memory_order_relaxed);
+}
+
 kernel void coinIslandSleepHub(
     device const CoinBody* coins    [[ buffer(0) ]],
     device const uint*     asleep   [[ buffer(1) ]],
@@ -4938,10 +6362,7 @@ kernel void coinIslandSleepHub(
     constant CoinUniforms& u        [[ buffer(4) ]],
     uint id [[ thread_position_in_grid ]])
 {
-    if (id >= u.coinCount) return;
-    uint key = sleepKey[id];
-    if (asleep[id] == 0u || key >= u.coinCount || coins[id].posInvMass.w == 0.0) return;
-    atomic_fetch_min_explicit(&sleepHub[key], id, memory_order_relaxed);
+    cdIslandSleepHubBody(id, coins, asleep, sleepKey, sleepHub, u);
 }
 
 static void cdUnionLabels(device atomic_uint* label, uint a, uint b) {
@@ -4956,6 +6377,29 @@ static void cdUnionLabels(device atomic_uint* label, uint a, uint b) {
 // Threads below coinCount ALSO apply their body's sleep-group edge (body → its group's
 // hub), so the rounds converge contact, joint and sleep-group connectivity together
 // with no extra dispatch (the grid is maxContacts ≥ maxCoins threads).
+// `n` = the contact count (the caller's read of the append cursor).
+static inline void cdIslandUnionBody(uint cid, uint n,
+    device atomic_uint*       label,
+    device const CoinContact* contacts,
+    device const CoinBody*    coins,
+    device const uint*        asleep,
+    device const uint*        sleepKey,
+    device const uint*        sleepHub,
+    constant CoinUniforms&    u)
+{
+    if (cid < u.coinCount && asleep[cid] != 0u) {
+        uint key = sleepKey[cid];
+        if (key < u.coinCount && coins[cid].posInvMass.w != 0.0) {
+            uint hub = sleepHub[key];
+            if (hub < u.coinCount && hub != cid) cdUnionLabels(label, cid, hub);
+        }
+    }
+    if (cid >= n) return;
+    CoinContact c = contacts[cid];
+    if (c.meta.y == CD_STATIC) return;                 // statics aren't solver DOFs
+    cdUnionLabels(label, c.meta.x, c.meta.y);
+}
+
 kernel void coinIslandUnion(
     device atomic_uint*       label        [[ buffer(0) ]],
     device const CoinContact* contacts     [[ buffer(1) ]],
@@ -4967,39 +6411,29 @@ kernel void coinIslandUnion(
     constant CoinUniforms&    u            [[ buffer(7) ]],
     uint cid [[ thread_position_in_grid ]])
 {
-    if (cid < u.coinCount && asleep[cid] != 0u) {
-        uint key = sleepKey[cid];
-        if (key < u.coinCount && coins[cid].posInvMass.w != 0.0) {
-            uint hub = sleepHub[key];
-            if (hub < u.coinCount && hub != cid) cdUnionLabels(label, cid, hub);
-        }
-    }
-    uint n = atomic_load_explicit(&contactCount, memory_order_relaxed);
-    if (cid >= n) return;
-    CoinContact c = contacts[cid];
-    if (c.meta.y == CD_STATIC) return;                 // statics aren't solver DOFs
-    cdUnionLabels(label, c.meta.x, c.meta.y);
+    cdIslandUnionBody(cid, atomic_load_explicit(&contactCount, memory_order_relaxed), label, contacts, coins,
+                      asleep, sleepKey, sleepHub, u);
 }
 
 // Pointer-jump: flatten label[id] toward its component root (run a few times after union).
-kernel void coinIslandJump(
-    device uint*           label [[ buffer(0) ]],
-    constant CoinUniforms& u     [[ buffer(1) ]],
-    uint id [[ thread_position_in_grid ]])
+static inline void cdIslandJumpBody(uint id, device uint* label, constant CoinUniforms& u)
 {
     if (id >= u.coinCount) return;
     uint l = label[id];
     label[id] = label[l];
 }
 
-// Per body: tick the slow-frame counter; then reset the per-island min accumulator.
-kernel void coinSleepTick(
-    device const CoinBody* coins      [[ buffer(0) ]],
-    device uint*           sleepTimer [[ buffer(1) ]],
-    device uint*           islandMin  [[ buffer(2) ]],
-    constant CoinUniforms& u          [[ buffer(3) ]],
-    device const float4*   bias       [[ buffer(4) ]],   // last substep's motor-driven marker (.w of [2*id+1])
+kernel void coinIslandJump(
+    device uint*           label [[ buffer(0) ]],
+    constant CoinUniforms& u     [[ buffer(1) ]],
     uint id [[ thread_position_in_grid ]])
+{
+    cdIslandJumpBody(id, label, u);
+}
+
+// Per body: tick the slow-frame counter; then reset the per-island min accumulator.
+static inline void cdSleepTickBody(uint id, device const CoinBody* coins, device uint* sleepTimer,
+                                   device uint* islandMin, constant CoinUniforms& u, device const float4* bias)
 {
     if (id >= u.coinCount) return;
     islandMin[id] = 0xFFFFFFFFu;
@@ -5019,8 +6453,26 @@ kernel void coinSleepTick(
     sleepTimer[id] = slow ? min(t + 1u, 100000u) : (t > 6u ? t - 6u : 0u);
 }
 
+kernel void coinSleepTick(
+    device const CoinBody* coins      [[ buffer(0) ]],
+    device uint*           sleepTimer [[ buffer(1) ]],
+    device uint*           islandMin  [[ buffer(2) ]],
+    constant CoinUniforms& u          [[ buffer(3) ]],
+    device const float4*   bias       [[ buffer(4) ]],   // last substep's motor-driven marker (.w of [2*id+1])
+    uint id [[ thread_position_in_grid ]])
+{
+    cdSleepTickBody(id, coins, sleepTimer, islandMin, u, bias);
+}
+
 // Reduce each island's MIN slow-frame count (an island is only as asleep as its
 // most-recently-moved body — so any motion anywhere keeps the whole island awake).
+static inline void cdIslandMinReduceBody(uint id, device const uint* label, device const uint* sleepTimer,
+                                         device atomic_uint* islandMin, constant CoinUniforms& u)
+{
+    if (id >= u.coinCount) return;
+    atomic_fetch_min_explicit(&islandMin[label[id]], sleepTimer[id], memory_order_relaxed);
+}
+
 kernel void coinIslandMinReduce(
     device const uint*  label      [[ buffer(0) ]],
     device const uint*  sleepTimer [[ buffer(1) ]],
@@ -5028,8 +6480,7 @@ kernel void coinIslandMinReduce(
     constant CoinUniforms& u       [[ buffer(3) ]],
     uint id [[ thread_position_in_grid ]])
 {
-    if (id >= u.coinCount) return;
-    atomic_fetch_min_explicit(&islandMin[label[id]], sleepTimer[id], memory_order_relaxed);
+    cdIslandMinReduceBody(id, label, sleepTimer, islandMin, u);
 }
 
 // Mark a body asleep iff its whole island has been slow for ≥ sleepFrames.
@@ -5045,15 +6496,9 @@ kernel void coinIslandMinReduce(
 // as a run-to-run lottery (see RigidPileFieldTests.testPileOfMessRestQuiet). Zeroing
 // on freeze is also what Box2D/Bullet do: asleep means at rest, so v ≡ 0. It cannot
 // lose momentum, because a frozen body was already not moving.
-kernel void coinSleepMark(
-    device const uint*     label     [[ buffer(0) ]],
-    device const uint*     islandMin [[ buffer(1) ]],
-    device uint*           asleep    [[ buffer(2) ]],
-    constant CoinUniforms& u         [[ buffer(3) ]],
-    constant uint&         sleepFrames [[ buffer(4) ]],
-    device CoinBody*       coins     [[ buffer(5) ]],
-    device uint*           sleepKey  [[ buffer(6) ]],
-    uint id [[ thread_position_in_grid ]])
+static inline void cdSleepMarkBody(uint id, device const uint* label, device const uint* islandMin,
+                                   device uint* asleep, constant CoinUniforms& u, uint sleepFrames,
+                                   device CoinBody* coins, device uint* sleepKey)
 {
     if (id >= u.coinCount) return;
     bool sleeping = (islandMin[label[id]] >= sleepFrames);
@@ -5065,6 +6510,19 @@ kernel void coinSleepMark(
         coins[id].vel.xyz    = float3(0.0);
         coins[id].angVel.xyz = float3(0.0);
     }
+}
+
+kernel void coinSleepMark(
+    device const uint*     label     [[ buffer(0) ]],
+    device const uint*     islandMin [[ buffer(1) ]],
+    device uint*           asleep    [[ buffer(2) ]],
+    constant CoinUniforms& u         [[ buffer(3) ]],
+    constant uint&         sleepFrames [[ buffer(4) ]],
+    device CoinBody*       coins     [[ buffer(5) ]],
+    device uint*           sleepKey  [[ buffer(6) ]],
+    uint id [[ thread_position_in_grid ]])
+{
+    cdSleepMarkBody(id, label, islandMin, asleep, u, sleepFrames, coins, sleepKey);
 }
 
 // Diagnostic probe: run GJK+EPA on coins[a],coins[b]; write [overlap, depthµm, nx,ny,nz].
@@ -5082,3 +6540,18 @@ kernel void coinGJKEPAProbe(
     result[0] = float4(hit ? 1.0 : 0.0, depth, 0.0, 0.0);
     result[1] = float4(nrm, 0.0);
 }
+
+// FOOT HOOK — the spring-foot actuator's kernels (CoinDEMSolver+Foot.swift). Last in the file:
+// they use the structs and helpers above. A solver without an active foot never dispatches them.
+#include "CoinDEMFoot.h"
+
+// The multi-dispatch substep's small kernels, fused (stage B3, engine plan 3b).
+#include "CoinDEMFusedKernels.h"
+
+// Prepared contact rows (stage B3, opt-in CoinDEMSolver.preparedContactSolve): the pose-constant
+// factors of every contact row computed once per substep.
+#include "CoinDEMPreparedSolve.h"
+
+// The SMALL-WORLD frame kernel (stage B3, engine plan 3c; CoinDEMSolver+SmallWorld.swift): a whole
+// constraint-path frame of a small world in one threadgroup dispatch, over the same step functions.
+#include "CoinDEMSmallWorld.h"

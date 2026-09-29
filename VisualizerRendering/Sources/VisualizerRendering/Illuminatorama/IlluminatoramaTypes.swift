@@ -35,7 +35,9 @@ public struct IlluminatoramaFrameUniforms {
     /// renderer from `extendedGBufferEnabled`, never by a host. Repurposes `_padDir`.
     public var extendedGBuffer: Float = 0
     public var directionalLightColor: SIMD3<Float>    // pre-multiplied intensity
-    public var _padColor: Float = 0
+    /// Defocus-aware shading rate's gate (`lightingDefocusShadingMinCoC`; 0 = off). Repurposes the
+    /// former `_padColor` pad — same 4 bytes, same offset.
+    public var lightingCoarseMinCoC: Float = 0
     public var ambientColor: SIMD3<Float>
     public var exposure: Float
     public var bloomThreshold: Float
@@ -1515,6 +1517,16 @@ struct IlluminatoramaGlassRTUniforms {
     var nightSkyExtra: SIMD4<Float> = .zero
     var nightSkyExtra2: SIMD4<Float> = .zero
     var nightCelestial: SIMD4<Float> = .zero
+    /// Defocus trace (`rtGlassDefocusTraceFactor`) — x = mode (0 OFF ⇒ exactly the previous
+    /// behaviour, 1 = the reduced-resolution trace pass, 2 = the full-resolution pass that takes
+    /// its result where the lens blurs the pane), y = factor k, z = the full-res pass's |CoC|
+    /// gate (px), w = the low-res pass's (lower) gate. Mirror of the Metal `defocus`.
+    var defocus: SIMD4<Float> = .zero
+    /// The DOF's lens for the gate: x = focus distance (m), y = CoC diameter coefficient (px),
+    /// z = max CoC radius (px), w = diffraction floor (px).
+    var defocusLens: SIMD4<Float> = .zero
+    /// xyz = the camera's unit view axis (depth is measured along it, as the DOF measures it).
+    var cameraForward: SIMD4<Float> = SIMD4(0, 0, -1, 0)
 
     mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
         let p = InteriorRoomGains.pack(gains, enabled: enabled)
@@ -1720,3 +1732,50 @@ public struct IlluminatoramaCamera {
 // compiles to tight vector compares — cheap enough to run on every frame.
 extension IlluminatoramaInstance: Equatable {}
 extension IlluminatoramaGlassInstance: Equatable {}
+
+// plausibility: real — an analytic ray-box room behind a pane, lit by a point lamp (inverse-square
+// × cosine, exact for an empty convex box) + a uniform one-bounce term. See
+// `IlluminatoramaRenderer.interiorMappedMeshKinds` and IlluminatoramaGBuffer.metal
+// `interiorMapRadiance`.
+/// Interior mapping (van Dongen 2008) for one mesh kind: the room box behind each pane.
+public struct IlluminatoramaInteriorMapping: Equatable, Sendable {
+    /// Room width, height, mean depth (m).
+    public var roomSize: SIMD3<Float>
+    /// Floor → the pane's bottom edge (m).
+    public var sillHeight: Float
+    /// The pane's width × height (m) — what its UVs span.
+    public var paneSize: SIMD2<Float>
+    /// Subtracted from uv.x before use (a host that biases u, e.g. to keep it positive).
+    public var uvBias: Float
+    /// ± fraction of the depth each window's room varies by (hashed per window).
+    public var depthJitter: Float
+    /// Wall albedo (linear); floor and ceiling as scales of it.
+    public var wallAlbedo: SIMD3<Float>
+    public var floorScale: Float
+    public var ceilingScale: Float
+    /// The lamp: height above the floor, inset from the back wall (m).
+    public var lampHeight: Float
+    public var lampInset: Float
+    /// Uniform one-bounce term, as a fraction of the back wall's direct light.
+    public var ambient: Float
+
+    public init(roomSize: SIMD3<Float> = SIMD3(3.6, 2.5, 4.0), sillHeight: Float = 0.8,
+                paneSize: SIMD2<Float>, uvBias: Float = 0, depthJitter: Float = 0.25,
+                wallAlbedo: SIMD3<Float> = SIMD3(0.55, 0.50, 0.44), floorScale: Float = 0.45,
+                ceilingScale: Float = 1.3, lampHeight: Float = 1.1, lampInset: Float = 0.7,
+                ambient: Float = 0.12) {
+        self.roomSize = roomSize; self.sillHeight = sillHeight; self.paneSize = paneSize
+        self.uvBias = uvBias; self.depthJitter = depthJitter; self.wallAlbedo = wallAlbedo
+        self.floorScale = floorScale; self.ceilingScale = ceilingScale
+        self.lampHeight = lampHeight; self.lampInset = lampInset; self.ambient = ambient
+    }
+
+    /// Mirror of the shader's `InteriorMapParams` (four float4s).
+    struct GPU { var room: SIMD4<Float>; var pane: SIMD4<Float>; var wall: SIMD4<Float>; var lamp: SIMD4<Float> }
+    var gpu: GPU {
+        GPU(room: SIMD4(roomSize.x, roomSize.y, roomSize.z, sillHeight),
+            pane: SIMD4(paneSize.x, paneSize.y, uvBias, depthJitter),
+            wall: SIMD4(wallAlbedo, floorScale),
+            lamp: SIMD4(lampHeight, lampInset, ceilingScale, ambient))
+    }
+}

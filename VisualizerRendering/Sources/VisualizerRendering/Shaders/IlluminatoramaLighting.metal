@@ -956,6 +956,76 @@ static inline float illumiContactShadow(
     return 0.0;
 }
 
+// ── DEFOCUS-AWARE SHADING RATE (opt-in, `lightingDefocusShadingMinCoC`, VZ-0197) ─────────────
+//
+// Where the lens will spread every pixel over a disc ≥ `frame.lightingCoarseMinCoC` px in radius
+// (a 16×16 tile whose geometry is ALL that far out of focus — the renderer's `illumi_dof_shading_tiles`
+// map), a 2×2 quad of ONE surface (four geometry pixels whose view depths agree within 2 %) is shaded
+// once, at its top-left pixel, and that radiance is written to all four: the depth-of-field gather
+// then averages it over > 100 px, so the 2×2 replication (a 2-px box, σ 0.5 px) widens the blur
+// against the disc's σ (≥ gate/2) by < 1.5 % at a 6-px gate and shifts it ½ px. A quad must also be
+// ONE orientation (its four normals within ~8°): an edge or a bevel carries thin highlights, whose
+// defocused image is a bokeh rim, not a smooth average. Every other pixel — in focus, a silhouette or sky
+// in the quad, a partial tile at the frame edge — is shaded exactly as before.
+//
+// Two variants, one dispatch each: COARSE (a thread per quad: shades the coarse quads, returns on the
+// rest) and SKIP (a thread per pixel: returns on exactly those quads, shades the rest). The two tests
+// are the same function of the same inputs, so every pixel is written by exactly one of them. Neither
+// constant defined (every other host, and this one while off) ⇒ the kernel is the one it always was.
+constant bool kLightingCoarseFC     [[function_constant(6)]];
+constant bool kLightingCoarseSkipFC [[function_constant(7)]];
+constant bool kLightingCoarse     = is_function_constant_defined(kLightingCoarseFC) && kLightingCoarseFC;
+constant bool kLightingCoarseSkip = is_function_constant_defined(kLightingCoarseSkipFC) && kLightingCoarseSkipFC;
+constant bool kLightingShadingRate = kLightingCoarse || kLightingCoarseSkip;
+// The shading-rate tile edge (px) — `illumi_dof_shading_tiles` reduces tiles of this size.
+constant uint kLightingRateTile = 16u;
+
+/// Is the 2×2 quad whose top-left pixel is `q` shaded once (the defocus shading rate)? The single
+/// test BOTH variants evaluate, so their pixel sets partition the frame.
+static inline bool lightingQuadIsCoarse(uint2 q, uint w, uint h,
+                                        depth2d<float, access::read> gDepth,
+                                        texture2d<half, access::read> gNormalRgh,
+                                        texture2d<float, access::read> rateTiles,
+                                        constant FrameUniforms& frame) {
+    if (!(frame.lightingCoarseMinCoC > 0.0)) return false;
+    if (q.x + 1u >= w || q.y + 1u >= h) return false;                  // a ragged edge: per pixel
+    uint2 t = min(q / kLightingRateTile, uint2(rateTiles.get_width() - 1u, rateTiles.get_height() - 1u));
+    if (rateTiles.read(t).r < frame.lightingCoarseMinCoC) return false; // not defocused throughout
+    float d0 = gDepth.read(q), d1 = gDepth.read(q + uint2(1u, 0u));
+    float d2 = gDepth.read(q + uint2(0u, 1u)), d3 = gDepth.read(q + uint2(1u, 1u));
+    if (max(max(d0, d1), max(d2, d3)) >= 0.99999) return false;        // sky in the quad: per pixel
+    // One surface: the four VIEW depths within 2 % (a perspective projection's z/w does not depend
+    // on the pixel's x, y — jitter included — so the axis unprojection is exact for all four).
+    float4 z;
+    for (uint k = 0u; k < 4u; ++k) {
+        float d = (k == 0u) ? d0 : (k == 1u) ? d1 : (k == 2u) ? d2 : d3;
+        float4 v = frame.invProjection * float4(0.0, 0.0, d, 1.0);
+        z[k] = abs(v.z / max(abs(v.w), 1e-8));
+    }
+    float zmin = min(min(z.x, z.y), min(z.z, z.w)), zmax = max(max(z.x, z.y), max(z.z, z.w));
+    if (zmax - zmin > 0.02 * zmin) return false;
+    // …and ONE orientation: the four shading normals within ~8° of the leader's. A bevel, a crease or
+    // a moulding's edge is where a thin specular highlight lives (the Digital Clock's moonlit sill at
+    // 23:47): lit once per quad it would alias along its length, a bright line's bokeh beading.
+    float3 n0 = octDecode(float2(gNormalRgh.read(q).rg));
+    for (uint k = 1u; k < 4u; ++k) {
+        uint2 p = q + uint2(k & 1u, k >> 1u);
+        if (dot(n0, octDecode(float2(gNormalRgh.read(p).rg))) < 0.99) return false;
+    }
+    return true;
+}
+
+/// Write one lighting output: this pixel, or — in the coarse variant — the whole 2×2 quad it leads.
+template <typename T>
+static inline void lightingStore(texture2d<T, access::write> tex, vec<T, 4> v, uint2 gid) {
+    tex.write(v, gid);
+    if (kLightingCoarse) {
+        tex.write(v, gid + uint2(1u, 0u));
+        tex.write(v, gid + uint2(0u, 1u));
+        tex.write(v, gid + uint2(1u, 1u));
+    }
+}
+
 kernel void illumi_lighting(
     texture2d<half,  access::read>          gAlbedoMet      [[texture(0)]],
     texture2d<half,  access::read>          gNormalRgh      [[texture(1)]],
@@ -1028,11 +1098,21 @@ kernel void illumi_lighting(
     // the host binds it exactly when it selects that variant (the bit requires a
     // live TLAS, so there is always a real accel to bind).
     instance_acceleration_structure         rtSunAccel      [[buffer(8), function_constant(kLightingRTSunShadow)]],
-    uint2                                   gid             [[thread_position_in_grid]]
+    // The defocus shading-rate tile map (least |CoC| of each 16×16 tile's geometry) — exists only in
+    // the coarse / skip variants (`kLightingShadingRate`), which the host binds it for.
+    texture2d<float, access::read>          rateTiles       [[texture(24), function_constant(kLightingShadingRate)]],
+    uint2                                   gidIn           [[thread_position_in_grid]]
 ) {
     uint w = outHDR.get_width();
     uint h = outHDR.get_height();
+    // Defocus shading rate (opt-in): the coarse variant runs a thread per 2×2 quad and shades its
+    // top-left pixel; the skip variant leaves exactly those quads to it. Off ⇒ gid = gidIn.
+    uint2 gid = kLightingCoarse ? gidIn * 2u : gidIn;
     if (gid.x >= w || gid.y >= h) return;
+    if (kLightingShadingRate) {
+        bool coarse = lightingQuadIsCoarse(gid & ~uint2(1u), w, h, gDepth, gNormalRgh, rateTiles, frame);
+        if (coarse != kLightingCoarse) return;
+    }
 
     float depth = gDepth.read(gid);
     half4 emH = gEmission.read(gid);
@@ -1059,9 +1139,9 @@ kernel void illumi_lighting(
         float3 celestials = nightCelestials(dir, night, pixAngle, sky);
         if (night.model > 0.5f) celestials *= saturate(skySample.a);
         sky += celestials;
-        outHDR.write(half4(half3(sky), 1.0h), gid);
+        lightingStore(outHDR, half4(half3(sky), 1.0h), gid);
         // Issue #65 — sky is never SSS; clear its mask so the composite skips it.
-        if (frame.sssStrength > 0.0) sssOut.write(half4(0.0h), gid);
+        if (frame.sssStrength > 0.0) lightingStore(sssOut, half4(0.0h), gid);
         return;
     }
 
@@ -1643,10 +1723,10 @@ kernel void illumi_lighting(
                 irradianceSrc = sampleDDGIIrradiance(worldPos, N,
                                                      ddgiIrrAtlas, ddgiDepthAtlas, ddgi);
             }
-            irrCacheCur.write(half4(half3(irradianceSrc), 1.0h), gid);
+            lightingStore(irrCacheCur, half4(half3(irradianceSrc), 1.0h), gid);
         } else {
             irradianceSrc = float3(irradianceCube.sample(cubeSampler, N).rgb);
-            irrCacheCur.write(half4(0.0h), gid);
+            lightingStore(irrCacheCur, half4(0.0h), gid);
         }
         // Phase 4.15 — IBL diffuse saturation boost. Procedural-gradient
         // backdrops that the extractor reuses as the IBL probe integrate
@@ -2097,12 +2177,12 @@ kernel void illumi_lighting(
             }
         }
     }
-    outHDR.write(half4(half3(color), 1.0h), gid);
+    lightingStore(outHDR, half4(half3(color), 1.0h), gid);
     if (specIBLOut.get_width() == outHDR.get_width() && frame.debugTerm == 0u) {
-        specIBLOut.write(half4(half3(specIBLInComposite), 0.0h), gid);
+        lightingStore(specIBLOut, half4(half3(specIBLInComposite), 0.0h), gid);
     }
     if (diffSkyOut.get_width() == outHDR.get_width() && frame.debugTerm == 0u) {
-        diffSkyOut.write(half4(half3(diffSkyInComposite), 0.0h), gid);
+        lightingStore(diffSkyOut, half4(half3(diffSkyInComposite), 0.0h), gid);
     }
 
     // Issue #65 — hand the diffuse-lit term to the separable SSS blur. rgb = the
@@ -2110,6 +2190,6 @@ kernel void illumi_lighting(
     // Skipped entirely when the scene hasn't opted in (sssStrength == 0), so the
     // binding is an unread dummy and non-SSS scenes pay nothing here.
     if (frame.sssStrength > 0.0) {
-        sssOut.write(half4(half3(sssDiffuse), isSSS ? 1.0h : 0.0h), gid);
+        lightingStore(sssOut, half4(half3(sssDiffuse), isSSS ? 1.0h : 0.0h), gid);
     }
 }

@@ -183,7 +183,7 @@ public struct CoinTransform {
 }
 
 // One contact-constraint (a manifold point) — the constraint solver's currency.
-// 112 bytes (7 × {u,f}16). Mirrors `CoinContact` in CoinDEM.metal exactly.
+// 128 bytes (8 × {u,f}16). Mirrors `CoinContact` in CoinDEM.metal exactly.
 public struct CoinContact {
     public var meta: SIMD4<UInt32>   // x=A, y=B (0xFFFFFFFF=static), z=collider|feature, w=pairKey
     public var nrm:  SIMD4<Float>    // xyz=normal (B→A), w=depth
@@ -191,7 +191,14 @@ public struct CoinContact {
     public var rB:   SIMD4<Float>    // xyz=cp−comB, w=tangent1Impulse
     public var tan1: SIMD4<Float>    // xyz=tangent1, w=tangent2Impulse
     public var tan2: SIMD4<Float>    // xyz=tangent2, w=colour
-    public var aux:  SIMD4<Float>    // x=pre-solve approach vn₀ (restitution target), yz=accumulated rolling impulse (opt-in), w=captured flag
+    // x = pre-solve approach vn₀ (restitution target), yz = accumulated rolling impulse (opt-in),
+    // w = captured flag (1 after the first solve pass); BEFORE it, the manifold marker of
+    // `manifoldSolve`: 0 ungrouped, −n the head of an n-point manifold, −0.25 a later point.
+    public var aux:  SIMD4<Float>
+    /// Stage B2 (torsional friction, `setPatchRadius`): x = accumulated torsional impulse
+    /// about the normal (N·m·s, + on A), y = the torsion capacity per unit normal impulse
+    /// the contact was solved with (μ·r_patch·share, m; 0 = no torsion row), zw reserved.
+    public var ext:  SIMD4<Float>
 }
 
 // One generic joint (constraint path). 96 bytes (6 × {u,f}16). Mirrors `CoinJoint`
@@ -205,6 +212,7 @@ public struct CoinJoint {
     public var meta:    SIMD4<UInt32>  // x=type(0 ball,1 hinge,2 distance,3 prismatic,4 weld), y=A, z=B(0xFFFFFFFF=world), w=enabled|collideConnected bits
     public var anchorA: SIMD4<Float>   // xyz=A-local anchor; w=rest length (distance) or motor target (hinge rad/s, prismatic m/s)
     public var anchorB: SIMD4<Float>   // xyz=B-local anchor (WORLD if z==world); w=motor max torque / force, >0 enables
+                                       //   (distance: w = swing-friction arm, m — setDistanceSwingFriction, VZ-0168)
     public var axisA:   SIMD4<Float>   // xyz=A-local hinge/slide axis, w=limit lo (rad / m)
     public var axisB:   SIMD4<Float>   // xyz=B-local hinge axis (WORLD if world), w=limit hi
     /// Relative orientation at creation, conj(qA)·qB (world joint: conj(qA)), as
@@ -250,6 +258,8 @@ struct CoinUniforms {
     var dragRefRadius: Float = 0.0          // radius where quadraticDrag is calibrated; drag ∝1/r per body. 0 = flat k
     var speculativeMargin: Float = 0.0      // emit near-contacts within this gap (anti-tunneling); 0 = off
     var solverFlags: UInt32 = 0             // CD_FLAG_* opt-in bits (see CoinDEM.metal); 0 = legacy
+    var maxBodyBound: Float = 0             // largest tight bounding radius spawned (broadphase reach, VZ-0161)
+    var manifoldPasses: UInt32 = 4          // Gauss–Seidel passes over a grouped manifold (manifoldSolve only)
 }
 
 @MainActor
@@ -313,6 +323,72 @@ public final class CoinDEMSolver: PenetrationProbing {
     private let markJointedPipeline: MTLComputePipelineState      // coinMarkJointedBodies (VZ-0153)
     private let islandSleepHubPipeline: MTLComputePipelineState   // coinIslandSleepHub (VZ-0152)
     private let solveTailPipeline: MTLComputePipelineState        // coinSolveVelocityTail (VZ-0154)
+    private let polyArgsPipeline: MTLComputePipelineState         // coinWritePolyArgs (stage B1)
+    private let polyNarrowPipeline: MTLComputePipelineState       // coinPolyNarrow: one thread per pair
+    private let captureApproachPipeline: MTLComputePipelineState  // coinCaptureApproach (manifoldSolve)
+    private let colorTentativePipeline: MTLComputePipelineState   // coinColorTentative (VZ-0160, .speculative)
+    private let colorResolvePipeline: MTLComputePipelineState     // coinColorResolve   (VZ-0160, .speculative)
+    /// The OPTIONAL stage-B3 pipelines — coinSmallWorldFrame and the prepared contact rows' three —
+    /// are resolved on FIRST USE (the first frame that opts in), not at init. coinSmallWorldFrame
+    /// inlines a whole substep; its cold backend compile is ≈ 6 s on an M1 Max (5.9–6.8 s measured
+    /// with the shader cache defeated; the prepared rows' three ≈ 0.25 s together), and resolving
+    /// it in init made EVERY solver pay that on the main actor after an engine change — Daydream
+    /// Home's egg rain and every scene, though only the Digital Clock takes the path. A kernel the
+    /// library lacks, or a device cannot build (the small-world kernel's 25 KB of threadgroup memory
+    /// on a 16 KB GPU), resolves to nil once and that path is simply never taken.
+    private let resolveOptionalPipeline: (String) -> MTLComputePipelineState?
+    private var optionalPipelines: [String: MTLComputePipelineState?] = [:]
+    private func optionalPipeline(_ name: String) -> MTLComputePipelineState? {
+        if let cached = optionalPipelines[name] { return cached }
+        let p = resolveOptionalPipeline(name)
+        optionalPipelines[name] = .some(p)
+        return p
+    }
+    /// coinSmallWorldFrame — a whole small-world frame in one dispatch (stage B3; nil when the
+    /// library lacks it, and then the small-world path is never taken). Resolved on first access.
+    var smallWorldPipeline: MTLComputePipelineState? { optionalPipeline("coinSmallWorldFrame") }
+    /// The prepared contact rows (stage B3, opt-in `preparedContactSolve`; Shaders/CoinDEMPreparedSolve.h):
+    /// the prepare pass and the prepared solve's per-colour / tail kernels. Optional like the
+    /// small-world pipeline — a library without them simply never prepares. Resolved on first access.
+    private var prepareContactsPipeline: MTLComputePipelineState? { optionalPipeline("coinPrepareContacts") }
+    /// The dormant carry (opt-in `keepSleepingContacts`, CD_FLAG_KEEP_ASLEEP_CONTACTS).
+    private var carryDormantPipeline: MTLComputePipelineState? { optionalPipeline("coinCarryDormant") }
+    private var solveColorPrepPipeline: MTLComputePipelineState? { optionalPipeline("coinSolveVelocityColorPrep") }
+    private var solveTailPrepPipeline: MTLComputePipelineState? { optionalPipeline("coinSolveVelocityTailPrep") }
+    /// Per contact point, CD_PREP_F4 (12) float4 — allocated on the first prepared substep.
+    private var contactPrepBuffer: MTLBuffer?
+    static let contactPrepStride = 192
+    /// The fused multi-dispatch substep kernels (stage B3, plan 3b — Shaders/CoinDEMFusedKernels.h):
+    /// 15 of the constraint substep's dispatches folded into 5, the same simulation.
+    private let substepBeginPipeline: MTLComputePipelineState      // coinSubstepBegin
+    private let broadphaseTGPipeline: MTLComputePipelineState      // coinBroadphaseTG
+    private let colorPrepareTGPipeline: MTLComputePipelineState    // coinColorPrepareTG
+    private let colorFinishTGPipeline: MTLComputePipelineState     // coinColorFinishTG
+    private let intPosFinalizePipeline: MTLComputePipelineState    // coinIntegratePositionFinalize
+    /// TEST SEAM (stage B3): encode the constraint substep with the one-step kernels the fused
+    /// ones replace (A/B parity and cost). Never set in a scene.
+    var fusedSubstepKernelsDisabledForTesting = false
+    /// The speculative colouring's per-contact bid (UInt32 per contact slot), allocated the
+    /// first time `coloringScheme == .speculative` colours anything — a Jones–Plassmann
+    /// world (every existing scene, Daydream Home) never allocates it.
+    private var colorBidBuffer: MTLBuffer?
+    /// The polytope narrowphase's per-substep pair list (uint4 per candidate piece pair),
+    /// its append cursor and the indirect args of the per-pair pass — allocated with the
+    /// first box / hull / compound, so a world without them (Daydream Home's egg rain)
+    /// never pays for it.
+    private var polyPairBuffer: MTLBuffer?
+    var polyPairCountBuffer: MTLBuffer?               // shared: `polyPairCount` reads it back
+    private var polyArgsBuffer: MTLBuffer?
+    var maxPolyPairs: Int { maxCoins * 64 }
+    /// Piece pairs the last generate pass listed for the polytope narrowphase, UNCLAMPED —
+    /// above `maxPolyPairs` the surplus was dropped (those pairs got no contact). Tests /
+    /// diagnostics; 0 while no polytope body exists.
+    var polyPairCount: Int {
+        guard let b = polyPairCountBuffer else { return 0 }
+        return Int(b.contents().bindMemory(to: UInt32.self, capacity: 1).pointee)
+    }
+    /// Bound in place of the pair list while none exists (coinGenerateContacts never writes it then).
+    private lazy var polyDummyBuffer: MTLBuffer? = device.makeBuffer(length: 32, options: .storageModePrivate)
     private let warmApplyTailPipeline: MTLComputePipelineState    // coinWarmStartApplyTail (VZ-0154)
     /// One MTLDispatchThreadgroupsIndirectArguments per colour, 16-byte stride (the GPU
     /// sizes each colour's solve to that colour's slice; an empty colour gets 0 groups).
@@ -328,7 +404,7 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// written by coinWriteColorArgs, read by the tail passes (VZ-0154).
     private let uncolSubBuffer: MTLBuffer          // UInt32[maxContacts]
     private let colorContactsBuffer: MTLBuffer     // UInt32[maxContacts] — contacts sorted by colour
-    private let colorStatsBuffer: MTLBuffer        // UInt32[5]: overflow / uncoloured / maxColourUsed / beyondSweep / uncolouredUnsolved
+    let colorStatsBuffer: MTLBuffer                // UInt32[5]: overflow / uncoloured / maxColourUsed / beyondSweep / uncolouredUnsolved
     /// How many colours the solve sweep encodes as separate parallel dispatches. The
     /// colouring takes the lowest free colour, so the live colours are 0…maxUsed with
     /// nothing above; dispatching all `maxColors` would pay ~50 empty dispatch bubbles
@@ -356,14 +432,21 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// Per-body articulation link (SIMD2<Int32> per slot): x = partner slot (−1 =
     /// none), y = which of this body's ends joins (±1 → ±Y). Drives `coinJointSolve`
     /// so a frankfurter's two segments bend at their joint. Default (−1, 0).
-    private let linkBuffer: MTLBuffer
+    let linkBuffer: MTLBuffer
     /// Per-body material (SIMD2<Float> per slot): x = Coulomb friction μ, y =
     /// restitution e. A NEGATIVE lane means "inherit the global uniform"
     /// (`frictionCoeff` / `restitution`) — the default, so untouched scenes are
     /// unchanged. Constraint path only; combined per contact as μ=√(μA·μB),
     /// e=max(eA,eB). Set at spawn (`friction:`/`restitution:`) or via `setMaterial`.
     public let materialBuffer: MTLBuffer
-    private let colliderBuffer: SimBuffer<CoinStaticCollider>
+    /// Per-body contact PATCH radius (Float per slot, m; 0 = a point contact, the default):
+    /// the effective moment arm of torsional friction about each of the body's contact
+    /// normals (stage B2, engine plan 5a — `setPatchRadius`, CoinDEMSolver+Torsion.swift).
+    /// Bound to the solve kernels always; read only while `torsionPatchSlots` is non-empty.
+    let patchRadiusBuffer: MTLBuffer
+    /// Slots with a patch radius > 0 (CD_FLAG_TORSION is set iff non-empty).
+    var torsionPatchSlots: Set<Int> = []
+    let colliderBuffer: SimBuffer<CoinStaticCollider>
     private let coinDeltaBuffer: MTLBuffer         // private — per-coin Jacobi delta
     private let cellCounts: MTLBuffer              // private
     private let cellOffsets: MTLBuffer             // private
@@ -391,15 +474,17 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// Mirrors `CD_MAX_BODY_CONTACTS` in CoinDEM.metal — must exceed the true per-body
     /// contact degree or the colouring races (see the shader comment).
     private static let maxBodyContacts = 64
+    /// `maxBodyContacts` for the small-world arena layout (CoinDEMSolver+SmallWorld.swift).
+    static var bodyContactCapacity: Int { maxBodyContacts }
     /// Per-body split-impulse BIAS (pseudo) velocity: 2 × float4 per body
     /// (linear, angular). Cleared each substep; moves position then is discarded.
-    private let biasBuffer: MTLBuffer              // maxCoins × 2 × SIMD4<Float>
+    let biasBuffer: MTLBuffer                      // maxCoins × 2 × SIMD4<Float>
     /// Warm starting: last substep's solved contacts + an open-addressing hash
     /// (pairKey → prev slot) so a re-found contact resumes from its converged impulse.
-    private let prevContactBuffer: MTLBuffer       // CoinContact[maxContacts]
-    private let pairHashBuffer: MTLBuffer          // UInt32[hashSize] (power of two)
+    let prevContactBuffer: MTLBuffer               // CoinContact[maxContacts]
+    let pairHashBuffer: MTLBuffer                  // UInt32[hashSize] (power of two)
     private let hashSizeBuffer: MTLBuffer          // 1×UInt32 (constant)
-    private let hashSize: Int
+    let hashSize: Int
     /// Island sleeping: connected-component label + per-island min sleep-timer
     /// (scratch, recomputed each frame), a persistent per-body slow-frame counter,
     /// and the asleep flag the solver kernels gate on (shared → host can read the count).
@@ -411,7 +496,7 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// while awake; persists), and the per-group hub rebuilt each sleep update. Asleep
     /// pairs no longer generate contacts, so these carry an asleep heap's connectivity:
     /// a body that touches any member wakes the whole group in the same frame.
-    private let sleepKeyBuffer: MTLBuffer          // maxCoins UInt32 (persists; shared for the init fill)
+    let sleepKeyBuffer: MTLBuffer                  // maxCoins UInt32 (persists; shared for the init fill)
     private let sleepHubBuffer: MTLBuffer          // maxCoins UInt32 (scratch)
     /// Per body: 1 iff it is an end of an enabled, non-collideConnected two-body joint
     /// (coinMarkJointedBodies, once per frame) — gates the generate kernel's joint scan.
@@ -423,12 +508,24 @@ public final class CoinDEMSolver: PenetrationProbing {
     // ── Convex hulls (constraint path) ────────────────────────────────────────
     /// Registered hull vertices (principal frame, COM at origin), all hulls
     /// packed into one buffer; per-hull (offset, count) ranges beside it.
-    public let hullVertexBuffer: MTLBuffer      // SIMD4<Float> × maxHullVertices
-    public let hullRangeBuffer: MTLBuffer       // SIMD2<UInt32> × maxHulls
+    /// The SHAPE TABLE: every registered hull's principal-frame vertices followed by its
+    /// face/edge topology (CoinHullTopology.pack), and every registered compound's child
+    /// boxes (3 slots each) — one float4 buffer, so every kernel that already binds it
+    /// sees both. `hullRangeBuffer[i]` = (first slot, vertex / child count) of entry i.
+    public let hullVertexBuffer: MTLBuffer      // SIMD4<Float> × maxHullVertices (table slots)
+    public let hullRangeBuffer: MTLBuffer       // SIMD2<UInt32> × maxHulls (table entries)
+    /// Shape-table ENTRIES (hulls + compounds share the numbering).
     public static let maxHulls = 64
-    public static let maxHullVertices = 4096
-    private var registeredHulls: [CoinHullMath.Prepared] = []
-    private var hullVertexCursor = 0
+    /// Shape-table float4 SLOTS: a hull takes its vertices + 1 header + its packed
+    /// topology (the Digital Clock bar: 32 + 1 + 136); a compound 3 per child box.
+    public static let maxHullVertices = 16384
+    /// Entry i of the shape table: a hull (spawnHull) or a compound (spawnCompound).
+    enum ShapeTableEntry {
+        case hull(CoinHullMath.Prepared)
+        case compound(CoinCompoundMath.Prepared)
+    }
+    var shapeTable: [ShapeTableEntry] = []
+    var hullVertexCursor = 0
     /// Frame change applied at registration, returned so callers can express
     /// their render mesh in the same (principal, COM-origin) frame the solver
     /// simulates in: stored = principalRotation⁻¹ · (input − comOffset).
@@ -455,6 +552,12 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// only the ENABLED ones (the per-frame active list), so reserved-but-disabled pool
     /// slots cost nothing (VZ-0150 item 4c). For tests / instrumentation.
     public var jointCount: Int { jointHighWater }
+    /// FOOT HOOK — spring feet (CoinDEMSolver+Foot.swift, Shaders/CoinDEMFoot.h): nil until the
+    /// first `addFoot`; a solver without an active foot never dispatches anything for them.
+    var footSystem: CoinFootSystem?
+    /// SMALL-WORLD HOOK — the one-dispatch frame path (CoinDEMSolver+SmallWorld.swift,
+    /// Shaders/CoinDEMSmallWorld.h, stage B3): its opt-in flag, limits and scratch.
+    let smallWorld = CoinSmallWorldState()
     /// Joint passes per velocity iteration (≥ 1): the serial joint loop runs this many
     /// times inside its one dispatch, so a long jointed chain can converge further than
     /// the contacts without paying another round of contact-colour dispatches. Each
@@ -465,8 +568,8 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// by coinJointListUpload from the host's scan) and the per-slot block-solve scratch
     /// + warm-start impulses (private; allocated with the first enabled joint, so a
     /// solver that never uses joints never pays for it).
-    private let jointListBuffer: MTLBuffer          // UInt32 × 4·maxJoints: slots, TG-cache pairs, TG-cache bodies
-    private var jointPrepBuffer: MTLBuffer?         // jointPrepStride × maxJoints
+    let jointListBuffer: MTLBuffer                  // UInt32 × (4·maxJoints + 4): slots, TG-cache pairs, TG-cache bodies, active list
+    var jointPrepBuffer: MTLBuffer?                 // jointPrepStride × maxJoints
     /// `sizeof(CoinJointPrep)` in CoinDEM.metal (static_assert there).
     static let jointPrepStride = 496
     /// Geometry of each slot at the last list upload. A slot that was not enabled then,
@@ -488,11 +591,11 @@ public final class CoinDEMSolver: PenetrationProbing {
     }
     private var jointKeys: [Int: JointKey] = [:]
     /// Active joints uploaded for the frame being encoded (0 ⇒ no joint work at all).
-    private var frameJointCount = 0
+    var frameJointCount = 0
     /// Distinct bodies the frame's active joints join, when joints and bodies fit the
     /// joint solve's threadgroup cache (CD_JSOLVE_MAXJ / CD_JSOLVE_MAXB in CoinDEM.metal);
     /// 0 ⇒ the direct (device-memory) path.
-    private var frameJointTGBodies = 0
+    var frameJointTGBodies = 0
     static let jointTGMaxJoints = 40
     static let jointTGMaxBodies = 80
     /// Active (enabled) joints.
@@ -549,9 +652,64 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// never counts as slow for sleep — unless it is pushing into a limit it has already
     /// reached (holding, not moving) — so set the target to 0 (a brake) to let it rest.
     public var scaleAwareDeadStop: Bool = false
+    /// Constraint path, OPT-IN (VZ-0157, VZ-0163): solve every multi-point contact MANIFOLD
+    /// (≤ 4 points of one body pair — a box on a table, a bar in a V, a cube on a cube) as
+    /// ONE unit. Its points are emitted contiguously, coloured as one node, and solved by one
+    /// thread with the pair's velocities in registers: `manifoldInnerPasses` Gauss–Seidel
+    /// passes over its normal / split-impulse / friction rows per velocity iteration, then
+    /// one rolling-resistance pass. OFF (default): each point is its own colouring node and
+    /// gets one visit per iteration — which leaves a 4-point manifold (a redundant, rank-3
+    /// system on a rigid body) asymmetric at low iteration counts: a 10 mm cube resting on a
+    /// cube got ω = 0.48 rad/s from its first cold 6-iteration solve (a 5-cube tower fell at
+    /// frame 3), and a lone resting box yawed ~1°/s. Manifolds also cost one colour node
+    /// instead of four, so the colour sweep shrinks. It also captures EVERY contact's
+    /// restitution approach speed before the substep's first impulse (coinCaptureApproach)
+    /// — the solve's lazy capture, in colour order, gave a flat landing's later corners a
+    /// speed their predecessors had already cut, and the one-sided bounce tipped a dropped
+    /// L 0.5°. Every existing scene keeps it off.
+    public var manifoldSolve: Bool = false
+    /// Constraint path, OPT-IN: the split-impulse BIAS row only ever pushes a contact's bodies
+    /// apart (CD_FLAG_SEPARATING_BIAS, CoinDEM.metal). Off (the default, every existing world): the
+    /// row drives the relative bias velocity to its target both ways, so a SPECULATIVE contact
+    /// (two bodies within `speculativeMargin` but not touching) or one within the slop PULLS its
+    /// bodies together in the position channel whenever another contact's recovery moves one of
+    /// them away. With stacked bodies and a margin wider than the gaps between neighbours (a 2 × 5
+    /// on-edge bar stack on a dynamic stake pallet, 0.5 mm between rows and stakes, margin 2.5 mm)
+    /// that glue kept the stack jiggling and walking and it never slept; the flag makes the row
+    /// what its documentation always said it was ("the pseudo impulse stays separating"), and a
+    /// speculative contact resists a bias approach only beyond its own gap.
+    public var separatingSplitImpulse: Bool = false
+    /// Constraint path + `warmStart`, OPT-IN: a sleeping island keeps its warm start
+    /// (CD_FLAG_KEEP_ASLEEP_CONTACTS, CoinDEM.metal `coinCarryDormant`). Off (the default, every
+    /// existing world): VZ-0152 skips generating the contacts of asleep pairs (and asleep vs static),
+    /// so they drop out of the warm-start table the substep after an island falls asleep, and every
+    /// WAKE starts all of its contacts COLD. A tall stack does not survive that: Digital Clock's
+    /// 2 × 5 stock of on-edge bars, woken after a sleep (the crane's magnet touching its top bar),
+    /// sank at 14–48 mm/s in its first frame (a cold 6-iteration Gauss–Seidel pass cannot hold a
+    /// 6-deep chain) and crept 0.7–1.4 mm; woken while its contacts were still in the table it moved
+    /// 0.0003 mm. With the flag, each substep carries the last substep's contacts whose ends are
+    /// both still inert into the new list as DORMANT copies (no narrowphase — VZ-0152 still skips
+    /// the pairs; never coloured or solved), so the table keeps them for as long as the island
+    /// sleeps and a wake resumes from its converged impulses. Cost: a copy of the dormant records
+    /// per substep (one thread per hash slot).
+    public var keepSleepingContacts: Bool = false
+    /// Gauss–Seidel passes over a grouped manifold's points per velocity iteration
+    /// (`manifoldSolve` only). ≥ 1; default 4.
+    public var manifoldInnerPasses: Int = 4
     /// TEST SEAM (VZ-0151): skip coinGenerateContacts' per-collider bounding reject, so a
     /// test can prove the reject leaves the contact set bit-identical. Never set in a scene.
     var colliderCullDisabledForTesting: Bool = false
+    /// Tests only: false registers compounds WITHOUT culling clusters (every child walked, as a
+    /// compound of ≤ 16 children is) — the contact set must not change (CoinDEMSolver+Compound).
+    var compoundClustersForTesting: Bool = true
+    /// TEST SEAMS (stage B1 cost attribution): scan ±1 cell whatever the bodies' size, and
+    /// skip the polytope narrowphase dispatch. Never set in a scene.
+    var broadphaseClassicScanForTesting: Bool = false
+    var polyKernelDisabledForTesting: Bool = false
+    /// TEST SEAM (stage B3, VZ-0198): run the polytope narrowphase's separating-axis test on ONE
+    /// thread (cdPolySAT, lane 0) instead of spread over the SIMD group (cdPolySATSG) — the A/B
+    /// that proves the two bit-identical. Never set in a scene.
+    var polySATSerialForTesting: Bool = false
     /// TEST SEAM (VZ-0150): force coinJointSolveCS's direct (device-memory) path, so a
     /// test can prove the threadgroup-cached path gives the same result. Never set in a scene.
     var jointThreadgroupCacheDisabledForTesting: Bool = false
@@ -630,7 +788,39 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// substeps) can occasionally leave the heap un-settled. Scenes that build towers
     /// opt in; the loose-heap scenes (Pile of Mess) leave it off — GS alone is enough.
     public var warmStart: Bool = false
-    private var needsHashClear = true           // lazily zero the pair hash on first use
+    var needsHashClear = true                   // lazily zero the pair hash on first use
+
+    /// OPT-IN (default off; stage B3 — Shaders/CoinDEMPreparedSolve.h): compute every contact row's
+    /// pose-constant factors (effective masses, each body's angular response I⁻¹(r×d)) ONCE per
+    /// substep, in a prepare pass, instead of on every row of every velocity iteration and manifold
+    /// pass. The same rows, bounds, targets and order — but the arithmetic is regrouped
+    /// (I⁻¹(r×(λd)) → λ·I⁻¹(r×d)) and Metal's fast math rounds it differently, so it is opt-in and
+    /// every world that does not set it steps exactly as before. Measured on the Digital Clock's perf
+    /// fence (small-world path, M1 Max, the two interleaved in one process): the contact solve of a
+    /// frame where the crane's box manifold touches went from ≈ 233 µs per substep to ≈ 136 µs (plus
+    /// ≈ 11 µs for the prepare pass); frames with 1–4 single contacts 69 → 52 µs; the fence scene
+    /// configuration's physics p95 3.83 → 3.31 ms (see docs/coindem-constraint-solver.md, stage B3).
+    /// `VIZ_COINDEM_PREPARED=1` makes it every solver's default for a test run.
+    public var preparedContactSolve: Bool = CoinDEMSolver.preparedEnvironmentDefault
+    static let preparedEnvironmentDefault = ProcessInfo.processInfo.environment["VIZ_COINDEM_PREPARED"] == "1"
+    /// The prepared rows are in use this substep (the knob, the constraint path, the pipelines and
+    /// the buffer all present).
+    var preparedContactsLive: Bool {
+        preparedContactSolve && solverMode == .constraint && contactPrepBuffer != nil
+            && prepareContactsPipeline != nil && solveColorPrepPipeline != nil && solveTailPrepPipeline != nil
+    }
+    /// Make the prepare buffer before a frame that needs it (so the uniforms' flag and the bound
+    /// buffer agree for the whole frame).
+    func ensureContactPrepBuffer() {
+        guard preparedContactSolve, contactPrepBuffer == nil, prepareContactsPipeline != nil else { return }
+        contactPrepBuffer = device.makeBuffer(length: Self.contactPrepStride * maxContacts, options: .storageModePrivate)
+        contactPrepBuffer?.label = "Coin.contactPrep"
+    }
+    /// The prepare buffer for the small-world kernel's binding (nil until first used).
+    var contactPrepBufferForBinding: MTLBuffer? { contactPrepBuffer }
+    /// Whether an optional (stage-B3) pipeline has been resolved yet — tests: a solver must not
+    /// compile a path it has not opted into.
+    func optionalPipelineResolvedForTesting(_ name: String) -> Bool { optionalPipelines[name] != nil }
     /// Island sleeping: freeze a connected island once every body in it has been slow
     /// for `sleepFrames`, so a settled heap skips the whole solve. On by default for the
     /// constraint path (it's pure perf + the per-island gate prevents premature freezing).
@@ -668,7 +858,22 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// slow-motion detection (`steps × fixedDt / wallDt` ≈ realtime ratio).
     private(set) public var lastStepCount: Int = 0
 
-    private var colliders: [CoinStaticCollider] = []
+    var colliders: [CoinStaticCollider] = []
+
+    /// Largest TIGHT bounding radius of any body spawned since the last `clearAll` (a
+    /// sphere's R, a box's |he|, a capsule's hl + r, a disc's √(R² + h²), an egg's / hull's /
+    /// compound's bounding radius). The broadphase scans ±1 cell while this fits the cell
+    /// (every correctly sized scene: bit-identical to before); a body that outgrew the
+    /// cell widens the neighbourhood instead of silently missing pairs two cells apart
+    /// (VZ-0161: a 0.08 m capsule in a 0.12 m cell, 20–30 mm overlaps with no contact).
+    private(set) var maxBodyBound: Float = 0
+    /// Any box / hull / compound spawned since the last `clearAll` — only then are the
+    /// polytope pair list allocated and its narrowphase (coinPolyNarrow) dispatched.
+    private(set) var hasPolyBodies = false
+    func noteBodyBound(_ r: Float, poly: Bool = true) {
+        maxBodyBound = max(maxBodyBound, r)
+        if poly { hasPolyBodies = true }
+    }
 
     // ── Init ──────────────────────────────────────────────────────────────────
 
@@ -693,11 +898,20 @@ public final class CoinDEMSolver: PenetrationProbing {
         let jointPrepare, jointListUpload: MTLComputePipelineState                 // VZ-0150
         let markJointed, islandSleepHub: MTLComputePipelineState                   // VZ-0153 / VZ-0152
         let solveTail, warmApplyTail: MTLComputePipelineState                      // VZ-0154
+        let polyArgs, polyNarrow: MTLComputePipelineState                          // stage B1 polytope narrowphase
+        let captureApproach: MTLComputePipelineState                               // stage B1 restitution capture
+        let colorTentative, colorResolve: MTLComputePipelineState                  // VZ-0160 speculative colouring (B2)
+        /// The OPTIONAL stage-B3 kernels (coinSmallWorldFrame, the prepared contact rows) are not
+        /// resolved here: the solver keeps this lookup and resolves each on first use (see
+        /// `optionalPipeline`). A device or library without one simply never takes that path.
+        var resolveOptional: (String) -> MTLComputePipelineState? = { _ in nil }
+        /// The fused multi-dispatch substep kernels (stage B3, plan 3b; Shaders/CoinDEMFusedKernels.h).
+        let substepBegin, broadphaseTG, colorPrepareTG, colorFinishTG, intPosFinalize: MTLComputePipelineState
     }
 
     /// Resolve the kernels through an arbitrary lookup (engine cache in production; a
     /// runtime-compiled library in the headless tests).
-    static func makePipelines(_ resolve: (String) -> MTLComputePipelineState?) -> Pipelines? {
+    static func makePipelines(_ resolve: @escaping (String) -> MTLComputePipelineState?) -> Pipelines? {
         guard
             let p0 = resolve("coinIntegrate"),
             let p1 = resolve("coinCellClear"),
@@ -748,9 +962,19 @@ public final class CoinDEMSolver: PenetrationProbing {
             let p44 = resolve("coinSolveVelocityTail"),
             let p45 = resolve("coinWarmStartApplyTail"),
             let p46 = resolve("coinJointPrepare"),
-            let p47 = resolve("coinJointListUpload")
+            let p47 = resolve("coinJointListUpload"),
+            let p49 = resolve("coinWritePolyArgs"),
+            let p50 = resolve("coinPolyNarrow"),
+            let p51 = resolve("coinCaptureApproach"),
+            let p52 = resolve("coinColorTentative"),
+            let p53 = resolve("coinColorResolve"),
+            let p54 = resolve("coinSubstepBegin"),
+            let p55 = resolve("coinBroadphaseTG"),
+            let p56 = resolve("coinColorPrepareTG"),
+            let p57 = resolve("coinColorFinishTG"),
+            let p58 = resolve("coinIntegratePositionFinalize")
         else { return nil }
-        return Pipelines(integrate: p0, cellClear: p1, cellCount: p2, scatter: p4,
+        var pipelines = Pipelines(integrate: p0, cellClear: p1, cellCount: p2, scatter: p4,
                          blockSums: pS1, blockScan: pS2, offsetsApply: pS3,
                          contact: p5, apply: p6, finalize: p7, orient: p8, transform: p9, joint: p10,
                          measure: p11, generate: p12, clearBody: p13, buildBody: p14, colorRound: p15,
@@ -763,7 +987,13 @@ public final class CoinDEMSolver: PenetrationProbing {
                          sleepTick: p27, islandMinReduce: p28, sleepMark: p29, gjkEPA: p30,
                          jointSolveCS: p32, islandUnionJoints: p33,
                          jointPrepare: p46, jointListUpload: p47,
-                         markJointed: p42, islandSleepHub: p43, solveTail: p44, warmApplyTail: p45)
+                         markJointed: p42, islandSleepHub: p43, solveTail: p44, warmApplyTail: p45,
+                         polyArgs: p49, polyNarrow: p50, captureApproach: p51,
+                         colorTentative: p52, colorResolve: p53,
+                         substepBegin: p54, broadphaseTG: p55, colorPrepareTG: p56, colorFinishTG: p57,
+                         intPosFinalize: p58)
+        pipelines.resolveOptional = resolve
+        return pipelines
     }
 
     /// Production init: pipelines come from the engine's memoised cache (the
@@ -867,6 +1097,8 @@ public final class CoinDEMSolver: PenetrationProbing {
                                        options: .storageModeShared),
             let matB = dev.makeBuffer(length: MemoryLayout<SIMD2<Float>>.stride * maxCoins,
                                       options: .storageModeShared),
+            let patchB = dev.makeBuffer(length: MemoryLayout<Float>.stride * maxCoins,
+                                        options: .storageModeShared),
             let uni = dev.makeBuffer(length: MemoryLayout<CoinUniforms>.stride,
                                      options: .storageModeShared),
             let penResult = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * 2,
@@ -920,7 +1152,8 @@ public final class CoinDEMSolver: PenetrationProbing {
             let solveTG = dev.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared),
             let jointsBuf = dev.makeBuffer(length: MemoryLayout<CoinJoint>.stride * CoinDEMSolver.maxJoints,
                                            options: .storageModeShared),
-            let jointList = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * 4 * CoinDEMSolver.maxJoints,
+            // slots, TG-cache pairs, TG-cache bodies, the substep's active list (+ its count)
+            let jointList = dev.makeBuffer(length: MemoryLayout<UInt32>.stride * (4 * CoinDEMSolver.maxJoints + 4),
                                            options: .storageModePrivate),
             let hullV = dev.makeBuffer(length: MemoryLayout<SIMD4<Float>>.stride * CoinDEMSolver.maxHullVertices,
                                        options: .storageModeShared),
@@ -990,12 +1223,26 @@ public final class CoinDEMSolver: PenetrationProbing {
         self.islandSleepHubPipeline = pipelines.islandSleepHub
         self.solveTailPipeline = pipelines.solveTail
         self.warmApplyTailPipeline = pipelines.warmApplyTail
+        self.polyArgsPipeline = pipelines.polyArgs
+        self.polyNarrowPipeline = pipelines.polyNarrow
+        self.captureApproachPipeline = pipelines.captureApproach
+        self.colorTentativePipeline = pipelines.colorTentative
+        self.colorResolvePipeline = pipelines.colorResolve
+        self.resolveOptionalPipeline = pipelines.resolveOptional
+        self.substepBeginPipeline = pipelines.substepBegin
+        self.broadphaseTGPipeline = pipelines.broadphaseTG
+        self.colorPrepareTGPipeline = pipelines.colorPrepareTG
+        self.colorFinishTGPipeline = pipelines.colorFinishTG
+        self.intPosFinalizePipeline = pipelines.intPosFinalize
         self.coinBuffer = coins
         self.transformBuffer = xform
         self.bodyTypeBuffer = btype
         self.linkBuffer = linkB
         matB.label = "Coin.material"
         self.materialBuffer = matB
+        patchB.label = "Coin.patchRadius"
+        memset(patchB.contents(), 0, patchB.length)
+        self.patchRadiusBuffer = patchB
         self.colliderBuffer = cols
         self.coinDeltaBuffer = delta
         self.cellCounts = counts
@@ -1154,6 +1401,7 @@ public final class CoinDEMSolver: PenetrationProbing {
         // Per-body collision dimensions: radius → prevPos.w, halfThickness → vel.w.
         ptr[slot].prevPos.w = radius ?? coinRadius
         ptr[slot].vel.w     = halfThickness ?? self.halfThickness
+        noteBodyBound((ptr[slot].prevPos.w * ptr[slot].prevPos.w + ptr[slot].vel.w * ptr[slot].vel.w).squareRoot(), poly: false)
         setMaterial(slot, friction: friction, restitution: restitution)
         bodyTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = type
         // A freshly-spawned body has no joint until setLink wires one (it may be
@@ -1200,6 +1448,7 @@ public final class CoinDEMSolver: PenetrationProbing {
         // rides vel.w (the floor-safety / per-apply-clamp scale, like a disc's halfThick).
         ptr[slot].prevPos.w = simd_length(halfExtents)
         ptr[slot].vel.w     = min(halfExtents.x, min(halfExtents.y, halfExtents.z))
+        noteBodyBound(simd_length(halfExtents))
         setMaterial(slot, friction: friction, restitution: restitution)
         bodyTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = type
         linkBuffer.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)[slot] = SIMD2(-1, 0)
@@ -1244,6 +1493,7 @@ public final class CoinDEMSolver: PenetrationProbing {
         // (the per-apply / floor-safety min-extent), so a sphere reads R uniformly.
         ptr[slot].prevPos.w = radius
         ptr[slot].vel.w     = radius
+        noteBodyBound(radius, poly: false)
         setMaterial(slot, friction: friction, restitution: restitution)
         bodyTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = type
         linkBuffer.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)[slot] = SIMD2(-1, 0)
@@ -1292,6 +1542,7 @@ public final class CoinDEMSolver: PenetrationProbing {
         // the broadphase reach, and the floor backstop all see the true bounds.
         ptr[slot].prevPos.w = radius
         ptr[slot].vel.w     = halfLength + radius
+        noteBodyBound(halfLength + radius, poly: false)
         setMaterial(slot, friction: friction, restitution: restitution)
         bodyTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = type
         linkBuffer.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)[slot] = SIMD2(-1, 0)
@@ -1352,6 +1603,7 @@ public final class CoinDEMSolver: PenetrationProbing {
         let maxExtent = max(abs(props.yFat) + fatRadius, abs(props.yTip) + tipRadius)
         ptr[slot].prevPos.w = maxExtent
         ptr[slot].vel.w     = maxExtent
+        noteBodyBound(maxExtent, poly: false)
         setMaterial(slot, friction: friction, restitution: restitution)
         bodyTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = type
         linkBuffer.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)[slot] = SIMD2(-1, 0)
@@ -1428,22 +1680,34 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// carries that frame change so the render mesh can match. nil when the
     /// input is degenerate or the hull tables are full.
     public func registerHull(vertices: [SIMD3<Float>]) -> HullHandle? {
-        guard registeredHulls.count < Self.maxHulls,
+        guard shapeTable.count < Self.maxHulls,
               let prep = CoinHullMath.prepare(vertices),
-              prep.vertices.count >= 4,
-              hullVertexCursor + prep.vertices.count <= Self.maxHullVertices else { return nil }
-        let index = registeredHulls.count
+              prep.vertices.count >= 4 else { return nil }
+        // The vertices, then ALWAYS a topology header (flags 0 = none: the kernels fall
+        // back to the vertex-probe / GJK paths), then the packed faces/edges when the
+        // hull fits the GPU narrowphase's caps.
+        let topo = prep.topology.flatMap { $0.fitsGPU ? $0.pack(vertices: prep.vertices) : nil } ?? [CoinHullTopology.emptyHeader]
+        guard hullVertexCursor + prep.vertices.count + topo.count <= Self.maxHullVertices else { return nil }
+        let index = shapeTable.count
         let vp = hullVertexBuffer.contents().bindMemory(to: SIMD4<Float>.self,
                                                         capacity: Self.maxHullVertices)
         for (i, v) in prep.vertices.enumerated() { vp[hullVertexCursor + i] = SIMD4(v, 0) }
+        for (i, t) in topo.enumerated() { vp[hullVertexCursor + prep.vertices.count + i] = t }
         hullRangeBuffer.contents().bindMemory(to: SIMD2<UInt32>.self, capacity: Self.maxHulls)[index] =
             SIMD2(UInt32(hullVertexCursor), UInt32(prep.vertices.count))
-        hullVertexCursor += prep.vertices.count
-        registeredHulls.append(prep)
+        hullVertexCursor += prep.vertices.count + topo.count
+        shapeTable.append(.hull(prep))
         return HullHandle(index: index, vertices: prep.vertices,
                           comOffset: prep.comOffset,
                           principalRotation: prep.principalRotation,
                           boundingRadius: prep.boundingRadius)
+    }
+
+    /// Whether registered hull `index` carries GPU face topology (the exact SAT + face-
+    /// clipping narrowphase); false ⇒ it uses the vertex-probe / GJK fallback paths.
+    public func hullHasTopology(_ index: Int) -> Bool {
+        guard index >= 0, index < shapeTable.count, case .hull(let p) = shapeTable[index] else { return false }
+        return p.topology?.fitsGPU ?? false
     }
 
     /// Activate a CONVEX HULL body (a shape registered with `registerHull`).
@@ -1462,8 +1726,8 @@ public final class CoinDEMSolver: PenetrationProbing {
                           type: UInt32 = 0) -> Int? {
         assert(solverMode == .constraint,
                "spawnHull requires solverMode == .constraint (legacy has no hull narrowphase)")
-        guard hull.index >= 0, hull.index < registeredHulls.count else { return nil }
-        let prep = registeredHulls[hull.index]
+        guard hull.index >= 0, hull.index < shapeTable.count,
+              case .hull(let prep) = shapeTable[hull.index] else { return nil }
         let slot: Int
         if let reused = freeSlots.popLast() {
             slot = reused
@@ -1481,6 +1745,7 @@ public final class CoinDEMSolver: PenetrationProbing {
                                             prep.invInertiaK.x, prep.invInertiaK.y, prep.invInertiaK.z))
         ptr[slot].prevPos.w = prep.boundingRadius
         ptr[slot].vel.w     = prep.minHalfExtent
+        noteBodyBound(prep.boundingRadius, poly: prep.topology?.fitsGPU ?? false)
         setMaterial(slot, friction: friction, restitution: restitution)
         bodyTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = type
         linkBuffer.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)[slot] = SIMD2(-1, 0)
@@ -1488,6 +1753,26 @@ public final class CoinDEMSolver: PenetrationProbing {
         sleepTimerBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
         highWater = max(highWater, slot + 1)
         return slot
+    }
+
+    /// Claim a free body slot (the shared slot logic of every spawn*), or nil if full.
+    func claimBodySlot() -> Int? {
+        if let reused = freeSlots.popLast() { return reused }
+        guard nextSlot < maxCoins else { return nil }
+        defer { nextSlot += 1 }
+        return nextSlot
+    }
+
+    /// The per-slot bookkeeping every spawn* finishes with: material, render type, no
+    /// articulation link, awake with a zero slow-frame timer, and the high-water mark.
+    func finishSpawn(_ slot: Int, friction: Float?, restitution: Float?, type: UInt32) {
+        setMaterial(slot, friction: friction, restitution: restitution)
+        clearPatchRadius(slot)                // a reused slot starts as a point contact (stage B2)
+        bodyTypeBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = type
+        linkBuffer.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)[slot] = SIMD2(-1, 0)
+        asleepBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
+        sleepTimerBuffer.contents().bindMemory(to: UInt32.self, capacity: maxCoins)[slot] = 0
+        highWater = max(highWater, slot + 1)
     }
 
     // ── Generic joints (constraint path) ──────────────────────────────────────
@@ -1719,6 +2004,7 @@ public final class CoinDEMSolver: PenetrationProbing {
         let lptr = linkBuffer.contents().bindMemory(to: SIMD2<Int32>.self, capacity: maxCoins)
         clearLink(slot, lptr)
         removeJoints(referencing: slot)
+        clearPatchRadius(slot)
         ptr[slot] = .inactive
         freeSlots.append(slot)
     }
@@ -1736,6 +2022,7 @@ public final class CoinDEMSolver: PenetrationProbing {
             if ptr[slot].posInvMass.y < y {
                 clearLink(slot, lptr)
                 removeJoints(referencing: slot)
+                clearPatchRadius(slot)
                 ptr[slot] = .inactive
                 freeSlots.append(slot)
                 n += 1
@@ -1760,6 +2047,9 @@ public final class CoinDEMSolver: PenetrationProbing {
         freeSlots.removeAll(keepingCapacity: true)
         nextSlot = 0
         highWater = 0
+        maxBodyBound = 0
+        hasPolyBodies = false
+        for slot in torsionPatchSlots { clearPatchRadius(slot) }
         // Joints reference the cleared bodies — drop them all with the field.
         let j = jointBuffer.contents().bindMemory(to: CoinJoint.self, capacity: Self.maxJoints)
         for i in 0..<jointHighWater { j[i].meta.w = 0 }
@@ -1875,6 +2165,7 @@ public final class CoinDEMSolver: PenetrationProbing {
             if active > 0 && asleepCount >= active { didSkipLastFrame = true; return }
         }
         didSkipLastFrame = false
+        ensureContactPrepBuffer()                 // (opt-in prepared rows: before the uniforms say so)
 
         // Re-size the colour sweep from what the GPU has actually needed so far (read of
         // a shared buffer written by completed frames — no stall). The sweep is only a
@@ -1898,6 +2189,20 @@ public final class CoinDEMSolver: PenetrationProbing {
         // The frame's active joint list (constraint path): one scan of the host-owned joint
         // table, uploaded once, read by every joint kernel below (VZ-0150 item 4c).
         frameJointCount = (solverMode == .constraint && accumulator >= fixedDt) ? encodeJointListUpload(cb) : 0
+        // SMALL-WORLD HOOK (CoinDEMSolver+SmallWorld.swift): a small world's whole frame —
+        // every substep, the sleep update and the transforms — as ONE dispatch, the same
+        // simulation as the loop below; a world that outgrows it takes the loop by itself.
+        if smallWorldEligible(bodies: bound) {
+            var steps = 0
+            while accumulator >= fixedDt && steps < maxSubsteps { accumulator -= fixedDt; steps += 1 }
+            lastStepCount = steps
+            smallWorld.lastFrameUsed = steps > 0
+            guard steps > 0 else { return }
+            writeUniforms(dt: fixedDt, coinCount: bound)
+            encodeSmallWorldFrame(cb, coinCount: bound, steps: steps)
+            return
+        }
+        smallWorld.lastFrameUsed = false
         var steps = 0
         while accumulator >= fixedDt && steps < maxSubsteps {
             writeUniforms(dt: fixedDt, coinCount: bound)
@@ -2033,15 +2338,85 @@ public final class CoinDEMSolver: PenetrationProbing {
         // reported (plus headroom for a denser moment). `colorStats.beyondSweep` is the
         // fail-closed counter if this is ever too small.
         let colors = colorSweep
-        dispatch(cb, intVelCSPipeline, threads: coinCount, label: "Coin.cs.intVel") { enc in
-            enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
-            enc.setBuffer(self.biasBuffer, offset: 0, index: 1)
-            enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
-            enc.setBuffer(self.asleepBuffer, offset: 0, index: 3)
+        // Stage B3 (plan 3b): the substep's bookkeeping kernels run fused — the same step
+        // functions in the same order (Shaders/CoinDEMFusedKernels.h), 15 fewer dependent
+        // dispatches per substep. The one-step kernels stay for the diagnostics
+        // (generateContactsNow, measurePenetration) and as the A/B seam.
+        let fused = !fusedSubstepKernelsDisabledForTesting
+        ensurePolyPairBuffers()
+        if fused {
+            // Velocity integration + every clear the substep needs before generation (cells,
+            // the append cursors, per-body contact counts, colour buckets): coinSubstepBegin.
+            let threads = max(coinCount, numCells, maxCoins, Self.maxColors + 1)
+            dispatch(cb, substepBeginPipeline, threads: threads, label: "Coin.cs.begin") { enc in
+                enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
+                enc.setBuffer(self.biasBuffer, offset: 0, index: 1)
+                enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
+                enc.setBuffer(self.asleepBuffer, offset: 0, index: 3)
+                enc.setBuffer(self.cellCounts, offset: 0, index: 4)
+                var cells = UInt32(self.numCells)
+                enc.setBytes(&cells, length: MemoryLayout<UInt32>.size, index: 5)
+                enc.setBuffer(self.contactCountBuffer, offset: 0, index: 6)
+                // The polytope pair cursor (else the contact cursor again).
+                enc.setBuffer(self.polyPairCountBuffer ?? self.contactCountBuffer, offset: 0, index: 7)
+                enc.setBuffer(self.bodyContactCountBuffer, offset: 0, index: 8)
+                var slots = UInt32(self.maxCoins)
+                enc.setBytes(&slots, length: MemoryLayout<UInt32>.size, index: 9)
+                enc.setBuffer(self.colorCountBuffer, offset: 0, index: 10)
+            }
+        } else {
+            dispatch(cb, intVelCSPipeline, threads: coinCount, label: "Coin.cs.intVel") { enc in
+                enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
+                enc.setBuffer(self.biasBuffer, offset: 0, index: 1)
+                enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
+                enc.setBuffer(self.asleepBuffer, offset: 0, index: 3)
+            }
         }
-        encodeBroadphase(cb, coinCount: coinCount)
-        encodeGenerateContacts(cb, coinCount: coinCount)
-        encodeColoring(cb)
+        // FOOT HOOK (CoinDEMSolver+Foot.swift): each active spring foot's leg contact and its
+        // exactly integrated spring impulse, after gravity and before contact generation.
+        encodeFootSubstep(cb, colliders: colliderBuffer.buffer, colliderCount: colliders.count, bias: biasBuffer)
+        encodeBroadphase(cb, coinCount: coinCount, fused: fused && fusedBroadphaseFits, clearCells: !fused)
+        encodeGenerateContacts(cb, coinCount: coinCount, clearCursors: !fused)
+        // Opt-in warm-start memory through a sleep: the sleeping pairs' last contacts, carried as
+        // dormant records (coinCarryDormant) — before the colouring, whose cursor clamp covers them.
+        if keepSleepingContacts && warmStart && !needsHashClear, let pso = carryDormantPipeline {
+            dispatch(cb, pso, threads: hashSize, label: "Coin.cs.carryDormant") { enc in
+                enc.setBuffer(self.pairHashBuffer, offset: 0, index: 0)
+                enc.setBuffer(self.hashSizeBuffer, offset: 0, index: 1)
+                enc.setBuffer(self.prevContactBuffer, offset: 0, index: 2)
+                enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 3)
+                enc.setBuffer(self.asleepBuffer, offset: 0, index: 4)
+                enc.setBuffer(self.contactBuffer, offset: 0, index: 5)
+                enc.setBuffer(self.contactCountBuffer, offset: 0, index: 6)
+                enc.setBuffer(self.maxContactsBuffer, offset: 0, index: 7)
+            }
+        }
+        encodeColoring(cb, fused: fused)
+        // Manifold solve: every contact's restitution approach speed from the PRE-solve
+        // velocities (coinCaptureApproach), not lazily in colour order.
+        if manifoldSolve {
+            dispatchOverContacts(cb, captureApproachPipeline, label: "Coin.cs.captureApproach") { enc in
+                enc.setBuffer(self.contactBuffer, offset: 0, index: 0)
+                enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
+                enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 2)
+                enc.setBuffer(self.colliderBuffer.buffer, offset: 0, index: 3)
+            }
+        }
+        // Prepared contact rows (opt-in, stage B3): every contact's pose-constant factors, once.
+        let prepared = preparedContactsLive
+        if prepared, let prepPSO = prepareContactsPipeline, let prep = contactPrepBuffer {
+            dispatchOverContacts(cb, prepPSO, label: "Coin.cs.prepareContacts") { enc in
+                enc.setBuffer(self.contactBuffer, offset: 0, index: 0)
+                enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
+                enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 2)
+                enc.setBuffer(self.uniformBuffer, offset: 0, index: 3)
+                enc.setBuffer(self.asleepBuffer, offset: 0, index: 4)
+                enc.setBuffer(self.materialBuffer, offset: 0, index: 5)
+                enc.setBuffer(self.colliderBuffer.buffer, offset: 0, index: 6)
+                enc.setBuffer(self.patchRadiusBuffer, offset: 0, index: 7)
+                enc.setBuffer(prep, offset: 0, index: 8)
+            }
+        }
         // Warm start: seed fresh contacts with last substep's converged impulses and
         // apply them before iterating (a resting stack resumes from its solution).
         if warmStart {
@@ -2057,12 +2432,17 @@ public final class CoinDEMSolver: PenetrationProbing {
                 enc.setBuffer(self.prevContactBuffer, offset: 0, index: 2)
                 enc.setBuffer(self.pairHashBuffer, offset: 0, index: 3)
                 enc.setBuffer(self.hashSizeBuffer, offset: 0, index: 4)
+                enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 5)   // position-match tolerance scale
+                // Carry the torsion impulse only while CD_FLAG_TORSION is set (see the kernel).
+                var torsionOn: UInt32 = self.torsionPatchSlots.isEmpty ? 0 : 1
+                enc.setBytes(&torsionOn, length: MemoryLayout<UInt32>.size, index: 6)
             }
             dispatchPerColor(cb, warmApplyPipeline, tail: warmApplyTailPipeline, colors: colors, label: "Coin.cs.warmApply") { enc in
                 enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
                 enc.setBuffer(self.contactBuffer, offset: 0, index: 1)
                 enc.setBuffer(self.colorContactsBuffer, offset: 0, index: 2)
                 enc.setBuffer(self.colorOffsetBuffer, offset: 0, index: 4)
+                enc.setBuffer(self.asleepBuffer, offset: 0, index: 6)      // an asleep end is immovable (VZ-0162)
             }
         }
         // Joints: rows, block factors and re-projected impulses for this substep's poses,
@@ -2070,6 +2450,20 @@ public final class CoinDEMSolver: PenetrationProbing {
         // iterate against an assembly that already carries its load (VZ-0150).
         encodeJointPrepare(cb)
         for _ in 0..<velocityIterations {
+            if prepared, let colorPSO = solveColorPrepPipeline, let tailPSO = solveTailPrepPipeline, let prep = contactPrepBuffer {
+                // The prepared rows (their μ, e and patch radius come from the prepare buffer).
+                dispatchPerColor(cb, colorPSO, tail: tailPSO, colors: colors, label: "Coin.cs.solvePrep") { enc in
+                    enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
+                    enc.setBuffer(self.biasBuffer, offset: 0, index: 1)
+                    enc.setBuffer(self.contactBuffer, offset: 0, index: 2)
+                    enc.setBuffer(self.colorContactsBuffer, offset: 0, index: 3)
+                    enc.setBuffer(self.uniformBuffer, offset: 0, index: 4)
+                    enc.setBuffer(self.asleepBuffer, offset: 0, index: 6)
+                    enc.setBuffer(self.colliderBuffer.buffer, offset: 0, index: 8)
+                    enc.setBuffer(self.colorOffsetBuffer, offset: 0, index: 9)
+                    enc.setBuffer(prep, offset: 0, index: 12)
+                }
+            } else {
             dispatchPerColor(cb, solveVelCSPipeline, tail: solveTailPipeline, colors: colors, label: "Coin.cs.solve") { enc in
                 enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
                 enc.setBuffer(self.biasBuffer, offset: 0, index: 1)
@@ -2080,6 +2474,8 @@ public final class CoinDEMSolver: PenetrationProbing {
                 enc.setBuffer(self.materialBuffer, offset: 0, index: 7)
                 enc.setBuffer(self.colliderBuffer.buffer, offset: 0, index: 8)
                 enc.setBuffer(self.colorOffsetBuffer, offset: 0, index: 9)
+                enc.setBuffer(self.patchRadiusBuffer, offset: 0, index: 11)   // torsion (stage B2)
+            }
             }
             // Generic joints: one serial Gauss-Seidel pass over the active joints per
             // velocity iteration (each joint an exact block), interleaved with the
@@ -2089,9 +2485,10 @@ public final class CoinDEMSolver: PenetrationProbing {
                 var jc = UInt32(frameJointCount)
                 var passes = UInt32(max(1, jointInnerPasses))
                 var tgBodies = UInt32(frameJointTGBodies)
-                // One group: 32 threads stage the threadgroup cache (tgBodies > 0), else
-                // thread 0 alone walks device memory.
-                dispatch(cb, jointSolveCSPipeline, threads: frameJointTGBodies > 0 ? 32 : 1, label: "Coin.cs.joints") { enc in
+                // One group of two SIMD groups: the real-velocity chain on thread 0, the bias
+                // chain on thread 32 (they never exchange a value — cdJointSolveReal); the 64
+                // threads also stage the threadgroup cache (tgBodies > 0).
+                dispatch(cb, jointSolveCSPipeline, threads: 64, label: "Coin.cs.joints") { enc in
                     enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
                     enc.setBuffer(self.biasBuffer, offset: 0, index: 1)
                     enc.setBuffer(self.jointListBuffer, offset: 0, index: 2)
@@ -2101,6 +2498,9 @@ public final class CoinDEMSolver: PenetrationProbing {
                     enc.setBytes(&tgBodies, length: MemoryLayout<UInt32>.size, index: 6)
                 }
             }
+            // FOOT HOOK (CoinDEMSolver+Foot.swift): planted pads' torsion / yaw-motor rows; on
+            // the last iteration, the legs' exact position correction (split-impulse bias).
+            encodeFootIteration(cb, colliders: colliderBuffer.buffer, colliderCount: colliders.count, bias: biasBuffer)
         }
         // Snapshot the solved contacts + rebuild the pair hash for next substep.
         if warmStart {
@@ -2114,6 +2514,16 @@ public final class CoinDEMSolver: PenetrationProbing {
                 enc.setBuffer(self.pairHashBuffer, offset: 0, index: 3)
                 enc.setBuffer(self.hashSizeBuffer, offset: 0, index: 4)
             }
+        }
+        if fused {
+            // Position integration + finalize, both per body (coinIntegratePositionFinalize).
+            dispatch(cb, intPosFinalizePipeline, threads: coinCount, label: "Coin.cs.intPosFinalize") { enc in
+                enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
+                enc.setBuffer(self.biasBuffer, offset: 0, index: 1)   // + the motor-driven marker (no dead-stop)
+                enc.setBuffer(self.uniformBuffer, offset: 0, index: 2)
+                enc.setBuffer(self.asleepBuffer, offset: 0, index: 3)
+            }
+            return
         }
         dispatch(cb, intPosCSPipeline, threads: coinCount, label: "Coin.cs.intPos") { enc in
             enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
@@ -2170,6 +2580,9 @@ public final class CoinDEMSolver: PenetrationProbing {
                     enc.setBuffer(self.jointListBuffer, offset: 0, index: 3)
                 }
             }
+            // FOOT HOOK (CoinDEMSolver+Foot.swift): a planted foot joins its body's island to a
+            // dynamic support's.
+            encodeFootIslandUnion(cb, label: islandLabelBuffer)
             dispatch(cb, islandJumpPipeline, threads: coinCount, label: "Coin.cs.islandJump") { enc in
                 enc.setBuffer(self.islandLabelBuffer, offset: 0, index: 0)
                 enc.setBuffer(self.uniformBuffer, offset: 0, index: 1)
@@ -2291,9 +2704,23 @@ public final class CoinDEMSolver: PenetrationProbing {
 
     /// Encode the broadphase (counting-sort spatial hash) from CURRENT positions —
     /// no integrate. Shared by the diagnostic measure and the constraint passes.
-    private func encodeBroadphase(_ cb: MTLCommandBuffer, coinCount: Int) {
-        dispatch(cb, cellClearPipeline, threads: numCells, label: "Coin.cs.cellClear") { enc in
-            enc.setBuffer(self.cellCounts, offset: 0, index: 0)
+    private func encodeBroadphase(_ cb: MTLCommandBuffer, coinCount: Int, fused: Bool = false, clearCells: Bool = true) {
+        if fused {
+            // Count, the block scan and the scatter in ONE threadgroup (coinBroadphaseTG); the
+            // counts were zeroed by coinSubstepBegin.
+            dispatchOneGroup(cb, broadphaseTGPipeline, label: "Coin.cs.broadphase") { enc in
+                enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
+                enc.setBuffer(self.cellCounts, offset: 0, index: 1)
+                enc.setBuffer(self.cellOffsets, offset: 0, index: 2)
+                enc.setBuffer(self.sortedIndices, offset: 0, index: 3)
+                enc.setBuffer(self.uniformBuffer, offset: 0, index: 4)
+            }
+            return
+        }
+        if clearCells {                               // (coinSubstepBegin already zeroed them when fused)
+            dispatch(cb, cellClearPipeline, threads: numCells, label: "Coin.cs.cellClear") { enc in
+                enc.setBuffer(self.cellCounts, offset: 0, index: 0)
+            }
         }
         dispatch(cb, cellCountPipeline, threads: coinCount, label: "Coin.cs.cellCount") { enc in
             enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
@@ -2312,32 +2739,94 @@ public final class CoinDEMSolver: PenetrationProbing {
 
     /// Encode contact generation: zero the append cursor (CPU, shared), then append
     /// all contacts from the broadphase (must already be built this command buffer).
-    private func encodeGenerateContacts(_ cb: MTLCommandBuffer, coinCount: Int) {
+    private func encodeGenerateContacts(_ cb: MTLCommandBuffer, coinCount: Int, clearCursors: Bool = true) {
         // Reset the append cursor as a DISPATCH — a CPU write would land at encode time,
         // before any substep has run, leaving every later substep appending to the
-        // previous one's contacts (see coinClearContactCount).
-        dispatch(cb, clearContactCountPipeline, threads: 1, label: "Coin.cs.clearContactCount") { enc in
-            enc.setBuffer(self.contactCountBuffer, offset: 0, index: 0)
+        // previous one's contacts (see coinClearContactCount). The fused substep's
+        // coinSubstepBegin has already reset both cursors (clearCursors false).
+        ensurePolyPairBuffers()
+        if clearCursors {
+            dispatch(cb, clearContactCountPipeline, threads: 1, label: "Coin.cs.clearContactCount") { enc in
+                enc.setBuffer(self.contactCountBuffer, offset: 0, index: 0)
+                // The polytope pair cursor rides the same dispatch (else the contact count again).
+                enc.setBuffer(self.polyPairCountBuffer ?? self.contactCountBuffer, offset: 0, index: 1)
+            }
         }
         var jc = UInt32(frameJointCount)
-        dispatch(cb, generatePipeline, threads: coinCount, label: "Coin.cs.generate") { enc in
-            enc.setBuffer(self.coinBuffer.buffer, offset: 0, index: 0)
-            enc.setBuffer(self.sortedIndices, offset: 0, index: 1)
-            enc.setBuffer(self.cellOffsets, offset: 0, index: 2)
-            enc.setBuffer(self.colliderBuffer.buffer, offset: 0, index: 3)
-            enc.setBuffer(self.uniformBuffer, offset: 0, index: 4)
-            enc.setBuffer(self.linkBuffer, offset: 0, index: 5)
-            enc.setBuffer(self.contactBuffer, offset: 0, index: 6)
-            enc.setBuffer(self.contactCountBuffer, offset: 0, index: 7)
-            enc.setBuffer(self.maxContactsBuffer, offset: 0, index: 8)
-            enc.setBuffer(self.hullVertexBuffer, offset: 0, index: 9)
-            enc.setBuffer(self.hullRangeBuffer, offset: 0, index: 10)
-            enc.setBuffer(self.jointBuffer, offset: 0, index: 11)
-            enc.setBytes(&jc, length: MemoryLayout<UInt32>.size, index: 12)
-            enc.setBuffer(self.asleepBuffer, offset: 0, index: 13)
-            enc.setBuffer(self.jointedBodyBuffer, offset: 0, index: 14)
-            enc.setBuffer(self.jointListBuffer, offset: 0, index: 15)
+        let live = hasPolyBodies && !polyKernelDisabledForTesting && polyPairBuffer != nil
+        // ONE serial compute encoder: the generate dispatch, then (with polytope bodies) the
+        // pair pass's indirect args and the per-pair narrowphase — Metal runs a serial
+        // encoder's dispatches in order, so this is the same barrier semantics as three
+        // encoders, minus two encoder setups per substep.
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.label = "Coin.cs.generate"
+        enc.setComputePipelineState(generatePipeline)
+        enc.setBuffer(coinBuffer.buffer, offset: 0, index: 0)
+        enc.setBuffer(sortedIndices, offset: 0, index: 1)
+        enc.setBuffer(cellOffsets, offset: 0, index: 2)
+        enc.setBuffer(colliderBuffer.buffer, offset: 0, index: 3)
+        enc.setBuffer(uniformBuffer, offset: 0, index: 4)
+        enc.setBuffer(linkBuffer, offset: 0, index: 5)
+        enc.setBuffer(contactBuffer, offset: 0, index: 6)
+        enc.setBuffer(contactCountBuffer, offset: 0, index: 7)
+        enc.setBuffer(maxContactsBuffer, offset: 0, index: 8)
+        enc.setBuffer(hullVertexBuffer, offset: 0, index: 9)
+        enc.setBuffer(hullRangeBuffer, offset: 0, index: 10)
+        enc.setBuffer(jointBuffer, offset: 0, index: 11)
+        enc.setBytes(&jc, length: MemoryLayout<UInt32>.size, index: 12)
+        enc.setBuffer(asleepBuffer, offset: 0, index: 13)
+        enc.setBuffer(jointedBodyBuffer, offset: 0, index: 14)
+        enc.setBuffer(jointListBuffer, offset: 0, index: 15)
+        // The polytope pair list it appends to (a dummy with capacity 0 while none exists).
+        var maxP = UInt32(live ? maxPolyPairs : 0)
+        enc.setBuffer(live ? polyPairBuffer : polyDummyBuffer, offset: 0, index: 16)
+        enc.setBuffer(live ? polyPairCountBuffer : polyDummyBuffer, offset: 0, index: 17)
+        enc.setBytes(&maxP, length: MemoryLayout<UInt32>.size, index: 18)
+        let w = min(coinCount, generatePipeline.maxTotalThreadsPerThreadgroup)
+        enc.dispatchThreads(MTLSize(width: coinCount, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+        // The polytope narrowphase (boxes, topology hulls, compounds — and those against
+        // swept spheres): coinGenerateContacts listed exactly the pairs cdPairIsPoly owns
+        // (and generated nothing for them); one thread per listed pair now generates them,
+        // appending to the same contact buffer. A world without such bodies never pays it.
+        if live, let pairs = polyPairBuffer, let pairCount = polyPairCountBuffer, let args = polyArgsBuffer {
+            var maxPairs = UInt32(maxPolyPairs)
+            // One SIMD-group-wide threadgroup per listed pair (stage B3, VZ-0198): the pairs
+            // that run the separating-axis test spread it over the group's lanes
+            // (cdPolyNarrowSGBody); a swept / GJK pair runs on lane 0.
+            var pairsPerGroup: UInt32 = 1
+            enc.setComputePipelineState(polyArgsPipeline)
+            enc.setBuffer(pairCount, offset: 0, index: 0)
+            enc.setBuffer(args, offset: 0, index: 1)
+            enc.setBytes(&pairsPerGroup, length: MemoryLayout<UInt32>.size, index: 2)
+            enc.setBytes(&maxPairs, length: MemoryLayout<UInt32>.size, index: 3)
+            enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            enc.setComputePipelineState(polyNarrowPipeline)
+            enc.setBuffer(coinBuffer.buffer, offset: 0, index: 0)
+            enc.setBuffer(colliderBuffer.buffer, offset: 0, index: 1)
+            enc.setBuffer(uniformBuffer, offset: 0, index: 2)
+            enc.setBuffer(contactBuffer, offset: 0, index: 3)
+            enc.setBuffer(contactCountBuffer, offset: 0, index: 4)
+            enc.setBuffer(maxContactsBuffer, offset: 0, index: 5)
+            enc.setBuffer(hullVertexBuffer, offset: 0, index: 6)
+            enc.setBuffer(hullRangeBuffer, offset: 0, index: 7)
+            enc.setBuffer(pairs, offset: 0, index: 8)
+            enc.setBuffer(pairCount, offset: 0, index: 9)
+            enc.setBytes(&maxPairs, length: MemoryLayout<UInt32>.size, index: 10)
+            enc.dispatchThreadgroups(indirectBuffer: args, indirectBufferOffset: 0,
+                                     threadsPerThreadgroup: MTLSize(width: polyNarrowPipeline.threadExecutionWidth, height: 1, depth: 1))
         }
+        enc.endEncoding()
+    }
+
+    /// The polytope narrowphase's pair list, made on first use (a world without polytope
+    /// bodies never pays for it) — before anything in the substep binds its cursor.
+    private func ensurePolyPairBuffers() {
+        guard hasPolyBodies && !polyKernelDisabledForTesting && polyPairBuffer == nil else { return }
+        polyPairBuffer = device.makeBuffer(length: MemoryLayout<SIMD4<UInt32>>.stride * maxPolyPairs, options: .storageModePrivate)
+        polyPairCountBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride, options: .storageModeShared)
+        polyArgsBuffer = device.makeBuffer(length: MemoryLayout<UInt32>.stride * 3, options: .storageModePrivate)
+        polyPairBuffer?.label = "Coin.polyPairs"; polyPairCountBuffer?.label = "Coin.polyPairCount"; polyArgsBuffer?.label = "Coin.polyArgs"
     }
 
     /// Mark every body that is one end of an enabled, non-collideConnected two-body
@@ -2427,8 +2916,11 @@ public final class CoinDEMSolver: PenetrationProbing {
         enc.setBuffer(uniformBuffer, offset: 0, index: 5)
         enc.setBuffer(asleepBuffer, offset: 0, index: 6)
         enc.setBuffer(prep, offset: 0, index: 7)
-        // ≤ CD_JPREP_TG (32) threads: each owns a slice of the kernel's threadgroup scratch.
-        let tg = max(1, min(frameJointCount, 32, jointPreparePipeline.maxTotalThreadsPerThreadgroup))
+        // Up to 8 SIMD groups: joint k on group k mod 8, lane k / 8, so every joint of the frame is
+        // prepared in one round (cdJointPrepareTG — the prepare is instruction-fetch bound, and a
+        // group's lanes share its one instruction stream).
+        let simd = max(1, jointPreparePipeline.threadExecutionWidth)
+        let tg = max(simd, min(frameJointCount * simd, 8 * simd, (jointPreparePipeline.maxTotalThreadsPerThreadgroup / simd) * simd))
         enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
                                  threadsPerThreadgroup: MTLSize(width: tg, height: 1, depth: 1))
         enc.endEncoding()
@@ -2474,32 +2966,61 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// Measured on the shipped Pile of Mess config: 24 rounds leaves 0 uncoloured across
     /// a 900-frame settle, 16 rounds leaves a handful per frame. `colorStats.uncolored`
     /// counts them — a scene paying for the tail shows up there as a number.
+    /// (`.jonesPlassmann` only; `.speculative` runs `speculativeColorRounds` instead.)
     public var colorRounds: Int = 24
+
+    /// How each substep's contacts are coloured (VZ-0160, stage B2 — see `ColoringScheme`,
+    /// CoinDEMSolver+Coloring.swift). `.jonesPlassmann` is the default and colours exactly
+    /// as before; `.speculative` colours a busy body's contacts several per round, so a
+    /// heap whose busiest bodies touch 20–40 others is fully coloured in ~6 rounds, where
+    /// Jones–Plassmann needs ~2.5 rounds per contact on the busiest body.
+    public var coloringScheme: ColoringScheme = .jonesPlassmann
+    /// Rounds encoded per substep by `.speculative` (two dispatches each). 6 coloured every
+    /// contact of every heap measured for VZ-0160 (CoinDEMColoringTests).
+    public var speculativeColorRounds: Int = 6
 
     /// Encode the graph colouring of the current contact buffer: build per-body
     /// contact lists, then run `colorRounds` Jones-Plassmann rounds — all in `cb`,
     /// no per-round readback. Assumes contacts were generated this command buffer.
-    private func encodeColoring(_ cb: MTLCommandBuffer) {
-        dispatch(cb, writeContactArgsPipeline, threads: 1, label: "Coin.cs.contactArgs") { enc in
-            enc.setBuffer(self.contactCountBuffer, offset: 0, index: 0)
-            enc.setBuffer(self.contactArgsBuffer, offset: 0, index: 1)
-            enc.setBuffer(self.solveTGSizeBuffer, offset: 0, index: 2)
-        }
-        dispatch(cb, clearBodyPipeline, threads: maxCoins, label: "Coin.cs.clearBody") { enc in
-            enc.setBuffer(self.bodyContactCountBuffer, offset: 0, index: 0)
-        }
-        dispatchOverContacts(cb, buildBodyPipeline, label: "Coin.cs.buildBody") { enc in
-            enc.setBuffer(self.contactBuffer, offset: 0, index: 0)
-            enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
-            enc.setBuffer(self.bodyContactsBuffer, offset: 0, index: 2)
-            enc.setBuffer(self.bodyContactCountBuffer, offset: 0, index: 3)
-            enc.setBuffer(self.colorStatsBuffer, offset: 0, index: 4)
-        }
-        dispatchOverContacts(cb, colorInitPipeline, label: "Coin.cs.colorInit") { enc in
-            enc.setBuffer(self.contactBuffer, offset: 0, index: 0)
-            enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
-            enc.setBuffer(self.contactPriorityBuffer, offset: 0, index: 2)
-            enc.setBuffer(self.colorBuffers[0], offset: 0, index: 3)
+    private func encodeColoring(_ cb: MTLCommandBuffer, fused: Bool = false) {
+        if fused {
+            // The cursor clamp + contact args, the per-body lists and the colouring seed in
+            // one threadgroup (coinColorPrepareTG; the list counts were zeroed by coinSubstepBegin).
+            dispatchOneGroup(cb, colorPrepareTGPipeline, label: "Coin.cs.colorPrepare") { enc in
+                enc.setBuffer(self.contactCountBuffer, offset: 0, index: 0)
+                enc.setBuffer(self.contactArgsBuffer, offset: 0, index: 1)
+                enc.setBuffer(self.solveTGSizeBuffer, offset: 0, index: 2)
+                enc.setBuffer(self.maxContactsBuffer, offset: 0, index: 3)   // clamps the cursor (overflow)
+                enc.setBuffer(self.contactBuffer, offset: 0, index: 4)
+                enc.setBuffer(self.bodyContactsBuffer, offset: 0, index: 5)
+                enc.setBuffer(self.bodyContactCountBuffer, offset: 0, index: 6)
+                enc.setBuffer(self.colorStatsBuffer, offset: 0, index: 7)
+                enc.setBuffer(self.contactPriorityBuffer, offset: 0, index: 8)
+                enc.setBuffer(self.colorBuffers[0], offset: 0, index: 9)
+            }
+        } else {
+            dispatch(cb, writeContactArgsPipeline, threads: 1, label: "Coin.cs.contactArgs") { enc in
+                enc.setBuffer(self.contactCountBuffer, offset: 0, index: 0)
+                enc.setBuffer(self.contactArgsBuffer, offset: 0, index: 1)
+                enc.setBuffer(self.solveTGSizeBuffer, offset: 0, index: 2)
+                enc.setBuffer(self.maxContactsBuffer, offset: 0, index: 3)   // clamps the cursor (overflow)
+            }
+            dispatch(cb, clearBodyPipeline, threads: maxCoins, label: "Coin.cs.clearBody") { enc in
+                enc.setBuffer(self.bodyContactCountBuffer, offset: 0, index: 0)
+            }
+            dispatchOverContacts(cb, buildBodyPipeline, label: "Coin.cs.buildBody") { enc in
+                enc.setBuffer(self.contactBuffer, offset: 0, index: 0)
+                enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
+                enc.setBuffer(self.bodyContactsBuffer, offset: 0, index: 2)
+                enc.setBuffer(self.bodyContactCountBuffer, offset: 0, index: 3)
+                enc.setBuffer(self.colorStatsBuffer, offset: 0, index: 4)
+            }
+            dispatchOverContacts(cb, colorInitPipeline, label: "Coin.cs.colorInit") { enc in
+                enc.setBuffer(self.contactBuffer, offset: 0, index: 0)
+                enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
+                enc.setBuffer(self.contactPriorityBuffer, offset: 0, index: 2)
+                enc.setBuffer(self.colorBuffers[0], offset: 0, index: 3)
+            }
         }
         // Ping-pong the rounds: each reads the previous round's colours and writes the
         // next, so a round is a pure function and the colouring can't depend on which
@@ -2507,7 +3028,34 @@ public final class CoinDEMSolver: PenetrationProbing {
         // encoder — Metal orders dispatches within a compute encoder, so this is the same
         // barrier semantics as an encoder each, minus ~`colorRounds` encoder setups.
         var src = 0
-        if colorRounds > 0, let enc = cb.makeComputeCommandEncoder() {   // (an empty encoder aborts under validation)
+        if coloringScheme == .speculative {
+            // VZ-0160: tentative bids + conflict resolution, both pure functions of the
+            // previous round's colours (the bids have their own buffer), ping-ponged the same
+            // way — see coinColorTentative / coinColorResolve.
+            if speculativeColorRounds > 0, let bid = speculativeBidBuffer(),
+               let enc = cb.makeComputeCommandEncoder() {                // (never an empty encoder)
+                enc.label = "Coin.cs.colorSpeculative"
+                enc.setBuffer(contactBuffer, offset: 0, index: 0)
+                enc.setBuffer(contactCountBuffer, offset: 0, index: 1)
+                enc.setBuffer(bodyContactsBuffer, offset: 0, index: 2)
+                enc.setBuffer(bodyContactCountBuffer, offset: 0, index: 3)
+                enc.setBuffer(contactPriorityBuffer, offset: 0, index: 4)
+                enc.setBuffer(bid, offset: 0, index: 6)
+                let tg = MTLSize(width: Self.solveTGSize, height: 1, depth: 1)
+                for _ in 0..<speculativeColorRounds {
+                    enc.setComputePipelineState(colorTentativePipeline)
+                    enc.setBuffer(colorBuffers[src], offset: 0, index: 5)
+                    enc.dispatchThreadgroups(indirectBuffer: contactArgsBuffer, indirectBufferOffset: 0,
+                                             threadsPerThreadgroup: tg)
+                    enc.setComputePipelineState(colorResolvePipeline)
+                    enc.setBuffer(colorBuffers[1 - src], offset: 0, index: 7)
+                    enc.dispatchThreadgroups(indirectBuffer: contactArgsBuffer, indirectBufferOffset: 0,
+                                             threadsPerThreadgroup: tg)
+                    src = 1 - src
+                }
+                enc.endEncoding()
+            }
+        } else if colorRounds > 0, let enc = cb.makeComputeCommandEncoder() {   // (an empty encoder aborts under validation)
             enc.label = "Coin.cs.color"
             enc.setComputePipelineState(colorRoundPipeline)
             enc.setBuffer(contactBuffer, offset: 0, index: 0)
@@ -2527,6 +3075,26 @@ public final class CoinDEMSolver: PenetrationProbing {
         }
         let final = colorBuffers[src]
         var sweep = UInt32(colorSweep)
+        if fused {
+            // Writeback, the colour buckets (count, scan, scatter — counts zeroed by
+            // coinSubstepBegin), the uncoloured bucket and the per-colour args in one
+            // threadgroup (coinColorFinishTG).
+            dispatchOneGroup(cb, colorFinishTGPipeline, label: "Coin.cs.colorFinish") { enc in
+                enc.setBuffer(self.contactBuffer, offset: 0, index: 0)
+                enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
+                enc.setBuffer(final, offset: 0, index: 2)
+                enc.setBuffer(self.colorStatsBuffer, offset: 0, index: 3)
+                enc.setBytes(&sweep, length: MemoryLayout<UInt32>.size, index: 4)
+                enc.setBuffer(self.colorCountBuffer, offset: 0, index: 5)
+                enc.setBuffer(self.colorOffsetBuffer, offset: 0, index: 6)
+                enc.setBuffer(self.colorContactsBuffer, offset: 0, index: 7)
+                enc.setBuffer(self.contactPriorityBuffer, offset: 0, index: 8)
+                enc.setBuffer(self.uncolSubBuffer, offset: 0, index: 9)
+                enc.setBuffer(self.solveArgsBuffer, offset: 0, index: 10)
+                enc.setBuffer(self.solveTGSizeBuffer, offset: 0, index: 11)
+            }
+            return
+        }
         dispatchOverContacts(cb, colorWritebackPipeline, label: "Coin.cs.colorWriteback") { enc in
             enc.setBuffer(self.contactBuffer, offset: 0, index: 0)
             enc.setBuffer(self.contactCountBuffer, offset: 0, index: 1)
@@ -2554,6 +3122,7 @@ public final class CoinDEMSolver: PenetrationProbing {
             enc.setBuffer(self.colorCountBuffer, offset: 0, index: 2)   // zeroed by the scan → cursor
             enc.setBuffer(self.colorOffsetBuffer, offset: 0, index: 3)
             enc.setBuffer(self.colorContactsBuffer, offset: 0, index: 4)
+            enc.setBuffer(self.contactBuffer, offset: 0, index: 5)        // a manifold head's point count
         }
         // maxColors threads write the per-colour args; the first threadgroup (up to 256
         // threads) also orders + sub-colours the uncoloured bucket (coinWriteColorArgs).
@@ -2598,6 +3167,17 @@ public final class CoinDEMSolver: PenetrationProbing {
         colorSweep = 0      // re-sized from the fresh stats; the tail pass covers the gap
     }
 
+    /// The `.speculative` colouring's bid buffer, made on first use (VZ-0160). Private: the
+    /// kernels write every uncoloured contact's bid before any read of it, so it is never
+    /// cleared.
+    private func speculativeBidBuffer() -> MTLBuffer? {
+        if let b = colorBidBuffer { return b }
+        let b = device.makeBuffer(length: MemoryLayout<UInt32>.stride * max(maxContacts, 1), options: .storageModePrivate)
+        b?.label = "Coin.colorBid"
+        colorBidBuffer = b
+        return b
+    }
+
     /// One-shot: build the broadphase + generate contacts (and optionally colour them)
     /// from the CURRENT state; return how many contacts were produced. Does NOT advance
     /// the sim. For tests / diagnostics.
@@ -2618,7 +3198,12 @@ public final class CoinDEMSolver: PenetrationProbing {
     }
 
     private func writeUniforms(dt: Float, coinCount: Int) {
-        let u = CoinUniforms(
+        uniformBuffer.contents().bindMemory(to: CoinUniforms.self, capacity: 1).pointee = makeUniforms(dt: dt, coinCount: coinCount)
+    }
+
+    /// The per-substep uniforms (also the small-world frame kernel's, over its one-cell grid).
+    func makeUniforms(dt: Float, coinCount: Int) -> CoinUniforms {
+        CoinUniforms(
             dt: dt, gravity: gravity, linDamping: linDamping,
             coinRadius: coinRadius, halfThickness: halfThickness,
             contactRelax: contactRelax, friction: friction, restitution: restitution,
@@ -2635,8 +3220,12 @@ public final class CoinDEMSolver: PenetrationProbing {
             quadraticDrag: quadraticDrag, dragRefRadius: dragRefRadius,
             speculativeMargin: speculativeMargin,
             solverFlags: (scaleAwareDeadStop ? 1 : 0) | (accumulatedRollingResistance ? 2 : 0)
-                       | (colliderCullDisabledForTesting ? 4 : 0))
-        uniformBuffer.contents().bindMemory(to: CoinUniforms.self, capacity: 1).pointee = u
+                       | (colliderCullDisabledForTesting ? 4 : 0) | (manifoldSolve ? 8 : 0)
+                       | (torsionPatchSlots.isEmpty ? 0 : 16) | (polySATSerialForTesting ? 32 : 0)
+                       | (preparedContactsLive ? 64 : 0) | (separatingSplitImpulse ? 128 : 0)
+                       | (keepSleepingContacts ? 256 : 0),
+            maxBodyBound: broadphaseClassicScanForTesting ? 0 : maxBodyBound,
+            manifoldPasses: UInt32(max(1, manifoldInnerPasses)))
     }
 
     private func dispatch(_ cb: MTLCommandBuffer,
@@ -2653,6 +3242,43 @@ public final class CoinDEMSolver: PenetrationProbing {
                             threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
         enc.endEncoding()
     }
+
+    /// One threadgroup of a single-threadgroup kernel (the fused substep kernels): as wide as
+    /// the pipeline allows, up to 1024, in whole SIMD groups; the kernel loops over any count.
+    private func dispatchOneGroup(_ cb: MTLCommandBuffer, _ pipeline: MTLComputePipelineState,
+                                  label: String, _ bind: (MTLComputeCommandEncoder) -> Void) {
+        guard let enc = cb.makeComputeCommandEncoder() else { return }
+        enc.label = label
+        enc.setComputePipelineState(pipeline)
+        bind(enc)
+        let simd = max(1, pipeline.threadExecutionWidth)
+        let w = max(simd, (min(Self.fusedTGSize, pipeline.maxTotalThreadsPerThreadgroup) / simd) * simd)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+        enc.endEncoding()
+    }
+
+    /// Threads in a fused single-threadgroup kernel's group (capped by the pipeline): wide, so a
+    /// big world's per-contact loops take few passes (an 800-egg rain's ~5 700 contacts: 6).
+    private static let fusedTGSize = 1024
+
+    /// The fused broadphase (coinBroadphaseTG) only while the grid's scan fits ONE pass of its group:
+    /// ≤ one scan block (1 024 cells) per thread, ≤ 1 048 576 cells at 1 024 threads. Past that its
+    /// scan runs chunk after chunk on the ONE core its threadgroup occupies, where the one-step kernels
+    /// (coinCellBlockSums / coinCellOffsetsApply) spread the blocks over the whole GPU — measured by the
+    /// stage-B3 verifier (M1 Max, a 400-egg rain at 1/120 s × 4, fused vs one-step interleaved in one
+    /// process, GPU ms per frame p50): 0.75 M cells 18.7 vs 19.1, 0.96 M 21.6 vs 22.1 (fused ahead),
+    /// then 1.28 M 27.3 vs 24.1, 1.58 M 32.9 vs 24.6, 2.06 M 40.3 vs 24.6, 7.98 M 137 vs 47.5. Both
+    /// broadphases build the same cell offsets and sorted list (integer scans), so the choice changes
+    /// no bit of the simulation (CoinDEMSmallWorldTests.testFusedBroadphaseScansAHouseScaleGrid).
+    var fusedBroadphaseFits: Bool {
+        if let m = fusedBroadphaseMaxBlocksForTesting { return numScanBlocks <= m }
+        let simd = max(1, broadphaseTGPipeline.threadExecutionWidth)
+        let group = max(simd, (min(Self.fusedTGSize, broadphaseTGPipeline.maxTotalThreadsPerThreadgroup) / simd) * simd)
+        return numScanBlocks <= group
+    }
+    /// TEST SEAM: overrides the fused broadphase's block limit (the multi-chunk scan's parity test).
+    var fusedBroadphaseMaxBlocksForTesting: Int?
 
     /// Dispatch a contact-indexed kernel over the LIVE contacts (threadgroup count
     /// written by `coinWriteContactArgs`) rather than the buffer capacity — a settled

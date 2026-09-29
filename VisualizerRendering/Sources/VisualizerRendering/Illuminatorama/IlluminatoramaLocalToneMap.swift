@@ -88,6 +88,123 @@ public struct IlluminatoramaLocalToneMapping: Equatable, Sendable {
     /// as (0.78, 0.90, 1.18) reads as moonlight.
     public var mesopicTint: SIMD3<Float> = SIMD3(1, 1, 1)
 
+    // ── Adaptation from the frame (opt-in) ───────────────────────────────
+    /// OFF (default) = the lift is bounded by `maxLift` alone. ON = also by the frame's own
+    /// EXPOSURE DEFICIT: the bilateral grid is a whole-frame log-brightness histogram at the
+    /// applied exposure, so its mean is a meter reading of what the camera actually printed;
+    /// the lift ceiling is `adaptationGain · max(0, adaptationTargetEV − mean − adaptationTolerance)`
+    /// (computed on the GPU, no readback). A frame exposed within `adaptationTolerance` of the key
+    /// is left EXACTLY as rendered (no lift, no mesopic shift — the pass is an exact copy); as the
+    /// light falls and a capped / partial meter leaves the field under-exposed, the eye makes the
+    /// deficit up stop for stop. One adaptation state, keyed on the frame — not a second ramp
+    /// fighting the exposure's.
+    public var adaptationFromFrame: Bool = false
+    /// The meter key the deficit is measured against (log2 of the exposed brightness a "correct"
+    /// field averages to — the auto-exposure target EV).
+    public var adaptationTargetEV: Float = -2.2
+    /// Stops of underexposure a print keeps before the eye starts adapting.
+    public var adaptationTolerance: Float = 1
+    /// Stops of lift per stop of deficit past the tolerance (1 = the eye makes it all up).
+    public var adaptationGain: Float = 1
+    /// Photopic field luminance (cd/m², through `mesopicNitsPerUnit`; 0 = off): a field whose mean
+    /// luminance is above it gets one more stop of tolerance per stop above — in cone vision the
+    /// eye's lightness constancy keeps pace with a camera's print (a sunlit room reads as the
+    /// photograph of it), so the operator only re-adapts where the light has fallen toward mesopic.
+    public var adaptationPhotopicNits: Float = 0
+
+    // ── Histogram-adjusted tail (opt-in) ─────────────────────────────────
+    /// OFF (default) = the fixed far-tail slope `1 − strength` (and the `floorLevel` segment).
+    /// ON = the far-tail slope at each brightness is set from the frame's own histogram (Ward
+    /// Larson, Rushmeier & Piatko 1997, histogram adjustment): populated brightness ranges keep
+    /// contrast, empty ones (the gap between bright emitters and a dim room) are compressed to
+    /// `gapSlope`; the populated slope is then scaled (≥ `minPopulatedScale`) so the absolute
+    /// floor luminance `printFloorNits` lands exactly on `printFloorLevel` — the range the eye
+    /// adapts across is FITTED into what the display can still print. `strength` still has to be
+    /// > 0 (it enables the pass); `floorLevel` / `floorSlope` are ignored.
+    public var histogramTail: Bool = false
+    /// Slope (output stops per input stop) across an empty brightness range.
+    public var gapSlope: Float = 0.05
+    /// Fraction of the frame a 1-stop bin must hold to count as fully populated (slope 1 before
+    /// the fit's scale).
+    public var populatedFraction: Float = 0.01
+    /// Lowest the fit may scale the populated slope to.
+    public var minPopulatedScale: Float = 0.1
+    /// Absolute luminance (cd/m², through `mesopicNitsPerUnit`) the fit lands on
+    /// `printFloorLevel`: ~1e-5, where a dark-adapted eye still makes out a room. 0 = no fit.
+    public var printFloorNits: Float = 0
+    /// EXPOSED brightness (after the lift; the meter's metric) the display prints at the lowest
+    /// code the host wants a dark-adapted room to reach — solve it through the display
+    /// transform's inverse (`IlluminatoramaDisplayInverse.exposedLevel`).
+    public var printFloorLevel: Float = 0
+
+    // ── Mesopic model (opt-in, with `mesopic` > 0) ───────────────────────
+    public enum MesopicModel: Int, Sendable {
+        /// CIE 191 m as the colour weight (the original — m is a LUMINANCE weighting).
+        case cie191 = 0
+        /// Jensen et al. (2000)'s blue shift: colour fades with LOG luminance across
+        /// `mesopicLogRange` toward rod vision in `mesopicTint` (Jensen's CIE xy (0.25, 0.25) ≈
+        /// linear sRGB (0.71, 0.99, 1.97)).
+        case blueShift = 1
+    }
+    public var mesopicModel: MesopicModel = .cie191
+    /// log10 cd/m²: fully rod-coloured at or below `.x`, fully photopic at or above `.y`
+    /// (Jensen 2000: −2 … 0.6).
+    public var mesopicLogRange: SIMD2<Float> = SIMD2(-2, 0.6)
+    /// Take the mesopic luminance as max(the pixel's own, its neighbourhood's): the base comes
+    /// from the dark side of an edge, so a lit patch's rim would otherwise be rod-tinted.
+    public var mesopicPixelFloor: Bool = false
+
+    /// How a pixel's ROD response is computed from its linear sRGB (opt-in; default `.larson`).
+    public enum MesopicRodModel: Int, Sendable {
+        /// Larson, Rushmeier & Piatko (1997): V = Y·[1.33·(1 + (Y+Z)/X) − 1.68] — a fit that is
+        /// NOT additive in radiance: red light added to dim moonlight raises X and the mixture's
+        /// rod response falls below the moonlight's own, so the edge of a red light printed a
+        /// near-black seam where the mixture was red-dominated but still mesopic (VZ-0194).
+        case larson = 0
+        /// The sum of per-primary rod responses (Larson's own value at each sRGB primary; D65 grey
+        /// within 0.3 %) — additive, as a photoreceptor's response to light is: adding light never
+        /// lowers it, and the mesopic print rises monotonically with radiance.
+        case additive = 1
+    }
+    public var mesopicRodModel: MesopicRodModel = .larson
+    /// With `mesopicPixelFloor`: floor the mesopic luminance with the pixel's CONE signal (the
+    /// operator's brightness metric, max(luma, ½·max channel)) instead of its luma. A small red-lit
+    /// feature beside a dark field (a toy's ridge) has a dark neighbourhood base AND a low luma — a
+    /// saturated red is ~¼ luma — so it was rod-mapped to near-black while the same red on a larger
+    /// patch beside it stayed red: a dark seam printed from radiance no darker than its
+    /// neighbours' (VZ-0194). Opt-in.
+    public var mesopicConeFloor: Bool = false
+    /// Take the mesopic WEIGHT from the neighbourhood's plain (not edge-aware) adaptation level —
+    /// the blurred grid's mean log brightness per cell, bilinear — instead of the edge-aware base
+    /// sliced at the pixel's own brightness. The eye adapts to its surround, not to each pixel:
+    /// the edge-aware base follows a small lit feature's own level, so across a red light's
+    /// terminator the weight flipped from rod to cone within a few pixels and the rod-mapped band
+    /// (red has almost no rod response) printed darker than both sides (VZ-0194). With a smooth
+    /// weight the print mixes cone colour and rod response by the same amount on both sides of an
+    /// edge — linear in radiance with non-negative weights, so a brighter input never prints darker.
+    /// (`mesopicPixelFloor` still floors it with the pixel's own level.) Opt-in.
+    public var mesopicSpatialAdaptation: Bool = false
+
+    /// Rod luminance (photopic-equivalent: D65 grey keeps its luminance) — Larson et al. 1997.
+    /// Mirrors the shader's `ltmScotopicRatio` path.
+    public static func larsonRodLuminance(_ c: SIMD3<Float>) -> Float {
+        let X = simd_dot(c, SIMD3(0.4124, 0.3576, 0.1805))
+        let Y = simd_dot(c, SIMD3(0.2126, 0.7152, 0.0722))
+        let Z = simd_dot(c, SIMD3(0.0193, 0.1192, 0.9505))
+        guard X > 1e-20, Y > 1e-20 else { return Y }
+        let vy = max(1.33 * (1 + (Y + Z) / X) - 1.68, 0)
+        return min(Y * vy / 2.573, 4 * Y)
+    }
+    /// Per-primary rod responses (Larson's V/2.573 at R, G and B) — the additive model's weights.
+    public static let additiveRodWeights = SIMD3<Float>(0.032876, 0.765326, 0.201635)
+    public static func additiveRodLuminance(_ c: SIMD3<Float>) -> Float {
+        simd_dot(simd_max(c, .zero), additiveRodWeights)
+    }
+
+    /// Jensen et al. (2000)'s scotopic blue-shift chromaticity (CIE xy 0.25, 0.25) in linear
+    /// sRGB, unit luma.
+    public static let jensenBlueShiftTint = SIMD3<Float>(0.706, 0.990, 1.966)
+
     public init(strength: Float = 0, radius: Float = 0.04, edgeStops: Float = 1, detail: Float = 1,
                 anchor: Float = 0.18, knee: Float = 2, maxLift: Float = 8,
                 floorLevel: Float = 0, floorSlope: Float = 0.5,
@@ -178,7 +295,22 @@ final class IlluminatoramaLocalToneMapPass {
         var meso: SIMD4<Float>
         /// xyz = rod-vision tint (luminance-normalised in the shader), w unused.
         var mesoTint: SIMD4<Float>
+        /// x = adaptation from the frame ON, y = meter target EV, z = tolerance, w = gain.
+        var adapt: SIMD4<Float> = .zero
+        /// x = histogram tail ON, y = gap slope, z = populated fraction, w = min populated scale.
+        var hist: SIMD4<Float> = .zero
+        /// x = print-floor luminance (cd/m²), y = print-floor level (exposed), zw unused.
+        var pfloor: SIMD4<Float> = .zero
+        /// x = mesopic model, y/z = log10 range, w = pixel floor ON.
+        var meso2: SIMD4<Float> = .zero
+        /// x = photopic field luminance (cd/m²; 0 = off), yzw unused.
+        var adapt2: SIMD4<Float> = .zero
     }
+
+    /// Floats in the stats buffer (`illumiLTMStats`): 4 header + the f(d) table.
+    static let statsFloatCount = 4 + 161
+    /// The f(d) table's step (stops) — the shader's `kLTMCurveStep`.
+    static let curveStep: Float = 0.25
 
     /// The grid layout for one frame size and radius.
     struct Layout: Equatable {
@@ -210,6 +342,23 @@ final class IlluminatoramaLocalToneMapPass {
     private let buildPipeline: MTLComputePipelineState?
     private let blurPipeline: MTLComputePipelineState?
     private let applyPipeline: MTLComputePipelineState?
+    /// The neighbourhood's (not edge-aware) mean log brightness per grid cell — `mesopicSpatialAdaptation`.
+    private let adaptPipeline: MTLComputePipelineState?
+    private var adaptation: MTLTexture?
+    private let statsPipeline: MTLComputePipelineState?
+    /// Frame statistics + the fitted curve (`illumiLTMStats` → apply). Shared storage so a host
+    /// can read the adaptation state the GPU settled on (`lastLiftCeiling` — a plain load of the
+    /// latest completed write, never a wait; the same idiom as the renderer's `lastAutoExposure`).
+    /// Unified memory: shared costs nothing over private for 165 floats.
+    private(set) var statsBuffer: MTLBuffer?
+    /// The lift ceiling (stops) `illumiLTMStats` derived from the frame's exposure deficit on the
+    /// latest completed frame — `adaptationGain · max(0, deficit − tolerance)` — or −1 when
+    /// `adaptationFromFrame` is off or the pass has not run. Lets a host key a print-side grade on
+    /// the SAME adaptation state as the lift instead of a second ramp of its own.
+    var lastLiftCeiling: Float {
+        guard let b = statsBuffer, b.storageMode == .shared else { return -1 }
+        return b.contents().advanced(by: MemoryLayout<Float>.stride).assumingMemoryBound(to: Float.self).pointee
+    }
 
     private var layoutCache: Layout?
     private var lowLog: MTLTexture?
@@ -222,7 +371,8 @@ final class IlluminatoramaLocalToneMapPass {
     private(set) var lastParams: Params?
 
     /// The kernels' names in `IlluminatoramaLocalToneMap.metal`.
-    static let kernelNames = ["illumiLTMLogLuminance", "illumiLTMGridBuild", "illumiLTMGridBlur", "illumiLTMApply"]
+    static let kernelNames = ["illumiLTMLogLuminance", "illumiLTMGridBuild", "illumiLTMGridBlur", "illumiLTMApply",
+                              "illumiLTMStats", "illumiLTMAdaptation"]
 
     /// Pipelines from the shared cache (the renderer's own library; no new queue or library).
     convenience init(engine: SimEngine) {
@@ -237,10 +387,16 @@ final class IlluminatoramaLocalToneMapPass {
         buildPipeline = pipeline(Self.kernelNames[1])
         blurPipeline = pipeline(Self.kernelNames[2])
         applyPipeline = pipeline(Self.kernelNames[3])
+        statsPipeline = pipeline(Self.kernelNames[4])
+        adaptPipeline = pipeline(Self.kernelNames[5])
+        statsBuffer = device.makeBuffer(length: Self.statsFloatCount * MemoryLayout<Float>.stride,
+                                        options: .storageModeShared)
+        statsBuffer?.label = "Illuminatorama.ltm.stats"
     }
 
     var isAvailable: Bool {
         lumPipeline != nil && buildPipeline != nil && blurPipeline != nil && applyPipeline != nil
+            && statsPipeline != nil && statsBuffer != nil && adaptPipeline != nil
     }
 
     /// Encode the operator on `source` (scene-referred HDR, rgba16Float) and return the adapted
@@ -254,7 +410,8 @@ final class IlluminatoramaLocalToneMapPass {
                 makeEncoder: (String) -> MTLComputeCommandEncoder?) -> MTLTexture? {
         guard s.isEnabled, isAvailable,
               let lumP = lumPipeline, let buildP = buildPipeline,
-              let blurP = blurPipeline, let applyP = applyPipeline else { return nil }
+              let blurP = blurPipeline, let applyP = applyPipeline,
+              let statsP = statsPipeline, let stats = statsBuffer, let adaptP = adaptPipeline else { return nil }
         let lay = Self.layout(width: source.width, height: source.height, settings: s)
         guard ensureTextures(lay) else { return nil }
         guard let lowLog, let gridA, let gridB, let output else { return nil }
@@ -271,7 +428,17 @@ final class IlluminatoramaLocalToneMapPass {
                         IlluminatoramaLocalToneMapping.effectiveFloorSlope(s.floorSlope, strength: max(0, min(0.98, s.strength))),
                         0, 0),
             meso: SIMD4(s.mesopicNitsPerUnit > 0 ? max(0, min(1, s.mesopic)) : 0, max(0, s.mesopicNitsPerUnit), 0, 0),
-            mesoTint: SIMD4(simd_max(s.mesopicTint, SIMD3(repeating: 1e-4)), 0))
+            mesoTint: SIMD4(simd_max(s.mesopicTint, SIMD3(repeating: 1e-4)), Float(s.mesopicRodModel.rawValue)),
+            adapt: s.adaptationFromFrame
+                ? SIMD4(1, s.adaptationTargetEV, max(0, s.adaptationTolerance), max(0, s.adaptationGain)) : .zero,
+            hist: s.histogramTail
+                ? SIMD4(1, max(0, min(1, s.gapSlope)), max(1e-4, s.populatedFraction), max(0, min(1, s.minPopulatedScale))) : .zero,
+            pfloor: SIMD4(s.printFloorNits.isFinite ? max(0, s.printFloorNits) : 0,
+                          s.printFloorLevel.isFinite ? max(0, s.printFloorLevel) : 0, 0, 0),
+            meso2: SIMD4(Float(s.mesopicModel.rawValue), s.mesopicLogRange.x,
+                         max(s.mesopicLogRange.y, s.mesopicLogRange.x + 1e-3), s.mesopicPixelFloor ? 1 : 0),
+            adapt2: SIMD4(s.adaptationFromFrame && s.adaptationPhotopicNits.isFinite ? max(0, s.adaptationPhotopicNits) : 0,
+                          s.mesopicConeFloor ? 1 : 0, s.mesopicSpatialAdaptation ? 1 : 0, 0))
         lastLayout = lay
         lastParams = p
 
@@ -289,6 +456,16 @@ final class IlluminatoramaLocalToneMapPass {
         enc.setTexture(lowLog, index: 0)
         enc.setTexture(gridA, index: 1)
         Self.dispatch3D(enc, buildP, lay.gridW, lay.gridH, lay.gridD)
+        // 2b. frame statistics + fitted curve, on the UNBLURRED grid (one threadgroup). Always
+        // encoded — cheap (a few hundred reads per bin) — so the apply's stats binding is valid.
+        enc.setComputePipelineState(statsP)
+        // Slot 4: slots 0 / 1 are re-bound by the blurs next, and binding gridA at 0 here would
+        // make the first blur's identical binding a "redundant setting" (API validation abort).
+        enc.setTexture(gridA, index: 4)
+        enc.setBuffer(stats, offset: 0, index: 2)
+        enc.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: min(64, statsP.maxTotalThreadsPerThreadgroup),
+                                                                height: 1, depth: 1))
         // 3. blur x (A→B), y (B→A), range (A→B)
         enc.setComputePipelineState(blurP)
         for (axis, (src, dst)) in [(gridA, gridB), (gridB, gridA), (gridA, gridB)].enumerated() {
@@ -298,13 +475,18 @@ final class IlluminatoramaLocalToneMapPass {
             enc.setTexture(dst, index: 1)
             Self.dispatch3D(enc, blurP, lay.gridW, lay.gridH, lay.gridD)
         }
-        // 4. slice + apply. The grid goes in at index 3 and the exposure buffer stays bound at 1
-        // from step 1: re-binding an object at the slot it already occupies is a "redundant
-        // setting" that API validation (assert mode) aborts on.
+        // 3b. the neighbourhood's plain (not edge-aware) adaptation level per cell — read by the
+        // apply only with `mesopicSpatialAdaptation`; always encoded (tiny) so its slot is bound.
+        enc.setComputePipelineState(adaptP)
+        enc.setTexture(gridB, index: 3)
+        enc.setTexture(adaptation, index: 5)
+        Self.dispatch2D(enc, adaptP, lay.gridW, lay.gridH)
+        // 4. slice + apply. The grid (index 3) and the adaptation (5) stay bound from 3b and the
+        // exposure buffer at 1 from step 1: re-binding an object at the slot it already occupies
+        // is a "redundant setting" that API validation (assert mode) aborts on.
         enc.setComputePipelineState(applyP)
         enc.setTexture(source, index: 0)
         enc.setTexture(output, index: 2)
-        enc.setTexture(gridB, index: 3)
         enc.setBytes(&p, length: MemoryLayout<Params>.stride, index: 0)
         Self.dispatch2D(enc, applyP, lay.fullW, lay.fullH)
         enc.endEncoding()
@@ -312,7 +494,7 @@ final class IlluminatoramaLocalToneMapPass {
     }
 
     private func ensureTextures(_ lay: Layout) -> Bool {
-        if layoutCache == lay, lowLog != nil, gridA != nil, gridB != nil, output != nil { return true }
+        if layoutCache == lay, lowLog != nil, gridA != nil, gridB != nil, output != nil, adaptation != nil { return true }
         func tex2D(_ w: Int, _ h: Int, _ fmt: MTLPixelFormat, _ label: String) -> MTLTexture? {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: fmt, width: max(1, w),
                                                              height: max(1, h), mipmapped: false)
@@ -337,8 +519,9 @@ final class IlluminatoramaLocalToneMapPass {
         gridA = tex3D("Illuminatorama.ltm.gridA")
         gridB = tex3D("Illuminatorama.ltm.gridB")
         output = tex2D(lay.fullW, lay.fullH, .rgba16Float, "Illuminatorama.ltm.out")
+        adaptation = tex2D(lay.gridW, lay.gridH, .r32Float, "Illuminatorama.ltm.adaptation")
         layoutCache = lay
-        let ok = lowLog != nil && gridA != nil && gridB != nil && output != nil
+        let ok = lowLog != nil && gridA != nil && gridB != nil && output != nil && adaptation != nil
         if !ok { Self.log.error("local tone map: texture allocation failed") }
         return ok
     }

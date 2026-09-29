@@ -376,6 +376,20 @@ public final class VolumetricCloudRenderer {
         /// multiple scattering. 0.1 ≈ Earth's mean clear-sky surface albedo. Changing it rebuilds
         /// the LUTs (a GPU-only, ≈2–3 ms step), so don't animate it.
         public var atmosphereGroundAlbedo: Float = 0.1
+        /// **Spectral bake** (opt-in, with `atmosphereMultipleScattering`). Off (the default) =
+        /// the atmosphere is marched at ONE wavelength per channel (680 / 550 / 440 nm) written
+        /// straight to linear sRGB — exact for a smooth spectrum, wrong at twilight: ozone's
+        /// Chappuis band peaks near 600 nm, inside the sRGB red primary, which the 680 nm sample
+        /// barely sees, so over the long grazing sun path green is over-absorbed relative to red
+        /// and the civil-twilight sky prints mauve (measured: sun −4°, 30° up, 90° from the sun —
+        /// 1 : 0.55 : 0.93 against a spectral reference's 0.47 : 0.60 : 1). On = the same march,
+        /// LUTs and multiple scattering at 12 wavelengths (380–720 nm), each converted through
+        /// ∫ CIE 1931 CMF × solar spectrum to linear sRGB, white-balanced so the sun above the
+        /// atmosphere is white (the 3-wavelength convention — `atmosphereIntensity` keeps its
+        /// meaning). The day sky moves a few % (sun 48°, 10° up: R/B 0.38 → 0.43); twilight turns
+        /// blue. Cost: 4× the LUT build (once) and 4× the per-pixel MS march (dome bake / IBL /
+        /// in-view sky). Bake-time only — no per-frame work for a throttled dome.
+        public var atmosphereSpectral: Bool = false
 
         // ── Night directional moonlight (cloud form) ───────────────────
         /// Strength of the moon as the cloud deck's DIRECTIONAL light. 0 =
@@ -952,15 +966,21 @@ public final class VolumetricCloudRenderer {
         nonisolated static let msW = 64, msH = 32          // Ψ LUT: cos(sun zenith) × altitude
         nonisolated static let lastOrder = 5               // orders 2…5 iterated, then the tail
         nonisolated static let dirThreads = 64             // threads per Ψ texel in the order kernel
-        /// Float4s in the region: header + transmittance + Ψ (2 per texel) + 5 scratch tables.
+        /// Float4s ONE band's LUTs take, with the shared header: header + transmittance + Ψ (2 per
+        /// texel) + 5 scratch tables (the shader's `kLUTLength`).
         nonisolated static let float4Count = 1 + transW * transH + 2 * msW * msH + 5 * msW * msH
+        /// Wavelength triples of the spectral bake (`atmosphereSpectral`; the shader's `kSpecBands`);
+        /// band b's tables sit b × (float4Count − 1) after band 0's.
+        nonisolated static let spectralBands = 4
+        /// Float4s the region is allocated with: room for every spectral band.
+        nonisolated static let regionFloat4Count = 1 + spectralBands * (float4Count - 1)
     }
     /// Byte offset of the atmosphere LUT region in `skyUniformsBuffer` (after the uniforms).
     nonisolated static var atmosphereLUTOffset: Int { (MemoryLayout<SkyUniforms>.stride + 255) & ~255 }
     /// Length of `skyUniformsBuffer`: the uniforms, then the atmosphere LUT region. A buffer this
     /// long is what `illumi_cloud_inview` needs to read the LUTs (Illuminatorama checks it).
     nonisolated static var skyUniformsBufferLength: Int {
-        atmosphereLUTOffset + AtmosphereLUT.float4Count * MemoryLayout<SIMD4<Float>>.stride
+        atmosphereLUTOffset + AtmosphereLUT.regionFloat4Count * MemoryLayout<SIMD4<Float>>.stride
     }
 
     /// The dome / IBL kernel for these params: `volSkyRender` has no multiple-scattering code in
@@ -982,30 +1002,31 @@ public final class VolumetricCloudRenderer {
         return buffer.contents().load(fromByteOffset: off, as: Float.self) > 0.5
     }
 
-    /// Ground albedo the atmosphere LUTs were last built for (nil = never built).
-    private var atmosphereLUTAlbedo: Float?
-    /// A build this update still has to encode (its albedo), or nil.
-    private var pendingAtmosphereLUT: Float?
+    /// Ground albedo and spectral flag the atmosphere LUTs were last built for (nil = never built).
+    private var atmosphereLUTKey: SIMD2<Float>?
+    /// A build this update still has to encode (albedo, spectral), or nil.
+    private var pendingAtmosphereLUT: SIMD2<Float>?
 
     /// Queue a (re)build when the flag is on and the LUTs are missing or stale (albedo changed).
     /// Never per frame: the LUTs depend only on compile-time constants and the albedo.
     private func scheduleAtmosphereLUT(_ uniforms: SkyUniforms) {
-        guard uniforms.msParams.x > 0.5, atmosphereLUTAlbedo != uniforms.msParams.y else { return }
-        pendingAtmosphereLUT = uniforms.msParams.y
+        let key = SIMD2<Float>(uniforms.msParams.y, uniforms.msParams.z)
+        guard uniforms.msParams.x > 0.5, atmosphereLUTKey != key else { return }
+        pendingAtmosphereLUT = key
     }
 
     /// Encode a pending build at the head of `cmd` — the first command buffer of this update, so
     /// every later dispatch on the queue (this update's prepass, IBL and dome, and the in-view
     /// pass after it) reads complete LUTs. GPU-only: no wait, no readback.
     private func encodePendingAtmosphereLUT(into cmd: MTLCommandBuffer) {
-        guard let albedo = pendingAtmosphereLUT else { return }
+        guard let key = pendingAtmosphereLUT else { return }
         pendingAtmosphereLUT = nil
-        if encodeAtmosphereLUTBuild(into: cmd, albedo: albedo) { atmosphereLUTAlbedo = albedo }
+        if encodeAtmosphereLUTBuild(into: cmd, albedo: key.x, spectral: key.y > 0.5) { atmosphereLUTKey = key }
     }
 
     /// Encode the whole LUT build (transmittance → orders 2…N → finalize → ready flag) into
     /// `cmd`. Internal so a test can time it on a command buffer of its own.
-    func encodeAtmosphereLUTBuild(into cmd: MTLCommandBuffer, albedo: Float) -> Bool {
+    func encodeAtmosphereLUTBuild(into cmd: MTLCommandBuffer, albedo: Float, spectral: Bool = false) -> Bool {
         guard let trans = pipelineCache.pipelineState(name: "volSkyTransmittanceLUT", device: device),
               let order = pipelineCache.pipelineState(name: "volSkyMultiScatterOrder", device: device),
               let finalize = pipelineCache.pipelineState(name: "volSkyMultiScatterFinalize", device: device),
@@ -1025,21 +1046,29 @@ public final class VolumetricCloudRenderer {
             body(enc)
             enc.endEncoding()
         }
-        stage("volSkyTransmittanceLUT", trans) { enc in
-            enc.dispatchThreads(MTLSize(width: L.transW, height: L.transH, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))
-        }
-        for n in 2...L.lastOrder {
-            bp.x = Float(n)
-            stage("volSkyMultiScatterOrder\(n)", order) { enc in
+        // bp: x = order, y = albedo, z = band, w = spectral. One pass over the tables per band.
+        bp.w = spectral ? 1 : 0
+        for band in 0..<(spectral ? L.spectralBands : 1) {
+            bp.z = Float(band)
+            bp.x = 0
+            stage("volSkyTransmittanceLUT", trans) { enc in
                 enc.setBytes(&bp, length: MemoryLayout<SIMD4<Float>>.stride, index: 1)
-                enc.dispatchThreadgroups(MTLSize(width: L.msW, height: L.msH, depth: 1),
-                                         threadsPerThreadgroup: MTLSize(width: L.dirThreads, height: 1, depth: 1))
+                enc.dispatchThreads(MTLSize(width: L.transW, height: L.transH, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))
             }
-        }
-        stage("volSkyMultiScatterFinalize", finalize) { enc in
-            enc.dispatchThreads(MTLSize(width: L.msW, height: L.msH, depth: 1),
-                                threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))
+            for n in 2...L.lastOrder {
+                bp.x = Float(n)
+                stage("volSkyMultiScatterOrder\(n)", order) { enc in
+                    enc.setBytes(&bp, length: MemoryLayout<SIMD4<Float>>.stride, index: 1)
+                    enc.dispatchThreadgroups(MTLSize(width: L.msW, height: L.msH, depth: 1),
+                                             threadsPerThreadgroup: MTLSize(width: L.dirThreads, height: 1, depth: 1))
+                }
+            }
+            stage("volSkyMultiScatterFinalize", finalize) { enc in
+                enc.setBytes(&bp, length: MemoryLayout<SIMD4<Float>>.stride, index: 1)
+                enc.dispatchThreads(MTLSize(width: L.msW, height: L.msH, depth: 1),
+                                    threadsPerThreadgroup: MTLSize(width: 16, height: 8, depth: 1))
+            }
         }
         stage("volSkyMultiScatterReady", ready) { enc in
             enc.setBytes(&bp, length: MemoryLayout<SIMD4<Float>>.stride, index: 1)
@@ -1308,7 +1337,8 @@ struct SkyUniforms {
         let q = params.celestialOrientation
         self.nightSkyD = simd_length(q) > 1e-6 ? q / simd_length(q) : SIMD4<Float>(0, 0, 0, 1)
         self.msParams = SIMD4<Float>(params.physicalMultipleScattering ? 1 : 0,
-                                     min(max(params.atmosphereGroundAlbedo, 0), 1), 0, 0)
+                                     min(max(params.atmosphereGroundAlbedo, 0), 1),
+                                     params.physicalMultipleScattering && params.atmosphereSpectral ? 1 : 0, 0)
         let skyglow = physical && params.artificialSkyglow.isFinite ? max(0, params.artificialSkyglow) : 0
         self.nightSkyE = SIMD4<Float>(skyglow,
                                       NightSkyEphemeris.skyglowGradientExponent(horizonToZenith: params.artificialSkyglowHorizonRatio),

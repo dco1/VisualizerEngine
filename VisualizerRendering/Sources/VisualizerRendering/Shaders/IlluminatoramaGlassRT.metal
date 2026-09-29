@@ -140,7 +140,71 @@ struct GlassRTUniforms {
     float4 nightSkyExtra;
     float4 nightSkyExtra2;
     float4 nightCelestial;
+    // ── Defocus trace (opt-in `rtGlassDefocusTraceFactor`, VZ-0197) ──────────
+    // x = mode: 0 = OFF (every fragment traces — exactly the previous behaviour), 1 = the
+    //     reduced-resolution trace pass, 2 = the full-resolution pass that takes that result
+    //     wherever the lens blurs the pane anyway; y = the factor k (low-res pixel = k × k);
+    // z = the |CoC| radius (px) from which a full-res fragment takes the low-res result;
+    // w = the same threshold for the low-res pass (lower, so the full-res gate's edge has
+    //     valid low-res neighbours).
+    float4 defocus;
+    // x = focus distance (m, along the view axis), y = CoC DIAMETER coefficient (px per unit of
+    // |z − z_f| / z), z = max CoC radius (px), w = diffraction floor (px) — the DOF's own lens.
+    float4 defocusLens;
+    // xyz = the camera's unit view axis (the DOF measures depth along it).
+    float4 cameraForward;
 };
+
+// ── Defocus trace: shade the pane at the resolution the lens resolves ─────────
+//
+// A pane BEHIND the focus plane reaches the frame through the depth-of-field gather, which
+// spreads every pixel over a disc |CoC| px in radius — the Digital Clock's window sits at the
+// 32–48 px clamp. Everything the RT trace resolves finer than that disc is integrated away by
+// the lens: tracing it once per pixel pays ~7 ray traversals a pixel for detail no frame shows.
+// Mode 1 traces the pane once per k × k pixels into a small target; mode 2 (the ordinary
+// full-resolution glass pass) takes that result, reconstructed bilinearly, wherever the pane is
+// defocused by ≥ `defocus.z` px — a k-px reconstruction under a ≥ 4k-px disc (the default gate)
+// widens the blur by ~2 % — and traces in full everywhere else (in focus, or in FRONT of the
+// focus plane, where the DOF follows the opaque surface behind the glass and may keep it sharp).
+
+/// |CoC| radius (px) of a pane point, when it lies BEHIND the focus plane — else 0. Behind focus
+/// the circle of confusion grows with depth, so whatever the DOF sees through the pane (the
+/// opaque depth behind it) blurs at least this much: the gate is conservative by construction.
+static inline float glassDefocusCoC(float3 worldPos, constant GlassRTUniforms& u) {
+    float z = dot(worldPos - u.cameraWorldPos, u.cameraForward.xyz);
+    float zf = u.defocusLens.x;
+    if (!(z > zf) || zf <= 0.0) return 0.0;
+    float c = 0.5 * u.defocusLens.y * (z - zf) / max(z, 1e-4);
+    return min(max(c, u.defocusLens.w), u.defocusLens.z);
+}
+
+/// The reduced-resolution trace at full-resolution pixel `fragPx` (`clipPos.xy`, a pixel
+/// centre): the bilinear blend of the four nearest low-res texels, each weighted by its own
+/// coverage (alpha 1 where the low-res pass traced glass, 0 where it wrote nothing — past the
+/// pane's edge, or where its own gate declined). `.a` is the summed coverage weight: 0 ⇒ no
+/// low-res texel covers this pixel, and the caller traces it in full.
+static inline float4 glassDefocusUpsample(texture2d<float, access::read> lo, float2 fragPx, float k) {
+    int2 size = int2(lo.get_width(), lo.get_height());
+    if (size.x < 1 || size.y < 1 || k < 1.0) return float4(0.0);
+    float2 uv = fragPx / k - 0.5;                 // low-res texel centres sit on integers
+    float2 b = floor(uv);
+    float2 f = uv - b;
+    int2 i0 = int2(b);
+    float3 acc = float3(0.0);
+    float wsum = 0.0;
+    for (int j = 0; j < 2; ++j) {
+        for (int i = 0; i < 2; ++i) {
+            int2 q = i0 + int2(i, j);
+            if (q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y) continue;
+            float w = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);
+            float4 t = lo.read(uint2(q));
+            float wv = w * saturate(t.a);
+            acc += t.rgb * wv;
+            wsum += wv;
+        }
+    }
+    return wsum > 1e-3 ? float4(acc / wsum, wsum) : float4(0.0);
+}
 
 /// This pass's view of the shared night-sky currency — the mirror of
 /// `frameNightSky` in Illuminatorama.metal, reading the same packing order.
@@ -658,8 +722,25 @@ fragment float4 illumi_glass_rt_fs(
     texture2d<float, access::sample> surfAtlas   [[texture(1)]],
     texture2d<float, access::sample> backdrop    [[texture(2)]],
     texturecube<float, access::sample> irrCube   [[texture(3)]],
-    texture2d_array<float, access::sample> albedoAtlas [[texture(4)]])
+    texture2d_array<float, access::sample> albedoAtlas [[texture(4)]],
+    // The reduced-resolution trace (defocus mode 2 only; any texture otherwise, unread).
+    texture2d<float, access::read>   defocusLo   [[texture(5)]])
 {
+    // ── Defocus trace (opt-in; mode 0 skips both branches) ───────────────────
+    uint defocusMode = uint(u.defocus.x + 0.5);
+    if (defocusMode == 2u && glassDefocusCoC(in.worldPos, u) >= u.defocus.z) {
+        // Every glass fragment covering this pixel reads the SAME low-res texels, so the result
+        // does not depend on which surface of a nested body is drawn last — no front-surface
+        // ray is needed on this path.
+        float4 lo = glassDefocusUpsample(defocusLo, in.clipPos.xy, u.defocus.y);
+        if (lo.a > 0.0) return float4(lo.rgb, 1.0);
+    } else if (defocusMode == 1u && glassDefocusCoC(in.worldPos, u) < u.defocus.w) {
+        // Low-res pass: this pane point is sharp enough that the full-res pass will trace it
+        // itself — write nothing (coverage 0).
+        discard_fragment();
+        return float4(0.0);
+    }
+
     GlassInstance gi = instances[in.instanceID];
     float ior        = max(1.0, gi.tintIor.w);
     float3 tint      = gi.tintIor.xyz;

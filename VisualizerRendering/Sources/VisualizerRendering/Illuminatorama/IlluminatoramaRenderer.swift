@@ -369,6 +369,17 @@ public final class IlluminatoramaRenderer {
                                          _ pointLightBuffer: MTLBuffer,
                                          _ count: Int) -> Void)?
 
+    /// Opt-in FRAME-COMPUTE hook (additive, nil elsewhere — every other host is byte-identical).
+    /// Called once per frame that actually renders — never for a tick `render()` drops because
+    /// `maxFramesInFlight` frames are already queued — with the frame's own command buffer, before
+    /// any pass (and before the RT acceleration-structure refit) reads a mesh. A host that writes
+    /// its own GPU geometry each frame (skinning a `LinearBlendSkinMesh`, an `ArcTubeBatch`) encodes
+    /// it here instead of committing a command buffer of its own every tick: at a 30 fps GPU frame
+    /// and a 60 Hz tick a per-tick side buffer is encoded twice for every frame drawn, queued behind
+    /// the frames in flight, and holds command-buffer slots on the renderer's queue (Digital Clock,
+    /// VZ-0233). Same ordering on the GPU as a side buffer committed just before the frame.
+    public var onEncodeFrameCompute: ((_ cb: MTLCommandBuffer) -> Void)?
+
     public var pointLights: [IlluminatoramaPointLight] = []
     public var spotLights: [IlluminatoramaSpotLight] = []
     /// Rectangular LTC area lights (#60 task 5). Populated by the extractor from
@@ -1067,6 +1078,133 @@ public final class IlluminatoramaRenderer {
     /// Optical vignetting, 0…1 — how hard the lens barrel clips the aperture toward
     /// the frame corners, turning bokeh discs into cat's-eye lemons. 0 = none.
     public var dofCatsEye: Float = 0
+    /// **Sharp subjects in front of a defocused background** (opt-in; off = byte-identical).
+    /// Two gather fixes for an in-focus silhouette against a far, blurred field: the in-focus
+    /// pixel's OWN confusion disc is counted explicitly (a spiral whose reach a defocused
+    /// neighbour pushed out to 8+ px never reliably hits a ≲ 1 px disc, so the subject's edge went
+    /// see-through, a band as wide as the background's CoC), and a background tap reads the
+    /// prefilter pyramid only where its footprint holds no sharper layer (an HDR-bright subject
+    /// swamps the pyramid's CoC floor weight and was carried out a whole background-CoC wide as a
+    /// halo). Measured on the Digital Clock's toys (VZ-0188).
+    public var dofSharpSubjects: Bool = false
+    /// **Partial occlusion — the LAYERED COMPOSITE** (opt-in, with `dofSharpSubjects`; off =
+    /// byte-identical). What the thin lens does at a pixel whose own surface has CoC c: the share of
+    /// its rays that a NEARER defocused surface stops is that surface's absolute coverage, composited
+    /// over the rest; the rest cross the pixel's depth inside its own disc (radius |c|), where the frame
+    /// shows either its own layer or — through a HOLE, past an edge or a gap — whatever lies farther.
+    /// So the pixel is `α_F·front + (1 − α_F)·(its own disc's average, holes included)`.
+    /// Replaces the sharp-subject gather's behind-tap rule (a farther tap at |c_p|/|c_s| of its weight,
+    /// within |c_p| + 1) and its normalised averaging of nearer taps, which — measured against an
+    /// aperture-sampled reference of the Digital Clock (`dofReferenceAccumulation`) — kept a blurred
+    /// wall's edge 97 % wall where the lens has 50 % (a hard step at every defocused silhouette),
+    /// left a defocused FOREGROUND member opaque to its own edge (a crane mast's lattice cut out sharp
+    /// inside its soft halo; its falls dark and crisp), and gave a foreground over a sharp subject a
+    /// third of the pixel at the silhouette where the lens gives half. Keeps VZ-0188's invariant (an
+    /// in-focus subject stays opaque, the wall behind it clean). Taps: the own disc and the near-field
+    /// disc round the pixel, one spiral or two; prefiltered reads only where a tap's footprint belongs
+    /// to its term (the min-CoC pyramid carries the signed-CoC range for that, rgba16Float while on).
+    /// The fronts' coverage is sampled finely enough not to print as a dotted line along every
+    /// defocused edge: a NEAR-FIELD coverage pyramid (two more half-res mip chains while on) lets a
+    /// near-field front count as the coverage of each tap's footprint instead of a hit-or-miss texel,
+    /// and a front behind the focus plane much smaller than the pixel's own disc gets a spiral fitted
+    /// to it. Held to the exact layered thin-lens integral in `IlluminatoramaDOFPartialOcclusionTests`.
+    public var dofPartialOcclusion: Bool = false
+    /// **Fast gather** (opt-in, with `dofSharpSubjects`; off = byte-identical). The gather's cost is
+    /// taps × pixels and the taps followed the dilated tile max, so every in-focus pixel within a
+    /// max-radius of a blurred wall paid the wall's 100+ taps (Digital Clock: 65–73 ms of a 145 ms
+    /// frame at 2880×1620). ON: (1) the exact reach — in sharp-subject mode a tap outside the pixel's
+    /// own blur and beyond the near field's widest disc can only weigh 0, so it is never taken;
+    /// (2) 3 prefiltered taps per px of reach (8…64) instead of 6 (24…128); (3) pixels at least
+    /// `dofHalfResMinCoC` px out of focus take a half-resolution gather where the four half-res
+    /// texels they read are one layer. Measured against the full gather in
+    /// `IlluminatoramaDOFSubjectTests` (VZ-0191).
+    public var dofFastGather: Bool = false
+    /// Fast gather: the |CoC| (px, radius) from which a pixel may take the half-res result.
+    public var dofHalfResMinCoC: Float = 3
+    /// **Quarter-resolution background** (opt-in, with `dofFastGather`; 0 = off = byte-identical).
+    /// Pixels at least this many px out of focus (radius, internal pixels; clamped to ≥ 6) take a
+    /// bilinear read of a gather made once per 4 × 4 block, where that block is one layer, and the
+    /// half-res pass skips every texel whose pixels all do — a macro shot's far wall at the CoC
+    /// clamp then costs a quarter of the half-res gathers. A ≥ 12 px disc averages > 450 px; its
+    /// 4-px bilinear reconstruction (tent σ 1.63 px) widens it by ≤ 3.6 % in σ at 12 px, ~1 % at 32.
+    /// Measured against the full gather in `IlluminatoramaDOFSubjectTests` (VZ-0197).
+    public var dofQuarterResMinCoC: Float = 0
+    /// **Defocus-aware shading rate for the lighting pass** (opt-in, VZ-0197; 0 = off = byte-identical
+    /// — the default lighting variant never reads the gate and no extra pass is encoded).
+    ///
+    /// With depth of field on, a 16×16 tile whose geometry is ALL at least this far out of focus
+    /// (CoC radius, internal px, under the DOF's own lens and clamps; floored at 4) has each
+    /// one-surface 2×2 quad (four geometry pixels whose view depths agree within 2 %) lit ONCE, at
+    /// its top-left pixel, and that radiance written to all four; every other pixel is lit exactly as
+    /// before. The lens then spreads each of those pixels over a disc ≥ π·gate² px, so the 2×2
+    /// replication (a 2-px box, σ 0.5 px, and a ½-px shift) widens the blur against the disc's σ of
+    /// ≥ gate/2 px by < 1 % in σ at an 8 px gate, 1.4 % at 6. It point-samples the quad, so detail
+    /// within ~0.05 cycles/px of Nyquist can alias below the disc's cut-off — texture-filtered
+    /// G-buffers carry little there; the look diff is the check. Two dispatches of the same kernel (a coarse variant, a thread
+    /// per quad, and a skip variant) whose pixel sets partition the frame, plus a depth-only tile
+    /// reduction (`illumi_dof_shading_tiles`). Off whenever `dofEnabled` is off. Lighting-pass
+    /// consumers that must see every pixel lit individually (SSR, RT reflections, SSS) see the
+    /// replicated values in those tiles — acceptable only because the DOF blurs them past a disc.
+    public var lightingDefocusShadingMinCoC: Float = 0
+
+    // ── Depth of field: the GROUND TRUTH (opt-in diagnostics; off = exact no-op) ─────────
+    /// **Depth of field by aperture sampling** — the reference the gather is measured against.
+    /// An offline renderer makes defocus by integrating over the lens: the host renders N pinhole
+    /// frames of a frozen instant, frame k with the eye moved to pupil point k and the frustum
+    /// sheared by `projectionShiftNDC` so the focus plane stays on the same pixels, and this
+    /// averages them (`illumi_dof_reference_accumulate`). While on, the DOF pass does not gather:
+    /// it adds this frame's HDR to a float accumulator (per-pixel cat's-eye weight for
+    /// `dofReferenceApertureSample`) and hands the running MEAN to local adaptation, bloom,
+    /// halation and the tonemap — so the finished frame is the lens's own integral through the same
+    /// post chain the gather's output takes. The host turns `dofEnabled` off for it (every pixel
+    /// shaded and traced at full rate — no defocus shading rate, no reduced glass trace) and keeps
+    /// `dofCatsEye` / `naturalVignetteK` as the lens has them. See the kernel for the optics.
+    public var dofReferenceAccumulation: Bool = false
+    /// This frame's pupil point, in units of the iris's circumradius, oriented like the gather's
+    /// footprint (x right, y DOWN in pixels). Only its cat's-eye clip is read here — the host has
+    /// already moved the eye and sheared the frustum for it.
+    public var dofReferenceApertureSample: SIMD2<Float> = .zero
+    /// false ⇒ this frame is not added: the stored mean is re-presented (settle frames, so the
+    /// temporal post state — local adaptation — converges on the finished integral).
+    public var dofReferenceAddsFrame: Bool = true
+    /// Zero the accumulator; takes effect on the next frame's DOF pass.
+    public func resetDOFReferenceAccumulation() { dofReferenceNeedsReset = true }
+    /// Frames added since the last reset (counted when encoded).
+    public private(set) var dofReferenceFrameCount: Int = 0
+    private var dofReferenceNeedsReset = true
+    private var dofReferenceAccumTexture: MTLTexture?
+    /// Built on first use (a diagnostics path: no host that never turns it on pays the compile).
+    private lazy var dofReferencePipeline: MTLComputePipelineState? = {
+        guard let fn = engine.library?.makeFunction(name: "illumi_dof_reference_accumulate") else { return nil }
+        return try? device.makeComputePipelineState(function: fn) // gpu-ok: lazy one-time build, opt-in diagnostics pipeline
+    }()
+    /// **Off-axis lens shift**, in NDC (clip.xy += shift · clip.w): slides the image under a fixed
+    /// eye without turning the view — a view camera's rise/shift, and the shear that keeps a focus
+    /// plane on the same pixels while the eye moves across the pupil (`dofReferenceAccumulation`).
+    /// Folded into the projection with the TAA jitter and, like it, kept out of the motion vectors.
+    /// Zero (default) = exact no-op.
+    public var projectionShiftNDC: SIMD2<Float> = .zero
+    /// **Hold the exposure meter** (opt-in; false = exact no-op): skip the estimate and keep
+    /// applying the last smoothed exposure, so offline A/B renders of one instant (and the frames of
+    /// an aperture-sampled reference, whose eye moves) print through exactly the same exposure.
+    public var autoExposureHold: Bool = false
+    /// The G-buffer depth this frame rendered (NDC z, Metal [0, 1]) — for diagnostics that need the
+    /// per-pixel depth the DOF read (e.g. a circle-of-confusion map). Private storage: blit it.
+    public var gbufferDepthTexture: MTLTexture { depthTexture }
+    /// The DOF pass's output this frame — linear HDR at the internal size, before bloom, halation,
+    /// local adaptation and the tonemap (under `dofReferenceAccumulation`, the running mean) — for
+    /// diagnostics that compare lenses in scene-linear light. Nil until the pass has run; its
+    /// contents are this frame's only if `dofApplied`. Private storage: blit it.
+    public var dofOutputTextureForDiagnostics: MTLTexture? { dofOutputTexture }
+
+    /// **Pin the auto-exposure meter's sample grid** (opt-in, VZ-0197; nil = the internal render size,
+    /// as always). `illumi_exposure_estimate` samples 256 × 32 cells by LINEAR index over an
+    /// (w/8 × h/8) grid in normalised UV — so which part of the frame it meters depends on the
+    /// internal size (VZ-0172: at 4320 × 2430 the top ~5 % of the frame, at 2880 × 1620 the top
+    /// ~11 %), and a host that renders one canvas at two internal scales gets two exposures. Set this
+    /// to the internal size the host's look was metered at and every scale samples the same UV
+    /// positions (the kernel reads them with a normalised sampler).
+    public var exposureMeterGridSize: SIMD2<Int>? = nil
 
     // ── Volumetric light shaft (god-rays) ────────────────────────────
     /// Single-scatter ray-march of the sun through hazy air, making the beam
@@ -1406,6 +1544,14 @@ public final class IlluminatoramaRenderer {
     /// buffer for the shadow passes); only the G-buffer raster skips them, so they
     /// write no albedo/depth/velocity/layer and are invisible + unpickable on screen.
     public var shadowOnlyMeshKinds: Set<MeshKind> = []
+    /// Opt-in INTERIOR MAPPING (van Dongen 2008) per mesh kind: every instance of a listed kind is
+    /// drawn with a G-buffer variant whose emission is the radiance of a lamp-lit room box behind
+    /// the pane, ray-traced analytically per fragment along the camera ray (parallax-correct room
+    /// depth, one draw, no extra geometry) — `inst.emission` is the lamp's colour × the room's
+    /// luminance. The mesh must carry UVs across the pane's face (u along its width from
+    /// `pane.z`, v up from 0) and a tangent along u. Empty (default) ⇒ the variant is never built
+    /// or bound ⇒ byte-identical.
+    public var interiorMappedMeshKinds: [MeshKind: IlluminatoramaInteriorMapping] = [:]
 
     /// Interior day-light separation (opt-in; pairs with light-layer masking).
     /// `interiorLayerMask` = OR of every instance-layer bit the host stamped on
@@ -2076,6 +2222,14 @@ public final class IlluminatoramaRenderer {
     /// saturation push is off; above `hi` both are exactly the shipped ones; between, a
     /// smoothstep blend. `.zero` (default, `hi == 0`) ⇒ off, byte-identical.
     public var hueStableToe: SIMD2<Float> = .zero
+    /// Opt-in, with `hueStableToe` and the AgX display transform: the toe's LEVEL comes from AgX's
+    /// bare sigmoid instead of its 'punchy' look. The look's power 1.35 acts as a ~2.3-power toe —
+    /// 4 stops under mid-grey prints at sRGB 4, 5 stops at 1 — so a locally-adapted night room is
+    /// fitted into ~4 printable stops and re-crushed; the bare sigmoid prints 4 stops under at 21,
+    /// 5 under at 7, 6 under at 2 (Digital Clock round 3). The toe keeps the scene's colour ratios
+    /// either way; above the knee the shipped (punchy) transform is untouched. False (default) ⇒
+    /// displayParams.w = 0 ⇒ byte-identical.
+    public var hueStableToeBareLevel: Bool = false
 
     // ── Phase 9 — film-stock LUT (post-tonemap colour grade) ─────────
     /// The film stock's cube as an `MTLTexture3D`, N×N×N. `nil` = stock bypassed
@@ -2802,6 +2956,31 @@ public final class IlluminatoramaRenderer {
     /// Costs one full-frame blit of the composite per frame when the RT glass pass runs.
     public var rtGlassScreenSpaceTransmission: Bool = true
 
+    /// **Trace RT glass at the resolution the lens resolves** (VZ-0197). OPT-IN: 1 (the
+    /// default) traces every glass fragment, exactly as before.
+    ///
+    /// With depth of field on, a pane BEHIND the focus plane reaches the frame through the DOF
+    /// gather, which spreads each pixel over its circle of confusion — a window behind a macro
+    /// subject sits at the CoC clamp, tens of pixels. Everything the per-pixel glass trace
+    /// resolves finer than that disc is integrated away, and it is the frame's single most
+    /// expensive pass (≈ 7 ray traversals per glass pixel: the front-surface test, entry, exit,
+    /// the world behind, the reflection, and a shadow ray at each shaded hit).
+    ///
+    /// k = 2…4 (clamped) traces the glass once per k × k pixels into a small target, then the
+    /// ordinary full-resolution glass pass takes that result — reconstructed bilinearly, each
+    /// low-res texel weighted by its own coverage — wherever the pane point is behind the focus
+    /// plane and defocused by at least `rtGlassDefocusMinCoCTexels × k` px. Everywhere else
+    /// (in focus; in front of the focus plane, where the DOF follows the opaque depth BEHIND the
+    /// glass and may keep it sharp; where no low-res texel covers the pixel) it traces in full.
+    /// Off whenever `dofEnabled` is off. The low-res pass skips the depth test, so the trace is
+    /// continuous behind an occluder's silhouette and the reconstruction never mixes in anything
+    /// that is not glass.
+    public var rtGlassDefocusTraceFactor: Int = 1
+    /// The defocus trace's gate, in LOW-RES texels of CoC radius: a pixel takes the reduced trace
+    /// when its |CoC| ≥ this × k px. At 4 a k-px bilinear reconstruction sits under a ≥ 4k-px
+    /// disc, which widens the blur by ~2 % (σ² adds: (0.41k)² against (2k)²).
+    public var rtGlassDefocusMinCoCTexels: Float = 4
+
     // ── Secondary-ray shading parity: three ABLATION switches ───────────────
     // A SECONDARY ray's opaque hit — refraction or reflection out of the glass pass,
     // a glossy reflection or GI bounce out of the deferred TLAS kernel — is shaded
@@ -2880,6 +3059,12 @@ public final class IlluminatoramaRenderer {
     private var glassRTPipeline: MTLRenderPipelineState?       // illumi_glass_rt_fs (traces TLAS)
     private var glassFallbackPipeline: MTLRenderPipelineState? // illumi_glass_fallback_fs (Fresnel+sky)
     private var glassDepthState: MTLDepthStencilState?
+    /// `rtGlassDefocusTraceFactor` targets: the reduced-resolution trace (rgba16Float, coverage
+    /// in alpha) and a same-size depth target cleared to far — the RT glass pipeline carries a
+    /// depth attachment, and a cleared one passes every fragment (no occlusion test at low res).
+    /// Allocated on first use; nil for every scene that never opts in.
+    private var glassDefocusTexture: MTLTexture?
+    private var glassDefocusDepth: MTLTexture?
     /// Grows on demand in `encodeGlassPass` to hold the flattened glass instances.
     private lazy var glassInstanceBuffer: MTLBuffer = {
         device.makeBuffer(length: MemoryLayout<IlluminatoramaGlassInstance>.stride,
@@ -3522,6 +3707,9 @@ public final class IlluminatoramaRenderer {
     /// live app never pays the fragment compile for a lane it may never enter.
     private var gbufferPipelineExt: MTLRenderPipelineState?
     private var gbufferPipelinePrevVertsExt: MTLRenderPipelineState?
+    /// Interior-mapping variants (kInteriorMap = true), built on first use (live / extended lane).
+    private var gbufferPipelineInterior: MTLRenderPipelineState?
+    private var gbufferPipelineInteriorExt: MTLRenderPipelineState?
     private let shadowPipeline: MTLRenderPipelineState
     private let depthState: MTLDepthStencilState
     private let lightingPipeline: MTLComputePipelineState
@@ -3709,6 +3897,15 @@ public final class IlluminatoramaRenderer {
     /// exposure-invariant result from two scenes that happened to be exposed the same.
     public var lastAutoExposure: Float {
         exposureBuffer.contents().advanced(by: 4).assumingMemoryBound(to: Float.self).pointee
+    }
+    /// The local adaptation's lift ceiling (stops) on the latest completed frame — the eye's
+    /// adaptation state when `localToneMapping.adaptationFromFrame` is on (the frame's exposure
+    /// deficit past the tolerance, × gain) — or −1 when that is off or the pass has not run. A
+    /// shared-buffer load, no wait. For hosts that grade the print (e.g. a night shadow lift) on
+    /// the same state the lift uses, instead of on an independent ramp.
+    public var lastLocalAdaptationCeiling: Float {
+        guard localToneMapping.isEnabled, localToneMapping.adaptationFromFrame else { return -1 }
+        return localToneMapPass.lastLiftCeiling
     }
     /// TEST-OBSERVABLE: the log2 luminance the meter TARGETED on the last completed frame
     /// (slot 2 of `ExposureState`) — before the EMA and the boost clamp, so two meters can be
@@ -4628,6 +4825,19 @@ public final class IlluminatoramaRenderer {
         /// Mirrors the Metal `DOFParams.cocFloor` — the diffraction Airy disc's CoC radius in
         /// pixels, applied at every distance including the focus plane (DH-0882).
         var cocFloor: Float = 0
+        /// Mirrors the Metal `DOFParams.subjectAware` (1 = `dofSharpSubjects`).
+        var subjectAware: Float = 0
+        /// Mirrors `DOFParams.fastGather` (1 = `dofFastGather`, with `dofSharpSubjects`).
+        var fastGather: Float = 0
+        /// Mirrors `DOFParams.halfMinCoC` (`dofHalfResMinCoC`).
+        var halfMinCoC: Float = 0
+        /// Mirrors `DOFParams.quarterMinCoC` (`dofQuarterResMinCoC`; 0 = no quarter tier).
+        var quarterMinCoC: Float = 0
+        /// Mirrors `DOFParams.partialOcclusion` (1 = `dofPartialOcclusion`, with `dofSharpSubjects`).
+        var partialOcclusion: Float = 0
+        /// Mirrors `DOFParams.nearPyramid` (1 = the layered composite's near-field coverage pyramid is
+        /// written and read — on whenever `partialOcclusion` is and its textures exist).
+        var nearPyramid: Float = 0
     }
     /// Tile size for the max-CoC reduction. Must match nothing in the shader but the
     /// value passed in `DOFParams.tileSize` — the kernel reads it from there.
@@ -4636,6 +4846,22 @@ public final class IlluminatoramaRenderer {
     private let dofTilePipeline: MTLComputePipelineState?
     private let dofDilatePipeline: MTLComputePipelineState?
     private let dofPrefilterPipeline: MTLComputePipelineState?
+    /// `dofSharpSubjects`: builds the min-CoC pyramid one level at a time (VZ-0188).
+    private let dofMinCoCPipeline: MTLComputePipelineState?
+    /// `dofFastGather`: the half-resolution background gather.
+    private let dofHalfPipeline: MTLComputePipelineState?
+    /// `dofFastGather`: the max-CoC tile reduction with a threadgroup per tile instead of one
+    /// thread walking all 256 texels in series — the same tile map, bit for bit (VZ-0197).
+    private let dofTileParallelPipeline: MTLComputePipelineState?
+    /// `dofQuarterResMinCoC`: the quarter-resolution background gather.
+    private let dofQuarterPipeline: MTLComputePipelineState?
+    /// `lightingDefocusShadingMinCoC`: the least-|CoC|-per-tile reduction the lighting pass gates on,
+    /// and its target (r32Float, one texel per 16×16 tile; allocated on first use).
+    private let dofShadingTilesPipeline: MTLComputePipelineState?
+    private var lightingRateTileTexture: MTLTexture?
+    private var dofHalfTexture: MTLTexture?
+    /// `dofQuarterResMinCoC`'s target (a quarter of the internal size; allocated on first use).
+    private var dofQuarterTexture: MTLTexture?
     private var dofOutputTexture: MTLTexture?
     private var dofTileTexture: MTLTexture?
     private var dofTileDilatedTexture: MTLTexture?
@@ -4644,6 +4870,16 @@ public final class IlluminatoramaRenderer {
     /// texel's own CoC, so in-focus pixels all but vanish from the coarse levels and a sharp
     /// silhouette cannot smear a halo of itself into the bokeh behind it.
     private var dofPrefilterTexture: MTLTexture?
+    /// `dofSharpSubjects` (VZ-0188): the least |CoC| under each texel of the prefilter pyramid,
+    /// same size and levels (r16Float), plus one single-level view per level for its reduction.
+    /// The gather asks it whether a tap's prefiltered footprint straddles a sharper layer.
+    private var dofMinCoCTexture: MTLTexture?
+    private var dofMinCoCLevels: [MTLTexture] = []
+    /// `dofPartialOcclusion`: the NEAR-FIELD coverage pyramid (premultiplied colour + coverage of the
+    /// texels in front of the focus plane) and its CoC × coverage, the prefilter's size and mip chain.
+    /// Allocated only while the layered composite is on.
+    private var dofNearTexture: MTLTexture?
+    private var dofNearCoCTexture: MTLTexture?
 
     // ── Volumetric shaft state ───────────────────────────────────────
     private struct VolUniforms {
@@ -5314,6 +5550,31 @@ public final class IlluminatoramaRenderer {
             self.dofPrefilterPipeline = try? device.makeComputePipelineState(function: dofPrefilterFn) // gpu-ok: one-time init, optional DoF pipeline
         } else {
             self.dofPrefilterPipeline = nil
+        }
+        if let dofMinFn = library.makeFunction(name: "illumi_dof_mincoc") {
+            self.dofMinCoCPipeline = try? device.makeComputePipelineState(function: dofMinFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            self.dofMinCoCPipeline = nil
+        }
+        if let dofHalfFn = library.makeFunction(name: "illumi_dof_half") {
+            self.dofHalfPipeline = try? device.makeComputePipelineState(function: dofHalfFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            self.dofHalfPipeline = nil
+        }
+        if let dofTileParFn = library.makeFunction(name: "illumi_dof_tile_parallel") {
+            self.dofTileParallelPipeline = try? device.makeComputePipelineState(function: dofTileParFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            self.dofTileParallelPipeline = nil
+        }
+        if let dofQuarterFn = library.makeFunction(name: "illumi_dof_quarter") {
+            self.dofQuarterPipeline = try? device.makeComputePipelineState(function: dofQuarterFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            self.dofQuarterPipeline = nil
+        }
+        if let rateFn = library.makeFunction(name: "illumi_dof_shading_tiles") {
+            self.dofShadingTilesPipeline = try? device.makeComputePipelineState(function: rateFn) // gpu-ok: one-time init, optional shading-rate pipeline
+        } else {
+            self.dofShadingTilesPipeline = nil
         }
 
         // ── Volumetric shaft pipeline ────────────────────────────────
@@ -9926,6 +10187,8 @@ public final class IlluminatoramaRenderer {
         presentSync.markInFlight(writeIdx)
         cb.label = "Illuminatorama.frame"
         passTimer.beginFrame()   // reset per-pass GPU-timer sample assignment (env-gated)
+        // Opt-in host GPU work for THIS frame (see `onEncodeFrameCompute`); nil → nothing.
+        onEncodeFrameCompute?(cb)
 
         // Opt-in GPU-resident instance write (additive — see `onEncodeGPUInstances`).
         // `uploadInstances()` above already reserved the slots + built `meshGroups`;
@@ -11468,6 +11731,32 @@ public final class IlluminatoramaRenderer {
             ? 2 * tan(camera.fovYRadians * 0.5)
             : 2.0 / max(camera.projectionMatrix[1][1], 1e-6)
         u.nightPixAngle = pixExtent / Float(max(hdrCompositeTexture.height, 1))
+
+        // ── Defocus trace (opt-in `rtGlassDefocusTraceFactor`, VZ-0197) ──────────────
+        // The full-res pass (mode 2) and the reduced-res pass (mode 1) share every binding but
+        // their uniforms: the low-res copy has the low-res viewport (backdrop UV) and pixel angle
+        // (a star's point spread is still one of ITS pixels — the flux is integrated over the
+        // footprint, so the reconstruction conserves it). The lens fields mirror the DOF pass's
+        // own clamps exactly, so the gate agrees with the blur the DOF then applies.
+        let defocusK = max(1, min(4, rtGlassDefocusTraceFactor))
+        let defocusOn = useRT && defocusK > 1 && dofEnabled && dofCoCCoefficient > 0
+            && !camera.isOrthographic && ensureGlassDefocusTargets(k: defocusK)
+        var lowU = u
+        if defocusOn {
+            let k = Float(defocusK)
+            let gate = max(0.5, rtGlassDefocusMinCoCTexels) * k
+            let axis = camera.target - camera.position
+            let forward = simd_length(axis) > 1e-6 ? simd_normalize(axis) : SIMD3<Float>(0, 0, -1)
+            u.defocus = SIMD4(2, k, gate, gate * 0.75)
+            u.defocusLens = SIMD4(max(0.05, dofFocusDistance), max(0, dofCoCCoefficient),
+                                  max(1, dofMaxRadius), max(0, dofDiffractionCoCPixels))
+            u.cameraForward = SIMD4(forward, 0)
+            lowU = u
+            lowU.defocus.x = 1
+            lowU.viewW = u.viewW / k
+            lowU.viewH = u.viewH / k
+            lowU.nightPixAngle = u.nightPixAngle * k
+        }
         memcpy(glassRTUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaGlassRTUniforms>.stride)
 
         // Screen-space cheap glass (mode 2) samples the scene BEHIND the pane: copy
@@ -11493,6 +11782,122 @@ public final class IlluminatoramaRenderer {
             }
         }
 
+        /// One glass draw pass's state, bindings and draws. `lowRes` = the defocus trace's
+        /// reduced-resolution pass: its uniforms go in by value, and the low-res result is not
+        /// bound to itself (the full-res pass reads it at fragment texture 5).
+        func encodeGlassDraws(_ enc: MTLRenderCommandEncoder, lowRes: Bool,
+                              uniforms: inout IlluminatoramaGlassRTUniforms) {
+            enc.setRenderPipelineState(pipeline)
+            enc.setDepthStencilState(glassDepth)
+            // Perf: the RT path's bounce loop traces the WHOLE glass volume from the
+            // front (entry) surface, so back faces are wasted invocations (overwritten
+            // by the nearer front face under depth-LE + no-write). Cull them — ~half
+            // the glass fragments on convex glass, identical output. (CCW-front matches
+            // the G-buffer winding.) The Fresnel+sky FALLBACK still wants both surfaces,
+            // so it stays two-sided.
+            if useRT || (cheap && effectiveCheapMode == 2) {
+                // Screen-space cheap glass traces from the FRONT pane (samples the scene
+                // behind it), so back faces are wasted/double-darkening — cull them.
+                enc.setCullMode(.back)
+                enc.setFrontFacing(.counterClockwise)
+            } else {
+                enc.setCullMode(.none)                        // two-sided glass (fallback / synthetic)
+            }
+            enc.setVertexBuffer(frameUniformBuffer, offset: 0, index: 1)   // viewProjection is first
+            if lowRes {
+                let len = MemoryLayout<IlluminatoramaGlassRTUniforms>.stride
+                enc.setVertexBytes(&uniforms, length: len, index: 3)
+                enc.setFragmentBytes(&uniforms, length: len, index: 1)
+            } else {
+                enc.setVertexBuffer(glassRTUniformBuffer, offset: 0, index: 3) // VS reads time/wobble for oscillation-mode undulation
+                enc.setFragmentBuffer(glassRTUniformBuffer, offset: 0, index: 1)
+            }
+            // The defocus trace's low-res result (full-res pass in defocus mode only); any texture
+            // otherwise — the shader reads it only in mode 2.
+            enc.setFragmentTexture((!lowRes && defocusOn ? glassDefocusTexture : nil) ?? dummySkyTexture, index: 5)
+            enc.setFragmentTexture(equirectSky ?? dummySkyTexture, index: 0)
+            // Backdrop (cheap mode 2) — bind a dummy otherwise so the slot is valid.
+            enc.setFragmentTexture((useBackdrop ? glassBackdropTexture : nil) ?? dummySkyTexture, index: 2)
+            if useRT, let tlas = rtTLAS, let instData = rtInstanceDataBuffer,
+               let objN = rtObjNormalBuffer, let gData = rtGlassDataBuffer {
+                enc.setFragmentAccelerationStructure(tlas, bufferIndex: 0)
+                enc.setFragmentBuffer(instData, offset: 0, index: 3)
+                enc.setFragmentBuffer(objN, offset: 0, index: 4)
+                enc.setFragmentBuffer(gData, offset: 0, index: 5)
+                // Surface-cache buffers (dummies keep the bindings valid when off);
+                // optional-ternary mirrors the TLAS lighting pass — no force-unwrap.
+                let dummy: MTLBuffer = instData
+                enc.setFragmentBuffer(cacheOn ? surfTriCardBuffer : dummy, offset: 0, index: 6)
+                enc.setFragmentBuffer(cacheOn ? surfTriUVaBuffer : dummy, offset: 0, index: 7)
+                enc.setFragmentBuffer(cacheOn ? surfTriUVcBuffer : dummy, offset: 0, index: 8)
+                enc.setFragmentBuffer(cacheOn ? rtSoupTriBaseBuffer : dummy, offset: 0, index: 9)
+                enc.setFragmentBuffer(cacheOn ? surfCardRectBuffer : dummy, offset: 0, index: 10)
+                enc.setFragmentBuffer(cacheOn ? surfCardBuffer : (surfCardDummyBuffer ?? dummy), offset: 0, index: 11)
+                enc.setFragmentTexture(cacheOn ? surfConsumerAtlas : (equirectSky ?? dummySkyTexture), index: 1)
+                // Through-glass world parity: re-shaded opaque hits sample the SAME
+                // cosine-convolved irradiance cube the deferred lighting pass uses for
+                // its diffuse IBL, so transmitted scenery gets the sky fill (not just
+                // the flat ambient supplement) and matches the world beside the pane.
+                enc.setFragmentTexture(irradianceCube, index: 3)
+                // Through-glass TEXTURE parity: the per-triangle mesh UVs + the albedo
+                // atlas (and its per-slice letterbox table), so a re-shaded hit samples
+                // the SAME texel the G-buffer would instead of the instance's mean
+                // albedo. Without these the world behind a pane is flat slabs.
+                enc.setFragmentBuffer(rtObjUVBuffer ?? instData, offset: 0, index: 12)
+                enc.setFragmentBuffer(albedoAtlas.uvScaleBuffer, offset: 0, index: 13)
+                enc.setFragmentTexture(albedoAtlas.texture, index: 4)
+                // Local lights: the deferred kernel accumulates point + spot; the glass
+                // pass used to have sun-only, so a lamp-lit room went black through a
+                // window. Same ring buffers the lighting kernel reads this frame.
+                enc.setFragmentBuffer(pointLightBuffer, offset: 0, index: 14)
+                enc.setFragmentBuffer(spotLightBuffer, offset: 0, index: 15)
+                // Smooth refraction: glass hits interpolate these corner normals (a dummy with
+                // every row's base 0 means "face normal" — see `rtGlassCornerNormalBuffer`).
+                enc.setFragmentBuffer(rtGlassCornerNormalBuffer ?? instData, offset: 0, index: 16)
+                // DH-0718 — area lights at the refracted hit (buffer 17); dummy when none.
+                enc.setFragmentBuffer(secondaryAreaLightCount > 0 ? areaLightBuffer : instData,
+                                      offset: 0, index: 17)
+                // The TLAS references the BLASes which reference mesh buffers — all
+                // must be resident for the fragment-stage intersector.
+                for blas in rtBLASList { enc.useResource(blas, usage: .read) }
+                for buf in rtResidentBuffers { enc.useResource(buf, usage: .read) }
+            }
+            for (i, g) in groups.enumerated() {
+                guard let mesh = meshes[g.kind] else { continue }
+                let off = stride * offsets[i]
+                enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
+                enc.setVertexBuffer(glassInstanceBuffer, offset: off, index: 2)
+                enc.setFragmentBuffer(glassInstanceBuffer, offset: off, index: 2)
+                enc.drawIndexedPrimitives(type: .triangle, indexCount: mesh.indexCount,
+                                          indexType: mesh.indexType, indexBuffer: mesh.indexBuffer,
+                                          indexBufferOffset: 0, instanceCount: g.insts.count)
+            }
+        }
+
+        // The low-res trace first (defocus only): its own targets, no occlusion test, its own
+        // uniforms (by value — the shared uniform buffer holds the full-res pass's).
+        if defocusOn, let loTex = glassDefocusTexture, let loDepth = glassDefocusDepth {
+            let lp = MTLRenderPassDescriptor()
+            lp.colorAttachments[0].texture = loTex
+            lp.colorAttachments[0].loadAction = .clear   // coverage 0 wherever no glass traces
+            lp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+            lp.colorAttachments[0].storeAction = .store
+            lp.depthAttachment.texture = loDepth
+            lp.depthAttachment.loadAction = .clear       // far: every fragment passes
+            lp.depthAttachment.clearDepth = 1.0
+            lp.depthAttachment.storeAction = .dontCare
+            if let lenc = timedRenderEncoder(cb, lp, "glass.lowres") {
+                lenc.label = "Illuminatorama.glass.rt.defocusLowRes"
+                let k = Double(defocusK)
+                lenc.setViewport(MTLViewport(originX: 0, originY: 0,
+                                             width: Double(hdrCompositeTexture.width) / k,
+                                             height: Double(hdrCompositeTexture.height) / k,
+                                             znear: 0, zfar: 1))
+                encodeGlassDraws(lenc, lowRes: true, uniforms: &lowU)
+                lenc.endEncoding()
+            }
+        }
+
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = hdrCompositeTexture
         pass.colorAttachments[0].loadAction = .load     // keep the lit scene
@@ -11503,83 +11908,30 @@ public final class IlluminatoramaRenderer {
         guard let enc = timedRenderEncoder(cb, pass, "glass") else { return }
         enc.label = useRT ? "Illuminatorama.glass.rt"
             : (cheap ? "Illuminatorama.glass.cheap\(effectiveCheapMode)\(autoCheapFallback && glassCheapMode == 0 ? "-auto" : "")" : "Illuminatorama.glass.fallback")
-        enc.setRenderPipelineState(pipeline)
-        enc.setDepthStencilState(glassDepth)
-        // Perf: the RT path's bounce loop traces the WHOLE glass volume from the
-        // front (entry) surface, so back faces are wasted invocations (overwritten
-        // by the nearer front face under depth-LE + no-write). Cull them — ~half
-        // the glass fragments on convex glass, identical output. (CCW-front matches
-        // the G-buffer winding.) The Fresnel+sky FALLBACK still wants both surfaces,
-        // so it stays two-sided.
-        if useRT || (cheap && effectiveCheapMode == 2) {
-            // Screen-space cheap glass traces from the FRONT pane (samples the scene
-            // behind it), so back faces are wasted/double-darkening — cull them.
-            enc.setCullMode(.back)
-            enc.setFrontFacing(.counterClockwise)
-        } else {
-            enc.setCullMode(.none)                        // two-sided glass (fallback / synthetic)
-        }
-        enc.setVertexBuffer(frameUniformBuffer, offset: 0, index: 1)   // viewProjection is first
-        enc.setVertexBuffer(glassRTUniformBuffer, offset: 0, index: 3) // VS reads time/wobble for oscillation-mode undulation
-        enc.setFragmentBuffer(glassRTUniformBuffer, offset: 0, index: 1)
-        enc.setFragmentTexture(equirectSky ?? dummySkyTexture, index: 0)
-        // Backdrop (cheap mode 2) — bind a dummy otherwise so the slot is valid.
-        enc.setFragmentTexture((useBackdrop ? glassBackdropTexture : nil) ?? dummySkyTexture, index: 2)
-        if useRT, let tlas = rtTLAS, let instData = rtInstanceDataBuffer,
-           let objN = rtObjNormalBuffer, let gData = rtGlassDataBuffer {
-            enc.setFragmentAccelerationStructure(tlas, bufferIndex: 0)
-            enc.setFragmentBuffer(instData, offset: 0, index: 3)
-            enc.setFragmentBuffer(objN, offset: 0, index: 4)
-            enc.setFragmentBuffer(gData, offset: 0, index: 5)
-            // Surface-cache buffers (dummies keep the bindings valid when off);
-            // optional-ternary mirrors the TLAS lighting pass — no force-unwrap.
-            let dummy: MTLBuffer = instData
-            enc.setFragmentBuffer(cacheOn ? surfTriCardBuffer : dummy, offset: 0, index: 6)
-            enc.setFragmentBuffer(cacheOn ? surfTriUVaBuffer : dummy, offset: 0, index: 7)
-            enc.setFragmentBuffer(cacheOn ? surfTriUVcBuffer : dummy, offset: 0, index: 8)
-            enc.setFragmentBuffer(cacheOn ? rtSoupTriBaseBuffer : dummy, offset: 0, index: 9)
-            enc.setFragmentBuffer(cacheOn ? surfCardRectBuffer : dummy, offset: 0, index: 10)
-            enc.setFragmentBuffer(cacheOn ? surfCardBuffer : (surfCardDummyBuffer ?? dummy), offset: 0, index: 11)
-            enc.setFragmentTexture(cacheOn ? surfConsumerAtlas : (equirectSky ?? dummySkyTexture), index: 1)
-            // Through-glass world parity: re-shaded opaque hits sample the SAME
-            // cosine-convolved irradiance cube the deferred lighting pass uses for
-            // its diffuse IBL, so transmitted scenery gets the sky fill (not just
-            // the flat ambient supplement) and matches the world beside the pane.
-            enc.setFragmentTexture(irradianceCube, index: 3)
-            // Through-glass TEXTURE parity: the per-triangle mesh UVs + the albedo
-            // atlas (and its per-slice letterbox table), so a re-shaded hit samples
-            // the SAME texel the G-buffer would instead of the instance's mean
-            // albedo. Without these the world behind a pane is flat slabs.
-            enc.setFragmentBuffer(rtObjUVBuffer ?? instData, offset: 0, index: 12)
-            enc.setFragmentBuffer(albedoAtlas.uvScaleBuffer, offset: 0, index: 13)
-            enc.setFragmentTexture(albedoAtlas.texture, index: 4)
-            // Local lights: the deferred kernel accumulates point + spot; the glass
-            // pass used to have sun-only, so a lamp-lit room went black through a
-            // window. Same ring buffers the lighting kernel reads this frame.
-            enc.setFragmentBuffer(pointLightBuffer, offset: 0, index: 14)
-            enc.setFragmentBuffer(spotLightBuffer, offset: 0, index: 15)
-            // Smooth refraction: glass hits interpolate these corner normals (a dummy with
-            // every row's base 0 means "face normal" — see `rtGlassCornerNormalBuffer`).
-            enc.setFragmentBuffer(rtGlassCornerNormalBuffer ?? instData, offset: 0, index: 16)
-            // DH-0718 — area lights at the refracted hit (buffer 17); dummy when none.
-            enc.setFragmentBuffer(secondaryAreaLightCount > 0 ? areaLightBuffer : instData,
-                                  offset: 0, index: 17)
-            // The TLAS references the BLASes which reference mesh buffers — all
-            // must be resident for the fragment-stage intersector.
-            for blas in rtBLASList { enc.useResource(blas, usage: .read) }
-            for buf in rtResidentBuffers { enc.useResource(buf, usage: .read) }
-        }
-        for (i, g) in groups.enumerated() {
-            guard let mesh = meshes[g.kind] else { continue }
-            let off = stride * offsets[i]
-            enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
-            enc.setVertexBuffer(glassInstanceBuffer, offset: off, index: 2)
-            enc.setFragmentBuffer(glassInstanceBuffer, offset: off, index: 2)
-            enc.drawIndexedPrimitives(type: .triangle, indexCount: mesh.indexCount,
-                                      indexType: mesh.indexType, indexBuffer: mesh.indexBuffer,
-                                      indexBufferOffset: 0, instanceCount: g.insts.count)
-        }
+        encodeGlassDraws(enc, lowRes: false, uniforms: &u)
         enc.endEncoding()
+    }
+
+    /// (Re)allocate the defocus trace's targets for factor `k` at the current internal size.
+    /// False (the caller then traces every fragment in full) if an allocation fails.
+    private func ensureGlassDefocusTargets(k: Int) -> Bool {
+        let w = max(1, (hdrCompositeTexture.width + k - 1) / k)
+        let h = max(1, (hdrCompositeTexture.height + k - 1) / k)
+        if glassDefocusTexture?.width != w || glassDefocusTexture?.height != h {
+            let c = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: w, height: h,
+                                                             mipmapped: false)
+            c.usage = [.renderTarget, .shaderRead]
+            c.storageMode = .private
+            glassDefocusTexture = device.makeTexture(descriptor: c)
+            glassDefocusTexture?.label = "Illuminatorama.glass.defocusLowRes"
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float, width: w, height: h,
+                                                             mipmapped: false)
+            d.usage = [.renderTarget]
+            d.storageMode = .private
+            glassDefocusDepth = device.makeTexture(descriptor: d)
+            glassDefocusDepth?.label = "Illuminatorama.glass.defocusLowResDepth"
+        }
+        return glassDefocusTexture != nil && glassDefocusDepth != nil
     }
 
     private func encodeGBufferPass(_ cb: MTLCommandBuffer) {
@@ -11688,6 +12040,7 @@ public final class IlluminatoramaRenderer {
         // Track which pipeline is bound to avoid redundant state switches when the
         // groups are all ordinary meshes (the common case).
         var prevVertsBound = false
+        var interiorBound = false
         var substrateBiased = false
         let cullClip = cullVolume(gbufferCullVP)   // DH-0534
         for (gi, group) in meshGroups.enumerated() {
@@ -11717,12 +12070,22 @@ public final class IlluminatoramaRenderer {
             // and bind their per-vertex prev positions at buffer(5); every other
             // group uses the base pipeline (which declares no buffer(5)).
             let prevPos = prevPosByKind[group.kind]
-            if prevPos != nil {
-                if !prevVertsBound { enc.setRenderPipelineState(prevPipe) }
+            // Interior-mapped kinds (opt-in): their own pipeline + params at fragment buffer(9).
+            if let imap = interiorMappedMeshKinds[group.kind], prevPos == nil,
+               let ip = interiorGBufferPipeline(extended: extended) {
+                if !interiorBound { enc.setRenderPipelineState(ip) }
+                interiorBound = true
+                prevVertsBound = false
+                var gpu = imap.gpu
+                enc.setFragmentBytes(&gpu, length: MemoryLayout<IlluminatoramaInteriorMapping.GPU>.stride, index: 9)
+            } else if prevPos != nil {
+                if !prevVertsBound || interiorBound { enc.setRenderPipelineState(prevPipe) }
                 prevVertsBound = true
-            } else if prevVertsBound {
+                interiorBound = false
+            } else if prevVertsBound || interiorBound {
                 enc.setRenderPipelineState(basePipe)
                 prevVertsBound = false
+                interiorBound = false
             }
             enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
             enc.setVertexBuffer(frameUniformBuffer, offset: 0, index: 1)
@@ -12480,6 +12843,8 @@ public final class IlluminatoramaRenderer {
     }
 
     private func encodeLightingPass(_ cb: MTLCommandBuffer) {
+        // Defocus shading rate (opt-in): the tile map first, then the coarse + skip variants below.
+        let rate = lightingShadingRateRequested ? encodeLightingRateTiles(cb) : nil
         guard let enc = timedComputeEncoder(cb, "lighting") else { return }
         enc.label = "Illuminatorama.lighting"
         let pipe = currentLightingPipeline()
@@ -12558,9 +12923,97 @@ public final class IlluminatoramaRenderer {
         if rtSunShadowLightingActive, let tlas = rtTLAS {
             enc.setAccelerationStructure(tlas, bufferIndex: 8)
         }
-        dispatch(enc, pipeline: pipe, width: width, height: height)
+        if let rate, let variants = lightingShadingRatePipelines() {
+            // Same bindings; the tile map at texture(24). Coarse quads first (a thread per quad),
+            // then every other pixel — the two variants' pixel sets partition the frame.
+            enc.setTexture(rate, index: 24)
+            enc.setComputePipelineState(variants.coarse)
+            dispatch(enc, pipeline: variants.coarse, width: (width + 1) / 2, height: (height + 1) / 2)
+            enc.setComputePipelineState(variants.skip)
+            dispatch(enc, pipeline: variants.skip, width: width, height: height)
+        } else {
+            dispatch(enc, pipeline: pipe, width: width, height: height)
+        }
         enc.endEncoding()
     }
+
+    /// Whether this frame asks for the defocus shading rate (the host's knob, with a live lens).
+    private var lightingShadingRateRequested: Bool {
+        lightingDefocusShadingMinCoC > 0 && dofEnabled && dofCoCCoefficient > 0 && !camera.isOrthographic
+            && dofShadingTilesPipeline != nil
+    }
+
+    /// The defocus shading rate's tile map: the least |CoC| of each 16×16 tile's geometry, under the
+    /// DOF's own lens (the same `DOFParams` the gather will use this frame). Nil if it cannot run.
+    private func encodeLightingRateTiles(_ cb: MTLCommandBuffer) -> MTLTexture? {
+        guard let pipe = dofShadingTilesPipeline else { return nil }
+        let tile = Self.dofTileSize
+        let tileW = max(1, (width + tile - 1) / tile), tileH = max(1, (height + tile - 1) / tile)
+        if lightingRateTileTexture?.width != tileW || lightingRateTileTexture?.height != tileH {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: tileW, height: tileH,
+                                                             mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            lightingRateTileTexture = device.makeTexture(descriptor: d)
+            lightingRateTileTexture?.label = "Illuminatorama.lighting.rateTiles"
+        }
+        guard let tiles = lightingRateTileTexture,
+              let enc = timedComputeEncoder(cb, "lighting.rateTiles") else { return nil }
+        enc.label = "Illuminatorama.lighting.rateTiles"
+        let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
+        var p = DOFParams(
+            invProjection: fu.invProjection,
+            focusDist: max(0.05, dofFocusDistance),
+            cocCoefficient: max(0, dofCoCCoefficient),
+            maxRadius: max(1, dofMaxRadius),
+            blades: dofBlades >= 3 ? Float(dofBlades) : 0,
+            bladeRotation: dofBladeRotation,
+            catsEye: max(0, min(1, dofCatsEye)),
+            width: UInt32(width), height: UInt32(height),
+            tileW: UInt32(tileW), tileH: UInt32(tileH), tileSize: UInt32(tile),
+            prefilterScale: 0,
+            cocFloor: max(0, dofDiffractionCoCPixels))
+        enc.setComputePipelineState(pipe)
+        enc.setTexture(depthTexture, index: 0)
+        enc.setTexture(tiles, index: 1)
+        enc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
+        let side = min(tile, max(1, Int(sqrt(Double(pipe.maxTotalThreadsPerThreadgroup)))))
+        enc.dispatchThreadgroups(MTLSize(width: tileW, height: tileH, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: side, height: side, depth: 1))
+        enc.endEncoding()
+        return tiles
+    }
+
+    /// The coarse and skip lighting variants for this frame's feature bits (+ function constants 6 /
+    /// 7). Compiled in the background on first use (nil meanwhile — the frame then lights every pixel,
+    /// exactly as with the feature off); BLOCKING in a `blockingLightingCompile` lane, so a settled
+    /// still is deterministic.
+    private func lightingShadingRatePipelines() -> (coarse: MTLComputePipelineState, skip: MTLComputePipelineState)? {
+        let rtSun = rtSunShadowLightingActive
+        let bits: UInt8 = (iblEnabled ? 1 : 0) | (shadowsEnabled ? 2 : 0) | (dfgLUTEnabled ? 4 : 0)
+                        | (ddgiEnabled ? 8 : 0) | (ddgiIrrCacheEnabled && ddgiEnabled ? 16 : 0) | (rtSun ? 32 : 0)
+        if bits == lastRatePipelines.flags, let memo = lastRatePipelines.pair { return memo }
+        func variant(coarse: Bool) -> MTLComputePipelineState? {
+            let (key, cv) = Self.lightingFeatureConstants(
+                ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
+                ddgi: ddgiEnabled, ddgiIrrCache: ddgiIrrCacheEnabled, rtSunShadow: rtSun)
+            var c = coarse, k = !coarse
+            cv.setConstantValue(&c, type: .bool, index: 6)
+            cv.setConstantValue(&k, type: .bool, index: 7)
+            let vkey = key + (coarse ? "-rateCoarse" : "-rateSkip")
+            if blockingLightingCompile || rtSun {
+                return engine.pipelineCache.pipelineState(name: "illumi_lighting", device: device,
+                                                          constants: cv, variantKey: vkey)
+            }
+            return engine.pipelineCache.pipelineStateAsync(name: "illumi_lighting", device: device,
+                                                           constants: cv, variantKey: vkey)
+        }
+        guard let c = variant(coarse: true), let k = variant(coarse: false) else { return nil }
+        lastRatePipelines = (bits, (c, k))
+        return (c, k)
+    }
+    /// One-entry memo of `lightingShadingRatePipelines` (flags as `currentLightingPipeline` packs them).
+    private var lastRatePipelines: (flags: UInt8, pair: (coarse: MTLComputePipelineState, skip: MTLComputePipelineState)?) = (0xFF, nil)
 
     // Phase 4.39: SSR is now split into three passes.
     // 1) Gather  — ray march → write pre-weighted SSR delta to ssrRawTexture.
@@ -13238,6 +13691,10 @@ public final class IlluminatoramaRenderer {
     /// whole tiles that are in focus. See `IlluminatoramaDOF.metal` for the optics.
     private func encodeDOFPass(_ cb: MTLCommandBuffer) {
         dofApplied = false
+        if dofReferenceAccumulation {
+            encodeDOFReferenceAccumulation(cb)
+            return
+        }
         guard dofEnabled, dofCoCCoefficient > 0,
               let pipeline = dofPipeline, let tilePipeline = dofTilePipeline,
               let dilatePipeline = dofDilatePipeline else { return }
@@ -13259,7 +13716,8 @@ public final class IlluminatoramaRenderer {
             || dofTileTexture?.width != tileW || dofTileTexture?.height != tileH {
             let d = MTLTextureDescriptor()
             d.textureType = .type2D
-            d.pixelFormat = .r32Float
+            // r = max |CoC|, g = the near field's max CoC (the fast gather's bound; unused otherwise).
+            d.pixelFormat = .rg32Float
             d.width = tileW; d.height = tileH
             d.usage = [.shaderRead, .shaderWrite]
             d.storageMode = .private
@@ -13271,8 +13729,13 @@ public final class IlluminatoramaRenderer {
         // The prefilter pyramid: half resolution, full mip chain. Sized from the internal
         // render size like everything else here, so it follows the draft/settled scale.
         let pw = max(1, (width + 1) / 2), ph = max(1, (height + 1) / 2)
+        // The min-CoC pyramid's format: R = least |CoC| (the sharp-subject tests) everywhere; the
+        // layered composite (`dofPartialOcclusion`) also reads G/B = the signed-CoC range, so only
+        // it pays for an rgba16Float pyramid.
+        let minCoCFormat: MTLPixelFormat = dofSharpSubjects && dofPartialOcclusion ? .rgba16Float : .r16Float
         if dofPrefilterTexture == nil
-            || dofPrefilterTexture?.width != pw || dofPrefilterTexture?.height != ph {
+            || dofPrefilterTexture?.width != pw || dofPrefilterTexture?.height != ph
+            || dofMinCoCTexture?.pixelFormat != minCoCFormat {
             let d = MTLTextureDescriptor()
             d.textureType = .type2D
             d.pixelFormat = .rgba16Float
@@ -13282,6 +13745,33 @@ public final class IlluminatoramaRenderer {
             d.storageMode = .private
             dofPrefilterTexture = device.makeTexture(descriptor: d)
             dofPrefilterTexture?.label = "Illuminatorama.dof.prefilter"
+            // The min-CoC pyramid rides along (always allocated with it, so the kernels' slots are
+            // always bound; only `dofSharpSubjects` writes or reads it).
+            d.pixelFormat = minCoCFormat
+            dofMinCoCTexture = device.makeTexture(descriptor: d)
+            dofMinCoCTexture?.label = "Illuminatorama.dof.minCoC"
+            dofMinCoCLevels = (0..<d.mipmapLevelCount).compactMap { l in
+                dofMinCoCTexture?.makeTextureView(pixelFormat: minCoCFormat, textureType: .type2D,
+                                                  levels: l..<(l + 1), slices: 0..<1)
+            }
+            dofNearTexture = nil
+            dofNearCoCTexture = nil
+        }
+        // The layered composite's near-field coverage pyramid (the prefilter's size and mip chain).
+        if dofSharpSubjects && dofPartialOcclusion, dofNearTexture == nil,
+           let pre = dofPrefilterTexture {
+            let d = MTLTextureDescriptor()
+            d.textureType = .type2D
+            d.pixelFormat = .rgba16Float
+            d.width = pre.width; d.height = pre.height
+            d.mipmapLevelCount = pre.mipmapLevelCount
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            dofNearTexture = device.makeTexture(descriptor: d)
+            dofNearTexture?.label = "Illuminatorama.dof.nearField"
+            d.pixelFormat = .r16Float
+            dofNearCoCTexture = device.makeTexture(descriptor: d)
+            dofNearCoCTexture?.label = "Illuminatorama.dof.nearCoC"
         }
         guard let out = dofOutputTexture, let tiles = dofTileTexture,
               let dilated = dofTileDilatedTexture else { return }
@@ -13289,6 +13779,10 @@ public final class IlluminatoramaRenderer {
         // "sample the frame directly", which is the correct fallback and NOT a silent one —
         // it is the only value the field ever held before DH-0883.
         let prefilter: MTLTexture? = dofPrefilterPipeline != nil ? dofPrefilterTexture : nil
+        // The sharp-subject gather needs its min-CoC pyramid (and the prefilter that seeds it).
+        let minCoC = dofMinCoCTexture
+        let sharpSubjects = dofSharpSubjects && prefilter != nil && minCoC != nil && dofMinCoCPipeline != nil
+            && dofMinCoCLevels.count == (minCoC?.mipmapLevelCount ?? -1)
         let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
         var p = DOFParams(
             invProjection: fu.invProjection,
@@ -13301,14 +13795,57 @@ public final class IlluminatoramaRenderer {
             width: UInt32(width), height: UInt32(height),
             tileW: UInt32(tileW), tileH: UInt32(tileH), tileSize: UInt32(tile),
             prefilterScale: prefilter != nil ? max(0, dofPrefilterScale) : 0,
-            cocFloor: max(0, dofDiffractionCoCPixels))
+            cocFloor: max(0, dofDiffractionCoCPixels),
+            subjectAware: sharpSubjects ? 1 : 0)
+        p.partialOcclusion = sharpSubjects && dofPartialOcclusion ? 1 : 0
+        let nearOn = p.partialOcclusion > 0.5 && dofNearTexture != nil && dofNearCoCTexture != nil
+        p.nearPyramid = nearOn ? 1 : 0
+        // The near-field slots: the pyramid while it is on, else any texture of the pyramid's size
+        // (bound, never read or written — the kernels test `nearPyramid`).
+        let nearBinding: MTLTexture? = nearOn ? dofNearTexture : prefilter
+        let nearCoCBinding: MTLTexture? = nearOn ? dofNearCoCTexture : minCoC
+        // The fast gather needs the half-res target (same size as the pyramid's base).
+        if sharpSubjects && dofFastGather && dofHalfPipeline != nil,
+           dofHalfTexture == nil || dofHalfTexture?.width != pw || dofHalfTexture?.height != ph {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: pw, height: ph,
+                                                             mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            dofHalfTexture = device.makeTexture(descriptor: d)
+            dofHalfTexture?.label = "Illuminatorama.dof.half"
+        }
+        let fast = sharpSubjects && dofFastGather && dofHalfPipeline != nil && dofHalfTexture != nil
+        p.fastGather = fast ? 1 : 0
+        p.halfMinCoC = max(1, dofHalfResMinCoC)
+        // The quarter tier (opt-in): its target is a quarter of the internal size (the prefilter
+        // pyramid's level 1), and it needs the pyramid's mips for the blocks' own colour.
+        let qw = max(1, (width + 3) / 4), qh = max(1, (height + 3) / 4)
+        if fast && dofQuarterResMinCoC > 0 && dofQuarterPipeline != nil,
+           dofQuarterTexture == nil || dofQuarterTexture?.width != qw || dofQuarterTexture?.height != qh {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: qw, height: qh,
+                                                             mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            dofQuarterTexture = device.makeTexture(descriptor: d)
+            dofQuarterTexture?.label = "Illuminatorama.dof.quarter"
+        }
+        let quarter = fast && dofQuarterResMinCoC > 0 && dofQuarterPipeline != nil && dofQuarterTexture != nil
+        p.quarterMinCoC = quarter ? max(6, dofQuarterResMinCoC) : 0
         guard let tileEnc = timedComputeEncoder(cb, "dof.tiles") else { return }
         tileEnc.label = "Illuminatorama.dof.tiles"
-        tileEnc.setComputePipelineState(tilePipeline)
         tileEnc.setTexture(depthTexture, index: 0)
         tileEnc.setTexture(tiles, index: 1)
         tileEnc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
-        dispatch(tileEnc, pipeline: tilePipeline, width: tileW, height: tileH)
+        if dofFastGather, let par = dofTileParallelPipeline {
+            // One threadgroup per tile (bit-identical map; the serial kernel walked 256 texels a thread).
+            let side = min(tile, max(1, Int(sqrt(Double(par.maxTotalThreadsPerThreadgroup)))))
+            tileEnc.setComputePipelineState(par)
+            tileEnc.dispatchThreadgroups(MTLSize(width: tileW, height: tileH, depth: 1),
+                                         threadsPerThreadgroup: MTLSize(width: side, height: side, depth: 1))
+        } else {
+            tileEnc.setComputePipelineState(tilePipeline)
+            dispatch(tileEnc, pipeline: tilePipeline, width: tileW, height: tileH)
+        }
         tileEnc.endEncoding()
 
         // Spread each tile's max by the gather's reach, so the gather itself reads one texel.
@@ -13332,6 +13869,9 @@ public final class IlluminatoramaRenderer {
                 preEnc.setTexture(displaySource, index: 0)
                 preEnc.setTexture(depthTexture, index: 1)
                 preEnc.setTexture(pre, index: 2)
+                preEnc.setTexture(minCoC, index: 3)
+                preEnc.setTexture(nearBinding, index: 4)
+                preEnc.setTexture(nearCoCBinding, index: 5)
                 preEnc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
                 dispatch(preEnc, pipeline: prePipeline, width: pre.width, height: pre.height)
                 preEnc.endEncoding()
@@ -13339,8 +13879,63 @@ public final class IlluminatoramaRenderer {
             if pre.mipmapLevelCount > 1, let blit = cb.makeBlitCommandEncoder() {
                 blit.label = "Illuminatorama.dof.prefilter.mips"
                 blit.generateMipmaps(for: pre)
+                if nearOn, let near = dofNearTexture, let nearCoC = dofNearCoCTexture {
+                    blit.generateMipmaps(for: near)
+                    blit.generateMipmaps(for: nearCoC)
+                }
                 blit.endEncoding()
             }
+            // Min-CoC levels 1… from the prefilter-written base (sharp-subject mode only).
+            if sharpSubjects, let minP = dofMinCoCPipeline, dofMinCoCLevels.count > 1,
+               let mEnc = timedComputeEncoder(cb, "dof.minCoC") {
+                mEnc.label = "Illuminatorama.dof.minCoC"
+                mEnc.setComputePipelineState(minP)
+                for l in 1..<dofMinCoCLevels.count {
+                    let dst = dofMinCoCLevels[l]
+                    mEnc.setTexture(dofMinCoCLevels[l - 1], index: 0)
+                    mEnc.setTexture(dst, index: 1)
+                    dispatch(mEnc, pipeline: minP, width: dst.width, height: dst.height)
+                }
+                mEnc.endEncoding()
+            }
+        }
+
+        // The quarter tier first (opt-in): the half-res pass reads it to skip the texels it serves.
+        if quarter, let quarterP = dofQuarterPipeline, let qTex = dofQuarterTexture,
+           let qEnc = timedComputeEncoder(cb, "dof.quarter") {
+            qEnc.label = "Illuminatorama.dof.quarter"
+            qEnc.setComputePipelineState(quarterP)
+            qEnc.setTexture(displaySource, index: 0)
+            qEnc.setTexture(depthTexture, index: 1)
+            qEnc.setTexture(qTex, index: 2)
+            qEnc.setTexture(dilated, index: 3)
+            qEnc.setTexture(prefilter, index: 4)
+            qEnc.setTexture(minCoC, index: 5)
+            qEnc.setTexture(nearBinding, index: 6)
+            qEnc.setTexture(nearCoCBinding, index: 7)
+            qEnc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
+            dispatch(qEnc, pipeline: quarterP, width: qTex.width, height: qTex.height)
+            qEnc.endEncoding()
+        }
+        // The quarter result, or any half-precision texture when the tier is off (bound, unread).
+        let quarterBinding: MTLTexture? = quarter ? dofQuarterTexture : prefilter
+
+        if fast, let halfP = dofHalfPipeline, let half = dofHalfTexture,
+           let hEnc = timedComputeEncoder(cb, "dof.half") {
+            hEnc.label = "Illuminatorama.dof.half"
+            hEnc.setComputePipelineState(halfP)
+            hEnc.setTexture(displaySource, index: 0)
+            hEnc.setTexture(depthTexture, index: 1)
+            hEnc.setTexture(half, index: 2)
+            hEnc.setTexture(dilated, index: 3)
+            hEnc.setTexture(prefilter, index: 4)
+            hEnc.setTexture(minCoC, index: 5)
+            hEnc.setTexture(quarterBinding, index: 6)
+            hEnc.setTexture(nearBinding, index: 7)
+            hEnc.setTexture(nearCoCBinding, index: 8)
+            hEnc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
+            dispatch(hEnc, pipeline: halfP, width: half.width, height: half.height)
+            hEnc.endEncoding()
         }
 
         guard let enc = timedComputeEncoder(cb, "dof") else { return }
@@ -13351,9 +13946,69 @@ public final class IlluminatoramaRenderer {
         enc.setTexture(out, index: 2)
         enc.setTexture(dilated, index: 3)
         enc.setTexture(prefilter, index: 4)
+        enc.setTexture(minCoC, index: 5)
+        // The fast gather's half-res result (any half-size texture when it is off: bound, unread).
+        enc.setTexture(fast ? dofHalfTexture : prefilter, index: 6)
+        enc.setTexture(quarterBinding, index: 7)
+        enc.setTexture(nearBinding, index: 8)
+        enc.setTexture(nearCoCBinding, index: 9)
         enc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
         dispatch(enc, pipeline: pipeline, width: width, height: height)
         enc.endEncoding()
+        dofApplied = true
+    }
+
+    /// Swift mirror of the Metal `DOFReferenceParams` (32 bytes).
+    private struct DOFReferenceParams {
+        var aperture: SIMD2<Float>
+        var catsEye: Float
+        var add: Float
+        var reset: Float
+        var width: UInt32
+        var height: UInt32
+        var _pad: UInt32 = 0
+    }
+
+    /// `dofReferenceAccumulation`: add this frame's pinhole HDR into the float accumulator (or
+    /// re-present it) and hand the running mean to the post chain in the DOF output's place.
+    private func encodeDOFReferenceAccumulation(_ cb: MTLCommandBuffer) {
+        guard let pipeline = dofReferencePipeline else { return }
+        if dofOutputTexture == nil
+            || dofOutputTexture?.width != width || dofOutputTexture?.height != height {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: max(1, width),
+                                                             height: max(1, height), mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            dofOutputTexture = device.makeTexture(descriptor: d)
+            dofOutputTexture?.label = "Illuminatorama.dof"
+        }
+        if dofReferenceAccumTexture == nil
+            || dofReferenceAccumTexture?.width != width || dofReferenceAccumTexture?.height != height {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float, width: max(1, width),
+                                                             height: max(1, height), mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            dofReferenceAccumTexture = device.makeTexture(descriptor: d)
+            dofReferenceAccumTexture?.label = "Illuminatorama.dof.reference"
+            dofReferenceNeedsReset = true
+        }
+        guard let out = dofOutputTexture, let accum = dofReferenceAccumTexture,
+              let enc = timedComputeEncoder(cb, "dof.reference") else { return }
+        let reset = dofReferenceNeedsReset
+        let add = dofReferenceAddsFrame
+        var p = DOFReferenceParams(aperture: dofReferenceApertureSample, catsEye: max(0, min(1, dofCatsEye)),
+                                   add: add ? 1 : 0, reset: reset ? 1 : 0,
+                                   width: UInt32(width), height: UInt32(height))
+        enc.label = "Illuminatorama.dof.reference"
+        enc.setComputePipelineState(pipeline)
+        enc.setTexture(displaySource, index: 0)
+        enc.setTexture(accum, index: 1)
+        enc.setTexture(out, index: 2)
+        enc.setBytes(&p, length: MemoryLayout<DOFReferenceParams>.stride, index: 0)
+        dispatch(enc, pipeline: pipeline, width: width, height: height)
+        enc.endEncoding()
+        if reset { dofReferenceFrameCount = 0; dofReferenceNeedsReset = false }
+        if add { dofReferenceFrameCount += 1 }
         dofApplied = true
     }
 
@@ -13507,6 +14162,8 @@ public final class IlluminatoramaRenderer {
 
     private func encodeExposureEstimate(_ cb: MTLCommandBuffer) {
         guard autoExposureEnabled else { return }
+        // Held (opt-in): the smoothed exposure in `exposureBuffer` stays exactly where it is.
+        guard !autoExposureHold else { return }
         // Per-frame dt, clamped to a sane window so a stalled frame
         // (debugger pause, scene reload) doesn't pump the EMA.
         let now = CACurrentMediaTime()
@@ -13517,8 +14174,10 @@ public final class IlluminatoramaRenderer {
         enc.setComputePipelineState(exposureEstimatePipeline)
         enc.setTexture(displaySource, index: 0)
         enc.setBuffer(exposureBuffer, offset: 0, index: 0)
-        // imgSize for stride computation inside the kernel.
-        var imgSize = SIMD2<UInt32>(UInt32(width), UInt32(height))
+        // imgSize for stride computation inside the kernel (the meter's coarse grid; opt-in
+        // `exposureMeterGridSize` pins it independently of the internal render scale).
+        let grid = exposureMeterGridSize.map { SIMD2(max(8, $0.x), max(8, $0.y)) } ?? SIMD2(width, height)
+        var imgSize = SIMD2<UInt32>(UInt32(grid.x), UInt32(grid.y))
         enc.setBytes(&imgSize, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 1)
         // params: x = targetEV, y = halfLife, z = maxBoost, w = minBoost.
         // Phase 4.28 — minBoost is now an independent floor (not `1/maxBoost`)
@@ -14028,8 +14687,8 @@ public final class IlluminatoramaRenderer {
         // lighting unprojection) so the internal consistency holds and TAA
         // averages out the sub-pixel offsets as supersampling.
         let unjitteredProj = camera.projectionMatrix
-        let proj: simd_float4x4
-        let jitterNDC: SIMD2<Float>
+        var proj: simd_float4x4
+        var jitterNDC: SIMD2<Float>
         if taaEnabled && taaJitterPixels > 0 {
             let h2 = Self.halton(taaFrameIndex &+ 1, base: 2) - 0.5
             let h3 = Self.halton(taaFrameIndex &+ 1, base: 3) - 0.5
@@ -14045,6 +14704,16 @@ public final class IlluminatoramaRenderer {
         } else {
             proj = unjitteredProj
             jitterNDC = .zero
+        }
+        // Off-axis lens shift (opt-in; zero skips this block, so the matrices are untouched). The
+        // same constant-NDC translation as the jitter, so it rides in `jitterNDC` too and stays out
+        // of the motion vectors (`taaJitterDelta`).
+        let shift = projectionShiftNDC
+        if shift != .zero, shift.x.isFinite, shift.y.isFinite {
+            var S = matrix_identity_float4x4
+            S.columns.3 = SIMD4(shift.x, shift.y, 0, 1)
+            proj = S * proj
+            jitterNDC += shift
         }
         // `J` is a pure NDC translation (clip.xy += j · clip.w), so the jitter
         // enters every projected point as a constant additive NDC offset — which
@@ -14330,7 +14999,10 @@ public final class IlluminatoramaRenderer {
         // Pre-exposure + hue-stable toe (all zero by default ⇒ the shader's legacy paths).
         let toeHi = max(0, hueStableToe.y)
         u.displayParams = SIMD4<Float>(preExposureDivisor == 1 ? 0 : preExposureDivisor,
-                                       toeHi > 0 ? max(0, min(hueStableToe.x, toeHi * 0.999)) : 0, toeHi, 0)
+                                       toeHi > 0 ? max(0, min(hueStableToe.x, toeHi * 0.999)) : 0, toeHi,
+                                       toeHi > 0 && hueStableToeBareLevel ? 1 : 0)
+        // Defocus shading rate's gate (read only by the coarse lighting variants; 0 ⇒ off).
+        u.lightingCoarseMinCoC = lightingShadingRateRequested ? max(4, lightingDefocusShadingMinCoC) : 0
         // Lens flare: project the primary sun's direction to screen uv. w carries the
         // on-screen weight — a smooth fade as the sun leaves the frame, hard 0 behind
         // the camera (clip.w ≤ 0). Strength 0 (default) leaves the whole cluster zero,
@@ -14820,11 +15492,42 @@ public final class IlluminatoramaRenderer {
 
     /// `illumi_fs` specialised for one lane (DH-0140): `extended` selects the six-target output
     /// struct. The fragment carries a function constant now, so it can no longer be made by name alone.
-    private static func makeGBufferFragment(library: MTLLibrary, extended: Bool) throws -> MTLFunction {
+    private static func makeGBufferFragment(library: MTLLibrary, extended: Bool, interior: Bool = false) throws -> MTLFunction {
         let c = MTLFunctionConstantValues()
         var ext = extended
         c.setConstantValue(&ext, type: .bool, index: 11)
+        var imap = interior
+        c.setConstantValue(&imap, type: .bool, index: 12)
         return try library.makeFunction(name: "illumi_fs", constantValues: c)
+    }
+
+    /// The interior-mapping G-buffer pipeline for this lane (built once; nil if it fails to compile,
+    /// in which case the kind draws with the ordinary pipeline — its flat emission).
+    private func interiorGBufferPipeline(extended: Bool) -> MTLRenderPipelineState? {
+        if let p = extended ? gbufferPipelineInteriorExt : gbufferPipelineInterior { return p }
+        guard let library = engine.library else { return nil }
+        let d = MTLRenderPipelineDescriptor()
+        d.label = extended ? "Illuminatorama.gbuffer.interior.ext" : "Illuminatorama.gbuffer.interior"
+        let vsC = MTLFunctionConstantValues()
+        var pv = false
+        vsC.setConstantValue(&pv, type: .bool, index: 10)
+        do {
+            d.vertexFunction = try library.makeFunction(name: "illumi_vs", constantValues: vsC)
+            d.fragmentFunction = try Self.makeGBufferFragment(library: library, extended: extended, interior: true)
+        } catch {
+            Self.log.error("interior-mapping G-buffer: compile failed: \(error.localizedDescription)")
+            return nil
+        }
+        d.colorAttachments[0].pixelFormat = .rgba16Float
+        d.colorAttachments[1].pixelFormat = .rgba16Float
+        d.colorAttachments[2].pixelFormat = .rgba16Float
+        d.colorAttachments[3].pixelFormat = .rg16Float
+        d.colorAttachments[4].pixelFormat = .r32Uint
+        if extended { d.colorAttachments[5].pixelFormat = .rgba16Float }
+        d.depthAttachmentPixelFormat = .depth32Float
+        let p = try? device.makeRenderPipelineState(descriptor: d)
+        if extended { gbufferPipelineInteriorExt = p } else { gbufferPipelineInterior = p }
+        return p
     }
 
     /// DH-0140 — build one six-target G-buffer pipeline variant. Same attachments as the live PSO

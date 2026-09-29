@@ -296,7 +296,7 @@ final class NishitaMultipleScatteringTests: XCTestCase {
     func testLUTLayoutMirrorMatchesTheShader() throws {
         let engine = SimEngine.shared
         guard let pso = engine.pipeline("volSkyAtmosphereLUTLayout"),
-              let out = engine.device.makeBuffer(length: 32, options: .storageModeShared),
+              let out = engine.device.makeBuffer(length: 48, options: .storageModeShared),
               let cb = engine.commandQueue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else {
             return XCTFail("volSkyAtmosphereLUTLayout missing")
         }
@@ -306,13 +306,17 @@ final class NishitaMultipleScatteringTests: XCTestCase {
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()  // gpu-ok: test harness
-        let v = out.contents().bindMemory(to: SIMD4<Int32>.self, capacity: 2)
+        let v = out.contents().bindMemory(to: SIMD4<Int32>.self, capacity: 3)
         let L = VolumetricCloudRenderer.AtmosphereLUT.self
         XCTAssertEqual(Int(v[0].x), L.float4Count, "kLUTLength")
         XCTAssertEqual(Int(v[0].y), 1, "kLUTTrans")
         XCTAssertEqual(Int(v[0].z), 1 + L.transW * L.transH, "kLUTMS")
         XCTAssertEqual(Int(v[1].x), L.transW); XCTAssertEqual(Int(v[1].y), L.transH)
         XCTAssertEqual(Int(v[1].z), L.msW); XCTAssertEqual(Int(v[1].w), L.msH)
+        XCTAssertEqual(Int(v[2].x), L.spectralBands, "kSpecBands")
+        XCTAssertEqual(Int(v[2].y), L.float4Count - 1, "kLUTBandStride")
+        XCTAssertEqual(VolumetricCloudRenderer.skyUniformsBufferLength,
+                       VolumetricCloudRenderer.atmosphereLUTOffset + L.regionFloat4Count * 16, "room for every band")
         XCTAssertGreaterThanOrEqual(VolumetricCloudRenderer.atmosphereLUTOffset, MemoryLayout<SkyUniforms>.stride)
         XCTAssertEqual(VolumetricCloudRenderer.atmosphereLUTOffset % 256, 0)
         // The GPU-owned cloud-lighting tail is still the last 3 float4s of the uniforms.
@@ -830,6 +834,40 @@ final class NishitaMultipleScatteringTests: XCTestCase {
             }
         }
         print("── NishitaMS day sky, flag on vs off ──\n" + report)
+    }
+
+    /// The spectral bake (`atmosphereSpectral`): the 3-wavelength march's mauve civil twilight
+    /// turns blue (ozone's Chappuis band is sampled where the sRGB red primary sees it), while the
+    /// day sky moves only a little. Targets from the offline spectral reference
+    /// (scratchpad sky/r3/spectral.py, single scatter, 380–720 nm, CIE 1931): sun −4.2°, the
+    /// window direction — 3 wavelengths (1.00, 0.55, 0.93), spectral (0.47, 0.60, 1.00).
+    @MainActor
+    func testSpectralBakeTurnsTheTwilightWindowBlue() throws {
+        let h = try Harness()
+        let window = View.window.dir
+        var report = "sun   rgb-3λ                         spectral\n"
+        for el: Float in [-1.2, -4.2, -7.1] {
+            var p = Self.bareSky(el: el, ms: true)
+            let rgb = try h.sky(p, [window])[0]
+            p.atmosphereSpectral = true
+            let sp = try h.sky(p, [window])[0]
+            report += String(format: "%5.1f (%.3e %.3e %.3e)  (%.3e %.3e %.3e)\n", el, rgb.x, rgb.y, rgb.z, sp.x, sp.y, sp.z)
+            XCTAssertGreaterThan(sp.z, sp.x, "spectral at \(el)°: B > R — \(sp)")
+            XCTAssertGreaterThanOrEqual(sp.y, 0.7 * sp.x, "spectral at \(el)°: G ≥ 0.7 R — \(sp)")
+            XCTAssertLessThan(rgb.y / rgb.x, sp.y / sp.x, "the 3-wavelength march is the greener-starved one at \(el)°")
+        }
+        for el: Float in [50, 15] {
+            var p = Self.bareSky(el: el, ms: true)
+            let rgb = try h.sky(p, [View.zenith.dir, window])
+            p.atmosphereSpectral = true
+            let sp = try h.sky(p, [View.zenith.dir, window])
+            for (a, b) in zip(rgb, sp) {
+                XCTAssertLessThan(abs(Self.stops(simd_dot(b, Self.luma), simd_dot(a, Self.luma))), 0.15, "day \(el)°: luma within 0.15 stop")
+                let na = a / a.z, nb = b / b.z
+                XCTAssertLessThan(simd_length(na - nb), 0.12, "day \(el)°: hue within a few % — \(na) vs \(nb)")
+            }
+        }
+        print("── Nishita spectral bake, window direction ──\n" + report)
     }
 
     @MainActor

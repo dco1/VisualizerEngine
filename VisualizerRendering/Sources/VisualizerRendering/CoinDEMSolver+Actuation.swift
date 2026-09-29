@@ -301,6 +301,7 @@ extension CoinDEMSolver {
         b[slot].hullRef = SIMD4(p.yFat, p.invInertiaK.x, p.invInertiaK.y, p.invInertiaK.z)
         b[slot].prevPos.w = p.boundingRadius
         b[slot].vel.w = p.boundingRadius
+        noteBodyBound(p.boundingRadius, poly: false)   // the ballast shifts the COM: its bound, not spawnEgg's
         return slot
     }
 
@@ -595,16 +596,38 @@ extension CoinDEMSolver {
     /// orientation, through any number of turns, and cannot wrap. Lanes: meta = (4, A,
     /// B|world, 1 | cc<<1); anchorA/anchorB as `enableBall`; axes unused; ref. Wakes A
     /// and B. (It was two perpendicular hinges on two slots before VZ-0150.)
+    ///
+    /// `bodyBAnchor` (optional, default nil = `worldAnchor`): the point of B, where it is NOW, that the
+    /// weld brings to A's `worldAnchor` — B is then held that far from where it was welded, reached
+    /// through the joint's own position bias over a few substeps (a clip that closes on a part and
+    /// lifts it into its jaws: Digital Clock's fitter lifting a bar off the sawhorse it rests on, so
+    /// the bar is carried clear of it instead of dragged across it).
+    ///
+    /// `bodyBTurn` (optional, default nil = none): a WORLD rotation of B from where it is now that the
+    /// rotation lock holds instead — B is turned by it (about the anchor, through the lock's own bias)
+    /// and held so. An electromagnet that touches a steel face a degree or two off square pulls it
+    /// flush: Digital Clock's crane magnet on a stacked bar leaning 1.3° onto its stakes.
     public func enableWeld(_ w: CoinWeld, bodyA: Int, bodyB: Int?, worldAnchor: SIMD3<Float>,
+                           bodyBAnchor: SIMD3<Float>? = nil, bodyBTurn: simd_quatf? = nil,
                            collideConnected: Bool = false) {
         guard poolSlotUsable(w.slot, bodyA, bodyB) else { return }
+        let onB = bodyBAnchor ?? worldAnchor
+        var ref = jointReference(bodyA, bodyB)
+        if let turn = bodyBTurn {
+            let qa = simd_quatf(ix: bodies[bodyA].orient.x, iy: bodies[bodyA].orient.y, iz: bodies[bodyA].orient.z,
+                                r: bodies[bodyA].orient.w).normalized
+            let qb = bodyB.map { simd_quatf(ix: bodies[$0].orient.x, iy: bodies[$0].orient.y, iz: bodies[$0].orient.z,
+                                            r: bodies[$0].orient.w).normalized } ?? simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
+            let r = (qa.inverse * (turn.normalized * qb)).normalized
+            ref = SIMD4(r.imag, r.real)
+        }
         joints[w.slot] = CoinJoint(
             meta: SIMD4(4, UInt32(bodyA), bodyB.map { UInt32($0) } ?? Self.worldBody,
                         Self.metaW(collideConnected)),
             anchorA: SIMD4(localPoint(bodyA, worldAnchor), 0),
-            anchorB: SIMD4(bodyB.map { localPoint($0, worldAnchor) } ?? worldAnchor, 0),
+            anchorB: SIMD4(bodyB.map { localPoint($0, onB) } ?? worldAnchor, 0),
             axisA: SIMD4(0, 1, 0, 0), axisB: SIMD4(0, 1, 0, 0),
-            ref: jointReference(bodyA, bodyB))
+            ref: ref)
         wake(bodyB.map { [bodyA, $0] } ?? [bodyA])
     }
 

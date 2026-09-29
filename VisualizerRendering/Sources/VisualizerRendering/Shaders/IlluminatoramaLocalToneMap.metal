@@ -60,8 +60,24 @@ struct LTMParams {
     uint4  cells2;  // x gridD (bins), y blur axis (0 x, 1 y, 2 range), zw unused
     float4 tail;    // x floor level (scene-referred; 0 = off), y floor slope, zw unused
     float4 meso;    // x mesopic amount (0 = off), y cd/m² per frame unit, zw unused
-    float4 mesoTint;// xyz rod-vision tint, w unused
+    float4 mesoTint;// xyz rod-vision tint, w rod model (0 Larson 1997, 1 additive per-primary)
+    // ── Round-3 opt-ins (all zero ⇒ the paths above, bit-identical) ──
+    float4 adapt;   // x adaptation from the frame ON, y meter target EV, z tolerance (stops), w gain
+    float4 hist;    // x histogram tail ON, y gap slope, z populated fraction τ, w min populated scale
+    float4 pfloor;  // x floor luminance (cd/m², needs meso.y), y floor print level (exposed), zw unused
+    float4 meso2;   // x mesopic model (0 CIE 191 m, 1 blue shift), y log10 lo, z log10 hi, w pixel floor ON
+    float4 adapt2;  // x photopic field luminance (cd/m², needs meso.y; 0 = off), y cone floor ON,
+                    // z mesopic weight from the spatial adaptation ON, w unused
 };
+
+// Stats buffer written by `illumiLTMStats` (one threadgroup) and read by the apply:
+//   [0] mean exposed log2 brightness of the frame (the grid's own meter), [1] lift ceiling from
+//   the frame's exposure deficit (stops, −1 = not computed), [2] populated-slope scale q of the
+//   histogram fit, [3] unused, [4 …] f(d) at d = i·kLTMCurveStep, i < kLTMCurveN.
+constant constexpr int   kLTMCurveN    = 161;
+constant constexpr float kLTMCurveStep = 0.25;
+constant constexpr int   kLTMStatsHead = 4;
+constant constexpr int   kLTMMaxBins   = 160;
 
 // The frame's exposure, exactly as the tonemap derives it (IlluminatoramaTonemap.metal:
 // `autoBase * frame.exposure`). `expoState[1]` is ExposureState.smoothedExposure —
@@ -202,16 +218,200 @@ static inline float ltmScotopicRatio(float3 c) {
     return VY * (2.47 / 2.573);
 }
 
+// Rod luminance (photopic-equivalent, D65 grey keeps its luminance) of a linear-sRGB colour.
+// Larson (model 0) is NOT additive — red light added to dim moonlight LOWERS the mixture's value —
+// which printed the edge of a red light as a near-black seam (VZ-0194). The additive model (1) sums
+// Larson's own per-primary values (D65 grey within 0.3 %): a photoreceptor's response to light is
+// linear in it, so adding light never lowers it.
+static inline float ltmRodLuminance(float3 cc, float Y, float model) {
+    if (model > 0.5) return dot(cc, float3(0.032876, 0.765326, 0.201635));
+    return min(Y * ltmScotopicRatio(cc) / 2.47, 4.0 * Y);
+}
+
+// ── Round-3: adaptation from the frame + histogram-adjusted tail (opt-in) ─────────────────────
+//
+// ADAPTATION FROM THE FRAME (`adapt.x`). The eye's adaptation is set by the whole field it sees;
+// a camera whose exposure is held down (a bright emitter's cap, or a meter that reads only part
+// of the frame) leaves the field UNDER-exposed, and it is exactly that deficit a dark-adapted eye
+// makes up. The grid already holds the frame's log-brightness distribution, so its mean is a
+// whole-frame meter at the APPLIED exposure: deficit = targetEV − mean. The lift ceiling is
+//   ceiling = gain · max(0, deficit − tolerance)
+// — 0 while the field is exposed within `tolerance` of the meter's key (the operator then leaves
+// the frame EXACTLY as rendered), growing stop for stop with the underexposure as the light
+// falls: one adaptation state keyed on what the frame actually is, not on a separate ramp.
+//
+// HISTOGRAM-ADJUSTED TAIL (`hist.x`, Ward Larson, Rushmeier & Piatko 1997, histogram adjustment).
+// The fixed far-tail slope c = 1 − strength compresses every range under the knee alike —
+// populated or empty — so a lit facade 2.6 stops under the sky it stands against printed 0.1
+// stop under it. Here the slope at each brightness bin comes from the frame's own histogram (the
+// grid's unblurred weight per bin, i.e. the low-res log image's distribution): a POPULATED bin
+// (≥ τ of the frame) keeps contrast (slope 1 × q), an empty one is compressed (`gap slope`) —
+// the digits-to-window gap collapses, the room and the view keep their internal contrast.
+//   f′(d) = c(d) + (1 − c(d))·e^(−d/knee),   c(d) = gap + (w(p) · (1 − gap)) · q
+// (the knee keeps contrast as shot right under the anchor, as before). q ∈ [min scale, 1] is
+// FITTED so the curve lands the absolute floor luminance (`pfloor.x`, cd/m² — ~1e-5, where a
+// dark-adapted eye still sees) exactly at the floor PRINT level (`pfloor.y`, the exposed
+// brightness the display prints at a chosen low code — the host solves it through the display
+// transform's inverse): the range the eye adapts across is fitted into the range the display
+// can still print, instead of being aimed at a level the display's toe crushes to black.
+
+/// The tail slope at exposed level `lv` from the per-bin slopes in threadgroup memory (linear
+/// between bin centres).
+static inline float ltmBinSlope(threadgroup const float* sl, uint D, float lMin, float bin, float lv) {
+    float x = clamp((lv - lMin) / bin, 0.0, float(D - 1u));
+    uint i0 = uint(floor(x)); uint i1 = min(i0 + 1u, D - 1u);
+    return mix(sl[i0], sl[i1], x - float(i0));
+}
+
+/// f(d) at `d` — integrated in kLTMCurveStep steps (trapezoid) for the slope scale q.
+static inline float ltmTailF(threadgroup const float* sl, uint D, float lMin, float bin, float A,
+                             float gap, float q, float knee, float dEnd) {
+    float f = 0.0;
+    float prev = 1.0;   // f′(0) = 1
+    int n = int(ceil(dEnd / kLTMCurveStep));
+    for (int i = 1; i <= n; ++i) {
+        float d = min(float(i) * kLTMCurveStep, dEnd);
+        float c = gap + (ltmBinSlope(sl, D, lMin, bin, A - d) - gap) * q;
+        float fp = c + (1.0 - c) * exp(-d / max(knee, 1e-4));
+        f += 0.5 * (prev + fp) * (d - float(i - 1) * kLTMCurveStep);
+        prev = fp;
+    }
+    return f;
+}
+
+// 2b ── frame statistics + the fitted curve: ONE threadgroup, run on the UNBLURRED grid.
+kernel void illumiLTMStats(texture3d<float, access::read> grid  [[texture(4)]],
+                           constant LTMParams& p                [[buffer(0)]],
+                           device const float* expoState        [[buffer(1)]],
+                           device float* stats                  [[buffer(2)]],
+                           uint tid    [[thread_index_in_threadgroup]],
+                           uint tgSize [[threads_per_threadgroup]]) {
+    threadgroup float hW[kLTMMaxBins];
+    threadgroup float hWL[kLTMMaxBins];
+    threadgroup float sl[kLTMMaxBins];
+    const uint D = min(p.cells2.x, uint(kLTMMaxBins));
+    for (uint k = tid; k < D; k += tgSize) {
+        float w = 0.0, wl = 0.0;
+        for (uint y = 0u; y < p.cells.w; ++y) {
+            for (uint x = 0u; x < p.cells.z; ++x) {
+                float2 g = grid.read(uint3(x, y, k)).rg;
+                wl += g.x; w += g.y;
+            }
+        }
+        hW[k] = w; hWL[k] = wl;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0u) return;
+
+    float sw = 0.0, swl = 0.0;
+    for (uint k = 0u; k < D; ++k) { sw += hW[k]; swl += hWL[k]; }
+    const float lMin = p.grid.x, bin = max(p.grid.y, 1e-3);
+    const float meanL = sw > 0.0 ? swl / sw : lMin;
+    stats[0] = meanL;
+    // Photopic fields (`adapt2.x`): in cone vision lightness constancy keeps pace with a camera's
+    // print, so a field brighter than the photopic level gets one more stop of tolerance per stop
+    // it sits above it — the eye re-adapts beyond the print only where the cones give out.
+    float tol = p.adapt.z;
+    if (p.adapt2.x > 0.0 && p.meso.y > 0.0) {
+        const float La = exp2(meanL) / max(ltmExposure(p, expoState), 1e-30) * p.meso.y;
+        tol += max(0.0, log2(max(La, 1e-30) / p.adapt2.x));
+    }
+    stats[1] = (p.adapt.x > 0.5) ? p.adapt.w * max(0.0, (p.adapt.y - meanL) - tol) : -1.0;
+
+    if (p.hist.x > 0.5) {
+        const float exposure = ltmExposure(p, expoState);
+        const float A = p.tone.x, knee = p.tone.z, gap = clamp(p.hist.y, 0.0, 1.0);
+        const float tau = max(p.hist.z, 1e-6);
+        // Where the fit's floor sits (exposed log2); with no absolute scale, no fit (q = 1).
+        const bool fit = p.pfloor.x > 0.0 && p.meso.y > 0.0 && p.pfloor.y > 0.0;
+        const float lF = fit ? log2(max(p.pfloor.x / p.meso.y * exposure, 1e-30)) : lMin;
+        // Populated fraction over the bins the curve acts on (under the anchor, above the floor
+        // less one knee — the room just under the floor still counts).
+        float tot = 0.0;
+        for (uint k = 0u; k < D; ++k) {
+            float lk = lMin + float(k) * bin;
+            if (lk < A && lk >= lF - knee) tot += hW[k];
+        }
+        for (uint k = 0u; k < D; ++k) {
+            float t = saturate((hW[k] / max(tot, 1e-9)) / tau);
+            sl[k] = gap + (1.0 - gap) * (t * t * (3.0 - 2.0 * t));
+        }
+        float q = 1.0;
+        if (fit) {
+            const float dF = A - lF;
+            const float budget = A - log2(p.pfloor.y);
+            if (dF > 0.0 && ltmTailF(sl, D, lMin, bin, A, gap, 1.0, knee, dF) > budget) {
+                float lo = clamp(p.hist.w, 0.0, 1.0), hi = 1.0;
+                for (int it = 0; it < 18; ++it) {
+                    float mid = 0.5 * (lo + hi);
+                    if (ltmTailF(sl, D, lMin, bin, A, gap, mid, knee, dF) > budget) hi = mid; else lo = mid;
+                }
+                q = lo;
+            }
+        }
+        stats[2] = q;
+        // The LUT: f(d) at every step, one running integral.
+        float f = 0.0, prev = 1.0;
+        stats[kLTMStatsHead] = 0.0;
+        for (int i = 1; i < kLTMCurveN; ++i) {
+            float d = float(i) * kLTMCurveStep;
+            float c = gap + (ltmBinSlope(sl, D, lMin, bin, A - d) - gap) * q;
+            float fp = c + (1.0 - c) * exp(-d / max(knee, 1e-4));
+            f += 0.5 * (prev + fp) * kLTMCurveStep;
+            prev = fp;
+            stats[kLTMStatsHead + i] = f;
+        }
+    } else {
+        stats[2] = 1.0;
+    }
+}
+
+/// f(d) from the stats LUT (linear; past the table's end, continued at the last slope).
+static inline float ltmTailLUT(device const float* stats, float d) {
+    float x = d / kLTMCurveStep;
+    const float last = float(kLTMCurveN - 1);
+    if (x >= last) {
+        float fl = stats[kLTMStatsHead + kLTMCurveN - 1];
+        float sl = (fl - stats[kLTMStatsHead + kLTMCurveN - 2]) / kLTMCurveStep;
+        return fl + sl * (d - last * kLTMCurveStep);
+    }
+    int i0 = int(floor(x));
+    float t = x - float(i0);
+    return mix(stats[kLTMStatsHead + i0], stats[kLTMStatsHead + i0 + 1], t);
+}
+
+// 3b ── the neighbourhood's PLAIN adaptation level per cell: the blurred grid summed over every
+// brightness bin (Σ w·L / Σ w) — its mean log brightness, NOT edge-aware (the eye's adaptation is
+// set by its surround, whatever the pixel's own level). Read only by the mesopic weight.
+kernel void illumiLTMAdaptation(texture3d<float, access::read>  grid [[texture(3)]],
+                                texture2d<float, access::write> outA [[texture(5)]],
+                                constant LTMParams& p                [[buffer(0)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.cells.z || gid.y >= p.cells.w) return;
+    float2 acc = float2(0.0);
+    for (uint k = 0u; k < p.cells2.x; ++k) acc += grid.read(uint3(gid, k)).rg;
+    outA.write(float4(acc.y > 1e-12 ? acc.x / acc.y : p.grid.x, 0.0, 0.0, 0.0), gid);
+}
+
 // 4 ── slice + apply: one thread per full-res pixel.
 kernel void illumiLTMApply(texture2d<float, access::read>  src  [[texture(0)]],
                            texture2d<float, access::write> dst  [[texture(2)]],
                            texture3d<float, access::read>  grid [[texture(3)]],
+                           texture2d<float, access::read>  adaptTex [[texture(5)]],
                            constant LTMParams& p                [[buffer(0)]],
                            device const float* expoState        [[buffer(1)]],
+                           device const float* stats            [[buffer(2)]],
                            uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.sizes.x || gid.y >= p.sizes.y) return;
     float4 c = src.read(gid);
     if (!all(isfinite(c.rgb))) { dst.write(c, gid); return; }
+    // Adaptation from the frame: a field exposed within tolerance of the key is left EXACTLY as
+    // rendered (no lift, no mesopic shift).
+    float ceilingFromFrame = -1.0;
+    if (p.adapt.x > 0.5) {
+        ceilingFromFrame = stats[1];
+        if (!(ceilingFromFrame > 0.0)) { dst.write(c, gid); return; }
+    }
     const float exposure = ltmExposure(p, expoState);
     const float L = ltmLogBrightness(c.rgb, exposure, p);
 
@@ -237,18 +437,55 @@ kernel void illumiLTMApply(texture2d<float, access::read>  src  [[texture(0)]],
 
     const float anchor = p.tone.x, strength = p.tone.y, knee = p.tone.z, maxLift = p.tone.w;
     const float d = max(anchor - B, 0.0);
-    float lift = d - ltmCompress(d, strength, knee);
-    if (p.tail.x > 0.0) {
+    float lift;
+    if (p.hist.x > 0.5) {
+        lift = d - ltmTailLUT(stats, d);
+    } else {
+        lift = d - ltmCompress(d, strength, knee);
+    }
+    if (p.hist.x <= 0.5 && p.tail.x > 0.0) {
         // The floor, in stops under the anchor at THIS frame's exposure.
         const float dF = anchor - log2(max(p.tail.x * exposure, 1e-30));
         lift -= (p.tail.y - (1.0 - strength)) * ltmSoftplus(d - dF);
     }
-    float gain = ltmSoftCeiling(lift, maxLift);
+    const float liftCeiling = (ceilingFromFrame >= 0.0) ? min(maxLift, ceilingFromFrame) : maxLift;
+    float gain = ltmSoftCeiling(lift, liftCeiling);
     gain += (p.grid.z - 1.0) * (L - B);
     gain = clamp(gain, -maxLift, maxLift);
 
     float3 rgb = c.rgb;
-    if (p.meso.x > 0.0) {
+    // The mesopic shift follows the adaptation state in: fully on once the frame's ceiling is
+    // past a stop (1 when the adaptation is not taken from the frame).
+    const float mesoAmount = p.meso.x * ((ceilingFromFrame >= 0.0) ? smoothstep(0.0, 1.0, ceilingFromFrame) : 1.0);
+    if (mesoAmount > 0.0 && p.meso2.x > 0.5) {
+        // BLUE SHIFT (Jensen, Durand, Stark, Premože, Dorsey & Shirley 2000): rod vision reads a
+        // desaturated BLUE (the tint — Jensen's CIE xy (0.25, 0.25)), and colour fades with LOG
+        // luminance across the mesopic range [lo, hi] (log10 cd/m²) — not with CIE 191's m,
+        // which is a luminance weighting (it says how much the rods count toward brightness, not
+        // how much colour is lost). The luminance is the pixel's own when it is the brighter of
+        // the two (`meso2.w`): the neighbourhood base comes from the dark side of an edge, so on
+        // a lit patch's rim it would rod-tint pixels bright enough to be photopic.
+        float3 cc = max(rgb, 0.0);
+        float Y = dot(cc, float3(0.2126, 0.7152, 0.0722));
+        float bright = max(Y, 0.5 * max(cc.r, max(cc.g, cc.b)));
+        float lumRatio = bright > 1e-30 ? Y / bright : 1.0;
+        float Lp = exp2(B) / max(exposure, 1e-30) * p.meso.y * lumRatio;
+        if (p.adapt2.z > 0.5) {
+            // The surround's plain adaptation level (bilinear over the cells), no per-pixel ratio.
+            float a00 = adaptTex.read(i0.xy).r, a10 = adaptTex.read(uint2(i1.x, i0.y)).r;
+            float a01 = adaptTex.read(uint2(i0.x, i1.y)).r, a11 = adaptTex.read(i1.xy).r;
+            float Ba = mix(mix(a00, a10, fr.x), mix(a01, a11, fr.x), fr.y);
+            Lp = exp2(Ba) / max(exposure, 1e-30) * p.meso.y;
+        }
+        if (p.meso2.w > 0.5) Lp = max(Lp, (p.adapt2.y > 0.5 ? bright : Y) * p.meso.y);
+        float lg = log10(max(Lp, 1e-12));
+        float w = mesoAmount * (1.0 - smoothstep(p.meso2.y, p.meso2.z, lg));
+        if (w > 0.0) {
+            float rodLum = ltmRodLuminance(cc, Y, p.mesoTint.w);
+            float3 tint = p.mesoTint.xyz / max(dot(p.mesoTint.xyz, float3(0.2126, 0.7152, 0.0722)), 1e-4);
+            rgb = mix(rgb, rodLum * tint, w);
+        }
+    } else if (mesoAmount > 0.0) {
         // The neighbourhood's photopic luminance (cd/m²): the edge-aware base, un-exposed, with
         // the pixel's own luma / brightness-metric ratio (the base is in the meter's metric,
         // which reads a saturated red at ½·R — ~2.4× its luminance).
@@ -257,9 +494,10 @@ kernel void illumiLTMApply(texture2d<float, access::read>  src  [[texture(0)]],
         float bright = max(Y, 0.5 * max(cc.r, max(cc.g, cc.b)));
         float lumRatio = bright > 1e-30 ? Y / bright : 1.0;
         float Lp = exp2(B) / max(exposure, 1e-30) * p.meso.y * lumRatio;
+        if (p.meso2.w > 0.5) Lp = max(Lp, Y * p.meso.y);
         float sp = ltmScotopicRatio(cc);
         float m = ltmMesopicM(Lp, Lp * sp);
-        float w = p.meso.x * (1.0 - m);
+        float w = mesoAmount * (1.0 - m);
         if (w > 0.0) {
             // The rod response: photopic-equivalent scotopic luminance (a D65 grey keeps its
             // luminance), bounded like the legacy scotopic branch, in the rod tint.

@@ -1052,6 +1052,7 @@ final class CoinDEMActuationTests: XCTestCase {
         var hops = 0, realtime = 0.0, idleSleepSeconds: Float = -1, idleP50 = 0.0
         var stockedAsleepBefore = 0, stockedMaxTiltDeg: Float = 0
         var craneAwakeIdle = 0, craneMaxSpeedIdle: Float = 0
+        var smallWorldFrames = 0
     }
 
     /// What the fence world contains / does (the default is the §F.3 #16 world with the
@@ -1066,6 +1067,25 @@ final class CoinDEMActuationTests: XCTestCase {
         var operate = true
         var activityFrames = 300
         var idleFrames = 300
+        /// Stage B1 opt-ins (the recommended §G setting is both on).
+        var manifoldSolve = false
+        var warmStart = false
+        /// Stage B2 opt-ins: the speculative colouring (VZ-0160), a torsion patch on the
+        /// workers (plan 5a; 0 = off), Coulomb sheave friction on the crane's falls (VZ-0168;
+        /// 0 = frictionless rods).
+        var coloringScheme: CoinDEMSolver.ColoringScheme = .jonesPlassmann
+        var workerPatchRadius: Float = 0
+        var fallFrictionArm: Float = 0
+        /// Stage B3: the small-world path (plan 3c — the whole frame as one threadgroup dispatch).
+        /// Set explicitly either way, so VIZ_COINDEM_SMALLWORLD never changes what a config measures.
+        var smallWorld = false
+        /// Stage B3: the prepared contact rows (CoinDEMSolver.preparedContactSolve — the same rows,
+        /// their pose-constant factors computed once per substep). Set explicitly either way, so
+        /// VIZ_COINDEM_PREPARED never changes what a config measures.
+        var preparedRows = false
+        /// Joint Gauss–Seidel passes per velocity iteration (`CoinDEMSolver.jointInnerPasses`, the
+        /// solver's default 1). The Digital Clock scene runs 6 (ClockRigidWorld.configure; VZ-0208).
+        var jointInnerPasses = 1
     }
 
     /// The §A2 static set (134 colliders), tagged: `pads` are touched by design (seated
@@ -1258,6 +1278,12 @@ final class CoinDEMActuationTests: XCTestCase {
                                     boundsMin: SIMD3(-0.30, 0.55, 0.00), boundsMax: SIMD3(0.30, 0.90, 0.46))
         else { throw XCTSkip("solver init failed") }
         Self.applyClockConfig(s, dt: dt, iterations: iterations)
+        s.manifoldSolve = o.manifoldSolve
+        s.warmStart = o.warmStart
+        s.coloringScheme = o.coloringScheme
+        s.smallWorldPath = o.smallWorld
+        s.preparedContactSolve = o.preparedRows
+        s.jointInnerPasses = o.jointInnerPasses
         let statics = Self.clockStatics()
         s.setColliders(statics.all)
         var res = FenceResult(label: label)
@@ -1321,6 +1347,7 @@ final class CoinDEMActuationTests: XCTestCase {
                 workers.append(try XCTUnwrap(s.spawnBallastedEgg(Self.worker, fatCenter: SIMD3(x, Self.tableTop + 0.0115, 0.30),
                                                                  friction: 0.6, restitution: 0.15)))
             }
+            if o.workerPatchRadius > 0 { for w in workers { s.setPatchRadius(w, o.workerPatchRadius) } }
         }
         // ── Crane (identity-spawned chain: jib, trolley, block, rail, puck) + held bar.
         let xt: Float = 0.10, cable: Float = 0.09
@@ -1351,6 +1378,7 @@ final class CoinDEMActuationTests: XCTestCase {
                                                               worldAnchorA: SIMD3(xt + dx, 0.8175, 0.205 + dz),
                                                               worldAnchorB: SIMD3(xt + dx, blockTop, 0.205 + dz))))
             }
+            if o.fallFrictionArm > 0 { for f in falls { s.setDistanceSwingFriction(f, arm: o.fallFrictionArm) } }
             // J6 / J7 follow the falls in the GS order: the first two slots of the main pool.
         }
         res.bodies = s.activeCount
@@ -1443,6 +1471,7 @@ final class CoinDEMActuationTests: XCTestCase {
                 res.hops += 1
             }
             gpu += frame()
+            if s.lastFrameUsedSmallWorld { res.smallWorldFrames += 1 }
             steps += s.lastStepCount
             awakeSum += s.activeCount - s.asleepCount
             contactSum += s.contactCount
@@ -1472,27 +1501,99 @@ final class CoinDEMActuationTests: XCTestCase {
         res.craneMaxSpeedIdle = crane.map { simd_length(s.velocity(of: $0)!) }.max() ?? 0
         res.stockedMaxTiltDeg = zip(stocked, stockedPose0).map { Self.angleDeg(s.orientation(of: $0.0)! * $0.1.inverse) }.max() ?? 0
         print("ACT_16 [\(label)] bodies=\(res.bodies) colliders=\(res.colliders) uploaded(mean)=\(String(format: "%.1f", res.meanUploaded)) jointSlots=\(res.jointSlots) activeJoints=\(res.activeJoints) latchedAsleepBeforeActivity=\(res.latchedAsleepBefore)/\(latched.count) stockedAsleepBefore=\(res.stockedAsleepBefore)/\(stocked.count) stockedMaxRotation=\(res.stockedMaxTiltDeg)° landClearance=\(worstLand * 1000) mm")
-        print("ACT_16 [\(label)] physics GPU ms p50=\(String(format: "%.3f", res.p50)) p95=\(String(format: "%.3f", res.p95)) max=\(String(format: "%.3f", res.max)) mean=\(String(format: "%.3f", res.mean)) | colorStats overflow=\(res.listOverflow) uncolored=\(res.uncolored) maxColorUsed=\(res.maxColorUsed) beyondSweep=\(res.beyondSweep) | meanAwake=\(res.meanAwake) meanContacts=\(res.meanContacts) hops=\(res.hops) realtime=\(res.realtime) | idle: world asleep after \(res.idleSleepSeconds) s, idle p50=\(String(format: "%.3f", res.idleP50)) ms, crane awake \(res.craneAwakeIdle)/\(crane.count) max |v| \(res.craneMaxSpeedIdle * 1000) mm/s")
+        print("ACT_16 [\(label)] physics GPU ms p50=\(String(format: "%.3f", res.p50)) p95=\(String(format: "%.3f", res.p95)) max=\(String(format: "%.3f", res.max)) mean=\(String(format: "%.3f", res.mean)) | colorStats overflow=\(res.listOverflow) uncolored=\(res.uncolored) maxColorUsed=\(res.maxColorUsed) beyondSweep=\(res.beyondSweep) | meanAwake=\(res.meanAwake) meanContacts=\(res.meanContacts) hops=\(res.hops) realtime=\(res.realtime) smallWorldFrames=\(res.smallWorldFrames)/\(o.activityFrames) | idle: world asleep after \(res.idleSleepSeconds) s, idle p50=\(String(format: "%.3f", res.idleP50)) ms, crane awake \(res.craneAwakeIdle)/\(crane.count) max |v| \(res.craneMaxSpeedIdle * 1000) mm/s")
         return res
     }
 
     /// #16 — the go/no-go perf fence: 26 bar hulls (21 latched + asleep, 1 on the crane
     /// grip, 4 cradled) over the 81-box display land, 12 racked bars, 4 hopping Weebles,
     /// the 5-body crane chain with 4 falls, 30 fps wall dt. Runs both candidate
-    /// configurations and asserts the fence on the default (1/180 s × 6).
+    /// configurations and asserts the fence on the default (1/180 s × 6); then the stage-B1
+    /// opt-ins, the B1 + speculative colouring (VZ-0160), every B2 opt-in the clock runs
+    /// (worker torsion patch, crane sheave friction — the braked crane must sleep, VZ-0168),
+    /// and — stage B3 — the SCENE configuration: those opt-ins plus the small-world path (plan
+    /// 3c) and the prepared contact rows, gated the same way (p95 ≤ 3 ms, idle = the whole-world
+    /// skip, 0 uncoloured, the latched bars asleep before the job); and, measured but not gated,
+    /// the same at the scene's own jointInnerPasses = 6 (`g` — the pass count is decision VZ-0208).
     ///
-    /// Skipped unless VIZ_COINDEM_FENCE=1: the 3 ms budget is the TARGET of the
-    /// in-progress small-world work (plan items 3b/3c; p95 ≈ 13 ms after VZ-0147..0156),
-    /// not a regression gate yet, and a red fence blocked every other session's engine
-    /// landing (bump-engine runs the full suite). Turn it back on unconditionally once
-    /// it holds.  Run:  VIZ_COINDEM_FENCE=1 ./Scripts/test.sh --filter testClockLikeWorldPerfFence
+    /// Skipped unless VIZ_COINDEM_FENCE=1: the 3 ms budget is still a TARGET, not a regression
+    /// gate — timing fences flake under other sessions' GPU load, and a red fence blocked every
+    /// other session's engine landing (bump-engine runs the full suite). The DEFAULT configuration's
+    /// assertions (`a`, the multi-dispatch path without the opt-ins) still fail by design.
+    ///
+    /// Stage B3, the finished speed round (docs/coindem-constraint-solver.md), M1 Max, 3 rounds
+    /// interleaved with the stage-A engine (8038c45), other sessions sharing the GPU (load average
+    /// 3.5–12.2; median [range], ms): the SCENE configuration (`f`) p50 1.73 [1.72–1.74] / p95 2.72
+    /// [2.71–2.72] / max 2.78 [2.77–2.78] — within the fence in 3 of 3 rounds — every activity frame
+    /// on the small-world path, 0 uncoloured, 21/21 latched bars asleep before the job, 16/16 stocked
+    /// bars within 0.013°, the world asleep 1.33 s into the idle (idle p50 0.000 ms, crane 0/6 awake).
+    /// (Before the speed round, without the prepared rows: p50 3.41 / p95 5.99.) The DEFAULT
+    /// configurations stay far above it: 1/180 s × 6 — stage A p50 11.70 [11.68–11.85] / p95 13.47
+    /// [13.47–13.60] / max 14.83, B3 p50 8.83 [8.02–9.14] / p95 12.78 [10.24–13.13] / max 14.24 (the
+    /// multi-dispatch path swings with the GPU's other load: a quieter set gave p50 6.43 / p95 9.21);
+    /// 1/240 s × 8 — A 16.17 / 18.86, B3 8.36 / 12.47. Where the scene configuration's time goes (µs
+    /// per substep, each phase timed as its own dispatch; no contact / single contacts / a polytope
+    /// manifold touching): joint solve 99 / 99 / 102, contact solve 13 / 47 / 138 (VZ-0210), polytope
+    /// narrowphase 53 / 53 / 106 (VZ-0211), contact generation 72–75, joint prepare 47, colouring
+    /// 20–29, warm start 12–28, the prepare 11–21, ≈ 11–15 for each near-empty phase. `g`, the scene's
+    /// jointInnerPasses = 6: the joint solve +62 µs per extra pass per substep, ≈ +1.85 ms per frame —
+    /// p50 3.64 [3.56–4.34] / p95 4.92 [4.54–6.19] ms over 7 runs, every one with other load on the GPU
+    /// (in one process against 1 pass: p50 1.93 → 3.65) — over the budget; decision VZ-0208. In the
+    /// same three later sets (another session's app rendering, then the machine in interactive use;
+    /// load 6.6–15.5) `f` measured p50 1.73–3.19 / p95 3.23–5.10 over 7 runs, over the fence in each:
+    /// it holds on a GPU the physics has to itself.
+    /// Turn the gate on unconditionally once it holds with a margin.
+    ///   Run:  VIZ_COINDEM_FENCE=1 ./Scripts/test.sh --filter testClockLikeWorldPerfFence
     func testClockLikeWorldPerfFence() throws {
         guard ProcessInfo.processInfo.environment["VIZ_COINDEM_FENCE"] != nil else {
             throw XCTSkip("perf fence is a work-in-progress target; set VIZ_COINDEM_FENCE=1 to run it")
         }
         let a = try runClockFence(dt: 1.0 / 180, iterations: 6, label: "1/180×6")
         let b = try runClockFence(dt: 1.0 / 240, iterations: 8, label: "1/240×8")
-        print("ACT_16 SUMMARY 1/180×6 p50=\(a.p50) p95=\(a.p95) maxColor=\(a.maxColorUsed) | 1/240×8 p50=\(b.p50) p95=\(b.p95) maxColor=\(b.maxColorUsed)")
+        // The recommended stage-B1 setting (manifold solve + warm start), for its cost.
+        let c = try runClockFence(dt: 1.0 / 180, iterations: 6, label: "1/180×6 manifold+warm",
+                                  options: FenceOptions(manifoldSolve: true, warmStart: true))
+        // Stage B2: the same with the speculative colouring, then with every B2 opt-in the clock
+        // is meant to run (3 mm torsion patch on the workers, toy-crane sheave friction on the falls).
+        let d = try runClockFence(dt: 1.0 / 180, iterations: 6, label: "1/180×6 manifold+warm+speculative",
+                                  options: FenceOptions(manifoldSolve: true, warmStart: true, coloringScheme: .speculative))
+        let e = try runClockFence(dt: 1.0 / 180, iterations: 6, label: "1/180×6 B2 (manifold+warm+speculative+torsion+sheaves)",
+                                  options: FenceOptions(manifoldSolve: true, warmStart: true, coloringScheme: .speculative,
+                                                        workerPatchRadius: 0.003,
+                                                        fallFrictionArm: CoinDEMSolver.toyCraneFallFrictionArm))
+        // Stage B3: the SCENE configuration — every B2 opt-in plus the small-world path (plan 3c) and
+        // the prepared contact rows.
+        let f = try runClockFence(dt: 1.0 / 180, iterations: 6, label: "1/180×6 scene (B2 opt-ins + small world + prepared rows)",
+                                  options: FenceOptions(manifoldSolve: true, warmStart: true, coloringScheme: .speculative,
+                                                        workerPatchRadius: 0.003,
+                                                        fallFrictionArm: CoinDEMSolver.toyCraneFallFrictionArm,
+                                                        smallWorld: true, preparedRows: true))
+        // The same at the Digital Clock's jointInnerPasses = 6 (ClockRigidWorld.configure). MEASURED,
+        // not gated: how many passes the crane gets against this budget is the decision VZ-0208.
+        let g = try runClockFence(dt: 1.0 / 180, iterations: 6, label: "1/180×6 scene + 6 joint passes",
+                                  options: FenceOptions(manifoldSolve: true, warmStart: true, coloringScheme: .speculative,
+                                                        workerPatchRadius: 0.003,
+                                                        fallFrictionArm: CoinDEMSolver.toyCraneFallFrictionArm,
+                                                        smallWorld: true, preparedRows: true, jointInnerPasses: 6))
+        print("ACT_16 SUMMARY 1/180×6 p50=\(a.p50) p95=\(a.p95) maxColor=\(a.maxColorUsed) | 1/240×8 p50=\(b.p50) p95=\(b.p95) maxColor=\(b.maxColorUsed) | 1/180×6 manifold+warm p50=\(c.p50) p95=\(c.p95) maxColor=\(c.maxColorUsed) stockedMaxRotation=\(c.stockedMaxTiltDeg)° | +speculative p50=\(d.p50) p95=\(d.p95) maxColor=\(d.maxColorUsed) | B2 all p50=\(e.p50) p95=\(e.p95) maxColor=\(e.maxColorUsed) idle asleep after \(e.idleSleepSeconds) s, idle p50=\(e.idleP50), crane awake \(e.craneAwakeIdle)/6 | scene (B2 + small world) p50=\(f.p50) p95=\(f.p95) max=\(f.max) smallWorldFrames=\(f.smallWorldFrames) idle asleep after \(f.idleSleepSeconds) s, idle p50=\(f.idleP50) | scene + 6 joint passes (not gated, VZ-0208) p50=\(g.p50) p95=\(g.p95) max=\(g.max) idle p50=\(g.idleP50)")
+        XCTAssertEqual(c.uncolored, 0, "manifold + warm: every contact coloured")
+        XCTAssertEqual(c.latchedAsleepBefore, 21, "manifold + warm: latched bars sleep before the job starts")
+        XCTAssertEqual(d.uncolored, 0, "speculative colouring: every contact coloured")
+        XCTAssertEqual(e.uncolored, 0, "B2 opt-ins: every contact coloured")
+        XCTAssertEqual(e.listOverflow, 0)
+        XCTAssertEqual(e.craneAwakeIdle, 0, "VZ-0168: with sheave friction the braked crane's hook stops swinging and it sleeps")
+        // The scene configuration (stage B3): the same fence on the clock's engine opt-ins (at the
+        // fence world's 1 joint pass — `g` measures the scene's 6).
+        XCTAssertEqual(f.smallWorldFrames, 300, "scene config: every activity frame took the small-world path")
+        XCTAssertLessThanOrEqual(f.p95, 3.0, "scene config fence: physics GPU p95 ≤ 3.0 ms during activity (1/180 s × 6)")
+        XCTAssertEqual(f.uncolored, 0, "scene config: every contact coloured")
+        XCTAssertEqual(f.listOverflow, 0)
+        XCTAssertEqual(f.latchedAsleepBefore, 21, "scene config: latched bars sleep before the job starts")
+        XCTAssertGreaterThanOrEqual(f.idleSleepSeconds, 0, "scene config: the parked world reaches the whole-world skip")
+        XCTAssertLessThanOrEqual(f.idleP50, 0.01, "scene config: idle frames cost nothing (the whole-world skip)")
+        XCTAssertEqual(f.craneAwakeIdle, 0)
+        XCTAssertGreaterThan(f.hops, 20, "scene config: the Weebles actually hopped")
+        XCTAssertEqual(g.smallWorldFrames, 300, "6 joint passes: measured on the small-world path")
         XCTAssertLessThanOrEqual(a.p95, 3.0, "fence: physics GPU p95 ≤ 3.0 ms during activity (1/180 s × 6)")
         XCTAssertEqual(a.uncolored, 0, "fence: every contact coloured")
         XCTAssertLessThanOrEqual(a.maxColorUsed, 12, "fence: colour sweep stays small")

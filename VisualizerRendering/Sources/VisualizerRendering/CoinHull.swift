@@ -51,6 +51,10 @@ enum CoinHullMath {
         /// Rotation from the (COM-shifted) input frame to the principal frame:
         /// stored = principalRotation⁻¹ · (input − comOffset).
         var principalRotation: simd_quatf
+        /// Merged polygon faces + edges in the principal frame, indices into
+        /// `vertices` (CoinHullTopology) — what the exact polytope narrowphase
+        /// clips against. nil (or `!fitsGPU`) ⇒ the hull keeps the vertex-probe paths.
+        var topology: CoinHullTopology? = nil
     }
 
     /// nil when fewer than 4 non-degenerate points are given.
@@ -127,6 +131,14 @@ enum CoinHullMath {
             mn = simd_min(mn, v); mx = simd_max(mx, v)
         }
         let he = (mx - mn) * 0.5
+        // Face topology in the SAME frame and vertex numbering the GPU gets.
+        var slotOf = [Int: Int]()
+        for (k, i) in used.enumerated() { slotOf[i] = k }
+        let principal = used.map { simd_act(qInv, P[$0] - com) }
+        let mapped = faces.map { (slotOf[$0.0]!, slotOf[$0.1]!, slotOf[$0.2]!) }
+        var M = 0.0
+        for p in points { M = max(M, Double(max(abs(p.x), max(abs(p.y), abs(p.z))))) }
+        let topology = CoinHullTopology.build(points: principal, triangles: mapped, tol: 1e-6 * L + 1e-7 * M)
         // Relative floor (a real 3-D hull's principal moments are all ~L²).
         let evFloor = 1e-12 * L * L
         let ev = SIMD3<Double>(max(eigVals.x, evFloor), max(eigVals.y, evFloor), max(eigVals.z, evFloor))
@@ -136,7 +148,8 @@ enum CoinHullMath {
             boundingRadius: Float(boundR),
             minHalfExtent: max(Float(min(he.x, min(he.y, he.z))), 1e-4),
             comOffset: SIMD3<Float>(Float(com.x), Float(com.y), Float(com.z)),
-            principalRotation: q)
+            principalRotation: q,
+            topology: topology)
     }
 
     private static func outer(_ a: SIMD3<Double>, _ b: SIMD3<Double>) -> simd_double3x3 {
