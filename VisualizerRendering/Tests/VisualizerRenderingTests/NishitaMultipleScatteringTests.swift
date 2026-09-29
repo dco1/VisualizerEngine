@@ -296,7 +296,7 @@ final class NishitaMultipleScatteringTests: XCTestCase {
     func testLUTLayoutMirrorMatchesTheShader() throws {
         let engine = SimEngine.shared
         guard let pso = engine.pipeline("volSkyAtmosphereLUTLayout"),
-              let out = engine.device.makeBuffer(length: 48, options: .storageModeShared),
+              let out = engine.device.makeBuffer(length: 96, options: .storageModeShared),
               let cb = engine.commandQueue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else {
             return XCTFail("volSkyAtmosphereLUTLayout missing")
         }
@@ -306,17 +306,29 @@ final class NishitaMultipleScatteringTests: XCTestCase {
         enc.endEncoding()
         cb.commit()
         cb.waitUntilCompleted()  // gpu-ok: test harness
-        let v = out.contents().bindMemory(to: SIMD4<Int32>.self, capacity: 3)
+        let v = out.contents().bindMemory(to: SIMD4<Int32>.self, capacity: 6)
         let L = VolumetricCloudRenderer.AtmosphereLUT.self
-        XCTAssertEqual(Int(v[0].x), L.float4Count, "kLUTLength")
+        XCTAssertEqual(Int(v[0].x), L.builtinFloat4Count, "kLUTLength")
+        // The aerosol medium's Mie table after it (`NishitaAerosol`), inside the same region.
+        XCTAssertEqual(Int(v[2].x), L.builtinFloat4Count, "kLUTJ")
+        XCTAssertEqual(Int(v[2].y), L.float4Count, "kLUTLengthAerosol")
+        XCTAssertEqual(Int(v[2].z), L.mieTableEl); XCTAssertEqual(Int(v[2].w), L.mieTableAz)
+        XCTAssertEqual(Int(v[3].x), L.builtinFloat4Count + L.mieTableSize, "kLUTJB")
+        XCTAssertEqual(Int(v[3].y), L.mieTableSize, "kJSize")
+        // The spectral bake's bands 1…3 after it: each only the tables the render reads.
+        XCTAssertEqual(Int(v[4].x), L.spectralBands, "kSpecBands")
+        XCTAssertEqual(Int(v[4].y), L.float4Count, "kLUTSpecExtra")
+        XCTAssertEqual(Int(v[4].z), L.spectralBandFloat4Count, "kLUTSpecBandSize")
+        XCTAssertEqual(Int(v[4].w), L.regionFloat4Count, "kLUTRegionLength")
+        XCTAssertEqual(Int(v[5].x), 0, "kLUTSpecTrans")
+        XCTAssertEqual(Int(v[5].y), L.transW * L.transH, "kLUTSpecMS")
+        XCTAssertEqual(Int(v[5].z), L.transW * L.transH + 2 * L.msW * L.msH, "kLUTSpecJ")
+        XCTAssertEqual(VolumetricCloudRenderer.skyUniformsBufferLength,
+                       VolumetricCloudRenderer.atmosphereLUTOffset + L.regionFloat4Count * 16, "room for every band")
         XCTAssertEqual(Int(v[0].y), 1, "kLUTTrans")
         XCTAssertEqual(Int(v[0].z), 1 + L.transW * L.transH, "kLUTMS")
         XCTAssertEqual(Int(v[1].x), L.transW); XCTAssertEqual(Int(v[1].y), L.transH)
         XCTAssertEqual(Int(v[1].z), L.msW); XCTAssertEqual(Int(v[1].w), L.msH)
-        XCTAssertEqual(Int(v[2].x), L.spectralBands, "kSpecBands")
-        XCTAssertEqual(Int(v[2].y), L.float4Count - 1, "kLUTBandStride")
-        XCTAssertEqual(VolumetricCloudRenderer.skyUniformsBufferLength,
-                       VolumetricCloudRenderer.atmosphereLUTOffset + L.regionFloat4Count * 16, "room for every band")
         XCTAssertGreaterThanOrEqual(VolumetricCloudRenderer.atmosphereLUTOffset, MemoryLayout<SkyUniforms>.stride)
         XCTAssertEqual(VolumetricCloudRenderer.atmosphereLUTOffset % 256, 0)
         // The GPU-owned cloud-lighting tail is still the last 3 float4s of the uniforms.
@@ -534,15 +546,18 @@ final class NishitaMultipleScatteringTests: XCTestCase {
         return try MetalSourceLoader.makeLibrary(device: device, contentsOf: dir.appendingPathComponent("VolumetricSky.metal"))
     }
 
-    /// The old struct is this one without `msParams` and the later `nightSkyE` (the skyglow +
-    /// limiting-magnitude cluster), which sit together just before the GPU-owned tail.
+    /// The old struct is this one without `msParams` and the later clusters (`nightSkyE` — the
+    /// skyglow + limiting-magnitude cluster — and the aerosol's `aerosolA/B`), which sit together
+    /// just before the GPU-owned tail.
     static func preVZ0159Bytes(_ u: SkyUniforms) -> [UInt8] {
         var u = u
         let all = withUnsafeBytes(of: &u) { Array($0) }
         let off = MemoryLayout<SkyUniforms>.offset(of: \SkyUniforms.msParams)!
         let tail = MemoryLayout<SkyUniforms>.offset(of: \SkyUniforms.cloudLitSun)!
-        precondition(MemoryLayout<SkyUniforms>.offset(of: \SkyUniforms.nightSkyE)! == off + 16 && tail == off + 32,
-                     "msParams + nightSkyE must be the two clusters right before the GPU-written tail")
+        precondition(MemoryLayout<SkyUniforms>.offset(of: \SkyUniforms.nightSkyE)! == off + 16
+                     && MemoryLayout<SkyUniforms>.offset(of: \SkyUniforms.aerosolA)! == off + 32
+                     && MemoryLayout<SkyUniforms>.offset(of: \SkyUniforms.aerosolB)! == off + 48 && tail == off + 64,
+                     "msParams, nightSkyE, aerosolA/B must be the clusters right before the GPU-written tail")
         return Array(all[0..<off]) + Array(all[tail...])
     }
 
@@ -868,6 +883,58 @@ final class NishitaMultipleScatteringTests: XCTestCase {
             }
         }
         print("── Nishita spectral bake, window direction ──\n" + report)
+    }
+
+    /// Spectral × aerosol: the host's aerosol takes part in the spectral bake at the bake's own 12
+    /// wavelengths (Ångström per triple, its Mie shape table per triple). The aerosol's effect being
+    /// the same physics in both paths, the step from the built-in air to the haze is the same in
+    /// each — to 0.15 stop over the zenith, the window and the sunward (3° up) and anti-solar
+    /// horizons, 0.25 on the sunward horizon with the sun 4° up, where the haze reddens the light
+    /// 2–5 stops and 3 samples of that steep spectrum are exactly what the bake replaces. By day
+    /// the spectral and 3-wavelength skies agree at the zenith and the window with the haze as they
+    /// do without it (the horizons' colours legitimately differ). At twilight the haze keeps the
+    /// spectral window blue. The per-wavelength extinction itself is pinned against a CPU spectral
+    /// integration in `NishitaAerosolTests.testSpectralSunTransmittanceIsTheSkysOwn`.
+    @MainActor
+    func testSpectralBakeCarriesTheAerosol() throws {
+        let h = try Harness()
+        let dirs = [View.zenith.dir, View.window.dir, SIMD3<Float>(cos(3 * Float.pi / 180), sin(3 * Float.pi / 180), 0), View.anti5.dir]
+        var report = "aerosol       sun   view  3λ haze/builtin (stops)  spectral haze/builtin\n"
+        for (name, aerosol) in [("hazySuburban", NishitaAerosol.hazySuburban), ("urban", NishitaAerosol.urban),
+                                ("cleanMaritime", NishitaAerosol.cleanMaritime)] {
+            for el: Float in [50, 15, 4] {
+                var p = Self.bareSky(el: el, ms: true)
+                let rgbClean = try h.sky(p, dirs)
+                p.atmosphereSpectral = true
+                let spClean = try h.sky(p, dirs)
+                p.atmosphereAerosol = aerosol
+                let spHaze = try h.sky(p, dirs)
+                p.atmosphereSpectral = false
+                let rgbHaze = try h.sky(p, dirs)
+                for i in dirs.indices {
+                    let l = { (v: SIMD3<Float>) in simd_dot(v, Self.luma) }
+                    let d3 = Self.stops(l(rgbHaze[i]), l(rgbClean[i]))
+                    let dS = Self.stops(l(spHaze[i]), l(spClean[i]))
+                    report += String(format: "%-13@ %4.0f° %d     %+.3f                  %+.3f\n", name as NSString, el, i, d3, dS)
+                    let stepTol: Float = (i == 2 && el < 5) ? 0.25 : 0.15
+                    XCTAssertLessThan(abs(dS - d3), stepTol, "\(name) sun \(el)° view \(i): the aerosol's step differs between paths")
+                    guard i < 2, el >= 15 else { continue }
+                    XCTAssertLessThan(abs(Self.stops(l(spHaze[i]), l(rgbHaze[i]))), 0.15,
+                                      "\(name) sun \(el)° view \(i): spectral vs 3λ luma with the aerosol")
+                    let na = rgbHaze[i] / rgbHaze[i].z, nb = spHaze[i] / spHaze[i].z
+                    XCTAssertLessThan(simd_length(na - nb), 0.12, "\(name) sun \(el)° view \(i): hue — \(na) vs \(nb)")
+                }
+            }
+            var p = Self.bareSky(el: -4.2, ms: true)
+            p.atmosphereAerosol = aerosol
+            let rgb = try h.sky(p, [View.window.dir])[0]
+            p.atmosphereSpectral = true
+            let sp = try h.sky(p, [View.window.dir])[0]
+            XCTAssertGreaterThan(sp.z, sp.x, "\(name) spectral at −4.2°: B > R — \(sp)")
+            XCTAssertLessThan(rgb.y / rgb.x, sp.y / sp.x, "\(name): the 3-wavelength march is the greener-starved one at −4.2°")
+            XCTAssertTrue([sp.x, sp.y, sp.z].allSatisfy { $0.isFinite && $0 > 0 }, "\(name): finite, positive")
+        }
+        print("── Nishita spectral bake × aerosol ──\n" + report)
     }
 
     @MainActor

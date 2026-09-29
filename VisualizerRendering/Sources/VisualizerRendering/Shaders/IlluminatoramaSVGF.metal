@@ -112,7 +112,11 @@ struct RTGITemporalUniforms {
     uint  width; uint height; uint enabled; uint isFirstFrame;
     float blend;       // weight of the CURRENT frame in steady state (e.g. 0.06)
     float gammaClamp;  // neighborhood clamp width in sigmas (wide, e.g. 4.0)
-    float _pad0; float _pad1;
+    // Daydream DH-0887 — 1 ⇒ STILL mode: the camera is frozen and every frame is a new sample
+    // of the same picture, so the history is an unbiased running mean (α = 1/N, N up to 2048)
+    // with no neighbourhood clamp and no velocity ramp. Was `_pad0` — same 4 bytes.
+    uint  staticAccumulation;
+    float _pad1;
 };
 
 kernel void illumi_rt_gi_temporal(
@@ -147,6 +151,29 @@ kernel void illumi_rt_gi_temporal(
 
     constexpr sampler samp(filter::linear, address::clamp_to_edge);
     float3 hist = float3(histGI.sample(samp, histUV).rgb);
+
+    // STILL mode (DH-0887). The EMA below is a MOVING average: its steady-state weight floor
+    // (`blend`) and the N ≤ 32 cap forget old samples, and the clamp pulls the history toward
+    // THIS frame's noisy 3×3 box — right for a moving camera, and exactly why a frozen still
+    // never got past a few dozen effective samples of 1-ray GI (the settled canvas's "sponge").
+    // With the camera frozen the history is the same picture, so average it: α = 1/N.
+    if (u.staticAccumulation != 0u) {
+        // A real camera move (the velocity has the TAA jitter removed, so a frozen jittered
+        // camera reads ~0) means a different picture: start the mean again rather than average
+        // two views. The host's reset remains the primary guard.
+        if (length(vel) > 5e-4) {
+            sampleCount.write(half4(1.0h), gid);
+            outGI.write(half4(half3(current), 1.0h), gid);
+            return;
+        }
+        // The first-frame branch above stores 0 while the history already holds that frame, so
+        // a stored count below 1 still means one sample.
+        float Ns = min(max(N, 1.0) + 1.0, 2048.0);
+        sampleCount.write(half4(half(Ns)), gid);
+        float3 mean = hist + (current - hist) / Ns;
+        outGI.write(half4(half3(max(float3(0.0), mean)), 1.0h), gid);
+        return;
+    }
 
     // Wide YCoCg neighborhood clamp — guards gross ghosting at on-screen
     // disocclusions, but loose enough not to fight low-frequency convergence.

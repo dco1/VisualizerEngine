@@ -48,6 +48,7 @@
 #include <metal_stdlib>
 #include <metal_raytracing>
 #include "IlluminatoramaNightSky.h"
+#include "IlluminatoramaSampling.h"
 
 using namespace metal;
 using namespace raytracing;

@@ -40,6 +40,9 @@ enum NishitaReference {
         var betaM = 21e-6
         var mieExt = 1.1
         var g = 0.76
+        /// A per-channel aerosol (680 / 550 / 440 nm): sea-level scattering and extinction (m⁻¹).
+        /// nil = the built-in grey one above (betaM, ×mieExt). Set with `setAerosol`.
+        var mieChannel: (scattering: V3, extinction: V3)? = nil
         var betaO = V3(0.650e-6, 1.881e-6, 0.085e-6)
         var ozoneC = 25000.0
         var ozoneW = 15000.0
@@ -47,14 +50,30 @@ enum NishitaReference {
 
         @inline(__always) func ozone(_ h: Double) -> Double { max(0, 1 - abs(h - ozoneC) / ozoneW) }
 
-        /// (sigmaS Rayleigh per channel, sigmaS Mie, sigmaT per channel) at radius r.
-        @inline(__always) func coeffs(_ r: Double) -> (sR: V3, sM: Double, t: V3) {
+        /// (sigmaS Rayleigh per channel, sigmaS Mie per channel, sigmaT per channel) at radius r.
+        @inline(__always) func coeffs(_ r: Double) -> (sR: V3, sM: V3, t: V3) {
             let h = r - Rg
-            if h > Rt - Rg { return (.zero, 0, .zero) }
+            if h > Rt - Rg { return (.zero, .zero, .zero) }
             let dr = exp(-h / HR), dm = exp(-h / HM), dO = ozone(h)
             let sR = betaR * dr
+            if let c = mieChannel {
+                return (sR, c.scattering * dm, sR + c.extinction * dm + betaO * dO)
+            }
             let sM = betaM * dm
-            return (sR, sM, sR + V3(repeating: betaM * mieExt * dm) + betaO * dO)
+            return (sR, V3(repeating: sM), sR + V3(repeating: betaM * mieExt * dm) + betaO * dO)
+        }
+
+        /// `NishitaAerosol`'s definition (VisualizerRendering/NishitaAerosol.swift): τa(λ) =
+        /// τ550 (λ/550 nm)^−α at the 680 / 550 / 440 nm channels, βe = τa / H_M at sea level on an
+        /// exponential profile, βs = ω₀ βe, Cornette–Shanks g. `NishitaAerosolTests` checks the
+        /// two agree.
+        mutating func setAerosol(tau550: Double, alpha: Double, scaleHeight: Double, omega0: Double, g: Double) {
+            let lam = V3(680, 550, 440)
+            let tau = V3(pow(lam.x / 550, -alpha), pow(lam.y / 550, -alpha), pow(lam.z / 550, -alpha)) * tau550
+            let ext = tau / scaleHeight
+            mieChannel = (ext * omega0, ext)
+            HM = scaleHeight
+            self.g = g
         }
     }
 
@@ -186,7 +205,7 @@ enum NishitaReference {
         var dt: Double
         var sT: V3
         var sR: V3
-        var sM: Double
+        var sM: V3
         var T0: V3
     }
 
@@ -221,7 +240,7 @@ enum NishitaReference {
             let pm = x + w * (t + 0.5 * dt)
             let c = atm.coeffs(len3(pm))
             let Ts = tab.sunTrans(pm, s)
-            let S = (c.sR * pR + V3(repeating: c.sM * pM)) * Ts
+            let S = (c.sR * pR + c.sM * pM) * Ts
             let Tseg = vexp(-c.t * dt)
             L += T * S * (V3(1, 1, 1) - Tseg) / c.t
             if record { segs.append(Seg(t0: t, dt: dt, sT: c.t, sR: c.sR, sM: c.sM, T0: T)) }
@@ -345,7 +364,7 @@ enum NishitaReference {
                             var groundVertex = false
                             let u = rng.uniform()
                             var xn = x
-                            var sR = V3.zero, sM = 0.0
+                            var sR = V3.zero, sM = V3.zero
                             // Analog free flight when the ray ends on the ground: τ* ≥ τ_end ⇒ the ground
                             // (probability T_end); a ray that escapes to space forces a volume collision.
                             if ray.hitGround && u >= 1 - TgEnd { groundVertex = true }
@@ -416,7 +435,7 @@ enum NishitaReference {
                                 let ct = dot3(w, wn)
                                 var pdf = wU / (4 * Double.pi) + wH * phaseHG(ct, atm.g)
                                 if wB > 0 && band.contains(wn) { pdf += wB * band.pdf }
-                                let f = sR * phaseR(ct) + V3(repeating: sM * phaseM(ct, atm.g))
+                                let f = sR * phaseR(ct) + sM * phaseM(ct, atm.g)
                                 beta *= f / pdf
                                 x = xn; w = wn
                             }

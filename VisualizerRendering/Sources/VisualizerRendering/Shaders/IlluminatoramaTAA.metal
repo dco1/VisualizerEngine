@@ -101,6 +101,31 @@ static inline float3 clipHistoryToAABB(float3 boxMin, float3 boxMax, float3 hist
 //     current-frame weight up when the velocity is large so disoccluded
 //     pixels reconverge quickly instead of ghosting.
 
+// ── STILL accumulation (host opt-in, Daydream DH-0887) ───────────────────────
+//
+// With the camera frozen (a photo; the settled canvas's converge + refine) every frame is a new
+// sample of the SAME picture, and the resolve's job changes from "reproject and reject ghosts" to
+// "average". The moving-camera resolve below fights that three ways, and each was measured:
+//
+//   · the neighbourhood CLIP pulls the accumulated history back toward THIS frame's noisy 3×3
+//     box every frame, so the average stops converging at a floor set by one frame's noise
+//     (DH-0858: raising its σ floor made the still 2.9× cleaner at 64 frames);
+//   · Catmull-Rom RE-SAMPLING of the history at a jittered UV every frame blurs/sharpens the
+//     accumulation a little each time;
+//   · the display SHARPEN is a high-pass of the CURRENT frame, so the held picture carries 25 %
+//     of the last frame's raw noise — traced sun, portal rays, GI — frozen on screen.
+//
+// Still mode reads the same pixel's history directly, averages with the host's blend
+// (`taaHistoryBlend` = the current frame's weight, e.g. 1/(k+prior)) and no clip, and takes the
+// sharpen from the ACCUMULATION's own neighbourhood. `still = 0` (every existing host) never
+// enters the branch.
+struct TAAStillParams {
+    uint still;    // 1 ⇒ frozen-camera running average
+    uint karis;    // 1 ⇒ keep the Karis 1/(1+Y) weights in still mode (firefly damping, biased)
+    uint _r0;
+    uint _r1;
+};
+
 kernel void illumi_taa_resolve(
     texture2d<half,  access::read>    currentHDR  [[texture(0)]],
     texture2d<half,  access::sample>  historyHDR  [[texture(1)]],
@@ -119,6 +144,7 @@ kernel void illumi_taa_resolve(
     depth2d<float,   access::read>    gPrevDepth  [[texture(5)]],
     texture2d<half,  access::write>   outResolved [[texture(6)]],
     constant FrameUniforms&           frame       [[buffer(0)]],
+    constant TAAStillParams&          still       [[buffer(1)]],
     uint2                             gid         [[thread_position_in_grid]]
 ) {
     uint W = outHistory.get_width();
@@ -132,6 +158,37 @@ kernel void illumi_taa_resolve(
     if (frame.taaEnabled == 0u || frame.taaIsFirstFrame != 0u) {
         outHistory.write(half4(half3(current), 1.0h), gid);
         outResolved.write(half4(half3(current), 1.0h), gid);
+        return;
+    }
+
+    if (still.still != 0u) {
+        float3 hist = float3(historyHDR.read(gid).rgb);
+        float a = saturate(frame.taaHistoryBlend);
+        float3 result;
+        if (still.karis != 0u) {
+            float wC = a         / (1.0 + max(0.0, RGBtoYCoCg(current).x));
+            float wH = (1.0 - a) / (1.0 + max(0.0, RGBtoYCoCg(hist).x));
+            result = (current * wC + hist * wH) / max(1e-6, wC + wH);
+        } else {
+            result = mix(hist, current, a);
+        }
+        result = max(float3(0.0), result);
+        outHistory.write(half4(half3(result), 1.0h), gid);
+        // Acutance from the accumulation's own neighbourhood (last frame's history), clamped
+        // to its range — never from the current noisy frame.
+        float3 rY = RGBtoYCoCg(result);
+        float yMean = 0.0, yMin = 1e30, yMax = -1e30;
+        for (int j = -1; j <= 1; ++j) {
+            for (int i = -1; i <= 1; ++i) {
+                int2 c = clamp(int2(gid) + int2(i, j), int2(0), int2(int(W) - 1, int(H) - 1));
+                float y = RGBtoYCoCg(float3(historyHDR.read(uint2(c)).rgb)).x;
+                yMean += y; yMin = min(yMin, y); yMax = max(yMax, y);
+            }
+        }
+        yMean /= 9.0;
+        float3 sh = rY;
+        sh.x = clamp(rY.x + 0.25 * (rY.x - yMean), min(yMin, rY.x), max(yMax, rY.x));
+        outResolved.write(half4(half3(max(float3(0.0), YCoCgtoRGB(sh))), 1.0h), gid);
         return;
     }
 

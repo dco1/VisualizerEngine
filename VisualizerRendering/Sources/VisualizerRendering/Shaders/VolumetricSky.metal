@@ -224,13 +224,26 @@ struct SkyUniforms {
     float4 nightSkyD;
     // ── Multiple scattering (Params.atmosphereMultipleScattering, VZ-0159) — host-owned ─────
     // x = on (> 0.5; the kernels also need the LUT's ready flag, see `nishitaMSReady`),
-    // y = ground albedo the LUT is built for, zw = unused.
+    // y = ground albedo the LUT is built for, z = spectral bake (Params.atmosphereSpectral, > 0.5),
+// w = unused.
     float4 msParams;
     // ── Artificial skyglow + limiting magnitude (Params.artificialSkyglow…, physical night) ──
     // x = zenith radiance of the skyglow in F0/sr (0 = off — every existing host), y = its
     // horizon-gradient exponent p, z = its colour temperature (K), w = star limiting magnitude
     // (0 = no limit).
     float4 nightSkyE;
+    // ── Aerosols (Params.atmosphereAerosol) — host-owned ────────────────────────────────────
+    // All zero (the default, `NishitaAerosol.builtin`) = the built-in Mie constants below
+    // (kBetaM, kMieH, kMieG): the unchanged kernels read neither. The `…Aerosol` kernel variants
+    // read them as the Mie medium (`NishitaMieAerosol`), in atmospheric science's own terms so any
+    // sampling of the spectrum can evaluate them:
+    // aerosolA: x = τ550 (vertical aerosol optical depth at 550 nm, sea level → space),
+    //           y = Ångström exponent α (τ(λ) = τ550·(λ/550 nm)^−α), z = single-scattering albedo
+    //           ω₀, w = Cornette–Shanks g.
+    // aerosolB: w = scale height H_M (m) of the exponential profile — > 0 marks the aerosol on;
+    //           xyz reserved (0).
+    float4 aerosolA;
+    float4 aerosolB;
     // ── Cloud lighting from the atmosphere — GPU-WRITTEN, never by the host ─────────────────
     // `volSkyCloudLight` fills these from the nishita march itself (the SAME `nishitaScatter`
     // the sky pixels use), so the deck is lit in the sky's own units. The host packs only the
@@ -639,7 +652,9 @@ constant float  kAtmosRadius = 6420e3;   // m (60 km shell)
 constant float  kRayleighH   = 7994.0;   // Rayleigh scale height (m)
 constant float  kMieH        = 1200.0;   // Mie scale height (m)
 constant float3 kBetaR       = float3(5.8e-6, 13.5e-6, 33.1e-6); // Rayleigh β (m⁻¹)
+constant float3 kChannelWavelengths = float3(680.0f, 550.0f, 440.0f);   // nm — the channels kBetaR is quoted at
 constant float3 kBetaM       = float3(21e-6);                    // Mie β (m⁻¹)
+constant float  kMieExtRatio = 1.1f;     // Mie extinction / scattering (single-scattering albedo 1/1.1)
 constant float  kMieG        = 0.76;     // Mie anisotropy (forward bias)
 // Ozone absorption β (m⁻¹), Chappuis band — pure absorption, no scattering. The
 // green/red-heavy cross-section (Hillaire 2020) is what gives a real twilight its
@@ -680,7 +695,79 @@ inline float rayGroundHit(float3 orig, float3 dir, float radius) {
     return (t > 0.0f) ? t : -1.0f;
 }
 
-inline float3 nishitaScatter(float3 rayDir, float3 sunDir, float intensity) {
+// ── The aerosol (Mie) medium: built-in constants or Params.atmosphereAerosol ─────────────────
+//
+// Every nishita function below that touches the Mie term takes a medium `M`, so the aerosol
+// control reaches the single-scatter march, both LUTs, the per-pixel multiple-scattering march,
+// the cloud-lighting prepass (sun through the air, sky fill), the moonlit sky and the in-view
+// pass from ONE set of numbers.
+//
+//   • `NishitaMieBuiltin` IS the constants above (kBetaM grey, ×1.1 extinction, kMieH, kMieG).
+//     Each accessor returns exactly the expression its call site always computed, so a kernel
+//     instantiated with it compiles to the same code as before the control existed — every
+//     existing kernel keeps this medium and stays bit-identical (NishitaAerosolTests pins it).
+//     In the parameters of `NishitaAerosol` it is τ550 = 21e-6·1.1·1200 = 0.0277, Ångström
+//     α = 0 (grey), H_M = 1200 m, single-scattering albedo ω₀ = 1/1.1, g = 0.76.
+//   • `NishitaMieAerosol` carries the host's aerosol from `SkyUniforms.aerosolA/B` (τ550, α, ω₀,
+//     g, H_M): extinction τ550·(λ/550)^−α / H_M at sea level on an exponential profile, evaluated
+//     at the channel wavelengths kBetaR is quoted at (kChannelWavelengths), scattering ω₀ × that.
+//     Only the `…Aerosol` kernel variants instantiate it (a runtime switch in the shared body was
+//     measured to perturb the compiled default kernel's last bits — see volSkyRenderImpl).
+struct NishitaMieBuiltin {
+    typedef float Coef;                                                     // grey: one β
+    float  density(float h) const             { return exp(-h / kMieH); }
+    Coef   scattering(float d) const          { return kBetaM.x * d; }       // σs at density d
+    float3 extinction(float d) const          { return kBetaM * (kMieExtRatio * d); }  // σt at density d
+    float3 extinctionOfColumn(float c) const  { return kBetaM * kMieExtRatio * c; }  // τ of a density column
+    float3 scatteringOfColumn(float3 s) const { return s * kBetaM; }        // Σ (T·density) → σs units
+    float  g() const                          { return kMieG; }
+    // Order-2 phase renormalisation (the aerosol medium's; the built-in LUT keeps its quadrature).
+    float  order2Phase(float p, float norm) const { return p; }
+    bool   renormalisesOrder2() const         { return false; }
+    // The aerosol medium's Mie shape tables (`msMieShape`); the built-in sky keeps its isotropic
+    // Mie last bounce and re-scatter (VZ-0159).
+    bool   buildsMieTable() const             { return false; }
+};
+
+struct NishitaMieAerosol {
+    typedef float3 Coef;                                                    // per channel (Ångström)
+    float3 betaS;   // sea-level scattering, m⁻¹
+    float3 betaE;   // sea-level extinction, m⁻¹
+    float  invH;    // 1 / scale height, m⁻¹
+    float  gCS;     // Cornette–Shanks g
+    float4 pa, pb;  // the host's parameters (SkyUniforms.aerosolA/B), to re-evaluate at other λ
+    NishitaMieAerosol(float4 a, float4 b)
+        : betaS(0.0f), betaE(0.0f), invH(1.0f / max(b.w, 1.0f)), gCS(clamp(a.w, -0.95f, 0.95f)), pa(a), pb(b) {
+        // Ångström: τ(λ) = τ550 (λ/550)^−α; sea-level extinction τ(λ)/H on the exponential profile.
+        betaE = max(a.x, 0.0f) * invH * pow(kChannelWavelengths / 550.0f, float3(-a.y));
+        betaS = saturate(a.z) * betaE;
+    }
+    /// The same aerosol at three other wavelengths `lambda` (nm): a spectral bake's triple
+    /// (`msBandMedium`). Ångström's law carries the aerosol's whole spectral dependence — ω₀ and g
+    /// are grey, as `NishitaAerosol` defines them.
+    NishitaMieAerosol(float4 a, float4 b, float3 lambda)
+        : betaS(0.0f), betaE(0.0f), invH(1.0f / max(b.w, 1.0f)), gCS(clamp(a.w, -0.95f, 0.95f)), pa(a), pb(b) {
+        betaE = max(a.x, 0.0f) * invH * pow(lambda / 550.0f, float3(-a.y));
+        betaS = saturate(a.z) * betaE;
+    }
+    float  density(float h) const             { return exp(-h * invH); }
+    Coef   scattering(float d) const          { return betaS * d; }
+    float3 extinction(float d) const          { return betaE * d; }
+    float3 extinctionOfColumn(float c) const  { return betaE * c; }
+    float3 scatteringOfColumn(float3 s) const { return s * betaS; }
+    float  g() const                          { return gCS; }
+    float  order2Phase(float p, float norm) const { return p * norm; }
+    bool   renormalisesOrder2() const         { return true; }
+    bool   buildsMieTable() const             { return true; }
+};
+
+/// The aerosol medium's uniforms are on (the host packs zeros for the built-in aerosol).
+inline bool nishitaAerosolOn(constant SkyUniforms &u) { return u.aerosolB.w > 0.0f; }
+
+/// The single-scatter march. Its Mie terms come from the medium `m` — every expression is the
+/// one the march always computed, with the medium's accessor where a Mie constant was.
+template <typename M>
+inline float3 nishitaScatter(float3 rayDir, float3 sunDir, float intensity, M m) {
     float3 orig = float3(0.0f, kEarthRadius + 1.0f, 0.0f); // viewer at the pole
     float3 toSun = -sunDir.xyz;                            // sunDir = travel dir
 
@@ -703,16 +790,17 @@ inline float3 nishitaScatter(float3 rayDir, float3 sunDir, float intensity) {
     // Angular (phase) terms depend only on the view–sun angle, not position.
     float mu = dot(rayDir, toSun);
     float phaseR = 3.0f / (16.0f * 3.14159265f) * (1.0f + mu * mu);
-    float g2 = kMieG * kMieG;
+    float gM = m.g();
+    float g2 = gM * gM;
     float phaseM = 3.0f / (8.0f * 3.14159265f)
                  * ((1.0f - g2) * (1.0f + mu * mu))
-                 / ((2.0f + g2) * pow(max(1.0f + g2 - 2.0f * kMieG * mu, 1e-4f), 1.5f));
+                 / ((2.0f + g2) * pow(max(1.0f + g2 - 2.0f * gM * mu, 1e-4f), 1.5f));
 
     for (int i = 0; i < kPrimary; ++i) {
         float3 sp = orig + rayDir * (t + segLen * 0.5f);
         float h = length(sp) - kEarthRadius;
         float hr = exp(-h / kRayleighH) * segLen;
-        float hm = exp(-h / kMieH) * segLen;
+        float hm = m.density(h) * segLen;
         odR += hr;
         odM += hm;
         odO += ozoneDensity(h) * segLen;
@@ -732,16 +820,16 @@ inline float3 nishitaScatter(float3 rayDir, float3 sunDir, float intensity) {
             float hl = length(spl) - kEarthRadius;
             if (hl < 0.0f) break;          // sun ray is occluded by the planet
             odLR += exp(-hl / kRayleighH) * segLenL;
-            odLM += exp(-hl / kMieH) * segLenL;
+            odLM += m.density(hl) * segLenL;
             odLO += ozoneDensity(hl) * segLenL;
             tl += segLenL;
         }
 
         if (j == kLight) {
-            // Combined extinction along view-in + sun-out paths. Mie ×1.1 is
-            // the standard extinction-vs-scattering fudge from the source; ozone
+            // Combined extinction along view-in + sun-out paths. Mie extinction is the medium's
+            // (built-in: ×1.1 its scattering — the source's single-scattering albedo 1/1.1); ozone
             // adds pure absorption (no scattering term, so it only attenuates).
-            float3 tau = kBetaR * (odR + odLR) + kBetaM * 1.1f * (odM + odLM)
+            float3 tau = kBetaR * (odR + odLR) + m.extinctionOfColumn(odM + odLM)
                        + kBetaO * (odO + odLO);
             float3 atten = exp(-tau);
             sumR += atten * hr;
@@ -750,7 +838,72 @@ inline float3 nishitaScatter(float3 rayDir, float3 sunDir, float intensity) {
         t += segLen;
     }
 
-    return intensity * (sumR * kBetaR * phaseR + sumM * kBetaM * phaseM);
+    return intensity * (sumR * kBetaR * phaseR + m.scatteringOfColumn(sumM) * phaseM);
+}
+
+/// The single-scatter march for the AEROSOL medium (every `…Aerosol` kernel's single scatter: the
+/// dome and in-view sky without multiple scattering, the moonlit sky, the deck's sky fill). Same
+/// integrand and the same kPrimary × kLight samples as the built-in march above (which keeps its
+/// discretisation — bit-identical), but placed so a haze layer is resolved:
+///   • view and sun samples crowd toward their start (t ∝ u²) — a grazing view ray is ~900 km
+///     long but its aerosol sits in the first ~30 km, where 16 uniform ~55 km segments put ONE
+///     sample;
+///   • each sample is attenuated by the optical depth to its midpoint (the uniform march adds the
+///     whole segment first — with a dense haze in a 55 km segment that alone is several stops);
+///   • the Earth's shadow is the exact sun-below-local-horizon test, not a sample dipping under.
+/// Against a converged double-precision single scatter (NishitaAerosolTests), the uniform march
+/// put the hazy-suburban horizon 1.5–3 stops dark and 2–3.4 stops too red at noon (urban haze:
+/// −14 stops); this one is within 0.12 stop (hazy, rural; maritime 0.2 with the sun 1° up; sun
+/// +40° … −3°) at the same cost. Urban haze (τ550 0.64) with a low sun stays ~0.5 stop off.
+inline float3 nishitaScatter(float3 rayDir, float3 sunDir, float intensity, NishitaMieAerosol m) {
+    float3 orig = float3(0.0f, kEarthRadius + 1.0f, 0.0f); // viewer at the pole
+    float3 toSun = -sunDir.xyz;                            // sunDir = travel dir
+    float tShell = raySphereExit(orig, rayDir, kAtmosRadius);
+    if (tShell <= 0.0f) return float3(0.0f);
+    float tGround = rayGroundHit(orig, rayDir, kEarthRadius);
+    float tMax = (tGround > 0.0f) ? min(tShell, tGround) : tShell;
+
+    float mu = dot(rayDir, toSun);
+    float phaseR = 3.0f / (16.0f * 3.14159265f) * (1.0f + mu * mu);
+    float gM = m.g();
+    float g2 = gM * gM;
+    float phaseM = 3.0f / (8.0f * 3.14159265f)
+                 * ((1.0f - g2) * (1.0f + mu * mu))
+                 / ((2.0f + g2) * pow(max(1.0f + g2 - 2.0f * gM * mu, 1e-4f), 1.5f));
+
+    float3 od = float3(0.0f);          // view-ray columns: Rayleigh, aerosol, ozone density × m
+    float3 sumR = float3(0.0f), sumM = float3(0.0f);
+    float tPrev = 0.0f;
+    for (int i = 0; i < kPrimary; ++i) {
+        float u = float(i + 1) / float(kPrimary);
+        float t = tMax * u * u;
+        float seg = t - tPrev;
+        float3 sp = orig + rayDir * (0.5f * (tPrev + t));
+        tPrev = t;
+        float r = length(sp);
+        float h = r - kEarthRadius;
+        float3 dens = float3(exp(-h / kRayleighH), m.density(h), ozoneDensity(h));
+        float3 odAt = od + dens * (0.5f * seg);
+        od += dens * seg;
+        // The planet's shadow: the sun below this sample's geometric horizon.
+        if (dot(sp, toSun) / r < -sqrt(max(h * (2.0f * kEarthRadius + h), 0.0f)) / r) continue;
+        float tLight = raySphereExit(sp, toSun, kAtmosRadius);
+        float3 odL = float3(0.0f);
+        float lPrev = 0.0f;
+        for (int j = 0; j < kLight; ++j) {
+            float v = float(j + 1) / float(kLight);
+            float tl = tLight * v * v;
+            float hl = max(length(sp + toSun * (0.5f * (lPrev + tl))) - kEarthRadius, 0.0f);
+            odL += float3(exp(-hl / kRayleighH), m.density(hl), ozoneDensity(hl)) * (tl - lPrev);
+            lPrev = tl;
+        }
+        float3 tau = kBetaR * (odAt.x + odL.x) + m.extinctionOfColumn(odAt.y + odL.y)
+                   + kBetaO * (odAt.z + odL.z);
+        float3 atten = exp(-tau);
+        sumR += atten * (dens.x * seg);
+        sumM += atten * (dens.y * seg);
+    }
+    return intensity * (sumR * kBetaR * phaseR + m.scatteringOfColumn(sumM) * phaseM);
 }
 
 // Wrapper matching atmosphereColor()'s role: physical sky above the horizon,
@@ -861,7 +1014,8 @@ inline float3 nightAirglowAndZodiacal(float3 g, float3 rayDir, constant SkyUnifo
     return g;
 }
 
-inline float3 nightSkyGlow(float3 rayDir, constant SkyUniforms &u) {
+template <typename M>
+inline float3 nightSkyGlow(float3 rayDir, constant SkyUniforms &u, M m) {
     float rad = u.nightSkyB.z;
     if (u.nightSkyA.x < 0.5f || rad <= 0.0f || u.nightParams.w <= 0.0f) return float3(0.0f);
     float sinEl = max(rayDir.y, 0.0f);
@@ -877,7 +1031,7 @@ inline float3 nightSkyGlow(float3 rayDir, constant SkyUniforms &u) {
         // multiple-scattering path (`nishitaScatterMS`) sums the two lights instead.
         float w = smoothstep(0.10f, 0.17f, u.sunDir.y);
         if (moonD.y > -0.3f && w > 0.0f)
-            g += nishitaScatter(rayDir, -moonD, 1.0f) * (w * kFullMoonSkyF0 * rad * flux / kNishitaZenithRef);
+            g += nishitaScatter(rayDir, -moonD, 1.0f, m) * (w * kFullMoonSkyF0 * rad * flux / kNishitaZenithRef);
     }
     return nightAirglowAndZodiacal(g, rayDir, u, rad, sinEl);
 }
@@ -909,8 +1063,11 @@ inline float3 nightSkyGlow(float3 rayDir, constant SkyUniforms &u) {
 //   • The first scatter (order 2) uses the true Rayleigh + Mie phase, not isotropic; and the
 //     field's QUADRUPOLE is stored beside Ψ so the last scatter toward the camera uses the exact
 //     Rayleigh phase (P0 + ½P2: forward/back-scatter 1.5×, 90° 0.75× — isotropic was the rest of
-//     Hillaire's error). Mie's last scatter stays isotropic (a lobe cannot hold the bimodal
-//     twilight field; measured best).
+//     Hillaire's error). The built-in medium's Mie last scatter stays isotropic (a lobe cannot
+//     hold the bimodal twilight field; measured best). The aerosol medium (NishitaMieAerosol,
+//     where haze makes Mie matter) instead reads the field's Mie SHAPE from tables built from the
+//     field's own directions — for the last scatter and for the re-scatter of orders ≥ 3
+//     (msMieShape): within 0.15 stop of the reference at τ550 0.2–0.4, sun +79° … −6°.
 //   • The atmosphere top is 100 km on this path (kMSAtmosRadius): the 60 km shell's shadow
 //     height passes its top at −7.8°, a 100 km top at −10.1° — twilight that the real mesosphere
 //     does produce. The 60–100 km air is 0.06 % of the column: the day sky does not see it.
@@ -954,6 +1111,30 @@ constant constexpr int kLUTAccA     = kLUTLnPsiB + kMSLutTexels;            // �
 constant constexpr int kLUTAccB     = kLUTAccA + kMSLutTexels;              // Σ Q_ss, Σ Q_us
 constant constexpr int kLUTAccF     = kLUTAccB + kMSLutTexels;              // f_ms.rgb of the last order
 constant constexpr int kLUTLength   = kLUTAccF + kMSLutTexels;
+// The aerosol medium's Mie shape tables (`msMieShape`), after the built-in region: per Ψ column
+// (64 cos-sun-zenith) × every other Ψ row (16 altitudes), the field's Mie-weighted radiance over
+// its mean, ĵ(v) = ∫p(v·ω)L(ω)dω / Ψ, toward kJEl × kJAz view directions — rgb as half4 (ĵ is a
+// ratio, O(0.01…100)), two per float4 — 1.15 MB each. Two tables, ping-ponged by the order
+// passes (each reads the running shape of the orders before it for its own re-scatter while it
+// writes its own); the last order leaves the final one in A.
+constant constexpr int kJH          = kMSLutH / 2;
+constant constexpr int kJEl         = 14;     // view elevation: sin(el) = u|u|, u node-aligned −1…1
+constant constexpr int kJAz         = 10;     // view azimuth from the sun's: 0…180°, node-aligned
+constant constexpr int kJViews      = kJEl * kJAz;
+constant constexpr int kJSize       = kMSLutW * kJH * kJViews / 2;   // float4s per table
+constant constexpr int kLUTJ        = kLUTLength;          // A: odd orders, then the final table
+constant constexpr int kLUTJB       = kLUTJ + kJSize;      // B: even orders
+constant constexpr int kLUTLengthAerosol = kLUTJB + kJSize;
+static_assert((kMSLastOrder & 1) == 1, "the last order must write the Mie shape to table A");
+static_assert((kJViews & 1) == 0, "two half4 views per float4");
+
+inline device const half4* msJTable(device const float4* lut, int base) {
+    return reinterpret_cast<device const half4*>(lut + base);
+}
+inline device half4* msJTableW(device float4* lut, int base) {
+    return reinterpret_cast<device half4*>(lut + base);
+}
+inline half4 msJPack(float3 j) { return half4(half3(clamp(j, float3(0.0f), float3(65504.0f))), 0.0h); }
 
 // ── Spectral bake (opt-in: Params.atmosphereSpectral → msParams.z; fix for the magenta twilight) ──
 //
@@ -969,13 +1150,22 @@ constant constexpr int kLUTLength   = kLUTAccF + kMSLutTexels;
 // magenta, spectral (0.47, 0.60, 1.00) blue; sun 48°: within 4 % per channel.
 //
 // With the flag the SAME march runs at 12 wavelengths (380–720 nm in 28.3 nm bins, four triples:
-// every LUT exists once per triple) and each triple's radiance is converted to linear sRGB by a
-// 3×3 of its bins' ∫ CIE 1931 CMF × solar spectrum (Bruneton's table), white-balanced so the sun
-// above the atmosphere is (1, 1, 1) — the 3-wavelength path's convention, so `atmosphereIntensity`
-// keeps its meaning. β_R = 1.24062e-6 · λ[µm]⁻⁴ (the kBetaR fit), β_O = Bruneton's ozone cross
-// section (bin mean) × 300 DU in the same 15 km tent. 12 samples match the 35-sample reference
-// within 1–4 % in channel ratios from sun +48° to −7°.
+// the LUTs the render reads exist once per triple) and each triple's radiance is converted to
+// linear sRGB by a 3×3 of its bins' ∫ CIE 1931 CMF × solar spectrum (Bruneton's table),
+// white-balanced so the sun above the atmosphere is (1, 1, 1) — the 3-wavelength path's
+// convention, so `atmosphereIntensity` keeps its meaning. β_R = 1.24062e-6 · λ[µm]⁻⁴ (the kBetaR
+// fit), β_O = Bruneton's ozone cross section (bin mean) × 300 DU in the same 15 km tent. 12
+// samples match the 35-sample reference within 1–4 % in channel ratios from sun +48° to −7°.
+//
+// The aerosol takes part at the same wavelengths: the built-in Mie medium is grey (the same β at
+// every λ); the host's aerosol (`NishitaMieAerosol`) is re-evaluated per triple at the bin
+// centres through its Ångström law (`msBandMedium`) — so its extinction and scattering, its
+// transmittance and multiple-scattering LUTs and its Mie shape table are all per wavelength,
+// exactly as the 3-wavelength path evaluates it at 680 / 550 / 440 nm.
 constant constexpr int kSpecBands = 4;
+constant float3 kSpecLambda[kSpecBands] = {                        // nm — the bins' centres
+    float3(394.1667f, 422.5f, 450.8333f), float3(479.1667f, 507.5f, 535.8333f),
+    float3(564.1667f, 592.5f, 620.8333f), float3(649.1667f, 677.5f, 705.8333f) };
 constant float3 kSpecBetaR[kSpecBands] = {
     float3(5.1395e-05, 3.8934e-05, 3.0031e-05),   // 394, 422, 451 nm
     float3(2.3534e-05, 1.8702e-05, 1.5049e-05),   // 479, 507, 536
@@ -993,27 +1183,54 @@ constant float3x3 kSpecToRGB[kSpecBands] = {
     float3x3(float3(-0.077427, 0.056624, 0.286298), float3(-0.183751, 0.237692, 0.032761), float3(-0.160448, 0.405376, -0.038132)),
     float3x3(float3(0.170906, 0.326844, -0.044765), float3(0.506805, 0.100838, -0.024563), float3(0.468394, -0.025277, -0.007598)),
     float3x3(float3(0.179585, -0.018066, -0.001843), float3(0.027025, -0.001122, -0.000481), float3(0.001689, 0.000429, -0.000094)) };
-/// Float4s one band's LUTs occupy (everything but the shared header); band b's tables start
-/// b × this after the legacy offsets.
-constant constexpr int kLUTBandStride = kLUTLength - 1;
+// Band 0 lives in the region above, at the legacy offsets. Bands 1…3 each add only the tables the
+// render reads — transmittance, Ψ (+ quadrupole) and the aerosol's final Mie shape (A) — after
+// it; the build's scratch (ln Ψₙ ping-pong, the accumulators, Mie shape B) is shared, the bands
+// being built one after another (each stage is its own encoder on one command buffer).
+constant constexpr int kLUTSpecTrans    = 0;                                    // within a band
+constant constexpr int kLUTSpecMS       = kLUTSpecTrans + kMSTransW * kMSTransH;
+constant constexpr int kLUTSpecJ        = kLUTSpecMS + 2 * kMSLutTexels;
+constant constexpr int kLUTSpecBandSize = kLUTSpecJ + kJSize;
+constant constexpr int kLUTSpecExtra    = kLUTLengthAerosol;                    // band 1's base
+constant constexpr int kLUTRegionLength = kLUTSpecExtra + (kSpecBands - 1) * kLUTSpecBandSize;
 
-/// The scattering coefficients and LUT offset a march uses: the legacy 3-wavelength set (band 0
-/// of a non-spectral build, which is exactly the original constants and offsets) or spectral
-/// triple `b`.
-struct MSBand { float3 bR; float3 bO; int base; };
+/// The scattering coefficients, wavelengths and per-band table offsets a march or build uses: the
+/// legacy 3-wavelength set (a non-spectral build: exactly the original constants and offsets) or
+/// spectral triple `b`.
+struct MSBand {
+    float3 bR, bO;    // Rayleigh scattering, ozone absorption (m⁻¹)
+    float3 lambda;    // nm
+    int trans, ms, j; // table offsets: transmittance, Ψ, Mie shape A
+    bool spectral;
+};
 inline MSBand msBand(int b, bool spectral) {
     MSBand m;
-    if (spectral) { m.bR = kSpecBetaR[b]; m.bO = kSpecBetaO[b]; m.base = b * kLUTBandStride; }
-    else          { m.bR = kBetaR;        m.bO = kBetaO;        m.base = 0; }
+    if (spectral) { m.bR = kSpecBetaR[b]; m.bO = kSpecBetaO[b]; m.lambda = kSpecLambda[b]; }
+    else          { m.bR = kBetaR;        m.bO = kBetaO;        m.lambda = kChannelWavelengths; }
+    m.spectral = spectral;
+    if (spectral && b > 0) {
+        int o = kLUTSpecExtra + (b - 1) * kLUTSpecBandSize;
+        m.trans = o + kLUTSpecTrans; m.ms = o + kLUTSpecMS; m.j = o + kLUTSpecJ;
+    } else {
+        m.trans = kLUTTrans; m.ms = kLUTMS; m.j = kLUTJ;
+    }
     return m;
 }
 inline bool msSpectral(constant SkyUniforms &u) { return u.msParams.z > 0.5f; }
+/// The Mie medium at a band's wavelengths: the built-in aerosol is grey; the host's is re-evaluated
+/// through its Ångström law — and returned untouched off the spectral path (bit-identical).
+inline NishitaMieBuiltin msBandMedium(NishitaMieBuiltin m, MSBand bd) { return m; }
+inline NishitaMieAerosol msBandMedium(NishitaMieAerosol m, MSBand bd) {
+    return bd.spectral ? NishitaMieAerosol(m.pa, m.pb, bd.lambda) : m;
+}
 
 inline float msRayleighPhase(float mu) { return 3.0f / (16.0f * M_PI_F) * (1.0f + mu * mu); }
-inline float msMiePhase(float mu) {
-    float g2 = kMieG * kMieG;
+template <typename M>
+inline float msMiePhase(M m, float mu) {
+    float gM = m.g();
+    float g2 = gM * gM;
     return 3.0f / (8.0f * M_PI_F) * ((1.0f - g2) * (1.0f + mu * mu))
-         / ((2.0f + g2) * pow(max(1.0f + g2 - 2.0f * kMieG * mu, 1e-4f), 1.5f));
+         / ((2.0f + g2) * pow(max(1.0f + g2 - 2.0f * gM * mu, 1e-4f), 1.5f));
 }
 
 /// ∫₀^dt e^(−σt·s) ds per channel — (1 − e^(−x))/σt, with its series where x is too small for
@@ -1033,7 +1250,7 @@ inline float msDistToTop(float r, float mu) {
 
 /// Optical depth to the top from (r, μ) — bilinear in the transmittance LUT (rays that clear
 /// the planet only; `msSunTransmittance` tests the shadow first).
-inline float3 msOpticalDepth(device const float4* lut, float r, float mu, int band) {
+inline float3 msOpticalDepth(device const float4* lut, float r, float mu, int trans) {
     const float Hh = sqrt((kMSAtmosRadius - kEarthRadius) * (kMSAtmosRadius + kEarthRadius));
     float h = max(r - kEarthRadius, 0.0f);
     float rho = sqrt(h * (r + kEarthRadius));
@@ -1043,27 +1260,54 @@ inline float3 msOpticalDepth(device const float4* lut, float r, float mu, int ba
     float fy = saturate(rho / Hh) * float(kMSTransH - 1);
     int ix = min(int(fx), kMSTransW - 2), iy = min(int(fy), kMSTransH - 2);
     float ax = fx - float(ix), ay = fy - float(iy);
-    device const float4* t = lut + band + kLUTTrans + iy * kMSTransW + ix;
+    device const float4* t = lut + trans + iy * kMSTransW + ix;
     return mix(mix(t[0].xyz, t[1].xyz, ax), mix(t[kMSTransW].xyz, t[kMSTransW + 1].xyz, ax), ay);
 }
 
 /// Direct light (sun or moon) reaching radius r where the light's zenith cosine is μ: 0 when
 /// the ray toward it meets the planet (the Earth's shadow), else exp(−τ).
-inline float3 msSunTransmittance(device const float4* lut, float r, float mu, int band = 0) {
+inline float3 msSunTransmittance(device const float4* lut, float r, float mu, int trans = kLUTTrans) {
     if (mu < 0.0f && r * sqrt(max(1.0f - mu * mu, 0.0f)) < kEarthRadius) return float3(0.0f);
-    return exp(-msOpticalDepth(lut, min(r, kMSAtmosRadius), mu, band));
+    return exp(-msOpticalDepth(lut, min(r, kMSAtmosRadius), mu, trans));
 }
 
-inline float2 msLutCoord(float h, float mus) {
+/// The Ψ LUT's altitude axis, per medium. Built in: linear from 1 m to 100 km (3.2 km a row —
+/// the built-in 1.2 km aerosol is a small part of the field). Aerosol: quadratic (row n at
+/// 100 km·(n/31)²: 0.1, 0.4, 0.9, 1.7, 2.6 km …), so a hazy boundary layer — where the field
+/// changes most, lit from above and dimmed by the haze itself — spans five rows instead of none.
+inline float msLutAltitudeFraction(NishitaMieBuiltin m, float h) {
+    return saturate((h - kMSHeightOffset) / (kMSAtmosRadius - kEarthRadius - kMSHeightOffset));
+}
+inline float msLutAltitudeFraction(NishitaMieAerosol m, float h) {
+    return sqrt(saturate((h - kMSHeightOffset) / (kMSAtmosRadius - kEarthRadius - kMSHeightOffset)));
+}
+/// The transmittance LUT's march, per medium: the built-in 40 steps, and 4× that for an aerosol —
+/// a 1.5 km haze layer on a 6° sun path is crossed in the first ~15 km of ~600, where 40 midpoint
+/// steps miss 5 % of its optical depth (τ ≈ 3.8 at τ550 0.4: +0.27 stops of direct sun); 160 keep
+/// it under 0.5 %.
+inline int msTransmittanceSteps(NishitaMieBuiltin m) { return kMSTransSteps; }
+inline int msTransmittanceSteps(NishitaMieAerosol m) { return 4 * kMSTransSteps; }
+
+inline float msLutRowAltitude(NishitaMieBuiltin m, uint row) {
+    return kMSHeightOffset + (kMSAtmosRadius - kEarthRadius - kMSHeightOffset) * float(row) / float(kMSLutH - 1);
+}
+inline float msLutRowAltitude(NishitaMieAerosol m, uint row) {
+    float y = float(row) / float(kMSLutH - 1);
+    return kMSHeightOffset + (kMSAtmosRadius - kEarthRadius - kMSHeightOffset) * (y * y);
+}
+
+template <typename M>
+inline float2 msLutCoord(M m, float h, float mus) {
     return float2((clamp(mus, -1.0f, 1.0f) + 1.0f) * 0.5f * float(kMSLutW - 1),
-                  saturate((h - kMSHeightOffset) / (kMSAtmosRadius - kEarthRadius - kMSHeightOffset))
+                  msLutAltitudeFraction(m, h)
                   * float(kMSLutH - 1));
 }
 
 /// ln Ψ from one of the build's scratch tables (log-bilinear: Ψ falls by decades per texel near
 /// the terminator, which linear interpolation would overshoot).
-inline float3 msScratchPsi(device const float4* lut, int base, float h, float mus) {
-    float2 f = msLutCoord(h, mus);
+template <typename M>
+inline float3 msScratchPsi(M m, device const float4* lut, int base, float h, float mus) {
+    float2 f = msLutCoord(m, h, mus);
     int ix = min(int(f.x), kMSLutW - 2), iy = min(int(f.y), kMSLutH - 2);
     float ax = f.x - float(ix), ay = f.y - float(iy);
     device const float4* t = lut + base + iy * kMSLutW + ix;
@@ -1074,18 +1318,19 @@ struct MSField {
     float3 psi;   // mean incoming radiance of orders ≥ 2 per unit irradiance
     float3 q;     // its quadrupole (Q_uu, Q_ss, Q_us) in the local (up, sun-horizontal) frame
 };
-inline MSField msField(device const float4* lut, float h, float mus, int band = 0) {
-    float2 f = msLutCoord(h, mus);
+template <typename M>
+inline MSField msField(M m, device const float4* lut, float h, float mus, int msBase = kLUTMS) {
+    float2 f = msLutCoord(m, h, mus);
     int ix = min(int(f.x), kMSLutW - 2), iy = min(int(f.y), kMSLutH - 2);
     float ax = f.x - float(ix), ay = f.y - float(iy);
-    device const float4* t = lut + band + kLUTMS + 2 * (iy * kMSLutW + ix);
+    device const float4* t = lut + msBase + 2 * (iy * kMSLutW + ix);
     const int row = 2 * kMSLutW;
     float4 a = mix(mix(t[0], t[2], ax), mix(t[row], t[row + 2], ax), ay);
     float4 b = mix(mix(t[1], t[3], ax), mix(t[row + 1], t[row + 3], ax), ay);
-    MSField m;
-    m.psi = exp(a.xyz);
-    m.q = float3(a.w, b.x, b.y);
-    return m;
+    MSField field;
+    field.psi = exp(a.xyz);
+    field.q = float3(a.w, b.x, b.y);
+    return field;
 }
 
 /// The LUTs are usable: the host turned the path on AND the build has run (header ready).
@@ -1093,15 +1338,97 @@ inline bool nishitaMSReady(constant SkyUniforms &u, device const float4* lut, bo
     return u.msParams.x > 0.5f && lutBound && lut[kLUTHeader].x > 0.5f;
 }
 
+/// The Mie table's view direction (j, k) in a texel's local frame: x = toward the sun's azimuth,
+/// y = up, z = across (the field is mirror-symmetric in z).
+inline float3 msJView(int j, int k) {
+    float u = -1.0f + 2.0f * float(j) / float(kJEl - 1);
+    float z = u * abs(u);
+    float phi = M_PI_F * float(k) / float(kJAz - 1);
+    float r = sqrt(max(1.0f - z * z, 0.0f));
+    return float3(r * cos(phi), z, r * sin(phi));
+}
+
+/// The Mie LAST bounce of the multiply-scattered field toward a viewer looking along v (local
+/// components vu = up, vs = toward the sun's azimuth, vb² = across): σM·Ψ·ĵ(v), ĵ = the field's
+/// Mie-weighted radiance over its mean — read from the shape table the aerosol medium builds from
+/// the field's own 256 directions per texel (4-D bilinear: sun zenith, altitude, view elevation
+/// and azimuth — `msMieShape`). The built-in sky keeps its isotropic Mie bounce (ĵ ≡ 1).
+///
+/// Why a table: with haze the field near the ground is concentrated toward the bright sunward sky
+/// (the aureole by day, the twilight arch after sunset), and aerosol scatters it FORWARD — into a
+/// viewer looking at that sky, 5–20× the isotropic share. Against the path-traced reference
+/// (NishitaAerosolTests), an isotropic bounce left the sunward sky 0.5–0.9 stops dark; the
+/// field's dipole + quadrupole (l ≤ 2) still 0.3–0.7 at twilight, the arch being narrower than
+/// l ≤ 2 can hold; the table on the last bounce alone 0.2–0.4 — the rest was the orders ≥ 3
+/// re-scattering isotropically (`msMieRescatter` now reads the same tables). Both: within 0.15.
+inline float msMieFieldScatter(NishitaMieBuiltin m, float sM, device const float4* lut, float h, float mus,
+                               float vu, float vs, float vb2, int jBase) {
+    return sM;
+}
+inline float3 msMieShape(NishitaMieAerosol m, device const float4* lut, int base, float h, float mus,
+                         float vu, float vs, float vb2) {
+    float fm = clamp((clamp(mus, -1.0f, 1.0f) + 1.0f) * 0.5f * float(kMSLutW - 1), 0.0f, float(kMSLutW - 1));
+    float fh = clamp(msLutAltitudeFraction(m, h) * float(kMSLutH - 1) * 0.5f, 0.0f, float(kJH - 1));
+    float uj = sign(vu) * sqrt(abs(vu));
+    float fj = clamp((uj + 1.0f) * 0.5f * float(kJEl - 1), 0.0f, float(kJEl - 1));
+    float fk = clamp(atan2(sqrt(max(vb2, 0.0f)), vs) / M_PI_F * float(kJAz - 1), 0.0f, float(kJAz - 1));
+    int im = min(int(fm), kMSLutW - 2), ih = min(int(fh), kJH - 2), ij = min(int(fj), kJEl - 2), ik = min(int(fk), kJAz - 2);
+    float am = fm - float(im), ah = fh - float(ih), aj = fj - float(ij), ak = fk - float(ik);
+    float3 j = float3(0.0f);
+    for (int c = 0; c < 4; ++c) {
+        int dm = c & 1, dh = c >> 1;
+        float wc = (dm ? am : 1.0f - am) * (dh ? ah : 1.0f - ah);
+        device const half4* t = msJTable(lut, base) + ((ih + dh) * kMSLutW + (im + dm)) * kJViews + ij * kJAz + ik;
+        float3 v = mix(mix(float3(t[0].xyz), float3(t[1].xyz), ak),
+                       mix(float3(t[kJAz].xyz), float3(t[kJAz + 1].xyz), ak), aj);
+        j += wc * v;
+    }
+    return max(j, float3(0.0f));
+}
+inline float3 msMieFieldScatter(NishitaMieAerosol m, float3 sM, device const float4* lut, float h, float mus,
+                                float vu, float vs, float vb2, int jBase) {
+    // Only where the aerosol is: above ~5 scale heights (density < 1 %: under 1 % of the column,
+    // whose field is the lit air below it) the isotropic bounce, blended over a factor of 2 in
+    // density — half the per-pixel lookups, no measurable change against the reference.
+    float wj = smoothstep(0.005f, 0.01f, m.density(h));
+    if (wj <= 0.0f) return sM;
+    return sM * mix(float3(1.0f), msMieShape(m, lut, jBase, h, mus, vu, vs, vb2), wj);
+}
+
+/// Orders ≥ 3, the re-scatter at a point p (up p/r, sun cosine μs) of an order ray looking along
+/// w: the built-in medium scatters Ψₙ₋₁ isotropically (σM); the aerosol medium through the Mie
+/// shape of the orders before (table `base`) — the forward lobe that carries the bright sunward
+/// field on toward a viewer looking into it, which an isotropic re-scatter spreads over the sphere.
+/// (Order 3 reads order 2's own shape; orders 4–5 the running shape of 2…n−1 — the exact
+/// per-order shapes, in a third table, measured no closer to the reference.)
+inline float msMieRescatter(NishitaMieBuiltin m, float sM, device const float4* lut, int base, float3 p,
+                            float r, float h, float mus, float3 w, float3 s) {
+    return sM;
+}
+inline float3 msMieRescatter(NishitaMieAerosol m, float3 sM, device const float4* lut, int base, float3 p,
+                             float r, float h, float mus, float3 w, float3 s) {
+    float3 up = p / r;
+    float3 sh = s - up * mus;
+    float shl = length(sh);
+    sh = (shl > 1e-6f) ? sh / shl : float3(0.0f);
+    float vu = dot(w, up), vs = dot(w, sh);
+    return sM * msMieShape(m, lut, base, h, mus, vu, vs, max(1.0f - vu * vu - vs * vs, 0.0f));
+}
+
 /// In-scattered radiance toward the camera (per unit irradiance of the light toward `toL`) at a
 /// march sample: the single scatter with the true phase, planet-shadowed; plus orders ≥ 2 —
-/// Rayleigh through its exact P0 + ½P2 phase against the field's quadrupole, Mie isotropic.
+/// Rayleigh through its exact P0 + ½P2 phase against the field's quadrupole, Mie isotropic
+/// (built-in medium) or through the field's Mie shape (aerosol medium).
+/// `M` = the Mie medium (grey `float` coefficients built in; per-channel `float3` aerosol, whose Mie
+/// last bounce reads the field's own angular distribution: `msMieFieldScatter`). `bd` = the band
+/// whose tables it reads.
+template <typename M>
 inline float3 msInscatter(device const float4* lut, float3 p, float r, float h, float3 v, float3 toL,
-                          float3 sR, float sM, float pR, float pM, int band = 0) {
+                          float3 sR, typename M::Coef sM, float pR, float pM, M m, MSBand bd) {
     float3 up = p / r;
     float mus = dot(up, toL);
-    float3 Tl = msSunTransmittance(lut, r, mus, band);
-    MSField f = msField(lut, h, mus, band);
+    float3 Tl = msSunTransmittance(lut, r, mus, bd.trans);
+    MSField f = msField(m, lut, h, mus, bd.ms);
     float3 sh = toL - up * mus;
     float shl = length(sh);
     sh = (shl > 1e-6f) ? sh / shl : float3(0.0f);
@@ -1109,22 +1436,24 @@ inline float3 msInscatter(device const float4* lut, float3 p, float r, float h, 
     float vb2 = max(1.0f - vu * vu - vs * vs, 0.0f);
     float vqv = f.q.x * vu * vu + f.q.y * vs * vs - (f.q.x + f.q.y) * vb2 + 2.0f * f.q.z * vu * vs;
     float jr = max(1.0f + 0.5f * vqv, 0.0f);
-    return (sR * pR + sM * pM) * Tl + f.psi * (sR * jr + sM);
+    return (sR * pR + sM * pM) * Tl + f.psi * (sR * jr + msMieFieldScatter(m, sM, lut, h, mus, vu, vs, vb2, bd.j));
 }
 
 /// The multiply-scattered sky along `rayDir` from the viewer (1 m up at the pole): ONE march for
 /// the sun AND the moon — each light's single scatter + orders ≥ 2 — so the two sum as light
 /// does (no cross-fade window, no dip at the hand-off). `moonI` = 0 skips the moon's lookups.
+/// `m` = the Mie medium the LUTs were built with, at `bd`'s wavelengths (`msBandMedium`).
+template <typename M>
 inline float3 nishitaScatterMSBand(float3 rayDir, float3 toSun, float sunI, float3 toMoon, float moonI,
-                                   device const float4* lut, MSBand bd) {
+                                   device const float4* lut, M m, MSBand bd) {
     float3 orig = float3(0.0f, kEarthRadius + kMSHeightOffset, 0.0f);
     float tTop = raySphereExit(orig, rayDir, kMSAtmosRadius);
     if (tTop <= 0.0f) return float3(0.0f);
     float tGround = rayGroundHit(orig, rayDir, kEarthRadius);
     float tMax = (tGround > 0.0f) ? min(tTop, tGround) : tTop;
     float muS = dot(rayDir, toSun), muM = dot(rayDir, toMoon);
-    float pRS = msRayleighPhase(muS), pMS = msMiePhase(muS);
-    float pRM = msRayleighPhase(muM), pMM = msMiePhase(muM);
+    float pRS = msRayleighPhase(muS), pMS = msMiePhase(m, muS);
+    float pRM = msRayleighPhase(muM), pMM = msMiePhase(m, muM);
     float3 T = float3(1.0f);
     float3 L = float3(0.0f);
     float tPrev = 0.0f;
@@ -1136,14 +1465,14 @@ inline float3 nishitaScatterMSBand(float3 rayDir, float3 toSun, float sunI, floa
         float3 p = orig + rayDir * (tPrev + 0.5f * dt);
         float r = length(p);
         float h = r - kEarthRadius;
-        float dM = exp(-h / kMieH);
+        float dM = m.density(h);
         float3 sR = bd.bR * exp(-h / kRayleighH);
-        float sM = kBetaM.x * dM;
-        float3 sT = sR + kBetaM * (1.1f * dM) + bd.bO * ozoneDensity(h);
+        typename M::Coef sM = m.scattering(dM);
+        float3 sT = sR + m.extinction(dM) + bd.bO * ozoneDensity(h);
         float3 Tseg = exp(-sT * dt);
         float3 w = T * msSegmentIntegral(sT, dt, Tseg);
-        float3 S = sunI * msInscatter(lut, p, r, h, rayDir, toSun, sR, sM, pRS, pMS, bd.base);
-        if (moonI > 0.0f) S += moonI * msInscatter(lut, p, r, h, rayDir, toMoon, sR, sM, pRM, pMM, bd.base);
+        float3 S = sunI * msInscatter(lut, p, r, h, rayDir, toSun, sR, sM, pRS, pMS, m, bd);
+        if (moonI > 0.0f) S += moonI * msInscatter(lut, p, r, h, rayDir, toMoon, sR, sM, pRM, pMM, m, bd);
         L += w * S;
         T *= Tseg;
         tPrev = t;
@@ -1152,28 +1481,32 @@ inline float3 nishitaScatterMSBand(float3 rayDir, float3 toSun, float sunI, floa
 }
 
 /// `nishitaScatterMSBand` in linear sRGB: the legacy 3-wavelength march, or (spectral) the four
-/// triples each converted through its CMF matrix.
+/// triples — each with the medium at its own wavelengths — converted through their CMF matrices.
+template <typename M>
 inline float3 nishitaScatterMS(float3 rayDir, float3 toSun, float sunI, float3 toMoon, float moonI,
-                               device const float4* lut, bool spectral = false) {
-    if (!spectral) return nishitaScatterMSBand(rayDir, toSun, sunI, toMoon, moonI, lut, msBand(0, false));
+                               device const float4* lut, M m, bool spectral = false) {
+    if (!spectral) return nishitaScatterMSBand(rayDir, toSun, sunI, toMoon, moonI, lut, m, msBand(0, false));
     float3 s = float3(0.0f);
-    for (int b = 0; b < kSpecBands; ++b)
-        s += kSpecToRGB[b] * nishitaScatterMSBand(rayDir, toSun, sunI, toMoon, moonI, lut, msBand(b, true));
+    for (int b = 0; b < kSpecBands; ++b) {
+        MSBand bd = msBand(b, true);
+        s += kSpecToRGB[b] * nishitaScatterMSBand(rayDir, toSun, sunI, toMoon, moonI, lut, msBandMedium(m, bd), bd);
+    }
     return max(s, 0.0f);
 }
 /// Direct light's transmittance in linear sRGB (the sun's colour through the air).
 inline float3 msSunTransmittanceRGB(device const float4* lut, float r, float mu, bool spectral) {
     if (!spectral) return msSunTransmittance(lut, r, mu);
     float3 t = float3(0.0f);
-    for (int b = 0; b < kSpecBands; ++b) t += kSpecToRGB[b] * msSunTransmittance(lut, r, mu, b * kLUTBandStride);
+    for (int b = 0; b < kSpecBands; ++b) t += kSpecToRGB[b] * msSunTransmittance(lut, r, mu, msBand(b, true).trans);
     return max(t, 0.0f);
 }
 /// Luma of the multiply-scattered field Ψ at (h, μs), in linear sRGB.
-inline float msFieldPsiLuma(device const float4* lut, float h, float mus, bool spectral) {
+template <typename M>
+inline float msFieldPsiLuma(M m, device const float4* lut, float h, float mus, bool spectral) {
     const float3 kLuma = float3(0.2126f, 0.7152f, 0.0722f);
-    if (!spectral) return dot(msField(lut, h, mus).psi, kLuma);
+    if (!spectral) return dot(msField(m, lut, h, mus).psi, kLuma);
     float3 p = float3(0.0f);
-    for (int b = 0; b < kSpecBands; ++b) p += kSpecToRGB[b] * msField(lut, h, mus, b * kLUTBandStride).psi;
+    for (int b = 0; b < kSpecBands; ++b) p += kSpecToRGB[b] * msField(m, lut, h, mus, msBand(b, true).ms).psi;
     return dot(p, kLuma);
 }
 
@@ -1182,16 +1515,17 @@ inline float msFieldPsiLuma(device const float4* lut, float h, float mus, bool s
 /// moon is down, the physical night model is off — or where the moonlit sky is below 1e-4 of
 /// the sunlit one (its mean multiply-scattered radiance at the ground as the yardstick for both
 /// lights), so daytime pays nothing for it and its entry is an unmeasurable 0.01 %.
+template <typename M>
 inline float nishitaMSMoonIntensity(constant SkyUniforms &u, device const float4* lut, float sunI,
-                                    thread float3 &toMoon) {
+                                    thread float3 &toMoon, M m) {
     toMoon = normalize(u.moonParams.xyz);
     float rad = u.nightSkyB.z;
     if (u.nightSkyA.x < 0.5f || rad <= 0.0f || u.nightParams.y <= 0.0f || toMoon.y <= -0.3f) return 0.0f;
     float flux = nightMoonPhaseFlux(dot(normalize(u.nightSkyC.xyz), -toMoon));
     float moonI = kFullMoonSkyF0 * rad * flux / max(lut[kLUTHeader].z, 1e-30f);
     const bool spectral = msSpectral(u);
-    float gS = msFieldPsiLuma(lut, kMSHeightOffset, -u.sunDir.y, spectral) * sunI;
-    float gM = msFieldPsiLuma(lut, kMSHeightOffset, toMoon.y, spectral) * moonI;
+    float gS = msFieldPsiLuma(m, lut, kMSHeightOffset, -u.sunDir.y, spectral) * sunI;
+    float gM = msFieldPsiLuma(m, lut, kMSHeightOffset, toMoon.y, spectral) * moonI;
     return (gM > 1e-4f * gS) ? moonI : 0.0f;
 }
 
@@ -1199,11 +1533,12 @@ inline float nishitaMSMoonIntensity(constant SkyUniforms &u, device const float4
 /// horizon; horizon haze + airlight handover to the ground below it; the same grade), the
 /// march replaced by `nishitaScatterMS` with the moon summed in and the night glow's
 /// non-lunar light (airglow, zodiacal) added as before.
-inline float3 nishitaAtmosphereColorMS(float3 rayDir, constant SkyUniforms &u, device const float4* lut) {
+template <typename M>
+inline float3 nishitaAtmosphereColorMS(float3 rayDir, constant SkyUniforms &u, device const float4* lut, M m) {
     float intensity = max(0.0f, u.atmosphereParams.y);
     float3 toSun = -u.sunDir.xyz;
     float3 toMoon;
-    float moonI = nishitaMSMoonIntensity(u, lut, intensity, toMoon);
+    float moonI = nishitaMSMoonIntensity(u, lut, intensity, toMoon, m);
     float rad = u.nightSkyB.z;
     bool glow = u.nightSkyA.x > 0.5f && rad > 0.0f && u.nightParams.w > 0.0f;
     float3 d = rayDir;
@@ -1212,7 +1547,7 @@ inline float3 nishitaAtmosphereColorMS(float3 rayDir, constant SkyUniforms &u, d
         float hlen = length(hxz);
         d = (hlen > 1e-5f) ? float3(hxz.x / hlen, 0.0f, hxz.y / hlen) : float3(1.0f, 0.0f, 0.0f);
     }
-    float3 s = nishitaScatterMS(d, toSun, intensity, toMoon, moonI, lut, msSpectral(u));
+    float3 s = nishitaScatterMS(d, toSun, intensity, toMoon, moonI, lut, m, msSpectral(u));
     if (glow) s = nightAirglowAndZodiacal(s, d, u, rad, max(d.y, 0.0f));
     s = skyGraded(s, u.skyGrade.x, u.skyGrade.y);
     if (rayDir.y >= 0.0f) return s;
@@ -1224,15 +1559,17 @@ inline float3 nishitaAtmosphereColorMS(float3 rayDir, constant SkyUniforms &u, d
     return mix(s, groundRad, ground);
 }
 
-// ── LUT build (once per renderer; again only when the ground albedo changes) ──────────────
+// ── LUT build (once per renderer; again only when the ground albedo or the aerosol changes) ─
 // Encoded by `VolumetricCloudRenderer` into the first command buffer that needs it, in order:
 // volSkyTransmittanceLUT → volSkyMultiScatterOrder (orders 2…kMSLastOrder) →
-// volSkyMultiScatterFinalize → volSkyMultiScatterReady. `lut` is the region's base.
+// volSkyMultiScatterFinalize → volSkyMultiScatterReady. `lut` is the region's base. With an
+// aerosol (`Params.atmosphereAerosol` ≠ built-in) the `…Aerosol` twins build the same tables
+// through that medium; its two float4s (SkyUniforms.aerosolA/B) arrive at buffer(2). Every stage
+// takes `bp` at buffer(1): x = order, y = ground albedo, z = band, w = spectral — a spectral build
+// runs transmittance → orders → finalize once per band (`msBand`), then one ready pass.
 
-kernel void volSkyTransmittanceLUT(device float4* lut [[buffer(0)]],
-                                   constant float4 &bp [[buffer(1)]],   // z = band, w = spectral
-                                   uint2 gid [[thread_position_in_grid]]) {
-    const MSBand bd = msBand(int(bp.z + 0.5f), bp.w > 0.5f);
+template <typename M>
+inline void volSkyTransmittanceLUTImpl(device float4* lut, uint2 gid, M m, MSBand bd) {
     if (gid.x >= uint(kMSTransW) || gid.y >= uint(kMSTransH)) return;
     const float Hh = sqrt((kMSAtmosRadius - kEarthRadius) * (kMSAtmosRadius + kEarthRadius));
     float rho = Hh * float(gid.y) / float(kMSTransH - 1);
@@ -1242,21 +1579,44 @@ kernel void volSkyTransmittanceLUT(device float4* lut [[buffer(0)]],
     float mu = (d <= 0.0f) ? 1.0f : clamp((Hh * Hh - rho * rho - d * d) / (2.0f * r * d), -1.0f, 1.0f);
     float3 o = float3(0.0f, r, 0.0f);
     float3 dir = float3(sqrt(max(1.0f - mu * mu, 0.0f)), mu, 0.0f);
-    float dt = d / float(kMSTransSteps);
+    float dt = d / float(msTransmittanceSteps(m));
     float3 od = float3(0.0f);
-    for (int i = 0; i < kMSTransSteps; ++i) {
+    for (int i = 0; i < msTransmittanceSteps(m); ++i) {
         float h = length(o + dir * ((float(i) + 0.5f) * dt)) - kEarthRadius;
-        od += bd.bR * exp(-h / kRayleighH) + kBetaM * (1.1f * exp(-h / kMieH)) + bd.bO * ozoneDensity(h);
+        od += bd.bR * exp(-h / kRayleighH) + m.extinction(m.density(h)) + bd.bO * ozoneDensity(h);
     }
-    lut[bd.base + kLUTTrans + int(gid.y) * kMSTransW + int(gid.x)] = float4(od * dt, 0.0f);
+    lut[bd.trans + int(gid.y) * kMSTransW + int(gid.x)] = float4(od * dt, 0.0f);
+}
+
+kernel void volSkyTransmittanceLUT(device float4* lut [[buffer(0)]],
+                                   constant float4 &bp [[buffer(1)]],   // z = band, w = spectral
+                                   uint2 gid [[thread_position_in_grid]]) {
+    const MSBand bd = msBand(int(bp.z + 0.5f), bp.w > 0.5f);
+    volSkyTransmittanceLUTImpl(lut, gid, NishitaMieBuiltin(), bd);
+}
+
+kernel void volSkyTransmittanceLUTAerosol(device float4* lut [[buffer(0)]],
+                                          constant float4 &bp [[buffer(1)]],   // z = band, w = spectral
+                                          constant float4* aerosol [[buffer(2)]],
+                                          uint2 gid [[thread_position_in_grid]]) {
+    const MSBand bd = msBand(int(bp.z + 0.5f), bp.w > 0.5f);
+    // Two instantiations, not a runtime-selected medium: a selected λ would turn the constant
+    // kChannelWavelengths / 550 into runtime arithmetic and move the non-spectral LUT's last bits.
+    if (bd.spectral) volSkyTransmittanceLUTImpl(lut, gid, NishitaMieAerosol(aerosol[0], aerosol[1], bd.lambda), bd);
+    else             volSkyTransmittanceLUTImpl(lut, gid, NishitaMieAerosol(aerosol[0], aerosol[1]), bd);
 }
 
 /// One direction of an order pass from x: order 2 = the TRUE-phase single scatter of the light
 /// toward `s` arriving at x (planet-shadowed at every sample) + its direct reflection off the
-/// ground; order n > 2 = ∫ T σs Ψₙ₋₁ (isotropic re-scatter) + the ground under Ψₙ₋₁. `F` = the
-/// local transfer ∫ T σs (Hillaire's f_ms), for the tail.
+/// ground; order n > 2 = ∫ T σs Ψₙ₋₁ (isotropic re-scatter; the aerosol medium's Mie part through
+/// the field's Mie shape, table `jReadBase` — msMieRescatter) + the ground under Ψₙ₋₁. `F` = the
+/// local transfer ∫ T σs (Hillaire's f_ms), for the tail. `mieNorm` renormalises the order-2 Mie
+/// phase over the direction set (aerosol medium only — see volSkyMultiScatterOrderImpl). `m` is
+/// at `bd`'s wavelengths.
+template <typename M>
 inline void msOrderRay(device const float4* lut, float3 x, float3 w, float3 s, int order, float albedo,
-                       int readBase, MSBand bd, thread float3 &L, thread float3 &F) {
+                       int readBase, thread float3 &L, thread float3 &F, M m, float mieNorm, int jReadBase,
+                       MSBand bd) {
     L = float3(0.0f);
     F = float3(0.0f);
     float tTop = raySphereExit(x, w, kMSAtmosRadius);
@@ -1265,7 +1625,7 @@ inline void msOrderRay(device const float4* lut, float3 x, float3 w, float3 s, i
     float tEnd = hit ? tG : max(tTop, 0.0f);
     int steps = (order == 2) ? kMSStepsOrder2 : kMSStepsHigher;
     float cy = dot(s, w);   // sunlight (travelling −s) turned toward x (travelling −w)
-    float pR = msRayleighPhase(cy), pM = msMiePhase(cy);
+    float pR = msRayleighPhase(cy), pM = m.order2Phase(msMiePhase(m, cy), mieNorm);
     float3 T = float3(1.0f);
     float tPrev = 0.0f;
     for (int i = 0; i < steps; ++i) {
@@ -1275,15 +1635,16 @@ inline void msOrderRay(device const float4* lut, float3 x, float3 w, float3 s, i
         float3 p = x + w * (tPrev + 0.5f * dt);
         float r = length(p);
         float h = r - kEarthRadius;
-        float dM = exp(-h / kMieH);
+        float dM = m.density(h);
         float3 sR = bd.bR * exp(-h / kRayleighH);
-        float sM = kBetaM.x * dM;
-        float3 sT = sR + kBetaM * (1.1f * dM) + bd.bO * ozoneDensity(h);
+        typename M::Coef sM = m.scattering(dM);
+        float3 sT = sR + m.extinction(dM) + bd.bO * ozoneDensity(h);
         float3 Tseg = exp(-sT * dt);
         float3 wgt = T * msSegmentIntegral(sT, dt, Tseg);
         float mus = dot(p, s) / r;
-        if (order == 2) L += wgt * (sR * pR + sM * pM) * msSunTransmittance(lut, r, mus, bd.base);
-        else            L += wgt * (sR + sM) * msScratchPsi(lut, bd.base + readBase, h, mus);
+        if (order == 2) L += wgt * (sR * pR + sM * pM) * msSunTransmittance(lut, r, mus, bd.trans);
+        else            L += wgt * (sR + msMieRescatter(m, sM, lut, jReadBase, p, r, h, mus, w, s))
+                              * msScratchPsi(m, lut, readBase, h, mus);
         F += wgt * (sR + sM);
         T *= Tseg;
         tPrev = t;
@@ -1293,9 +1654,9 @@ inline void msOrderRay(device const float4* lut, float3 x, float3 w, float3 s, i
         float cs = dot(n, s);
         if (order == 2) {
             if (cs > 0.0f) L += T * (albedo / M_PI_F) * cs
-                              * msSunTransmittance(lut, kEarthRadius + kMSHeightOffset, cs, bd.base);
+                              * msSunTransmittance(lut, kEarthRadius + kMSHeightOffset, cs, bd.trans);
         } else {
-            L += T * albedo * msScratchPsi(lut, bd.base + readBase, kMSHeightOffset, cs);   // E = πΨ, L = aE/π
+            L += T * albedo * msScratchPsi(m, lut, readBase, kMSHeightOffset, cs);   // E = πΨ, L = aE/π
         }
     }
 }
@@ -1304,25 +1665,58 @@ inline void msOrderRay(device const float4* lut, float3 x, float3 w, float3 s, i
 /// over the kMSDirAz × kMSDirEl directions (the field is mirror-symmetric about the plane of
 /// the local up and the sun, so φ covers half a turn at double weight). Writes ln Ψₙ to the
 /// scratch the next order reads, and accumulates Ψₙ and its quadrupole into the totals.
-/// `bp.x` = order, `bp.y` = ground albedo.
-kernel void volSkyMultiScatterOrder(device float4* lut [[buffer(0)]],
-                                    constant float4 &bp [[buffer(1)]],
-                                    uint2 tg [[threadgroup_position_in_grid]],
-                                    uint tid [[thread_index_in_threadgroup]]) {
-    threadgroup float4 sumA[kMSDirThreads];   // Σ L·w (rgb), Σ Lg·w·q_uu
-    threadgroup float4 sumB[kMSDirThreads];   // Σ Lg·w·q_ss, Σ Lg·w·q_us
-    threadgroup float4 sumF[kMSDirThreads];   // Σ F·w
+/// `bp.x` = order, `bp.y` = ground albedo, `bp.z` = band, `bp.w` = spectral (a band's own tables
+/// — transmittance, Ψ, Mie shape A — are per band; ln Ψₙ, the sums and Mie shape B are shared).
+///
+/// Aerosol medium: the order-2 Mie phase is renormalised so that its sum over the direction set
+/// is exactly 1. The 8 × 16 set samples no direction above 61.5° elevation and none closer than
+/// 11.25° in azimuth to the sun's plane, so a forward-peaked phase sums to 0.73 (g 0.76) with the
+/// sun 79° up, 0.63 at the zenith, ~0.97 near the horizon — negligible for the built-in 0.028
+/// aerosol, a real deficit in the noon sky once aerosol scattering dominates the second order.
+/// Renormalising puts the missed forward-scattered energy back into the field (whose mean is what
+/// Ψ stores), on the directions nearest the sun.
+///
+/// Aerosol medium, every other altitude row: the order's field is also convolved with the Mie
+/// phase toward the shape table's kJViews view directions (a phase-weighted mean over the 256
+/// directions, normalised by the phase's own quadrature: Jₙ(v)), and folded into the running
+/// shape ĵ = Σ Jₙ / Σ Ψₙ in the table this order writes (A for odd orders, B for even — the next
+/// order's re-scatter reads it while this one's is being written). After the last order the
+/// finalize folds in the tail and `msMieFieldScatter` reads A.
+template <typename M>
+inline void volSkyMultiScatterOrderImpl(device float4* lut, constant float4 &bp, uint2 tg, uint tid,
+                                        threadgroup float4* sumA, threadgroup float4* sumB,
+                                        threadgroup float4* sumF, threadgroup float4* dirL,
+                                        threadgroup float4* dirW, M m) {
     int order = int(bp.x + 0.5f);
     float albedo = bp.y;
-    const MSBand bd = msBand(int(bp.z + 0.5f), bp.w > 0.5f);   // z = band, w = spectral
+    const MSBand bd = msBand(int(bp.z + 0.5f), bp.w > 0.5f);   // `m` is already at its wavelengths
     int texel = int(tg.y) * kMSLutW + int(tg.x);
     float mus = -1.0f + 2.0f * float(tg.x) / float(kMSLutW - 1);
-    float h = kMSHeightOffset + (kMSAtmosRadius - kEarthRadius - kMSHeightOffset) * float(tg.y) / float(kMSLutH - 1);
+    float h = msLutRowAltitude(m, tg.y);
     float3 x = float3(0.0f, kEarthRadius + h, 0.0f);
     float3 s = float3(sqrt(max(1.0f - mus * mus, 0.0f)), mus, 0.0f);
     bool odd = (order & 1) != 0;
     int readBase = odd ? kLUTLnPsiA : kLUTLnPsiB;     // order n reads what n − 1 wrote
     int writeBase = odd ? kLUTLnPsiB : kLUTLnPsiA;
+    int jReadBase = odd ? kLUTJB : bd.j;              // the Mie shape tables ping-pong the same way
+    int jWriteBase = odd ? bd.j : kLUTJB;
+    // Σ Ψ of the orders before this one, read before this pass adds its own (tid 0, at the end).
+    float3 accPrev = (m.buildsMieTable() && order > 2) ? lut[kLUTAccA + texel].xyz : float3(0.0f);
+    float mieNorm = 1.0f;
+    if (m.renormalisesOrder2() && order == 2) {
+        float sumP = 0.0f;
+        for (int k = 0; k < kMSDirAz * kMSDirEl; ++k) {
+            int j = k / kMSDirAz, i = k - j * kMSDirAz;
+            float uu = -1.0f + 2.0f * (float(j) + 0.5f) / float(kMSDirEl);
+            float z = sign(uu) * pow(abs(uu), kMSDirWarp);
+            float wt = kMSDirWarp * pow(abs(uu), kMSDirWarp - 1.0f) * (2.0f / float(kMSDirEl))
+                     * (2.0f * M_PI_F / float(kMSDirAz));
+            float phi = M_PI_F * (float(i) + 0.5f) / float(kMSDirAz);
+            float rxy = sqrt(max(1.0f - z * z, 0.0f));
+            sumP += msMiePhase(m, dot(s, float3(rxy * cos(phi), z, rxy * sin(phi)))) * wt;
+        }
+        mieNorm = 1.0f / max(sumP, 1e-3f);
+    }
     float4 A = float4(0.0f), B = float4(0.0f), Fs = float4(0.0f);
     for (int k = int(tid); k < kMSDirAz * kMSDirEl; k += kMSDirThreads) {
         int j = k / kMSDirAz, i = k - j * kMSDirAz;
@@ -1334,7 +1728,8 @@ kernel void volSkyMultiScatterOrder(device float4* lut [[buffer(0)]],
         float rxy = sqrt(max(1.0f - z * z, 0.0f));
         float3 w = float3(rxy * cos(phi), z, rxy * sin(phi));   // x = sun-horizontal, y = up
         float3 L, F;
-        msOrderRay(lut, x, w, s, order, albedo, readBase, bd, L, F);
+        msOrderRay(lut, x, w, s, order, albedo, readBase, L, F, m, mieNorm, jReadBase, bd);
+        if (m.buildsMieTable()) { dirL[k] = float4(L, wt); dirW[k] = float4(w, 0.0f); }
         float lg = L.y * wt;
         A += float4(L * wt, lg * (1.5f * w.y * w.y - 0.5f));
         B += float4(lg * (1.5f * w.x * w.x - 0.5f), lg * (1.5f * w.x * w.y), 0.0f, 0.0f);
@@ -1350,45 +1745,131 @@ kernel void volSkyMultiScatterOrder(device float4* lut [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (tid != 0u) return;
     const float inv4pi = 1.0f / (4.0f * M_PI_F);
+    if (m.buildsMieTable() && (tg.y & 1u) == 0u) {
+        // This order's shape ĵₙ = Jₙ/Ψₙ folded into the running one: ĵ = (Σ Ψ·ĵ) / Σ Ψ.
+        float3 psiN = sumA[0].xyz * inv4pi;
+        float3 accNew = accPrev + psiN;
+        float3 invAcc = select(float3(0.0f), 1.0f / accNew, accNew > float3(1e-37f));
+        int jOff = (int(tg.y) / 2 * kMSLutW + int(tg.x)) * kJViews;
+        for (int vi = int(tid); vi < kJViews; vi += kMSDirThreads) {
+            int vj = vi / kJAz;
+            float3 v = msJView(vj, vi - vj * kJAz);
+            float3 acc = float3(0.0f);
+            float nrm = 0.0f;
+            for (int k = 0; k < kMSDirAz * kMSDirEl; ++k) {
+                float4 d = dirL[k];
+                float3 w = dirW[k].xyz;
+                // The direction and its mirror across the up–sun plane (the same radiance).
+                float p = msMiePhase(m, dot(v, w)) + msMiePhase(m, dot(v, float3(w.x, w.y, -w.z)));
+                acc += (p * d.w) * d.xyz;
+                nrm += p * d.w;
+            }
+            float3 jn = acc / max(nrm, 1e-30f);
+            float3 prev = (order > 2) ? float3(msJTable(lut, jReadBase)[jOff + vi].xyz) : float3(0.0f);
+            msJTableW(lut, jWriteBase)[jOff + vi] = msJPack((accPrev * prev + jn) * invAcc);
+        }
+        // accPrev is a device load the compiler may sink to its first use above: every thread's
+        // must be done before tid 0 adds this order's Ψ to the same texel. (Uniform per
+        // threadgroup — tg.y — so every thread reaches it.)
+        threadgroup_barrier(mem_flags::mem_device);
+    }
+    if (tid != 0u) return;
     float4 a = sumA[0] * inv4pi, b = sumB[0] * inv4pi;
-    device float4* lb = lut + bd.base;
-    lb[writeBase + texel] = float4(log(max(a.xyz, float3(1e-37f))), 0.0f);
-    if (order == 2) { lb[kLUTAccA + texel] = a; lb[kLUTAccB + texel] = b; }
-    else            { lb[kLUTAccA + texel] += a; lb[kLUTAccB + texel] += b; }
-    if (order == kMSLastOrder) lb[kLUTAccF + texel] = sumF[0] * inv4pi;
+    lut[writeBase + texel] = float4(log(max(a.xyz, float3(1e-37f))), 0.0f);
+    if (order == 2) { lut[kLUTAccA + texel] = a; lut[kLUTAccB + texel] = b; }
+    else            { lut[kLUTAccA + texel] += a; lut[kLUTAccB + texel] += b; }
+    if (order == kMSLastOrder) lut[kLUTAccF + texel] = sumF[0] * inv4pi;
+}
+
+kernel void volSkyMultiScatterOrder(device float4* lut [[buffer(0)]],
+                                    constant float4 &bp [[buffer(1)]],
+                                    uint2 tg [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float4 sumA[kMSDirThreads];   // Σ L·w (rgb), Σ Lg·w·q_uu
+    threadgroup float4 sumB[kMSDirThreads];   // Σ Lg·w·q_ss, Σ Lg·w·q_us
+    threadgroup float4 sumF[kMSDirThreads];   // Σ F·w
+    // (No Mie table: the direction scratch is never touched — any threadgroup pointer stands in.)
+    volSkyMultiScatterOrderImpl(lut, bp, tg, tid, sumA, sumB, sumF, sumF, sumF, NishitaMieBuiltin());
+}
+
+kernel void volSkyMultiScatterOrderAerosol(device float4* lut [[buffer(0)]],
+                                           constant float4 &bp [[buffer(1)]],
+                                           constant float4* aerosol [[buffer(2)]],
+                                           uint2 tg [[threadgroup_position_in_grid]],
+                                           uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float4 sumA[kMSDirThreads];
+    threadgroup float4 sumB[kMSDirThreads];
+    threadgroup float4 sumF[kMSDirThreads];
+    threadgroup float4 dirL[kMSDirAz * kMSDirEl];   // L (rgb), quadrature weight — per direction
+    threadgroup float4 dirW[kMSDirAz * kMSDirEl];   // the direction
+    // The medium at the band's wavelengths — two instantiations (see volSkyTransmittanceLUTAerosol).
+    if (bp.w > 0.5f)
+        volSkyMultiScatterOrderImpl(lut, bp, tg, tid, sumA, sumB, sumF, dirL, dirW,
+                                    NishitaMieAerosol(aerosol[0], aerosol[1], kSpecLambda[int(bp.z + 0.5f)]));
+    else
+        volSkyMultiScatterOrderImpl(lut, bp, tg, tid, sumA, sumB, sumF, dirL, dirW, NishitaMieAerosol(aerosol[0], aerosol[1]));
 }
 
 /// Ψ = Σ Ψₙ + the local geometric tail Ψ_N·f/(1 − f) past the last order (isotropic), and the
-/// quadrupole normalised by Ψ (green): the table the per-pixel march reads.
-kernel void volSkyMultiScatterFinalize(device float4* lutAll [[buffer(0)]],
-                                       constant float4 &bp [[buffer(1)]],   // z = band, w = spectral
-                                       uint2 gid [[thread_position_in_grid]]) {
+/// quadrupole normalised by Ψ (green): the table the per-pixel march reads. The aerosol twin also
+/// finishes the Mie shape table: ĵ(v) = (Σ Ψₙ·ĵₙ(v) + the tail, which is isotropic) / Ψ.
+template <bool kMieTable>
+inline void volSkyMultiScatterFinalizeImpl(device float4* lut, uint2 gid, MSBand bd) {
     if (gid.x >= uint(kMSLutW) || gid.y >= uint(kMSLutH)) return;
-    device float4* lut = lutAll + msBand(int(bp.z + 0.5f), bp.w > 0.5f).base;
     int texel = int(gid.y) * kMSLutW + int(gid.x);
     int lastBase = ((kMSLastOrder & 1) != 0) ? kLUTLnPsiB : kLUTLnPsiA;
     float4 a = lut[kLUTAccA + texel], b = lut[kLUTAccB + texel];
     float3 f = min(lut[kLUTAccF + texel].xyz, float3(0.999f));
     float3 psi = a.xyz + exp(lut[lastBase + texel].xyz) * f / (1.0f - f);
     float inv = (psi.y > 1e-37f) ? 1.0f / psi.y : 0.0f;
-    lut[kLUTMS + 2 * texel]     = float4(log(max(psi, float3(1e-37f))), a.w * inv);
-    lut[kLUTMS + 2 * texel + 1] = float4(b.x * inv, b.y * inv, 0.0f, 0.0f);
+    lut[bd.ms + 2 * texel]     = float4(log(max(psi, float3(1e-37f))), a.w * inv);
+    lut[bd.ms + 2 * texel + 1] = float4(b.x * inv, b.y * inv, 0.0f, 0.0f);
+    if (kMieTable && (gid.y & 1u) == 0u) {
+        // The last order (odd) left the running shape in A: fold in the (isotropic) tail.
+        float3 tail = exp(lut[lastBase + texel].xyz) * f / (1.0f - f);
+        float3 invPsi = select(float3(0.0f), 1.0f / psi, psi > float3(1e-37f));
+        device half4* jt = msJTableW(lut, bd.j) + (int(gid.y) / 2 * kMSLutW + int(gid.x)) * kJViews;
+        for (int vi = 0; vi < kJViews; ++vi) jt[vi] = msJPack((a.xyz * float3(jt[vi].xyz) + tail) * invPsi);
+    }
+}
+
+kernel void volSkyMultiScatterFinalize(device float4* lut [[buffer(0)]],
+                                       constant float4 &bp [[buffer(1)]],   // z = band, w = spectral
+                                       uint2 gid [[thread_position_in_grid]]) {
+    volSkyMultiScatterFinalizeImpl<false>(lut, gid, msBand(int(bp.z + 0.5f), bp.w > 0.5f));
+}
+
+kernel void volSkyMultiScatterFinalizeAerosol(device float4* lut [[buffer(0)]],
+                                              constant float4 &bp [[buffer(1)]],   // z = band, w = spectral
+                                              uint2 gid [[thread_position_in_grid]]) {
+    volSkyMultiScatterFinalizeImpl<true>(lut, gid, msBand(int(bp.z + 0.5f), bp.w > 0.5f));
 }
 
 /// Last step: this sky's zenith luminance with the sun 50° up at unit irradiance (the moonlit
 /// sky's calibration reference, as kNishitaZenithRef is the single-scatter march's), then the
 /// ready flag. One thread.
-kernel void volSkyMultiScatterReady(device float4* lut [[buffer(0)]],
-                                    constant float4 &bp [[buffer(1)]],
-                                    uint tid [[thread_position_in_grid]]) {
+template <typename M>
+inline void volSkyMultiScatterReadyImpl(device float4* lut, constant float4 &bp, uint tid, M m) {
     if (tid != 0u) return;
     float3 toSun = float3(cos(50.0f * M_PI_F / 180.0f), sin(50.0f * M_PI_F / 180.0f), 0.0f);
-    float3 z = nishitaScatterMS(float3(0.0f, 1.0f, 0.0f), toSun, 1.0f, float3(0.0f, 1.0f, 0.0f), 0.0f, lut,
+    float3 z = nishitaScatterMS(float3(0.0f, 1.0f, 0.0f), toSun, 1.0f, float3(0.0f, 1.0f, 0.0f), 0.0f, lut, m,
                                 bp.w > 0.5f);
     float ref = dot(z, float3(0.2126f, 0.7152f, 0.0722f));
     lut[kLUTHeader] = float4(1.0f, bp.y, ref, float(kLUTLength));
+}
+
+kernel void volSkyMultiScatterReady(device float4* lut [[buffer(0)]],
+                                    constant float4 &bp [[buffer(1)]],
+                                    uint tid [[thread_position_in_grid]]) {
+    volSkyMultiScatterReadyImpl(lut, bp, tid, NishitaMieBuiltin());
+}
+
+kernel void volSkyMultiScatterReadyAerosol(device float4* lut [[buffer(0)]],
+                                           constant float4 &bp [[buffer(1)]],
+                                           constant float4* aerosol [[buffer(2)]],
+                                           uint tid [[thread_position_in_grid]]) {
+    volSkyMultiScatterReadyImpl(lut, bp, tid, NishitaMieAerosol(aerosol[0], aerosol[1]));
 }
 
 /// The layout constants, for the Swift mirror's test.
@@ -1396,13 +1877,28 @@ kernel void volSkyAtmosphereLUTLayout(device int4* out [[buffer(0)]], uint tid [
     if (tid != 0u) return;
     out[0] = int4(kLUTLength, kLUTTrans, kLUTMS, kLUTLnPsiA);
     out[1] = int4(kMSTransW, kMSTransH, kMSLutW, kMSLutH);
-    out[2] = int4(kSpecBands, kLUTBandStride, 0, 0);
+    out[2] = int4(kLUTJ, kLUTLengthAerosol, kJEl, kJAz);
+    out[3] = int4(kLUTJB, kJSize, 0, 0);
+    out[4] = int4(kSpecBands, kLUTSpecExtra, kLUTSpecBandSize, kLUTRegionLength);
+    out[5] = int4(kLUTSpecTrans, kLUTSpecMS, kLUTSpecJ, 0);
 }
 
+/// The atmosphere's constants, for the Swift mirror's test (`NishitaAtmosphere`, which the CPU sun
+/// transmittance and `NishitaAerosol.builtin` are built from — one source of truth, pinned).
+kernel void volSkyAtmosphereConstants(device float4* out [[buffer(0)]], uint tid [[thread_position_in_grid]]) {
+    if (tid != 0u) return;
+    out[0] = float4(kBetaR, kRayleighH);
+    out[1] = float4(kBetaM, kMieH);
+    out[2] = float4(kBetaO, kMieG);
+    out[3] = float4(kEarthRadius, kAtmosRadius, kMSAtmosRadius, kOzoneCenter);
+    out[4] = float4(kOzoneWidth, kMieExtRatio, 0.0f, 0.0f);
+}
+
+template <typename M>
 inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u,
-                                     device const float4* skyLUT, bool lutBound) {
+                                     device const float4* skyLUT, bool lutBound, M m) {
     // Opt-in multiple scattering (VZ-0159): the LUT path, once its LUTs are built.
-    if (nishitaMSReady(u, skyLUT, lutBound)) return nishitaAtmosphereColorMS(rayDir, u, skyLUT);
+    if (nishitaMSReady(u, skyLUT, lutBound)) return nishitaAtmosphereColorMS(rayDir, u, skyLUT, m);
     float intensity = max(0.0f, u.atmosphereParams.y);
     float sat = u.skyGrade.x;
     // Physical night sky: once the sun is 18° down (astronomical night) its single-scatter
@@ -1410,8 +1906,8 @@ inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u,
     // and spend the budget on the moon's march instead (`nightSkyGlow`).
     bool sunMarch = !(u.nightSkyA.x > 0.5f && u.sunDir.y > 0.309f);
     if (rayDir.y >= 0.0f) {
-        float3 s = (sunMarch ? nishitaScatter(rayDir, u.sunDir.xyz, intensity) : float3(0.0f))
-                 + nightSkyGlow(rayDir, u);
+        float3 s = (sunMarch ? nishitaScatter(rayDir, u.sunDir.xyz, intensity, m) : float3(0.0f))
+                 + nightSkyGlow(rayDir, u, m);
         // Chroma about luma, luma preserved — the sky's exposure does not move with it.
         return skyGraded(s, sat, u.skyGrade.y);
     }
@@ -1424,8 +1920,8 @@ inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u,
     float hlen = length(hxz);
     float3 grazing = (hlen > 1e-5f) ? float3(hxz.x / hlen, 0.0f, hxz.y / hlen)
                                     : float3(1.0f, 0.0f, 0.0f);
-    float3 horizonHaze = (sunMarch ? nishitaScatter(grazing, u.sunDir.xyz, intensity) : float3(0.0f))
-                       + nightSkyGlow(grazing, u);
+    float3 horizonHaze = (sunMarch ? nishitaScatter(grazing, u.sunDir.xyz, intensity, m) : float3(0.0f))
+                       + nightSkyGlow(grazing, u, m);
     horizonHaze = skyGraded(horizonHaze, sat, u.skyGrade.y);
     // Airlight scale in radians of depression: the 1/e point of the haze->ground
     // handover. 0.0035 rad (~0.2 deg) is one eye-height in ~3 km of haze, which is
@@ -1436,6 +1932,16 @@ inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u,
     float3 groundRad = u.groundColor.xyz
                      + ((u.skyGrade.w > 0.5f) ? u.cloudLitGround.xyz : float3(0.0f));
     return mix(horizonHaze, groundRad, ground);
+}
+
+/// The sky as the renderer's kernels draw it for these uniforms, choosing the Mie medium at RUN
+/// time — for probes and tests that evaluate single directions. The production kernels never call
+/// this: each is instantiated with its medium at compile time (see volSkyRenderImpl).
+inline float3 nishitaAtmosphereColor(float3 rayDir, constant SkyUniforms &u,
+                                     device const float4* skyLUT, bool lutBound) {
+    if (nishitaAerosolOn(u))
+        return nishitaAtmosphereColor(rayDir, u, skyLUT, lutBound, NishitaMieAerosol(u.aerosolA, u.aerosolB));
+    return nishitaAtmosphereColor(rayDir, u, skyLUT, lutBound, NishitaMieBuiltin());
 }
 
 // ── Lava-lamp sky (Params.lavaLamp) ──────────────────────────────────────────────────────
@@ -1607,7 +2113,8 @@ inline float3 applyCirrus(float3 sky, float3 ro, float3 rayDir, float time, cons
 // update; results land in `SkyUniforms.cloudLitSun/cloudLitAmbient`, which every later cloud
 // dispatch on the queue reads.
 
-inline float3 nishitaTransmittanceToSun(float altitude, float3 toSun) {
+template <typename M>
+inline float3 nishitaTransmittanceToSun(float altitude, float3 toSun, M m) {
     float3 o = float3(0.0f, kEarthRadius + max(altitude, 1.0f), 0.0f);
     float tl = raySphereExit(o, toSun, kAtmosRadius);
     if (tl <= 0.0f) return float3(1.0f);
@@ -1618,15 +2125,38 @@ inline float3 nishitaTransmittanceToSun(float altitude, float3 toSun) {
         float3 p = o + toSun * ((float(j) + 0.5f) * seg);
         float h = length(p) - kEarthRadius;
         if (h < 0.0f) return float3(0.0f);          // the planet shades the deck
-        od += float3(exp(-h / kRayleighH), exp(-h / kMieH), ozoneDensity(h)) * seg;
+        od += float3(exp(-h / kRayleighH), m.density(h), ozoneDensity(h)) * seg;
     }
-    return exp(-(kBetaR * od.x + kBetaM * 1.1f * od.y + kBetaO * od.z));
+    return exp(-(kBetaR * od.x + m.extinctionOfColumn(od.y) + kBetaO * od.z));
 }
 
-// Compiled twice, like `volSkyRenderImpl` (no MS code in `volSkyCloudLight`).
-template <bool kMS>
+/// The aerosol medium's sun path for the deck: 64 steps crowded toward the observer (t ∝ u², where
+/// the haze is) instead of 16 uniform ones, which miss most of a 2 km haze layer on a low sun's
+/// ~600 km path (+30 % sunlight at 6° through τ550 0.25). Matches `NishitaAtmosphere.transmittance`
+/// — the sun hosts give their disc and directional light — within ~1 %.
+inline float3 nishitaTransmittanceToSun(float altitude, float3 toSun, NishitaMieAerosol m) {
+    float3 o = float3(0.0f, kEarthRadius + max(altitude, 1.0f), 0.0f);
+    float tl = raySphereExit(o, toSun, kAtmosRadius);
+    if (tl <= 0.0f) return float3(1.0f);
+    if (rayGroundHit(o, toSun, kEarthRadius) > 0.0f) return float3(0.0f);   // the planet shades the deck
+    constexpr int N = 64;
+    float3 od = float3(0.0f);
+    float tPrev = 0.0f;
+    for (int j = 1; j <= N; ++j) {
+        float u = float(j) / float(N);
+        float t = tl * u * u;
+        float h = length(o + toSun * (0.5f * (tPrev + t))) - kEarthRadius;
+        od += float3(exp(-h / kRayleighH), m.density(h), ozoneDensity(h)) * (t - tPrev);
+        tPrev = t;
+    }
+    return exp(-(kBetaR * od.x + m.extinctionOfColumn(od.y) + kBetaO * od.z));
+}
+
+// Compiled per variant, like `volSkyRenderImpl` (no MS code in `volSkyCloudLight`, the built-in
+// Mie medium in every kernel without `Aerosol` in its name).
+template <bool kMS, typename M>
 inline void volSkyCloudLightImpl(device SkyUniforms &u, device const float4* skyLUT, uint tid,
-                                 threadgroup float3* radiance, threadgroup float* weight) {
+                                 threadgroup float3* radiance, threadgroup float* weight, M m) {
     float intensity = max(0.0f, u.atmosphereParams.y);
     // Multiple scattering (opt-in): the deck is lit by the same multiply-scattered sky the dome
     // shows, and the sun through the same transmittance LUT (100 km top, analytic shadow).
@@ -1645,9 +2175,9 @@ inline void volSkyCloudLightImpl(device SkyUniforms &u, device const float4* sky
             d = normalize(float3(cos(a) * cos(el), sin(el), sin(a) * cos(el)));
             w = (k < 6u) ? 1.2f : 1.0f;
         }
-        float3 sky = ms ? nishitaScatterMS(d, -u.sunDir.xyz, intensity, float3(0.0f, 1.0f, 0.0f), 0.0f, skyLUT,
+        float3 sky = ms ? nishitaScatterMS(d, -u.sunDir.xyz, intensity, float3(0.0f, 1.0f, 0.0f), 0.0f, skyLUT, m,
                                            u.msParams.z > 0.5f)
-                        : nishitaScatter(d, u.sunDir.xyz, intensity);
+                        : nishitaScatter(d, u.sunDir.xyz, intensity, m);
         s = skyGraded(sky, u.skyGrade.x, u.skyGrade.y) * w;
     }
     radiance[tid] = s;
@@ -1661,7 +2191,7 @@ inline void volSkyCloudLightImpl(device SkyUniforms &u, device const float4* sky
     float3 toSun = -u.sunDir.xyz;
     float3 sun = intensity * (ms ? msSunTransmittanceRGB(skyLUT, kEarthRadius + max(u.cloudSlab.x, 1.0f), toSun.y,
                                                          u.msParams.z > 0.5f)
-                                 : nishitaTransmittanceToSun(u.cloudSlab.x, toSun));
+                                 : nishitaTransmittanceToSun(u.cloudSlab.x, toSun, m));
     // Lambertian ground under the deck (albedo in skyHorizon.xyz in this mode).
     float3 groundRad = u.skyHorizon.xyz * (sun * max(toSun.y, 0.0f) + M_PI_F * skyMean) / M_PI_F;
     u.cloudLitSun     = float4(sun, 1.0f);
@@ -1675,7 +2205,8 @@ kernel void volSkyCloudLight(device SkyUniforms &u [[buffer(0)]],
                              uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float3 radiance[16];
     threadgroup float  weight[16];
-    volSkyCloudLightImpl<false>(u, reinterpret_cast<device const float4*>(&u), tid, radiance, weight);
+    volSkyCloudLightImpl<false>(u, reinterpret_cast<device const float4*>(&u), tid, radiance, weight,
+                                NishitaMieBuiltin());
 }
 
 kernel void volSkyCloudLightMS(device SkyUniforms &u [[buffer(0)]],
@@ -1683,7 +2214,23 @@ kernel void volSkyCloudLightMS(device SkyUniforms &u [[buffer(0)]],
                                uint tid [[thread_index_in_threadgroup]]) {
     threadgroup float3 radiance[16];
     threadgroup float  weight[16];
-    volSkyCloudLightImpl<true>(u, skyLUT, tid, radiance, weight);
+    volSkyCloudLightImpl<true>(u, skyLUT, tid, radiance, weight, NishitaMieBuiltin());
+}
+
+kernel void volSkyCloudLightAerosol(device SkyUniforms &u [[buffer(0)]],
+                                    uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float3 radiance[16];
+    threadgroup float  weight[16];
+    volSkyCloudLightImpl<false>(u, reinterpret_cast<device const float4*>(&u), tid, radiance, weight,
+                                NishitaMieAerosol(u.aerosolA, u.aerosolB));
+}
+
+kernel void volSkyCloudLightMSAerosol(device SkyUniforms &u [[buffer(0)]],
+                                      device const float4* skyLUT [[buffer(1)]],
+                                      uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float3 radiance[16];
+    threadgroup float  weight[16];
+    volSkyCloudLightImpl<true>(u, skyLUT, tid, radiance, weight, NishitaMieAerosol(u.aerosolA, u.aerosolB));
 }
 
 // Sun disk — a soft circular hotspot anchored to the sun's 3D direction.
@@ -1966,13 +2513,16 @@ inline float3 burstLightEval(float3 worldPos, VSBurstLight L) {
 // one never taken, changes how the compiler schedules the rest of this kernel under fast-math
 // (last-bit differences in the cloud march), so only separate instantiations keep the flag-off
 // output bit-identical. `volSkyRenderMS` adds the LUT sky (`Params.atmosphereMultipleScattering`).
-template <bool kMS>
+// The same holds for the Mie medium `M`: `volSkyRender` / `volSkyRenderMS` are instantiated with
+// the built-in constants, `volSkyRenderAerosol` / `volSkyRenderMSAerosol` with the host's aerosol
+// (`Params.atmosphereAerosol`) — four kernels, one body.
+template <bool kMS, typename M>
 inline void volSkyRenderImpl(texture2d<float, access::write>  outTex,
                              texture3d<float, access::sample> noiseVol,
                              constant SkyUniforms &u,
                              device const VSBurstLight* burstLights,
                              device const float4* skyLUT,
-                             uint2 gid) {
+                             uint2 gid, M m) {
     uint W = outTex.get_width();
     uint H = outTex.get_height();
     if (gid.x >= W || gid.y >= H) return;
@@ -2015,8 +2565,8 @@ inline void volSkyRenderImpl(texture2d<float, access::write>  outTex,
             sky = lavaCol;   // the lamp replaces the atmosphere: skip it
         } else {
             sky = (u.atmosphereParams.x > 0.5f)
-                ? nishitaAtmosphereColor(rayDir, u, skyLUT, kMS)
-                : atmosphereColor(rayDir, u) + (rayDir.y >= 0.0f ? nightSkyGlow(rayDir, u) : float3(0.0f));
+                ? nishitaAtmosphereColor(rayDir, u, skyLUT, kMS, m)
+                : atmosphereColor(rayDir, u) + (rayDir.y >= 0.0f ? nightSkyGlow(rayDir, u, m) : float3(0.0f));
             sky += sunDisk(rayDir, u);
         }
 
@@ -2319,7 +2869,7 @@ kernel void volSkyRender(
 ) {
     // Never dereferenced when kMS is false: any valid pointer stands in for the LUT.
     volSkyRenderImpl<false>(outTex, noiseVol, u, burstLights,
-                            reinterpret_cast<device const float4*>(burstLights), gid);
+                            reinterpret_cast<device const float4*>(burstLights), gid, NishitaMieBuiltin());
 }
 
 kernel void volSkyRenderMS(
@@ -2331,7 +2881,33 @@ kernel void volSkyRenderMS(
     device const float4* skyLUT                  [[buffer(2)]],
     uint2 gid                                    [[thread_position_in_grid]]
 ) {
-    volSkyRenderImpl<true>(outTex, noiseVol, u, burstLights, skyLUT, gid);
+    volSkyRenderImpl<true>(outTex, noiseVol, u, burstLights, skyLUT, gid, NishitaMieBuiltin());
+}
+
+// The same two with the host's aerosol as the Mie medium (`Params.atmosphereAerosol`; the renderer
+// picks these whenever it is not `.builtin`).
+kernel void volSkyRenderAerosol(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    volSkyRenderImpl<false>(outTex, noiseVol, u, burstLights,
+                            reinterpret_cast<device const float4*>(burstLights), gid,
+                            NishitaMieAerosol(u.aerosolA, u.aerosolB));
+}
+
+kernel void volSkyRenderMSAerosol(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    device const float4* skyLUT                  [[buffer(2)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    volSkyRenderImpl<true>(outTex, noiseVol, u, burstLights, skyLUT, gid,
+                           NishitaMieAerosol(u.aerosolA, u.aerosolB));
 }
 
 // ── In-view (perspective) cloud kernel ───────────────────────────────────────
@@ -2387,9 +2963,10 @@ inline float inViewPixelAngle(constant CloudInViewUniforms &cv, float2 uv, float
     return 2.0f * asin(min(0.5f * length(rd - rd1), 1.0f));
 }
 
-// Compiled twice, like `volSkyRenderImpl`: `illumi_cloud_inview` has no multiple-scattering code;
-// `illumi_cloud_inview_ms` reads the LUTs at buffer(3) when cv.night.y says they are bound.
-template <bool kMS>
+// Compiled per variant, like `volSkyRenderImpl`: `illumi_cloud_inview` has no multiple-scattering
+// code; `illumi_cloud_inview_ms` reads the LUTs at buffer(3) when cv.night.y says they are bound;
+// the `_aerosol` twins carry the host's aerosol as the Mie medium.
+template <bool kMS, typename M>
 inline void illumiCloudInViewImpl(texture2d<float, access::write>  outTex,
                                   texture3d<float, access::sample> noiseVol,
                                   depth2d<float,   access::read>   gDepth,
@@ -2397,7 +2974,7 @@ inline void illumiCloudInViewImpl(texture2d<float, access::write>  outTex,
                                   constant CloudInViewUniforms &cv,
                                   device const VSBurstLight* burstLights,
                                   device const float4* skyLUT,
-                                  uint2 gid) {
+                                  uint2 gid, M m) {
     uint W = outTex.get_width();
     uint H = outTex.get_height();
     if (gid.x >= W || gid.y >= H) return;
@@ -2446,8 +3023,8 @@ inline void illumiCloudInViewImpl(texture2d<float, access::write>  outTex,
             sky = lavaCol;
         } else {
             sky = (u.atmosphereParams.x > 0.5f)
-                ? nishitaAtmosphereColor(rayDir, u, skyLUT, kMS && cv.night.y > 0.5f)
-                : atmosphereColor(rayDir, u) + (rayDir.y >= 0.0f ? nightSkyGlow(rayDir, u) : float3(0.0f));
+                ? nishitaAtmosphereColor(rayDir, u, skyLUT, kMS && cv.night.y > 0.5f, m)
+                : atmosphereColor(rayDir, u) + (rayDir.y >= 0.0f ? nightSkyGlow(rayDir, u, m) : float3(0.0f));
             sky += sunDisk(rayDir, u);
         }
         // Same analytic-night-sky skip as volSkyRender (cloudExtra2.y).
@@ -2644,7 +3221,7 @@ kernel void illumi_cloud_inview(
     uint2 gid                                    [[thread_position_in_grid]]
 ) {
     illumiCloudInViewImpl<false>(outTex, noiseVol, gDepth, u, cv, burstLights,
-                                 reinterpret_cast<device const float4*>(burstLights), gid);
+                                 reinterpret_cast<device const float4*>(burstLights), gid, NishitaMieBuiltin());
 }
 
 kernel void illumi_cloud_inview_ms(
@@ -2658,7 +3235,37 @@ kernel void illumi_cloud_inview_ms(
     device const float4* skyLUT                  [[buffer(3)]],
     uint2 gid                                    [[thread_position_in_grid]]
 ) {
-    illumiCloudInViewImpl<true>(outTex, noiseVol, gDepth, u, cv, burstLights, skyLUT, gid);
+    illumiCloudInViewImpl<true>(outTex, noiseVol, gDepth, u, cv, burstLights, skyLUT, gid, NishitaMieBuiltin());
+}
+
+// The same two with the host's aerosol as the Mie medium (IlluminatoramaRenderer picks these
+// when the sky uniforms it is given carry one — `VolumetricCloudRenderer.aerosolRequested(in:)`).
+kernel void illumi_cloud_inview_aerosol(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    depth2d<float,   access::read>   gDepth      [[texture(2)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    constant CloudInViewUniforms &cv             [[buffer(1)]],
+    device const VSBurstLight* burstLights       [[buffer(2)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    illumiCloudInViewImpl<false>(outTex, noiseVol, gDepth, u, cv, burstLights,
+                                 reinterpret_cast<device const float4*>(burstLights), gid,
+                                 NishitaMieAerosol(u.aerosolA, u.aerosolB));
+}
+
+kernel void illumi_cloud_inview_ms_aerosol(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    depth2d<float,   access::read>   gDepth      [[texture(2)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    constant CloudInViewUniforms &cv             [[buffer(1)]],
+    device const VSBurstLight* burstLights       [[buffer(2)]],
+    device const float4* skyLUT                  [[buffer(3)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    illumiCloudInViewImpl<true>(outTex, noiseVol, gDepth, u, cv, burstLights, skyLUT, gid,
+                                NishitaMieAerosol(u.aerosolA, u.aerosolB));
 }
 
 // Depth-aware upsample of a downsampled in-view cloud march into the HDR composite. Sky pixels

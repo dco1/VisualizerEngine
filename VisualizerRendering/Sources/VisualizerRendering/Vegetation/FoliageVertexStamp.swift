@@ -84,4 +84,25 @@ public enum FoliageVertexStamp {
                              backlight.alpha)
         for i in vertices.indices { vertices[i].color = c }
     }
+
+    /// Stamp PER-VERTEX colours + the backlight flag over a baked foliage group — for a plant whose
+    /// generator PAINTED its leaves (`PaintedMesh.colors`: one albedo per mesh vertex, in the order
+    /// the bake kept them), rather than handing over bare geometry for one flat stamp.
+    ///
+    /// `value` scales every colour: pass `1 + shadeJitter(seed:)` for the per-plant shade variation.
+    /// It is a MULTIPLY, not the flat stamp's add, and that matters once the leaves are the right
+    /// darkness: ±0.07 added to a fig leaf's 0.036 red nearly doubles it or zeroes it, where ×(1 ±
+    /// 0.07) moves a dark leaf and a light one by the same proportion.
+    public static func stamp(_ vertices: inout [IlluminatoramaVertex],
+                             colors: [SIMD3<Float>],
+                             backlight: Backlight,
+                             value: Float = 1) {
+        precondition(colors.count == vertices.count,
+                     "a painted foliage group needs exactly one colour per baked vertex")
+        let a = backlight.alpha
+        for i in vertices.indices {
+            let c = colors[i] * value
+            vertices[i].color = SIMD4<Float>(max(0, c.x), max(0, c.y), max(0, c.z), a)
+        }
+    }
 }
