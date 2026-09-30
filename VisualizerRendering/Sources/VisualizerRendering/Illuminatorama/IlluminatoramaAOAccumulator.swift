@@ -44,7 +44,8 @@ final class IlluminatoramaAOAccumulator {
         var transportRayMask: UInt32
         var fullWidth: UInt32
         var fullHeight: UInt32
-        var reserved0: UInt32 = 0
+        /// DH-0715 — the traced-origin snap's reach in depth ULPs (0 ⇒ off; was `reserved0`).
+        var surfaceSnapULPs: Float = 0
         var reserved1: UInt32 = 0
         var reserved2: UInt32 = 0
     }

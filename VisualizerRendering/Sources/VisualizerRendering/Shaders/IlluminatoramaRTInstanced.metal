@@ -137,7 +137,10 @@ struct RTInstUniforms {
     // Daydream DH-0887 — the GI directions' progressive index: +1 per TLAS lighting dispatch,
     // CONTIGUOUS (unlike `frameSeed`, which the glass pass also advances). Ray `g` of a dispatch is
     // point `giProgressiveIndex·giRays + g` of the pixel's own Owen-scrambled Sobol sequence.
-    uint  giProgressiveIndex; uint _padProg0; uint _padProg1; uint _padProg2;
+    uint  giProgressiveIndex;
+    // Daydream DH-0715 — the traced-origin snap's depth-ULP reach (`illumiSnapToVisibleSurface`;
+    // 0 ⇒ off). Was `_padProg0` — same 4 bytes, stride unchanged.
+    float surfaceSnapULPs; uint _padProg1; uint _padProg2;
 };
 
 // ── Curve primitives (#60 item 7) ────────────────────────────────────────────
@@ -380,7 +383,11 @@ kernel void illumi_rt_lighting_tlas(
 
     float2 ndc = (float2(gid) + 0.5) / float2(u.width, u.height) * 2.0 - 1.0;
     ndc.y = -ndc.y;
-    float3 P = worldPosFromDepth(ndc, depth, u.invViewProjection);
+    // Rays leave from the surface the camera SEES (a substrate's biased depth buries the
+    // rebuilt point — see `illumiSnapToVisibleSurface`).
+    float3 P = illumiSnapToVisibleSurface(accel, worldPosFromDepth(ndc, depth, u.invViewProjection),
+                                          u.cameraWorldPos, ndc, depth, u.invViewProjection,
+                                          u.surfaceSnapULPs);
     half4 nrH = gNormalRgh.read(gid);
     half4 amH = gAlbedoMet.read(gid);
     float3 N = octDecode(float2(nrH.rg));

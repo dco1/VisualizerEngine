@@ -40,7 +40,7 @@ struct RTAOv2Uniforms {
     uint     transportRayMask;    // 0x01 opaque | 0x04 invisible occluder (glass excluded)
     uint     fullWidth;           // full-res depth dims (AO is half-res)
     uint     fullHeight;
-    uint     _reserved0;
+    float    surfaceSnapULPs;     // DH-0715 traced-origin snap reach (0 ⇒ off; was _reserved0)
     uint     _reserved1;
     uint     _reserved2;
 };
@@ -100,6 +100,13 @@ kernel void illumi_rtao_tlas_v2(
     // `min_distance` is tiny on purpose: the old 4 mm guard ignored the near wall for any texel
     // within 4 mm of a crease — a bright line one to three texels wide down every wall/floor
     // junction. With the origin lifted off the true plane, no upper-hemisphere ray can re-hit it.
+    // DH-0715 — onto the surface the camera SEES: a substrate's biased depth buries P (the
+    // neighbours shift with it, so N above is still the ground's). See `illumiSnapToVisibleSurface`.
+    float2 ndcP = (float2(p) + 0.5) / fdim * 2.0 - 1.0;
+    ndcP.y = -ndcP.y;
+    P = illumiSnapToVisibleSurface(accel, P, u.cameraWorldPos.xyz, ndcP, depth, u.invViewProjection,
+                                   u.surfaceSnapULPs);
+    toCam = u.cameraWorldPos.xyz - P;
     float dist = length(toCam);
     float3 origin = P + N * max(u.rayTMin, 2e-4 * dist);
 

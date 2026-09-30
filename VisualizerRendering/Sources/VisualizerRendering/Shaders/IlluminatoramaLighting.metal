@@ -1192,6 +1192,13 @@ kernel void illumi_lighting(
     uint   fragLayer = gLayer.read(gid).r;
 
     float3 worldPos = worldPosFromDepth(ndc, depth, frame.invViewProjection);
+    // Traced rays leave from the surface the camera SEES, not from a depth-rebuilt point that
+    // a substrate bias (or range) buried behind it — see `illumiSnapToVisibleSurface`.
+    float3 rtPos = worldPos;
+    if (kLightingRTSunShadow && kLightingShadowEnabled) {
+        rtPos = illumiSnapToVisibleSurface(rtSunAccel, worldPos, frame.cameraWorldPos, ndc, depth,
+                                           frame.invViewProjection, frame.rtSurfaceSnap.x);
+    }
     // Surface → eye. Under a PARALLEL projection the eye is not a point: every
     // pixel is viewed along the same direction, so `cameraWorldPos − worldPos`
     // (which fans out from a finite eye) would put a fake radial gradient in
@@ -1230,7 +1237,7 @@ kernel void illumi_lighting(
     // to what it compiled to before this constant existed.
     float visibility;
     if (kLightingRTSunShadow && kLightingShadowEnabled) {
-        visibility = rtSunSoftVisibility(rtSunAccel, frame, worldPos, N, Ld, gid);
+        visibility = rtSunSoftVisibility(rtSunAccel, frame, rtPos, N, Ld, gid);
     } else {
         visibility = sunVisibility(shadowMap, shadowSampler, frame,
                                    worldPos, N, NdotL_sun);
@@ -1558,7 +1565,7 @@ kernel void illumi_lighting(
                                               ltcMat, ltcMag, areaLTC);
             float lum = dot(unshadowed, float3(0.2126, 0.7152, 0.0722));
             if (lum <= kRTAreaShadowSkipLuma) { areaSum += unshadowed; continue; }
-            visibility = rtAreaVisibility(rtSunAccel, frame, al, worldPos, N, gid, i);
+            visibility = rtAreaVisibility(rtSunAccel, frame, al, rtPos, N, gid, i);
             areaSum += visibility * unshadowed;
             continue;
         } else if (al.shadowSliceIndex >= 0) {

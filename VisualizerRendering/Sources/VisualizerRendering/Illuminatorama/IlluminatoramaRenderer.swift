@@ -1942,6 +1942,21 @@ public final class IlluminatoramaRenderer {
     /// is a handful of pixels. Doubling again would start eating into the near figure.
     public var substrateDepthBias: Float = 32
 
+    /// **Traced rays leave from the surface the camera sees** (Daydream DH-0715). The substrate's
+    /// depth bias above buries its depth-rebuilt world position BEHIND the surface — ≈ 10 cm down
+    /// the view ray at 50 m — so every traced sun, portal, bounce and AO ray from the ground started
+    /// underground and hit it from below: Daydream's settled canvas and exports put a sunlit noon
+    /// lawn in full shadow (sRGB luma 40 vs 153 on the shadow-map path). With this on, each traced
+    /// pass first probes from the rebuilt point back toward the camera (`illumiSnapToVisibleSurface`)
+    /// and moves the ray origin onto the surface it meets; a point not buried meets nothing and is
+    /// unchanged. Effective only while `substrateMeshKinds` is non-empty (reach: twice
+    /// `substrateDepthBias`), so a host with no substrate is byte-identical.
+    public var rtSurfaceSnapEnabled: Bool = true
+    /// The snap reach the traced passes receive, in depth ULPs (0 ⇒ no probe).
+    var effectiveRTSurfaceSnapULPs: Float {
+        rtSurfaceSnapEnabled && !substrateMeshKinds.isEmpty ? max(0, substrateDepthBias) * 2 : 0
+    }
+
     /// PCF kernel radius in shadow-map texels: 0 = single tap, 1 = 3×3, 2 = 5×5.
     public var shadowPcfRadius: UInt32 = 1
     /// How far from the camera the outermost cascade extends, in metres. Past
@@ -4453,7 +4468,9 @@ public final class IlluminatoramaRenderer {
         var interiorRoomGainMeta: SIMD4<Float> = .zero
         // DH-0887 — the GI directions' contiguous progressive index (Metal twin appended last).
         var giProgressiveIndex: UInt32 = 0
-        var padProg0: UInt32 = 0, padProg1: UInt32 = 0, padProg2: UInt32 = 0
+        /// DH-0715 — the traced-origin snap's reach (was `padProg0`, same 4 bytes).
+        var surfaceSnapULPs: Float = 0
+        var padProg1: UInt32 = 0, padProg2: UInt32 = 0
 
         mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
             let p = InteriorRoomGains.pack(gains, enabled: enabled)
@@ -9456,6 +9473,7 @@ public final class IlluminatoramaRenderer {
             reflEnabled: rtReflectionsEnabled ? 1 : 0)
         // DH-0887 — the GI's progressive sample index: contiguous per dispatch of THIS pass.
         u.giProgressiveIndex = rtGIProgressiveIndex
+        u.surfaceSnapULPs = effectiveRTSurfaceSnapULPs
         rtGIProgressiveIndex &+= 1
         // DH-0896 — a reflection hit REPLACES the sky the deferred pass put there.
         let specIBLOn = rtReflectionsEnabled && specIBLWrittenThisFrame && specIBLTexture != nil
@@ -12794,7 +12812,8 @@ public final class IlluminatoramaRenderer {
             radius: radius, intensity: intensity, rayTMin: 0.001,
             rayCount: UInt32(rays), sampleBase: 0, scramble: aoAccumulationScramble,
             transportRayMask: 0x01 | 0x04,
-            fullWidth: UInt32(width), fullHeight: UInt32(height))
+            fullWidth: UInt32(width), fullHeight: UInt32(height),
+            surfaceSnapULPs: effectiveRTSurfaceSnapULPs)
         let encoded = acc.encode(device: device,
                                  encoder: { [unowned self] label in self.timedComputeEncoder(cb, label) },
                                  dispatch: { [unowned self] enc, p, w, h in self.dispatch(enc, pipeline: p, width: w, height: h) },
@@ -15138,6 +15157,7 @@ public final class IlluminatoramaRenderer {
         u.scotopicParams = SIMD4<Float>(max(0, scotopicKnee), max(0, scotopicTint.x), max(0, scotopicTint.y), max(0, scotopicTint.z))
         // Pre-exposure + hue-stable toe (all zero by default ⇒ the shader's legacy paths).
         let toeHi = max(0, hueStableToe.y)
+        u.rtSurfaceSnap = SIMD4<Float>(effectiveRTSurfaceSnapULPs, 0, 0, 0)
         u.displayParams = SIMD4<Float>(preExposureDivisor == 1 ? 0 : preExposureDivisor,
                                        toeHi > 0 ? max(0, min(hueStableToe.x, toeHi * 0.999)) : 0, toeHi,
                                        toeHi > 0 && hueStableToeBareLevel ? 1 : 0)

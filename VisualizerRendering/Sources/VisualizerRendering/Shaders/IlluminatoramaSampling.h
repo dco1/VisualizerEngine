@@ -20,6 +20,7 @@
 #define ILLUMI_SAMPLING_H
 
 #include <metal_stdlib>
+#include <metal_raytracing>
 using namespace metal;
 
 /// Concentric (Shirley–Chiu) square → disk map: adjacent strata stay adjacent.
@@ -105,6 +106,50 @@ static inline float3 illumiCosineHemisphereAxisSafe(float3 n, float2 u) {
     float z = sqrt(max(0.0, 1.0 - dot(d, d)));
     float3 t, b; illumiONBAxisSafe(n, t, b);
     return t * d.x + b * d.y + n * z;
+}
+
+// ── Traced-ray origins on the surface the camera SEES (Daydream DH-0715) ──────────
+//
+// Every traced pass rebuilds a pixel's world position from the depth buffer. That depth is
+// not always the surface's: a SUBSTRATE draw (`IlluminatoramaRenderer.substrateMeshKinds` —
+// the ground a road or a driveway is laid flush on) is written `substrateDepthBias` ULPs
+// FURTHER than it is, so the thing laid on it wins the depth test at any distance, and plain
+// float-depth precision loses millimetres at range besides. The rebuilt point then sits BEHIND
+// its own surface — for the ground, underground: at 50 m, 32 ULPs of a `zNear` 0.05 buffer is
+// ≈ 10 cm down the view ray — and every ray leaving it hits the ground from below. Measured on
+// Daydream Home's default orbit at noon: the traced sun left the whole lawn in shadow (sRGB
+// luma 40 against 153 with the shadow map), and the traced bounce, whose misses ARE the sky,
+// saw no sky from it.
+//
+// The fix is exact rather than a bigger offset: the camera sees this pixel, so the segment
+// from the surface back toward the camera is empty. Probe it, up to the reach `snapULPs` of
+// depth error spans at this pixel; the first opaque surface met IS the one the point is buried
+// under, and the ray origin moves onto it. A point already on (or in front of) its surface
+// meets nothing and is returned unchanged, so only buried points move, and each lands exactly
+// on the geometry. Mask 0x01 only: glass and the invisible occluders are not what the camera
+// sees. `snapULPs` 0 ⇒ no probe, the input unchanged — byte-identical for every host that
+// declares no substrate.
+static inline float3 illumiSnapToVisibleSurface(
+    metal::raytracing::instance_acceleration_structure accel,
+    float3 P, float3 cameraPos, float2 ndc, float depth, float4x4 invVP, float snapULPs)
+{
+    if (snapULPs <= 0.0f) return P;
+    // The world distance `snapULPs` depth steps span at this pixel, along its view ray.
+    float step = as_type<float>(as_type<uint>(depth) + 1u) - depth;
+    float4 q = invVP * float4(ndc, max(depth - snapULPs * step, 0.0f), 1.0f);
+    float reach = length(q.xyz / q.w - P);
+    float3 toCam = cameraPos - P;
+    float d = length(toCam);
+    if (!(reach > 0.0f) || !(d > 0.0f)) return P;
+    metal::raytracing::ray r;
+    r.origin = P;
+    r.direction = toCam / d;
+    r.min_distance = 0.0f;
+    r.max_distance = min(reach, d);
+    metal::raytracing::intersector<metal::raytracing::triangle_data, metal::raytracing::instancing> isect;
+    isect.set_triangle_cull_mode(metal::raytracing::triangle_cull_mode::none);
+    auto h = isect.intersect(r, accel, 0x01u);
+    return (h.type != metal::raytracing::intersection_type::none) ? P + r.direction * h.distance : P;
 }
 
 #endif

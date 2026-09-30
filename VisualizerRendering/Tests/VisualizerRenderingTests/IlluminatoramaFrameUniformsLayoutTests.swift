@@ -36,13 +36,14 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
     /// `static_assert(sizeof(FrameUniforms) == 1584)` in IlluminatoramaCommon.h; 1584 → 1648
     /// with the physical night sky + scotopic shaping (`nightSkyExtra`, `nightSkyExtra2`,
     /// `nightCelestial`, `scotopicParams`), pinned by the same static_assert at 1648; 1648 → 1664
-    /// with the display-chain cluster (`displayParams`: HDR pre-exposure + hue-stable toe).
+    /// with the display-chain cluster (`displayParams`: HDR pre-exposure + hue-stable toe); 1664 →
+    /// 1680 with the traced-ray origin snap (`rtSurfaceSnap`, Daydream DH-0715).
     /// Verified against Metal by compiling a scratch kernel carrying
     /// `static_assert(sizeof(FrameUniforms) == 1568)`, which holds while the same assert at
     /// 1552 fails — i.e. the assert is live, not a tautology. (`offsetof` is not available
     /// in Metal; the tail offsets below are the Swift-side half of the check, and the fields
     /// are APPENDED, so stride pins them.)
-    private static let metalStride = 1664
+    private static let metalStride = 1680
 
     func testFrameUniformsStrideMatchesMetal() {
         XCTAssertEqual(MemoryLayout<IlluminatoramaFrameUniforms>.stride,
@@ -105,6 +106,7 @@ final class IlluminatoramaFrameUniformsLayoutTests: XCTestCase {
         assertOffset(\.nightCelestial,        1616, "nightCelestial")
         assertOffset(\.scotopicParams,        1632, "scotopicParams")
         assertOffset(\.displayParams,         1648, "displayParams")
+        assertOffset(\.rtSurfaceSnap,         1664, "rtSurfaceSnap")
     }
 
     /// The packing the shader's `gains[b >> 2][b & 3]` assumes, held on the Swift side that

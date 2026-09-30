@@ -547,8 +547,12 @@ struct FrameUniforms {
     //                (`hueStableToeBareLevel`); 0 ⇒ the shipped transform's level.
     // ONE new 16-byte cluster (stride 1648 → 1664); mirror of IlluminatoramaFrameUniforms.
     float4   displayParams;
+    // Traced-ray origin snap (Daydream DH-0715, `illumiSnapToVisibleSurface`): x = how many
+    // depth ULPs the depth-rebuilt point may sit behind the surface the camera sees (0 ⇒ off,
+    // byte-identical); yzw reserved. ONE new 16-byte cluster (stride 1664 → 1680).
+    float4   rtSurfaceSnap;
 };
-static_assert(sizeof(FrameUniforms) == 1664, "FrameUniforms must match IlluminatoramaFrameUniforms (1664 bytes)");
+static_assert(sizeof(FrameUniforms) == 1680, "FrameUniforms must match IlluminatoramaFrameUniforms (1680 bytes)");
 
 // Secondary directional light (#60 task 5). Mirror of Swift
 // IlluminatoramaDirectionalLight. `dir` points TOWARD the light (world space,
