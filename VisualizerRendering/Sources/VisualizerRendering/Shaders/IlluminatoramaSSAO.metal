@@ -116,6 +116,14 @@ static inline float gtaoPlaneWeight(float3 d, float3 Ngeo, float dist) {
     return smoothstep(kPlaneBias * dist, kPlaneBiasFull * dist, dot(d, Ngeo));
 }
 
+/// **Thin-step guard for the WIDE ring (DH-0963).** `gtaoPlaneWeight` is RELATIVE to distance, so a
+/// 6 mm recessed-can trim lip 30 cm away already reads as a full occluder, and the wide ring
+/// smeared a dark halo with streaks under every ceiling downlight in the live canvas. The ring
+/// exists to ground furniture-scale objects; an occluder that stands less than ~1 cm off the
+/// surface is trim, not furniture. Ramp 1 cm -> 3 cm so nothing pops.
+static inline float gtaoRingHeightWeight(float3 d, float3 Ngeo) {
+    return smoothstep(0.01, 0.03, dot(d, Ngeo));
+}
 
 // **Why there IS a guard, after shipping without one.** DH-0527 first shipped this march
 // with no tangent-plane test at all, on the reasoning that the live canvas's TAA +
@@ -415,11 +423,13 @@ kernel void illumi_ssao(
                 float t = mix(kGtaoMinPix, farMaxPix, frac * frac);
                 float2 off = omega * t;
                 if (gtaoTap(gDepth, float2(fullGid) + off, fdim, frame.invProjection, Pview, d, dist)) {
-                    float fall = gtaoRingFalloff(dist, radius, farRadius) * gtaoPlaneWeight(d, Ngeo, dist);
+                    float fall = gtaoRingFalloff(dist, radius, farRadius) * gtaoPlaneWeight(d, Ngeo, dist)
+                                 * gtaoRingHeightWeight(d, Ngeo);
                     unionPos = max(unionPos, mix(-1.0, dot(d / dist, V), fall));
                 }
                 if (gtaoTap(gDepth, float2(fullGid) - off, fdim, frame.invProjection, Pview, d, dist)) {
-                    float fall = gtaoRingFalloff(dist, radius, farRadius) * gtaoPlaneWeight(d, Ngeo, dist);
+                    float fall = gtaoRingFalloff(dist, radius, farRadius) * gtaoPlaneWeight(d, Ngeo, dist)
+                                 * gtaoRingHeightWeight(d, Ngeo);
                     unionNeg = max(unionNeg, mix(-1.0, dot(d / dist, V), fall));
                 }
             }
