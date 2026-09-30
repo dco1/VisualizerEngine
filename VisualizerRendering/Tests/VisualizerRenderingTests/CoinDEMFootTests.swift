@@ -738,8 +738,11 @@ final class CoinDEMFootTests: XCTestCase {
 
     func testAddFootRefusesTheLegacySolver() throws {
         let (s, _) = try makeSolver()
-        s.solverMode = .legacy
+        // Spawn on the constraint path FIRST: the worker is a ballasted egg, and `spawnEgg`
+        // asserts `.constraint` (legacy has no ovoid narrowphase) — switching before the spawn
+        // trapped the whole debug test process (Daydream DH-0959).
         let w = try XCTUnwrap(spawnWorker(s))
+        s.solverMode = .legacy
         XCTAssertFalse(s.addFoot(body: w, spec: .weebleWorker()), "the legacy substep has no foot hooks: refuse, don't no-op")
         XCTAssertFalse(s.hasFoot(body: w))
         s.solverMode = .constraint

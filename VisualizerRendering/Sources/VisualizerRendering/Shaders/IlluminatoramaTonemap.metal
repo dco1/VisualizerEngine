@@ -414,6 +414,17 @@ static inline float3 agxWithoutLook(float3 v) {
     return saturate(pow(max(v, 0.0), float3(2.2)));
 }
 
+/// The exact sRGB OETF / EOTF pair — what the `.bgra8Unorm_srgb` store applies to the
+/// linear value this pass writes. For a post-tonemap effect whose size must be judged in
+/// the code values the viewer actually sees (the grain, the exact-sRGB dither).
+static inline float3 illumiSRGBEncode(float3 lin) {
+    float3 m = saturate(lin);
+    return select(1.055 * pow(m, float3(1.0 / 2.4)) - 0.055, m * 12.92, m <= 0.0031308);
+}
+static inline float3 illumiSRGBDecode(float3 srgb) {
+    return select(pow((srgb + 0.055) / 1.055, float3(2.4)), srgb / 12.92, srgb <= 0.04045);
+}
+
 /// The scene → display rendering this frame asked for. 0 keeps the shipped per-channel
 /// Rec.709 curve exactly, so every existing baseline is untouched.
 static inline float3 displayTransform(float3 scene, uint which) {
@@ -1355,13 +1366,32 @@ fragment float4 illumi_tonemap_fs(
         const float norm = 1.0 / sqrt(kShared * kShared + kOwn * kOwn);
         float3 nRGB = (kShared * n[0] + kOwn * float3(n[1], n[2], n[3])) * norm;
         // ── …and it is not a symmetric parabola ──────────────────────────────────
-        // `4·l·(1−l)` peaks exactly at mid-grey and dies at both ends at the same rate.
         // Negative grain is roughly constant in DENSITY, so through the print the visible
         // granularity peaks in the mid-to-LOW tones with a long tail into the shadows and a
         // short one into the highlights, where the dye is thin. Asymmetric on purpose.
-        float lumG = dot(mapped, float3(0.2126, 0.7152, 0.0722));
-        float mask = smoothstep(0.0, 0.12, lumG) * (1.0 - smoothstep(0.55, 1.0, lumG));
-        mapped = saturate(mapped + nRGB * frame.filmGrainStrength * mask);
+        //
+        // "Visible" is the operative word, so the mask AND the noise both live in the
+        // ENCODED (sRGB) domain — the code values the viewer sees. Daydream DH-0958: the
+        // first cut of this mask was evaluated on LINEAR luma and its noise added in linear,
+        // so the store's OETF — ~1.8× steeper at a shaded wall (linear 0.09) than at a lit
+        // sheet — amplified the darks a second time on top of the mask's own shadow tail.
+        // Measured on a settled bedroom at dial 0.18: 6.3 code values of grain on the
+        // sRGB 70–110 walls (44 % of the frame) against 2.5 under the old `4·l·(1−l)` and
+        // 1.3–1.6 of ray-traced sampling noise — the grain read as a noisy render. Per
+        // channel in linear it also swung a saturated surface's DARK channel hardest (the
+        // blue of an orange wall), which is colour speckle, not dye-layer grain.
+        //
+        // Flat across the lower mids (sRGB ≈ 77–140), a long tail to black, a shorter one to
+        // white. Calibration: at 18 % grey (encoded 0.461, inside the plateau) the swing
+        // equals the old linear parabola's there — 4·0.18·0.82 × the OETF slope at 0.18 =
+        // 0.7057 — so the strength dial means what it always did at the photographic
+        // reference. Same bedroom, same dial: ~1.8 on the walls, 0.8 in highlights.
+        const float kMidGreyEncodedGain = 0.7057;
+        float3 enc = illumiSRGBEncode(mapped);
+        float lumE = illumiSRGBEncode(float3(dot(mapped, float3(0.2126, 0.7152, 0.0722)))).x;
+        float mask = smoothstep(0.0, 0.30, lumE) * (1.0 - smoothstep(0.55, 1.0, lumE));
+        enc = saturate(enc + nRGB * (frame.filmGrainStrength * kMidGreyEncodedGain * mask));
+        mapped = illumiSRGBDecode(enc);
     }
 
     // ── Colour-grade LUT (issue #65) ──────────────────────────────────────────
@@ -1405,10 +1435,8 @@ fragment float4 illumi_tonemap_fs(
             // legacy pow(1/2.2) below is up to ~5× steeper than the OETF's linear toe, so its
             // ±1 LSB shrinks to ±0.2–0.5 of a real code in the lowest codes — exactly where a
             // night frame's walls live.
-            float3 m = saturate(mapped);
-            float3 srgb = select(1.055 * pow(m, float3(1.0 / 2.4)) - 0.055, m * 12.92, m <= 0.0031308);
-            srgb = saturate(srgb + tpdf * (1.0 / 255.0));
-            mapped = select(pow((srgb + 0.055) / 1.055, float3(2.4)), srgb / 12.92, srgb <= 0.04045);
+            float3 srgb = saturate(illumiSRGBEncode(mapped) + tpdf * (1.0 / 255.0));
+            mapped = illumiSRGBDecode(srgb);
         } else {
             float3 srgb = pow(mapped, float3(1.0 / 2.2));   // approx sRGB encode
             srgb += tpdf * (1.0 / 255.0);                    // ±1 LSB at 8-bit
