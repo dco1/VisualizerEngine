@@ -749,7 +749,12 @@ public enum MaterialGenerator {
     /// Left at 0.22. It was raised to 0.30 "to carry what the tone was doing", then measured:
     /// across a 7.5× sweep (0.30 → 0.04) the rendered panel is indistinguishable. Roughness is
     /// not the carrier here; `brushStreakHeightAmp` below is.
-    public nonisolated(unsafe) static var brushStreakRoughnessAmp: Double = 0.22
+    ///
+    /// **0.10 since DH-0965 (2026-09-30).** The note above was measured on a bake whose streak
+    /// repeated inside the tile and whose finer octaves were past Nyquist; on the band-limited
+    /// `brushedMetal` recipe the gloss streak IS a visible centimetre band, so it is held to a
+    /// faint drift (0.10 and 0.04 were indistinguishable on the Sunset range sheet).
+    public nonisolated(unsafe) static var brushStreakRoughnessAmp: Double = 0.10
 
     /// Amplitude of the brush streak in HEIGHT — `deriveNormals` turns this into the normal
     /// map, and **this is what drew the corduroy.**
@@ -765,42 +770,108 @@ public enum MaterialGenerator {
     /// (`steel-corduroy-{before,h20,h8,h3}`): 0.5 corrugates, **0.20 keeps a fine directional
     /// grain that reads as brushed satin**, 0.08 is nearly gone and 0.03 is a smooth panel. So
     /// the brushed read survives and the ribs do not.
-    public nonisolated(unsafe) static var brushStreakHeightAmp: Double = 0.20
+    ///
+    /// **0 since DH-0965 (2026-09-30): the brushed family bakes NO relief.** At ~2 mm a texel any
+    /// relief is a centimetre stripe — 0.20 on the rebuilt recipe drew the horizontal banding
+    /// Danny called out on the Sunset range ("still needs refining on the horizontal"), and every
+    /// arm at ≤ 0.05 read as flat satin beside maps-off stainless. The brush a person sees is the
+    /// detail-band hairline (`brushHairlineStrength`) plus the anisotropic lobe.
+    public nonisolated(unsafe) static var brushStreakHeightAmp: Double = 0
 
     public static func brushedSteel(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 6,
                                     base baseIn: Vec3 = Vec3(0.58, 0.585, 0.59)) -> MaterialChannels {
         let legacy = legacyTonalBrushStreakForTest
-        let base = legacy ? Vec3(0.66, 0.64, 0.60) : baseIn
+        guard legacy else {
+            return brushedMetal(size: size, seed: seed, base: baseIn, roughness: 0.28,
+                                acrossCells: 96, clearcoat: 0, microSeed: seed ^ 0xB2)
+        }
+        // The pre-2026-08-11 bake, frozen for the corduroy A/B — including the periodic
+        // `v · 24` stripe the shared recipe below no longer draws. Never shipped.
+        let base = Vec3(0.66, 0.64, 0.60)
         var ch = MaterialChannels(size: size, category: .metal)
-        var grain = [Vec2](repeating: Vec2(1, 0), count: size * size)   // brush runs along X
         for y in 0..<size {
             for x in 0..<size {
                 let u = Double(x) / Double(size), v = Double(y) / Double(size)
-                // streaks: high frequency ACROSS the brush (v), low along it (u)
                 let streak = Noise.fbmTiled(u * 2, v * 24, baseCells: 4, octaves: 3, seed: seed)
                 let fine = Noise.fbmTiled(u * 1, v * 64, baseCells: 6, octaves: 2, seed: seed ^ 0x55)
-
-                // FLAT albedo — a brushed metal's grain is a roughness/normal phenomenon, and
-                // its albedo is its F0. See the note above for the measurement that says so.
-                ch.albedo[ch.idx(x, y)] = clampBand(legacy ? base * (0.88 + 0.20 * streak) : base)
-                // …so roughness carries the whole brush. Amplitude raised 0.22 → 0.30 across
-                // the grain to take over what the tone was doing; the fine cross-hatch and the
-                // 0.28 mean are unchanged, so the satin level is where it was.
-                ch.roughness[ch.idx(x, y)] = clamp01(
-                    0.28 + (streak - 0.5) * (legacy ? 0.22 : brushStreakRoughnessAmp)
-                         + (fine - 0.5) * 0.10)
-                ch.height[ch.idx(x, y)] = clamp01(
-                    0.5 + (streak - 0.5) * (legacy ? 0.5 : brushStreakHeightAmp))
-                grain[ch.idx(x, y)] = Vec2(1, 0)
+                ch.albedo[ch.idx(x, y)] = clampBand(base * (0.88 + 0.20 * streak))
+                ch.roughness[ch.idx(x, y)] = clamp01(0.28 + (streak - 0.5) * 0.22 + (fine - 0.5) * 0.10)
+                ch.height[ch.idx(x, y)] = clamp01(0.5 + (streak - 0.5) * 0.5)
             }
         }
-        ch.grainTangent = grain
+        ch.grainTangent = [Vec2](repeating: Vec2(1, 0), count: size * size)
         ch.deriveNormals(strength: 2)
-        // Fine satin micro-tooth between the brush grooves — a real brushed-steel face
-        // isn't a mirror at close range. Subtle so it doesn't drown the anisotropic streak.
         addMicroDetail(&ch, seed: seed ^ 0xB2, baseCells: 100, strength: 0.30)
         return ch
     }
+
+    /// **The brushed-metal recipe — ONE for the whole family** (Brushed Steel / Stainless,
+    /// Aluminum, Brushed Nickel). Each used to carry its own, and the two copies that were not
+    /// brushed steel's had drifted into every defect brushed steel had already been cured of
+    /// (Daydream DH-0965 — a range finished in Aluminum read as corrugated sheet):
+    ///
+    /// * **Stretched on a non-square lattice, never a scaled coordinate.** `fbmTiled(u · 40, …)`
+    ///   tiles one strip forty times: an exactly periodic 25 mm rib on a 1 m millwork tile.
+    ///   `Noise.fbmTiledAniso` puts `alongCells × acrossCells` distinct cells over the tile.
+    /// * **Streaked ALONG the grain it declares.** Features are long in U (few cells along,
+    ///   many across) and the tangent is +U — Aluminum and Nickel had it the other way round,
+    ///   so the anisotropic lobe stretched the highlight across the streaks it was drawn over.
+    /// * **Flat albedo.** A metal's albedo IS its F0; the brush is roughness and relief
+    ///   (the 2026-08-11 "tan corduroy" correction, above).
+    /// * **Band-limited.** No octave finer than two texels per cell — past that the lattice
+    ///   is per-texel noise, which the normal derivation turns into sparkle.
+    ///
+    /// The streak amplitudes are brushed steel's measured ones (`brushStreakRoughnessAmp`,
+    /// `brushStreakHeightAmp`); a member differs only in its tint, satin level, lacquer and how
+    /// fine its brush is (`acrossCells` per tile).
+    static func brushedMetal(size: Int, seed: UInt64, base: Vec3, roughness: Double,
+                             acrossCells: Int, clearcoat: Double, microSeed: UInt64) -> MaterialChannels {
+        var ch = MaterialChannels(size: size, category: .metal)
+        let along = 8
+        let limit = max(along, size / 2)           // two texels per cell, even on the first octave
+        let across = min(acrossCells, limit)
+        let streakOctaves = Noise.bandLimitedOctaves(3, baseCells: across, size: size)
+        let fineAcross = min(across * 4, limit)
+        let fineOctaves = Noise.bandLimitedOctaves(2, baseCells: fineAcross, size: size)
+        let flat = clampBand(base)
+        for y in 0..<size {
+            for x in 0..<size {
+                let u = Double(x) / Double(size), v = Double(y) / Double(size)
+                let streak = Noise.fbmTiledAniso(u, v, cellsX: along, cellsY: across,
+                                                 octaves: streakOctaves, seed: seed)
+                let fine = Noise.fbmTiledAniso(u, v, cellsX: along, cellsY: fineAcross,
+                                               octaves: fineOctaves, seed: seed ^ 0x55)
+                ch.albedo[ch.idx(x, y)] = flat
+                ch.roughness[ch.idx(x, y)] = clamp01(
+                    roughness + (streak - 0.5) * brushStreakRoughnessAmp + (fine - 0.5) * 0.10)
+                ch.height[ch.idx(x, y)] = clamp01(0.5 + (streak - 0.5) * brushStreakHeightAmp)
+            }
+        }
+        ch.grainTangent = [Vec2](repeating: Vec2(1, 0), count: size * size)   // brush runs along U
+        ch.clearcoat = clearcoat
+        ch.deriveNormals(strength: 2)
+        // The HAIRLINE — the brush a person actually sees, drawn where it can exist. A real
+        // brushed line is ~0.1–0.5 mm; the base bake is ~2 mm a texel on a 1 m tile, so there it
+        // can only be a centimetre stripe (the banding). The detail band tiles
+        // `detailNormalUVScale` (8×) finer — ~0.24 mm a texel — and a metal is the one surface
+        // whose specular shows it (the detail band is inert on dielectrics). Long along U with
+        // the grain tangent, a few along-cells so each line runs centimetres; one octave, held
+        // to two texels a cell.
+        let hairAlong = 4
+        let hairAspect = max(1, min(64, (size / 2) / hairAlong))
+        addMicroDetail(&ch, seed: microSeed, baseCells: hairAlong, octaves: 1,
+                       strength: brushHairlineStrength, grainAspect: hairAspect, grainAlongU: true)
+        return ch
+    }
+
+    /// Strength of the brushed family's hairline detail normal (`brushedMetal`). Chosen off the
+    /// real-Metal Sunset range sheet (`HouseRenderBridgeGPUTests_BrushedMetalSheet`, DH-0965).
+    /// **0.20.** The hairline is sub-pixel at a room camera, so a stronger one ALIASES into a
+    /// fine horizontal hatch: 0.45 read clean under the older still-lane denoiser but hatched
+    /// once the still started preserving surface grain (round 2 of the sheet: both 0.45 arms
+    /// hatched with or without the gloss streak, 0.20 and 0 did not). 0.20 reads as smooth satin
+    /// beside maps-off stainless and still leaves the detail band live for close range.
+    public nonisolated(unsafe) static var brushHairlineStrength: Double = 0.20
 
     /// Polished concrete — low-reflectance grey whose defining trait is **spatially
     /// varying roughness** (§5): broad fBm blotches of sheen over a matte field, plus
@@ -880,7 +951,7 @@ public enum MaterialGenerator {
     /// lifted — a metal's albedo is its reflectance), but a MATTE one: the whole look is the
     /// oxide, so roughness sits high (0.55–0.85) and drifts spatially. The weathering is
     /// authored VERTICALLY — rain washes the oxide down the face in streaks — so the drift is
-    /// v-directional (`v * 24`, integer for a seamless wrap), with darker rain-runs and the odd
+    /// long down V (`fbmTiledAniso`, 96 × 4 cells), with darker rain-runs and the odd
     /// brighter fresh-oxide bloom. Isotropic (no grain tangent): the streaks are tone, not a
     /// brushed grain the engine should stretch a highlight along.
     public static func corten(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 211,
@@ -889,12 +960,18 @@ public enum MaterialGenerator {
                               runoff: Vec3 = Vec3(0.24, 0.13, 0.09)     // dark rain-streak stain
     ) -> MaterialChannels {
         var ch = MaterialChannels(size: size, category: .metal)
+        let runOctaves = Noise.bandLimitedOctaves(3, baseCells: 96, size: size)
         for y in 0..<size {
             for x in 0..<size {
                 let u = Double(x) / Double(size), v = Double(y) / Double(size)
                 // Broad blotchy patina + vertical rain-runs + fine pit mottle.
                 let patch  = Noise.fbmTiled(u, v, baseCells: 3, octaves: 4, seed: seed)
-                let streak = Noise.fbmTiled(u, v * 24.0, baseCells: 4, octaves: 3, seed: seed ^ 0x5C)
+                // Runs are LONG in V (world-vertical on every wall-facing surface): many cells
+                // across U, few down V, on a non-square lattice. This was `fbmTiled(u, v · 24)` —
+                // features 24× longer in U than V (horizontal bands, not runs) and one strip
+                // tiled 24 times down the face (DH-0965).
+                let streak = Noise.fbmTiledAniso(u, v, cellsX: 96, cellsY: 4,
+                                                 octaves: runOctaves, seed: seed ^ 0x5C)
                 let grit   = Noise.fbmTiled(u, v, baseCells: 30, octaves: 2, seed: seed ^ 0x2B)
                 let run    = pow(streak, 3) * 0.6                        // dark vertical runoff, sparse
                 let flush  = pow(patch, 4) * 0.5                          // bright fresh-oxide bloom
@@ -2558,23 +2635,28 @@ public enum MaterialGenerator {
     /// surface life on every wall/floor/counter — the cheap half of the "looks real" lift (audit
     /// worklist #1). No-op if the material already set its own detail normal.
     ///
-    /// `grainAspect` stretches every feature ALONG V by that factor — the anisotropic micro-relief
-    /// a directional material needs (wood's pore channels run down the board; a round pit is what
-    /// made oak read as corrugated). It multiplies the U frequency rather than dividing V's so the
-    /// coarsest octave keeps its cell count, and it must stay an INTEGER: `fbmTiled` wraps on a
-    /// `cells`-periodic lattice, so a fractional multiplier puts a discontinuity at the UV wrap.
+    /// `grainAspect` stretches every feature by that factor — the anisotropic micro-relief a
+    /// directional material needs — ALONG V by default (wood's pore channels run down the board;
+    /// a round pit is what made oak read as corrugated), or ALONG U with `grainAlongU` (a brushed
+    /// metal's hairline runs with its +U grain tangent). The cross-grain axis gets `aspect ×` the
+    /// cells, so the coarsest octave keeps its along-grain count. It is a real `cellsX × cellsY`
+    /// lattice (`Noise.fbmTiledAniso`): this used to multiply the coordinate instead, which tiles
+    /// one strip `aspect` times — an exact repeat inside the tile (DH-0965).
     static func addMicroDetail(_ ch: inout MaterialChannels, seed: UInt64,
                                baseCells: Int = 96, octaves: Int = 2, strength: Double = 0.9,
-                               occlusionStrength: Double? = nil, grainAspect: Int = 1) {
+                               occlusionStrength: Double? = nil, grainAspect: Int = 1,
+                               grainAlongU: Bool = false) {
         guard ch.detailNormal == nil else { return }
         let n = ch.size
-        let aspect = Double(max(1, grainAspect))
+        let cross = baseCells * max(1, grainAspect)
+        let cellsX = grainAlongU ? baseCells : cross
+        let cellsY = grainAlongU ? cross : baseCells
         var h = [Double](repeating: 0, count: n * n)
         for y in 0..<n {
             for x in 0..<n {
                 let u = Double(x) / Double(n), v = Double(y) / Double(n)
-                h[ch.idx(x, y)] = Noise.fbmTiled(u * aspect, v, baseCells: baseCells,
-                                                 octaves: octaves, seed: seed)
+                h[ch.idx(x, y)] = Noise.fbmTiledAniso(u, v, cellsX: cellsX, cellsY: cellsY,
+                                                      octaves: octaves, seed: seed)
             }
         }
         setDetailRelief(&ch, height: h, strength: strength, occlusionStrength: occlusionStrength)
@@ -2942,29 +3024,13 @@ public enum MaterialGenerator {
         return ch
     }
 
-    /// Brushed nickel — warm silver fixture finish: fine linear grain, thin lacquer coat.
+    /// Brushed nickel — warm silver fixture finish: a finer brush than steel under a thin
+    /// lacquer. A member of the `brushedMetal` family; it used to carry its own recipe, which
+    /// streaked ACROSS its grain tangent as an exactly periodic 15.6 mm rib painted into the
+    /// albedo (DH-0965).
     public static func brushedNickel(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 113) -> MaterialChannels {
-        var ch = MaterialChannels(size: size, category: .metal)
-        let sh = seed
-        let base = Vec3(0.72, 0.70, 0.67)
-        for y in 0..<size {
-            for x in 0..<size {
-                let u = (Double(x) + 0.5) / Double(size)
-                let v = (Double(y) + 0.5) / Double(size)
-                let grain = Noise.fbmTiled(u * 64, v * 2, baseCells: 8, octaves: 3, seed: sh)
-                let macro = 0.92 + 0.16 * Noise.fbmTiled(u, v, baseCells: 2, octaves: 2, seed: sh ^ 0x1F)
-                ch.albedo[ch.idx(x, y)] = clampBand(base * macro * (0.88 + 0.24 * grain))
-                ch.roughness[ch.idx(x, y)] = clamp01(0.22 + (grain - 0.5) * 0.18
-                    + (Noise.fbmTiled(u, v, baseCells: 50, octaves: 2, seed: sh ^ 0x2F) - 0.5) * 0.04)
-                ch.height[ch.idx(x, y)] = clamp01(0.50 + (grain - 0.5) * 0.08)
-            }
-        }
-        ch.grainTangent = [Vec2](repeating: Vec2(1, 0), count: size * size)
-        ch.clearcoat = 0.20
-        ch.deriveNormals(strength: 3)
-        // Fine satin tooth between the grain lines — a brushed-nickel fixture isn't a mirror.
-        addMicroDetail(&ch, seed: seed ^ 0xBD, baseCells: 100, strength: 0.30)
-        return ch
+        brushedMetal(size: size, seed: seed, base: Vec3(0.72, 0.70, 0.67), roughness: 0.22,
+                     acrossCells: 160, clearcoat: 0.20, microSeed: seed ^ 0xBD)
     }
 
     /// The colourway a bare `matteBlack()` bakes — the near-neutral powder-coat black, luma 0.10
@@ -2989,7 +3055,7 @@ public enum MaterialGenerator {
                 let u = (Double(x) + 0.5) / Double(size)
                 let v = (Double(y) + 0.5) / Double(size)
                 let micro = Noise.fbmTiled(u, v, baseCells: 6, octaves: 4, seed: sh)
-                let coat  = Noise.fbmTiled(u * 3, v * 3, baseCells: 5, octaves: 3, seed: sh ^ 0xAA)
+                let coat  = Noise.fbmTiled(u, v, baseCells: 15, octaves: 3, seed: sh ^ 0xAA)   // 15 distinct cells, not 5 tiled 3 × 3 (DH-0965)
                 // Powder-coated matte black is one of the most tonally UNIFORM finishes
                 // there is — its life is entirely the orange-peel tooth below, not blotch.
                 //
@@ -3120,32 +3186,14 @@ public enum MaterialGenerator {
         return ch
     }
 
-    /// Aluminum — anodized brushed finish: warm grey with fine directional grain,
-    /// slightly rougher than chrome, used for window frames and modern fixtures.
+    /// Brushed aluminium — the brightest, slightly more satin member of the `brushedMetal`
+    /// family, under a thin anodised coat. Its own recipe used to be
+    /// `fbmTiled(u · 40, v · 3, baseCells: 8)`: one 8-cell strip tiled forty times, a 25 mm rib
+    /// streaked ACROSS its grain tangent and painted ±15 % into the albedo — the corrugated range
+    /// front of DH-0965.
     public static func aluminum(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 131) -> MaterialChannels {
-        var ch = MaterialChannels(size: size, category: .metal)
-        let sh = seed
-        let base = Vec3(0.77, 0.77, 0.76)
-        for y in 0..<size {
-            for x in 0..<size {
-                let u = (Double(x) + 0.5) / Double(size)
-                let v = (Double(y) + 0.5) / Double(size)
-                let grain = Noise.fbmTiled(u * 40, v * 3, baseCells: 8, octaves: 3, seed: sh)
-                let macro = 0.90 + 0.20 * Noise.fbmTiled(u, v, baseCells: 2, octaves: 2, seed: sh ^ 0x3F)
-                let scratch = Noise.fbmTiled(u * 60, v * 2, baseCells: 8, octaves: 2, seed: sh ^ 0x6D)
-                ch.albedo[ch.idx(x, y)] = clampBand(base * macro * (0.85 + 0.30 * grain + 0.10 * scratch))
-                ch.roughness[ch.idx(x, y)] = clamp01(0.32 + (grain - 0.5) * 0.20
-                    + (scratch - 0.5) * 0.12)
-                ch.height[ch.idx(x, y)] = clamp01(0.50 + (grain - 0.5) * 0.06)
-            }
-        }
-        ch.grainTangent = [Vec2](repeating: Vec2(1, 0), count: size * size)
-        ch.clearcoat = 0.10
-        ch.deriveNormals(strength: 2)
-        // Fine satin tooth — anodized/brushed aluminum has a between-grain micro-structure,
-        // not a mirror finish. Subtle, so the directional grain still dominates.
-        addMicroDetail(&ch, seed: seed ^ 0xC0, baseCells: 100, strength: 0.30)
-        return ch
+        brushedMetal(size: size, seed: seed, base: Vec3(0.77, 0.77, 0.76), roughness: 0.32,
+                     acrossCells: 128, clearcoat: 0.10, microSeed: seed ^ 0xC0)
     }
 
     // MARK: – Wallpaper (customizable, colorway variants)

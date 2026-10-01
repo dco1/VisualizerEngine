@@ -41,12 +41,26 @@ public enum Noise {
     /// Bilinear value noise on a `cells × cells` lattice that wraps on the torus —
     /// returns `[0, 1]`. `cells` is how many lattice periods span the tile.
     public static func valueTiled(_ u: Double, _ v: Double, cells: Int, seed: UInt64) -> Double {
-        let n = max(1, cells)
-        let x = u * Double(n), y = v * Double(n)
+        valueTiledAniso(u, v, cellsX: cells, cellsY: cells, seed: seed)
+    }
+
+    /// Value noise on a `cellsX × cellsY` lattice that wraps on the torus — `[0, 1]`. The
+    /// STRETCHED form: `cellsY > cellsX` gives features long in U (a horizontal brush),
+    /// `cellsX > cellsY` long in V (a vertical rain run).
+    ///
+    /// This is the only honest way to stretch tiled noise. Scaling the coordinate instead —
+    /// `valueTiled(u · K, v, cells: C)` — does NOT add cells: the lattice still wraps at `C`, so
+    /// it tiles one `C`-cell strip `K` times, an exactly periodic stripe at `1/K` of the tile.
+    /// That drew a 25 mm rib across every aluminium appliance front (Daydream DH-0965);
+    /// `PatternAudit.repeatScore` is the instrument that catches it.
+    public static func valueTiledAniso(_ u: Double, _ v: Double, cellsX: Int, cellsY: Int,
+                                       seed: UInt64) -> Double {
+        let nx = max(1, cellsX), ny = max(1, cellsY)
+        let x = u * Double(nx), y = v * Double(ny)
         let xi = Int(floor(x)), yi = Int(floor(y))
         let fx = x - floor(x), fy = y - floor(y)
         @inline(__always) func corner(_ di: Int, _ dj: Int) -> Double {
-            unit(hash2(wrap(xi + di, n), wrap(yi + dj, n), seed))
+            unit(hash2(wrap(xi + di, nx), wrap(yi + dj, ny), seed))
         }
         let sx = smooth(fx), sy = smooth(fy)
         let top = corner(0, 0) + (corner(1, 0) - corner(0, 0)) * sx
@@ -65,6 +79,30 @@ public enum Noise {
             total += amp; amp *= gain; cells *= 2
         }
         return sum / total
+    }
+
+    /// fBm over `valueTiledAniso` — each octave doubles BOTH cell counts, so the aspect holds
+    /// down the octaves. Seeds per octave exactly as `fbmTiled` does.
+    public static func fbmTiledAniso(_ u: Double, _ v: Double, cellsX: Int, cellsY: Int,
+                                     octaves: Int, gain: Double = 0.5, seed: UInt64 = 0) -> Double {
+        var sum = 0.0, amp = 1.0, total = 0.0
+        var cx = max(1, cellsX), cy = max(1, cellsY)
+        for o in 0..<max(1, octaves) {
+            sum += amp * valueTiledAniso(u, v, cellsX: cx, cellsY: cy,
+                                         seed: seed &+ UInt64(o) &* 0x9E37_79B1)
+            total += amp; amp *= gain; cx *= 2; cy *= 2
+        }
+        return sum / total
+    }
+
+    /// How many fBm octaves a bake of side `size` can actually draw, starting from `baseCells`
+    /// on its finest axis: an octave whose lattice is finer than two texels per cell is not
+    /// detail, it is aliasing — random per-texel noise that the normal derivation then turns
+    /// into sparkle. Always at least one.
+    public static func bandLimitedOctaves(_ octaves: Int, baseCells: Int, size: Int) -> Int {
+        var n = 1, cells = max(1, baseCells) * 2
+        while n < octaves && cells * 2 <= size { n += 1; cells *= 2 }
+        return n
     }
 
     /// **Smooth 1-D value noise on an unbounded axis** — a fresh value per integer step,
