@@ -108,6 +108,10 @@ kernel void illumi_rt_denoise(
 // 1.5) so a clean accumulated history isn't yanked back toward the noisy current
 // 3×3 mean (which for low-frequency GI noise has a tiny sigma → a tight clamp
 // would re-inject the very crawl we're removing), and a tunable base blend.
+// The albedo floor the still's irradiance demodulation divides by (and the last à-trous level multiplies
+// back): a near-black channel must not amplify its own noise. One constant for both ends of the round trip.
+constant float kGIAlbedoFloor = 0.03;
+
 struct RTGITemporalUniforms {
     uint  width; uint height; uint enabled; uint isFirstFrame;
     float blend;       // weight of the CURRENT frame in steady state (e.g. 0.06)
@@ -125,11 +129,18 @@ kernel void illumi_rt_gi_temporal(
     texture2d<half,  access::read>       velocity    [[texture(2)]],  // full-res motion vectors
     texture2d<half,  access::write>      outGI       [[texture(3)]],  // accumulated → denoise input + next history
     texture2d<half,  access::read_write> sampleCount [[texture(4)]],  // full-res r16Float
+    texture2d<half,  access::read>       gAlbedo     [[texture(5)]],  // G-buffer albedo — still's demodulation
     constant RTGITemporalUniforms&       u           [[buffer(0)]],
     uint2                                gid         [[thread_position_in_grid]]
 ) {
     if (gid.x >= u.width || gid.y >= u.height) return;
     float3 current = float3(giRaw.read(gid).rgb);
+    // Daydream DH-0966 — bit 1 of `staticAccumulation`: keep the still's history as IRRADIANCE. The
+    // sample is divided by the albedo of THE FRAME THAT TRACED IT (this frame's jitter, this pixel),
+    // so the round trip is exact; the last à-trous level multiplies the composing frame's albedo
+    // back in. Dividing later, against whichever jitter the filter happens to see, is not the same
+    // operation — it cost the walls 4.5 % of their light.
+    if ((u.staticAccumulation & 2u) != 0u) current /= max(float3(gAlbedo.read(gid).rgb), float3(kGIAlbedoFloor));
 
     if (u.enabled == 0u || u.isFirstFrame != 0u) {
         sampleCount.write(half4(0.0h), gid);
@@ -157,7 +168,7 @@ kernel void illumi_rt_gi_temporal(
     // THIS frame's noisy 3×3 box — right for a moving camera, and exactly why a frozen still
     // never got past a few dozen effective samples of 1-ray GI (the settled canvas's "sponge").
     // With the camera frozen the history is the same picture, so average it: α = 1/N.
-    if (u.staticAccumulation != 0u) {
+    if ((u.staticAccumulation & 1u) != 0u) {
         // A real camera move (the velocity has the TAA jitter removed, so a frozen jittered
         // camera reads ~0) means a different picture: start the mean again rather than average
         // two views. The host's reset remains the primary guard.
@@ -229,7 +240,12 @@ kernel void illumi_rt_gi_temporal(
 // bilateral (225 samples) with the same effective support.
 
 struct SVGFAtrousUniforms {
-    uint  width;   uint  height;  uint stepSize; uint _pad0;
+    uint  width;   uint  height;  uint stepSize;
+    // Daydream DH-0966 — bit 0: the input is IRRADIANCE (the still's GI history, albedo divided out
+    // in `illumi_rt_gi_temporal`), so multiply the centre pixel's albedo back in on write — set on
+    // the LAST level only. Clear ⇒ the filter returns what it was handed, exactly as before.
+    // Was `_pad0` — same 4 bytes.
+    uint  flags;
     float sigmaL;  float sigmaZ;  float sigmaN;  float lumFloor;
 };
 
@@ -276,6 +292,7 @@ kernel void illumi_svgf_atrous(
     texture2d<half,  access::read>  gNormal   [[texture(3)]],
     texture2d<half,  access::write> giOut     [[texture(4)]],  // filtered color
     texture2d<half,  access::write> varOut    [[texture(5)]],  // filtered variance
+    texture2d<half,  access::read>  gAlbedo   [[texture(6)]],  // G-buffer albedo (rgb) — demodulation
     constant SVGFAtrousUniforms&    u         [[buffer(0)]],
     constant FrameUniforms&         frame     [[buffer(1)]],   // invProjection
     uint2                           gid       [[thread_position_in_grid]]
@@ -309,6 +326,13 @@ kernel void illumi_svgf_atrous(
     float  dzdx  = (dX >= 0.99999) ? 0.0 : (viewPosFromDepth(ndcX, dX, frame.invProjection).z - zC);
     float  dzdy  = (dY >= 0.99999) ? 0.0 : (viewPosFromDepth(ndcY, dY, frame.invProjection).z - zC);
 
+    // Daydream DH-0966 — the RT pass writes GI ALREADY multiplied by the pixel's textured albedo, so a
+    // spatial filter over it blurs the albedo's own grain (wood figure, fabric weave) along with the
+    // noise — the price of reaching far enough to flatten a low-frequency blob. In a still the
+    // history is therefore IRRADIANCE (the temporal pass divided each frame's albedo out of that
+    // frame's own samples); the last level multiplies this frame's centre albedo back in.
+    bool   remodOut  = (u.flags & 1u) != 0u;
+    float3 albedoC   = max(float3(gAlbedo.read(gid).rgb), float3(kGIAlbedoFloor));
     float3 giCenter  = float3(giIn.read(gid).rgb);
     float3 nCenter   = octDecode(float2(gNormal.read(gid).rg));
     float  lumCenter = dot(giCenter, float3(0.2126, 0.7152, 0.0722));
@@ -384,11 +408,12 @@ kernel void illumi_svgf_atrous(
     }
 
     if (weightSum < 1e-6) {
-        giOut.write(half4(half3(giCenter), 1.0h), gid);
+        giOut.write(half4(half3(remodOut ? giCenter * albedoC : giCenter), 1.0h), gid);
         varOut.write(varIn.read(gid), gid);
         return;
     }
 
-    giOut.write(half4(half3(max(float3(0.0), colorSum / weightSum)), 1.0h), gid);
+    float3 filtered = max(float3(0.0), colorSum / weightSum);
+    giOut.write(half4(half3(remodOut ? filtered * albedoC : filtered), 1.0h), gid);
     varOut.write(half4(half(varSum / (weightSum * weightSum))), gid);
 }

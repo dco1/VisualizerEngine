@@ -3397,6 +3397,11 @@ public final class IlluminatoramaRenderer {
     // VP matrices are recomputed per frame and stuffed into FrameUniforms.
     private let shadowMap: MTLTexture
     private var cascadeVPs: [simd_float4x4] = Array(repeating: matrix_identity_float4x4, count: 3)
+    /// Read-only instrument (Daydream DH-0964): the sun cascades' CURRENT light view-projections
+    /// (sub-texel jitter included) and the raw depth array they rasterise into, so a host can dump
+    /// the shadow map itself instead of inferring it from the lit frame (the DH-0862 method).
+    public var debugCascadeViewProjections: [simd_float4x4] { cascadeVPs }
+    public var debugShadowMapTexture: MTLTexture { shadowMap }
 
     // Phase 4.10 — depth atlas for spot light shadow maps. One slice per
     // shadowed spot. 8 slices × 512² × 4-byte depth = 8 MB at rest. NOT fixed any more
@@ -3708,6 +3713,19 @@ public final class IlluminatoramaRenderer {
     /// À-trous levels while `svgfStillForced` (2: the still lane's measured trade between
     /// residual noise and edge ringing, DH-0858).
     public var svgfStillLevels: Int = 2
+    /// Daydream DH-0966 — while the GI is a static running mean, keep it as IRRADIANCE: the temporal pass
+    /// divides each frame's G-buffer albedo out of that frame's own samples, and the last à-trous level
+    /// multiplies the composing frame's albedo back in. The RT pass bakes the albedo into the GI, so a
+    /// wide cascade over the modulated term blurs wood grain and fabric weave along with the noise.
+    /// Default `true`; moving-camera frames never enter static accumulation and are untouched.
+    /// `VIZ_ILLUMI_SVGF_DEMOD=0` A/Bs it.
+    public var svgfDemodulateAlbedo: Bool = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SVGF_DEMOD"] != "0"
+    /// The GI history is irradiance this frame: only where the SVGF cascade is what consumes it (the
+    /// bilateral fallback would composite it un-remodulated) and the history is a static mean.
+    private var giIrradianceMode: Bool {
+        rtGIStaticAccumulation && svgfDemodulateAlbedo && effectiveSVGFEnabled && rtGITemporalEnabled
+    }
+    private var previousGIIrradianceMode = false
     /// Number of à-trous cascade levels (1–5). Three levels cover a spatial
     /// reach of 1+2+4 = 7px radius; five levels cover 1+2+4+8+16 = 31px.
     public var svgfLevels: Int = 3
@@ -10163,6 +10181,10 @@ public final class IlluminatoramaRenderer {
         // moving-camera EMA (different weights, clamped), not a sum of this picture's samples.
         if rtGIStaticAccumulation && !previousRTGIStatic { rtGINeedsFirstFrame = true }
         previousRTGIStatic = rtGIStaticAccumulation
+        // …and so does any switch between the two representations (modulated ↔ irradiance): the history
+        // the other one wrote is not a history of this one.
+        if giIrradianceMode != previousGIIrradianceMode { rtGINeedsFirstFrame = true }
+        previousGIIrradianceMode = giIrradianceMode
         if taaStillAccumulation {
             let vp = camera.projectionMatrix * camera.viewMatrix
             if let last = lastStillViewProjection, last != vp { taaNeedsFirstFrame = true }
@@ -13412,7 +13434,7 @@ public final class IlluminatoramaRenderer {
             isFirstFrame: rtGINeedsFirstFrame ? 1 : 0,
             blend: max(0.01, min(1.0, rtGITemporalBlend)),
             gammaClamp: max(1.0, rtGITemporalClamp),
-            staticAccumulation: rtGIStaticAccumulation ? 1 : 0)
+            staticAccumulation: (rtGIStaticAccumulation ? 1 : 0) | (giIrradianceMode ? 2 : 0))
         guard let enc = timedComputeEncoder(cb, "rt.giTemporal") else { return }
         enc.label = "Illuminatorama.rt.giTemporal"
         enc.setComputePipelineState(rtGITemporalPipeline)
@@ -13421,6 +13443,7 @@ public final class IlluminatoramaRenderer {
         enc.setTexture(velocityTexture,            index: 2)
         enc.setTexture(currentRTGIHistoryTexture,  index: 3)  // accumulated write
         enc.setTexture(giSampleCount,              index: 4)  // adaptive count (read_write)
+        enc.setTexture(gbufferAlbedoMet,           index: 5)  // still: irradiance demodulation (DH-0966)
         // `setBytes`, not the shared single buffer: with two frames in flight a memcpy into one
         // buffer can hand the GPU the NEXT frame's `isFirstFrame` / mode (DH-0887 audit).
         enc.setBytes(&u, length: MemoryLayout<RTGITemporalUniforms>.stride, index: 0)
@@ -13431,7 +13454,8 @@ public final class IlluminatoramaRenderer {
     // ── Phase 4.44: SVGF à-trous cascade ─────────────────────────────────────
 
     private struct SVGFAtrousUniforms {
-        var width: UInt32; var height: UInt32; var stepSize: UInt32; var _pad0: UInt32 = 0
+        /// `flags` (DH-0966): bit 0 ⇒ the input is irradiance; multiply the centre albedo back in (last level).
+        var width: UInt32; var height: UInt32; var stepSize: UInt32; var flags: UInt32 = 0
         var sigmaL: Float; var sigmaZ: Float; var sigmaN: Float; var lumFloor: Float = 0
     }
 
@@ -13492,7 +13516,9 @@ public final class IlluminatoramaRenderer {
             enc.setTexture(gbufferNormalRgh, index: 3)
             enc.setTexture(cOut,             index: 4)
             enc.setTexture(vOut,             index: 5)
-            var u = SVGFAtrousUniforms(width: W, height: H, stepSize: stepSize,
+            enc.setTexture(gbufferAlbedoMet, index: 6)
+            let flags: UInt32 = giIrradianceMode && level == levels - 1 ? 1 : 0
+            var u = SVGFAtrousUniforms(width: W, height: H, stepSize: stepSize, flags: flags,
                                         sigmaL: svgfSigmaL, sigmaZ: svgfSigmaZ, sigmaN: svgfSigmaN,
                                         lumFloor: effectiveSVGFLumFloor)
             enc.setBytes(&u, length: MemoryLayout<SVGFAtrousUniforms>.stride, index: 0)
