@@ -897,24 +897,19 @@ fragment float4 illumi_tonemap_fs(
     float3 mixed = hdr + bloom * frame.bloomIntensity;
 
     // ── Halation (film) ────────────────────────────────────────────────────────
-    // The wide warm halo film wears around blown highlights (see the halation
-    // kernels above). Added in the HDR domain, like bloom, so exposure + ACES shape
-    // it. The halo is driven mostly by LUMINANCE and takes its colour from
-    // `halationTint` — real halation is red because red is what survives the round
-    // trip through the anti-halation backing, whatever colour the highlight was —
-    // with a quarter of the source hue left in so a strongly coloured highlight
-    // still tints its own halo. Intensity 0 (the default) skips the branch.
+    // The warm halo film wears around blown highlights (see the halation kernels in
+    // IlluminatoramaPost.metal). The texture arrives already TINTED — orange core, red
+    // tail, sourced from the red end of the highlight — so this is a plain add in the
+    // HDR domain, like bloom, so exposure and the display transform shape it.
+    // Intensity 0 (the default) skips the branch.
     if (frame.halationParams.x > 0.0) {
-        // Artistic normalisation. The threshold keeps only the EXCESS radiance above the
-        // blown point, and the wide gaussian then averages that excess down by the fraction
-        // of the kernel a highlight covers — so the raw halo is a small fraction of scene
-        // radiance and a 0…1 dial would spend its whole range on "barely visible". This gain
-        // makes `halationIntensity = 1.0` the intended full-strength look (the same
-        // convention `lensFlareIntensity` uses); it is a constant, not a per-scene tuning.
-        constexpr float kHalationGain = 3.0;
-        float3 halo    = float3(inHalation.sample(downSampler, in.uv).rgb);
-        float  haloLum = dot(halo, float3(0.2126, 0.7152, 0.0722));
-        halo = mix(float3(haloLum), halo, 0.25) * frame.halationTint.rgb;
+        // Artistic normalisation: the halo carries only the EXCESS over the threshold,
+        // spread across a kernel far larger than most highlights, so the raw add is a
+        // small fraction of scene radiance. This gain makes `halationIntensity = 1.0` a
+        // strong, unbacked-stock look (CineStill-like) and ~0.3 a backed negative; it is
+        // a constant, not a per-scene tuning.
+        constexpr float kHalationGain = 4.0;
+        float3 halo = float3(inHalation.sample(downSampler, in.uv).rgb);
         mixed += halo * (frame.halationParams.x * kHalationGain);
     }
 

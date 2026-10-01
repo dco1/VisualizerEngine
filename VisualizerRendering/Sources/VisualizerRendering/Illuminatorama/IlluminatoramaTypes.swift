@@ -441,7 +441,7 @@ public struct IlluminatoramaFrameUniforms {
     // `halationParams`: x = intensity (0 = OFF, the default — the renderer skips the
     // halation passes AND the tonemap branch is gated on it, so every non-opting
     // scene renders byte-identically), y = HDR luminance threshold, z = halo radius
-    // in INTERNAL-resolution texels, w reserved. `halationTint`: xyz = halo tint
+    // as a FRACTION OF FRAME HEIGHT, w reserved. `halationTint`: xyz = tail tint
     // (linear RGB), w reserved. TWO new 16-byte clusters (stride 1216 → 1248);
     // mirror of the Metal FrameUniforms.
     public var halationParams: SIMD4<Float> = .zero

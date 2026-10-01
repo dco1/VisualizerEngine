@@ -210,23 +210,45 @@ kernel void illumi_bloom_up(
 
 // ── Halation (film) ──────────────────────────────────────────────────────────
 //
-// On real film, light from a blown highlight passes THROUGH the emulsion, scatters
-// off the back of the acetate base, and re-exposes the emulsion from behind — a
-// wide, diffuse second exposure around the highlight. The anti-halation backing
-// absorbs short wavelengths best, so what survives that round trip is predominantly
-// RED, which is why blown highlights on film wear a warm orange halo far wider and
-// softer than any lens bloom.
+// On real film, light from a highlight passes THROUGH the emulsion, reflects off the
+// back of the base, and re-exposes the emulsion from behind — a soft second exposure
+// around the highlight. What reaches the base is what the blue and green layers (and
+// the yellow filter between them) did not absorb, i.e. overwhelmingly RED light, and
+// on the way back up it meets the red-sensitive layer first. So halation is:
 //
-// Modelled as its own threshold → wide separable gaussian → tinted add, run at a
-// QUARTER of the internal resolution. Quarter-res is both the cost win and the
-// point: it buys a wide, soft halo out of a 9-tap kernel, and halation carries no
-// high-frequency detail worth preserving. It is a SEPARATE chain from bloom rather
-// than a re-tint of the bloom texture because the two key off different thresholds
-// (only genuinely blown highlights halate) and want radii an order of magnitude
-// apart.
+//   • SOURCED from the red end of the highlight — a pure-blue light barely halates;
+//   • ISOTROPIC — a disc of scatter around every point, the same in every direction;
+//   • LONG-TAILED — a bright tight core (the first bounce) under a wide faint tail
+//     (oblique bounces and multiple reflections), never a single hard-edged blob;
+//   • COLOUR-GRADED by distance — orange where the core still carries some green-layer
+//     re-exposure, deepening to red in the tail, where only red survives.
+//   • a fixed size ON THE NEGATIVE — set by the base thickness — so it is specified
+//     as a fraction of FRAME HEIGHT, never in texels (a texel radius made the halo
+//     shrink by the supersample factor in a photo-lane still).
+//
+// Implementation (all at internal/2):
+//   threshold : internal HDR → per-texel soft-knee excess (thresholded BEFORE the 2×2
+//               average, so a one-texel-wide blown edge keeps its halo), collapsed to
+//               one scalar "halation exposure" weighted toward red.
+//   blur_h    : that scalar, convolved with FOUR normalised gaussians an octave apart
+//               at EVERY texel — out to 3σ, no tap skipping — → rgba = the four scales.
+//   blur_v    : the same, vertically; the four separable gaussians make four isotropic
+//               ones, tinted orange (inner) → red (outer) and summed → rgb halo.
+//
+// History: the first version was a 9-tap gaussian whose taps were spaced radius/16
+// quarter-res texels apart (4 quarter texels ≈ 16 internal px at the default). A
+// smooth blob survives that; a THIN highlight does not — each tap re-printed the
+// door edge as a separate copy, and the halo came out as a comb of discrete orange
+// stripes with dark gaps (published capture `halation-sunset-bedroom-on`, 2026-10-01).
+// Dense taps make that structurally impossible.
 //
 // `halationParams.x == 0` (the default) ⇒ the host does not encode these passes at
 // all AND the tonemap branch is skipped ⇒ non-opting scenes are byte-identical.
+
+/// How much of each channel of a highlight reaches the base and comes back as halation
+/// exposure. Normalised to sum 1, so a neutral highlight's halation exposure equals its
+/// excess radiance.
+constant float3 kHalationSourceWeight = float3(0.80, 0.18, 0.02);
 
 kernel void illumi_halation_threshold(
     texture2d<half, access::read>  inHDR     [[texture(0)]],
@@ -237,74 +259,87 @@ kernel void illumi_halation_threshold(
     uint w = outBright.get_width();
     uint h = outBright.get_height();
     if (gid.x >= w || gid.y >= h) return;
-    // 4×4 box downsample of the full-res HDR → quarter res.
     uint2 maxC = uint2(inHDR.get_width() - 1, inHDR.get_height() - 1);
-    uint2 src  = gid * 4;
-    float3 avg = float3(0.0);
-    for (uint j = 0; j < 4; ++j) {
-        for (uint i = 0; i < 4; ++i) {
-            avg += float3(inHDR.read(min(src + uint2(i, j), maxC)).rgb);
+    uint2 src  = gid * 2;
+    float threshold = frame.halationParams.y;
+    // A soft knee half the threshold wide: a light easing across the bar grows its halo
+    // continuously instead of popping it on (same curve bloom uses).
+    float knee = 0.5 * threshold;
+    float e = 0.0;
+    for (uint j = 0; j < 2; ++j) {
+        for (uint i = 0; i < 2; ++i) {
+            float3 c = max(float3(inHDR.read(min(src + uint2(i, j), maxC)).rgb), 0.0);
+            e += dot(illumiBloomKnee(c, threshold, knee), kHalationSourceWeight);
         }
     }
-    avg *= (1.0 / 16.0);
-    // Only the EXCESS over the threshold scatters — the same linear knee bloom uses,
-    // so the halo grows continuously out of the highlight instead of popping in.
-    float lum = dot(avg, float3(0.2126, 0.7152, 0.0722));
-    float t = max(0.0, lum - frame.halationParams.y);
-    float3 bright = avg * (t / max(lum, 1e-4));
-    outBright.write(half4(half3(bright), 1.0h), gid);
+    outBright.write(half4(half(e * 0.25), 0.0h, 0.0h, 1.0h), gid);
 }
 
-// Tap spacing (in QUARTER-res texels) for the 9-tap gaussian below. The kernel's
-// sigma is 2 taps, and a halo reads as radius ≈ 2σ, so a requested radius R in
-// INTERNAL-resolution texels — R/4 quarter-texels — wants a spacing of R/16.
-// Clamped to ≥1 so the kernel never collapses to a 9× re-read of one texel.
-static inline float halationTapStep(constant FrameUniforms& frame) {
-    return max(1.0, frame.halationParams.z * (1.0 / 16.0));
+/// The halo's PSF is a sum of FOUR normalised gaussians an octave apart — σ = R/16,
+/// R/8, R/4, R/2 (R = `halationParams.z` × frame height, so 2σ of the widest is R). With
+/// comparable weight per octave the sum falls off roughly as 1/r over the whole range —
+/// the long, soft tail of a real halation PSF — where a single gaussian would end in a
+/// visible rim (it did: one σ = R/2 gaussian read as an orange sleeve with an edge).
+static inline float4 halationSigmas(constant FrameUniforms& frame, float rows) {
+    float r = frame.halationParams.z * rows;
+    return max(float4(0.35), r * float4(1.0 / 16.0, 1.0 / 8.0, 1.0 / 4.0, 1.0 / 2.0));
+}
+
+/// Hard cap on the half-width of the 1-D kernel (texels). 3σ of the default widest
+/// scale on a 2400-row photo-lane still is ~45, so this only bites on absurd radii.
+constant int kHalationMaxReach = 128;
+
+/// One separable pass of all four gaussians. `axis` = (1,0) or (0,1). The horizontal
+/// pass blurs the single exposure scalar in .r by all four; the vertical pass blurs
+/// each of the four channels by its own σ.
+static inline float4 halationBlur1D(texture2d<half, access::read> inTex, int2 p, int2 axis,
+                                    float4 sigma, bool separate) {
+    int2 size = int2(inTex.get_width(), inTex.get_height());
+    int reach = min(int(ceil(3.0 * sigma.w)), kHalationMaxReach);
+    float4 inv2s2 = 1.0 / (2.0 * sigma * sigma);
+    float4 acc = 0.0, wsum = 0.0;
+    for (int k = -reach; k <= reach; ++k) {
+        int2 q = p + axis * k;
+        // Out-of-frame texels are SKIPPED and the weights renormalised — clamping
+        // would re-read the border texel and brighten every halo that touches an edge.
+        if (any(q < 0) || any(q >= size)) continue;
+        float4 v = float4(inTex.read(uint2(q)));
+        float4 wk = exp(-float(k * k) * inv2s2);
+        acc  += wk * (separate ? v : float4(v.x));
+        wsum += wk;
+    }
+    return acc / max(wsum, float4(1e-6));
 }
 
 kernel void illumi_halation_blur_h(
-    texture2d<half, access::sample> inTex  [[texture(0)]],
-    texture2d<half, access::write>  outTex [[texture(1)]],
-    constant FrameUniforms&         frame  [[buffer(0)]],
-    uint2                           gid    [[thread_position_in_grid]]
+    texture2d<half, access::read>  inTex  [[texture(0)]],
+    texture2d<half, access::write> outTex [[texture(1)]],
+    constant FrameUniforms&        frame  [[buffer(0)]],
+    uint2                          gid    [[thread_position_in_grid]]
 ) {
-    uint w = outTex.get_width();
-    uint h = outTex.get_height();
-    if (gid.x >= w || gid.y >= h) return;
-    constexpr sampler smp(filter::linear, address::clamp_to_edge, coord::normalized);
-    const float weights[5] = { 0.227027, 0.194595, 0.121622, 0.054054, 0.016216 };
-    float2 invSize = 1.0 / float2(w, h);
-    float2 uv = (float2(gid) + 0.5) * invSize;
-    float  tap = halationTapStep(frame);
-    float3 acc = float3(inTex.sample(smp, uv).rgb) * weights[0];
-    for (int i = 1; i < 5; ++i) {
-        float o = float(i) * tap * invSize.x;
-        acc += float3(inTex.sample(smp, uv + float2(o, 0.0)).rgb) * weights[i];
-        acc += float3(inTex.sample(smp, uv - float2(o, 0.0)).rgb) * weights[i];
-    }
-    outTex.write(half4(half3(acc), 1.0h), gid);
+    if (gid.x >= outTex.get_width() || gid.y >= outTex.get_height()) return;
+    float4 sigma = halationSigmas(frame, float(outTex.get_height()));
+    outTex.write(half4(halationBlur1D(inTex, int2(gid), int2(1, 0), sigma, false)), gid);
 }
 
 kernel void illumi_halation_blur_v(
-    texture2d<half, access::sample> inTex  [[texture(0)]],
-    texture2d<half, access::write>  outTex [[texture(1)]],
-    constant FrameUniforms&         frame  [[buffer(0)]],
-    uint2                           gid    [[thread_position_in_grid]]
+    texture2d<half, access::read>  inTex  [[texture(0)]],
+    texture2d<half, access::write> outTex [[texture(1)]],
+    constant FrameUniforms&        frame  [[buffer(0)]],
+    uint2                          gid    [[thread_position_in_grid]]
 ) {
-    uint w = outTex.get_width();
-    uint h = outTex.get_height();
-    if (gid.x >= w || gid.y >= h) return;
-    constexpr sampler smp(filter::linear, address::clamp_to_edge, coord::normalized);
-    const float weights[5] = { 0.227027, 0.194595, 0.121622, 0.054054, 0.016216 };
-    float2 invSize = 1.0 / float2(w, h);
-    float2 uv = (float2(gid) + 0.5) * invSize;
-    float  tap = halationTapStep(frame);
-    float3 acc = float3(inTex.sample(smp, uv).rgb) * weights[0];
-    for (int i = 1; i < 5; ++i) {
-        float o = float(i) * tap * invSize.y;
-        acc += float3(inTex.sample(smp, uv + float2(0.0, o)).rgb) * weights[i];
-        acc += float3(inTex.sample(smp, uv - float2(0.0, o)).rgb) * weights[i];
-    }
-    outTex.write(half4(half3(acc), 1.0h), gid);
+    if (gid.x >= outTex.get_width() || gid.y >= outTex.get_height()) return;
+    float4 sigma = halationSigmas(frame, float(outTex.get_height()));
+    float4 s = halationBlur1D(inTex, int2(gid), int2(0, 1), sigma, true);
+    // `halationTint` is the colour of the WIDEST scale — the deep red where only red
+    // survives the trip through the base. Nearer scales carry progressively more
+    // green-layer re-exposure and read orange; the colour grades with distance.
+    float3 tail = frame.halationTint.rgb;
+    float3 c0 = tail * float3(1.0, 2.4, 1.8);
+    float3 c1 = tail * float3(1.0, 1.8, 1.4);
+    float3 c2 = tail * float3(1.0, 1.3, 1.15);
+    // Energy per octave: the inner octaves a little heavier (the first bounce is the
+    // brightest), summing to 1.
+    float3 halo = c0 * (0.30 * s.x) + c1 * (0.28 * s.y) + c2 * (0.24 * s.z) + tail * (0.18 * s.w);
+    outTex.write(half4(half3(halo), 1.0h), gid);
 }

@@ -88,11 +88,11 @@ final class IlluminatoramaInternalScaleTests: XCTestCase {
                 XCTAssertGreaterThanOrEqual(ih, 2, "internal height for \(w)×\(h) @\(s)")
                 XCTAssertEqual(iw % 2, 0, "internal width must be even (\(w)×\(h) @\(s))")
                 XCTAssertEqual(ih % 2, 0, "internal height must be even (\(w)×\(h) @\(s))")
-                // The derived chains: SSAO/bloom at internal/2, halation at
-                // internal/4. `makeTargets` floors each at 1, so the invariant
+                // The derived chains: SSAO/bloom/halation at internal/2.
+                // `makeTargets` floors each at 1, so the invariant
                 // to hold here is simply that they stay allocatable.
-                XCTAssertGreaterThanOrEqual(max(1, iw / 4), 1)
-                XCTAssertGreaterThanOrEqual(max(1, ih / 4), 1)
+                XCTAssertGreaterThanOrEqual(max(1, iw / 2), 1)
+                XCTAssertGreaterThanOrEqual(max(1, ih / 2), 1)
             }
         }
     }

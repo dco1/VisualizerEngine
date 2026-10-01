@@ -365,8 +365,8 @@ struct FrameUniforms {
     // halationParams: x = intensity (0 = OFF, the default — the host skips the
     // halation passes entirely and the tonemap branch is gated on it, so non-opting
     // scenes are byte-for-byte unchanged), y = HDR luminance threshold above which a
-    // highlight scatters, z = halo radius in INTERNAL-resolution texels, w reserved.
-    // halationTint: xyz = halo tint (linear RGB), w reserved.
+    // highlight scatters, z = halo radius as a fraction of frame height, w reserved.
+    // halationTint: xyz = TAIL tint (linear RGB; the core is derived), w reserved.
     // TWO new 16-byte clusters (stride 1216 → 1248); mirror of
     // IlluminatoramaFrameUniforms.halationParams/halationTint.
     float4   halationParams;

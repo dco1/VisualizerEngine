@@ -504,12 +504,11 @@ public final class IlluminatoramaRenderer {
     /// Line thickness in OUTPUT pixels. The detector samples a cross at this radius, so
     /// non-integer values are legitimate; much above ~2 reads as a smudge, not a pen.
     public var diagramEdgeThickness: Float = 1.0
-    /// Film **halation**: the wide, warm halo real film wears around blown highlights.
+    /// Film **halation**: the warm halo real film wears around blown highlights.
     /// Light punches through the emulsion, reflects off the back of the base and
-    /// re-exposes it from behind; the anti-halation backing lets red survive that
-    /// round trip best, hence the tint. A separate quarter-res threshold → wide
-    /// gaussian chain from bloom (they key off different thresholds and want radii an
-    /// order of magnitude apart). 0 = OFF (the default for every scene): the halation
+    /// re-exposes it from behind; what reaches the base is mostly red, hence the tint.
+    /// A separate half-res threshold → dense four-scale isotropic gaussian chain from
+    /// bloom (see `IlluminatoramaPost.metal` § Halation). 0 = OFF (the default for every scene): the halation
     /// passes are not even encoded and the tonemap branch is skipped, so non-opting
     /// scenes are byte-for-byte unchanged. ~0.4 is a tasteful film amount; 1.0 is strong.
     public var halationIntensity: Float = 0
@@ -526,12 +525,14 @@ public final class IlluminatoramaRenderer {
     /// as halation (R−B +1.56, and the added light lands in a ΔR:ΔG:ΔB ≈ 1 : 0.23 : 0.27
     /// ratio that matches `halationTint`).
     public var halationThreshold: Float = 0.6
-    /// Halation halo radius in INTERNAL-resolution texels (≈2σ of the quarter-res
-    /// gaussian). Wide by design — this is what separates halation from bloom.
-    public var halationRadius: Float = 64
-    /// Halation halo tint (linear RGB). The default is the classic orange-red of an
-    /// anti-halation-backed colour negative.
-    public var halationTint: SIMD3<Float> = SIMD3(1.0, 0.32, 0.12)
+    /// Halation halo radius as a FRACTION OF FRAME HEIGHT (2σ of the widest scale). Halation is a fixed size on the negative — set by
+    /// the base thickness — so it must not depend on the render resolution: the old
+    /// radius was in internal texels, and a 2× supersampled still got half the halo.
+    /// The PSF is four gaussians an octave apart (σ = R/16 … R/2), a long soft tail.
+    public var halationRadius: Float = 0.025
+    /// Halation TAIL tint (linear RGB) — the deep red where only red survives the round
+    /// trip through the base. The core is derived from it in the shader and reads orange.
+    public var halationTint: SIMD3<Float> = SIMD3(1.0, 0.20, 0.07)
     /// Post-FX easing time constant (seconds) from the panel's "Easing" picker.
     /// The post-FX knobs above (exposure, bloom, chromatic aberration, fringe) are
     /// treated as TARGETS; each frame `uploadFrameUniforms` eases an internal
@@ -565,8 +566,8 @@ public final class IlluminatoramaRenderer {
     private var easedSphericalAberration: Float = 0
     private var easedHalationIntensity: Float = 0
     private var easedHalationThreshold: Float = 0.6
-    private var easedHalationRadius: Float = 64
-    private var easedHalationTint: SIMD3<Float> = SIMD3(1.0, 0.32, 0.12)
+    private var easedHalationRadius: Float = 0.025
+    private var easedHalationTint: SIMD3<Float> = SIMD3(1.0, 0.20, 0.07)
     private var lastPostFXEaseTime: CFTimeInterval = 0
     /// The scene animation clock, in **seconds since the session started** — reaches the GPU as
     /// `FrameUniforms.time` and drives every shader oscillator (`applyTreeWind`, `applySway`
@@ -2443,8 +2444,8 @@ public final class IlluminatoramaRenderer {
     /// internal frame is the lowest tier that still resolves architectural
     /// detail through the tonemap's 4-tap bilinear magnification, and it is the
     /// point where the derived chains bottom out usefully: SSAO/bloom run at
-    /// internal/2 and halation at internal/4, so 0.5 of a 1280×800 canvas is
-    /// still a 160×100 halation buffer. Below this the derived chains degenerate
+    /// internal/2 and halation at internal/2, so 0.5 of a 1280×800 canvas is
+    /// still a 320×200 halation buffer. Below this the derived chains degenerate
     /// toward single-texel buffers, TAA/SSR reprojection has too few samples to
     /// converge, and the upscale is mush — a worse trade than simply drawing
     /// less. Nothing in the pipeline *crashes* below 0.5 (every derived size is
@@ -3282,11 +3283,11 @@ public final class IlluminatoramaRenderer {
     /// `bloomUpChain[0]` (== internal/2) is what the tonemap samples.
     private var bloomDownChain: [MTLTexture]
     private var bloomUpChain: [MTLTexture]
-    // Halation runs at a QUARTER of the internal resolution — a wide diffuse halo has
-    // no high-frequency detail to lose, and the coarse grid buys radius for free.
-    private var halationBrightQuarter: MTLTexture
-    private var halationBlurHQuarter: MTLTexture
-    private var halationBlurVQuarter: MTLTexture
+    // Halation runs at HALF the internal resolution — the halo's tight orange core is a
+    // few output pixels wide, which a quarter-res grid cannot carry.
+    private var halationBright: MTLTexture
+    private var halationBlurH: MTLTexture
+    private var halationBlurV: MTLTexture
 
     // Phase 3 — sky-probe IBL. The irradiance + prefiltered cubes are baked
     // from `equirectSky` each frame (or whenever the sky texture changes).
@@ -5460,7 +5461,7 @@ public final class IlluminatoramaRenderer {
         guard let bloomUp = cache.pipelineState(name: "illumi_bloom_up", device: device) else {
             throw IlluminatoramaError.pipelineCreationFailed("illumi_bloom_up")
         }
-        // Film halation — its own threshold + wide gaussian, quarter-res. The pipelines
+        // Film halation — its own threshold + four-scale gaussian, half-res. The pipelines
         // are always built (cheap, and it keeps `let` initialisation simple); the passes
         // are only ENCODED when halationIntensity > 0.
         guard let halThreshold = cache.pipelineState(name: "illumi_halation_threshold", device: device) else {
@@ -6033,9 +6034,9 @@ public final class IlluminatoramaRenderer {
         self.taaResolvedTexture  = t.taaResolved
         self.bloomDownChain      = t.bloomDown
         self.bloomUpChain        = t.bloomUp
-        self.halationBrightQuarter = t.halationBright
-        self.halationBlurHQuarter  = t.halationBlurH
-        self.halationBlurVQuarter  = t.halationBlurV
+        self.halationBright = t.halationBright
+        self.halationBlurH  = t.halationBlurH
+        self.halationBlurV  = t.halationBlurV
         self.outputTexture       = t.ldr
         self.tonemapWriteTarget  = t.ldr
         // Phase 4.39 denoiser textures
@@ -9939,9 +9940,9 @@ public final class IlluminatoramaRenderer {
             self.taaResolvedTexture  = t.taaResolved
             self.bloomDownChain      = t.bloomDown
             self.bloomUpChain        = t.bloomUp
-            self.halationBrightQuarter = t.halationBright
-            self.halationBlurHQuarter  = t.halationBlurH
-            self.halationBlurVQuarter  = t.halationBlurV
+            self.halationBright = t.halationBright
+            self.halationBlurH  = t.halationBlurH
+            self.halationBlurV  = t.halationBlurV
             self.aoFilteredTexture   = t.aoFiltered
             self.aoHistoryA          = t.aoHistoryA
             self.aoHistoryB          = t.aoHistoryB
@@ -10067,7 +10068,7 @@ public final class IlluminatoramaRenderer {
     ///
     /// Rounding notes: `& ~1` truncates to an even number AFTER `.rounded()`, so
     /// an odd product rounds DOWN by one — deliberate, because every derived
-    /// chain divides (÷2 for SSAO/bloom, ÷4 for halation) and an even parent is
+    /// chain divides (÷2 for SSAO/bloom/halation) and an even parent is
     /// what keeps those aligned. `nonZeroSize` never returns 0: a 0-wide texture
     /// is a hard Metal allocation failure, and `resize` would then silently keep
     /// the old size forever.
@@ -14647,33 +14648,33 @@ public final class IlluminatoramaRenderer {
         colorLUTAmount = (s.colorGradeLook == .none) ? 0 : Float(s.colorLUTAmount)
     }
 
-    /// Film halation: quarter-res threshold → wide separable gaussian, tinted and
-    /// added back by the tonemap fragment. Encoded ONLY when the eased intensity is
+    /// Film halation: half-res threshold → dense four-scale separable gaussian, tinted
+    /// and added back by the tonemap fragment. Encoded ONLY when the eased intensity is
     /// non-zero — and that's the SAME value the shader's branch reads, so "passes ran"
     /// and "tonemap consumes the halo" can never disagree. A scene that never opts in
     /// pays no dispatches and renders byte-identically.
     private func encodeHalationPasses(_ cb: MTLCommandBuffer) {
         guard easedHalationIntensity > 0 else { return }
-        let quarterW = max(1, width / 4)
-        let quarterH = max(1, height / 4)
+        let halfW = halationBright.width
+        let halfH = halationBright.height
         guard let enc = timedComputeEncoder(cb, "halation") else { return }
         enc.label = "Illuminatorama.halation"
 
         enc.setComputePipelineState(halationThresholdPipeline)
         enc.setTexture(bloomTonemapSource, index: 0)
-        enc.setTexture(halationBrightQuarter, index: 1)
+        enc.setTexture(halationBright, index: 1)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
-        dispatch(enc, pipeline: halationThresholdPipeline, width: quarterW, height: quarterH)
+        dispatch(enc, pipeline: halationThresholdPipeline, width: halfW, height: halfH)
 
         enc.setComputePipelineState(halationBlurHPipeline)
-        enc.setTexture(halationBrightQuarter, index: 0)
-        enc.setTexture(halationBlurHQuarter, index: 1)
-        dispatch(enc, pipeline: halationBlurHPipeline, width: quarterW, height: quarterH)
+        enc.setTexture(halationBright, index: 0)
+        enc.setTexture(halationBlurH, index: 1)
+        dispatch(enc, pipeline: halationBlurHPipeline, width: halfW, height: halfH)
 
         enc.setComputePipelineState(halationBlurVPipeline)
-        enc.setTexture(halationBlurHQuarter, index: 0)
-        enc.setTexture(halationBlurVQuarter, index: 1)
-        dispatch(enc, pipeline: halationBlurVPipeline, width: quarterW, height: quarterH)
+        enc.setTexture(halationBlurH, index: 0)
+        enc.setTexture(halationBlurV, index: 1)
+        dispatch(enc, pipeline: halationBlurVPipeline, width: halfW, height: halfH)
         enc.endEncoding()
     }
 
@@ -14716,7 +14717,7 @@ public final class IlluminatoramaRenderer {
         // Halation halo at texture(8). Always bound (the texture is allocated
         // unconditionally); its contents are stale when halationIntensity == 0,
         // and the shader's branch is gated on the same uniform, so it isn't read then.
-        enc.setFragmentTexture(halationBlurVQuarter, index: 8)
+        enc.setFragmentTexture(halationBlurV, index: 8)
         // The AO field at texture(9) for `DebugTerm.ssao` — the same texture the
         // lighting pass multiplies its indirect terms by (post-denoise when the
         // denoiser is on), so the debug view IS the shipped multiplier, not a
@@ -15058,13 +15059,12 @@ public final class IlluminatoramaRenderer {
         u.sssTintG    = max(0, sssTint.y)
         u.sssTintB    = max(0, sssTint.z)
         u.sssDebugForceAll = Self.sssForceAllEnv ? 1.0 : 0.0
-        // Film halation: intensity / threshold / halo radius + tint. Intensity 0 (the
-        // default) → the tonemap branch is skipped AND `encodeHalationPasses` doesn't
-        // dispatch, so a non-opting scene is byte-identical. The radius floor of 1
-        // keeps the shader's tap spacing from collapsing if a host sets radius 0.
+        // Film halation: intensity / threshold / halo radius (fraction of frame height)
+        // + tail tint. Intensity 0 (the default) → the tonemap branch is skipped AND
+        // `encodeHalationPasses` doesn't dispatch, so a non-opting scene is byte-identical.
         u.halationParams = SIMD4(max(0, easedHalationIntensity),
                                  easedHalationThreshold * preExposureDivisor,
-                                 max(1, easedHalationRadius),
+                                 max(0, easedHalationRadius),
                                  0)
         u.halationTint = SIMD4(easedHalationTint.x, easedHalationTint.y, easedHalationTint.z, 0)
         // Bloom pyramid (S1.2): soft knee (fraction of the threshold) / upsample
@@ -15482,7 +15482,7 @@ public final class IlluminatoramaRenderer {
         // separate per-level textures rather than one mipmapped resource.
         var bloomDown: [MTLTexture]      // level 0 = internal/2, each halving
         var bloomUp: [MTLTexture]        // one SHORTER than `bloomDown`
-        // Film halation — quarter-res (see `halationBrightQuarter`).
+        // Film halation — half-res (see `halationBright`).
         var halationBright: MTLTexture
         var halationBlurH: MTLTexture
         var halationBlurV: MTLTexture
@@ -16087,21 +16087,18 @@ public final class IlluminatoramaRenderer {
                                         usage: [.shaderRead, .shaderWrite]))
             }
         }
-        // Film halation at QUARTER res — a wide diffuse halo carries no detail worth
-        // preserving, and the coarse grid is what makes a 9-tap gaussian reach ~64
-        // full-res texels. Allocated unconditionally so the tonemap always has a
-        // texture to bind at fragment slot 3; the passes that fill it are skipped
-        // when halationIntensity == 0.
-        let quarterW = max(1, internalW / 4)
-        let quarterH = max(1, internalH / 4)
+        // Film halation at HALF res — the halo's orange core is only a few output pixels
+        // wide. Allocated unconditionally so the tonemap always has a texture to bind at
+        // fragment slot 8; the passes that fill it are skipped when halationIntensity == 0.
+        // `bright` holds one scalar (the red-weighted exposure), `blurH` four (one per scale).
         let hb = try make(label: "Illuminatorama.halation.bright",
-                          format: .rgba16Float, w: quarterW, h: quarterH,
+                          format: .r16Float, w: halfW, h: halfH,
                           usage: [.shaderRead, .shaderWrite])
         let hbh = try make(label: "Illuminatorama.halation.blurH",
-                           format: .rgba16Float, w: quarterW, h: quarterH,
+                           format: .rgba16Float, w: halfW, h: halfH,
                            usage: [.shaderRead, .shaderWrite])
         let hbv = try make(label: "Illuminatorama.halation.blurV",
-                           format: .rgba16Float, w: quarterW, h: quarterH,
+                           format: .rgba16Float, w: halfW, h: halfH,
                            usage: [.shaderRead, .shaderWrite])
         // Final LDR output at OUTPUT resolution — the only texture sized to
         // what the SCNView shows. Tonemap kernel downsamples from internal
