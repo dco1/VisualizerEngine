@@ -563,8 +563,14 @@ struct FrameUniforms {
     // z = read noise (electrons), w = how much of the noise the three channels share (demosaic
     // correlation). ONE new 16-byte cluster (stride 1680 → 1696).
     float4   sensorNoise;
+    // THE CAPTURE MEDIUM'S GRAIN (Daydream DH-1000): x = emulsion grain as a RELATIVE σ of the
+    // exposed signal, i.e. constant in log exposure / density (0 ⇒ the sensor block is exactly
+    // DH-0992's), y = how much of that grain the three dye layers share. It rides in the sensor
+    // block as a second variance term — one draw, one σ — so film grain and sensor noise are
+    // one noise and cannot stack. zw reserved. ONE new 16-byte cluster (stride 1696 → 1712).
+    float4   filmMedium;
 };
-static_assert(sizeof(FrameUniforms) == 1696, "FrameUniforms must match IlluminatoramaFrameUniforms (1696 bytes)");
+static_assert(sizeof(FrameUniforms) == 1712, "FrameUniforms must match IlluminatoramaFrameUniforms (1712 bytes)");
 
 // Secondary directional light (#60 task 5). Mirror of Swift
 // IlluminatoramaDirectionalLight. `dir` points TOWARD the light (world space,

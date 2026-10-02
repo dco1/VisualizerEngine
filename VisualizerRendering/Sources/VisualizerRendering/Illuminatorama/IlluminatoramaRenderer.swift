@@ -454,6 +454,18 @@ public final class IlluminatoramaRenderer {
     /// How much of the noise the three channels share (demosaicing correlates neighbours' noise
     /// across channels); 0 = independent RGB speckle, 1 = pure luminance noise.
     public var sensorChannelCorrelation: Float = 0.5
+    /// The capture medium's EMULSION grain (Daydream DH-1000): a relative σ of the exposed signal
+    /// — constant in log exposure, which is what "constant in density" means for a negative — added
+    /// in the sensor block as a second variance term beside the shot + read noise, on ONE draw, so
+    /// the two are a single noise with a single σ (they cannot stack). 0 (default) ⇒ the sensor
+    /// block is exactly DH-0992's; with `sensorNoiseStrength` also 0 the block never runs. The
+    /// grain is drawn on the `filmGrainSize` cell grid while this is on. Independent of the legacy
+    /// encoded-domain `filmGrainStrength`, which a host using this should leave at 0.
+    public var filmDensityGrain: Float = 0
+    /// How much of the emulsion grain the three dye layers share (0.80: the DH-0880 figure).
+    /// Per pixel, the draw's correlation is the variance-weighted mix of this and
+    /// `sensorChannelCorrelation`, so each mechanism keeps its own colour character.
+    public var filmDensityGrainCorrelation: Float = 0.80
     /// Per-level scatter for the up-chain that realises `bloomPSFExponent` (nil ⇒ the shared
     /// scatter). Level i's down texture ends up weighted (1−s_i)·Π_{k<i} s_k, so for target
     /// weights a_i (Σ = 1): s_i = 1 − a_i / (1 − Σ_{k<i} a_k). Public for the gate.
@@ -15286,6 +15298,7 @@ public final class IlluminatoramaRenderer {
         // summing to 1 and the chain gains or loses energy.
         u.sensorNoise = SIMD4(max(0, sensorNoiseStrength), max(1, sensorElectronsPerUnit),
                               max(0, sensorReadNoise), min(max(sensorChannelCorrelation, 0), 1))
+        u.filmMedium = SIMD4(max(0, filmDensityGrain), min(max(filmDensityGrainCorrelation, 0), 1), 0, 0)
         u.bloomParams = SIMD4(max(0, bloomSoftKnee),
                               min(max(bloomScatter, 0), 1),
                               max(0, bloomTentRadius),

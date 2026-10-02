@@ -1126,9 +1126,33 @@ fragment float4 illumi_tonemap_fs(
     // digital noise read as digital. Per pixel, per frame (like grain, after the still's
     // accumulation, so the export keeps it), Gaussian, partly shared across the channels
     // (demosaicing correlates them; `.w`). Strength 0 ⇒ the branch never runs ⇒ byte-identical.
-    if (frame.sensorNoise.x > 0.0) {
+    //
+    // ── …and the capture medium's EMULSION grain rides in the same block (Daydream DH-1000) ──
+    // Danny: "film grain and sensor noise would know about each other and we'd only have one
+    // setting". They are the same physical thing — the exposure is a count of discrete events
+    // (photo-electrons, developed silver grains) — and differ only in how the variance depends on
+    // the signal:
+    //   sensor   σ² = s²·(N + r²)/e²   (shot + read; the RELATIVE noise falls as the signal rises)
+    //   emulsion σ² = g²·x²            (constant RELATIVE noise = constant in log exposure, which is
+    //                                    what "constant in DENSITY" means for a negative)
+    // so the medium's noise is ONE Gaussian with σ² = the sum, drawn ONCE, here in the scene-
+    // referred exposure. The display transform then renders it with its own log-slope — the print's
+    // slope — which is exactly the tonal profile the old encoded-domain mask was hand-approximating
+    // (peaks across the mids, a tail into the toe, a shorter one into the shoulder: AgX's slope at
+    // 0.05 / 0.09 / 0.4 / 2.0 exposed is 0.73 / 0.88 / 1.03 / 0.68 of mid-grey's, the old mask at the
+    // same prints 0.57 / 0.95 / 1.0 / 0.30). One σ means the two cannot stack: a host sets ONE budget
+    // and apportions it (Daydream's `RenderStyle.filmGrainMedium`). The channel correlation is the
+    // variance-weighted mix of the dye layers' (`filmMedium.y`, 0.80) and the demosaic's
+    // (`sensorNoise.w`), so a pushed, sensor-dominated pixel reads digital and a well-exposed one
+    // reads as film. `filmMedium.x` 0 ⇒ the code below is DH-0992's, unchanged.
+    if (frame.sensorNoise.x > 0.0 || frame.filmMedium.x > 0.0) {
         float ePerUnit = max(frame.sensorNoise.y, 1.0) / max(autoBase, 1e-3);
-        uint2 sp = uint2(max(in.position.xy, 0.0));
+        float g = frame.filmMedium.x;
+        // The emulsion's grain has a SIZE (the `filmGrainSize` cell grid, as the old grain did);
+        // a bare sensor is per photosite.
+        float2 spf = max(in.position.xy, 0.0);
+        if (g > 0.0) spf = floor(spf / max(frame.filmGrainSize, 1.0));
+        uint2 sp = uint2(spf);
         uint  st = as_type<uint>(frame.time) ^ 0x5E4501u;
         float u[4];
         for (uint c = 0; c < 4; ++c) {
@@ -1138,13 +1162,29 @@ fragment float4 illumi_tonemap_fs(
         }
         // Box–Muller: four uniforms → four standard normals.
         float r0 = sqrt(-2.0 * log(u[0])), r1 = sqrt(-2.0 * log(u[2]));
-        float4 g = float4(r0 * cos(2.0 * M_PI_F * u[1]), r0 * sin(2.0 * M_PI_F * u[1]),
-                          r1 * cos(2.0 * M_PI_F * u[3]), r1 * sin(2.0 * M_PI_F * u[3]));
-        float k = saturate(frame.sensorNoise.w);
-        float3 n = (k * g.x + (1.0 - k) * g.yzw) * rsqrt(k * k + (1.0 - k) * (1.0 - k));
+        float4 gn = float4(r0 * cos(2.0 * M_PI_F * u[1]), r0 * sin(2.0 * M_PI_F * u[1]),
+                           r1 * cos(2.0 * M_PI_F * u[3]), r1 * sin(2.0 * M_PI_F * u[3]));
         float3 electrons = max(exposedScene, 0.0) * ePerUnit;
-        float3 sigma = sqrt(electrons + frame.sensorNoise.z * frame.sensorNoise.z) / ePerUnit;
-        exposedScene = max(exposedScene + n * sigma * frame.sensorNoise.x, 0.0);
+        float  rn2 = frame.sensorNoise.z * frame.sensorNoise.z;
+        float k = saturate(frame.sensorNoise.w);
+        if (g > 0.0) {
+            // Per-channel variance of the medium: the sensor's (in exposed units, scaled by its
+            // strength) plus the emulsion's. The correlation follows whichever dominates, judged on
+            // the pixel's luminance so all three channels share one k.
+            float  sN = frame.sensorNoise.x;
+            float3 xs = max(exposedScene, 0.0);
+            float3 var3 = (sN * sN) * (electrons + rn2) / (ePerUnit * ePerUnit) + (g * g) * xs * xs;
+            float  xl = dot(xs, float3(0.2126, 0.7152, 0.0722));
+            float  vs = (sN * sN) * (xl * ePerUnit + rn2) / (ePerUnit * ePerUnit);
+            float  w  = vs / max(vs + (g * g) * xl * xl, 1e-20);
+            k = mix(saturate(frame.filmMedium.y), k, w);
+            float3 n = (k * gn.x + (1.0 - k) * gn.yzw) * rsqrt(k * k + (1.0 - k) * (1.0 - k));
+            exposedScene = max(exposedScene + n * sqrt(var3), 0.0);
+        } else {
+            float3 n = (k * gn.x + (1.0 - k) * gn.yzw) * rsqrt(k * k + (1.0 - k) * (1.0 - k));
+            float3 sigma = sqrt(electrons + rn2) / ePerUnit;
+            exposedScene = max(exposedScene + n * sigma * frame.sensorNoise.x, 0.0);
+        }
     }
 
     float3 mapped = displayTransform(exposedScene, frame.displayTransform);

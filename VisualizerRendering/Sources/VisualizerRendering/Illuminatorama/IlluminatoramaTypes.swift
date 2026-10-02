@@ -613,6 +613,10 @@ public struct IlluminatoramaFrameUniforms {
     /// x strength (0 ⇒ off, byte-identical), y photo-electrons per exposed unit at the camera's
     /// ISO, z read noise (e⁻), w channel correlation. 1680 → 1696.
     public var sensorNoise: SIMD4<Float> = .zero
+    /// The capture medium's emulsion grain (Daydream DH-1000) — see the Metal
+    /// `FrameUniforms.filmMedium`: x relative σ (0 ⇒ off, byte-identical), y dye-layer
+    /// correlation. 1696 → 1712.
+    public var filmMedium: SIMD4<Float> = .zero
 
     /// Fill the eight gain vectors from a flat 32-entry table, and stamp the enable.
     public mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
