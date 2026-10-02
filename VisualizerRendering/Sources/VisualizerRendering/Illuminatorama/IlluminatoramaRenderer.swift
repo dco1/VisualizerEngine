@@ -762,6 +762,22 @@ public final class IlluminatoramaRenderer {
     /// its meaning. The diffuse sibling of DH-0896's `reflReplacesIBL`. Default `false`:
     /// byte-identical for every host that does not opt in.
     public var rtGIReplacesDiffuseSky: Bool = false
+    /// **The path-traced GI lane (Daydream DH-0989; DH-0642's reference is the same lane at a deep
+    /// budget).** When true each of `rtGIRays` is a whole multi-bounce path — next-event estimation
+    /// of the sun, the local lights and ONE window aperture per vertex, a cosine continuation,
+    /// Russian roulette — and it owns the pixel's ENTIRE diffuse indirect: the deferred pass hands
+    /// over its diffuse IBL (interior bands and room gains included), its ambient supplement and
+    /// its area lights (this host's area lights are window portals, which the path samples as
+    /// apertures onto the real sky), and the traced pass subtracts them where it ran. Implies the
+    /// `rtGIReplacesDiffuseSky` hand-off. Default `false`: byte-identical for every host that does
+    /// not opt in. A host that opts in should run `rtGIStrength` at 1 — the estimate is physical.
+    public var rtPathTracedGI: Bool = false
+    /// Continuation bounces per path (Russian roulette also ends paths from the third vertex).
+    public var rtPathBounces: Int = 6
+    /// Luminance cap on one path's estimate (scene-linear, before exposure); 0 ⇒ no clamp. A
+    /// path through a sunlit patch seen past a doorway is the classic firefly; the cap trades a
+    /// little energy in those paths for a still that converges in the frames it is given.
+    public var rtPathClamp: Float = 0
     /// Cone-sampled shadow rays per pixel per frame for `rtSunSoftShadowsEnabled`'s traced
     /// sun visibility, host-clamped (`rtSunShadowRayCount`'s write, below) and shader-clamped
     /// (`rtSunSoftVisibility`, IlluminatoramaLighting.metal) to 1…32. DH-0856 measured this
@@ -3248,10 +3264,16 @@ public final class IlluminatoramaRenderer {
     /// Whether THIS frame's lighting pass wrote `diffSkyTexture` — the traced pass only
     /// subtracts a share that was written this frame.
     private var diffSkyWrittenThisFrame = false
+    /// Whether the traced GI will replace a deferred diffuse share this frame (the sky, or with
+    /// `rtPathTracedGI` the whole diffuse indirect). The frame uniforms read it to set
+    /// `kFrameFlagPathOwnsIndirect`; `diffSkyHandoffTarget` allocates on it.
+    private var diffSkyHandoffActive: Bool {
+        (rtGIReplacesDiffuseSky || rtPathTracedGI) && rtGIStrength > 0 && rtOpaqueLightingEnabled
+            && rtEnabled && rtTLASSupported && debugTerm == .normal
+    }
     /// The full-size hand-off target when the traced GI will replace the diffuse sky this frame.
     private func diffSkyHandoffTarget() -> MTLTexture? {
-        guard rtGIReplacesDiffuseSky, rtGIStrength > 0, rtOpaqueLightingEnabled, rtEnabled,
-              rtTLASSupported, debugTerm == .normal else { return nil }
+        guard diffSkyHandoffActive else { return nil }
         let w = hdrTexture.width, h = hdrTexture.height
         if let t = diffSkyTexture, t.width == w, t.height == h { return t }
         let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: w, height: h,
@@ -4489,7 +4511,9 @@ public final class IlluminatoramaRenderer {
         var giProgressiveIndex: UInt32 = 0
         /// DH-0715 — the traced-origin snap's reach (was `padProg0`, same 4 bytes).
         var surfaceSnapULPs: Float = 0
-        var padProg1: UInt32 = 0, padProg2: UInt32 = 0
+        /// DH-0989 — path bounces (0 ⇒ one-bounce GI) and the per-path luminance cap.
+        var pathBounces: UInt32 = 0
+        var pathClamp: Float = 0
 
         mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
             let p = InteriorRoomGains.pack(gains, enabled: enabled)
@@ -9497,8 +9521,13 @@ public final class IlluminatoramaRenderer {
         // DH-0896 — a reflection hit REPLACES the sky the deferred pass put there.
         let specIBLOn = rtReflectionsEnabled && specIBLWrittenThisFrame && specIBLTexture != nil
         u.reflReplacesIBL = specIBLOn ? 1 : 0
-        let diffSkyOn = rtGIReplacesDiffuseSky && diffSkyWrittenThisFrame && diffSkyTexture != nil
+        let diffSkyOn = (rtGIReplacesDiffuseSky || rtPathTracedGI) && diffSkyWrittenThisFrame && diffSkyTexture != nil
         u.giReplacesDiffuseSky = diffSkyOn ? 1 : 0
+        // DH-0989 — the path lane runs ONLY where the deferred pass handed its share over this
+        // frame; otherwise its whole-indirect estimate would land on top of the stand-ins.
+        let pathOn = rtPathTracedGI && diffSkyOn
+        u.pathBounces = pathOn ? UInt32(max(1, min(32, rtPathBounces))) : 0
+        u.pathClamp = pathOn ? max(0, rtPathClamp) : 0
         // Surface cache read (P1c): on only when the grouped soup + cards + base
         // are all live this topology. The kernel gates every atlas read on this.
         let cacheOn = surfCacheActive && surfCardCount > 0
@@ -14993,6 +15022,10 @@ public final class IlluminatoramaRenderer {
             u.directionalLightColor = .zero
             u.shadowEnabled = 0
         }
+        // DH-0989 — `frameFlags` bit 1 (the Metal twin of this dead `shadowEnabled` slot): the
+        // path-traced lane owns the diffuse indirect this frame, so the lighting pass hands ALL of
+        // it over (`kFrameFlagPathOwnsIndirect`).
+        if rtPathTracedGI && diffSkyHandoffActive { u.shadowEnabled |= 2 }
         // Tree wind (#58 #1): repurpose the two free pad floats as the vertex-
         // shader vegetation-wind knobs. _padPhase2A = strength (max canopy sway,
         // ~m), _padPhase2B = heading (radians). 0 strength → exact no-op (the

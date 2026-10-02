@@ -686,7 +686,11 @@ public struct IlluminatoramaAreaLight {
     /// shadow map and no visibility term, so this is its only containment.
     public var layerMask: UInt32 = 0xFFFF_FFFF
     public var ey: SIMD3<Float>              // half-height edge vector (world)
-    public var _pad1: Float = 0
+    /// Daydream DH-0989 — for an area light that stands over a real OPENING (a window portal), the
+    /// fraction of light its pane STOPS (1 − diffuse transmittance); 0 ⇒ an open hole. Read only by
+    /// the path-traced GI lane, which samples the opening as an aperture onto the real sky. Was
+    /// `_pad1` — same 4 bytes, stride unchanged; the deferred kernel never reads it.
+    public var apertureOpacity: Float = 0
     public var color: SIMD3<Float>           // pre-multiplied intensity
     public var radius: Float                 // distance-falloff range (metres)
     /// DH-0601 — portal VISIBILITY shadow. World → light-space NDC for the depth map
@@ -703,7 +707,12 @@ public struct IlluminatoramaAreaLight {
     /// Default 0, so every existing caller is unchanged. Mirrors `IlluminatoramaPointLight
     /// .castsShadow`.
     public var castsShadow: Int32 = 0
-    public var _pad2: Float = 0
+    /// Daydream DH-0989 — 1 ⇒ this rect stands over a real OPENING onto the sky (a window portal),
+    /// not an emitter. The path-traced GI lane samples an aperture as a window onto the real sky
+    /// (its fitted `color` only weights the choice between apertures) and takes over its diffuse
+    /// share from the deferred pass; an emitter (a light strip, a skylight lens) stays an emitter.
+    /// Was `_pad2` — same 4 bytes. Default 0 ⇒ every existing caller is an emitter, unchanged.
+    public var isAperture: Float = 0
     public var _pad3: Float = 0
 
     public init(center: SIMD3<Float>, ex: SIMD3<Float>, ey: SIMD3<Float>,

@@ -131,12 +131,12 @@ struct RTSpotLight {
 struct RTAreaLight {
     float3   center;     float twoSided;
     float3   ex;         uint  layerMask;
-    float3   ey;         float _pad1;
+    float3   ey;         float apertureOpacity;   // DH-0989 (was `_pad1`): 1 − pane transmittance
     float3   color;      float radius;
     float4x4 shadowMatrix;
     int      shadowSliceIndex;
     int      castsShadow;
-    float    _pad2; float _pad3;
+    float    isAperture; float _pad3;   // DH-0989 (was `_pad2`) — see `AreaLight.isAperture`
 };
 
 // ── Rectangular area light: the clamped-cosine form factor ───────────────────
@@ -652,11 +652,12 @@ static inline float3 secondaryAreaLightFill(thread Isect& isect,
                                             instance_acceleration_structure accel,
                                             float3 P, float3 N, uint layerBits,
                                             SecondaryShadeParams p, SecondaryScene sc,
-                                            thread uint& seed)
+                                            thread uint& seed, bool emittersOnly = false)
 {
     float3 sum = float3(0.0);
     for (uint i = 0u; i < p.areaLightCount; ++i) {
         RTAreaLight al = sc.areaLights[i];
+        if (emittersOnly && al.isAperture > 0.5) continue;   // DH-0989: the path samples those
         if ((al.layerMask & layerBits) == 0u) continue;
         float3 nL = cross(al.ex, al.ey);
         float  nLlen = length(nL);

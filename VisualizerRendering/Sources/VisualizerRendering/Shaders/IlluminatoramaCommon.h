@@ -43,6 +43,11 @@ using namespace metal;
 
 // ── Shared structs (mirror IlluminatoramaTypes.swift) ────────────────────────
 
+/// FrameUniforms.frameFlags bit 1 — the PATH-TRACED GI lane runs this frame and owns the whole
+/// diffuse indirect: the lighting pass writes its diffuse IBL (bands included) + ambient + area-light
+/// share to `diffSkyOut`, and the traced pass subtracts it where it ran (DH-0989).
+#define kFrameFlagPathOwnsIndirect 2u
+
 struct FrameUniforms {
     float4x4 viewProjection;
     float4x4 view;
@@ -113,8 +118,10 @@ struct FrameUniforms {
     float4   cascadeSplitsView;
     float    shadowBias;
     float    shadowSlopeBias;
-    uint     _padShadow;          // was `shadowEnabled`, never read (DH-0620); the
-                                  // kLightingShadowEnabled function constant gates shadows
+    // Was `_padShadow` (`shadowEnabled`, never read — DH-0620; the kLightingShadowEnabled
+    // function constant gates shadows). Bit 0 is still that dead value; bit 1 is
+    // `kFrameFlagPathOwnsIndirect` (Daydream DH-0989).
+    uint     frameFlags;
     uint     shadowPcfRadius;
     // Phase 2.7 — Motion vectors + TAA. `previousViewProjection` is the
     // *jittered* VP from the previous frame so the rasterized history sample
@@ -608,7 +615,7 @@ struct AreaLight {
     // window portal (see shadowMatrix below): an unmasked area light lights the yard
     // through the back of its own wall.
     float3 ex;       uint layerMask;   // half-width edge vector (world) + mask
-    float3 ey;       float _pad1;      // half-height edge vector (world)
+    float3 ey;       float apertureOpacity;  // half-height edge (world); DH-0989 pane opacity (was `_pad1`)
     float3 color;    float radius;     // premultiplied color + distance-falloff range
     // DH-0601 — portal VISIBILITY shadow (a window portal by day is the room's dominant
     // source; without occlusion nothing indoors casts a shadow). One depth map rendered
@@ -621,7 +628,10 @@ struct AreaLight {
     float4x4 shadowMatrix;
     int      shadowSliceIndex;
     int      castsShadow;
-    float    _pad2; float _pad3;       // close on a 16-byte boundary (stride 144)
+    // DH-0989 (was `_pad2`): 1 ⇒ this rect stands over a real OPENING onto the sky (a window
+    // portal) rather than being an emitter. The path-traced lane samples an aperture as a window
+    // onto the real sky and takes over its diffuse share; an emitter stays an emitter.
+    float    isAperture; float _pad3;  // close on a 16-byte boundary (stride 144)
 };
 
 // A daylight aperture (S3.5 Stage D) — a glazed opening reduced to what the interior

@@ -1534,6 +1534,9 @@ kernel void illumi_lighting(
     // Rectangular area lights (#60 task 5) — closed-form polygon diffuse + MRP
     // specular, replacing the old five-spot stand-in.
     float3 areaSum = float3(0.0);
+    // DH-0989 — the window-APERTURE share of `areaSum` (`AreaLight.isAperture`), which the
+    // path-traced lane takes over; emitters (strips, skylight lenses) stay in the composite.
+    float3 apertureSum = float3(0.0);
     bool areaLTC = frame.areaLTCEnabled != 0u;
     for (uint i = 0; i < frame.areaLightCount; ++i) {
         AreaLight al = areaLights[i];
@@ -1564,9 +1567,14 @@ kernel void illumi_lighting(
             float3 unshadowed = evalAreaLight(al, worldPos, N, V, albedo, metallic, roughness,
                                               ltcMat, ltcMag, areaLTC);
             float lum = dot(unshadowed, float3(0.2126, 0.7152, 0.0722));
-            if (lum <= kRTAreaShadowSkipLuma) { areaSum += unshadowed; continue; }
+            if (lum <= kRTAreaShadowSkipLuma) {
+                areaSum += unshadowed;
+                if (al.isAperture > 0.5) apertureSum += unshadowed;
+                continue;
+            }
             visibility = rtAreaVisibility(rtSunAccel, frame, al, rtPos, N, gid, i);
             areaSum += visibility * unshadowed;
+            if (al.isAperture > 0.5) apertureSum += visibility * unshadowed;
             continue;
         } else if (al.shadowSliceIndex >= 0) {
             float4 lsPos = al.shadowMatrix * float4(worldPos, 1.0);
@@ -1598,8 +1606,10 @@ kernel void illumi_lighting(
             }
         }
         if (visibility <= 0.0) continue;
-        areaSum += visibility * evalAreaLight(al, worldPos, N, V, albedo, metallic, roughness,
+        float3 areaTerm = visibility * evalAreaLight(al, worldPos, N, V, albedo, metallic, roughness,
                                               ltcMat, ltcMag, areaLTC);
+        areaSum += areaTerm;
+        if (al.isAperture > 0.5) apertureSum += areaTerm;
     }
 
     // Secondary directional lights (#60 task 5) — fill / back lights that a
@@ -1988,6 +1998,12 @@ kernel void illumi_lighting(
         float3 ambSupp = mix(ambCol * 0.4, ambCol, upness) * albedo;
         indirect += ambSupp * ao * interiorAmbK;
         dbgAmbient = ambSupp * ao * interiorAmbK;
+        // DH-0989 — the path-traced lane walks the light every one of these terms stands in
+        // for, so it takes the WHOLE diffuse IBL (bands, room gains, interior scalars) and the
+        // ambient supplement — not only the outdoor-cube share.
+        if ((frame.frameFlags & kFrameFlagPathOwnsIndirect) != 0u) {
+            diffSkyInComposite = dbgDiffuseIBL + dbgAmbient;
+        }
         // Ambient sheen — the same lobe against the flat ambient term, so a scene that lights
         // its interior with `ambientColor` rather than an IBL probe still gets fabric. Uses
         // `interiorAmbK` for the same reason the supplement above does. Exact no-op when
@@ -2006,6 +2022,7 @@ kernel void illumi_lighting(
         float3 amb = mix(ambCol * 0.4, ambCol, upness) * albedo;
         indirect = amb * ao * interiorAmbK;
         dbgAmbient = amb * ao * interiorAmbK;
+        if ((frame.frameFlags & kFrameFlagPathOwnsIndirect) != 0u) diffSkyInComposite = dbgAmbient;
     }
 
     // Issue #65 — fold the indirect DIFFUSE (diffuse-IBL irradiance + ambient
@@ -2138,6 +2155,10 @@ kernel void illumi_lighting(
     // `directSun` / `pointSum` / `spotSum` / `dirFillSum` / `indirect`, so adding it again here
     // would double-count it.
     float3 color = directSun + transmission + dirFillSum + pointSum + spotSum + areaSum + indirect + emission + clearcoat + hotdogCC + plushSheenTerm;
+    // DH-0989 — and the area lights: in this lane they are the window APERTURES the path samples
+    // directly (their glossy share comes back through the traced reflections, which see the sky
+    // through the same opening).
+    if ((frame.frameFlags & kFrameFlagPathOwnsIndirect) != 0u) diffSkyInComposite += apertureSum;
 
     // Per-term split-render: isolate ONE contribution so a flooded/flat scene
     // can be decomposed. Surfaces only — sky already returned above.
