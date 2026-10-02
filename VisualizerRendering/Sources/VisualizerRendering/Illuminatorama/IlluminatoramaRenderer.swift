@@ -440,7 +440,8 @@ public final class IlluminatoramaRenderer {
     /// total (and `bloomIntensity`'s meaning) is unchanged. Real lenses sit near α ≈ 2.5–3.
     public var bloomPSFExponent: Float = 0
     /// **Physical glare (Daydream DH-1001).** false (default) ⇒ the bloom above, byte-identical.
-    /// true ⇒ the pyramid IS the CIE 146:2002 glare spread function (`IlluminatoramaGlareSpread`):
+    /// true ⇒ the pyramid IS a physical glare spread function (`IlluminatoramaGlareSpread`; which one
+    /// is `bloomGlareModel` — a camera lens by default since DH-1009, the CIE 146:2002 eye before):
     /// no threshold, no Karis weighting, level weights solved against the GSF in this frame's own
     /// angular units (the camera projection's pixel angle — so the halo scales with focal length and
     /// resolution), and the scattered fraction η taken OUT of the direct image (the tonemap forms
@@ -450,12 +451,13 @@ public final class IlluminatoramaRenderer {
     /// tail (`illumi_bloom_glare_tail`, an exact angular convolution over a coarse down level), so
     /// it follows the standard to the frame corner instead of stopping a few degrees out.
     public var bloomPhysicalGlare: Bool = false
-    /// The CIE observer the glare is computed for (age, years; ocular pigmentation 0…1.2).
-    public var bloomGlareObserverAge: Float = Float(IlluminatoramaGlareSpread.defaultAge)
-    public var bloomGlarePigment: Float = Float(IlluminatoramaGlareSpread.defaultPigment)
+    /// Whose glare it is (Daydream DH-1009): a camera lens's surface scatter (`.cameraLens`, the
+    /// default — Ritt et al. 2020's generic double-Gauss, η ≈ 0.025) or the CIE 146:2002 eye
+    /// (`.standardObserver` or `.eye(age:pigment:)`, η ≈ 0.30). Both run the same fit + far tail.
+    public var bloomGlareModel: IlluminatoramaGlareSpread.Model = .cameraLens
     /// TEST-OBSERVABLE: the glare fit the last frame used (nil ⇒ physical glare was off).
     public private(set) var lastBloomGlareFit: IlluminatoramaGlareSpread.Fit?
-    private var glareFitKey: SIMD4<Float> = .zero
+    private var glareFitKey: (texelRad: Float, levels: Int, model: IlluminatoramaGlareSpread.Model)?
     /// DH-0998 — the far-field glare tail: tan of the half field of view (x, y) this frame, its
     /// output (rgb = the tail's glare, a = the in-frame share of each pixel's light it scatters),
     /// and its pipeline (built on first use: only an export on the physical lane ever runs it).
@@ -14746,7 +14748,8 @@ public final class IlluminatoramaRenderer {
     private struct BloomGlareTailParams {
         var tanHalf: SIMD2<Float>
         var rhoA: Float, rhoB: Float, thetaMax: Float
-        var ageTerm: Float, pigment: Float, pad: Float = 0
+        var ageTerm: Float = 0, pigment: Float = 0
+        var model: Float = 0, lensK: Float = 0, lensInvL2: Float = 0, lensHalfS: Float = 0, pad: Float = 0
     }
 
     /// Encode `illumi_bloom_glare_tail` over `source` into `output`. Leaves buffer 0 bound to the
@@ -14760,9 +14763,15 @@ public final class IlluminatoramaRenderer {
         // exactly (see the shader for why not in angle).
         let tanPerDegree = Double.pi / 180
         var p = BloomGlareTailParams(tanHalf: tanHalf, rhoA: Float(fit.tailStartDegrees * tanPerDegree),
-                                     rhoB: Float(fit.tailEndDegrees * tanPerDegree), thetaMax: Float(fit.tailMaxDegrees),
-                                     ageTerm: Float(1 + pow(Double(bloomGlareObserverAge) / 62.5, 4)),
-                                     pigment: bloomGlarePigment)
+                                     rhoB: Float(fit.tailEndDegrees * tanPerDegree), thetaMax: Float(fit.tailMaxDegrees))
+        // The tail evaluates the SAME model the pyramid's weights were solved against — the fit's.
+        switch fit.model {
+        case let .eye(age, pigment):
+            p.ageTerm = Float(1 + pow(age / 62.5, 4)); p.pigment = Float(pigment)
+        case let .lens(L):
+            p.model = 1; p.lensK = Float(Double(L.surfaces) * L.b0)
+            p.lensInvL2 = Float(1 / (L.l * L.l)); p.lensHalfS = Float(L.s / 2)
+        }
         enc.setComputePipelineState(pipe)
         enc.setTexture(source, index: 0)
         enc.setTexture(output, index: 1)
@@ -15538,12 +15547,11 @@ public final class IlluminatoramaRenderer {
         if bloomPhysicalGlare, !camera.isOrthographic, let mip0 = bloomDownChain.first, bloomDownChain.count >= 2 {
             let texelRad = (2.0 / max(camera.projectionMatrix[1][1], 1e-6)) / Float(max(mip0.height, 1))
             let fitLevels = Self.bloomGlareFitLevelCount(halfW: mip0.width, halfH: mip0.height)
-            let key = SIMD4<Float>(texelRad, Float(fitLevels), bloomGlareObserverAge, bloomGlarePigment)
-            if lastBloomGlareFit == nil || key != glareFitKey {
+            if lastBloomGlareFit == nil || glareFitKey?.texelRad != texelRad || glareFitKey?.levels != fitLevels
+                || glareFitKey?.model != bloomGlareModel {
                 lastBloomGlareFit = IlluminatoramaGlareSpread.fit(
-                    texelRadians: Double(texelRad), levels: fitLevels,
-                    age: Double(bloomGlareObserverAge), pigment: Double(bloomGlarePigment))
-                glareFitKey = key
+                    texelRadians: Double(texelRad), levels: fitLevels, model: bloomGlareModel)
+                glareFitKey = (texelRad, fitLevels, bloomGlareModel)
             }
             // DH-0998 — the far-field tail's view geometry: the half field of view's tangents.
             glareTailTanHalf = SIMD2(1 / max(camera.projectionMatrix[0][0], 1e-6),

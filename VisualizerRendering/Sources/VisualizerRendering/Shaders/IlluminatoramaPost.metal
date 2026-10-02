@@ -240,8 +240,8 @@ kernel void illumi_bloom_up(
 // ── Far-field glare tail (Daydream DH-0998) ──────────────────────────────────
 //
 // The pyramid above is a sum of COMPACT kernels: its coarsest level ends ~2^(levels+1.2) mip0
-// texels out, so the physical glare it realises (IlluminatoramaGlareSpread) followed the CIE
-// 146:2002 glare spread function only to ~1.5·2^levels texels — a few degrees — and then fell off
+// texels out, so the physical glare it realises (IlluminatoramaGlareSpread — the eye's CIE 146:2002
+// GSF, or since DH-1009 a camera lens's Harvey scatter PSF) followed the CIE glare spread function only to ~1.5·2^levels texels — a few degrees — and then fell off
 // a cliff, while the standard's 5/θ² + 0.1p/θ + 0.0025p skirt keeps going to its 100° validity
 // limit. This is the rest of it, done EXACTLY rather than approximated by more levels: a direct
 // sum over a coarse level of the down chain (≤ ~10⁴ cells; evaluated on a grid half that per axis,
@@ -266,9 +266,13 @@ struct BloomGlareTailParams {
     float2 tanHalf;     // tan of the half field of view (1/P00, 1/P11)
     float  rhoA;        // ramp start, image-plane (tan) distance
     float  rhoB;        // ramp end, image-plane (tan) distance
-    float  thetaMax;    // tail end (the CIE validity limit), degrees
-    float  ageTerm;     // 1 + (age / 62.5)^4
-    float  pigment;     // ocular pigmentation p
+    float  thetaMax;    // tail end (the model's validity limit), degrees
+    float  ageTerm;     // eye: 1 + (age / 62.5)^4
+    float  pigment;     // eye: ocular pigmentation p
+    float  model;       // 0 = the eye (CIE 146:2002 GSF); 1 = a camera lens (Harvey surface scatter, DH-1009)
+    float  lensK;       // lens: N_surfaces · b0, sr⁻¹
+    float  lensInvL2;   // lens: 1 / l², l the Harvey shoulder (rad)
+    float  lensHalfS;   // lens: s / 2 (s < 0, the power-law slope)
     float  pad;
 };
 
@@ -309,10 +313,19 @@ kernel void illumi_bloom_glare_tail(
         float inv = rsqrt(dot(d, d));
         float c = dot(dp, d) * inv;
         if (c < cosMax) continue;
-        float it = (M_PI_F / 180.0) / acos(clamp(c, -1.0, 1.0));     // 1/θ, θ in degrees
-        // 10/θ³ + (5/θ² + 0.1p/θ)·ageTerm + 0.0025p, on one reciprocal.
-        float gsf = it * (it * (10.0 * it + 5.0 * P.ageTerm) + 0.1 * P.pigment * P.ageTerm)
-                  + 0.0025 * P.pigment;
+        float gsf;
+        if (P.model > 0.5) {
+            // DH-1009 — a camera lens: N·b0·[1 + (sin θ / l)²]^(s/2)·cos θ (Harvey surface scatter
+            // per projected solid angle × the obliquity; Ritt et al. 2020). sin θ from the cross
+            // product, not 1 − c² (which cancels catastrophically in float a few degrees out).
+            float3 cr = cross(dp, d * inv);
+            gsf = P.lensK * pow(1.0 + dot(cr, cr) * P.lensInvL2, P.lensHalfS) * c;
+        } else {
+            float it = (M_PI_F / 180.0) / acos(clamp(c, -1.0, 1.0));     // 1/θ, θ in degrees
+            // 10/θ³ + (5/θ² + 0.1p/θ)·ageTerm + 0.0025p, on one reciprocal.
+            gsf = it * (it * (10.0 * it + 5.0 * P.ageTerm) + 0.1 * P.pigment * P.ageTerm)
+                + 0.0025 * P.pigment;
+        }
         float ramp = 1.0;                                            // past ρB: the tail is all
         if (rho2 < rhoB2) {
             float s = saturate((0.5 * log(rho2) - logA) * invSpan);
