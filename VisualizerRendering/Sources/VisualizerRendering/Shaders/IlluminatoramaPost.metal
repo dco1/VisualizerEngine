@@ -150,6 +150,17 @@ kernel void illumi_bloom_prefilter(
 
     float3 t[13];
     illumiBloomFetch13(inHDR, smp, uv, tx, t);
+    // Daydream DH-1001 — PHYSICAL GLARE (`bloomParams.w` = the scattered energy η > 0): a real
+    // eye or lens scatters a fixed fraction of ALL the light, so there is no threshold, and the
+    // Karis partial average (which deliberately under-weights bright quads) would throw away the
+    // very energy the glare is made of — the plain, energy-conserving 13-tap instead. The chain
+    // is then a LINEAR filter whose level weights the host solved against the CIE GSF
+    // (IlluminatoramaGlareSpread). w == 0 (every legacy lane) never enters this branch.
+    if (frame.bloomParams.w > 0.0) {
+        for (int i = 0; i < 13; ++i) t[i] = max(t[i], 0.0);
+        outMip0.write(half4(half3(illumiBloomCombine13(t, false)), 1.0h), gid);
+        return;
+    }
     float threshold = frame.bloomThreshold;
     float knee = max(0.0, frame.bloomParams.x) * threshold;
     for (int i = 0; i < 13; ++i) {

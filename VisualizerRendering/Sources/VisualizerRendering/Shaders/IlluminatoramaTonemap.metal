@@ -894,7 +894,10 @@ fragment float4 illumi_tonemap_fs(
     // gaussian it replaced, so `bloomIntensity` means what it always meant.
     float3 bloom = float3(inBloom.sample(downSampler, in.uv).rgb);
 
-    float3 mixed = hdr + bloom * frame.bloomIntensity;
+    // Daydream DH-1001 — physical glare: the scattered fraction η (`bloomParams.w`) LEAVES the
+    // direct image and arrives as the glare (`bloomIntensity` = η), so the PSF (1−η)·δ + η·G
+    // conserves energy. w == 0 ⇒ `hdr * 1.0`, exact — every legacy lane is byte-identical.
+    float3 mixed = hdr * (1.0 - frame.bloomParams.w) + bloom * frame.bloomIntensity;
 
     // ── Halation (film) ────────────────────────────────────────────────────────
     // The warm halo film wears around blown highlights (see the halation kernels in

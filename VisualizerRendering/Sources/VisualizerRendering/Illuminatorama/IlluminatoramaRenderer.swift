@@ -439,6 +439,21 @@ public final class IlluminatoramaRenderer {
     /// before, so an octave's share of the energy is ∝ r^(2−α); the weights are normalised, so the
     /// total (and `bloomIntensity`'s meaning) is unchanged. Real lenses sit near α ≈ 2.5–3.
     public var bloomPSFExponent: Float = 0
+    /// **Physical glare (Daydream DH-1001).** false (default) ⇒ the bloom above, byte-identical.
+    /// true ⇒ the pyramid IS the CIE 146:2002 glare spread function (`IlluminatoramaGlareSpread`):
+    /// no threshold, no Karis weighting, level weights solved against the GSF in this frame's own
+    /// angular units (the camera projection's pixel angle — so the halo scales with focal length and
+    /// resolution), and the scattered fraction η taken OUT of the direct image (the tonemap forms
+    /// `hdr·(1−η) + η·bloom`). Overrides `bloomThreshold`, `bloomSoftKnee`, `bloomIntensity`,
+    /// `bloomScatter` and `bloomPSFExponent` while on. The tent radius must stay 1.0 (the measured
+    /// kernels are for it).
+    public var bloomPhysicalGlare: Bool = false
+    /// The CIE observer the glare is computed for (age, years; ocular pigmentation 0…1.2).
+    public var bloomGlareObserverAge: Float = Float(IlluminatoramaGlareSpread.defaultAge)
+    public var bloomGlarePigment: Float = Float(IlluminatoramaGlareSpread.defaultPigment)
+    /// TEST-OBSERVABLE: the glare fit the last frame used (nil ⇒ physical glare was off).
+    public private(set) var lastBloomGlareFit: IlluminatoramaGlareSpread.Fit?
+    private var glareFitKey: SIMD4<Float> = .zero
 
     // ── Digital sensor noise (Daydream DH-0992) ───────────────────────
     /// Shot + read noise of a photo-electron count, in the exposed scene signal before the
@@ -14673,7 +14688,9 @@ public final class IlluminatoramaRenderer {
         // smallest DOWN level (which is why the up chain is one texture shorter).
         enc.setComputePipelineState(bloomUpPipeline)
         let last = bloomDownChain.count - 1
-        let levelScatters = Self.bloomPSFScatters(levels: bloomDownChain.count, exponent: bloomPSFExponent)
+        let levelScatters = lastBloomGlareFit.map { fit in
+            (0..<bloomDownChain.count).map { $0 < fit.scatters.count ? fit.scatters[$0] : 1 }
+        } ?? Self.bloomPSFScatters(levels: bloomDownChain.count, exponent: bloomPSFExponent)
         for level in stride(from: last - 1, through: 0, by: -1) {
             let low = (level == last - 1) ? bloomDownChain[last] : bloomUpChain[level + 1]
             let dst = bloomUpChain[level]
@@ -14685,6 +14702,114 @@ public final class IlluminatoramaRenderer {
             dispatch(enc, pipeline: bloomUpPipeline, width: dst.width, height: dst.height)
         }
         enc.endEncoding()
+    }
+
+    /// **TEST INSTRUMENT (Daydream DH-1001): the bloom chain's impulse response, on the GPU.**
+    /// Runs the SAME prefilter / down / up pipelines the frame does, in physical-glare mode (no
+    /// threshold, no Karis), on a `2·size × 2·size` HDR texture holding one texel of `impulse` at
+    /// full-res pixel `at`, with the up-chain's convex weights set to `levelWeights` (Σ = 1; a
+    /// one-hot vector isolates one level's kernel Kᵢ). Returns the pyramid output (mip0,
+    /// `size × size`) as linear luma, unscaled. Synchronous; call between frames. Uses the current
+    /// frame uniforms for everything the bloom kernels do not read.
+    public func measureBloomImpulseResponse(levelWeights: [Float], size: Int,
+                                            at: SIMD2<Int>, impulse: Float = 1024) -> [Float]? {
+        let levels = min(levelWeights.count, Self.bloomLevelCount(halfW: size, halfH: size))
+        guard levels >= 1, size >= 8 else { return nil }
+        func tex(_ w: Int, _ h: Int, _ fmt: MTLPixelFormat = .rgba16Float) -> MTLTexture? {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: fmt, width: w, height: h, mipmapped: false)
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            return device.makeTexture(descriptor: d)
+        }
+        // Input: zero, one impulse texel. Uploaded through a shared staging buffer.
+        let fw = 2 * size
+        guard let input = tex(fw, fw),
+              let stage = device.makeBuffer(length: fw * fw * 8, options: .storageModeShared) else { return nil }
+        memset(stage.contents(), 0, fw * fw * 8)
+        let hv = Self.float32to16(impulse)
+        let px = stage.contents().advanced(by: (at.y * fw + at.x) * 8).assumingMemoryBound(to: UInt16.self)
+        px[0] = hv; px[1] = hv; px[2] = hv; px[3] = Self.float32to16(1)
+        var down: [MTLTexture] = [], up: [MTLTexture] = []
+        for level in 0..<levels {
+            let (lw, lh) = Self.bloomLevelSize(halfW: size, halfH: size, level: level)
+            guard let d = tex(lw, lh) else { return nil }
+            down.append(d)
+            if level < levels - 1 {
+                guard let u = tex(lw, lh, level == 0 ? .rgba32Float : .rgba16Float) else { return nil }
+                up.append(u)
+            }
+        }
+        // A one-level pyramid has no up chain: mip0 itself (half) is read back.
+        let readTex: MTLTexture = levels == 1 ? down[0] : up[0]
+        guard let readBuf = device.makeBuffer(length: size * size * 16, options: .storageModeShared),
+              let ubuf = device.makeBuffer(length: MemoryLayout<IlluminatoramaFrameUniforms>.stride,
+                                           options: .storageModeShared),
+              let cb = commandQueue.makeCommandBuffer() else { return nil }
+        var u = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
+        u.bloomThreshold = 0
+        u.bloomParams = SIMD4(0, 0, 1, 1)
+        ubuf.contents().storeBytes(of: u, as: IlluminatoramaFrameUniforms.self)
+        let scat = IlluminatoramaGlareSpread.convexScatters(levelWeights.prefix(levels).map(Double.init))
+
+        if let blit = cb.makeBlitCommandEncoder() {
+            blit.copy(from: stage, sourceOffset: 0, sourceBytesPerRow: fw * 8, sourceBytesPerImage: fw * fw * 8,
+                      sourceSize: MTLSize(width: fw, height: fw, depth: 1),
+                      to: input, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin())
+            blit.endEncoding()
+        }
+        guard let enc = cb.makeComputeCommandEncoder() else { return nil }
+        enc.setBuffer(ubuf, offset: 0, index: 0)
+        enc.setComputePipelineState(bloomPrefilterPipeline)
+        enc.setTexture(input, index: 0); enc.setTexture(down[0], index: 1)
+        dispatch(enc, pipeline: bloomPrefilterPipeline, width: down[0].width, height: down[0].height)
+        enc.setComputePipelineState(bloomDownPipeline)
+        for level in stride(from: 1, to: levels, by: 1) {
+            enc.setTexture(down[level - 1], index: 0); enc.setTexture(down[level], index: 1)
+            dispatch(enc, pipeline: bloomDownPipeline, width: down[level].width, height: down[level].height)
+        }
+        if levels > 1 {
+            enc.setComputePipelineState(bloomUpPipeline)
+            let last = levels - 1
+            for level in stride(from: last - 1, through: 0, by: -1) {
+                enc.setTexture(level == last - 1 ? down[last] : up[level + 1], index: 0)
+                enc.setTexture(down[level], index: 1)
+                enc.setTexture(up[level], index: 2)
+                var s = scat[level]
+                enc.setBytes(&s, length: MemoryLayout<Float>.stride, index: 1)
+                dispatch(enc, pipeline: bloomUpPipeline, width: up[level].width, height: up[level].height)
+            }
+        }
+        enc.endEncoding()
+        let src: MTLTexture = readTex
+        let bpp = src.pixelFormat == .rgba32Float ? 16 : 8
+        if let blit = cb.makeBlitCommandEncoder() {
+            blit.copy(from: src, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(),
+                      sourceSize: MTLSize(width: size, height: size, depth: 1),
+                      to: readBuf, destinationOffset: 0, destinationBytesPerRow: size * bpp,
+                      destinationBytesPerImage: size * size * bpp)
+            blit.endEncoding()
+        }
+        cb.commit()
+        cb.waitUntilCompleted()
+        var out = [Float](repeating: 0, count: size * size)
+        if bpp == 16 {
+            let f = readBuf.contents().assumingMemoryBound(to: Float.self)
+            for i in 0..<(size * size) {
+                out[i] = (0.2126 * f[4 * i] + 0.7152 * f[4 * i + 1] + 0.0722 * f[4 * i + 2]) / impulse
+            }
+        } else {
+            let hp = readBuf.contents().assumingMemoryBound(to: UInt16.self)
+            func h2f(_ h: UInt16) -> Float {
+                let s: UInt32 = UInt32(h & 0x8000) << 16, e = Int((h >> 10) & 0x1F), m = UInt32(h & 0x3FF)
+                if e == 0 { return (s != 0 ? -1 : 1) * Float(m) * pow(2, -24) }
+                if e == 31 { return Float(bitPattern: s | 0x7F80_0000 | (m << 13)) }
+                return Float(bitPattern: s | UInt32(e - 15 + 127) << 23 | (m << 13))
+            }
+            for i in 0..<(size * size) {
+                out[i] = (0.2126 * h2f(hp[4 * i]) + 0.7152 * h2f(hp[4 * i + 1]) + 0.0722 * h2f(hp[4 * i + 2])) / impulse
+            }
+        }
+        return out
     }
 
     // ── Issue #65: colour-grading LUT ─────────────────────────────────────────
@@ -15303,6 +15428,24 @@ public final class IlluminatoramaRenderer {
                               min(max(bloomScatter, 0), 1),
                               max(0, bloomTentRadius),
                               0)
+        // DH-1001 — physical glare: refit (only when the lens / resolution / observer changes) and
+        // hand the shaders η. The pixel angle is derived exactly like `nightPixAngle` (tan(fovY/2) =
+        // 1/P[1][1]) over the PYRAMID's mip0 height, the grid the measured kernels are in.
+        if bloomPhysicalGlare, !camera.isOrthographic, let mip0 = bloomDownChain.first {
+            let texelRad = (2.0 / max(camera.projectionMatrix[1][1], 1e-6)) / Float(max(mip0.height, 1))
+            let key = SIMD4<Float>(texelRad, Float(bloomDownChain.count), bloomGlareObserverAge, bloomGlarePigment)
+            if lastBloomGlareFit == nil || key != glareFitKey {
+                lastBloomGlareFit = IlluminatoramaGlareSpread.fit(
+                    texelRadians: Double(texelRad), levels: bloomDownChain.count,
+                    age: Double(bloomGlareObserverAge), pigment: Double(bloomGlarePigment))
+                glareFitKey = key
+            }
+            let eta = Float(lastBloomGlareFit?.energy ?? 0)
+            u.bloomIntensity = eta
+            u.bloomParams = SIMD4(0, 0, 1, eta)
+        } else {
+            lastBloomGlareFit = nil
+        }
         // Diagram look. `mix` 0 (the default) keeps the tonemap branch unentered, so
         // this is an exact no-op for every scene that never opts in. The `w` slot is
         // the ORTHOGRAPHIC flag, not a look control: it is read straight off the live

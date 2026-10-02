@@ -384,7 +384,8 @@ struct FrameUniforms {
     // identical to the hard one above T·(1+x) either way), y = upsample scatter
     // (the convex `mix` weight toward the blurred low mip — 0 collapses the
     // pyramid to its finest level, 1 to its coarsest), z = 3×3 tent radius in
-    // LOW-mip texels, w reserved.
+    // LOW-mip texels, w = PHYSICAL GLARE energy η (Daydream DH-1001; 0 = off: the legacy
+    // thresholded, Karis-weighted bloom added on top, byte-identical).
     // ONE new 16-byte cluster (stride 1248 → 1264); mirror of
     // IlluminatoramaFrameUniforms.bloomParams.
     float4   bloomParams;
