@@ -1183,6 +1183,28 @@ kernel void illumi_rtao_tlas(
 //     perspective's job (#10c); without this an exterior view would fog over.
 // Every random number is a progressive Owen-scrambled Sobol pair per march step, so a still's
 // frames stratify the march. The background is attenuated by the roofed path's transmittance.
+//
+// SUNLIT DUST (DH-0999). The air above is molecular-faint: at a density that never greys a
+// sunless room, a sunbeam crossing it barely reads. What makes a beam visible in a real room is
+// DUST — large particles, strongly forward-scattering — and dust is only seen where direct sun
+// lights it. So a second, sun-only scatterer rides on top, and its amount is tied to how much
+// direct sun actually enters the view's air:
+//   • `illumi_volumetric_rt_admittance` marches a coarse fixed grid of the SAME view rays first
+//     (same roof test, same sun shadow ray) and counts roofed samples and the sunlit ones among
+//     them; A = sunlit / roofed is the measured direct-sun admittance of the room's air in view.
+//   • σ_dust = dustDensity · saturate(A / dustAdmittanceRef): full dust once A reaches the
+//     reference fraction, proportionally less below it, and EXACTLY none when no sun gets in
+//     (night, overcast-dark sun, a north room, the sun on the other façade) — no grey fog.
+//   • the dust in-scatters the SUN ONLY (HG g = dustAnisotropy). Dust lit by the sky alone is a
+//     low-contrast veil the faint air term already stands for; carrying it at dust density
+//     would be exactly the grey fog the gate exists to prevent (a deliberate departure).
+//   • it does NOT dim the view. Dust is a conservative scatterer (albedo ≈ 1), and in the room's
+//     near-uniform DIFFUSE field radiance is invariant along a ray (the equilibrium result:
+//     what the dust scatters out of the view ray it scatters back in from the same field), so
+//     its extinction and its diffuse in-scatter cancel and are both left out. The one part of
+//     the field that is NOT uniform is the collimated sunbeam — that is the shaft, and it is
+//     the dust's only net term. (Measured before this: carrying the dust's extinction alone
+//     darkened the sunny Primary Bedroom by −0.13 stops, −4.9 codes outside the beam.)
 struct VolRTUniforms {
     float4x4 invViewProjection;
     float3 cameraWorldPos; float density;          // σ, per metre (scattering = extinction)
@@ -1191,7 +1213,69 @@ struct VolRTUniforms {
     uint width; uint height; uint steps; uint progressiveIndex;
     float maxDist; float roofReach; uint areaLightCount; uint transportMask;
     float sunScatter; float skyScatter; float scotopicDesaturation; float rayTMin;
+    float dustDensity; float dustAnisotropy; float dustAdmittanceRef; uint admittanceGrid;
 };
+
+/// The view ray through pixel `gid` and its march end (depth-terminated, capped at maxDist).
+static inline float volRTViewRay(texture2d<float, access::read> gDepth, constant VolRTUniforms& u,
+                                 uint2 gid, thread float3& rd) {
+    float2 ndc = (float2(gid) + 0.5) / float2(u.width, u.height) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    float4 fw = u.invViewProjection * float4(ndc, 1.0, 1.0);
+    rd = normalize(fw.xyz / fw.w - u.cameraWorldPos);
+    float depth = gDepth.read(gid).r;
+    float tEnd = u.maxDist;
+    if (depth < 0.99999) {
+        float4 w = u.invViewProjection * float4(ndc, depth, 1.0);
+        tEnd = min(u.maxDist, length(w.xyz / w.w - u.cameraWorldPos));
+    }
+    return tEnd;
+}
+
+static inline bool volRTSunOn(constant VolRTUniforms& u) {
+    return u.sunScatter > 0.0 && any(u.sunColor > 0.0) && normalize(u.sunDir).y > -0.05;
+}
+
+/// DH-0999 — the direct-sun ADMITTANCE of the air in view (see the block comment above): a
+/// fixed `admittanceGrid` × `admittanceGrid·h/w` lattice of the view's own rays, each marched at
+/// the main pass's step count with mid-step samples (deterministic: the same View measures the
+/// same A every frame), counting roofed samples → counts[0] and the sun-seeing ones → counts[1].
+kernel void illumi_volumetric_rt_admittance(
+    texture2d<float, access::read>        gDepth      [[texture(0)]],
+    instance_acceleration_structure       accel       [[buffer(0)]],
+    constant VolRTUniforms&               u           [[buffer(1)]],
+    device atomic_uint*                   counts      [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    uint gx = max(u.admittanceGrid, 1u);
+    uint gy = max(1u, uint(float(gx) * float(u.height) / float(max(u.width, 1u))));
+    if (gid.x >= gx || gid.y >= gy) return;
+    uint2 px = min(uint2((float2(gid) + 0.5) / float2(gx, gy) * float2(u.width, u.height)),
+                   uint2(u.width - 1u, u.height - 1u));
+    float3 rd;
+    float tEnd = volRTViewRay(gDepth, u, px, rd);
+    if (tEnd <= 0.01) return;
+    intersector<triangle_data, instancing> isect;
+    isect.set_triangle_cull_mode(triangle_cull_mode::none);
+    isect.accept_any_intersection(true);
+    float3 toSun = normalize(u.sunDir);
+    bool sunOn = volRTSunOn(u);
+    uint N = clamp(u.steps, 1u, 64u);
+    float dt = tEnd / float(N);
+    uint roofed = 0u, sunlit = 0u;
+    for (uint i = 0u; i < N; ++i) {
+        float3 X = u.cameraWorldPos + rd * ((float(i) + 0.5) * dt);
+        ray up; up.origin = X; up.direction = float3(0.0, 1.0, 0.0);
+        up.min_distance = 0.0; up.max_distance = u.roofReach;
+        if (isect.intersect(up, accel, u.transportMask).type == intersection_type::none) continue;
+        roofed++;
+        if (!sunOn) continue;
+        ray sr; sr.origin = X; sr.direction = toSun; sr.min_distance = max(u.rayTMin, 1e-3); sr.max_distance = 1e4;
+        if (isect.intersect(sr, accel, u.transportMask).type == intersection_type::none) sunlit++;
+    }
+    if (roofed > 0u) atomic_fetch_add_explicit(&counts[0], roofed, memory_order_relaxed);
+    if (sunlit > 0u) atomic_fetch_add_explicit(&counts[1], sunlit, memory_order_relaxed);
+}
 
 static inline float volRTPhaseHG(float cosT, float g) {
     float g2 = g * g;
@@ -1220,29 +1304,35 @@ kernel void illumi_volumetric_rt(
     instance_acceleration_structure       accel       [[buffer(0)]],
     constant VolRTUniforms&               u           [[buffer(1)]],
     const device RTAreaLight*             areaLights  [[buffer(2)]],
+    const device uint*                    admittance  [[buffer(3)]],   // counts from the pre-pass
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height || u.density <= 0.0) return;
-    float2 ndc = (float2(gid) + 0.5) / float2(u.width, u.height) * 2.0 - 1.0;
-    ndc.y = -ndc.y;
-    float4 fw = u.invViewProjection * float4(ndc, 1.0, 1.0);
     float3 ro = u.cameraWorldPos;
-    float3 rd = normalize(fw.xyz / fw.w - ro);
-    float depth = gDepth.read(gid).r;
-    float tEnd = u.maxDist;
-    if (depth < 0.99999) {
-        float4 w = u.invViewProjection * float4(ndc, depth, 1.0);
-        tEnd = min(u.maxDist, length(w.xyz / w.w - ro));
-    }
+    float3 rd;
+    float tEnd = volRTViewRay(gDepth, u, gid, rd);
     if (tEnd <= 0.01) return;
+
+    // DH-0999 — sunlit dust, in proportion to the direct sun the pre-pass measured entering.
+    float sigmaDust = 0.0;
+    if (u.dustDensity > 0.0 && admittance[0] > 0u) {
+        float A = float(admittance[1]) / float(admittance[0]);
+        sigmaDust = u.dustDensity * saturate(A / max(u.dustAdmittanceRef, 1e-4));
+    }
+    float gDust = clamp(u.dustAnisotropy, -0.95, 0.95);
+    float sigmaT = u.density;   // the dust's extinction cancels its diffuse in-scatter (above)
 
     intersector<triangle_data, instancing> isect;
     isect.set_triangle_cull_mode(triangle_cull_mode::none);
     constexpr sampler skySamp(filter::linear, address::repeat);
     float3 Ls = float3(0.0);
     float3 toSun = normalize(u.sunDir);
-    float  sunPhase = volRTPhaseHG(dot(rd, toSun), u.anisotropy);
-    bool   sunOn = u.sunScatter > 0.0 && any(u.sunColor > 0.0) && toSun.y > -0.05;
+    float  cosSun = dot(rd, toSun);
+    // σ·phase of everything the sun lights: the air, plus the dust (density folded in here, so
+    // the in-scatter line below multiplies the air's σ only into the sky term).
+    float  sunSigmaPhase = u.density * volRTPhaseHG(cosSun, u.anisotropy)
+                         + sigmaDust * volRTPhaseHG(cosSun, gDust);
+    bool   sunOn = volRTSunOn(u);
     uint   N = clamp(u.steps, 1u, 64u);
     float  dt = tEnd / float(N);
     float  roofedLen = 0.0;
@@ -1260,13 +1350,13 @@ kernel void illumi_volumetric_rt(
         up.min_distance = 0.0; up.max_distance = u.roofReach;
         if (isect.intersect(up, accel, u.transportMask).type == intersection_type::none) continue;
         roofedLen += dt;
-        float Tcam = exp(-u.density * t);
+        float Tcam = exp(-sigmaT * t);
         float3 Lx = float3(0.0);
 
         if (sunOn) {
             ray sr; sr.origin = X; sr.direction = toSun; sr.min_distance = tMin; sr.max_distance = 1e4;
             if (isect.intersect(sr, accel, u.transportMask).type == intersection_type::none) {
-                Lx += u.sunColor * (sunPhase * u.sunScatter);
+                Lx += u.sunColor * (sunSigmaPhase * u.sunScatter);
             }
         }
 
@@ -1300,16 +1390,16 @@ kernel void illumi_volumetric_rt(
                             if (u.scotopicDesaturation > 0.0) sky = mix(sky, float3(pathLuma(sky)), u.scotopicDesaturation);
                             float pdfW = dist * dist / (area4 * cosL);
                             Lx += sky * (1.0 - saturate(al.apertureOpacity))
-                                * volRTPhaseHG(dot(rd, d), u.anisotropy) * u.skyScatter / (pj * pdfW);
+                                * (u.density * volRTPhaseHG(dot(rd, d), u.anisotropy)) * u.skyScatter / (pj * pdfW);
                         }
                     }
                 }
             }
         }
-        Ls += Lx * (u.density * Tcam * dt);
+        Ls += Lx * (Tcam * dt);   // σ is inside Lx (air on both terms, dust on the sun's)
     }
     if (roofedLen <= 0.0) return;
     half4 prev = outHDR.read(gid);
-    float Tbg = exp(-u.density * roofedLen);
+    float Tbg = exp(-sigmaT * roofedLen);
     outHDR.write(half4(half3(float3(prev.rgb) * Tbg + Ls), prev.a), gid);
 }

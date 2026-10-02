@@ -1353,12 +1353,42 @@ public final class IlluminatoramaRenderer {
     /// Separate gains on the sun's and the sky's in-scatter (1 = physical for the density).
     public var volRTSunScatter: Float = 1
     public var volRTSkyScatter: Float = 1
+    /// DH-0999 — SUNLIT DUST: a second, sun-only scatterer (per metre at full strength) whose
+    /// amount follows the direct sun measured entering the view's air. A coarse pre-pass marches
+    /// the view's own rays and counts the roofed samples that see the sun; with A = sunlit /
+    /// roofed, the dust is `volRTDustDensity · min(1, A / volRTDustAdmittanceRef)` — a sunbeam
+    /// crossing the room reads as a shaft, a room no sun enters gets none (no grey fog). It adds
+    /// only the collimated sun's in-scatter: as a conservative scatterer in the room's
+    /// near-uniform diffuse field its extinction and diffuse in-scatter cancel, so it never dims
+    /// the room. 0 = off: no pre-pass, the air term alone.
+    public var volRTDustDensity: Float = 0
+    /// HG g of the dust (large particles: strongly forward — the beam glows toward the sun).
+    public var volRTDustAnisotropy: Float = 0.6
+    /// The sunlit fraction of the roofed air in view at which the dust reaches full density.
+    public var volRTDustAdmittanceRef: Float = 0.1
+    /// The admittance lattice's width in rays (height follows the aspect).
+    public var volRTAdmittanceGrid: Int = 64
+    /// The direct-sun admittance A the last COMPLETED frame's pre-pass measured (0 when the dust
+    /// is off or nothing roofed is in view). An instrument read — blocking renders only.
+    public var volRTMeasuredAdmittance: Float {
+        guard let b = volRTAdmittanceBuffer else { return 0 }
+        let c = b.contents().bindMemory(to: UInt32.self, capacity: 2)
+        return c[0] > 0 ? Float(c[1]) / Float(c[0]) : 0
+    }
     private var volRTProgressiveIndex: UInt32 = 0
     private lazy var volRTPipeline: MTLComputePipelineState? = {
         guard device.supportsRaytracing,
               let fn = engine.library?.makeFunction(name: "illumi_volumetric_rt") else { return nil }
         return try? device.makeComputePipelineState(function: fn) // gpu-ok: lazy one-time build, still-lane opt-in pipeline
     }()
+    private lazy var volRTAdmittancePipeline: MTLComputePipelineState? = {
+        guard device.supportsRaytracing,
+              let fn = engine.library?.makeFunction(name: "illumi_volumetric_rt_admittance") else { return nil }
+        return try? device.makeComputePipelineState(function: fn) // gpu-ok: lazy one-time build, still-lane opt-in pipeline
+    }()
+    /// Two counters (roofed, sunlit), cleared and filled by the pre-pass each haze frame.
+    private lazy var volRTAdmittanceBuffer: MTLBuffer? =
+        device.makeBuffer(length: 2 * MemoryLayout<UInt32>.stride, options: .storageModeShared) // gpu-ok: lazy one-time 8-byte counter buffer
     /// Mirror of the Metal `VolRTUniforms` (IlluminatoramaRTInstanced.metal).
     private struct VolRTUniforms {
         var invViewProjection: simd_float4x4
@@ -1368,6 +1398,7 @@ public final class IlluminatoramaRenderer {
         var width: UInt32; var height: UInt32; var steps: UInt32; var progressiveIndex: UInt32
         var maxDist: Float; var roofReach: Float; var areaLightCount: UInt32; var transportMask: UInt32
         var sunScatter: Float; var skyScatter: Float; var scotopicDesaturation: Float; var rayTMin: Float
+        var dustDensity: Float; var dustAnisotropy: Float; var dustAdmittanceRef: Float; var admittanceGrid: UInt32
     }
 
     // ── Spot-light beam scattering (issue: CK5 concert beams) ───────
@@ -13735,8 +13766,36 @@ public final class IlluminatoramaRenderer {
             maxDist: max(0.1, volRTMaxDistance), roofReach: max(0.1, volRTRoofReach),
             areaLightCount: UInt32(areaLights.count), transportMask: Self.rtTransportRayMask,
             sunScatter: max(0, volRTSunScatter), skyScatter: max(0, volRTSkyScatter),
-            scotopicDesaturation: max(0, scotopicDesaturation), rayTMin: 0.004)
+            scotopicDesaturation: max(0, scotopicDesaturation), rayTMin: 0.004,
+            dustDensity: max(0, volRTDustDensity), dustAnisotropy: max(-0.95, min(0.95, volRTDustAnisotropy)),
+            dustAdmittanceRef: max(1e-4, volRTDustAdmittanceRef),
+            admittanceGrid: UInt32(max(1, min(512, volRTAdmittanceGrid))))
         volRTProgressiveIndex &+= 1
+        guard let counts = volRTAdmittanceBuffer else { return }
+        // DH-0999 — measure the direct sun entering the view's air BEFORE the march reads it. The
+        // counters are cleared every haze frame; with the dust off the pass is skipped and the
+        // zeroed counters read as "no dust".
+        if let blit = cb.makeBlitCommandEncoder() {
+            blit.label = "Illuminatorama.volumetricRT.admittanceClear"
+            blit.fill(buffer: counts, range: 0..<counts.length, value: 0)
+            blit.endEncoding()
+        }
+        if u.dustDensity > 0, let admPipeline = volRTAdmittancePipeline,
+           let enc = timedComputeEncoder(cb, "volumetricRTAdmittance") {
+            enc.label = "Illuminatorama.volumetricRT.admittance"
+            enc.setComputePipelineState(admPipeline)
+            enc.setTexture(depthTexture, index: 0)
+            enc.setAccelerationStructure(tlas, bufferIndex: 0)
+            enc.setBytes(&u, length: MemoryLayout<VolRTUniforms>.stride, index: 1)
+            enc.setBuffer(counts, offset: 0, index: 2)
+            for blas in rtBLASList { enc.useResource(blas, usage: .read) }
+            for blas in rtCurveBLASList { enc.useResource(blas, usage: .read) }
+            for buf in rtResidentBuffers { enc.useResource(buf, usage: .read) }
+            let gx = Int(u.admittanceGrid)
+            let gy = max(1, Int(Float(gx) * Float(height) / Float(max(width, 1))))
+            dispatch(enc, pipeline: admPipeline, width: gx, height: gy, maxThreadsOverride: rtThreadgroupMax)
+            enc.endEncoding()
+        }
         guard let enc = timedComputeEncoder(cb, "volumetricRT") else { return }
         enc.label = "Illuminatorama.volumetricRT"
         enc.setComputePipelineState(pipeline)
@@ -13746,6 +13805,7 @@ public final class IlluminatoramaRenderer {
         enc.setAccelerationStructure(tlas, bufferIndex: 0)
         enc.setBytes(&u, length: MemoryLayout<VolRTUniforms>.stride, index: 1)
         enc.setBuffer(areaLightBuffer, offset: 0, index: 2)
+        enc.setBuffer(counts, offset: 0, index: 3)
         for blas in rtBLASList { enc.useResource(blas, usage: .read) }
         for blas in rtCurveBLASList { enc.useResource(blas, usage: .read) }
         for buf in rtResidentBuffers { enc.useResource(buf, usage: .read) }
