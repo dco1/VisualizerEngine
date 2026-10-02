@@ -558,8 +558,13 @@ struct FrameUniforms {
     // depth ULPs the depth-rebuilt point may sit behind the surface the camera sees (0 ⇒ off,
     // byte-identical); yzw reserved. ONE new 16-byte cluster (stride 1664 → 1680).
     float4   rtSurfaceSnap;
+    // DIGITAL SENSOR NOISE (Daydream DH-0992): x = strength (0 ⇒ off, byte-identical), y = photo-
+    // electrons per unit of EXPOSED scene radiance at the camera's ISO before the meter's push,
+    // z = read noise (electrons), w = how much of the noise the three channels share (demosaic
+    // correlation). ONE new 16-byte cluster (stride 1680 → 1696).
+    float4   sensorNoise;
 };
-static_assert(sizeof(FrameUniforms) == 1680, "FrameUniforms must match IlluminatoramaFrameUniforms (1680 bytes)");
+static_assert(sizeof(FrameUniforms) == 1696, "FrameUniforms must match IlluminatoramaFrameUniforms (1696 bytes)");
 
 // Secondary directional light (#60 task 5). Mirror of Swift
 // IlluminatoramaDirectionalLight. `dir` points TOWARD the light (world space,

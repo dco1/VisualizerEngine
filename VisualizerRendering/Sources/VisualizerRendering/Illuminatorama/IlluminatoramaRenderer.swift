@@ -431,6 +431,45 @@ public final class IlluminatoramaRenderer {
     /// so changing this changes the halo's SHAPE and never its total energy.
     /// Default 0.7.
     public var bloomScatter: Float = 0.7
+    /// **Lens point-spread bloom (Daydream DH-0992).** 0 (default) ⇒ the geometric up-chain above,
+    /// byte-identical. > 0 ⇒ the pyramid's per-level weights are set so the halo's surface
+    /// brightness falls as a POWER LAW, I(r) ∝ r^−α with α = this value — the long-tailed glare
+    /// spread of a real lens (a tight core over a faint skirt that keeps going), where the
+    /// geometric chain is an exponential that dies. Each level reaches 2× the radius of the one
+    /// before, so an octave's share of the energy is ∝ r^(2−α); the weights are normalised, so the
+    /// total (and `bloomIntensity`'s meaning) is unchanged. Real lenses sit near α ≈ 2.5–3.
+    public var bloomPSFExponent: Float = 0
+
+    // ── Digital sensor noise (Daydream DH-0992) ───────────────────────
+    /// Shot + read noise of a photo-electron count, in the exposed scene signal before the
+    /// display transform (see the tonemap's sensor block). 0 (default) ⇒ off, byte-identical;
+    /// 1 ⇒ the physical amount for `sensorElectronsPerUnit` and `sensorReadNoise`.
+    public var sensorNoiseStrength: Float = 0
+    /// Photo-electrons per unit of exposed scene radiance at the camera's own ISO, BEFORE the
+    /// meter's push (which the shader counts as extra gain). A full-frame sensor at ISO 100 puts
+    /// mid-grey (0.18) near 5 000 e⁻ — ~28 000 per unit; divide by ISO/100 for a faster setting.
+    public var sensorElectronsPerUnit: Float = 28_000
+    /// Read noise, electrons (a modern CMOS sensor: ~2–5).
+    public var sensorReadNoise: Float = 3
+    /// How much of the noise the three channels share (demosaicing correlates neighbours' noise
+    /// across channels); 0 = independent RGB speckle, 1 = pure luminance noise.
+    public var sensorChannelCorrelation: Float = 0.5
+    /// Per-level scatter for the up-chain that realises `bloomPSFExponent` (nil ⇒ the shared
+    /// scatter). Level i's down texture ends up weighted (1−s_i)·Π_{k<i} s_k, so for target
+    /// weights a_i (Σ = 1): s_i = 1 − a_i / (1 − Σ_{k<i} a_k). Public for the gate.
+    public static func bloomPSFScatters(levels: Int, exponent: Float) -> [Float]? {
+        guard exponent > 0, levels >= 2 else { return nil }
+        let raw = (0..<levels).map { i in pow(Float(1 << (i + 1)), 2 - exponent) }
+        let total = raw.reduce(0, +)
+        let a = raw.map { $0 / total }
+        var remaining: Float = 1
+        var s: [Float] = []
+        for i in 0..<levels {
+            s.append(remaining > 1e-6 ? min(1, max(0, 1 - a[i] / remaining)) : 1)
+            remaining -= a[i]
+        }
+        return s
+    }
     /// 3×3 tent radius on the up-chain, in LOW-mip texels. 1.0 is the plain tent;
     /// larger values widen each level's contribution without adding taps.
     public var bloomTentRadius: Float = 1.0
@@ -1291,6 +1330,45 @@ public final class IlluminatoramaRenderer {
     /// buffer still terminates the march at surfaces, so beams glow brightest
     /// when the camera looks toward the low sun through canopy gaps.
     public var volOutdoorMode: Bool = false
+
+    // ── Traced volumetric light (Daydream DH-0990) ────────────────────
+    /// Single scattering in a faint haze, marched along each view ray against the REAL geometry:
+    /// the sun through a shadow ray per sample (so the shafts are exactly what the window openings
+    /// cut) plus the sky through one window APERTURE per sample (`IlluminatoramaAreaLight
+    /// .isAperture`), confined to ROOFED air (a short ray straight up must meet the house), so an
+    /// exterior view never fogs. Monte-Carlo per frame and progressive across frames: a STILL
+    /// lane feature — it needs a live TLAS and an accumulating resolve. Default off: no cost.
+    public var volumetricRTEnabled: Bool = false
+    /// Haze extinction = scattering coefficient σ, per metre. A real room's air is ~1e-3; a
+    /// photograph's visible shafts need dust, ~1e-2.
+    public var volRTDensity: Float = 0.01
+    /// Henyey–Greenstein g for the haze (> 0 forward: the beams glow toward the sun).
+    public var volRTAnisotropy: Float = 0.5
+    /// March samples per pixel per frame (stratified; a still's frames fill in the rest).
+    public var volRTSteps: Int = 6
+    /// The march's reach along a view ray (metres) — an interior is a few metres deep.
+    public var volRTMaxDistance: Float = 20
+    /// How far above an air sample a roof may be for the sample to count as indoors (metres).
+    public var volRTRoofReach: Float = 8
+    /// Separate gains on the sun's and the sky's in-scatter (1 = physical for the density).
+    public var volRTSunScatter: Float = 1
+    public var volRTSkyScatter: Float = 1
+    private var volRTProgressiveIndex: UInt32 = 0
+    private lazy var volRTPipeline: MTLComputePipelineState? = {
+        guard device.supportsRaytracing,
+              let fn = engine.library?.makeFunction(name: "illumi_volumetric_rt") else { return nil }
+        return try? device.makeComputePipelineState(function: fn) // gpu-ok: lazy one-time build, still-lane opt-in pipeline
+    }()
+    /// Mirror of the Metal `VolRTUniforms` (IlluminatoramaRTInstanced.metal).
+    private struct VolRTUniforms {
+        var invViewProjection: simd_float4x4
+        var cameraWorldPos: SIMD3<Float>; var density: Float
+        var sunDir: SIMD3<Float>; var anisotropy: Float
+        var sunColor: SIMD3<Float>; var skyIntensity: Float
+        var width: UInt32; var height: UInt32; var steps: UInt32; var progressiveIndex: UInt32
+        var maxDist: Float; var roofReach: Float; var areaLightCount: UInt32; var transportMask: UInt32
+        var sunScatter: Float; var skyScatter: Float; var scotopicDesaturation: Float; var rayTMin: Float
+    }
 
     // ── Spot-light beam scattering (issue: CK5 concert beams) ───────
     /// Single-scatter march of every `spotLights` cone through hazy air, so
@@ -10488,6 +10566,7 @@ public final class IlluminatoramaRenderer {
         }
         // Volumetric god-ray shaft in the air. No-op unless enabled.
         encodeVolumetricPass(cb)
+        encodeVolumetricRTPass(cb)
         encodeSpotBeamPass(cb)
         // In-view perspective cloud composite (issue #61). No-op unless a scene
         // opted in. Lands before TAA (so clouds anti-alias) and before the
@@ -13636,6 +13715,44 @@ public final class IlluminatoramaRenderer {
         enc.endEncoding()
     }
 
+    /// DH-0990 — the traced volumetric light (see `volumetricRTEnabled`). After the RT lighting and
+    /// its denoise chain have composited, so the haze attenuates the finished surface radiance it
+    /// sits in front of; before glass, TAA and bloom.
+    private func encodeVolumetricRTPass(_ cb: MTLCommandBuffer) {
+        // A TLAS holding CURVE instances needs the curve-aware intersector contract this kernel does
+        // not compile; such a scene (no Daydream document today) skips the haze rather than trace it
+        // under the wrong geometry-type assumption.
+        guard volumetricRTEnabled, volRTDensity > 0, rtTLASActive, rtCurveInstanceCount == 0,
+              let tlas = rtTLAS, let pipeline = volRTPipeline else { return }
+        let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
+        var u = VolRTUniforms(
+            invViewProjection: fu.invViewProjection,
+            cameraWorldPos: fu.cameraWorldPos, density: volRTDensity,
+            sunDir: simd_normalize(rtSunDirection), anisotropy: max(-0.95, min(0.95, volRTAnisotropy)),
+            sunColor: rtSunColor, skyIntensity: max(0, iblIntensity),
+            width: UInt32(width), height: UInt32(height),
+            steps: UInt32(max(1, min(64, volRTSteps))), progressiveIndex: volRTProgressiveIndex,
+            maxDist: max(0.1, volRTMaxDistance), roofReach: max(0.1, volRTRoofReach),
+            areaLightCount: UInt32(areaLights.count), transportMask: Self.rtTransportRayMask,
+            sunScatter: max(0, volRTSunScatter), skyScatter: max(0, volRTSkyScatter),
+            scotopicDesaturation: max(0, scotopicDesaturation), rayTMin: 0.004)
+        volRTProgressiveIndex &+= 1
+        guard let enc = timedComputeEncoder(cb, "volumetricRT") else { return }
+        enc.label = "Illuminatorama.volumetricRT"
+        enc.setComputePipelineState(pipeline)
+        enc.setTexture(depthTexture, index: 0)
+        enc.setTexture(hdrCompositeTexture, index: 1)
+        enc.setTexture(equirectSky ?? dummySkyTexture, index: 2)
+        enc.setAccelerationStructure(tlas, bufferIndex: 0)
+        enc.setBytes(&u, length: MemoryLayout<VolRTUniforms>.stride, index: 1)
+        enc.setBuffer(areaLightBuffer, offset: 0, index: 2)
+        for blas in rtBLASList { enc.useResource(blas, usage: .read) }
+        for blas in rtCurveBLASList { enc.useResource(blas, usage: .read) }
+        for buf in rtResidentBuffers { enc.useResource(buf, usage: .read) }
+        dispatch(enc, pipeline: pipeline, width: width, height: height, maxThreadsOverride: rtThreadgroupMax)
+        enc.endEncoding()
+    }
+
     /// Spot-light beam scattering — every entry in `spotLights` marches as a
     /// haze-lit cone. Runs after the sun volumetric pass so both add into the
     /// same HDR composite; independent of `volumetricEnabled`.
@@ -14484,12 +14601,15 @@ public final class IlluminatoramaRenderer {
         // smallest DOWN level (which is why the up chain is one texture shorter).
         enc.setComputePipelineState(bloomUpPipeline)
         let last = bloomDownChain.count - 1
+        let levelScatters = Self.bloomPSFScatters(levels: bloomDownChain.count, exponent: bloomPSFExponent)
         for level in stride(from: last - 1, through: 0, by: -1) {
             let low = (level == last - 1) ? bloomDownChain[last] : bloomUpChain[level + 1]
             let dst = bloomUpChain[level]
             enc.setTexture(low, index: 0)
             enc.setTexture(bloomDownChain[level], index: 1)
             enc.setTexture(dst, index: 2)
+            var s: Float = levelScatters?[level] ?? -1
+            enc.setBytes(&s, length: MemoryLayout<Float>.stride, index: 1)
             dispatch(enc, pipeline: bloomUpPipeline, width: dst.width, height: dst.height)
         }
         enc.endEncoding()
@@ -15104,6 +15224,8 @@ public final class IlluminatoramaRenderer {
         // scatter / tent radius. Scatter is clamped to [0,1] because the up-chain
         // blend must stay CONVEX — outside that range the geometric series stops
         // summing to 1 and the chain gains or loses energy.
+        u.sensorNoise = SIMD4(max(0, sensorNoiseStrength), max(1, sensorElectronsPerUnit),
+                              max(0, sensorReadNoise), min(max(sensorChannelCorrelation, 0), 1))
         u.bloomParams = SIMD4(max(0, bloomSoftKnee),
                               min(max(bloomScatter, 0), 1),
                               max(0, bloomTentRadius),

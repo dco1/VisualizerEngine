@@ -1116,6 +1116,37 @@ fragment float4 illumi_tonemap_fs(
         exposedScene *= cos2 * cos2;                  // cos⁴
     }
 
+    // ── Digital SENSOR noise (Daydream DH-0992) ─────────────────────────────────
+    // A sensor counts photo-electrons, so its noise is physics, not a texture: shot noise
+    // (Poisson — σ = √N electrons) plus a fixed read noise, in the SCENE-referred exposed
+    // signal before any display transform. Electrons per exposed unit fall as the gain rises:
+    // `sensorNoise.y` is that count at the camera's ISO, and the meter's push (`autoBase`) is
+    // the camera raising its gain further, so a dim room metered up comes out noisier — the
+    // relative noise √(N + r²)/N grows into the shadows and with ISO, the two things that make
+    // digital noise read as digital. Per pixel, per frame (like grain, after the still's
+    // accumulation, so the export keeps it), Gaussian, partly shared across the channels
+    // (demosaicing correlates them; `.w`). Strength 0 ⇒ the branch never runs ⇒ byte-identical.
+    if (frame.sensorNoise.x > 0.0) {
+        float ePerUnit = max(frame.sensorNoise.y, 1.0) / max(autoBase, 1e-3);
+        uint2 sp = uint2(max(in.position.xy, 0.0));
+        uint  st = as_type<uint>(frame.time) ^ 0x5E4501u;
+        float u[4];
+        for (uint c = 0; c < 4; ++c) {
+            uint h = (sp.x * 73856093u) ^ (sp.y * 19349663u) ^ (st * 83492791u) ^ ((c + 7u) * 2654435761u);
+            h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15; h *= 0x846ca68bu; h ^= h >> 16;
+            u[c] = (float(h) + 0.5) * (1.0 / 4294967296.0);
+        }
+        // Box–Muller: four uniforms → four standard normals.
+        float r0 = sqrt(-2.0 * log(u[0])), r1 = sqrt(-2.0 * log(u[2]));
+        float4 g = float4(r0 * cos(2.0 * M_PI_F * u[1]), r0 * sin(2.0 * M_PI_F * u[1]),
+                          r1 * cos(2.0 * M_PI_F * u[3]), r1 * sin(2.0 * M_PI_F * u[3]));
+        float k = saturate(frame.sensorNoise.w);
+        float3 n = (k * g.x + (1.0 - k) * g.yzw) * rsqrt(k * k + (1.0 - k) * (1.0 - k));
+        float3 electrons = max(exposedScene, 0.0) * ePerUnit;
+        float3 sigma = sqrt(electrons + frame.sensorNoise.z * frame.sensorNoise.z) / ePerUnit;
+        exposedScene = max(exposedScene + n * sigma * frame.sensorNoise.x, 0.0);
+    }
+
     float3 mapped = displayTransform(exposedScene, frame.displayTransform);
     // Hue-stable toe (opt-in; displayParams.z = 0 ⇒ skipped ⇒ bit-identical). `chromaW` 1 =
     // the shipped transform and saturation push; 0 = the ratio-preserving toe, no push.

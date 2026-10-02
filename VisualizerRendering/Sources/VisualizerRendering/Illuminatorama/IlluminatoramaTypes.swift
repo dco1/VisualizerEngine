@@ -609,6 +609,10 @@ public struct IlluminatoramaFrameUniforms {
     /// Traced-ray origin snap — see the Metal `FrameUniforms.rtSurfaceSnap`: x = the depth-ULP
     /// reach of `illumiSnapToVisibleSurface` (0 ⇒ off, byte-identical). 1664 → 1680.
     public var rtSurfaceSnap: SIMD4<Float> = .zero
+    /// Digital sensor noise (Daydream DH-0992) — see the Metal `FrameUniforms.sensorNoise`:
+    /// x strength (0 ⇒ off, byte-identical), y photo-electrons per exposed unit at the camera's
+    /// ISO, z read noise (e⁻), w channel correlation. 1680 → 1696.
+    public var sensorNoise: SIMD4<Float> = .zero
 
     /// Fill the eight gain vectors from a flat 32-entry table, and stamp the enable.
     public mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {

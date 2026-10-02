@@ -354,6 +354,7 @@ static inline SecondaryShadeParams giBounceParams(constant RTInstUniforms& u) {
 // Russian roulette from the third vertex; every random number is a padded, Owen-scrambled Sobol
 // dimension pair (DH-0951 item 1), so a still's frames stratify every bounce, not just the first.
 constant uint kPathDimsPerVertex = 4u;
+constant uint kPathPortalCache = 32u;   // per-vertex aperture-weight cache (thread memory)
 
 static inline float pathLuma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
@@ -480,14 +481,21 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         }
 
         // ── NEE: one window aperture ──
+        // Weights are evaluated ONCE per vertex (an LTC form factor each) and reused by the pick;
+        // a scene with more apertures than the cache re-evaluates for the pick.
+        float wCache[kPathPortalCache];
         float wSum = 0.0;
-        for (uint i = 0u; i < portalCount; ++i) wSum += pathPortalWeight(sec.areaLights[i], P, N);
+        for (uint i = 0u; i < portalCount; ++i) {
+            float w = pathPortalWeight(sec.areaLights[i], P, N);
+            if (i < kPathPortalCache) wCache[i] = w;
+            wSum += w;
+        }
         if (wSum > 0.0) {
             float2 sel = illumiSobolOwen2DShuffled(sampleIndex, illumiPixelSeed(gid, dimSalt + 2u));
             float pick = sel.x * wSum, acc = 0.0, pj = 0.0;
             uint j = portalCount;
             for (uint i = 0u; i < portalCount; ++i) {
-                float w = pathPortalWeight(sec.areaLights[i], P, N);
+                float w = (i < kPathPortalCache) ? wCache[i] : pathPortalWeight(sec.areaLights[i], P, N);
                 acc += w;
                 if (w > 0.0 && (pick < acc || i + 1u == portalCount)) { j = i; pj = w / wSum; break; }
             }
@@ -1157,4 +1165,151 @@ kernel void illumi_rtao_tlas(
     float occlusion = float(hits) / float(rays);
     float ao = 1.0 - occlusion * u.intensity;
     outAO.write(half4(half(clamp(ao, 0.0, 1.0))), gid);
+}
+
+// ── VOLUMETRIC LIGHT IN THE ROOM'S AIR (Daydream DH-0990, photo lane) ─────────────────────────
+//
+// Single scattering in a faint homogeneous haze, marched along each view ray against the REAL
+// geometry — the traced sibling of `illumi_volumetric`, whose sun test is one hard-coded window
+// box. At each sample of the march:
+//   • the SUN: one shadow ray toward it (transport mask, so glass passes and the house's walls,
+//     roof and invisible ceilings stop it) — the shafts are whatever the window openings cut, by
+//     construction; Henyey–Greenstein phase about the sun;
+//   • the SKY through ONE window aperture, chosen ∝ its level × solid angle from the sample, a
+//     point on it, one ray through it (blocked short of it ⇒ 0; past it, the sky along that exact
+//     direction × the pane; an outdoor hit beyond is left dark — a faint term on a faint term);
+//   • the medium exists only in ROOFED air: a short ray straight up must meet the house (drawn or
+//     lighting-only ceiling) within `roofReach`. Outdoors the far-field haze is aerial
+//     perspective's job (#10c); without this an exterior view would fog over.
+// Every random number is a progressive Owen-scrambled Sobol pair per march step, so a still's
+// frames stratify the march. The background is attenuated by the roofed path's transmittance.
+struct VolRTUniforms {
+    float4x4 invViewProjection;
+    float3 cameraWorldPos; float density;          // σ, per metre (scattering = extinction)
+    float3 sunDir;         float anisotropy;       // sunDir toward the sun; HG g
+    float3 sunColor;       float skyIntensity;     // irradiance units of the deferred sun; dome scale
+    uint width; uint height; uint steps; uint progressiveIndex;
+    float maxDist; float roofReach; uint areaLightCount; uint transportMask;
+    float sunScatter; float skyScatter; float scotopicDesaturation; float rayTMin;
+};
+
+static inline float volRTPhaseHG(float cosT, float g) {
+    float g2 = g * g;
+    return (1.0 - g2) / (4.0 * M_PI_F * pow(max(1.0 + g2 - 2.0 * g * cosT, 1e-4), 1.5));
+}
+
+/// Aperture weight seen from a point in the AIR (no surface normal): level × the rectangle's
+/// projected solid angle, softened at the near field. Zero behind a one-sided aperture.
+static inline float volRTApertureWeight(RTAreaLight al, float3 X) {
+    if (al.isAperture <= 0.5) return 0.0;
+    float3 nL = cross(al.ex, al.ey);
+    float area4 = 4.0 * length(nL);
+    if (area4 < 1e-8) return 0.0;
+    nL = normalize(nL);
+    float3 toX = X - al.center;
+    if (al.twoSided <= 0.5 && dot(nL, toX) <= 0.0) return 0.0;
+    float d2 = dot(toX, toX);
+    float cosL = abs(dot(nL, toX)) * rsqrt(max(d2, 1e-8));
+    return max(pathLuma(al.color), 1e-4) * area4 * cosL / (d2 + area4);
+}
+
+kernel void illumi_volumetric_rt(
+    texture2d<float, access::read>        gDepth      [[texture(0)]],
+    texture2d<half,  access::read_write>  outHDR      [[texture(1)]],
+    texture2d<float, access::sample>      skyEquirect [[texture(2)]],
+    instance_acceleration_structure       accel       [[buffer(0)]],
+    constant VolRTUniforms&               u           [[buffer(1)]],
+    const device RTAreaLight*             areaLights  [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= u.width || gid.y >= u.height || u.density <= 0.0) return;
+    float2 ndc = (float2(gid) + 0.5) / float2(u.width, u.height) * 2.0 - 1.0;
+    ndc.y = -ndc.y;
+    float4 fw = u.invViewProjection * float4(ndc, 1.0, 1.0);
+    float3 ro = u.cameraWorldPos;
+    float3 rd = normalize(fw.xyz / fw.w - ro);
+    float depth = gDepth.read(gid).r;
+    float tEnd = u.maxDist;
+    if (depth < 0.99999) {
+        float4 w = u.invViewProjection * float4(ndc, depth, 1.0);
+        tEnd = min(u.maxDist, length(w.xyz / w.w - ro));
+    }
+    if (tEnd <= 0.01) return;
+
+    intersector<triangle_data, instancing> isect;
+    isect.set_triangle_cull_mode(triangle_cull_mode::none);
+    constexpr sampler skySamp(filter::linear, address::repeat);
+    float3 Ls = float3(0.0);
+    float3 toSun = normalize(u.sunDir);
+    float  sunPhase = volRTPhaseHG(dot(rd, toSun), u.anisotropy);
+    bool   sunOn = u.sunScatter > 0.0 && any(u.sunColor > 0.0) && toSun.y > -0.05;
+    uint   N = clamp(u.steps, 1u, 64u);
+    float  dt = tEnd / float(N);
+    float  roofedLen = 0.0;
+    float  tMin = max(u.rayTMin, 1e-3);
+
+    for (uint i = 0u; i < N; ++i) {
+        uint salt = 0x564F4C00u + i * 2u;   // 'VOL'
+        float2 q0 = illumiSobolOwen2DShuffled(u.progressiveIndex, illumiPixelSeed(gid, salt));
+        float t = (float(i) + q0.x) * dt;
+        float3 X = ro + rd * t;
+
+        // Roofed air only.
+        isect.accept_any_intersection(true);
+        ray up; up.origin = X; up.direction = float3(0.0, 1.0, 0.0);
+        up.min_distance = 0.0; up.max_distance = u.roofReach;
+        if (isect.intersect(up, accel, u.transportMask).type == intersection_type::none) continue;
+        roofedLen += dt;
+        float Tcam = exp(-u.density * t);
+        float3 Lx = float3(0.0);
+
+        if (sunOn) {
+            ray sr; sr.origin = X; sr.direction = toSun; sr.min_distance = tMin; sr.max_distance = 1e4;
+            if (isect.intersect(sr, accel, u.transportMask).type == intersection_type::none) {
+                Lx += u.sunColor * (sunPhase * u.sunScatter);
+            }
+        }
+
+        if (u.skyScatter > 0.0 && u.areaLightCount > 0u) {
+            float wSum = 0.0;
+            for (uint k = 0u; k < u.areaLightCount; ++k) wSum += volRTApertureWeight(areaLights[k], X);
+            if (wSum > 0.0) {
+                float pick = q0.y * wSum, acc = 0.0, pj = 0.0;
+                uint j = u.areaLightCount;
+                for (uint k = 0u; k < u.areaLightCount; ++k) {
+                    float w = volRTApertureWeight(areaLights[k], X);
+                    acc += w;
+                    if (w > 0.0 && (pick < acc || k + 1u == u.areaLightCount)) { j = k; pj = w / wSum; break; }
+                }
+                if (j < u.areaLightCount) {
+                    RTAreaLight al = areaLights[j];
+                    float2 pq = illumiSobolOwen2DShuffled(u.progressiveIndex, illumiPixelSeed(gid, salt + 1u));
+                    float3 P = al.center + al.ex * (pq.x * 2.0 - 1.0) + al.ey * (pq.y * 2.0 - 1.0);
+                    float3 toP = P - X;
+                    float dist = length(toP);
+                    float3 d = toP / max(dist, 1e-6);
+                    float3 nL = cross(al.ex, al.ey);
+                    float area4 = 4.0 * length(nL);
+                    float cosL = abs(dot(normalize(nL), d));
+                    if (cosL > 1e-4 && dist > 1e-3) {
+                        isect.accept_any_intersection(false);
+                        ray pr; pr.origin = X; pr.direction = d; pr.min_distance = tMin; pr.max_distance = 1e4;
+                        auto h = isect.intersect(pr, accel, u.transportMask);
+                        if (h.type == intersection_type::none) {
+                            float3 sky = skyEquirect.sample(skySamp, dirToEquirectUV(d)).rgb * u.skyIntensity;
+                            if (u.scotopicDesaturation > 0.0) sky = mix(sky, float3(pathLuma(sky)), u.scotopicDesaturation);
+                            float pdfW = dist * dist / (area4 * cosL);
+                            Lx += sky * (1.0 - saturate(al.apertureOpacity))
+                                * volRTPhaseHG(dot(rd, d), u.anisotropy) * u.skyScatter / (pj * pdfW);
+                        }
+                    }
+                }
+            }
+        }
+        Ls += Lx * (u.density * Tcam * dt);
+    }
+    if (roofedLen <= 0.0) return;
+    half4 prev = outHDR.read(gid);
+    float Tbg = exp(-u.density * roofedLen);
+    outHDR.write(half4(half3(float3(prev.rgb) * Tbg + Ls), prev.a), gid);
 }

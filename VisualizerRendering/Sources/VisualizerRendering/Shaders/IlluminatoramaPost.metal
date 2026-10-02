@@ -191,6 +191,11 @@ kernel void illumi_bloom_up(
     texture2d<half, access::sample> inHigh [[texture(1)]],
     texture2d<half, access::write>  outTex [[texture(2)]],
     constant FrameUniforms&         frame  [[buffer(0)]],
+    // Daydream DH-0992 — THIS level's scatter, so the host can shape the halo's radial profile
+    // level by level (a lens PSF's power-law tail) instead of the one geometric ratio. < 0 ⇒ the
+    // shared `bloomParams.y`, byte-identical. Any per-level set in [0,1] stays CONVEX, so the
+    // chain's DC gain is still exactly 1.
+    constant float&                 levelScatter [[buffer(1)]],
     uint2                           gid    [[thread_position_in_grid]]
 ) {
     uint w = outTex.get_width();
@@ -202,7 +207,7 @@ kernel void illumi_bloom_up(
 
     float3 high = float3(inHigh.sample(smp, uv).rgb);
     float3 low  = illumiBloomTent(inLow, smp, uv, tx, max(0.0, frame.bloomParams.z));
-    float  scatter = clamp(frame.bloomParams.y, 0.0, 1.0);
+    float  scatter = clamp(levelScatter >= 0.0 ? levelScatter : frame.bloomParams.y, 0.0, 1.0);
     // CONVEX — see the section header. `high + low` here is the classic
     // dual-filter mistake and multiplies the added light by the level count.
     outTex.write(half4(half3(mix(high, low, scatter)), 1.0h), gid);
