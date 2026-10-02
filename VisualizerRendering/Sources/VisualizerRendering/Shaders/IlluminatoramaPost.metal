@@ -207,6 +207,13 @@ kernel void illumi_bloom_up(
     // shared `bloomParams.y`, byte-identical. Any per-level set in [0,1] stays CONVEX, so the
     // chain's DC gain is still exactly 1.
     constant float&                 levelScatter [[buffer(1)]],
+    // Daydream DH-0998 — the far-field glare tail (`illumi_bloom_glare_tail`), added on the FINEST
+    // up step only: `tailScale` > 0 ⇒ out.rgb += tail.rgb × tailScale (1/η of the pyramid, so the
+    // tonemap's `× bloomIntensity` lands the tail in absolute units) and out.a = tail.a, the
+    // in-frame share of each pixel's light the tail scatters (the tonemap takes it out of the
+    // direct image). 0 ⇒ the legacy write, byte-identical (the host binds a dummy texture).
+    texture2d<float, access::sample> inTail [[texture(3)]],
+    constant float&                 tailScale [[buffer(2)]],
     uint2                           gid    [[thread_position_in_grid]]
 ) {
     uint w = outTex.get_width();
@@ -221,7 +228,106 @@ kernel void illumi_bloom_up(
     float  scatter = clamp(levelScatter >= 0.0 ? levelScatter : frame.bloomParams.y, 0.0, 1.0);
     // CONVEX — see the section header. `high + low` here is the classic
     // dual-filter mistake and multiplies the added light by the level count.
-    outTex.write(half4(half3(mix(high, low, scatter)), 1.0h), gid);
+    float3 res = mix(high, low, scatter);
+    if (tailScale > 0.0) {
+        float4 tail = inTail.sample(smp, uv);
+        outTex.write(half4(half3(res + tail.rgb * tailScale), half(tail.a)), gid);
+        return;
+    }
+    outTex.write(half4(half3(res), 1.0h), gid);
+}
+
+// ── Far-field glare tail (Daydream DH-0998) ──────────────────────────────────
+//
+// The pyramid above is a sum of COMPACT kernels: its coarsest level ends ~2^(levels+1.2) mip0
+// texels out, so the physical glare it realises (IlluminatoramaGlareSpread) followed the CIE
+// 146:2002 glare spread function only to ~1.5·2^levels texels — a few degrees — and then fell off
+// a cliff, while the standard's 5/θ² + 0.1p/θ + 0.0025p skirt keeps going to its 100° validity
+// limit. This is the rest of it, done EXACTLY rather than approximated by more levels: a direct
+// sum over a coarse level of the down chain (≤ ~10⁴ cells; evaluated on a grid half that per axis,
+// which the finest up step samples bilinearly — the tail is smooth on that scale), in TRUE view angles (the angle
+// between the two pixels' rays, not a radius in pixels — the difference is 20 % at a 24 mm
+// lens's corner) and true per-cell solid angles (dΩ = cell area · cos³ off axis):
+//
+//     tail(p) = Σ_q  GSF(θ_pq) · S(θ_pq) · L_q · dΩ_q          (rgb)
+//     M(p)    = Σ_q  GSF(θ_pq) · S(θ_pq) · dΩ_q                (a)
+//
+// S is the hand-off ramp the host fitted the pyramid to the complement of (0 below `rhoA`, 1 past
+// `rhoB`, cubic in log ρ), so pyramid + tail IS the GSF. It is a ramp in IMAGE-PLANE distance ρ
+// (tan-plane units — what the screen-space pyramid's own reach is measured in), not in angle: off
+// axis a pixel subtends less angle, so an angular ramp would start the tail later than the pyramid
+// stops and leave a gap (measured 0.51× the GSF at 100 px from a 24 mm corner source). The sum covers only the frame's own
+// pixels (zero-padded — the picture says nothing about the light outside it), and the share of a
+// pixel's light that would scatter OUTSIDE the frame is not lost but kept in its direct image: by
+// the symmetry of the kernel M(p) is exactly the fraction of p's own light the tail puts back
+// INSIDE the frame, so the tonemap subtracts η_pyramid + M(p) from the direct image — a uniform
+// field stays exactly uniform, and every source's in-frame glare is the standard's, to the corner.
+struct BloomGlareTailParams {
+    float2 tanHalf;     // tan of the half field of view (1/P00, 1/P11)
+    float  rhoA;        // ramp start, image-plane (tan) distance
+    float  rhoB;        // ramp end, image-plane (tan) distance
+    float  thetaMax;    // tail end (the CIE validity limit), degrees
+    float  ageTerm;     // 1 + (age / 62.5)^4
+    float  pigment;     // ocular pigmentation p
+    float  pad;
+};
+
+// One THREADGROUP per output cell, its threads splitting the source cells and reducing in
+// threadgroup memory: one thread per output cell (the obvious layout) is ~10⁴ threads each running
+// a ~10⁴-long serial loop — a GPU that wants 10⁵–10⁶ threads in flight sat ~95 % idle (measured
+// 13–25 ms for a hero still's 120 × 75 grid; ~1.7 ms this way on the half-size output grid, under
+// load). `kBloomGlareTailThreads` must match the host.
+constant uint kBloomGlareTailThreads = 256;
+
+kernel void illumi_bloom_glare_tail(
+    texture2d<half, access::read>    src  [[texture(0)]],
+    texture2d<float, access::write>  dst  [[texture(1)]],
+    constant BloomGlareTailParams&   P    [[buffer(0)]],
+    uint2                            cell [[threadgroup_position_in_grid]],
+    uint                             tid  [[thread_index_in_threadgroup]]
+) {
+    threadgroup float4 partial[kBloomGlareTailThreads];
+    uint w = dst.get_width(), h = dst.get_height();
+    uint sw = src.get_width(), sh = src.get_height();
+    float2 pt = ((float2(cell) + 0.5) / float2(w, h) * 2.0 - 1.0) * P.tanHalf;
+    float3 dp = normalize(float3(pt, 1.0));
+    float2 step = 2.0 * P.tanHalf / float2(sw, sh);
+    float  cellArea = step.x * step.y;
+    float  rhoA2 = P.rhoA * P.rhoA, rhoB2 = P.rhoB * P.rhoB;
+    float  cosMax = cos(P.thetaMax * (M_PI_F / 180.0));
+    float  logA = log(P.rhoA);
+    float  invSpan = 1.0 / max(log(P.rhoB / P.rhoA), 1e-6);
+    float4 acc = 0.0;   // rgb = Σ k·L, a = Σ k
+    uint n = sw * sh;
+    for (uint i = tid; i < n; i += kBloomGlareTailThreads) {
+        uint x = i % sw, y = i / sw;
+        float2 q = (float2(x, y) + 0.5) * step - P.tanHalf;
+        float2 dq = q - pt;
+        float rho2 = dot(dq, dq);
+        if (rho2 < rhoA2) continue;
+        float3 d = float3(q, 1.0);
+        float inv = rsqrt(dot(d, d));
+        float c = dot(dp, d) * inv;
+        if (c < cosMax) continue;
+        float it = (M_PI_F / 180.0) / acos(clamp(c, -1.0, 1.0));     // 1/θ, θ in degrees
+        // 10/θ³ + (5/θ² + 0.1p/θ)·ageTerm + 0.0025p, on one reciprocal.
+        float gsf = it * (it * (10.0 * it + 5.0 * P.ageTerm) + 0.1 * P.pigment * P.ageTerm)
+                  + 0.0025 * P.pigment;
+        float ramp = 1.0;                                            // past ρB: the tail is all
+        if (rho2 < rhoB2) {
+            float s = saturate((0.5 * log(rho2) - logA) * invSpan);
+            ramp = s * s * (3.0 - 2.0 * s);
+        }
+        float k = gsf * ramp * cellArea * inv * inv * inv;
+        acc += k * float4(max(float3(src.read(uint2(x, y)).rgb), 0.0), 1.0);
+    }
+    partial[tid] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = kBloomGlareTailThreads / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) partial[tid] += partial[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0 && cell.x < w && cell.y < h) dst.write(partial[0], cell);
 }
 
 // ── Halation (film) ──────────────────────────────────────────────────────────

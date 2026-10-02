@@ -892,12 +892,16 @@ fragment float4 illumi_tonemap_fs(
     // interpolates across mip0 regardless of the source's pixel count. The
     // pyramid's convex up-chain has a DC gain of 1, exactly like the normalised
     // gaussian it replaced, so `bloomIntensity` means what it always meant.
-    float3 bloom = float3(inBloom.sample(downSampler, in.uv).rgb);
+    float4 bloomSample = float4(inBloom.sample(downSampler, in.uv));
+    float3 bloom = bloomSample.rgb;
 
     // Daydream DH-1001 — physical glare: the scattered fraction η (`bloomParams.w`) LEAVES the
     // direct image and arrives as the glare (`bloomIntensity` = η), so the PSF (1−η)·δ + η·G
-    // conserves energy. w == 0 ⇒ `hdr * 1.0`, exact — every legacy lane is byte-identical.
-    float3 mixed = hdr * (1.0 - frame.bloomParams.w) + bloom * frame.bloomIntensity;
+    // conserves energy. DH-0998: the far-field tail's in-frame share of this pixel's light (the
+    // bloom's alpha, written only on this lane) leaves it too. w == 0 ⇒ `hdr * (1.0 - 0.0)`,
+    // exact — every legacy lane is byte-identical.
+    float directLoss = frame.bloomParams.w > 0.0 ? frame.bloomParams.w + bloomSample.a : 0.0;
+    float3 mixed = hdr * (1.0 - directLoss) + bloom * frame.bloomIntensity;
 
     // ── Halation (film) ────────────────────────────────────────────────────────
     // The warm halo film wears around blown highlights (see the halation kernels in
