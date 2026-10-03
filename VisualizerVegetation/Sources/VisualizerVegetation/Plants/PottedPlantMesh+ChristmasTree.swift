@@ -107,8 +107,10 @@ extension PottedPlantMesh {
             groups[c].mesh.append(coniferBall(centre, radius: radius * bs, segments: 14))
             groups[1].mesh.append(coniferBaubleHardware(centre: centre, radius: radius * bs))
         }
-        groups[1].mesh.append(coniferGarland(sk, params: params))      // gold tinsel swags
         groups[1].mesh.append(coniferStar(apexY: Double(sk.apexY), size: params.plantSize))
+        // The garland is its OWN group: gold TINSEL is a satin metal, not the mirror glass of a bauble.
+        groups.append(ColoredGroup(color: Vec3(0.78, 0.56, 0.18), mesh: coniferGarland(sk, params: params),
+                                   metallic: 0.85, roughness: 0.30))
         return groups.filter { !$0.mesh.isEmpty }
     }
 
@@ -132,34 +134,160 @@ extension PottedPlantMesh {
         return m
     }
 
-    /// **The garland** — a gold tinsel rope draped in swags between the tips of neighbouring branches
-    /// in a whorl, on every third whorl. Each swag hangs a little outside the tips at a steady radius
-    /// and sags ~13 % of its chord; it rides the gold metallic group with the star and the bauble
-    /// hardware.
-    public static func coniferGarland(_ sk: FirSkeleton, params: some PottedPlantGeometry) -> Mesh3 {
-        var m = Mesh3()
-        let r = 0.0035 + 0.0012 * params.plantSize
+    /// **The garland** — ONE continuous strand of gold tinsel, spiralling down the tree from the top and
+    /// draped between the branches. An earlier version drew a separate little arc between each pair of
+    /// neighbouring branch tips, hung in the air outside them, as a smooth rod: every swag had two loose
+    /// ends and none of it touched the tree. This is a single path (`coniferGarlandPath`), so there is
+    /// nothing to be unconnected: it starts tucked into the tree beside the leader, winds down ~one turn
+    /// per 24 cm of canopy, sags between a support every quarter-turn (where it rests on the branch
+    /// tips) and dips a little into the foliage at mid-span, and ends in a short free tail.
+    public static func coniferGarlandPath(_ sk: FirSkeleton, params: some PottedPlantGeometry) -> [Vec3] {
+        var rng = SplitMix(params.seed &* 0xA24BAED4963EE407 &+ 0x2545F4914F6CDD1D)
+        let H = Double(sk.height)
+        let turns = max(4.0, (H / 0.24).rounded())
+        let support = Double.pi / 2                          // a support every quarter-turn
+        let theta0 = rng.unit() * 2 * .pi
         let soil = Double(sk.bottomY) - params.plantSize * 0.10
-        for (wi, ring) in sk.whorls.enumerated() where wi % 3 == 1 && wi < sk.whorls.count - 1 && ring.count >= 4 {
-            for k in 0 ..< ring.count {
-                let a = sk.branches[ring[k]], b = sk.branches[ring[(k + 1) % ring.count]]
-                let ta = a.point(at: 0.97), tb = b.point(at: 0.97)
-                let ra = Double((ta.x * ta.x + ta.z * ta.z).squareRoot()), rb = Double((tb.x * tb.x + tb.z * tb.z).squareRoot())
-                let aa = Double(atan2(ta.z, ta.x))
-                var bb = Double(atan2(tb.z, tb.x))
-                while bb <= aa { bb += 2 * .pi }
-                guard bb - aa < 1.5 else { continue }            // only neighbours, not across a gap
-                let rad = max(ra, rb) + 0.012
-                let chord = rad * (bb - aa)
-                let path: [Vec3] = (0 ... 11).map { i in
-                    let u = Double(i) / 11
-                    let th = aa + u * (bb - aa)
-                    let y = Double(ta.y) + Double(tb.y - ta.y) * u - chord * 0.13 * sin(u * .pi) - r
-                    return Vec3(cos(th) * rad, max(y, soil + 0.03), sin(th) * rad)
-                }
-                m.sweep(profile: .circle(radius: r, segments: 5), along: path, capStart: true, capEnd: true)
+        // Each span sags its own amount (deterministic per span) so the swags are not a repeated pattern.
+        let spans = Int(turns * 4) + 2
+        let sagAmp: [Double] = (0 ..< spans).map { _ in (0.040 + 0.030 * rng.unit()) * H / 1.2 }
+        func smooth(_ x: Double) -> Double { let t = max(0, min(1, x)); return t * t * (3 - 2 * t) }
+        func at(_ u: Double) -> Vec3 {
+            let f = 0.93 - 0.82 * u                           // from near the leader down to the lowest whorls
+            let th = theta0 + turns * 2 * .pi * u
+            let span = th / support
+            let local = span - floor(span)
+            let sag = sagAmp[min(spans - 1, max(0, Int(u * Double(spans - 1))))] * sin(.pi * local)
+            var rho = Double(sk.radius(atFraction: Float(f))) * 0.985 - 0.014 * sin(.pi * local)
+            var y = Double(sk.y(atFraction: Float(f))) - sag
+            if u < 0.05 { rho *= 0.25 + 0.75 * smooth(u / 0.05) }                    // tucked in at the top
+            if u > 0.97 { y -= (u - 0.97) / 0.03 * 0.07 }                            // a free tail at the bottom
+            return Vec3(cos(th) * rho, max(y, soil + 0.035), sin(th) * rho)
+        }
+        // Dense sample, then resample at even arc length (the rope's twist is per metre of strand).
+        let dense = (0 ... Int(turns) * 260).map { at(Double($0) / Double(Int(turns) * 260)) }
+        var out: [Vec3] = [dense[0]]
+        var carry = 0.0
+        let step = 0.015
+        for i in 1 ..< dense.count {
+            var a = dense[i - 1]
+            let seg = len3(dense[i] - a)
+            var left = seg
+            while carry + left >= step {
+                let t = (step - carry) / left
+                a = a + (dense[i] - a) * t
+                out.append(a)
+                left = len3(dense[i] - a); carry = 0
+            }
+            carry += left
+        }
+        out.append(dense[dense.count - 1])
+        return out
+    }
+
+    /// A TWISTED TINSEL ROPE along `path`: a fluted cross-section (alternating high and low ridges) that
+    /// rotates as it travels, which is what makes a tinsel garland read as a spun, glittering strand
+    /// rather than a smooth tube. Flat-shaded on purpose (each facet catches the light separately — that
+    /// IS the glitter). Closed solid with fan caps.
+    public static func twistedRope(along path: [Vec3], radius: Double, lobes: Int = 4,
+                                   twistsPerMetre: Double = 8) -> Mesh3 {
+        var m = Mesh3()
+        guard path.count >= 2 else { return m }
+        let N = lobes * 2
+        // Parallel-transport frames.
+        var tangents: [Vec3] = path.indices.map { i in
+            let d = i == 0 ? path[1] - path[0] : (i == path.count - 1 ? path[i] - path[i - 1] : path[i + 1] - path[i - 1])
+            return len3(d) > 1e-9 ? normalize3(d) : Vec3(0, 1, 0)
+        }
+        var us: [Vec3] = [], vs: [Vec3] = []
+        var u0 = cross3(tangents[0], abs(tangents[0].y) < 0.95 ? Vec3(0, 1, 0) : Vec3(1, 0, 0))
+        u0 = normalize3(u0)
+        us.append(u0); vs.append(cross3(tangents[0], u0))
+        for i in 1 ..< path.count {
+            // Rotate the previous u by the minimal rotation taking tangent[i-1] → tangent[i].
+            let a = tangents[i - 1], b = tangents[i]
+            let axis = cross3(a, b), s = len3(axis), c = dot3(a, b)
+            var u = us[i - 1]
+            if s > 1e-9 {
+                let k = axis / s, ang = atan2(s, c)
+                u = u * cos(ang) + cross3(k, u) * sin(ang) + k * (dot3(k, u) * (1 - cos(ang)))
+            }
+            u = normalize3(u - tangents[i] * dot3(u, tangents[i]))
+            us.append(u); vs.append(cross3(tangents[i], u))
+        }
+        tangents = tangents.map { $0 }
+        var arc = 0.0
+        var rings: [[Vec3]] = []
+        for i in path.indices {
+            if i > 0 { arc += len3(path[i] - path[i - 1]) }
+            let twist = 2 * Double.pi * twistsPerMetre * arc / Double(lobes)
+            rings.append((0 ..< N).map { k in
+                let ang = 2 * .pi * Double(k) / Double(N) + twist
+                let r = radius * (k % 2 == 0 ? 1.0 : 0.52)
+                return path[i] + (us[i] * cos(ang) + vs[i] * sin(ang)) * r
+            })
+        }
+        for i in 0 ..< path.count - 1 {
+            for k in 0 ..< N {
+                let k2 = (k + 1) % N
+                let a = rings[i][k], b = rings[i][k2], c = rings[i + 1][k2], d = rings[i + 1][k]
+                let centre = (a + b + c + d) * 0.25 - (path[i] + path[i + 1]) * 0.5
+                m.addQuad(a, b, c, d, outward: centre)
             }
         }
+        // End caps.
+        for (i, outward) in [(0, tangents[0] * -1), (path.count - 1, tangents[path.count - 1])] {
+            for k in 0 ..< N {
+                m.addTriangle(path[i], rings[i][k], rings[i][(k + 1) % N], outward: outward)
+            }
+        }
+        return m
+    }
+
+    /// The garland's core: a thin twisted gold rope along the continuous path (a closed solid).
+    public static func coniferGarlandRope(_ sk: FirSkeleton, params: some PottedPlantGeometry) -> Mesh3 {
+        twistedRope(along: coniferGarlandPath(sk, params: params), radius: garlandCoreRadius(params))
+    }
+
+    public static func garlandCoreRadius(_ params: some PottedPlantGeometry) -> Double { 0.0058 + 0.0010 * params.plantSize }
+
+    /// **Tinsel is a core wrapped in bristles.** A rope alone reads as a ribbon; the fuzz of fine foil
+    /// strands thrown out all round it is what makes it tinsel. Each bristle is one thin double-sided
+    /// spike (base ~2.5 mm, 1.2–2.4 cm long, thrown out radially with a little forward sweep and droop),
+    /// six per 1.5 cm of strand. Open cards (like leaves), so the strand's closed core is audited
+    /// separately from its fuzz.
+    public static func tinselBristles(along path: [Vec3], coreRadius: Double, seed: UInt64) -> Mesh3 {
+        var m = Mesh3()
+        var rng = SplitMix(seed &* 0x9E3779B97F4A7C15 &+ 0x51ED270B)
+        for i in 0 ..< path.count - 1 {
+            let a = path[i], b = path[i + 1]
+            let t = len3(b - a) > 1e-9 ? normalize3(b - a) : Vec3(0, 1, 0)
+            var u = cross3(t, abs(t.y) < 0.95 ? Vec3(0, 1, 0) : Vec3(1, 0, 0))
+            u = normalize3(u)
+            let v = cross3(t, u)
+            for _ in 0 ..< 6 {
+                let p = a + (b - a) * rng.unit()
+                let phi = rng.unit() * 2 * .pi
+                var d = u * cos(phi) + v * sin(phi)
+                d = normalize3(d + t * ((rng.unit() - 0.5) * 0.9))
+                let len = 0.012 + 0.012 * rng.unit()
+                let base = p + d * (coreRadius * 0.75)
+                var tip = base + d * len
+                tip.y -= 0.18 * len                                     // foil droops a little
+                let w = normalize3(cross3(d, t)) * 0.00125
+                let n = normalize3(cross3(w, tip - base))
+                m.addTriangle(base + w, base - w, tip, outward: n)
+                m.addTriangle(base + w, base - w, tip, outward: n * -1)
+            }
+        }
+        return m
+    }
+
+    /// The whole garland: rope + bristles, one mesh.
+    public static func coniferGarland(_ sk: FirSkeleton, params: some PottedPlantGeometry) -> Mesh3 {
+        let path = coniferGarlandPath(sk, params: params)
+        var m = twistedRope(along: path, radius: garlandCoreRadius(params))
+        m.append(tinselBristles(along: path, coreRadius: garlandCoreRadius(params), seed: params.seed))
         return m
     }
 

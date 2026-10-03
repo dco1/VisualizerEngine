@@ -38,10 +38,16 @@ public enum PottedPlantMesh {
         public var mesh: Mesh3
         /// One albedo per `mesh` vertex for a painted group; EMPTY for a flat `color` group.
         public var colors: [Vec3]
-        public init(color: Vec3, mesh: Mesh3, colors: [Vec3] = []) {
+        /// This group's OWN surface finish, when it differs from the style's default for its bloom
+        /// groups (a Christmas tree's are mirror-glass baubles): the tinsel garland is a satin metal.
+        /// `nil` takes the style default.
+        public var metallic: Float?
+        public var roughness: Float?
+        public init(color: Vec3, mesh: Mesh3, colors: [Vec3] = [], metallic: Float? = nil, roughness: Float? = nil) {
             precondition(colors.isEmpty || colors.count == mesh.vertexCount,
                          "a painted group needs one colour per vertex")
             self.color = color; self.mesh = mesh; self.colors = colors
+            self.metallic = metallic; self.roughness = roughness
         }
     }
 
