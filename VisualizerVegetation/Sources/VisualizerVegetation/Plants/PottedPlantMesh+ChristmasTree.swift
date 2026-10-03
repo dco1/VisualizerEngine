@@ -118,6 +118,7 @@ extension PottedPlantMesh {
     public static func coniferBaubles(_ tiers: [ConiferTier], params: some PottedPlantGeometry,
                                rng: inout SplitMix) -> [ColoredGroup] {
         var groups = baublePalette.map { ColoredGroup(color: $0, mesh: Mesh3()) }
+        var srng = SplitMix(params.seed &* 0xC6BC279692B5C323 &+ 0x9E3779B97F4A7C15)   // sizes: own stream, so colours keep theirs
         let radius = 0.024 + 0.01 * params.plantSize
         for t in tiers {
             let count = max(1, Int((Double(t.lobes) * 0.4 * Double(params.foliageDensity)).rounded()))
@@ -129,12 +130,18 @@ extension PottedPlantMesh {
                 let r = t.rimRadius(theta) * 0.90
                 let centre = Vec3(cos(theta) * r, t.rimY(theta) - radius * 1.05, sin(theta) * r)
                 let c = Int(rng.unit() * Double(baublePalette.count)) % baublePalette.count
-                groups[c].mesh.append(coniferBall(centre, radius: radius, segments: 12))
+                // Sizes vary (rubric 21): 0.8×…1.3× the base, from their OWN stream so a seed keeps its
+                // colour sequence. The ball is built about its own hang point.
+                let bs = 0.8 + 0.5 * srng.unit()
+                let soil = (tiers.first?.yRim ?? 0) - params.plantSize * 0.10       // the envelope's own soil line
+                let hung = Vec3(centre.x, max(centre.y - radius * (bs - 1) * 1.05, soil + 0.03 + radius * bs), centre.z)
+                groups[c].mesh.append(coniferBall(hung, radius: radius * bs, segments: 14))
                 // A real bauble hangs: a small metal cap on its neck and a hook up to the bough
                 // (rubric 23). Gold, like the star, whatever the glass colour.
-                groups[1].mesh.append(coniferBaubleHardware(centre: centre, radius: radius))
+                groups[1].mesh.append(coniferBaubleHardware(centre: hung, radius: radius * bs))
             }
         }
+        groups[1].mesh.append(coniferGarland(tiers, params: params))      // gold tinsel swags (rubric 25)
         if let tip = tiers.last {
             groups[1].mesh.append(coniferStar(apexY: tip.yTop, size: params.plantSize))
         }
@@ -158,6 +165,37 @@ extension PottedPlantMesh {
             return Vec3(base.x + (1 - cos(a)) * hr * 0.5, base.y + sin(a) * hr, base.z)
         }
         m.sweep(profile: .circle(radius: radius * 0.07, segments: 4), along: path, capStart: true, capEnd: true)
+        return m
+    }
+
+    /// **The garland** — a gold tinsel rope draped in swags from bough tip to bough tip, on every
+    /// other tier (rubric 25). Each swag spans two bough tips along the rim, hangs a little outside
+    /// it, and sags ~12 % of its chord; it rides the gold metallic group with the star and the
+    /// bauble hardware, so it reads as bright metal tinsel without a material of its own.
+    public static func coniferGarland(_ tiers: [ConiferTier], params: some PottedPlantGeometry) -> Mesh3 {
+        var m = Mesh3()
+        let r = 0.0035 + 0.0012 * params.plantSize
+        for (ti, t) in tiers.enumerated() where ti % 2 == 1 && ti < tiers.count - 1 {
+            let swags = max(3, t.lobes / 2)
+            let dTheta = 2 * Double.pi / Double(swags)
+            for j in 0 ..< swags {
+                let a0 = t.phase + Double(j) * dTheta
+                let p0 = t.top(1.03, a0), p1 = t.top(1.03, a0 + dTheta)
+                let r0 = (p0.x * p0.x + p0.z * p0.z).squareRoot()
+                let r1 = (p1.x * p1.x + p1.z * p1.z).squareRoot()
+                // Hung in the AIR outside the rim at a steady radius (the pins' larger one), so the
+                // arc stays smooth over the lobes' ups and downs instead of tracing the scalloped rim.
+                let rad = max(r0, r1) + 0.012
+                let chord = rad * dTheta
+                let path: [Vec3] = (0 ... 11).map { i in
+                    let u = Double(i) / 11
+                    let th = a0 + u * dTheta
+                    let y = p0.y + (p1.y - p0.y) * u - chord * 0.13 * sin(u * .pi) - r
+                    return Vec3(cos(th) * rad, y, sin(th) * rad)
+                }
+                m.sweep(profile: .circle(radius: r, segments: 5), along: path, capStart: true, capEnd: true)
+            }
+        }
         return m
     }
 
