@@ -855,6 +855,26 @@ public final class IlluminatoramaRenderer {
     /// path through a sunlit patch seen past a doorway is the classic firefly; the cap trades a
     /// little energy in those paths for a still that converges in the frames it is given.
     public var rtPathClamp: Float = 0
+    /// **DH-1011 — how a path vertex samples its lights.** True: the aperture sample and the
+    /// cosine continuation are combined by multiple importance sampling (power heuristic) instead
+    /// of partitioning the hemisphere — a continuation that leaves through a portal is kept,
+    /// weighted, not dropped — and the area emitters are ONE pick ∝ their unshadowed contribution
+    /// with ONE Sobol shadow ray instead of `secondaryAreaShadowRays` white-noise rays each. Same
+    /// integrand, so the converged picture does not move; only its variance does. False: the
+    /// DH-0989 estimator, byte-identical (the A/B lever).
+    public var rtPathLightSampling: Bool = true
+    /// **DH-1011 — shadowed lamps at path vertices.** True: every point / spot light that casts a
+    /// shadow in the deferred pass (`castsShadow` — the trapped cones of lamps, cans, sconces,
+    /// pendants; candle cubes) gets a traced shadow ray at a path vertex too, and the vertex's
+    /// lamps join its emitters in the ONE pick (so one light ray per vertex however many fixtures
+    /// the room holds). False: lamps are the unshadowed deterministic fill at a path vertex, as
+    /// DH-0989 shipped — which lights the floor under a table from the can above it. Needs
+    /// `rtPathLightSampling`. Unshadowed lights (bounce fills, string lights) stay unshadowed.
+    public var rtPathLampShadows: Bool = false
+    /// DH-1011 INSTRUMENT: the path lane returns only the primary surface's traced local-light
+    /// estimate (the lamps the deferred pass normally owns), so the traced lamp visibility can be
+    /// read against the shadow maps. Never set by a host.
+    public var rtPathDebugPrimaryLocal: Bool = false
     /// Cone-sampled shadow rays per pixel per frame for `rtSunSoftShadowsEnabled`'s traced
     /// sun visibility, host-clamped (`rtSunShadowRayCount`'s write, below) and shader-clamped
     /// (`rtSunSoftVisibility`, IlluminatoramaLighting.metal) to 1…32. DH-0856 measured this
@@ -896,6 +916,9 @@ public final class IlluminatoramaRenderer {
     public var rtaoIntensity: Float = 1.0
     /// Occlusion reach in world metres (the ray `max_distance`).
     public var rtaoRadius: Float = 0.5
+    /// Multi-bounce AO (Jimenez 2016 fit) on the lighting kernel's AO term. OFF by default => byte-identical.
+    /// Rides `filmMedium.z`. DH-0953.
+    public var aoMultiBounce: Bool = false
     /// Cosine-hemisphere rays per half-res texel per frame (clamped 1…32).
     public var rtaoRays: Int = 8
     /// Whether the LAST encoded AO pass was the traced one — a gate's proof that RTAO fired
@@ -4661,6 +4684,9 @@ public final class IlluminatoramaRenderer {
         /// DH-0989 — path bounces (0 ⇒ one-bounce GI) and the per-path luminance cap.
         var pathBounces: UInt32 = 0
         var pathClamp: Float = 0
+        /// DH-1011 — `kPathFlag*` (Metal twin appended last; three pads keep the 16-byte tail).
+        var pathFlags: UInt32 = 0
+        var padPath0: UInt32 = 0, padPath1: UInt32 = 0, padPath2: UInt32 = 0
 
         mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
             let p = InteriorRoomGains.pack(gains, enabled: enabled)
@@ -9675,6 +9701,10 @@ public final class IlluminatoramaRenderer {
         let pathOn = rtPathTracedGI && diffSkyOn
         u.pathBounces = pathOn ? UInt32(max(1, min(32, rtPathBounces))) : 0
         u.pathClamp = pathOn ? max(0, rtPathClamp) : 0
+        // DH-1011 — light sampling + MIS (bit 0), shadowed lamps (bit 1, needs bit 0), instrument (bit 7).
+        u.pathFlags = !pathOn ? 0 : (rtPathLightSampling ? 1 : 0)
+            | (rtPathLightSampling && rtPathLampShadows ? 2 : 0)
+            | (rtPathDebugPrimaryLocal ? 128 : 0)
         // Surface cache read (P1c): on only when the grouped soup + cards + base
         // are all live this topology. The kernel gates every atlas read on this.
         let cacheOn = surfCacheActive && surfCardCount > 0
@@ -15536,7 +15566,7 @@ public final class IlluminatoramaRenderer {
         // summing to 1 and the chain gains or loses energy.
         u.sensorNoise = SIMD4(max(0, sensorNoiseStrength), max(1, sensorElectronsPerUnit),
                               max(0, sensorReadNoise), min(max(sensorChannelCorrelation, 0), 1))
-        u.filmMedium = SIMD4(max(0, filmDensityGrain), min(max(filmDensityGrainCorrelation, 0), 1), 0, 0)
+        u.filmMedium = SIMD4(max(0, filmDensityGrain), min(max(filmDensityGrainCorrelation, 0), 1), aoMultiBounce ? 1 : 0, 0)
         u.bloomParams = SIMD4(max(0, bloomSoftKnee),
                               min(max(bloomScatter, 0), 1),
                               max(0, bloomTentRadius),

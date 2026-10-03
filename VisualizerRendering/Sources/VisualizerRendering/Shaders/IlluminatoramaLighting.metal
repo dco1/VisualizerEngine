@@ -1633,6 +1633,17 @@ kernel void illumi_lighting(
     uint aoH = aoTex.get_height();
     uint2 aoCoord = min(gid / 2, uint2(aoW - 1, aoH - 1));
     float ao = float(aoTex.read(aoCoord).r);
+    // Multi-bounce AO (Jimenez 2016 / Filament GTAO fit) — OPT-IN via frame.filmMedium.z (0 => this
+    // block is skipped and ao is untouched, byte-identical). Evaluated on the albedo's luminance
+    // (ao is a scalar through the rest of this kernel): bright surfaces get back the light the
+    // occluder bounces onto them, dark ones keep their full AO.
+    if (frame.filmMedium.z > 0.5) {
+        float mbA = dot(albedo, float3(0.2126, 0.7152, 0.0722));
+        float a = 2.0404 * mbA - 0.3324;
+        float b = -4.7951 * mbA + 0.6417;
+        float c = 2.7552 * mbA + 0.6903;
+        ao = max(ao, ((ao * a + b) * ao + c) * ao);
+    }
 
     // ── Interior day-light separation (FrameUniforms.interiorMask) ──────────
     // Both factors stay exactly 1.0 unless the host opted in AND this fragment
