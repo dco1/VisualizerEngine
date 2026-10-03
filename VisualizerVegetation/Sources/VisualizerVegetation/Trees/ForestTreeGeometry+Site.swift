@@ -195,6 +195,7 @@ extension ForestTreeGeometry {
         // the bole anyway.)
         case .orange, .lemon: s.speciesMark = 2.0
         case .elderberry:     s.speciesMark = 2.0     // furrowed grey-brown: the generic plate field
+        case .fir:            s.speciesMark = 2.0     // fir bark: the generic plate field (the bole is mostly hidden)
         }
         defer { s.speciesMark = prevSpecies }
         // Per-tree lean: tilt the whole tree about its base toward `leanAz`.
@@ -202,6 +203,12 @@ extension ForestTreeGeometry {
             ? rotY(site.leanAz) * rotX(site.lean) * rotY(-site.leanAz)
             : matrix_identity_float4x4
         let world = translate(site.pos) * leanTilt * rotY(site.baseYaw)
+
+        // A conifer grows by whorls of branches carrying sprigs, not by crown arms + leaf fill.
+        if let c = look.conifer {
+            emitConifer(&s, world: world, look: look, conifer: c, site: site)
+            return
+        }
 
         let ageBoost = 0.85 + site.age * 0.30
         let trunkLen = h * look.trunkHeightFrac * ageBoost

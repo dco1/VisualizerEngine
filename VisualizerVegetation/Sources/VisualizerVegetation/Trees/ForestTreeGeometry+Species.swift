@@ -4,7 +4,7 @@ import simd
 // Species identity, look profiles, sRGB→linear look-up.
 extension ForestTreeGeometry {
     // ===== Species+TreeLook+look+TreeSite (lines 1057-1169) =====
-    public enum Species: CaseIterable, Sendable { case oak, birch, maple, orange, lemon, elderberry }
+    public enum Species: CaseIterable, Sendable { case oak, birch, maple, orange, lemon, elderberry, fir }
 
     /// Ported subset of `TreeGeometry.LookProfile` — proportions + species
     /// identity. Colours are converted sRGB→linear for the Illuminatorama
@@ -45,6 +45,26 @@ extension ForestTreeGeometry {
         /// Crown width against the height-derived default. 1 for every tree-form species; a
         /// shrub-tree (elderberry) is wider than its height suggests.
         public var crownWidthMult: Float = 1
+        /// Present for a CONIFER: it grows by whorls of branches carrying needled sprigs
+        /// (`ForestTreeGeometry+Conifer`), not by the broadleaf crown-arm + volumetric leaf fill
+        /// that every other field above describes. `nil` for every broadleaf — byte-identical.
+        public var conifer: ConiferLook? = nil
+    }
+
+    /// How a conifer is grown. Lengths are FRACTIONS of the canopy height, so a desk fir and a hall
+    /// fir are the same tree at two sizes. `needleShade`/`needleLit` are linear albedo for a sprig's
+    /// base and tip.
+    public struct ConiferLook: Sendable {
+        public var whorlSpacing: Float
+        public var sprigSpacing: Float
+        public var sprigLength: Float
+        public var sprigAspect: Float
+        public var branchRadius: Float
+        public var baseRadius: Float        // canopy radius at its base, per canopy height
+        public var convexity: Float
+        public var reach: Float
+        public var needleShade: SIMD3<Float>
+        public var needleLit: SIMD3<Float>
     }
 
     /// Descriptor for a citrus tree's crown fruit (see `TreeLook.fruit`).
@@ -177,6 +197,24 @@ extension ForestTreeGeometry {
                 fruit: FruitLook(color: SIMD3(217, 201, 146) / 255,
                                  radius: 0.11, elongate: 0.34, count: 120, placement: .crowning),
                 crownWidthMult: 1.35)
+        case .fir:
+            // A cut fir as sold for Christmas — dense, deep blue-green, tiered by its whorls.
+            return TreeLook(
+                trunkHeightFrac: 0.10, flareBase: 1.20, trunkTopMult: 0.10,
+                maxDepth: 1, primaryCountMin: 5, primaryCountMax: 8,
+                primaryPitchMin: 0, primaryPitchRange: 0,
+                secondaryPitchMin: 0, secondaryPitchRange: 0,
+                lobePitchBoost: 0, leafCardSize: 0.08, leafDensityMult: 1,
+                leafAspectW: 0.3, leafAspectH: 1, opposite: false,
+                internodeFrac: 0.3, petioleFrac: 0.1,
+                leaf: srgbToLinear(SIMD3(0.075, 0.30, 0.17)),
+                bark: srgbToLinear(SIMD3(0.17, 0.11, 0.08)), isBirch: false,
+                species: .fir, leafCurl: 0.20,
+                conifer: ConiferLook(whorlSpacing: 0.055, sprigSpacing: 0.008, sprigLength: 0.050,
+                                     sprigAspect: 0.16, branchRadius: 0.0046, baseRadius: 0.44,
+                                     convexity: 0.95, reach: 0.95,
+                                     needleShade: srgbToLinear(SIMD3(0.020, 0.100, 0.075)),
+                                     needleLit: srgbToLinear(SIMD3(0.110, 0.330, 0.200))))
         }
     }
 

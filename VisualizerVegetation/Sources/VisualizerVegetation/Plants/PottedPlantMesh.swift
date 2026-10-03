@@ -107,18 +107,21 @@ public enum PottedPlantMesh {
                          foliageColors: bouquet.greenColors, blooms: bouquet.blooms)
         }
 
+        if params.plantStyle == .christmasTree {
+            // The fir is the unified tree factory's (`ForestTreeGeometry`, species `.fir`): its trunk
+            // and branches are the plant's wood, its sprigs the painted foliage. Baubles ride the
+            // per-colour bloom groups; the bulbs are their own self-lit group.
+            let tree = christmasTree(params: params, soilY: soilY, rng: &rng)
+            substrate.append(tree.wood)
+            substrate.append(tree.wire)          // the string's own cord: thin, dark, opaque
+            return Parts(vessel: vessel, substrate: substrate, foliage: tree.foliage,
+                         foliageColors: tree.foliageColors, blooms: tree.baubles, bulbs: tree.bulbs)
+        }
+
         // Foliage plant: a single trunk/stub stem (opaque — the plant's own woody trunk, so it's
         // substrate, NOT the vessel finish) + the painted leaves.
         let stem = stemMesh(params: params, baseY: soilY)
         substrate.append(stem)
-        if params.plantStyle == .christmasTree {
-            // A fir is a solid tiered canopy, not leaf cards — see PottedPlantMesh+ChristmasTree.
-            // Baubles ride the per-colour bloom groups; the bulbs are their own self-lit group.
-            let tree = christmasTree(params: params, soilY: soilY, rng: &rng)
-            substrate.append(tree.wire)          // the string's own cord: thin, dark, opaque
-            return Parts(vessel: vessel, substrate: substrate, foliage: tree.canopy,
-                         foliageColors: tree.canopyColors, blooms: tree.baubles, bulbs: tree.bulbs)
-        }
         let grown = foliage(params: params, soilY: soilY, rng: &rng)
         substrate.append(grown.woody)
         return Parts(vessel: vessel, substrate: substrate, foliage: grown.mesh, foliageColors: grown.colors)
@@ -142,9 +145,9 @@ public enum PottedPlantMesh {
     public static func foliage(params: some PottedPlantGeometry, soilY: Double, rng: inout SplitMix)
         -> (mesh: Mesh3, colors: [Vec3], woody: Mesh3) {
         if params.plantStyle == .christmasTree {
-            let tiers = coniferTiers(params: params, soilY: soilY, rng: &rng)
-            let painted = coniferFoliagePainted(tiers, params: params, soilY: soilY)
-            return (painted.mesh, painted.colors, Mesh3())
+            let sk = coniferSkeleton(params: params, soilY: soilY)
+            let tree = coniferTreeMeshes(sk, params: params, soilY: soilY)
+            return (tree.foliage, tree.foliageColors, tree.wood)
         }
         guard let grown = houseplantFoliage(params: params, soilY: soilY, rng: &rng) else {
             return (Mesh3(), [], Mesh3())

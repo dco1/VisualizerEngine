@@ -245,6 +245,10 @@ public enum ForestTreeGeometry {
         // gap at world (0,−3.5)). FALSE for AssetLab's TreeLab, whose single tree
         // sits at the origin — inside that zone — and would otherwise be erased.
         public nonisolated(unsafe) static var clearingCull = true
+        /// PER-SOUP opt-out of that cull, for a bake that is not the Forest scene and sits anywhere (a
+        /// potted tree at the plant's own origin). Prefer this to flipping the global `clearingCull`,
+        /// which is shared mutable state.
+        public var skipClearingCull = false
         // ── FLOOR NEON probe (env FOREST_FLOOR_NEON=1) ───────────────────────
         // The "lighter green square on the floor" keeps recurring (memory:
         // forest_disconnect_is_illum_tone_not_geometry). We already proved it is
@@ -360,7 +364,7 @@ public enum ForestTreeGeometry {
             // untouched. Understory uses windActive too, but it's already sparse-to-
             // absent in the open core (site culls), so this just guarantees the
             // BRIEF's "clearing floor owned by grass/ferns/logs, not trees."
-            if Self.clearingCull && (foliageMark > 0.5 || windActive) {
+            if Self.clearingCull && !skipClearingCull && (foliageMark > 0.5 || windActive) {
                 let mx = (p0.x + p1.x + p2.x) * 0.3333333
                 let my = (p0.y + p1.y + p2.y) * 0.3333333
                 let mz = (p0.z + p1.z + p2.z) * 0.3333333

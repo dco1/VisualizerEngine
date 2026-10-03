@@ -2,51 +2,37 @@ import Foundation
 import simd
 import VisualizerMaterials
 
-/// **The Christmas tree** (DH-0489) — a potted fir, its baubles, and a string of lights.
+/// **The Christmas tree** (DH-0489) — a potted fir, its baubles, a gold garland, and a string of lights.
 ///
-/// **Why this is not leaf cards.** Every other `PlantStyle` is built from `PlantLeafCard` blades on
-/// a phyllotaxis spiral, which is right for a broadleaf houseplant and wrong for a conifer: a fir's
-/// silhouette is a SOLID stacked canopy, and a porcupine of needle cards reads as exactly that (the
-/// Visualizer UFO scene's `PineGeometry` banned radiating branch-tip spikes for this reason and
-/// built noise-modulated layered cones instead). This file is that idea rebuilt on `Mesh3`: a stack
-/// of closed, drooping bough TIERS, each a skirt whose rim is scalloped into bough tips.
-///
-/// **One envelope, four consumers.** The tier stack (`ConiferTier`) is built ONCE per call and every
-/// dependent part reads it rather than re-deriving a radius: the canopy mesh, the baubles hung under
-/// the bough tips, the bulbs wound onto the tiers' outer bands, and — through `ConiferEnvelope` —
-/// the light the string throws (`FixtureEmission.stringLights`). Move the envelope and the baubles,
-/// bulbs and glow all move with it ([[feedback-single-source-of-truth]]).
+/// **The tree is the unified tree factory's.** `ForestTreeGeometry` grows it (species `.fir`, the
+/// factory's conifer growth mode: whorls of branches carrying needled sprigs — see
+/// `ForestTreeGeometry+Conifer`). An earlier version built the fir here, as a stack of closed skirts;
+/// it read as layers of cut fabric and was a second tree generator beside the one the yard trees use.
+/// What lives in this file is only what a POTTED, DRESSED tree adds: the pot-relative envelope, and
+/// the ornaments, which attach to the factory's own `ConiferSkeleton` — baubles hang from branches
+/// that exist, the string winds around the tree they define.
 ///
 /// Local space as `PottedPlantMesh`: X/Z plan about the trunk axis, Y up from the pot base.
 extension PottedPlantMesh {
 
-    // MARK: - The envelope + tiers (the SHARED conifer builder)
+    // MARK: - The envelope
 
-    /// The tree is built by `ConiferBuilder` — the one pine generator the engine shares with every
-    /// other consuming app — with its `.christmasTree` profile. These aliases keep the plant's
-    /// vocabulary (and the tests') stable; nothing here re-derives a tier.
-    public typealias ConiferTier = ConiferBuilder.Tier
-
-    /// The canopy's overall cone, sized off the plant's one size lever (`plantSize`).
+    /// The tree's overall cone, sized off the plant's one size lever (`plantSize`) and the pot.
     public struct ConiferEnvelope {
-        public let shared: ConiferBuilder.Envelope
-        public var bottomY: Double { shared.bottomY }
-        public var apexY: Double { shared.apexY }
-        public var baseRadius: Double { shared.baseRadius }
+        public let bottomY: Double
+        public let apexY: Double
+        public let baseRadius: Double
 
         public init(_ params: some PottedPlantGeometry, soilY: Double) {
-            let p = ConiferBuilder.Profile.of(.christmasTree)
+            bottomY = soilY + params.plantSize * 0.10     // a hand of bare trunk above the soil
             // The STAR's tip is the top of the plant, so `plantSize` stays the whole height above
             // the soil (`PottedPlantParams.totalHeight`, the halo, the stacking role all read it).
-            shared = ConiferBuilder.Envelope(
-                bottomY: soilY + params.plantSize * p.canopyBaseFrac,   // a hand of bare trunk above the soil
-                apexY: soilY + params.plantSize - PottedPlantMesh.coniferStarRise(size: params.plantSize),
-                baseRadius: params.plantSize * 0.34,                    // a 1.4 m fir is ~0.95 m across its skirt
-                convexity: p.convexity)
+            apexY = soilY + params.plantSize - PottedPlantMesh.coniferStarRise(size: params.plantSize)
+            baseRadius = params.plantSize * 0.34          // a 1.4 m fir is ~0.95 m across its skirt
         }
-        public var height: Double { shared.height }
-        public func y(atFraction h: Double) -> Double { shared.y(atFraction: h) }
-        public func radius(atFraction h: Double) -> Double { shared.radius(atFraction: h) }
+        public var height: Double { apexY - bottomY }
+        public func y(atFraction h: Double) -> Double { bottomY + height * h }
+        public func radius(atFraction h: Double) -> Double { baseRadius * pow(max(0, 1 - h), 0.95) }
     }
 
     /// Where the string's single stand-in light sits and how big it is (its `softRadius`). Read by
@@ -57,54 +43,37 @@ extension PottedPlantMesh {
         return (Vec3(0, env.y(atFraction: h), 0), env.radius(atFraction: h) * 0.9)
     }
 
-    /// Tier count rides `foliageDensity` (the Fullness slider): 5 sparse → 9 lush.
-    public static func coniferTierCount(_ params: some PottedPlantGeometry) -> Int {
-        min(9, max(5, Int((4 + 2.5 * Double(params.foliageDensity)).rounded())))
-    }
+    // MARK: - The factory's tree
 
-    public static func coniferTiers(params: some PottedPlantGeometry, soilY: Double, rng: inout SplitMix) -> [ConiferTier] {
-        ConiferBuilder.tiers(envelope: ConiferEnvelope(params, soilY: soilY).shared,
-                             profile: .of(.christmasTree), count: coniferTierCount(params), rng: &rng)
-    }
+    public typealias FirSkeleton = ForestTreeGeometry.ConiferSkeleton
 
-    /// The needle canopy — `ConiferBuilder.canopy`, the same skirts every conifer is made of.
-    public static func coniferCanopy(_ tiers: [ConiferTier]) -> Mesh3 { ConiferBuilder.canopy(tiers) }
-
-    /// The needle fringe that breaks the tiers' rims into a ragged edge (`ConiferBuilder.fringe`).
-    /// Scaled with the tree so a 0.6 m desk fir carries finer needles than a 2 m one.
-    /// Draws from its OWN stream (a function of the seed), so adding or retuning the fringe never
-    /// re-rolls the baubles and bulbs that draw from the plant's shared stream after the tiers.
-    public static func coniferFringe(_ tiers: [ConiferTier], params: some PottedPlantGeometry) -> Mesh3 {
-        var rng = SplitMix(params.seed &* 0xA24BAED4963EE407 &+ 0x9E3779B97F4A7C15)
-        return ConiferBuilder.fringe(tiers, spacing: 0.046 * (1 + params.plantSize), needles: 2,
-                                     length: 0.026 + 0.022 * params.plantSize, rng: &rng)
-    }
-
-    /// Tiers + fringe, PAINTED: the foliage mesh the plant draws and one albedo per vertex (blue-green
-    /// shade → lit tips, darker undersides; the fringe at the lit end). Single source for the mesh the
-    /// bridge stamps and the `foliageColors` it stamps with.
-    public static func coniferFoliagePainted(_ tiers: [ConiferTier], params: some PottedPlantGeometry,
-                                             soilY: Double) -> (mesh: Mesh3, colors: [Vec3]) {
-        let profile = ConiferBuilder.Profile.of(.christmasTree)
-        var (mesh, colors) = ConiferBuilder.paintedCanopy(tiers, profile: profile)
-        let fringe = coniferFringe(tiers, params: params)
+    /// The skeleton the potted fir is grown from — the SAME `growConiferSkeleton` the yard trees
+    /// use, sized to this plant's envelope. Everything on the tree reads it.
+    public static func coniferSkeleton(params: some PottedPlantGeometry, soilY: Double) -> FirSkeleton {
         let env = ConiferEnvelope(params, soilY: soilY)
-        colors.append(contentsOf: ConiferBuilder.fringeColors(fringe, profile: profile,
-                                                              apexY: env.apexY, bottomY: env.bottomY))
-        mesh.append(fringe)
-        // The boughs: serrated drooping fronds over each skirt. Own stream, like the fringe.
-        var brng = SplitMix(params.seed &* 0xD1B54A32D192ED03 &+ 0x9E3779B97F4A7C15)
-        let boughs = ConiferBuilder.boughs(tiers, profile: profile, floorY: soilY + 0.03, rng: &brng)
-        colors.append(contentsOf: boughs.colors)
-        mesh.append(boughs.mesh)
-        return (mesh, colors)
+        let look = ForestTreeGeometry.look(for: .fir)
+        return ForestTreeGeometry.growConiferSkeleton(
+            bottomY: Float(env.bottomY), apexY: Float(env.apexY), baseRadius: Float(env.baseRadius),
+            look: look.conifer!, density: max(0.5, min(2.2, Float(params.foliageDensity))), seed: params.seed)
     }
 
-    /// Tiers + fringe, unpainted (callers that only want the geometry).
-    public static func coniferFoliage(_ tiers: [ConiferTier], params: some PottedPlantGeometry) -> Mesh3 {
-        var m = coniferCanopy(tiers)
-        m.append(coniferFringe(tiers, params: params))
-        return m
+    /// The whole tree — trunk, branches AND sprigs — as one painted mesh, baked by the factory into a
+    /// soup. The wood rides the painted group (with its own bark albedo) rather than the pot's
+    /// substrate group, whose fixed earth material would render thin bark as pale tan.
+    public static func coniferTreeMeshes(_ sk: FirSkeleton, params: some PottedPlantGeometry, soilY: Double)
+        -> (wood: Mesh3, foliage: Mesh3, foliageColors: [Vec3]) {
+        let look = ForestTreeGeometry.look(for: .fir)
+        var soup = ForestTreeGeometry.Soup()
+        soup.skipClearingCull = true          // the Forest scene's clearing cull is not ours (the plant sits at its own origin)
+        ForestTreeGeometry.emitConiferWood(&soup, world: matrix_identity_float4x4, sk: sk, look: look,
+                                           trunkR: Float(stemRadius(.christmasTree, at: 0)) * Float(max(0.8, params.plantSize / 1.4)),
+                                           trunkBaseY: Float(soilY))
+        ForestTreeGeometry.emitConiferSprigs(&soup, world: matrix_identity_float4x4, sk: sk, look: look,
+                                             seed: params.seed)
+        let parts = soup.splitMeshes()
+        var all = parts.wood
+        all.append(parts.foliage)
+        return (Mesh3(), all, parts.woodColors + parts.foliageColors)
     }
 
     // MARK: - Baubles + the star
@@ -113,38 +82,33 @@ extension PottedPlantMesh {
     /// defaults, flagged for Danny.
     public static let baublePalette: [Vec3] = [Vec3(0.50, 0.03, 0.04), Vec3(0.72, 0.52, 0.16), Vec3(0.70, 0.68, 0.64)]
 
-    /// Baubles hung just under randomly chosen bough tips (the droop is where a real one hangs),
-    /// plus a gold star on the leader. One `ColoredGroup` per palette colour, never one per bauble.
-    public static func coniferBaubles(_ tiers: [ConiferTier], params: some PottedPlantGeometry,
-                               rng: inout SplitMix) -> [ColoredGroup] {
+    /// Baubles hung from branches of the lower and middle whorls (the tips are where a real one
+    /// hangs), plus the gold star on the leader and the garland. One `ColoredGroup` per palette
+    /// colour, never one per bauble.
+    public static func coniferBaubles(_ sk: FirSkeleton, params: some PottedPlantGeometry,
+                                      rng: inout SplitMix) -> [ColoredGroup] {
         var groups = baublePalette.map { ColoredGroup(color: $0, mesh: Mesh3()) }
-        var srng = SplitMix(params.seed &* 0xC6BC279692B5C323 &+ 0x9E3779B97F4A7C15)   // sizes: own stream, so colours keep theirs
-        let radius = 0.024 + 0.01 * params.plantSize
-        for t in tiers {
-            let count = max(1, Int((Double(t.lobes) * 0.4 * Double(params.foliageDensity)).rounded()))
-            var tips = Array(0 ..< t.lobes)
-            for i in 0 ..< min(count, tips.count) {                  // partial Fisher-Yates
-                let j = i + Int(rng.unit() * Double(tips.count - i)) % (tips.count - i)
-                tips.swapAt(i, j)
-                let theta = t.phase + 2 * .pi * Double(tips[i]) / Double(t.lobes)
-                let r = t.rimRadius(theta) * 0.90
-                let centre = Vec3(cos(theta) * r, t.rimY(theta) - radius * 1.05, sin(theta) * r)
-                let c = Int(rng.unit() * Double(baublePalette.count)) % baublePalette.count
-                // Sizes vary (rubric 21): 0.8×…1.3× the base, from their OWN stream so a seed keeps its
-                // colour sequence. The ball is built about its own hang point.
-                let bs = 0.8 + 0.5 * srng.unit()
-                let soil = (tiers.first?.yRim ?? 0) - params.plantSize * 0.10       // the envelope's own soil line
-                let hung = Vec3(centre.x, max(centre.y - radius * (bs - 1) * 1.05, soil + 0.03 + radius * bs), centre.z)
-                groups[c].mesh.append(coniferBall(hung, radius: radius * bs, segments: 14))
-                // A real bauble hangs: a small metal cap on its neck and a hook up to the bough
-                // (rubric 23). Gold, like the star, whatever the glass colour.
-                groups[1].mesh.append(coniferBaubleHardware(centre: hung, radius: radius * bs))
-            }
+        var srng = SplitMix(params.seed &* 0xC6BC279692B5C323 &+ 0x9E3779B97F4A7C15)   // sizes: own stream
+        let radius = 0.018 + 0.006 * params.plantSize
+        let soil = Double(sk.bottomY) - params.plantSize * 0.10
+        let usable = sk.branches.indices.filter { sk.branches[$0].whorl < Int(Double(sk.whorls.count) * 0.82)
+                                                  && sk.branches[$0].length > 0.15 }
+        let count = min(usable.count, Int(30 * pow(Double(params.foliageDensity), 0.5)))
+        var pool = usable
+        for i in 0 ..< count {
+            let j = i + Int(rng.unit() * Double(pool.count - i)) % (pool.count - i)
+            pool.swapAt(i, j)
+            let b = sk.branches[pool[i]]
+            let p = b.point(at: Float(0.80 + 0.14 * rng.unit()))
+            let c = Int(rng.unit() * Double(baublePalette.count)) % baublePalette.count
+            let bs = 0.8 + 0.5 * srng.unit()
+            let hang = Vec3(Double(p.x), Double(p.y) - (radius * bs * 1.05 + 0.03), Double(p.z))
+            let centre = Vec3(hang.x, max(hang.y, soil + 0.03 + radius * bs), hang.z)
+            groups[c].mesh.append(coniferBall(centre, radius: radius * bs, segments: 14))
+            groups[1].mesh.append(coniferBaubleHardware(centre: centre, radius: radius * bs))
         }
-        groups[1].mesh.append(coniferGarland(tiers, params: params))      // gold tinsel swags (rubric 25)
-        if let tip = tiers.last {
-            groups[1].mesh.append(coniferStar(apexY: tip.yTop, size: params.plantSize))
-        }
+        groups[1].mesh.append(coniferGarland(sk, params: params))      // gold tinsel swags
+        groups[1].mesh.append(coniferStar(apexY: Double(sk.apexY), size: params.plantSize))
         return groups.filter { !$0.mesh.isEmpty }
     }
 
@@ -168,30 +132,30 @@ extension PottedPlantMesh {
         return m
     }
 
-    /// **The garland** — a gold tinsel rope draped in swags from bough tip to bough tip, on every
-    /// other tier (rubric 25). Each swag spans two bough tips along the rim, hangs a little outside
-    /// it, and sags ~12 % of its chord; it rides the gold metallic group with the star and the
-    /// bauble hardware, so it reads as bright metal tinsel without a material of its own.
-    public static func coniferGarland(_ tiers: [ConiferTier], params: some PottedPlantGeometry) -> Mesh3 {
+    /// **The garland** — a gold tinsel rope draped in swags between the tips of neighbouring branches
+    /// in a whorl, on every third whorl. Each swag hangs a little outside the tips at a steady radius
+    /// and sags ~13 % of its chord; it rides the gold metallic group with the star and the bauble
+    /// hardware.
+    public static func coniferGarland(_ sk: FirSkeleton, params: some PottedPlantGeometry) -> Mesh3 {
         var m = Mesh3()
         let r = 0.0035 + 0.0012 * params.plantSize
-        for (ti, t) in tiers.enumerated() where ti % 2 == 1 && ti < tiers.count - 1 {
-            let swags = max(3, t.lobes / 2)
-            let dTheta = 2 * Double.pi / Double(swags)
-            for j in 0 ..< swags {
-                let a0 = t.phase + Double(j) * dTheta
-                let p0 = t.top(1.03, a0), p1 = t.top(1.03, a0 + dTheta)
-                let r0 = (p0.x * p0.x + p0.z * p0.z).squareRoot()
-                let r1 = (p1.x * p1.x + p1.z * p1.z).squareRoot()
-                // Hung in the AIR outside the rim at a steady radius (the pins' larger one), so the
-                // arc stays smooth over the lobes' ups and downs instead of tracing the scalloped rim.
-                let rad = max(r0, r1) + 0.012
-                let chord = rad * dTheta
+        let soil = Double(sk.bottomY) - params.plantSize * 0.10
+        for (wi, ring) in sk.whorls.enumerated() where wi % 3 == 1 && wi < sk.whorls.count - 1 && ring.count >= 4 {
+            for k in 0 ..< ring.count {
+                let a = sk.branches[ring[k]], b = sk.branches[ring[(k + 1) % ring.count]]
+                let ta = a.point(at: 0.97), tb = b.point(at: 0.97)
+                let ra = Double((ta.x * ta.x + ta.z * ta.z).squareRoot()), rb = Double((tb.x * tb.x + tb.z * tb.z).squareRoot())
+                let aa = Double(atan2(ta.z, ta.x))
+                var bb = Double(atan2(tb.z, tb.x))
+                while bb <= aa { bb += 2 * .pi }
+                guard bb - aa < 1.5 else { continue }            // only neighbours, not across a gap
+                let rad = max(ra, rb) + 0.012
+                let chord = rad * (bb - aa)
                 let path: [Vec3] = (0 ... 11).map { i in
                     let u = Double(i) / 11
-                    let th = a0 + u * dTheta
-                    let y = p0.y + (p1.y - p0.y) * u - chord * 0.13 * sin(u * .pi) - r
-                    return Vec3(cos(th) * rad, y, sin(th) * rad)
+                    let th = aa + u * (bb - aa)
+                    let y = Double(ta.y) + Double(tb.y - ta.y) * u - chord * 0.13 * sin(u * .pi) - r
+                    return Vec3(cos(th) * rad, max(y, soil + 0.03), sin(th) * rad)
                 }
                 m.sweep(profile: .circle(radius: r, segments: 5), along: path, capStart: true, capEnd: true)
             }
@@ -228,70 +192,56 @@ extension PottedPlantMesh {
 
     // MARK: - The string of lights
 
-    /// The string, as ONE continuous helix wound onto the tree — a turn per tier, climbing from each
-    /// tier's rim band into the next — with a bulb every ~16 cm and a THIN WIRE tracing the whole
-    /// route between them. Bulbs stay in the OUTER band of each tier (`u` 0.70…0.95), the part a
-    /// person can see: further in, the next tier's skirt hangs over them.
-    ///
-    /// The wire is built from the SAME samples as the bulbs (it interpolates the bulbs' own
-    /// `(azimuth, u)` on the tier surface), so it hugs the bough the bulbs sit on and passes
-    /// through every bulb — one route, two meshes ([[feedback-single-source-of-truth]]).
-    public static func coniferStringLights(_ tiers: [ConiferTier], params: some PottedPlantGeometry,
+    /// The string, as ONE continuous helix wound around the tree the skeleton defines — turns every
+    /// ~0.2 m of height, a bulb every ~16 cm of wire, sitting just inside the branch tips so the
+    /// foliage half-hides it the way a real string is half-hidden — with a THIN WIRE tracing the
+    /// whole route between the bulbs. The wire is built from the SAME samples as the bulbs, so it
+    /// passes through every one: one route, two meshes ([[feedback-single-source-of-truth]]).
+    public static func coniferStringLights(_ sk: FirSkeleton, params: some PottedPlantGeometry,
                                            rng: inout SplitMix) -> (bulbs: Mesh3, wire: Mesh3) {
         var bulbs = Mesh3()
         let radius = 0.0065 + 0.002 * params.plantSize
-        let spacing = 0.16                        // metres of rim between two bulbs
-        var theta = rng.unit() * 2 * .pi
-        // The route: one point per bulb, plus the tier it rides.
-        var route: [(tier: Int, a: Double, u: Double)] = []
-        for (ti, t) in tiers.enumerated() {
-            let n = max(3, Int((2 * .pi * t.rRim / spacing).rounded()))
-            for j in 0 ..< n {
-                let f = Double(j) / Double(n)
-                let a = theta + 2 * .pi * f + (rng.unit() - 0.5) * 0.12
-                let u = min(1, max(0, 0.95 - 0.25 * f + (rng.unit() - 0.5) * 0.06))
-                route.append((ti, a, u))
-            }
-            theta += 2 * .pi
+        let H = Double(sk.height)
+        let turns = max(5.0, (H / 0.20).rounded())
+        let phase0 = rng.unit() * 2 * .pi
+        // Helix position at u in [0,1]: bottom of the foliage to near the top.
+        func at(_ u: Double, jitter: Double) -> Vec3 {
+            let f = 0.06 + 0.84 * u
+            let th = phase0 + turns * 2 * .pi * u
+            let rho = Double(sk.radius(atFraction: Float(f))) * (0.95 + 0.10 * jitter)
+            return Vec3(cos(th) * rho, Double(sk.y(atFraction: Float(f))) + 0.012, sin(th) * rho)
         }
-        func lift(_ tier: Int, _ a: Double, _ u: Double) -> Vec3 {
-            let p = tiers[tier].top(u, a)
-            // Proud of the needles: out along the radius and up, so a bulb sits ON the bough.
-            return Vec3(p.x + cos(a) * radius * 0.4, p.y + radius * 0.6, p.z + sin(a) * radius * 0.4)
+        // Arc length of the helix, to space the bulbs by distance.
+        var length = 0.0, prev = at(0, jitter: 0.5)
+        for i in 1 ... 400 { let p = at(Double(i) / 400, jitter: 0.5); length += len3(p - prev); prev = p }
+        let n = max(8, Int(length / 0.16))
+        var route: [Double] = []
+        for k in 0 ... n { route.append(min(1, (Double(k) + (rng.unit() - 0.5) * 0.3) / Double(n))) }
+        var centres: [Vec3] = []
+        for u in route {
+            let c = at(u, jitter: rng.unit())
+            centres.append(c)
+            bulbs.append(coniferBall(c, radius: radius, segments: 8))
         }
-        for r in route { bulbs.append(coniferBall(lift(r.tier, r.a, r.u), radius: radius, segments: 8)) }
-
-        // Wire: densify each leg (same tier → walk the tier's own surface; tier→tier → a short sag).
+        // Wire: from bulb to bulb along the helix itself (3 sub-steps), with a few mm of sag.
         var path: [Vec3] = []
-        let steps = 4
         for k in 0 ..< route.count {
-            let r = route[k]
-            path.append(lift(r.tier, r.a, r.u))
+            path.append(centres[k])
             guard k + 1 < route.count else { break }
-            let n = route[k + 1]
-            for s in 1 ..< steps {
-                let f = Double(s) / Double(steps)
-                if n.tier == r.tier {
-                    path.append(lift(r.tier, r.a + (n.a - r.a) * f, r.u + (n.u - r.u) * f))
-                } else {
-                    let p0 = lift(r.tier, r.a, r.u), p1 = lift(n.tier, n.a, n.u)
-                    let sag = sin(f * .pi) * 0.012
-                    path.append(Vec3(p0.x + (p1.x - p0.x) * f, p0.y + (p1.y - p0.y) * f - sag,
-                                     p0.z + (p1.z - p0.z) * f))
-                }
+            for s in 1 ..< 3 {
+                let f = Double(s) / 3
+                let u = route[k] + (route[k + 1] - route[k]) * f
+                var p = at(u, jitter: 0.5)
+                p.y -= 0.006 * sin(f * .pi)
+                path.append(p)
             }
         }
         var wire = Mesh3()
         if path.count >= 2 {
-            let wr = 0.0011 + 0.0004 * params.plantSize
-            wire.sweep(profile: .circle(radius: wr, segments: 4), along: path, capStart: true, capEnd: true)
+            wire.sweep(profile: .circle(radius: 0.0011 + 0.0004 * params.plantSize, segments: 4), along: path,
+                       capStart: true, capEnd: true)
         }
         return (bulbs, wire)
-    }
-
-    /// The bulbs alone (kept for callers that only want the glass).
-    public static func coniferBulbs(_ tiers: [ConiferTier], params: some PottedPlantGeometry, rng: inout SplitMix) -> Mesh3 {
-        coniferStringLights(tiers, params: params, rng: &rng).bulbs
     }
 
     /// A small closed ball: one pole-to-pole `revolve` (no internal caps), smoothed. The tree carries
@@ -310,11 +260,11 @@ extension PottedPlantMesh {
 
     /// Everything above in one pass, in a fixed RNG order so a seed is a tree.
     public static func christmasTree(params: some PottedPlantGeometry, soilY: Double, rng: inout SplitMix)
-        -> (canopy: Mesh3, canopyColors: [Vec3], baubles: [ColoredGroup], bulbs: Mesh3, wire: Mesh3) {
-        let tiers = coniferTiers(params: params, soilY: soilY, rng: &rng)
-        let painted = coniferFoliagePainted(tiers, params: params, soilY: soilY)
-        let baubles = coniferBaubles(tiers, params: params, rng: &rng)
-        let lights = coniferStringLights(tiers, params: params, rng: &rng)
-        return (painted.mesh, painted.colors, baubles, lights.bulbs, lights.wire)
+        -> (foliage: Mesh3, foliageColors: [Vec3], wood: Mesh3, baubles: [ColoredGroup], bulbs: Mesh3, wire: Mesh3) {
+        let sk = coniferSkeleton(params: params, soilY: soilY)
+        let tree = coniferTreeMeshes(sk, params: params, soilY: soilY)
+        let baubles = coniferBaubles(sk, params: params, rng: &rng)
+        let lights = coniferStringLights(sk, params: params, rng: &rng)
+        return (tree.foliage, tree.foliageColors, tree.wood, baubles, lights.bulbs, lights.wire)
     }
 }

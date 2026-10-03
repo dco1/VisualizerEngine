@@ -17,7 +17,7 @@ import simd
 // a second live reference would COW-copy all of them on the first triangle of
 // every one of ~22k leaf cards.
 // ─────────────────────────────────────────────────────────────────────────────
-private struct TreeLeafStitch: LeafCardSink {
+struct TreeLeafStitch: LeafCardSink {
     public typealias Scalar = Float
 
     public var soup = ForestTreeGeometry.Soup()
@@ -429,6 +429,7 @@ extension ForestTreeGeometry {
         case .maple:          silhouette = .maple
         case .orange, .lemon: silhouette = .citrus
         case .elderberry:     silhouette = .citrus     // an entire lanceolate leaflet; the look narrows it
+        case .fir:            silhouette = .citrus     // unused: a conifer's sprigs come from ForestTreeGeometry+Conifer
         }
 
         // fold 0.30 — the taco cup: the margin lifts toward bentNormal ∝ u so the

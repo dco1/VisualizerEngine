@@ -173,7 +173,6 @@ public extension PlantStyle {
     public var leafVenation: Int32 {
         switch self {
         case .fiddleLeafFig: return 1        // pinnate, looping toward the tip
-        case .christmasTree: return 2        // conifer needle striations (DH-0489), drawn per pixel
         default:             return 0
         }
     }
