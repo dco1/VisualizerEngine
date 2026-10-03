@@ -84,7 +84,7 @@ extension ForestTreeGeometry {
         for w in 0 ..< nW {
             let f = (Float(w) + 0.35) / Float(nW) * c.reach
             let y0 = sk.y(atFraction: f)
-            let count = max(5, Int((5.0 + 6.0 * (1 - f)).rounded()))
+            let count = max(6, Int((6.0 + 7.0 * (1 - f)).rounded()))
             let phase0 = Float(w) * 2.399963 + rng.unit() * 0.5
             var ring: [(az: Float, idx: Int)] = []
             for k in 0 ..< count {
@@ -266,6 +266,33 @@ extension ForestTreeGeometry {
             }
             sprig(base: b.point(at: 0.97), dir: b.tangent(at: 1.0), length: sprigLen * 1.25,
                   ramp: 1.25, jitter: 0.9 + 0.2 * rng.unit(), roll: 0)
+        }
+
+        // THE CORE: a dark cone of foliage well INSIDE the branches (half the envelope's radius), so
+        // the gaps between sprigs show shadowed needle-mass — depth — not the room behind. A fir is a
+        // solid mass seen through its own fringe; without this the tree read as a lattice of sprigs.
+        // It is far enough in that it never reaches the silhouette.
+        let segs = 14
+        let shade = c.needleShade * 1.15
+        let n0 = 9
+        func ring(_ i: Int) -> (y: Float, r: Float) {
+            let f = Float(i) / Float(n0)
+            return (sk.y(atFraction: 0.01 + 0.97 * f), 0.52 * sk.radius(atFraction: 0.01 + 0.97 * f))
+        }
+        for i in 0 ..< n0 {
+            let a = ring(i), b = ring(i + 1)
+            for k in 0 ..< segs {
+                let t0 = 2 * Float.pi * Float(k) / Float(segs), t1 = 2 * Float.pi * Float(k + 1) / Float(segs)
+                func P(_ ra: (y: Float, r: Float), _ t: Float) -> SIMD3<Float> { xf(world, SIMD3(cos(t) * ra.r, ra.y, sin(t) * ra.r)) }
+                // The cone's own slope: outward, tilted up by how fast the radius falls with height.
+                let rise = max(1e-4, b.y - a.y)
+                let ny = max(0, (a.r - b.r) / rise)
+                func N(_ t: Float) -> SIMD3<Float> { simd_normalize((world * SIMD4<Float>(cos(t), ny, sin(t), 0)).xyz) }
+                let p00 = P(a, t0), p01 = P(a, t1), p10 = P(b, t0), p11 = P(b, t1)
+                // Wound OUTWARD: around the ring, then up is inward-facing, so the other way.
+                s.tri(p00, p11, p01, n0: N(t0), n1: N(t1), n2: N(t1), c0: shade, c1: shade, c2: shade)
+                s.tri(p00, p10, p11, n0: N(t0), n1: N(t0), n2: N(t1), c0: shade, c1: shade, c2: shade)
+            }
         }
     }
 }

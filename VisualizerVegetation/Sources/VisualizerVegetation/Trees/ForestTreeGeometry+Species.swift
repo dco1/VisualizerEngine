@@ -210,8 +210,8 @@ extension ForestTreeGeometry {
                 leaf: srgbToLinear(SIMD3(0.075, 0.30, 0.17)),
                 bark: srgbToLinear(SIMD3(0.17, 0.11, 0.08)), isBirch: false,
                 species: .fir, leafCurl: 0.20,
-                conifer: ConiferLook(whorlSpacing: 0.055, sprigSpacing: 0.008, sprigLength: 0.050,
-                                     sprigAspect: 0.16, branchRadius: 0.0046, baseRadius: 0.44,
+                conifer: ConiferLook(whorlSpacing: 0.040, sprigSpacing: 0.006, sprigLength: 0.074,
+                                     sprigAspect: 0.21, branchRadius: 0.0032, baseRadius: 0.44,
                                      convexity: 0.95, reach: 0.95,
                                      needleShade: srgbToLinear(SIMD3(0.020, 0.100, 0.075)),
                                      needleLit: srgbToLinear(SIMD3(0.110, 0.330, 0.200))))

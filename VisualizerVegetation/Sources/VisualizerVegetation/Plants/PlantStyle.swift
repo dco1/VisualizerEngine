@@ -46,16 +46,28 @@ public enum PlantStyle: String, Sendable, Equatable, Hashable, Codable, CaseIter
 public enum VesselKind: String, Sendable, Equatable, Hashable, Codable, CaseIterable {
     case pot     // classic tapered planter (base narrower than the rim)
     case vase    // taller, narrower flower vase: bulging belly → narrow neck → flared lip
+    case stand   // a tree stand: a short water bowl on four splayed rod legs, with wing screws
 
     public var label: String {
         switch self {
-        case .pot:  return "Pot"
-        case .vase: return "Vase"
+        case .pot:   return "Pot"
+        case .vase:  return "Vase"
+        case .stand: return "Tree Stand"
         }
     }
 }
 
 public extension PlantStyle {
+    /// The vessel this style is most naturally sold in — what a freshly placed plant of the style
+    /// stands in: a bouquet in a vase, a Christmas tree in a tree stand, everything else in a pot.
+    var naturalVessel: VesselKind {
+        switch self {
+        case .flowers, .driedSpray: return .vase
+        case .christmasTree:        return .stand
+        default:                    return .pot
+        }
+    }
+
     /// The natural size of this plant, in metres — the ONE table of per-style dimensions, read
     /// by `PottedPlantParams.init` as its defaults. A succulent is a fistful of leaves in a
     /// 9 cm pot and a fiddle-leaf fig is chest-high; giving all six the same 0.7 m foliage made
@@ -79,7 +91,7 @@ public extension PlantStyle {
         case .driedSpray:    return (0.055, 0.15, 0.34)   // ≈0.49 m — a counter/credenza vase
         // A living-room tree in a big planter: ≈1.70 m, a floor piece. `plantSize` tops out at the
         // shared 1.5 m clamp, so the tallest tree this style makes is ≈1.8 m with a tall pot.
-        case .christmasTree: return (0.20, 0.30, 1.40)
+        case .christmasTree: return (0.13, 0.10, 1.40)   // a stand's bowl: 26 cm across, 10 cm deep
         }
     }
 

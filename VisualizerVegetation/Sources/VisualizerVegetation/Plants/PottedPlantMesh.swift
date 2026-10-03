@@ -162,8 +162,9 @@ public enum PottedPlantMesh {
     /// they never read as a hollow tube, and both keep their rim arris soft (curved rings).
     public static func vesselMesh(params: some PottedPlantGeometry) -> Mesh3 {
         switch params.resolvedVessel {
-        case .pot:  return potMesh(params: params)
-        case .vase: return vaseMesh(params: params)
+        case .pot:   return potMesh(params: params)
+        case .vase:  return vaseMesh(params: params)
+        case .stand: var m = vesselShell(params: params); m.append(potSoilMesh(params: params)); return m
         }
     }
 
@@ -182,8 +183,9 @@ public enum PottedPlantMesh {
     public static func vesselShell(params: some PottedPlantGeometry) -> Mesh3 {
         let raw: Mesh3
         switch params.resolvedVessel {
-        case .pot:  raw = potShellMesh(params: params)
-        case .vase: raw = vaseShellMesh(params: params)
+        case .pot:   raw = potShellMesh(params: params)
+        case .vase:  raw = vaseShellMesh(params: params)
+        case .stand: var b = potShellMesh(params: params); b.append(standFittings(params: params)); raw = b
         }
         return raw.smoothed()
     }
@@ -192,9 +194,50 @@ public enum PottedPlantMesh {
     /// fixed natural material by the bridge, never the user's vessel finish.
     public static func vesselFill(params: some PottedPlantGeometry) -> Mesh3 {
         switch params.resolvedVessel {
-        case .pot:  return potSoilMesh(params: params)
-        case .vase: return vaseWaterMesh(params: params)
+        case .pot, .stand: return potSoilMesh(params: params)      // a stand's bowl holds water, read as the same dark disc
+        case .vase:        return vaseWaterMesh(params: params)
         }
+    }
+
+    // MARK: - Tree stand: four rod legs and four wing screws around the bowl
+
+    /// What makes the bowl a TREE STAND: four rod legs that spring from the bowl wall, splay out
+    /// and down to small foot pads on the floor (a cross-leg stand), and four wing screws at the
+    /// rim, between the legs, that clamp the trunk. Every dimension is a ratio of the bowl's own
+    /// radius, so a stand of any `potRadius` is the same stand. Closed solids, smoothed with the
+    /// bowl by `vesselShell`. The skirt's collision proxies (`TreeSkirt`) read the same numbers.
+    public static func standFittings(params: some PottedPlantGeometry) -> Mesh3 {
+        let R = params.potRadius, h = params.potHeight
+        let rod = R * 0.075
+        var m = Mesh3()
+        for k in 0 ..< 4 {
+            let az = Double.pi / 4 + Double(k) * .pi / 2
+            let c = cos(az), s = sin(az)
+            // From the wall at mid-height, out and down to the floor in a shallow arc.
+            let path: [Vec3] = (0 ... 8).map { i in
+                let t = Double(i) / 8
+                let r = R * (0.92 + 1.30 * pow(t, 0.85))
+                let y = max(rod, h * 0.50 * pow(1 - t, 1.6) + rod * (1 - (1 - t)))
+                return Vec3(c * r, y, s * r)
+            }
+            m.sweep(profile: .circle(radius: rod, segments: 8), along: path, capStart: true, capEnd: true)
+            // The foot pad.
+            var pad = Mesh3()
+            pad.revolve(profile: [.init(r: 0, y: 0), .init(r: rod * 2.2, y: 0), .init(r: rod * 2.2, y: rod * 0.55), .init(r: 0, y: rod * 0.55)],
+                        segments: 14, capBottom: true, capTop: true)
+            m.append(pad.translated(by: Vec3(c * R * 2.22, 0, s * R * 2.22)))
+            // A wing screw between this leg and the next: a short threaded shank and a flat wing.
+            let sa = az + .pi / 4
+            let sc = cos(sa), ss = sin(sa)
+            let shank: [Vec3] = [Vec3(sc * R * 0.96, h * 0.66, ss * R * 0.96), Vec3(sc * R * 1.30, h * 0.66, ss * R * 1.30)]
+            m.sweep(profile: .circle(radius: R * 0.034, segments: 8), along: shank, capStart: true, capEnd: true)
+            // The wing: a thin plate on the shank's end. Swept (u = vertical, v = tangential).
+            let wingPath: [Vec3] = [Vec3(sc * R * 1.30, h * 0.66, ss * R * 1.30), Vec3(sc * R * 1.325, h * 0.66, ss * R * 1.325)]
+            let a = R * 0.07, b = R * 0.10
+            m.sweep(profile: Mesh3.SectionProfile(points: [Vec2(-a, -b), Vec2(a, -b), Vec2(a, b), Vec2(-a, b)]),
+                    along: wingPath, capStart: true, capEnd: true)
+        }
+        return m
     }
 
     // MARK: - Pot: a tapered revolved vessel + a soil disc near the rim
@@ -437,8 +480,8 @@ public enum PottedPlantMesh {
     /// `vaseProfile`'s `waterY`. For a pot, this is just below the soil disc (`potHeight * 0.86`).
     public static func vesselMouthY(_ params: some PottedPlantGeometry) -> Double {
         switch params.resolvedVessel {
-        case .pot:  return params.potHeight * 0.86
-        case .vase: return vaseProfile(params).waterY
+        case .pot, .stand: return params.potHeight * 0.86
+        case .vase:        return vaseProfile(params).waterY
         }
     }
 
