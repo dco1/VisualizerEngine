@@ -76,7 +76,7 @@ extension PottedPlantMesh {
     /// re-rolls the baubles and bulbs that draw from the plant's shared stream after the tiers.
     public static func coniferFringe(_ tiers: [ConiferTier], params: some PottedPlantGeometry) -> Mesh3 {
         var rng = SplitMix(params.seed &* 0xA24BAED4963EE407 &+ 0x9E3779B97F4A7C15)
-        return ConiferBuilder.fringe(tiers, spacing: 0.034 * (1 + params.plantSize), needles: 2,
+        return ConiferBuilder.fringe(tiers, spacing: 0.046 * (1 + params.plantSize), needles: 2,
                                      length: 0.026 + 0.022 * params.plantSize, rng: &rng)
     }
 
@@ -92,6 +92,11 @@ extension PottedPlantMesh {
         colors.append(contentsOf: ConiferBuilder.fringeColors(fringe, profile: profile,
                                                               apexY: env.apexY, bottomY: env.bottomY))
         mesh.append(fringe)
+        // The boughs: serrated drooping fronds over each skirt. Own stream, like the fringe.
+        var brng = SplitMix(params.seed &* 0xD1B54A32D192ED03 &+ 0x9E3779B97F4A7C15)
+        let boughs = ConiferBuilder.boughs(tiers, profile: profile, floorY: soilY + 0.03, rng: &brng)
+        colors.append(contentsOf: boughs.colors)
+        mesh.append(boughs.mesh)
         return (mesh, colors)
     }
 
@@ -125,12 +130,35 @@ extension PottedPlantMesh {
                 let centre = Vec3(cos(theta) * r, t.rimY(theta) - radius * 1.05, sin(theta) * r)
                 let c = Int(rng.unit() * Double(baublePalette.count)) % baublePalette.count
                 groups[c].mesh.append(coniferBall(centre, radius: radius, segments: 12))
+                // A real bauble hangs: a small metal cap on its neck and a hook up to the bough
+                // (rubric 23). Gold, like the star, whatever the glass colour.
+                groups[1].mesh.append(coniferBaubleHardware(centre: centre, radius: radius))
             }
         }
         if let tip = tiers.last {
             groups[1].mesh.append(coniferStar(apexY: tip.yTop, size: params.plantSize))
         }
         return groups.filter { !$0.mesh.isEmpty }
+    }
+
+    /// The cap and hook that hang a bauble: a short revolved collar sitting on the ball's neck, and a
+    /// thin swept hook rising from it to the bough tip above. Closed solids, so they audit like the
+    /// ball does.
+    public static func coniferBaubleHardware(centre: Vec3, radius: Double) -> Mesh3 {
+        var m = Mesh3()
+        let top = centre.y + radius * 0.96
+        let capR = radius * 0.30, capH = radius * 0.32
+        m.revolve(profile: [.init(r: capR * 0.85, y: top - capH * 0.2), .init(r: capR, y: top + capH * 0.25),
+                            .init(r: capR * 0.7, y: top + capH)], segments: 8, capBottom: true, capTop: true)
+        // The hook: up from the cap, over a small arc, back down toward the branch.
+        let hr = radius * 0.55
+        let base = Vec3(centre.x, top + capH, centre.z)
+        let path: [Vec3] = (0 ... 4).map { i in
+            let a = Double(i) / 4 * 1.35 * .pi
+            return Vec3(base.x + (1 - cos(a)) * hr * 0.5, base.y + sin(a) * hr, base.z)
+        }
+        m.sweep(profile: .circle(radius: radius * 0.07, segments: 4), along: path, capStart: true, capEnd: true)
+        return m
     }
 
     public static func coniferStarOuterRadius(size: Double) -> Double { 0.05 + 0.02 * size }

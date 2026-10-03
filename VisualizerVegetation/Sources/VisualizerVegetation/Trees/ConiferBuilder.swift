@@ -189,7 +189,7 @@ public enum ConiferBuilder {
     // MARK: - Canopy
 
     /// Azimuth segments per tier — enough for ~5 per bough tip on the widest tier.
-    public static let segments = 64
+    public static let segments = 36
 
     /// The needle canopy: every tier as a closed, smoothed skirt. Smoothed PER TIER (tiers overlap,
     /// and averaging normals across two tiers' coincident points would blend unrelated surfaces);
@@ -282,6 +282,72 @@ public enum ConiferBuilder {
         }
     }
 
+    // MARK: - Bough fronds
+
+    /// One bough as a BLADE: a long, serrated, feathery outline — each tooth a side-branchlet. It is
+    /// the conifer sibling of `LeafSilhouette.needle`, authored here because it belongs to the
+    /// conifer's arrangement, not to a species' leaf.
+    public static let boughSilhouette = LeafSilhouette(name: "bough", hero: [
+        (0.00, 0.14), (0.10, 0.58), (0.20, 0.52), (0.32, 0.82), (0.44, 0.70),
+        (0.56, 0.92), (0.68, 0.72), (0.80, 0.76), (0.90, 0.42), (1.00, 0.00),
+    ])
+
+    /// **The boughs.** A tier is a smooth skirt until individual branches lie on it: each of these
+    /// is one drooping, cupped, serrated frond laid from near the trunk out past the rim along the
+    /// tier's own surface, so the skirt reads as layered branches (rubric 3, 4, 8, 9) instead of a
+    /// cardboard cone. Fronds overlap sideways (width > the arc between neighbours), so no skirt
+    /// shows between them from above, and a tooth's gap is a shadow, not a hole.
+    ///
+    /// They are shared-`LeafConstructor` blades, so they inherit the fold/curl/winding contract and
+    /// cost one `emitBlade` each (~80 triangles double-sided). Colour is the position-pure `tint`,
+    /// lifted so a frond reads against the skirt beneath it.
+    public static func boughs(_ tiers: [Tier], profile: Profile, floorY: Double = -.infinity,
+                              rng: inout VegetationRNG) -> (mesh: Mesh3, colors: [Vec3]) {
+        var m = Mesh3()
+        var colors: [Vec3] = []
+        let up = Vec3(0, 1, 0)
+        let margin = boughSilhouette.margin()
+        for t in tiers {
+            let n = max(12, Int((Double(t.lobes) * 2.3).rounded()))
+            for k in 0 ..< n {
+                let th = t.phase + (Double(k) + (rng.unit() - 0.5) * 0.5) / Double(n) * 2 * .pi
+                let root = t.top(0.20 + 0.06 * rng.unit(), th)
+                var tip = t.top(1.04 + 0.05 * rng.unit(), th)
+                tip.y -= t.droop * 0.5 * t.lobe(th)                          // the tip hangs
+                let along = tip - root
+                let length = len3(along)
+                guard length > 1e-4 else { continue }
+                let y = normalize3(along)
+                // Across: horizontal, perpendicular to the radius. Cup toward up (the lit face).
+                let x = normalize3(Vec3(-sin(th), 0, cos(th)))
+                var b = up - y * dot3(up, y)
+                b = len3(b) > 1e-6 ? normalize3(b) : up
+                let arc = 2 * .pi * (len3(Vec3(root.x, 0, root.z)) + len3(Vec3(tip.x, 0, tip.z))) * 0.5 / Double(n)
+                // A frond's droop is capped by its headroom above `floorY` (the soil): the lowest, longest
+                // boughs would otherwise hang through the pot. Tip fall ≈ curl × length.
+                let curl = floorY.isFinite ? min(0.27, max(0.03, (tip.y - floorY) * 0.7 / length)) : 0.27
+                var frond = Mesh3()
+                LeafConstructor.emitBlade(
+                    into: &frond,
+                    placement: LeafConstructor.Placement(
+                        position: root + y * (length * 0.46) + b * (0.004 + 0.002 * rng.unit()),
+                        xAxis: x, yAxis: y, bentNormal: b,
+                        width: max(0.035, arc * 1.55), height: length),
+                    margin: margin, fold: 0.18, curl: curl, winding: .doubleSidedShell)
+                // Real smooth normals, per frond (CLAUDE.md § curved geometry): the cup and droop shade
+                // as one curved surface instead of a handful of flat facets. The two faces of the
+                // double-sided shell face opposite ways (180° > the crease), so they never blend.
+                frond = frond.smoothed(creaseDegrees: 55)
+                for v in frond.positions {
+                    let c = tint(t, v, profile: profile)
+                    colors.append(Vec3(min(1, c.x * 1.18), min(1, c.y * 1.22), min(1, c.z * 1.10)))
+                }
+                m.append(frond)
+            }
+        }
+        return (m, colors)
+    }
+
     // MARK: - Needle fringe
 
     /// **The ragged edge.** A tier's rim is a smooth scallop — a lampshade — until needles break it:
@@ -316,14 +382,6 @@ public enum ConiferBuilder {
                 // Out along the radius, falling harder where the bough tip droops.
                 let dir = Vec3(cos(th), -(0.30 + 0.55 * lobe), sin(th))
                 emit(at, dir, length * (0.8 + 0.5 * lobe) * (0.85 + 0.3 * rng.unit()), splay: 0.34)
-            }
-            // Second row, up the bough: shorter, riding the surface outward and a touch up.
-            let n2 = max(6, Int((2 * .pi * t.rRim * 0.82 / (spacing * 2)).rounded()))
-            for j in 0 ..< n2 {
-                let th = (Double(j) + rng.unit()) / Double(n2) * 2 * .pi
-                let at = t.top(0.82, th)
-                let dir = Vec3(cos(th), 0.05 - 0.25 * t.lobe(th), sin(th))
-                emit(at, dir, length * 0.7 * (0.85 + 0.3 * rng.unit()), splay: 0.30)
             }
         }
         return m
