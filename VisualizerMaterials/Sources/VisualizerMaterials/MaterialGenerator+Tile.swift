@@ -564,6 +564,7 @@ public extension MaterialGenerator {
         let softV = Swift.max(1.0 / Swift.max(texelsV, 1), 0.004)
 
         let bevel = params.edge.bevelFraction
+        let handmade = params.edge == .handmade
         let bodyRough = params.finish.bodyRoughness
         // An imported face is only used when the params actually ask for one — so a stale
         // `faceImage` can't leak onto a tile the user switched back to procedural.
@@ -635,7 +636,9 @@ public extension MaterialGenerator {
                 // unit's own rim — a ramp over the band just inside the joint — which is free
                 // here because the normal is derived from this field anyway.
                 let chamfer = bevel > 0 ? (1 - smoothstep(0, bevel, Swift.min(dU, dV * aspect))) : 0
-                ch.height[ch.idx(x, y)] = clamp01(1 - joint * 0.7 - chamfer * bevel * 6)
+                let relief = params.edge.handmadeRelief(rim: Swift.min(dU, dV * aspect), fx: fx, fy: fy, unitHash: th,
+                                                        wobble: handmade ? Noise.fbmTiled(u, v, baseCells: Swift.max(cols, 2) * 2, octaves: 3, seed: p.seed ^ 0x44) : 0.5)
+                ch.height[ch.idx(x, y)] = clamp01((handmade ? 0.88 + relief : 1) - joint * 0.7 - chamfer * bevel * 6)   // machine edges bake exactly as before
             }
         }
 
@@ -680,6 +683,7 @@ public extension MaterialGenerator {
         let herring = p.bond == .herringbone
         let L = TileLayout.herringboneBrickLength
         let bevel = params.edge.bevelFraction
+        let handmade = params.edge == .handmade
         let bodyRough = params.finish.bodyRoughness
         let face = params.face.imageDocumentID == nil ? nil : faceImage
 
@@ -766,7 +770,9 @@ public extension MaterialGenerator {
                     clamp01(mix(bodyRough, 0.85, joint) + micro - 0.05 * pool)
 
                 let chamfer = bevel > 0 ? (1 - smoothstep(0, bevel, dMin)) : 0
-                ch.height[ch.idx(x, y)] = clamp01(1 - joint * 0.7 - chamfer * bevel * 6)
+                let relief = params.edge.handmadeRelief(rim: dMin, fx: faceU, fy: faceV, unitHash: th,
+                                                        wobble: handmade ? Noise.fbmTiled(u, v, baseCells: Swift.max(cells, 2) * 2, octaves: 3, seed: p.seed ^ 0x44) : 0.5)
+                ch.height[ch.idx(x, y)] = clamp01((handmade ? 0.88 + relief : 1) - joint * 0.7 - chamfer * bevel * 6)   // machine edges bake exactly as before
             }
         }
 
@@ -903,9 +909,31 @@ public enum TileFace: Equatable, Hashable, Sendable, Codable {
 /// a highlight along every joint — the look of a classic bevelled subway tile.
 public enum TileEdge: String, Equatable, Hashable, Sendable, Codable, CaseIterable {
     case square, bevelled
+    /// HANDMADE: a hand-pressed, kiln-warped face — cushioned toward the rim, slightly tilted and
+    /// gently wavy, a little different on every unit. It is what makes a glossy handmade tile (or
+    /// zellige) break a reflection into uneven highlights instead of mirroring it flat.
+    case handmade
 
     /// Chamfer width as a fraction of the unit, 0 for a square rim.
     public var bevelFraction: Double { self == .bevelled ? 0.06 : 0 }
 
-    public var displayName: String { self == .square ? "Square edge" : "Bevelled" }
+    public var displayName: String {
+        switch self {
+        case .square:   return "Square edge"
+        case .bevelled: return "Bevelled"
+        case .handmade: return "Handmade"
+        }
+    }
+
+    /// The handmade face's relief at one texel, in height-field units (0 for the machine edges).
+    /// `rim` is the distance to the nearest joint in unit fractions, `fx`/`fy` the within-unit
+    /// coordinate, `unitHash` the unit's own hash (its tilt), `wobble` a tiled fbm sample in 0…1.
+    /// Pure, so `tile` and `tileLattice` share one definition of what "handmade" is.
+    public func handmadeRelief(rim: Double, fx: Double, fy: Double, unitHash: UInt64, wobble: Double) -> Double {
+        guard self == .handmade else { return 0 }
+        let cushion = smoothstep(0, 0.22, rim)                        // the pillowed rim
+        let tx = Noise.unit(Noise.mix(unitHash ^ 0xA5A5)) - 0.5        // each unit sits a little askew
+        let ty = Noise.unit(Noise.mix(unitHash ^ 0x5A5A)) - 0.5
+        return 0.16 * cushion + 0.12 * (tx * (fx - 0.5) + ty * (fy - 0.5)) + 0.09 * (wobble - 0.5)
+    }
 }
