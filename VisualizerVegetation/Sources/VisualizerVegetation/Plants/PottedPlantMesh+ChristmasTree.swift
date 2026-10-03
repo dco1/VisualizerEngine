@@ -130,28 +130,70 @@ extension PottedPlantMesh {
 
     // MARK: - The string of lights
 
-    /// Bulbs wound onto the tree as ONE continuous helix — a turn per tier, climbing from each
-    /// tier's rim band into the next — and kept to the OUTER band of each tier (`u` 0.70…0.95),
-    /// which is the part a person can see: further in, the next tier's skirt hangs over them.
-    public static func coniferBulbs(_ tiers: [ConiferTier], params: some PottedPlantGeometry, rng: inout SplitMix) -> Mesh3 {
-        var m = Mesh3()
+    /// The string, as ONE continuous helix wound onto the tree — a turn per tier, climbing from each
+    /// tier's rim band into the next — with a bulb every ~16 cm and a THIN WIRE tracing the whole
+    /// route between them. Bulbs stay in the OUTER band of each tier (`u` 0.70…0.95), the part a
+    /// person can see: further in, the next tier's skirt hangs over them.
+    ///
+    /// The wire is built from the SAME samples as the bulbs (it interpolates the bulbs' own
+    /// `(azimuth, u)` on the tier surface), so it hugs the bough the bulbs sit on and passes
+    /// through every bulb — one route, two meshes ([[feedback-single-source-of-truth]]).
+    public static func coniferStringLights(_ tiers: [ConiferTier], params: some PottedPlantGeometry,
+                                           rng: inout SplitMix) -> (bulbs: Mesh3, wire: Mesh3) {
+        var bulbs = Mesh3()
         let radius = 0.0065 + 0.002 * params.plantSize
         let spacing = 0.16                        // metres of rim between two bulbs
         var theta = rng.unit() * 2 * .pi
-        for t in tiers {
+        // The route: one point per bulb, plus the tier it rides.
+        var route: [(tier: Int, a: Double, u: Double)] = []
+        for (ti, t) in tiers.enumerated() {
             let n = max(3, Int((2 * .pi * t.rRim / spacing).rounded()))
             for j in 0 ..< n {
                 let f = Double(j) / Double(n)
                 let a = theta + 2 * .pi * f + (rng.unit() - 0.5) * 0.12
-                let u = 0.95 - 0.25 * f + (rng.unit() - 0.5) * 0.06
-                let p = t.top(min(1, max(0, u)), a)
-                // Proud of the needles: out along the radius and up, so a bulb sits ON the bough.
-                let centre = Vec3(p.x + cos(a) * radius * 0.4, p.y + radius * 0.6, p.z + sin(a) * radius * 0.4)
-                m.append(coniferBall(centre, radius: radius, segments: 8))
+                let u = min(1, max(0, 0.95 - 0.25 * f + (rng.unit() - 0.5) * 0.06))
+                route.append((ti, a, u))
             }
             theta += 2 * .pi
         }
-        return m
+        func lift(_ tier: Int, _ a: Double, _ u: Double) -> Vec3 {
+            let p = tiers[tier].top(u, a)
+            // Proud of the needles: out along the radius and up, so a bulb sits ON the bough.
+            return Vec3(p.x + cos(a) * radius * 0.4, p.y + radius * 0.6, p.z + sin(a) * radius * 0.4)
+        }
+        for r in route { bulbs.append(coniferBall(lift(r.tier, r.a, r.u), radius: radius, segments: 8)) }
+
+        // Wire: densify each leg (same tier → walk the tier's own surface; tier→tier → a short sag).
+        var path: [Vec3] = []
+        let steps = 4
+        for k in 0 ..< route.count {
+            let r = route[k]
+            path.append(lift(r.tier, r.a, r.u))
+            guard k + 1 < route.count else { break }
+            let n = route[k + 1]
+            for s in 1 ..< steps {
+                let f = Double(s) / Double(steps)
+                if n.tier == r.tier {
+                    path.append(lift(r.tier, r.a + (n.a - r.a) * f, r.u + (n.u - r.u) * f))
+                } else {
+                    let p0 = lift(r.tier, r.a, r.u), p1 = lift(n.tier, n.a, n.u)
+                    let sag = sin(f * .pi) * 0.012
+                    path.append(Vec3(p0.x + (p1.x - p0.x) * f, p0.y + (p1.y - p0.y) * f - sag,
+                                     p0.z + (p1.z - p0.z) * f))
+                }
+            }
+        }
+        var wire = Mesh3()
+        if path.count >= 2 {
+            let wr = 0.0011 + 0.0004 * params.plantSize
+            wire.sweep(profile: .circle(radius: wr, segments: 4), along: path, capStart: true, capEnd: true)
+        }
+        return (bulbs, wire)
+    }
+
+    /// The bulbs alone (kept for callers that only want the glass).
+    public static func coniferBulbs(_ tiers: [ConiferTier], params: some PottedPlantGeometry, rng: inout SplitMix) -> Mesh3 {
+        coniferStringLights(tiers, params: params, rng: &rng).bulbs
     }
 
     /// A small closed ball: one pole-to-pole `revolve` (no internal caps), smoothed. The tree carries
@@ -170,11 +212,11 @@ extension PottedPlantMesh {
 
     /// Everything above in one pass, in a fixed RNG order so a seed is a tree.
     public static func christmasTree(params: some PottedPlantGeometry, soilY: Double, rng: inout SplitMix)
-        -> (canopy: Mesh3, baubles: [ColoredGroup], bulbs: Mesh3) {
+        -> (canopy: Mesh3, baubles: [ColoredGroup], bulbs: Mesh3, wire: Mesh3) {
         let tiers = coniferTiers(params: params, soilY: soilY, rng: &rng)
         let canopy = coniferCanopy(tiers)
         let baubles = coniferBaubles(tiers, params: params, rng: &rng)
-        let bulbs = coniferBulbs(tiers, params: params, rng: &rng)
-        return (canopy, baubles, bulbs)
+        let lights = coniferStringLights(tiers, params: params, rng: &rng)
+        return (canopy, baubles, lights.bulbs, lights.wire)
     }
 }

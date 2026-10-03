@@ -115,6 +115,7 @@ public enum PottedPlantMesh {
             // A fir is a solid tiered canopy, not leaf cards — see PottedPlantMesh+ChristmasTree.
             // Baubles ride the per-colour bloom groups; the bulbs are their own self-lit group.
             let tree = christmasTree(params: params, soilY: soilY, rng: &rng)
+            substrate.append(tree.wire)          // the string's own cord: thin, dark, opaque
             return Parts(vessel: vessel, substrate: substrate, foliage: tree.canopy,
                          blooms: tree.baubles, bulbs: tree.bulbs)
         }
