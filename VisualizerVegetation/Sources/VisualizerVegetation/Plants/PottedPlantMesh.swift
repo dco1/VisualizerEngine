@@ -927,19 +927,7 @@ public enum PottedPlantMesh {
 
     // MARK: - Seeded RNG (SplitMix64) — deterministic per (seed, params)
 
-    /// A tiny, deterministic PRNG. Same construction as `TreeScatter.SplitMix`; kept local so the
-    /// plant's variation is reproducible and never reaches for an unseeded `.random`.
-    public struct SplitMix {
-        public var state: UInt64
-        public init(_ seed: UInt64) { state = seed == 0 ? 0x9E3779B97F4A7C15 : seed }
-        public mutating func next() -> UInt64 {
-            state = state &+ 0x9E3779B97F4A7C15
-            var z = state
-            z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
-            z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
-            return z ^ (z >> 31)
-        }
-        /// A double in [0, 1).
-        public mutating func unit() -> Double { Double(next() >> 11) * (1.0 / 9007199254740992.0) }
-    }
+    /// The plant's PRNG is the vegetation module's one `VegetationRNG` (the conifer builder draws
+    /// from the same generator, so a seed means the same stream in a pot and in a yard).
+    public typealias SplitMix = VegetationRNG
 }

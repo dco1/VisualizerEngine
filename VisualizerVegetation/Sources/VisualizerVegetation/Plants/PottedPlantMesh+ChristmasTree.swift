@@ -20,27 +20,33 @@ import VisualizerMaterials
 /// Local space as `PottedPlantMesh`: X/Z plan about the trunk axis, Y up from the pot base.
 extension PottedPlantMesh {
 
-    // MARK: - The envelope
+    // MARK: - The envelope + tiers (the SHARED conifer builder)
 
-    /// The canopy's overall cone — where it starts, where the tip is, how wide the base tier is.
-    /// Everything here is a fraction of `plantSize`, the style's one size lever.
+    /// The tree is built by `ConiferBuilder` — the one pine generator the engine shares with every
+    /// other consuming app — with its `.christmasTree` profile. These aliases keep the plant's
+    /// vocabulary (and the tests') stable; nothing here re-derives a tier.
+    public typealias ConiferTier = ConiferBuilder.Tier
+
+    /// The canopy's overall cone, sized off the plant's one size lever (`plantSize`).
     public struct ConiferEnvelope {
-        public let bottomY: Double
-        public let apexY: Double
-        public let baseRadius: Double
+        public let shared: ConiferBuilder.Envelope
+        public var bottomY: Double { shared.bottomY }
+        public var apexY: Double { shared.apexY }
+        public var baseRadius: Double { shared.baseRadius }
 
         public init(_ params: some PottedPlantGeometry, soilY: Double) {
-            bottomY = soilY + params.plantSize * 0.10   // a hand of bare trunk above the soil
+            let p = ConiferBuilder.Profile.of(.christmasTree)
             // The STAR's tip is the top of the plant, so `plantSize` stays the whole height above
             // the soil (`PottedPlantParams.totalHeight`, the halo, the stacking role all read it).
-            apexY = soilY + params.plantSize - PottedPlantMesh.coniferStarRise(size: params.plantSize)
-            baseRadius = params.plantSize * 0.34        // a 1.4 m fir is ~0.95 m across its skirt
+            shared = ConiferBuilder.Envelope(
+                bottomY: soilY + params.plantSize * p.canopyBaseFrac,   // a hand of bare trunk above the soil
+                apexY: soilY + params.plantSize - PottedPlantMesh.coniferStarRise(size: params.plantSize),
+                baseRadius: params.plantSize * 0.34,                    // a 1.4 m fir is ~0.95 m across its skirt
+                convexity: p.convexity)
         }
-
-        public var height: Double { apexY - bottomY }
-        public func y(atFraction h: Double) -> Double { bottomY + height * h }
-        /// Slightly convex cone: a real fir holds its width a little further up than a straight cone.
-        public func radius(atFraction h: Double) -> Double { baseRadius * pow(max(0, 1 - h), 0.95) }
+        public var height: Double { shared.height }
+        public func y(atFraction h: Double) -> Double { shared.y(atFraction: h) }
+        public func radius(atFraction h: Double) -> Double { shared.radius(atFraction: h) }
     }
 
     /// Where the string's single stand-in light sits and how big it is (its `softRadius`). Read by
@@ -51,117 +57,18 @@ extension PottedPlantMesh {
         return (Vec3(0, env.y(atFraction: h), 0), env.radius(atFraction: h) * 0.9)
     }
 
-    // MARK: - The tiers
-
-    /// One bough tier: a closed skirt. Its TOP surface falls from the trunk to a scalloped rim with
-    /// a gravity droop that grows toward the tips; its UNDERSIDE climbs back in to the trunk; a short
-    /// inner wall closes it. Watertight, so the canopy is a set of solids, not a cardboard shell.
-    public struct ConiferTier {
-        public var yTop: Double          // where the top surface meets the trunk
-        public var yRim: Double          // rim height before the tips droop
-        public var yUnder: Double        // where the underside meets the trunk
-        public var rInner: Double        // top surface's inner radius (0 = the tree's tip)
-        public var rUnderInner: Double   // underside's inner radius
-        public var rRim: Double          // rim radius at a bough TIP
-        public var lobes: Int            // bough tips around the rim
-        public var phase: Double
-        public var noiseA: Double
-        public var noiseB: Double
-        public var droop: Double         // how far a bough tip hangs below the rim
-
-        /// 1 at a bough tip, 0 in the notch between two — sharp tips, broad notches.
-        public func lobe(_ theta: Double) -> Double {
-            pow(0.5 + 0.5 * cos(Double(lobes) * (theta - phase)), 2.5)
-        }
-        /// Seeded low-frequency wobble so no two tiers (and no two trees) share a rim.
-        public func noise(_ theta: Double) -> Double {
-            0.6 * sin(3 * theta + noiseA) + 0.4 * sin(7 * theta + noiseB)
-        }
-        public func rimRadius(_ theta: Double) -> Double {
-            rRim * (0.78 + 0.22 * lobe(theta)) * (1 + 0.05 * noise(theta))
-        }
-        public func rimY(_ theta: Double) -> Double { yRim - droop * lobe(theta) }
-
-        /// A point on the top surface, `u` 0 at the trunk → 1 at the rim. `pow(u, 1.3)` keeps the
-        /// bough shallow near the trunk and steep at the tip — it droops, it does not tent.
-        public func top(_ u: Double, _ theta: Double) -> Vec3 {
-            let r = rInner + (rimRadius(theta) - rInner) * u
-            let y = yTop - (yTop - yRim) * pow(u, 1.3) - droop * lobe(theta) * u * u
-            return Vec3(cos(theta) * r, y, sin(theta) * r)
-        }
-        /// A point on the underside, `v` 0 at the rim → 1 at the trunk.
-        public func under(_ v: Double, _ theta: Double) -> Vec3 {
-            let r = rimRadius(theta) + (rUnderInner - rimRadius(theta)) * v
-            let y = rimY(theta) + (yUnder - rimY(theta)) * pow(v, 0.7)
-            return Vec3(cos(theta) * r, y, sin(theta) * r)
-        }
-    }
-
     /// Tier count rides `foliageDensity` (the Fullness slider): 5 sparse → 9 lush.
     public static func coniferTierCount(_ params: some PottedPlantGeometry) -> Int {
         min(9, max(5, Int((4 + 2.5 * Double(params.foliageDensity)).rounded())))
     }
 
     public static func coniferTiers(params: some PottedPlantGeometry, soilY: Double, rng: inout SplitMix) -> [ConiferTier] {
-        let env = ConiferEnvelope(params, soilY: soilY)
-        let n = coniferTierCount(params)
-        let reach = 0.86                          // the tier RIMS span this much of the canopy
-        let spacing = reach / Double(n)
-        return (0 ..< n).map { i in
-            let hb = Double(i) * spacing
-            let isTip = i == n - 1
-            // Each tier's top reaches 1.6 rim-spacings up, well past the next tier's rim — the
-            // overlap is what makes the stack read as layered boughs rather than a pagoda of discs.
-            let ht = isTip ? 1.0 : min(1.0, hb + 1.6 * spacing)
-            let rRim = max(0.04, env.radius(atFraction: hb)) * (0.94 + 0.12 * rng.unit())
-            let yRim = env.y(atFraction: hb)
-            let yTop = env.y(atFraction: ht)
-            let inner = max(0.02, rRim * 0.10)
-            return ConiferTier(yTop: yTop, yRim: yRim, yUnder: yRim + (yTop - yRim) * 0.30,
-                               rInner: isTip ? 0 : inner, rUnderInner: inner,
-                               rRim: rRim, lobes: max(5, Int((rRim / 0.055).rounded())),
-                               phase: rng.unit() * 2 * .pi,
-                               noiseA: rng.unit() * 2 * .pi, noiseB: rng.unit() * 2 * .pi,
-                               droop: rRim * 0.10)
-        }
+        ConiferBuilder.tiers(envelope: ConiferEnvelope(params, soilY: soilY).shared,
+                             profile: .of(.christmasTree), count: coniferTierCount(params), rng: &rng)
     }
 
-    // MARK: - The canopy
-
-    /// Azimuth segments per tier — enough for ~5 per bough tip on the widest tier.
-    public static let coniferSegments = 44
-
-    /// The needle canopy: every tier as a closed, smoothed skirt. Smoothed PER TIER (tiers overlap,
-    /// and averaging normals across two tiers' coincident points would blend unrelated surfaces);
-    /// the 40° crease keeps each rim a crisp edge.
-    public static func coniferCanopy(_ tiers: [ConiferTier]) -> Mesh3 {
-        let s = coniferSegments
-        let thetas = (0 ..< s).map { Double($0) / Double(s) * 2 * .pi }
-        var canopy = Mesh3()
-        for t in tiers {
-            // Rings, inside → out → back in: top surface u = 0…1, then the underside v = ⅓…1
-            // (v = 0 IS the rim, already the top surface's last ring — shared, so the seam welds).
-            let topRings = [0.0, 0.42, 0.76, 1.0].map { u in thetas.map { t.top(u, $0) } }
-            let underRings = [0.45, 1.0].map { v in thetas.map { t.under(v, $0) } }
-            var m = Mesh3()
-            func strip(_ a: [Vec3], _ b: [Vec3], outward: (Double) -> Vec3) {
-                for j in 0 ..< s {
-                    let k = (j + 1) % s
-                    let mid = (thetas[j] + (k == 0 ? 2 * .pi : thetas[k])) / 2
-                    m.addQuad(a[j], a[k], b[k], b[j], outward: outward(mid))
-                }
-            }
-            // Top surface faces up-and-out; the underside down-and-in; the inner wall toward the axis.
-            for r in 0 ..< topRings.count - 1 {
-                strip(topRings[r], topRings[r + 1]) { Vec3(cos($0), 1, sin($0)) }
-            }
-            strip(topRings[topRings.count - 1], underRings[0]) { Vec3(-0.3 * cos($0), -1, -0.3 * sin($0)) }
-            strip(underRings[0], underRings[1]) { Vec3(-0.3 * cos($0), -1, -0.3 * sin($0)) }
-            strip(underRings[1], topRings[0]) { Vec3(-cos($0), -0.2, -sin($0)) }
-            canopy.append(m.smoothed(creaseDegrees: 40))
-        }
-        return canopy
-    }
+    /// The needle canopy — `ConiferBuilder.canopy`, the same skirts every conifer is made of.
+    public static func coniferCanopy(_ tiers: [ConiferTier]) -> Mesh3 { ConiferBuilder.canopy(tiers) }
 
     // MARK: - Baubles + the star
 
