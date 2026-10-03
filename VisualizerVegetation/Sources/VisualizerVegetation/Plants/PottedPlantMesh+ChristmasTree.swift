@@ -70,6 +70,38 @@ extension PottedPlantMesh {
     /// The needle canopy — `ConiferBuilder.canopy`, the same skirts every conifer is made of.
     public static func coniferCanopy(_ tiers: [ConiferTier]) -> Mesh3 { ConiferBuilder.canopy(tiers) }
 
+    /// The needle fringe that breaks the tiers' rims into a ragged edge (`ConiferBuilder.fringe`).
+    /// Scaled with the tree so a 0.6 m desk fir carries finer needles than a 2 m one.
+    /// Draws from its OWN stream (a function of the seed), so adding or retuning the fringe never
+    /// re-rolls the baubles and bulbs that draw from the plant's shared stream after the tiers.
+    public static func coniferFringe(_ tiers: [ConiferTier], params: some PottedPlantGeometry) -> Mesh3 {
+        var rng = SplitMix(params.seed &* 0xA24BAED4963EE407 &+ 0x9E3779B97F4A7C15)
+        return ConiferBuilder.fringe(tiers, spacing: 0.034 * (1 + params.plantSize), needles: 2,
+                                     length: 0.026 + 0.022 * params.plantSize, rng: &rng)
+    }
+
+    /// Tiers + fringe, PAINTED: the foliage mesh the plant draws and one albedo per vertex (blue-green
+    /// shade → lit tips, darker undersides; the fringe at the lit end). Single source for the mesh the
+    /// bridge stamps and the `foliageColors` it stamps with.
+    public static func coniferFoliagePainted(_ tiers: [ConiferTier], params: some PottedPlantGeometry,
+                                             soilY: Double) -> (mesh: Mesh3, colors: [Vec3]) {
+        let profile = ConiferBuilder.Profile.of(.christmasTree)
+        var (mesh, colors) = ConiferBuilder.paintedCanopy(tiers, profile: profile)
+        let fringe = coniferFringe(tiers, params: params)
+        let env = ConiferEnvelope(params, soilY: soilY)
+        colors.append(contentsOf: ConiferBuilder.fringeColors(fringe, profile: profile,
+                                                              apexY: env.apexY, bottomY: env.bottomY))
+        mesh.append(fringe)
+        return (mesh, colors)
+    }
+
+    /// Tiers + fringe, unpainted (callers that only want the geometry).
+    public static func coniferFoliage(_ tiers: [ConiferTier], params: some PottedPlantGeometry) -> Mesh3 {
+        var m = coniferCanopy(tiers)
+        m.append(coniferFringe(tiers, params: params))
+        return m
+    }
+
     // MARK: - Baubles + the star
 
     /// Bauble colours: a deep red, an old gold, a champagne silver. Taste — neutral classic
@@ -212,11 +244,11 @@ extension PottedPlantMesh {
 
     /// Everything above in one pass, in a fixed RNG order so a seed is a tree.
     public static func christmasTree(params: some PottedPlantGeometry, soilY: Double, rng: inout SplitMix)
-        -> (canopy: Mesh3, baubles: [ColoredGroup], bulbs: Mesh3, wire: Mesh3) {
+        -> (canopy: Mesh3, canopyColors: [Vec3], baubles: [ColoredGroup], bulbs: Mesh3, wire: Mesh3) {
         let tiers = coniferTiers(params: params, soilY: soilY, rng: &rng)
-        let canopy = coniferCanopy(tiers)
+        let painted = coniferFoliagePainted(tiers, params: params, soilY: soilY)
         let baubles = coniferBaubles(tiers, params: params, rng: &rng)
         let lights = coniferStringLights(tiers, params: params, rng: &rng)
-        return (canopy, baubles, lights.bulbs, lights.wire)
+        return (painted.mesh, painted.colors, baubles, lights.bulbs, lights.wire)
     }
 }

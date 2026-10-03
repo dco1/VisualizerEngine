@@ -117,7 +117,7 @@ public enum PottedPlantMesh {
             let tree = christmasTree(params: params, soilY: soilY, rng: &rng)
             substrate.append(tree.wire)          // the string's own cord: thin, dark, opaque
             return Parts(vessel: vessel, substrate: substrate, foliage: tree.canopy,
-                         blooms: tree.baubles, bulbs: tree.bulbs)
+                         foliageColors: tree.canopyColors, blooms: tree.baubles, bulbs: tree.bulbs)
         }
         let grown = foliage(params: params, soilY: soilY, rng: &rng)
         substrate.append(grown.woody)
@@ -143,7 +143,8 @@ public enum PottedPlantMesh {
         -> (mesh: Mesh3, colors: [Vec3], woody: Mesh3) {
         if params.plantStyle == .christmasTree {
             let tiers = coniferTiers(params: params, soilY: soilY, rng: &rng)
-            return (coniferCanopy(tiers), [], Mesh3())
+            let painted = coniferFoliagePainted(tiers, params: params, soilY: soilY)
+            return (painted.mesh, painted.colors, Mesh3())
         }
         guard let grown = houseplantFoliage(params: params, soilY: soilY, rng: &rng) else {
             return (Mesh3(), [], Mesh3())
