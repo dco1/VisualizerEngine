@@ -675,6 +675,28 @@ fragment GBufferOut illumi_fs(
         float vein = leafVeinMask(in.uv.x - 10.5f, in.uv.y, duvdx, duvdy);
         albedo = mix(albedo, albedo * 1.5f + float3(0.018f, 0.022f, 0.0f), vein * 0.6f);
     }
+    // DH-0489 — a CONIFER's needle striations. `leafVenation == 2` (a Christmas tree; the shared
+    // `ConiferBuilder`'s canopy) draws sub-millimetre needle rows as per-pixel albedo detail, because
+    // a needle is ~1 mm wide and no vertex grid carries that. The rows RADIATE from the plant's own
+    // axis (instance origin) — along the bough, which is the way real needles lie — in two families
+    // at different frequencies so the comb is not perfectly regular. The turn count is an EVEN
+    // integer so the atan2 branch cut at ±½ turn lands on a whole number of cycles (no seam), and the
+    // detail fades out toward the mean once a row is narrower than ~1 pixel (no aliasing, no moiré:
+    // the average stays the painted colour). 0 / 1 are untouched, so every other instance is exact.
+    if (inst.leafVenation == 2) {
+        float2 d = in.worldPos.xz - inst.modelMatrix[3].xz;
+        float turn = atan2(d.y, d.x) * 0.15915494f;
+        float rows = turn * 480.0f;
+        float fade = 1.0f - smoothstep(0.35f, 0.95f, fwidth(rows));
+        // Each row (one needle line) gets its own brightness, re-rolled every ~7 cm along its length,
+        // so the grain reads as CLUMPED needles rather than a regular comb; a slow sine family on top
+        // keeps neighbouring rows from being fully independent (needles grow in sprays).
+        float cell = floor(rows);
+        float seg = floor(length(d) * 14.0f);
+        float h = fract(sin(cell * 12.9898f + seg * 78.233f) * 43758.5453f);
+        float s2 = sin((turn * 130.0f + length(d) * 60.0f + in.worldPos.y * 26.0f) * 6.2831853f);
+        albedo *= 1.0f + 0.34f * fade * (0.70f * (h * 2.0f - 1.0f) + 0.30f * s2);
+    }
     // Animated hue cycle on host-TAGGED vertices (Instance.hueCycle; tangent.w > 0.5 is the tag).
     // Rodrigues rotation about the grey axis: hue turns, brightness and saturation hold.
     // Tag = tangent.w ≈ 1 exactly (0.5…1.5): a mesh's own tangent handedness (±1 on normal-mapped
