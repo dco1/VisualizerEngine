@@ -134,6 +134,7 @@ struct VolSpotLight {
     int      castsShadow;     // unused here
     float    softRadius;      // unused here
     uint     giVisible;       // unused here — present for the stride (see above)
+    float    bulbRadius;      // unused here — DH-1295, path lane only (size 184, stride 192)
 };
 
 struct VolSpotUniforms {

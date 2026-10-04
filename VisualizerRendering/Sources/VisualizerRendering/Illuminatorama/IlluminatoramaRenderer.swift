@@ -895,6 +895,17 @@ public final class IlluminatoramaRenderer {
     /// luminous disc of radius r — combined with each light's own `softRadius` by max. A physical
     /// lever (a can's aperture, a shade's opening has size), default off until it earns its place.
     public var rtPathLampSourceRadius: Float = 0
+    /// **DH-1295 — lamps have a physical size at path vertices.** True: each point / spot light's
+    /// own `bulbRadius` (host-authored, metres) floors its `1/d²` at path vertices —
+    /// `1/max(d² + softRadius², bulbRadius²)`, the law of a luminous sphere of that radius, exact
+    /// outside the glass, and no surface is inside it. A light with `bulbRadius` 0 keeps the point
+    /// law exactly, so a host that never authors one (Visualizer) is unaffected. False: every
+    /// light is a point at path vertices — the shipped-before A/B lever. Path lane only (the
+    /// primary's lamps are the deferred pass's; `pathOn` gates the flag), so the real-time lane and
+    /// every non-Maximum still are byte-identical either way. Default TRUE: measured on Daydream's
+    /// many-lights station (5 cm lamps), −40 % of a 16-spp still's variance at night (−39 % by day)
+    /// for a converged-mean shift ≤ 0.001 stops (Daydream DH-1293 → DH-1295).
+    public var rtPathLampBulbs: Bool = true
     /// Cone-sampled shadow rays per pixel per frame for `rtSunSoftShadowsEnabled`'s traced
     /// sun visibility, host-clamped (`rtSunShadowRayCount`'s write, below) and shader-clamped
     /// (`rtSunSoftVisibility`, IlluminatoramaLighting.metal) to 1…32. DH-0856 measured this
@@ -9729,6 +9740,7 @@ public final class IlluminatoramaRenderer {
         // DH-1011 — light sampling + MIS (bit 0), shadowed lamps (bit 1, needs bit 0), instrument (bit 7).
         u.pathFlags = !pathOn ? 0 : (rtPathLightSampling ? 1 : 0)
             | (rtPathLightSampling && rtPathLampShadows ? 2 : 0)
+            | (rtPathLampBulbs ? 4 : 0)                       // DH-1295 — `kPathFlagLampBulbs`
             | (rtPathDebugFlags & 0xF8)
         // DH-1293 — the lamps' near-field levers (0 ⇒ the shipped point-source law).
         u.pathLampMinDist = pathOn ? rtPathLampMinDistance : 0

@@ -103,7 +103,10 @@ struct PrimUV { float2 uvA; float2 uvB; float2 uvC; };
 struct RTPointLight {
     float3 position;  float radius;
     float3 color;     uint  layerMask;
-    uint   castsShadow; int shadowCubeIndex; int _pad0;
+    uint   castsShadow; int shadowCubeIndex;
+    // DH-1295 — the lamp's physical size (m; 0 ⇒ a point), read by the path lane's falloff at path
+    // vertices (`pathLampAtten`). Was `_pad0`: same offset and width as `PointLight.bulbRadius`.
+    float  bulbRadius;
     // DH-0818 — the source size, read (was `_pad1`: uploaded every frame, never read, so the
     // bounce path lit near a floor lamp as a hard point while the deferred pass used a 0.70 m
     // source). Same offset and 4-byte width as `PointLight.softRadius`, so sizeof is unchanged.
@@ -124,6 +127,8 @@ struct RTSpotLight {
     float    softRadius;    // DH-0818 — was `_pad2`; same slot as `SpotLight.softRadius`
     // DH-0872 — mirrors `SpotLight.giVisible`; see `RTPointLight.giVisible`.
     uint     giVisible;
+    // DH-1295 — mirrors `SpotLight.bulbRadius` (size 184, stride 192); see `RTPointLight.bulbRadius`.
+    float    bulbRadius;
 };
 /// Mirror of `AreaLight` (IlluminatoramaCommon.h) — the SAME Swift-uploaded
 /// `IlluminatoramaAreaLight` buffer the deferred kernel reads (stride 144). Keep in

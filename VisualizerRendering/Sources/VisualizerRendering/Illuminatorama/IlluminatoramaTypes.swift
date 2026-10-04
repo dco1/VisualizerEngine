@@ -781,8 +781,15 @@ public struct IlluminatoramaPointLight {
     /// lights a page; the rest fall back to unshadowed. Mirrors the Metal
     /// `PointLight.shadowCubeIndex`. Default `-1`.
     public var shadowCubeIndex: Int32 = -1
-    /// One explicit pad so the struct closes on a 16-byte boundary. Mirror the Metal padding.
-    public var _padPointShadow0: Int32 = 0
+    /// **The physical size of the lamp at this light** (metres; 0 ⇒ a point, the shipped law).
+    /// Read ONLY by the path-traced still lane (`rtPathLampBulbs`), at path vertices: there a lamp's
+    /// falloff is `1/max(d² + softRadius², bulbRadius²)` — a luminous SPHERE of this radius is
+    /// exactly `1/d²` outside itself, and no surface can sit inside the glass, so this is the honest
+    /// finite-bulb law rather than a clamp (Daydream DH-1293/DH-1295). The deferred pass and every
+    /// real-time kernel ignore it, so a host that sets it changes nothing off the path lane. Was the
+    /// former `_padPointShadow0` (same 4 bytes, stride unchanged). Mirrors the Metal
+    /// `PointLight.bulbRadius` / `RTPointLight.bulbRadius`.
+    public var bulbRadius: Float = 0
     /// Source-size term for the near-field falloff (was `_padPointShadow1`; reinterpreted, so
     /// the struct stride is unchanged). The lighting kernel attenuates by `1/(d² + softRadius²)`
     /// instead of `1/d²`: a point source of zero size explodes as d→0, so a wall a metre from a
@@ -801,7 +808,8 @@ public struct IlluminatoramaPointLight {
 
     public init(position: SIMD3<Float>, radius: Float, color: SIMD3<Float>,
                 layerMask: UInt32 = 0xFFFF_FFFF,
-                castsShadow: Bool = false, softRadius: Float = 0, giVisible: Bool = true) {
+                castsShadow: Bool = false, softRadius: Float = 0, giVisible: Bool = true,
+                bulbRadius: Float = 0) {
         self.position = position
         self.radius = radius
         self.color = color
@@ -809,6 +817,7 @@ public struct IlluminatoramaPointLight {
         self.castsShadow = castsShadow ? 1 : 0
         self.softRadius = softRadius
         self.giVisible = giVisible ? 1 : 0
+        self.bulbRadius = bulbRadius
     }
 }
 
@@ -879,14 +888,22 @@ public struct IlluminatoramaSpotLight {
     /// wall. Default 0 ⇒ exactly `1/d²`, byte-identical (Visualizer never sets it).
     public var softRadius: Float = 0
     /// DH-0872 — see `IlluminatoramaPointLight.giVisible`; same field, same reason, same
-    /// default. Mirrors the Metal `SpotLight.giVisible` (stride grows 176 → 180).
+    /// default. Mirrors the Metal `SpotLight.giVisible` (size grows 176 → 180; stride 192).
     public var giVisible: UInt32 = 1
+    /// The physical size of the lamp at this cone's apex — see `IlluminatoramaPointLight
+    /// .bulbRadius`; same field, same law, read only by the path-traced still lane. Appended after
+    /// `giVisible` (size 180 → 184): it sits inside the float4x4-aligned stride's tail padding, so
+    /// the stride stays 192 on both sides. Mirrors the Metal `SpotLight` / `RTSpotLight` /
+    /// `VolSpotLight.bulbRadius` — keep all four in lockstep.
+    public var bulbRadius: Float = 0
 
     public init(position: SIMD3<Float>, direction: SIMD3<Float>,
                 innerCone: Float, outerCone: Float,
                 color: SIMD3<Float>, radius: Float,
                 layerMask: UInt32 = 0xFFFF_FFFF,
-                castsShadow: Bool = true, softRadius: Float = 0, giVisible: Bool = true) {
+                castsShadow: Bool = true, softRadius: Float = 0, giVisible: Bool = true,
+                bulbRadius: Float = 0) {
+        self.bulbRadius = bulbRadius
         self.position = position
         self.direction = direction
         self.innerCone = innerCone

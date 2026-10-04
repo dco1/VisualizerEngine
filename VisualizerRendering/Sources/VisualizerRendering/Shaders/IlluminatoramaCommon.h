@@ -596,7 +596,10 @@ struct PointLight {
     // < 0 ⇒ no page this frame (treat as fully visible). Mirrors the Swift struct.
     uint   castsShadow;
     int    shadowCubeIndex;
-    int    _padPointShadow0;
+    // The lamp's physical size (m; 0 ⇒ a point). Read ONLY by the path-traced still lane at path
+    // vertices (`RTPointLight.bulbRadius`, DH-1295) — this deferred kernel ignores it. Was
+    // `_padPointShadow0` (same 4 bytes, stride unchanged). Mirrors the Swift struct.
+    float  bulbRadius;
     // Source-size term for the near-field falloff (was `_padPointShadow1`; reinterpreted,
     // so the struct stride is unchanged). Attenuation is `1/(d² + softRadius²)` instead of
     // `1/d²`: a point source of zero size blows up as d→0, so a wall a metre from a bulb
@@ -684,6 +687,10 @@ struct SpotLight {
     float    softRadius;
     // DH-0872 — see `PointLight.giVisible`; same field, same reason, same default.
     uint     giVisible;
+    // DH-1295 — see `PointLight.bulbRadius` (path lane only; ignored here). Inside the stride's
+    // tail padding: size 184, stride 192, unchanged. Keep in lockstep with `RTSpotLight` and
+    // `VolSpotLight`.
+    float    bulbRadius;
 };
 
 struct Instance {
