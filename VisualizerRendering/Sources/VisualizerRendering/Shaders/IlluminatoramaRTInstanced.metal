@@ -7,6 +7,9 @@
 // term added for one path cannot go missing on the other. Nothing declared there
 // may be re-declared here.
 #include "IlluminatoramaSecondary.h"
+// DH-1014 — the layered BSDF's weights, so the traced diffuse / reflection replace the deferred
+// terms by the same numbers those terms carry (`layeredRTWeights`, kPathFlagLayered*).
+#include "IlluminatoramaBSDF.h"
 using namespace metal;
 using namespace raytracing;
 
@@ -980,6 +983,10 @@ kernel void illumi_rt_lighting_tlas(
     // `u.reflReplacesIBL`; a 1×1 dummy otherwise).
     texture2d<half, access::read>         specIBL     [[texture(9)]],
     texture2d<half, access::read>         diffSky     [[texture(10)]],
+    // DH-1014 — the split-sum DFG LUT + the G-buffer emission (its alpha carries the cloth
+    // sheen), read only under `kPathFlagLayered*` (`layeredRTWeights`).
+    texture2d<half, access::sample>       dfgLUT      [[texture(11)]],
+    texture2d<half, access::read>         gEmission   [[texture(12)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -1005,6 +1012,14 @@ kernel void illumi_rt_lighting_tlas(
     float roughness = max(0.045, float(nrH.b));
     float3 albedo = float3(amH.rgb);
     float3 Pofs = P + N * max(u.rayTMin, 1e-3);
+    // DH-1014 — the layered weights (diffuse: × albedo × incoming; reflection: × radiance).
+    float3 Vrt = normalize(u.cameraWorldPos - P);
+    float  NdotVrt = saturate(dot(N, Vrt));
+    float3 F0rt = mix(float3(0.04), albedo, float(amH.a));
+    LayeredRTWeights lw = layeredRTWeights(u.pathFlags, albedo, float(amH.a), roughness, NdotVrt,
+                                           (u.pathFlags & (kPathFlagLayeredMultiscatter | kPathFlagLayeredSheen)) != 0u
+                                               ? gEmission.read(gid).a : 0.0h,
+                                           dfgLUT, F0rt + (float3(1.0) - F0rt) * pow(1.0 - NdotVrt, 5.0));
 
     constexpr sampler skySamp(filter::linear, address::repeat);
     // The curve_data tag is compile-time; the base variant keeps the original
@@ -1234,7 +1249,7 @@ kernel void illumi_rt_lighting_tlas(
                 indirect += (u.giReplacesDiffuseSky != 0u) ? sky * u.skyIntensity : sky;
             }
         }
-        indirect = (indirect / float(u.giRays)) * albedo * u.giStrength;
+        indirect = (indirect / float(u.giRays)) * albedo * lw.diffuse * u.giStrength;
         cacheTerms += (cacheGI / float(u.giRays)) * albedo * u.giStrength;
         if (u.pathBounces > 0u && (u.pathFlags & kPathFlagDebugPrimaryLocal) != 0u) {
             // DH-1011 INSTRUMENT — isolation view: the primary's traced local-light estimate ALONE
@@ -1274,6 +1289,9 @@ kernel void illumi_rt_lighting_tlas(
         // variant is for the prefiltered-IBL deferred path (one env sample that
         // needs the grazing-energy fudge), not for a cone-traced reflection.
         float3 fres = F0 + (float3(1.0) - F0) * pow(1.0 - NdotV, 5.0);
+        // DH-1014 — with the layered model on, the split-sum env BRDF the specular IBL this
+        // reflection replaces is weighted by (`lw.reflection`); `fres` itself otherwise.
+        if ((u.pathFlags & (kPathFlagLayeredMultiscatter | kPathFlagLayeredSheen)) != 0u) fres = lw.reflection;
         // Glossy cone widens with roughness² (GGX α scales as roughness²); mirror
         // surfaces stay tight. Harmonised with the soup-path kernel in
         // IlluminatoramaRT.metal (#60 task 5) — was the linear `roughness * 0.5`,

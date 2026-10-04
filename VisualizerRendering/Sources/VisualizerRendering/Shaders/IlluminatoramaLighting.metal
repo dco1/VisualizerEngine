@@ -11,6 +11,9 @@
 // (`coneSample`) plus <metal_raytracing>; the non-RT variant dead-strips the
 // whole path at pipeline-specialization time.
 #include "IlluminatoramaSecondary.h"
+// DH-1014 — the layered BSDF's energy bookkeeping (multiscatter, the diffuse base's share,
+// the sheen LUT) and the cloth-sheen lobe itself, shared with the DFG bake + the RT kernel.
+#include "IlluminatoramaBSDF.h"
 using namespace metal;
 
 static inline float distributionGGX(float NdotH, float roughness) {
@@ -400,27 +403,9 @@ static inline float rtAreaVisibility(
 // velvety bloom along the rim of a cushion, and the reason velvet reads as velvet. GGX has no
 // such lobe; without a sheen term upholstery renders as painted plaster.
 //
-// **Estevez & Kulla 2017 ("Production Friendly Microfacet Sheen BRDF", SIGGRAPH talk)**
-// replace GGX's Beckmann-like NDF with an inverted-Gaussian "Charlie" distribution, whose
-// density is highest for microfacets standing PERPENDICULAR to the surface. Paired with
-// Ashikhmin & Premoze / Neubelt & Pettineo's velvet visibility term (which stays finite as
-// either cosine goes to zero, exactly where GGX's Smith term collapses), it is four lines and
-// no texture.
-//
-// The `alpha → 0` guard matters: `invAlpha` becomes the exponent, so a zero roughness is an
-// infinite power. Clamped at 1e-3.
-static inline float clothSheenD(float alpha, float NdotH) {
-    float invAlpha = 1.0 / max(alpha, 1e-3);
-    float cos2h = NdotH * NdotH;
-    float sin2h = max(1.0 - cos2h, 1e-7);
-    return (2.0 + invAlpha) * pow(sin2h, invAlpha * 0.5) / (2.0 * M_PI_F);
-}
-
-/// Ashikhmin/Neubelt velvet visibility — finite at grazing, where Smith-GGX goes to zero and
-/// takes the whole sheen lobe with it.
-static inline float clothSheenV(float NdotV, float NdotL) {
-    return 1.0 / max(4.0 * (NdotL + NdotV - NdotL * NdotV), 1e-5);
-}
+// The lobe — `clothSheenD` (Charlie) and `clothSheenV` (Neubelt) — and the fibre-tip colour
+// `clothSheenColor` live in IlluminatoramaBSDF.h (DH-1014), so the DFG bake integrates the SAME
+// functions into the sheen albedo LUT that every light evaluates here.
 
 /// The DEFAULT sheen roughness (band 0). Per-material nap width now arrives folded into the
 /// negative `emission.alpha` alongside strength (DH-0081 — see `clothSheenRoughnessForBand`), so a
@@ -429,12 +414,10 @@ static inline float clothSheenV(float NdotV, float NdotL) {
 /// non-cloth unpack path. 0.30 is a soft, broad nap — a sensible neutral for a plain-weave cloth.
 constant float kClothSheenRoughness = 0.30;
 
-/// Fibre-tip colour: cloth sheen is scattered by the pale tips of the nap, not by the dyed
-/// core, so it is markedly whiter than the base albedo. Same mix the Phase-7b bolt-on used, so
-/// this re-siting is a MECHANISM change and not a restyling of the fabric library.
-static inline float3 clothSheenColor(float3 albedo) { return albedo * 0.4 + float3(0.6); }
-
-/// Directional albedo of the Charlie/Neubelt lobe, for the environment (IBL/ambient) arm.
+/// Directional albedo of the Charlie/Neubelt lobe, for the environment (IBL/ambient) arm —
+/// the LEGACY path. With `kFrameFlagLayeredSheen` the arm reads the fitted LUT instead
+/// (`LayeredEnergy.sheenAlbedo`, DH-0597 / DH-1014); this curve stays only so an opted-out host
+/// is byte-identical.
 ///
 /// **A declared approximation**, in the same spirit as the area light's most-representative-
 /// point specular above: the correct term is a fitted sheen DFG LUT (Estevez & Kulla §4), and
@@ -454,11 +437,17 @@ static inline float clothSheenEnvAlbedo(float NdotV) {
 /// `sheenOut`, when non-null, receives ONLY the sheen part of this call's contribution. That is
 /// what keeps `DebugTerm.clothSheen` an honest instrument now that the lobe is no longer a
 /// separable bolt-on: the term can still be isolated without evaluating the light loops twice.
+///
+/// `le` (DH-1014) is the pixel's layered-BSDF energy terms: with multiscatter on, the specular
+/// lobe takes its multiple-scattering factor and the diffuse base the share the specular layer
+/// did not reflect; with sheen on, everything under the sheen layer its albedo scaling. The
+/// default `layeredOff()` is the historical expression, bit for bit (× 1.0 is exact).
 static inline float3 brdf(
     float3 N, float3 V, float3 L, float3 albedo, float metallic, float roughness, float3 lightColor,
     float anisotropy = 0.0, float3 grainT = float3(0.0),
     float sheenStrength = 0.0, thread float3 *sheenOut = nullptr,
-    float sheenRoughness = kClothSheenRoughness
+    float sheenRoughness = kClothSheenRoughness,
+    LayeredEnergy le = layeredOff()
 ) {
     float3 H = normalize(V + L);
     float NdotL = saturate(dot(N, L));
@@ -488,6 +477,13 @@ static inline float3 brdf(
 
     float3 spec = (D * G * F) / (4.0 * NdotV * NdotL + 1e-7);
     float3 kd = (1.0 - F) * (1.0 - metallic);
+    // DH-1014 — the layered base: multiple scattering puts back what the single-scatter lobe
+    // dropped, and the diffuse gets what the specular layer (now including that energy) did
+    // not reflect. A white surface under a uniform light then returns exactly 1.
+    if (le.multiscatter) {
+        spec *= le.specDirectMS;
+        kd = le.diffuseDirect;
+    }
     float3 diff = kd * albedo / M_PI_F;
     // THE EXACT EARLY-OUT. Everything above this line is untouched, and this is the expression
     // `brdf` has always returned; a surface with no cloth sheen therefore cannot move by a bit.
@@ -497,7 +493,8 @@ static inline float3 brdf(
     float  Vs = clothSheenV(NdotV, NdotL);
     float3 sheen = clothSheenColor(albedo) * (sheenStrength * Ds * Vs);
     if (sheenOut != nullptr) *sheenOut += sheen * lightColor * NdotL;
-    return (diff + spec + sheen) * lightColor * NdotL;
+    // DH-1014 — the sheen layer sits ON TOP: what it reflects never reaches the base.
+    return ((diff + spec) * le.baseUnderSheen + sheen) * lightColor * NdotL;
 }
 
 // Issue #65 — the DIFFUSE-ONLY half of `brdf`, byte-for-byte the same diffuse
@@ -508,7 +505,8 @@ static inline float3 brdf(
 // collapses to "replace the sharp diffuse with the blurred diffuse" at s = 1,
 // leaving specular / emission / clearcoat untouched. No-op everywhere else.
 static inline float3 brdfDiffuse(
-    float3 N, float3 V, float3 L, float3 albedo, float metallic, float3 lightColor
+    float3 N, float3 V, float3 L, float3 albedo, float metallic, float3 lightColor,
+    LayeredEnergy le = layeredOff()
 ) {
     float NdotL = saturate(dot(N, L));
     if (NdotL <= 0.0) return float3(0);
@@ -517,6 +515,9 @@ static inline float3 brdfDiffuse(
     float3 F0 = mix(float3(0.04), albedo, metallic);
     float3 F  = fresnelSchlick(HdotV, F0);
     float3 kd = (1.0 - F) * (1.0 - metallic);
+    // DH-1014 — must stay `brdf`'s diffuse exactly (the SSS composite subtracts it).
+    if (le.multiscatter) kd = le.diffuseDirect;
+    kd *= le.baseUnderSheen;
     return kd * albedo / M_PI_F * lightColor * NdotL;
 }
 
@@ -608,10 +609,15 @@ static inline int ltcClipQuadToHorizon(thread float3* L) {
 }
 
 // Full rectangular area-light contribution at a shaded point.
+//
+// `le` (DH-1014): with multiscatter on, the specular takes the direct lobe's multiple-scattering
+// factor and the diffuse the share the specular layer passed down — the same bookkeeping as
+// `brdf`. (Area lights carry no sheen lobe — DH-0597 #2 — so no sheen albedo scaling either.)
 static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, float3 V,
                                    float3 albedo, float metallic, float roughness,
                                    texture2d<float> ltcMat, texture2d<float> ltcMag,
-                                   bool ltcEnabled) {
+                                   bool ltcEnabled,
+                                   LayeredEnergy le = layeredOff()) {
     float3 nL = cross(al.ex, al.ey);
     float  nLlen = length(nL);
     if (nLlen < 1e-8) return float3(0.0);
@@ -769,6 +775,10 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
             float  projSA    = min(M_PI_F * ff, NdotLs * collected * kAreaLightFormScale);
             spec = (D * G * F) / (4.0 * NdotV * NdotLs + 1e-7) * projSA;
         }
+    }
+    if (le.multiscatter) {
+        spec *= le.specDirectMS;
+        diffuse = le.diffuseDirect * albedo * ff;
     }
 
     return (diffuse + spec) * al.color * window;
@@ -1209,6 +1219,23 @@ kernel void illumi_lighting(
              ? normalize(frame.invView[2].xyz)
              : normalize(frame.cameraWorldPos - worldPos);
 
+    // ── DH-1014 — the layered BSDF's per-pixel energy terms (IlluminatoramaBSDF.h) ──────────
+    // One DFG LUT read at (N·V, roughness) buys every light's multiple-scattering factor and the
+    // diffuse base's share; cloth reads its sheen albedo at (N·V, sheenRoughness). Host-gated:
+    // with neither flag set (or the LUT off) `le` stays `layeredOff()` and every lobe below is
+    // the historical expression, so an opted-out host is byte-identical.
+    bool layeredMS    = kLightingDFGLUTEnabled && (frame.frameFlags & kFrameFlagLayeredMultiscatter) != 0u;
+    bool layeredSheen = kLightingDFGLUTEnabled && (frame.frameFlags & kFrameFlagLayeredSheen) != 0u;
+    LayeredEnergy le = layeredOff();
+    if (layeredMS || layeredSheen) {
+        constexpr sampler leSampler(filter::linear, address::clamp_to_edge);
+        float leNdotV = saturate(dot(N, V));
+        float4 leLUT = float4(dfgLUT.sample(leSampler, float2(leNdotV, roughness)));
+        float  leSheenA = (layeredSheen && sheenStrength > 0.0)
+                        ? float(dfgLUT.sample(leSampler, float2(leNdotV, sheenRoughness)).a) : 0.0;
+        le = layeredEnergy(albedo, metallic, leLUT, leSheenA, sheenStrength, layeredMS, layeredSheen);
+    }
+
     // Issue #65 — screen-space SSS. SSS-flagged pixels carry ≈0.95h in
     // normalRoughness.w (vertex-colour alpha ∈ [0.90,0.98]; above the foliage 0.0
     // / plush 0.55 / casing 0.75 bands, below opaque 1.0). When the scene opts in
@@ -1297,10 +1324,10 @@ kernel void illumi_lighting(
     float3 directSunSheen = float3(0.0);
     float3 directSun = brdf(N, V, Ld, albedo, metallic, roughness,
                             frame.directionalLightColor, aniso, grainT,
-                            sheenStrength, &directSunSheen, sheenRoughness) * visibility;
+                            sheenStrength, &directSunSheen, sheenRoughness, le) * visibility;
     clothSheen += directSunSheen * visibility;
     if (isSSS) sssDiffuse += brdfDiffuse(N, V, Ld, albedo, metallic,
-                                         frame.directionalLightColor) * visibility;
+                                         frame.directionalLightColor, le) * visibility;
 
     // ── Leaf thin-sheet transmission (issue #58 / #20 item 2) ───────────────
     // Leaves are flagged in normalRoughness.w (0 = foliage; opaque geometry is
@@ -1450,9 +1477,9 @@ kernel void illumi_lighting(
         }
         if (visibility <= 0.0) continue;
         pointSum += brdf(N, V, L, albedo, metallic, roughness, pl.color * atten * visibility,
-                         0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness);
+                         0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness, le);
         if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic,
-                                             pl.color * atten * visibility);
+                                             pl.color * atten * visibility, le);
     }
 
     // Spot lights — same distance attenuation as point lights, multiplied
@@ -1526,9 +1553,9 @@ kernel void illumi_lighting(
         if (visibility <= 0.0) continue;
         spotSum += brdf(N, V, L, albedo, metallic, roughness,
                         sl.color * atten * visibility,
-                        0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness);
+                        0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness, le);
         if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic,
-                                             sl.color * atten * visibility);
+                                             sl.color * atten * visibility, le);
     }
 
     // Rectangular area lights (#60 task 5) — closed-form polygon diffuse + MRP
@@ -1565,7 +1592,7 @@ kernel void illumi_lighting(
         if (kLightingRTSunShadow && kLightingShadowEnabled
             && frame.rtAreaShadowRayCount > 0u && al.shadowSliceIndex >= 0) {
             float3 unshadowed = evalAreaLight(al, worldPos, N, V, albedo, metallic, roughness,
-                                              ltcMat, ltcMag, areaLTC);
+                                              ltcMat, ltcMag, areaLTC, le);
             float lum = dot(unshadowed, float3(0.2126, 0.7152, 0.0722));
             if (lum <= kRTAreaShadowSkipLuma) {
                 areaSum += unshadowed;
@@ -1607,7 +1634,7 @@ kernel void illumi_lighting(
         }
         if (visibility <= 0.0) continue;
         float3 areaTerm = visibility * evalAreaLight(al, worldPos, N, V, albedo, metallic, roughness,
-                                              ltcMat, ltcMag, areaLTC);
+                                              ltcMat, ltcMag, areaLTC, le);
         areaSum += areaTerm;
         if (al.isAperture > 0.5) apertureSum += areaTerm;
     }
@@ -1623,8 +1650,8 @@ kernel void illumi_lighting(
     for (uint i = 0; i < frame.directionalLightCount; ++i) {
         DirectionalLight dl = extraDirectionals[i];
         dirFillSum += brdf(N, V, dl.dir, albedo, metallic, roughness, dl.color,
-                           0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness);
-        if (isSSS) sssDiffuse += brdfDiffuse(N, V, dl.dir, albedo, metallic, dl.color);
+                           0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness, le);
+        if (isSSS) sssDiffuse += brdfDiffuse(N, V, dl.dir, albedo, metallic, dl.color, le);
     }
 
     // SSAO (half-res, gid/2). Only the indirect term is modulated — direct
@@ -1728,6 +1755,14 @@ kernel void illumi_lighting(
         float NdotV = saturate(dot(N, V));
         float3 F  = fresnelSchlickRoughness(NdotV, F0, roughness);
         float3 kD = (1.0 - F) * (1.0 - metallic);
+        // DH-1014 — the diffuse base gets what the specular layer (multiple scattering
+        // included) did not reflect: `(1 − m)(1 − envSpec)`, Fdez-Agüera 2019 §5. The legacy
+        // roughness-Schlick `kD` has no relation to the lobe's actual albedo, so a white
+        // dielectric could return more than it received.
+        if (layeredMS) kD = le.diffuseEnv;
+        // …and the sheen layer over the base reflects its own albedo first (albedo scaling,
+        // Estevez & Kulla 2017 §4) — 1.0 exactly for every non-cloth pixel.
+        if (layeredSheen) kD *= le.baseUnderSheen;
 
         // Diffuse: use DDGI probe irradiance when available (one-bounce GI),
         // otherwise fall back to the sky-probe irradiance cube.
@@ -1909,34 +1944,21 @@ kernel void illumi_lighting(
         if (kLightingDFGLUTEnabled) {  // function_constant(2)
             constexpr sampler dfgSampler(filter::linear, address::clamp_to_edge);
             float2 dfg = float2(dfgLUT.sample(dfgSampler, float2(NdotV, roughness)).rg);
-            float3 FssEss = F0 * dfg.x + dfg.y;      // the split-sum single-scatter result
             // ── S1.3b — multi-scatter GGX energy compensation ────────────────
-            // Single-scattering GGX DROPS the light that would have bounced a
-            // second time between microfacets, and the loss grows with roughness:
-            // `dfg.x + dfg.y` IS the directional albedo of the lobe, so
-            // `Ems = 1 − (dfg.x + dfg.y)` is exactly the energy going missing.
-            // On a dielectric that is invisible (F0 = 0.04 ⇒ the returned light is
-            // ~0.5 %), but on a metal it is a colour shift as well as a darkening,
-            // because what is dropped is Fresnel-weighted — rough gold renders
-            // grey-brown instead of gold.
-            //
-            // Fdez-Agüera 2019 ("A Multiple-Scattering Microfacet Model for
-            // Real-Time Image-Based Lighting", JCGT 8.1) closes it with ONE extra
-            // term built from the LUT already sampled above: the missing energy is
-            // re-emitted having undergone an average Fresnel `F_avg`, which for
-            // Schlick integrates to `F0 + (1 − F0)/21`, and the geometric series of
-            // further bounces sums to `1 / (1 − F_avg·Ems)`. No new texture, no new
-            // sample — four lines on top of the split sum.
-            float  Ems    = saturate(1.0 - (dfg.x + dfg.y));
-            float3 Favg   = F0 + (1.0 - F0) * (1.0 / 21.0);
-            float3 FmsEms = (Ems * FssEss * Favg) / max(1.0 - Favg * Ems, 1e-4);
-            specularIBL = specEnv * (FssEss + FmsEms);
+            // Single-scattering GGX DROPS the light that would have bounced a second time
+            // between microfacets; `1 − (dfg.x + dfg.y)` is exactly the energy going missing,
+            // and on a metal what is dropped is Fresnel-weighted — rough gold renders grey-
+            // brown instead of gold. Fdez-Agüera 2019 puts it back with one term built from
+            // the LUT already sampled — `layeredEnvSpecular` (IlluminatoramaBSDF.h, DH-1014),
+            // which is also what the RT reflection is weighted by, so the two agree.
+            specularIBL = specEnv * layeredEnvSpecular(F0, dfg);
         } else {
             // No LUT ⇒ no `Ems` to compensate with. Lagarde's roughness-Schlick
             // fallback has no energy budget to speak of; leaving it alone keeps this
             // toggle a clean A/B of the split sum itself.
             specularIBL = specEnv * F;
         }
+        if (layeredSheen) specularIBL *= le.baseUnderSheen;   // DH-1014 — under the sheen layer
 
         // ── Foliage: no broad sky reflection ─────────────────────────────────
         // Foliage is flagged in normalRoughness.w < 0.5 (the same flag the thin-sheet
@@ -1992,8 +2014,11 @@ kernel void illumi_lighting(
         // SAME irradiance the diffuse lobe uses, through the same `iblIntensity × interiorIBLK`
         // and raw `ao`, so it dims with the room exactly as the diffuse does.
         if (sheenStrength > 0.0) {
+            // DH-0597 / DH-1014 — the fitted Charlie albedo from the LUT (`.a`, keyed on the
+            // material's own sheen roughness) replaces the hand-fitted curve when the host opts in.
+            float sheenE = layeredSheen ? le.sheenAlbedo : clothSheenEnvAlbedo(NdotV);
             float3 sheenEnv = clothSheenColor(albedo)
-                            * (sheenStrength * clothSheenEnvAlbedo(NdotV))
+                            * (sheenStrength * sheenE)
                             * irradianceSat * ao * frame.iblIntensity * interiorIBLKd;
             indirect += sheenEnv;
             clothSheen += sheenEnv;
@@ -2007,6 +2032,7 @@ kernel void illumi_lighting(
         float upness = saturate(N.y * 0.5 + 0.5);
         float3 ambCol = desaturateFill(frame.ambientColor, frame.iblDiffuseDesaturation);
         float3 ambSupp = mix(ambCol * 0.4, ambCol, upness) * albedo;
+        if (layeredSheen) ambSupp *= le.baseUnderSheen;   // DH-1014 — 1.0 off cloth
         indirect += ambSupp * ao * interiorAmbK;
         dbgAmbient = ambSupp * ao * interiorAmbK;
         // DH-0989 — the path-traced lane walks the light every one of these terms stands in
@@ -2021,7 +2047,7 @@ kernel void illumi_lighting(
         // `ambientColor` is 0 (every Daydream Home scene today) or the surface is not cloth.
         if (sheenStrength > 0.0) {
             float3 ambSheen = clothSheenColor(albedo)
-                            * (sheenStrength * clothSheenEnvAlbedo(NdotV))
+                            * (sheenStrength * (layeredSheen ? le.sheenAlbedo : clothSheenEnvAlbedo(NdotV)))
                             * mix(ambCol * 0.4, ambCol, upness) * ao * interiorAmbK;
             indirect += ambSheen;
             clothSheen += ambSheen;

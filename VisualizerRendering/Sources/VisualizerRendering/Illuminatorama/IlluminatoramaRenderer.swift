@@ -2907,6 +2907,21 @@ public final class IlluminatoramaRenderer {
     /// view/material/scene-independent, so there is no rebake cost.
     public var dfgLUTEnabled: Bool = true
 
+    /// **DH-1014 — the layered BSDF's energy bookkeeping** (IlluminatoramaBSDF.h). `true`:
+    /// multiple-scattering GGX compensation on EVERY specular lobe (sun, lamps, fills, area
+    /// portals — the IBL arm has had it since S1.3b) and the diffuse base weighted by what the
+    /// specular layer did not reflect, in the deferred pass AND in the ray-traced lighting
+    /// kernel's GI / reflection weights, so a white surface under a uniform environment returns
+    /// 1.0 at every roughness on the live lane and on Maximum alike. Needs `dfgLUTEnabled`.
+    /// `false` (the default) is every lobe's historical expression, byte for byte — a look
+    /// change is the host's call (Daydream Home opts in).
+    public var layeredMultiscatter: Bool = false
+    /// **DH-1014 / DH-0597 — cloth sheen as a layer.** `true`: the sheen's environment arms read
+    /// the fitted Charlie albedo from the DFG LUT (`.a`) instead of the hand-fitted curve, and
+    /// the base under the sheen loses what the sheen reflected (albedo scaling), in the deferred
+    /// pass and the RT weights. `false` (the default) is byte-identical.
+    public var layeredClothSheen: Bool = false
+
     /// **S1.6 — which Smith-GGX `k` remap `illumi_dfg_bake` integrates the split
     /// sum with.** `true` = Karis's IBL form `k = α/2` (physically the right one for
     /// this integral); `false` = the analytic-light form `k = (roughness+1)²/8` the
@@ -6134,7 +6149,9 @@ public final class IlluminatoramaRenderer {
         // automatically (no waitUntilCompleted needed).
         let dfgDesc = MTLTextureDescriptor()
         dfgDesc.textureType = .type2D
-        dfgDesc.pixelFormat = .rg16Float
+        // DH-1014 — four channels: (A, B) the env split sum, `.b` the direct lobe's albedo,
+        // `.a` the cloth-sheen albedo (IlluminatoramaBSDF.h documents the layout).
+        dfgDesc.pixelFormat = .rgba16Float
         dfgDesc.width  = Self.dfgLUTSize
         dfgDesc.height = Self.dfgLUTSize
         dfgDesc.usage  = [.shaderRead, .shaderWrite]
@@ -9742,6 +9759,9 @@ public final class IlluminatoramaRenderer {
             | (rtPathLightSampling && rtPathLampShadows ? 2 : 0)
             | (rtPathLampBulbs ? 4 : 0)                       // DH-1295 — `kPathFlagLampBulbs`
             | (rtPathDebugFlags & 0xF8)
+        // DH-1014 — the layered weights apply to the one-bounce GI too, so NOT gated on `pathOn`.
+        u.pathFlags |= (dfgLUTEnabled && layeredMultiscatter ? 256 : 0)
+            | (dfgLUTEnabled && layeredClothSheen ? 512 : 0)
         // DH-1293 — the lamps' near-field levers (0 ⇒ the shipped point-source law).
         u.pathLampMinDist = pathOn ? rtPathLampMinDistance : 0
         u.pathLampSourceRadius = pathOn ? max(0, rtPathLampSourceRadius) : 0
@@ -9897,6 +9917,8 @@ public final class IlluminatoramaRenderer {
         enc.setTexture(rtDiffuseTexture, index: 8)
         enc.setTexture(specIBLOn ? specIBLTexture : specIBLDummyTexture, index: 9)
         enc.setTexture(diffSkyOn ? diffSkyTexture : diffSkyDummyTexture, index: 10)
+        enc.setTexture(dfgLUT, index: 11)              // DH-1014 — `layeredRTWeights`
+        enc.setTexture(gbufferEmission, index: 12)     // DH-1014 — the cloth-sheen decode
         // DH-0653 hit/miss counters (buffer 19). Dummy = instData, never added to while
         // `surfStatsEnabled` is 0.
         enc.setBuffer(hitStats ?? instData, offset: 0, index: 19)
@@ -15526,6 +15548,9 @@ public final class IlluminatoramaRenderer {
         // path-traced lane owns the diffuse indirect this frame, so the lighting pass hands ALL of
         // it over (`kFrameFlagPathOwnsIndirect`).
         if rtPathTracedGI && diffSkyHandoffActive { u.shadowEnabled |= 2 }
+        // DH-1014 — the layered BSDF (`kFrameFlagLayeredMultiscatter` 4 / `…Sheen` 8).
+        if dfgLUTEnabled && layeredMultiscatter { u.shadowEnabled |= 4 }
+        if dfgLUTEnabled && layeredClothSheen { u.shadowEnabled |= 8 }
         // Tree wind (#58 #1): repurpose the two free pad floats as the vertex-
         // shader vegetation-wind knobs. _padPhase2A = strength (max canopy sway,
         // ~m), _padPhase2B = heading (radians). 0 strength → exact no-op (the

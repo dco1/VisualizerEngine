@@ -5,6 +5,7 @@
 
 #include <metal_stdlib>
 #include "IlluminatoramaCommon.h"
+#include "IlluminatoramaBSDF.h"
 using namespace metal;
 
 // Standard cubemap face → direction. Matches Metal's samplerCube convention
@@ -244,6 +245,12 @@ kernel void illumi_dfg_bake(
     const uint SAMPLES = 512;
     float scale = 0.0;
     float bias  = 0.0;
+    // DH-1014 — the DIRECT lobe's directional albedo at F = 1 (`.b`): the same GGX samples,
+    // weighted by the analytic-light Schlick-GGX (`geometrySmith`, k = (r+1)²/8) that `brdf()`
+    // evaluates for the sun / lamps / portals. Its multiple-scattering compensation must be
+    // computed against THIS lobe — the env lobe's (A + B) uses a different G and would leave a
+    // rough metal under a lamp short of the furnace by the difference.
+    float eDirect = 0.0;
 
     for (uint i = 0; i < SAMPLES; ++i) {
         float2 Xi = hammersley(i, SAMPLES);
@@ -263,11 +270,33 @@ kernel void illumi_dfg_bake(
             float Fc    = pow(1.0 - VdotH, 5.0);
             scale += (1.0 - Fc) * G_Vis;
             bias  += Fc * G_Vis;
+            eDirect += geometrySmith(NdotV, NdotL, roughness) * VdotH / max(NdotH * NdotV, 1e-6);
         }
     }
 
+    // DH-0597 / DH-1014 — the cloth-sheen lobe's directional albedo (`.a`), keyed on the same
+    // texel with y read DIRECTLY as the Charlie alpha (that is how `brdf` passes
+    // `sheenRoughness`): E(μ, α) = ∫ D_charlie · V_neubelt · N·L dω — the SAME `clothSheenD/V`
+    // the direct lobe evaluates (IlluminatoramaBSDF.h), so the environment arm and the light
+    // arm cannot drift. Uniform-hemisphere Hammersley, estimator D·V·N·L·2π/N (Filament's
+    // DFV_Charlie). The Charlie lobe is broad by construction, so 1024 uniform samples
+    // converge it to half precision.
+    const uint SHEEN_SAMPLES = 1024;
+    float eSheen = 0.0;
+    for (uint i = 0; i < SHEEN_SAMPLES; ++i) {
+        float2 Xi = hammersley(i, SHEEN_SAMPLES);
+        float  cosT = Xi.y;                                   // uniform hemisphere: z ~ U(0,1)
+        float  sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+        float  phi  = 2.0 * M_PI_F * Xi.x;
+        float3 L    = float3(sinT * cos(phi), sinT * sin(phi), cosT);
+        float3 Hs   = normalize(V + L);
+        eSheen += clothSheenD(roughness, max(Hs.z, 0.0)) * clothSheenV(NdotV, cosT) * cosT;
+    }
+    eSheen *= 2.0 * M_PI_F / float(SHEEN_SAMPLES);
+
     outLUT.write(
-        half4(half(scale / float(SAMPLES)), half(bias / float(SAMPLES)), 0.0h, 1.0h),
+        half4(half(scale / float(SAMPLES)), half(bias / float(SAMPLES)),
+              half(eDirect / float(SAMPLES)), half(eSheen)),
         gid
     );
 }

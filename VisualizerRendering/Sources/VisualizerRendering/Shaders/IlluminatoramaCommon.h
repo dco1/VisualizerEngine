@@ -953,31 +953,10 @@ static inline float3 anisoBaseTangent(float3 N, bool grainVertical) {
     return grainVertical ? normalize(cross(N, horiz)) : horiz; // in-plane, up-aligned (vertical)
 }
 
-// ── Cloth sheen roughness bands (DH-0081) ─────────────────────────────────────────────────
-// The sheen lobe's roughness is carried per-material by folding a small BAND index into the
-// INTEGER part of the (negative) sheen magnitude packed in `emission.alpha`, leaving the
-// FRACTION for sheen strength: `emission.alpha = -(band + strength)`. Band 0 is the historical
-// single constant (0.30), so a material that keeps the default nap packs `-strength` exactly as
-// it did before this existed — byte-for-byte. Four curated bands span crisp pile → broad fuzz; a
-// material's continuous `sheenRoughness` snaps to the nearest at pack time. Both directions live
-// here (this header is included by the G-buffer packer AND the lighting unpacker) so the band
-// table has ONE definition.
-inline float clothSheenRoughnessForBand(int band) {
-    switch (band) {
-        case 1:  return 0.18f;   // crisp / tight nap (sateen, silk)
-        case 2:  return 0.45f;   // broad soft nap (velvet, carpet pile)
-        case 3:  return 0.60f;   // very broad fuzz (wool bouclé, chenille)
-        default: return 0.30f;   // default — linen / general plain-weave upholstery
-    }
-}
-inline int clothSheenBandForRoughness(float r) {
-    // Nearest band. 0.30 (band 0) is listed first so a default-nap material snaps to it and
-    // packs identically to the pre-band encoding. Keep in sync with the switch above.
-    float bands[4] = { 0.30f, 0.18f, 0.45f, 0.60f };
-    int best = 0; float bestD = fabs(r - bands[0]);
-    for (int i = 1; i < 4; ++i) { float d = fabs(r - bands[i]); if (d < bestD) { bestD = d; best = i; } }
-    return best;
-}
+// ── Cloth sheen roughness bands (DH-0081) ── moved to IlluminatoramaBSDF.h (DH-1014): the
+// ray-traced lighting kernel decodes the band too (the sheen layer's albedo scaling of the traced
+// diffuse) and cannot include this header, so the one definition lives where both can reach it.
+#include "IlluminatoramaBSDF.h"
 
 struct Vertex {
     float3 position;
