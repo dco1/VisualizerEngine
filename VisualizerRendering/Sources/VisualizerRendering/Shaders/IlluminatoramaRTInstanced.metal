@@ -147,7 +147,38 @@ struct RTInstUniforms {
     // share over in `diffSky`, `kFrameFlagPathOwnsIndirect`). 0 ⇒ the one-bounce estimator, exactly
     // as before. `pathClamp` caps one path's luminance (0 ⇒ no clamp). Were `_padProg1/_padProg2`.
     uint pathBounces; float pathClamp;
+    // Daydream DH-1011 — how a path vertex samples its LIGHTS (`kPathFlag*` below). 0 ⇒ the
+    // DH-0989 estimator exactly (byte-identical): apertures an exact partition with the cosine
+    // continuation (a continuation through a portal is dropped), lamps an unshadowed deterministic
+    // sum, every area emitter traced with `areaShadowRays` white-noise rays.
+    uint pathFlags; uint _padPath0; uint _padPath1; uint _padPath2;
 };
+
+/// DH-1011 — `RTInstUniforms.pathFlags` bits.
+/// `kPathFlagLightSampling`: (1) the aperture estimator and the cosine continuation are COMBINED
+/// by multiple importance sampling (power heuristic) instead of partitioning the hemisphere — a
+/// continuation that leaves through a portal is kept, weighted, rather than dropped; (2) the area
+/// EMITTERS (light strips, skylight lenses) at a vertex are reduced to ONE pick ∝ their unshadowed
+/// contribution and ONE Sobol shadow ray, instead of `areaShadowRays` white-noise rays each.
+/// `kPathFlagLocalShadows`: the lamps / cans / sconces / pendants that cast a shadow in the
+/// deferred pass (`castsShadow`) get one at a path vertex too — joined into the same single pick,
+/// so a vertex traces ONE light ray however many fixtures the room holds. Unshadowed lights
+/// (bounce fills, string lights) stay unshadowed, as they are in the deferred pass.
+/// `kPathFlagDebugPrimaryLocal`: an INSTRUMENT — the path returns only the local-light NEE at
+/// the primary (whose lamps the deferred pass normally owns), so the traced lamp visibility can be
+/// checked against the shadow maps on open floor. Never set by a host.
+#define kPathFlagLightSampling     1u
+#define kPathFlagLocalShadows      2u
+#define kPathFlagDebugPrimaryLocal 128u
+/// INSTRUMENT: a continuation that hits an emissive surface adds nothing — the share of a still's
+/// noise the glowing shades are, measured by its absence. Never set by a host.
+#define kPathFlagDebugNoEmissionHits 64u
+/// INSTRUMENTS for the noise budget by light source (never set by a host): drop one source class
+/// from the path at its vertices — 32 the local lights (lamps + area emitters), 16 the sun, 8 the
+/// window apertures (both the aperture sample and a continuation that leaves through a portal).
+#define kPathFlagDebugNoLocal     32u
+#define kPathFlagDebugNoSun       16u
+#define kPathFlagDebugNoApertures 8u
 
 // ── Curve primitives (#60 item 7) ────────────────────────────────────────────
 // `kRTCurvesEnabled` specializes the kernel for a TLAS that contains curve
@@ -353,7 +384,49 @@ static inline SecondaryShadeParams giBounceParams(constant RTInstUniforms& u) {
 //     twice and nothing is lost — no MIS weights needed. Any other miss is the sky.
 // Russian roulette from the third vertex; every random number is a padded, Owen-scrambled Sobol
 // dimension pair (DH-0951 item 1), so a still's frames stratify every bounce, not just the first.
+//
+// DH-1011 (`pathFlags`, see `kPathFlag*`) — what changes when the host asks for light sampling:
+//   • the aperture estimator and the continuation are no longer a partition. BOTH strategies cover
+//     the portal's solid angle and each is weighted by the power heuristic against the other's
+//     density there: the aperture sample by p_L² / (p_L² + p_B²), a continuation that crosses a
+//     portal (first, before any hit) by p_B² / (p_B² + p_L²), where p_L = P(pick that portal at
+//     this vertex) · d² / (A cosθ_L) and p_B = cosθ / π. The weights sum to one for every
+//     direction, so the integrand — and therefore the converged mean — is the partition's; only
+//     the variance moves: the area sample is a poor density near grazing (the wall the window is
+//     cut into, a floor right under the sill) and for sky radiance that varies across the
+//     opening, and the continuation covers exactly that. The crossing continuation reads the same
+//     radiance the aperture sample does (the sky or the shaded outdoor hit along the ray, × the
+//     pane) and ends there, as the aperture sample does.
+//   • because the continuation now covers every portal direction, the aperture PICK no longer has
+//     to: it is restricted to the portals of the vertex's own room (`pathPortalWeightAt`; the
+//     primary's room comes from one short bracketing ray). A portal left out has p_L = 0 there and
+//     its light arrives through the continuation at weight 1 — unbiased by construction. The
+//     partition could not do this: a portal outside the pick was light it simply lost.
+//   • the vertex's local emitters — area emitters always, and with `kPathFlagLocalShadows` every
+//     point / spot light too — are ONE estimator: one light picked ∝ its own unshadowed
+//     contribution at this vertex (power × distance falloff × cone × N·L for a lamp, form factor ×
+//     range window for a rect — the exact quantity the deterministic sum adds), one Sobol shadow ray
+//     to it. Picking ∝ the unshadowed term means an unoccluded vertex's estimate EQUALS the sum (up
+//     to the lights' chroma spread), so the only variance left is visibility's — and the ray count
+//     is one however many fixtures the room holds.
 constant uint kPathDimsPerVertex = 4u;
+// DH-1011's dimensions live under their own salt so a flag-off path draws EXACTLY the numbers it
+// always did (byte-identical): .x of the first pair picks the local light, the second pair is the
+// point on a picked rect.
+constant uint kPathLightDimsPerVertex = 2u;
+// A lamp shadow ray stops this short of the light — the FIXTURE CLEARANCE. Every cone this host
+// emits sits INSIDE its own fixture: a bulb in a shade over a lamp base, a sconce's source in its
+// cylinder, a can's apex 10 cm under the ceiling. The cones are authored wider than the
+// housings' geometric openings (a sconce throws a 110° fan out of a short tube), and the deferred
+// pass never sees the housing (most of these cones get no shadow slice; the rest store back faces
+// behind a near plane). A ray that stopped 3 cm short found the housing: measured on the Debug
+// Tester's many-lights bay, the traced visibility of the sconces' own wall fans was ~0 and of a
+// table lamp's floor pool 0.40. 25 cm clears every shipped housing (a shade's radius, a sconce's
+// half-height, a can's well) and still leaves the furniture a lamp stands on or hangs over — a
+// nightstand top half a metre under its bulb, a dining table under a pendant — as the occluders.
+constant float kPathLampShadowGap = 0.25;
+// The one-pick's per-vertex weight cache (thread memory), in lights.
+constant uint kPathLightCache = 64u;
 constant uint kPathPortalCache = 32u;   // per-vertex aperture-weight cache (thread memory)
 
 static inline float pathLuma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
@@ -396,6 +469,188 @@ static inline float pathPortalWeight(RTAreaLight al, float3 P, float3 N) {
     return ff * max(pathLuma(al.color), 1e-4);
 }
 
+/// DH-1011 — the aperture PICK weight at a path vertex. Under MIS a portal may be left out of the
+/// pick without bias (a continuation through it then carries weight 1), so the pick is restricted
+/// to the portals of the vertex's own ROOM (`layerMask` — the same per-room bit the deferred pass
+/// confines a portal by): the windows of the bays on the other side of a wall have a real
+/// unshadowed form factor, and every sample spent on them is a ray that hits the wall. Without
+/// light sampling the partition needs every portal covered, so the old weight stands.
+static inline float pathPortalWeightAt(RTAreaLight al, float3 P, float3 N, uint layerBits, bool restrictToRoom) {
+    if (restrictToRoom && (al.layerMask & layerBits) == 0u) return 0.0;
+    return pathPortalWeight(al, P, N);
+}
+
+// ── DH-1011 — the vertex's local emitters as ONE pick ───────────────────────────────────────
+//
+// Each helper returns the light's UNSHADOWED contribution at (P, N) — radiance-per-albedo, the
+// exact term `secondaryLocalLightFill` / `secondaryAreaLightFill` add for it — and is the light's
+// selection weight (by luminance) too. Same layer mask, range window, cone and N·L tests as those
+// sums, so a light the sum skips has weight 0 here and a light the sum counts can be picked.
+
+static inline float3 pathPointContribution(RTPointLight pl, float3 P, float3 N, uint layerBits) {
+    if (pl.giVisible == 0u || (pl.layerMask & layerBits) == 0u) return float3(0.0);
+    float3 toL = pl.position - P;
+    float dist = length(toL);
+    if (dist > pl.radius) return float3(0.0);
+    float nl = saturate(dot(N, toL / max(dist, 1e-4)));
+    if (nl <= 0.0) return float3(0.0);
+    float atten = 1.0 / max(dist * dist + pl.softRadius * pl.softRadius, 1e-4);
+    float window = saturate(1.0 - pow(dist / pl.radius, 4.0));
+    return pl.color * (atten * window * window * nl * (1.0 / M_PI_F));
+}
+
+static inline float3 pathSpotContribution(RTSpotLight sl, float3 P, float3 N, uint layerBits) {
+    if (sl.giVisible == 0u || (sl.layerMask & layerBits) == 0u) return float3(0.0);
+    float3 toL = sl.position - P;
+    float dist = length(toL);
+    if (dist > sl.radius) return float3(0.0);
+    float3 L = toL / max(dist, 1e-4);
+    float coneAtten = smoothstep(sl.outerCone, sl.innerCone, dot(normalize(sl.direction), -L));
+    if (coneAtten <= 0.0) return float3(0.0);
+    float nl = saturate(dot(N, L));
+    if (nl <= 0.0) return float3(0.0);
+    float atten = 1.0 / max(dist * dist + sl.softRadius * sl.softRadius, 1e-4);
+    float window = saturate(1.0 - pow(dist / sl.radius, 4.0));
+    return sl.color * (atten * window * window * coneAtten * nl * (1.0 / M_PI_F));
+}
+
+/// An area EMITTER's (not an aperture's) unshadowed term — `secondaryAreaLightFill`'s per-light
+/// body before its visibility rays, including its `kSecondaryAreaSkip` cut.
+static inline float3 pathEmitterContribution(RTAreaLight al, float3 P, float3 N, uint layerBits) {
+    if (al.isAperture > 0.5 || (al.layerMask & layerBits) == 0u) return float3(0.0);
+    float3 nL = cross(al.ex, al.ey);
+    float  nLlen = length(nL);
+    if (nLlen < 1e-8) return float3(0.0);
+    nL /= nLlen;
+    bool twoSided = al.twoSided > 0.5;
+    if (!twoSided && dot(nL, P - al.center) <= 0.0) return float3(0.0);
+    float dist = length(al.center - P);
+    if (dist > al.radius) return float3(0.0);
+    float window = saturate(1.0 - pow(dist / al.radius, 4.0));
+    window *= window;
+    float3 p0 = al.center - al.ex - al.ey - P;
+    float3 p1 = al.center - al.ex + al.ey - P;
+    float3 p2 = al.center + al.ex + al.ey - P;
+    float3 p3 = al.center + al.ex - al.ey - P;
+    float3 L = al.color * (ltcPolygonForm(N, p0, p1, p2, p3, twoSided) * window);
+    return pathLuma(L) <= kSecondaryAreaSkip ? float3(0.0) : L;
+}
+
+/// Light index space for the one pick: [0, nPoint) points, then spots, then area emitters.
+/// `lamps` false ⇒ points and spots are left out (the caller adds their deterministic sum).
+static inline float3 pathLocalContribution(uint k, bool lamps, float3 P, float3 N, uint layerBits,
+                                           SecondaryShadeParams p, SecondaryScene sec) {
+    uint nP = lamps ? p.pointLightCount : 0u;
+    uint nS = lamps ? p.spotLightCount : 0u;
+    if (k < nP) return pathPointContribution(sec.pointLights[k], P, N, layerBits);
+    k -= nP;
+    if (k < nS) return pathSpotContribution(sec.spotLights[k], P, N, layerBits);
+    k -= nS;
+    return pathEmitterContribution(sec.areaLights[k], P, N, layerBits);
+}
+
+/// ONE light from the vertex's local emitters, picked ∝ its unshadowed contribution, with ONE
+/// visibility ray when the light casts a shadow: an unbiased estimate of Σ_i c_i·V_i. The weights
+/// are recomputed on the second pass rather than cached — an ALU-only pass over the room's lights
+/// is noise next to one traced ray, and it keeps the cost flat in light count for thread memory.
+template <typename Isect>
+static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceleration_structure accel,
+                                           float3 P, float3 N, float3 Pofs, uint layerBits,
+                                           bool lamps, bool lampVisibility, uint areaCount,
+                                           SecondaryShadeParams p, SecondaryScene sec,
+                                           constant RTInstUniforms& u, uint sampleIndex, uint lightSalt,
+                                           uint2 gid)
+{
+    uint nP = lamps ? p.pointLightCount : 0u;
+    uint nS = lamps ? p.spotLightCount : 0u;
+    uint n = nP + nS + areaCount;
+    // Weights evaluated ONCE and reused by the pick (the first `kPathLightCache` lights; a room past
+    // that re-evaluates the rest on the pick pass) — measured, the second full pass cost as much
+    // as the shadow ray itself.
+    float wc[kPathLightCache];
+    float W = 0.0;
+    for (uint k = 0u; k < n; ++k) {
+        float wk = pathLuma(pathLocalContribution(k, lamps, P, N, layerBits, p, sec));
+        if (k < kPathLightCache) wc[k] = wk;
+        W += wk;
+    }
+    if (W <= 0.0) return float3(0.0);
+    float2 sel = illumiSobolOwen2DShuffled(sampleIndex, illumiPixelSeed(gid, lightSalt + 0u));
+    float pick = sel.x * W, acc = 0.0;
+    uint j = n; float wj = 0.0;
+    for (uint k = 0u; k < n; ++k) {
+        float wk = (k < kPathLightCache) ? wc[k]
+                                          : pathLuma(pathLocalContribution(k, lamps, P, N, layerBits, p, sec));
+        acc += wk;
+        if (wk > 0.0 && (pick < acc || k + 1u == n)) { j = k; wj = wk; break; }
+    }
+    if (j >= n || wj <= 0.0) return float3(0.0);
+    float3 c = pathLocalContribution(j, lamps, P, N, layerBits, p, sec);
+    float pj = wj / W;
+
+    // Visibility — the same rule the deferred pass / the old sums apply per light class.
+    bool castsShadow; float3 target; float gap;
+    if (j < nP) {
+        RTPointLight pl = sec.pointLights[j];
+        castsShadow = lampVisibility && pl.castsShadow != 0u; target = pl.position; gap = kPathLampShadowGap;
+    } else if (j < nP + nS) {
+        RTSpotLight sl = sec.spotLights[j - nP];
+        castsShadow = lampVisibility && sl.castsShadow != 0; target = sl.position; gap = kPathLampShadowGap;
+    } else {
+        RTAreaLight al = sec.areaLights[j - nP - nS];
+        castsShadow = al.castsShadow != 0 && p.areaShadowRays > 0u;
+        float2 q = illumiSobolOwen2DShuffled(sampleIndex, illumiPixelSeed(gid, lightSalt + 1u));
+        target = al.center + al.ex * (q.x * 2.0 - 1.0) + al.ey * (q.y * 2.0 - 1.0);
+        gap = 0.02;                                        // never the pane / lens itself
+    }
+    if (castsShadow) {
+        // Off the surface on the light's side — the area fill's convention (a back-facing rect
+        // is skipped by its weight, so this is N for every light that can be picked).
+        float3 offN = (dot(N, target - P) >= 0.0) ? N : -N;
+        float3 o = P + offN * 2e-3;                        // `secondaryAreaLightFill`'s origin
+        float3 d = target - o;
+        float len = length(d);
+        if (len > gap + 1e-3) {
+            isect.accept_any_intersection(true);
+            ray sr; sr.origin = o; sr.direction = d / len;
+            sr.min_distance = 2e-3; sr.max_distance = len - gap;
+            bool blocked = isect.intersect(sr, accel, p.occluderMask).type != intersection_type::none;
+            isect.accept_any_intersection(false);
+            if (blocked) return float3(0.0);
+        }
+    }
+    return c / pj;
+}
+
+/// The radiance the aperture estimator reads along a ray that has crossed a portal — the sky, or
+/// the shaded outdoor hit — for a ray ALREADY traced (the continuation's own `res`). Must stay the
+/// body of `pathSkyOrOutdoor` below, or the two MIS strategies would estimate different integrals.
+template <typename Isect, typename Res>
+static inline float3 pathOutdoorFromResult(thread Isect& isect, instance_acceleration_structure accel,
+                                           thread Res& res, float3 o, float3 d,
+                                           constant RTInstUniforms& u, SecondaryShadeParams pOut,
+                                           SecondaryScene sec,
+                                           texture2d<float, access::sample> skyEquirect,
+                                           texturecube<float, access::sample> irrCube,
+                                           texture2d_array<float, access::sample> albedoAtlas,
+                                           thread uint& seed)
+{
+    if (res.type == intersection_type::triangle) {
+        SecondaryHit h;
+        h.P = o + d * res.distance;
+        h.N = hitWorldNormal(res.instance_id, res.primitive_id, sec.insts, sec.objNormal);
+        if (dot(h.N, d) > 0.0) h.N = -h.N;
+        h.bary = res.triangle_barycentric_coord;
+        h.instanceID = res.instance_id; h.primitiveID = res.primitive_id;
+        return shadeSecondarySurface(isect, accel, h, pOut, sec, irrCube, albedoAtlas, seed);
+    }
+    if (res.type != intersection_type::none) return float3(0.0);
+    constexpr sampler skySamp(filter::linear, address::repeat);
+    float3 sky = skyEquirect.sample(skySamp, dirToEquirectUV(d)).rgb;
+    if (u.scotopicDesaturation > 0.0) sky = mix(sky, float3(pathLuma(sky)), u.scotopicDesaturation);
+    return sky * u.skyIntensity;
+}
+
 template <typename Isect>
 static inline float3 pathSkyOrOutdoor(thread Isect& isect, instance_acceleration_structure accel,
                                       float3 o, float3 d, float tMin,
@@ -429,7 +684,8 @@ static inline float3 pathSkyOrOutdoor(thread Isect& isect, instance_acceleration
 
 template <typename Isect>
 static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_acceleration_structure accel,
-                                             float3 P0, float3 N0, uint sampleIndex, uint2 gid,
+                                             float3 P0, float3 N0, uint primaryLayerBits,
+                                             uint sampleIndex, uint2 gid,
                                              constant RTInstUniforms& u, SecondaryScene sec,
                                              SecondaryShadeParams pFull,
                                              texture2d<float, access::sample> skyEquirect,
@@ -451,17 +707,27 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
     float3 L = float3(0.0);
     float3 T = float3(1.0);
     float3 P = P0, N = N0;
-    uint layerBits = 0xFFFFFFFFu;   // the vertex's light layers (the local-light mask)
+    uint layerBits = primaryLayerBits;   // the vertex's light layers (the local-light / room mask)
     uint maxB = min(u.pathBounces, 32u);
+    // DH-1011 — light sampling (see the lane's header comment and `kPathFlag*`).
+    bool lightSampling = (u.pathFlags & kPathFlagLightSampling) != 0u;
+    bool lampShadows   = (u.pathFlags & kPathFlagLocalShadows) != 0u;
+    if ((u.pathFlags & kPathFlagDebugPrimaryLocal) != 0u) {
+        // INSTRUMENT: the primary's own local-light NEE and nothing else — the traced lamp
+        // visibility, readable against the deferred pass's shadow-mapped lamps (DH-1011).
+        return pathSampleLocalLights(isect, accel, P0, N0, P0 + N0 * tMin, layerBits, true, lampShadows,
+                                     0u, pVert, sec, u, sampleIndex, 0x4C495445u, gid);
+    }
     for (uint v = 0u; v <= maxB; ++v) {
         uint dimSalt = 0x50415448u + v * kPathDimsPerVertex;   // 'PATH'
+        uint lightSalt = 0x4C495445u + v * kPathLightDimsPerVertex;   // 'LITE' (DH-1011)
         float3 Pofs = P + N * tMin;
         float3 Lv = float3(0.0);
 
         // ── NEE: sun + local lights (secondary vertices) ──
         if (v > 0u) {
             float nl = saturate(dot(N, Ld));
-            if (nl > 0.0 && any(u.sunColor > 0.0)) {
+            if (nl > 0.0 && any(u.sunColor > 0.0) && (u.pathFlags & kPathFlagDebugNoSun) == 0u) {
                 float2 sq = illumiSobolOwen2DShuffled(sampleIndex, illumiPixelSeed(gid, dimSalt + 3u));
                 isect.accept_any_intersection(true);
                 ray sr; sr.origin = Pofs;
@@ -471,12 +737,22 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 isect.accept_any_intersection(false);
                 if (!blocked) Lv += u.sunColor * nl * (1.0 / M_PI_F);
             }
-            // Unshadowed (the shared fill), so the layer mask is what keeps a lamp in its room.
-            Lv += secondaryLocalLightFill(P, N, layerBits, pVert, sec);
-            // Area EMITTERS (light strips, skylight lenses) — the apertures are sampled below.
-            if (portalCount > 0u) {
-                SecondaryShadeParams pA = pVert; pA.areaLightCount = portalCount;
-                Lv += secondaryAreaLightFill(isect, accel, P, N, layerBits, pA, sec, seed, true);
+            if ((u.pathFlags & kPathFlagDebugNoLocal) != 0u) {
+                // instrument: no local lights at path vertices
+            } else if (!lightSampling) {
+                // Unshadowed (the shared fill), so the layer mask is what keeps a lamp in its room.
+                Lv += secondaryLocalLightFill(P, N, layerBits, pVert, sec);
+                // Area EMITTERS (light strips, skylight lenses) — the apertures are sampled below.
+                if (portalCount > 0u) {
+                    SecondaryShadeParams pA = pVert; pA.areaLightCount = portalCount;
+                    Lv += secondaryAreaLightFill(isect, accel, P, N, layerBits, pA, sec, seed, true);
+                }
+            } else {
+                // DH-1011 — the lamps stay the deterministic unshadowed sum unless they are to be
+                // shadowed; the emitters (and then the lamps) are ONE pick + ONE ray.
+                if (!lampShadows) Lv += secondaryLocalLightFill(P, N, layerBits, pVert, sec);
+                Lv += pathSampleLocalLights(isect, accel, P, N, Pofs, layerBits, lampShadows, true,
+                                            portalCount, pVert, sec, u, sampleIndex, lightSalt, gid);
             }
         }
 
@@ -485,8 +761,9 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         // a scene with more apertures than the cache re-evaluates for the pick.
         float wCache[kPathPortalCache];
         float wSum = 0.0;
+        if ((u.pathFlags & kPathFlagDebugNoApertures) == 0u)
         for (uint i = 0u; i < portalCount; ++i) {
-            float w = pathPortalWeight(sec.areaLights[i], P, N);
+            float w = pathPortalWeightAt(sec.areaLights[i], P, N, layerBits, lightSampling);
             if (i < kPathPortalCache) wCache[i] = w;
             wSum += w;
         }
@@ -495,7 +772,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
             float pick = sel.x * wSum, acc = 0.0, pj = 0.0;
             uint j = portalCount;
             for (uint i = 0u; i < portalCount; ++i) {
-                float w = (i < kPathPortalCache) ? wCache[i] : pathPortalWeight(sec.areaLights[i], P, N);
+                float w = (i < kPathPortalCache) ? wCache[i] : pathPortalWeightAt(sec.areaLights[i], P, N, layerBits, lightSampling);
                 acc += w;
                 if (w > 0.0 && (pick < acc || i + 1u == portalCount)) { j = i; pj = w / wSum; break; }
             }
@@ -518,7 +795,13 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                         // The aperture's OPACITY (1 − pane transmittance): 0 ⇒ an open hole.
                         float tPane = 1.0 - saturate(al.apertureOpacity);
                         float pdfW = dist * dist / (area4 * cosL);          // area → solid angle
-                        Lv += Lo * tPane * cosR / (M_PI_F * pj * pdfW);
+                        // DH-1011 — power-heuristic weight against the continuation's density.
+                        float misW = 1.0;
+                        if (lightSampling) {
+                            float pL = pj * pdfW, pB = cosR * (1.0 / M_PI_F);   // both per steradian
+                            misW = (pL * pL) / max(pL * pL + pB * pB, 1e-30);
+                        }
+                        Lv += Lo * tPane * cosR * misW / (M_PI_F * pj * pdfW);
                     }
                 }
             }
@@ -533,12 +816,41 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         ray r; r.origin = Pofs; r.direction = dir; r.min_distance = tMin; r.max_distance = 1e4;
         auto res = isect.intersect(r, accel, u.transportRayMask);
         float tHit = (res.type != intersection_type::none) ? res.distance : INFINITY;
-        bool throughPortal = false;
-        for (uint i = 0u; i < portalCount && !throughPortal; ++i) {
-            float tc = pathPortalCrossing(sec.areaLights[i], Pofs, dir);
-            throughPortal = tc > 0.0 && tc < tHit;
+        if (lightSampling) {
+            // DH-1011 — a continuation that leaves through a portal is the OTHER strategy for the
+            // aperture integral: keep it, MIS-weighted against the aperture sample's density for
+            // this direction, then end the path there exactly as the aperture sample does.
+            uint kc = portalCount; float tcMin = tHit;
+            for (uint i = 0u; i < portalCount; ++i) {
+                float tc = pathPortalCrossing(sec.areaLights[i], Pofs, dir);
+                if (tc > 0.0 && tc < tcMin) { tcMin = tc; kc = i; }
+            }
+            if (kc < portalCount && (u.pathFlags & kPathFlagDebugNoApertures) != 0u) break;
+            if (kc < portalCount) {
+                RTAreaLight al = sec.areaLights[kc];
+                float wk = (kc < kPathPortalCache) ? wCache[kc] : pathPortalWeightAt(al, P, N, layerBits, lightSampling);
+                float pL = 0.0;
+                float3 nL = cross(al.ex, al.ey);
+                float area4 = 4.0 * length(nL);
+                float cosL = abs(dot(normalize(nL), dir));
+                if (wSum > 0.0 && wk > 0.0 && cosL > 1e-4 && area4 > 0.0)
+                    pL = (wk / wSum) * (tcMin * tcMin) / (area4 * cosL);
+                float pB = max(dot(N, dir), 0.0) * (1.0 / M_PI_F);
+                float misW = (pB * pB) / max(pB * pB + pL * pL, 1e-30);
+                float tPane = 1.0 - saturate(al.apertureOpacity);
+                float3 Lo = pathOutdoorFromResult(isect, accel, res, Pofs, dir, u, pOut, sec,
+                                                  skyEquirect, irrCube, albedoAtlas, seed);
+                L += T * Lo * tPane * misW;
+                break;
+            }
+        } else {
+            bool throughPortal = false;
+            for (uint i = 0u; i < portalCount && !throughPortal; ++i) {
+                float tc = pathPortalCrossing(sec.areaLights[i], Pofs, dir);
+                throughPortal = tc > 0.0 && tc < tHit;
+            }
+            if (throughPortal) break;             // the aperture estimator owns that direction
         }
-        if (throughPortal) break;                 // the aperture estimator owns that direction
         if (res.type == intersection_type::none) {
             constexpr sampler skySamp(filter::linear, address::repeat);
             float3 sky = skyEquirect.sample(skySamp, dirToEquirectUV(dir)).rgb;
@@ -553,7 +865,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         if (dot(h.N, dir) > 0.0) h.N = -h.N;
         h.bary = res.triangle_barycentric_coord;
         h.instanceID = res.instance_id; h.primitiveID = res.primitive_id;
-        L += T * secondaryEmission(h.instanceID, sec.insts);
+        if ((u.pathFlags & kPathFlagDebugNoEmissionHits) == 0u) L += T * secondaryEmission(h.instanceID, sec.insts);
         float3 A = saturate(secondaryAlbedo(h, pFull, sec, albedoAtlas));
         T *= A;
         P = h.P; N = h.N;
@@ -745,8 +1057,23 @@ kernel void illumi_rt_lighting_tlas(
             // DH-0989 — the path-traced lane: each GI ray is a whole path owning the pixel's
             // entire diffuse indirect (see `illumiPathTraceIncoming`). The one-bounce body
             // below is skipped; its cache / curve / stats instruments belong to that estimator.
+            // DH-1011 — the primary surface's ROOM (light-layer bits), which the G-buffer does not
+            // carry: one short ray bracketing the depth-reconstructed point along the view ray
+            // finds the drawn triangle (the chart overlay's probe). Only the aperture pick reads
+            // it, and only under MIS, so a miss (all bits) costs nothing but efficiency.
+            uint primaryLayer = 0xFFFFFFFFu;
+            if ((u.pathFlags & kPathFlagLightSampling) != 0u) {
+                float3 toP = P - u.cameraWorldPos;
+                float dist = length(toP);
+                float3 vdir = toP / max(dist, 1e-6);
+                float bracket = min(0.05, 0.5 * dist);
+                ray pr; pr.origin = P - vdir * bracket; pr.direction = vdir;
+                pr.min_distance = 0.0; pr.max_distance = 2.0 * bracket + 1e-3;
+                auto pres = isect.intersect(pr, accel, 0x01u);
+                if (pres.type == intersection_type::triangle) primaryLayer = secondaryLayerBits(pres.instance_id, insts);
+            }
             for (uint g = 0; g < u.giRays; ++g) {
-                indirect += illumiPathTraceIncoming(isect, accel, Pofs - N * max(u.rayTMin, 1e-3), N,
+                indirect += illumiPathTraceIncoming(isect, accel, Pofs - N * max(u.rayTMin, 1e-3), N, primaryLayer,
                                                     u.giProgressiveIndex * u.giRays + g, gid, u, sec,
                                                     secFull, skyEquirect, irrCube, albedoAtlas, seed);
             }
@@ -863,6 +1190,14 @@ kernel void illumi_rt_lighting_tlas(
         }
         indirect = (indirect / float(u.giRays)) * albedo * u.giStrength;
         cacheTerms += (cacheGI / float(u.giRays)) * albedo * u.giStrength;
+        if (u.pathBounces > 0u && (u.pathFlags & kPathFlagDebugPrimaryLocal) != 0u) {
+            // DH-1011 INSTRUMENT — isolation view: the primary's traced local-light estimate ALONE
+            // (albedo × it), replacing the composite, so traced lamp visibility reads as a ratio
+            // of two frames (shadowed ÷ unshadowed) with nothing else in the pixel.
+            outHDR.write(half4(half3(indirect), outHDR.read(gid).a), gid);
+            rtDiffuse.write(half4(0.0h), gid);
+            return;
+        }
     }
 
     // ── Glossy reflections (RT) ───────────────────────────────────

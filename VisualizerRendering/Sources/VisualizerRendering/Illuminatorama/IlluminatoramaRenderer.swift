@@ -858,10 +858,12 @@ public final class IlluminatoramaRenderer {
     /// **DH-1011 — how a path vertex samples its lights.** True: the aperture sample and the
     /// cosine continuation are combined by multiple importance sampling (power heuristic) instead
     /// of partitioning the hemisphere — a continuation that leaves through a portal is kept,
-    /// weighted, not dropped — and the area emitters are ONE pick ∝ their unshadowed contribution
-    /// with ONE Sobol shadow ray instead of `secondaryAreaShadowRays` white-noise rays each. Same
-    /// integrand, so the converged picture does not move; only its variance does. False: the
-    /// DH-0989 estimator, byte-identical (the A/B lever).
+    /// weighted, not dropped — which in turn lets the aperture PICK leave out the portals of other
+    /// rooms (light-layer mask; the continuation carries their light at full weight); and the area
+    /// emitters are ONE pick ∝ their unshadowed contribution with ONE Sobol shadow ray instead of
+    /// `secondaryAreaShadowRays` white-noise rays each. Same integrand, so the converged picture
+    /// does not move; only its variance does. False: the DH-0989 estimator, byte-identical (the
+    /// A/B lever).
     public var rtPathLightSampling: Bool = true
     /// **DH-1011 — shadowed lamps at path vertices.** True: every point / spot light that casts a
     /// shadow in the deferred pass (`castsShadow` — the trapped cones of lamps, cans, sconces,
@@ -870,11 +872,17 @@ public final class IlluminatoramaRenderer {
     /// the room holds). False: lamps are the unshadowed deterministic fill at a path vertex, as
     /// DH-0989 shipped — which lights the floor under a table from the can above it. Needs
     /// `rtPathLightSampling`. Unshadowed lights (bounce fills, string lights) stay unshadowed.
-    public var rtPathLampShadows: Bool = false
-    /// DH-1011 INSTRUMENT: the path lane returns only the primary surface's traced local-light
-    /// estimate (the lamps the deferred pass normally owns), so the traced lamp visibility can be
-    /// read against the shadow maps. Never set by a host.
-    public var rtPathDebugPrimaryLocal: Bool = false
+    /// The ray stops `kPathLampShadowGap` (25 cm) short of the light so the fixture's own housing
+    /// is not its occluder. Default TRUE since DH-1011: measured on Daydream's many-lights station
+    /// at night it removes a −0.077-stop leak (frame level; 0.085 stops mean tile error; −0.021 by
+    /// day) at +38–43 % path-pass GPU time, flat in the number of fixtures (Daydream DH-1292).
+    public var rtPathLampShadows: Bool = true
+    /// DH-1011 INSTRUMENTS, OR'd into the path flags — never set by a host. 128: the frame is
+    /// replaced by the primary surface's traced local-light estimate alone (traced lamp visibility,
+    /// as a ratio of two frames); 64: a continuation that hits an emissive surface adds nothing
+    /// (the glowing shades' share of the noise, by its absence); 32 / 16 / 8: no local lights /
+    /// no sun / no window apertures at the path's vertices (the noise budget by source).
+    public var rtPathDebugFlags: UInt32 = 0
     /// Cone-sampled shadow rays per pixel per frame for `rtSunSoftShadowsEnabled`'s traced
     /// sun visibility, host-clamped (`rtSunShadowRayCount`'s write, below) and shader-clamped
     /// (`rtSunSoftVisibility`, IlluminatoramaLighting.metal) to 1…32. DH-0856 measured this
@@ -9704,7 +9712,7 @@ public final class IlluminatoramaRenderer {
         // DH-1011 — light sampling + MIS (bit 0), shadowed lamps (bit 1, needs bit 0), instrument (bit 7).
         u.pathFlags = !pathOn ? 0 : (rtPathLightSampling ? 1 : 0)
             | (rtPathLightSampling && rtPathLampShadows ? 2 : 0)
-            | (rtPathDebugPrimaryLocal ? 128 : 0)
+            | (rtPathDebugFlags & 0xF8)
         // Surface cache read (P1c): on only when the grouped soup + cards + base
         // are all live this topology. The kernel gates every atlas read on this.
         let cacheOn = surfCacheActive && surfCardCount > 0
