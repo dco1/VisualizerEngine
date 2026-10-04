@@ -151,7 +151,14 @@ struct RTInstUniforms {
     // DH-0989 estimator exactly (byte-identical): apertures an exact partition with the cosine
     // continuation (a continuation through a portal is dropped), lamps an unshadowed deterministic
     // sum, every area emitter traced with `areaShadowRays` white-noise rays.
-    uint pathFlags; uint _padPath0; uint _padPath1; uint _padPath2;
+    uint pathFlags;
+    // Daydream DH-1293 — the lamps' NEAR FIELD at path vertices (never the primary, whose lamps the
+    // deferred pass owns). `pathLampMinDist` (m, INSTRUMENT, biased by construction): the 1/d²
+    // falloff is floored at this distance; negative ⇒ no lamp light at all closer than |it|. `pathLampSourceRadius` (m): a finite source — the
+    // falloff becomes 1/(d² + r²), the on-axis law of a luminous DISC of radius r (a can's aperture,
+    // a shade's opening), combined with the light's own `softRadius` by max. Both 0 ⇒ the shipped
+    // point-source law exactly (byte-identical). Were `_padPath0/_padPath1`.
+    float pathLampMinDist; float pathLampSourceRadius; uint _padPath2;
 };
 
 /// DH-1011 — `RTInstUniforms.pathFlags` bits.
@@ -487,19 +494,29 @@ static inline float pathPortalWeightAt(RTAreaLight al, float3 P, float3 N, uint 
 // selection weight (by luminance) too. Same layer mask, range window, cone and N·L tests as those
 // sums, so a light the sum skips has weight 0 here and a light the sum counts can be picked.
 
-static inline float3 pathPointContribution(RTPointLight pl, float3 P, float3 N, uint layerBits) {
+/// DH-1293 — a lamp's distance falloff at a path vertex. `near` = (pathLampMinDist,
+/// pathLampSourceRadius); (0, 0) ⇒ `1/max(d² + softRadius², 1e-4)`, the shipped law, exactly.
+/// A NEGATIVE `pathLampMinDist` is the exclusion instrument: no light at all closer than |it|.
+static inline float pathLampAtten(float dist, float softRadius, float2 near) {
+    if (near.x < 0.0 && dist < -near.x) return 0.0;
+    float r2 = max(softRadius * softRadius, near.y * near.y);
+    float floorD = max(near.x, 0.0);
+    return 1.0 / max(dist * dist + r2, max(floorD * floorD, 1e-4));
+}
+
+static inline float3 pathPointContribution(RTPointLight pl, float3 P, float3 N, uint layerBits, float2 near) {
     if (pl.giVisible == 0u || (pl.layerMask & layerBits) == 0u) return float3(0.0);
     float3 toL = pl.position - P;
     float dist = length(toL);
     if (dist > pl.radius) return float3(0.0);
     float nl = saturate(dot(N, toL / max(dist, 1e-4)));
     if (nl <= 0.0) return float3(0.0);
-    float atten = 1.0 / max(dist * dist + pl.softRadius * pl.softRadius, 1e-4);
+    float atten = pathLampAtten(dist, pl.softRadius, near);
     float window = saturate(1.0 - pow(dist / pl.radius, 4.0));
     return pl.color * (atten * window * window * nl * (1.0 / M_PI_F));
 }
 
-static inline float3 pathSpotContribution(RTSpotLight sl, float3 P, float3 N, uint layerBits) {
+static inline float3 pathSpotContribution(RTSpotLight sl, float3 P, float3 N, uint layerBits, float2 near) {
     if (sl.giVisible == 0u || (sl.layerMask & layerBits) == 0u) return float3(0.0);
     float3 toL = sl.position - P;
     float dist = length(toL);
@@ -509,7 +526,7 @@ static inline float3 pathSpotContribution(RTSpotLight sl, float3 P, float3 N, ui
     if (coneAtten <= 0.0) return float3(0.0);
     float nl = saturate(dot(N, L));
     if (nl <= 0.0) return float3(0.0);
-    float atten = 1.0 / max(dist * dist + sl.softRadius * sl.softRadius, 1e-4);
+    float atten = pathLampAtten(dist, sl.softRadius, near);
     float window = saturate(1.0 - pow(dist / sl.radius, 4.0));
     return sl.color * (atten * window * window * coneAtten * nl * (1.0 / M_PI_F));
 }
@@ -539,14 +556,25 @@ static inline float3 pathEmitterContribution(RTAreaLight al, float3 P, float3 N,
 /// Light index space for the one pick: [0, nPoint) points, then spots, then area emitters.
 /// `lamps` false ⇒ points and spots are left out (the caller adds their deterministic sum).
 static inline float3 pathLocalContribution(uint k, bool lamps, float3 P, float3 N, uint layerBits,
-                                           SecondaryShadeParams p, SecondaryScene sec) {
+                                           SecondaryShadeParams p, SecondaryScene sec, float2 near) {
     uint nP = lamps ? p.pointLightCount : 0u;
     uint nS = lamps ? p.spotLightCount : 0u;
-    if (k < nP) return pathPointContribution(sec.pointLights[k], P, N, layerBits);
+    if (k < nP) return pathPointContribution(sec.pointLights[k], P, N, layerBits, near);
     k -= nP;
-    if (k < nS) return pathSpotContribution(sec.spotLights[k], P, N, layerBits);
+    if (k < nS) return pathSpotContribution(sec.spotLights[k], P, N, layerBits, near);
     k -= nS;
     return pathEmitterContribution(sec.areaLights[k], P, N, layerBits);
+}
+
+/// DH-1293 — the lamps' deterministic unshadowed sum at a path vertex under a near-field lever:
+/// `secondaryLocalLightFill`'s exact terms (`pathLocalContribution` mirrors them) with
+/// `pathLampAtten`'s falloff. Called only when a lever is on; off, the shared fill runs unchanged.
+static inline float3 pathLampSum(float3 P, float3 N, uint layerBits, SecondaryShadeParams p,
+                                 SecondaryScene sec, float2 near) {
+    float3 s = float3(0.0);
+    uint n = p.pointLightCount + p.spotLightCount;
+    for (uint k = 0u; k < n; ++k) s += pathLocalContribution(k, true, P, N, layerBits, p, sec, near);
+    return s;
 }
 
 /// ONE light from the vertex's local emitters, picked ∝ its unshadowed contribution, with ONE
@@ -564,13 +592,14 @@ static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceler
     uint nP = lamps ? p.pointLightCount : 0u;
     uint nS = lamps ? p.spotLightCount : 0u;
     uint n = nP + nS + areaCount;
+    float2 near = float2(u.pathLampMinDist, u.pathLampSourceRadius);   // DH-1293; (0,0) ⇒ shipped
     // Weights evaluated ONCE and reused by the pick (the first `kPathLightCache` lights; a room past
     // that re-evaluates the rest on the pick pass) — measured, the second full pass cost as much
     // as the shadow ray itself.
     float wc[kPathLightCache];
     float W = 0.0;
     for (uint k = 0u; k < n; ++k) {
-        float wk = pathLuma(pathLocalContribution(k, lamps, P, N, layerBits, p, sec));
+        float wk = pathLuma(pathLocalContribution(k, lamps, P, N, layerBits, p, sec, near));
         if (k < kPathLightCache) wc[k] = wk;
         W += wk;
     }
@@ -580,12 +609,12 @@ static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceler
     uint j = n; float wj = 0.0;
     for (uint k = 0u; k < n; ++k) {
         float wk = (k < kPathLightCache) ? wc[k]
-                                          : pathLuma(pathLocalContribution(k, lamps, P, N, layerBits, p, sec));
+                                          : pathLuma(pathLocalContribution(k, lamps, P, N, layerBits, p, sec, near));
         acc += wk;
         if (wk > 0.0 && (pick < acc || k + 1u == n)) { j = k; wj = wk; break; }
     }
     if (j >= n || wj <= 0.0) return float3(0.0);
-    float3 c = pathLocalContribution(j, lamps, P, N, layerBits, p, sec);
+    float3 c = pathLocalContribution(j, lamps, P, N, layerBits, p, sec, near);
     float pj = wj / W;
 
     // Visibility — the same rule the deferred pass / the old sums apply per light class.
@@ -712,6 +741,9 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
     // DH-1011 — light sampling (see the lane's header comment and `kPathFlag*`).
     bool lightSampling = (u.pathFlags & kPathFlagLightSampling) != 0u;
     bool lampShadows   = (u.pathFlags & kPathFlagLocalShadows) != 0u;
+    // DH-1293 — the lamps' near-field levers (see `RTInstUniforms.pathLampMinDist`).
+    float2 nearLevers = float2(u.pathLampMinDist, u.pathLampSourceRadius);
+    bool lampNear = nearLevers.x != 0.0 || nearLevers.y > 0.0;
     if ((u.pathFlags & kPathFlagDebugPrimaryLocal) != 0u) {
         // INSTRUMENT: the primary's own local-light NEE and nothing else — the traced lamp
         // visibility, readable against the deferred pass's shadow-mapped lamps (DH-1011).
@@ -741,7 +773,8 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 // instrument: no local lights at path vertices
             } else if (!lightSampling) {
                 // Unshadowed (the shared fill), so the layer mask is what keeps a lamp in its room.
-                Lv += secondaryLocalLightFill(P, N, layerBits, pVert, sec);
+                Lv += lampNear ? pathLampSum(P, N, layerBits, pVert, sec, nearLevers)
+                               : secondaryLocalLightFill(P, N, layerBits, pVert, sec);
                 // Area EMITTERS (light strips, skylight lenses) — the apertures are sampled below.
                 if (portalCount > 0u) {
                     SecondaryShadeParams pA = pVert; pA.areaLightCount = portalCount;
@@ -750,7 +783,8 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
             } else {
                 // DH-1011 — the lamps stay the deterministic unshadowed sum unless they are to be
                 // shadowed; the emitters (and then the lamps) are ONE pick + ONE ray.
-                if (!lampShadows) Lv += secondaryLocalLightFill(P, N, layerBits, pVert, sec);
+                if (!lampShadows) Lv += lampNear ? pathLampSum(P, N, layerBits, pVert, sec, nearLevers)
+                                                 : secondaryLocalLightFill(P, N, layerBits, pVert, sec);
                 Lv += pathSampleLocalLights(isect, accel, P, N, Pofs, layerBits, lampShadows, true,
                                             portalCount, pVert, sec, u, sampleIndex, lightSalt, gid);
             }

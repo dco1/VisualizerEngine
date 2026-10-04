@@ -883,6 +883,18 @@ public final class IlluminatoramaRenderer {
     /// (the glowing shades' share of the noise, by its absence); 32 / 16 / 8: no local lights /
     /// no sun / no window apertures at the path's vertices (the noise budget by source).
     public var rtPathDebugFlags: UInt32 = 0
+    /// **DH-1293 INSTRUMENT — floor the lamps' `1/d²` at path vertices** (metres; 0 ⇒ off,
+    /// byte-identical). A lamp / can / sconce reaching a path vertex closer than this lights it as
+    /// if it were this far away. BIASED by construction — it removes the near-field energy it
+    /// floors — so it answers "how much of a still's noise is vertices landing next to a bulb",
+    /// and is never set by a host. Path vertices only: the primary's lamps are the deferred pass's.
+    /// NEGATIVE ⇒ the exclusion form: a lamp adds nothing to a vertex closer than |value|.
+    public var rtPathLampMinDistance: Float = 0
+    /// **DH-1293 — a finite SOURCE size for the lamps at path vertices** (metres; 0 ⇒ off,
+    /// byte-identical). The falloff becomes `1/(d² + r²)` — the exact on-axis irradiance of a
+    /// luminous disc of radius r — combined with each light's own `softRadius` by max. A physical
+    /// lever (a can's aperture, a shade's opening has size), default off until it earns its place.
+    public var rtPathLampSourceRadius: Float = 0
     /// Cone-sampled shadow rays per pixel per frame for `rtSunSoftShadowsEnabled`'s traced
     /// sun visibility, host-clamped (`rtSunShadowRayCount`'s write, below) and shader-clamped
     /// (`rtSunSoftVisibility`, IlluminatoramaLighting.metal) to 1…32. DH-0856 measured this
@@ -1370,6 +1382,10 @@ public final class IlluminatoramaRenderer {
     /// diagnostics that compare lenses in scene-linear light. Nil until the pass has run; its
     /// contents are this frame's only if `dofApplied`. Private storage: blit it.
     public var dofOutputTextureForDiagnostics: MTLTexture? { dofOutputTexture }
+    /// DH-1293 — the RT lighting pass's raw per-frame diffuse (sun shadow + GI, before any denoise
+    /// or temporal blend), for per-sample statistics: with the path lane at one path per pixel per
+    /// frame, each texel IS one path sample. Read-only diagnostics; internal resolution, rgba16Float.
+    public var rtDiffuseTextureForDiagnostics: MTLTexture { rtDiffuseTexture }
 
     /// **Pin the auto-exposure meter's sample grid** (opt-in, VZ-0197; nil = the internal render size,
     /// as always). `illumi_exposure_estimate` samples 256 × 32 cells by LINEAR index over an
@@ -4694,7 +4710,8 @@ public final class IlluminatoramaRenderer {
         var pathClamp: Float = 0
         /// DH-1011 — `kPathFlag*` (Metal twin appended last; three pads keep the 16-byte tail).
         var pathFlags: UInt32 = 0
-        var padPath0: UInt32 = 0, padPath1: UInt32 = 0, padPath2: UInt32 = 0
+        /// DH-1293 — the lamps' near field at path vertices (were `padPath0/padPath1`, same bytes).
+        var pathLampMinDist: Float = 0, pathLampSourceRadius: Float = 0, padPath2: UInt32 = 0
 
         mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
             let p = InteriorRoomGains.pack(gains, enabled: enabled)
@@ -9713,6 +9730,9 @@ public final class IlluminatoramaRenderer {
         u.pathFlags = !pathOn ? 0 : (rtPathLightSampling ? 1 : 0)
             | (rtPathLightSampling && rtPathLampShadows ? 2 : 0)
             | (rtPathDebugFlags & 0xF8)
+        // DH-1293 — the lamps' near-field levers (0 ⇒ the shipped point-source law).
+        u.pathLampMinDist = pathOn ? rtPathLampMinDistance : 0
+        u.pathLampSourceRadius = pathOn ? max(0, rtPathLampSourceRadius) : 0
         // Surface cache read (P1c): on only when the grouped soup + cards + base
         // are all live this topology. The kernel gates every atlas read on this.
         let cacheOn = surfCacheActive && surfCardCount > 0
