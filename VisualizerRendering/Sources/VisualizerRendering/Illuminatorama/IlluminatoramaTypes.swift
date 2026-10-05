@@ -804,7 +804,11 @@ public struct IlluminatoramaPointLight {
     /// shadow map, origin just outboard of its own wall, relying on the deferred pass's own
     /// normal-facing/cone-direction rejection — leaks its full, un-occluded, facade-calibrated
     /// brightness onto nearby interior GI bounces. Mirrors the Metal `PointLight.giVisible`.
+    /// Daydream DH-1320 — `secondaryOnly` (2): the other way round — the light reaches secondary
+    /// hits ONLY and the deferred pass skips it: a stand-in for the light a traced bounce's HIT
+    /// receives (a lamp's first bounce, while the traced bounce delivers that bounce to the primary).
     public var giVisible: UInt32 = 1
+    public static let secondaryOnly: UInt32 = 2
 
     public init(position: SIMD3<Float>, radius: Float, color: SIMD3<Float>,
                 layerMask: UInt32 = 0xFFFF_FFFF,

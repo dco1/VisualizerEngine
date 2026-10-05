@@ -839,6 +839,39 @@ public final class IlluminatoramaRenderer {
     /// its meaning. The diffuse sibling of DH-0896's `reflReplacesIBL`. Default `false`:
     /// byte-identical for every host that does not opt in.
     public var rtGIReplacesDiffuseSky: Bool = false
+    /// **Daydream DH-1320 — which of a host's room-fill STAND-INS the one-bounce traced GI owns.**
+    /// A host that lights interiors without transport (interior irradiance bands, an ambient
+    /// supplement, window apertures as area lights) is describing the light a traced bounce
+    /// brings back: the bounce's misses ARE the sky through the window and its hits are lit
+    /// surfaces. With the traced GI running, each named stand-in is handed to it the way
+    /// `rtGIReplacesDiffuseSky` hands over the outdoor-cube sky (the lighting pass writes the share
+    /// to the hand-off target, the traced pass subtracts it where its rays ran) — the one-bounce
+    /// sibling of `rtPathTracedGI`'s whole-indirect hand-off, one bit per stand-in so each can be
+    /// measured alone. Needs `rtGIReplacesDiffuseSky`; ignored on the path lane (which already
+    /// owns all of it). Empty (default) ⇒ byte-identical.
+    public struct GIRoomFillHandoff: OptionSet, Sendable {
+        public let rawValue: UInt32
+        public init(rawValue: UInt32) { self.rawValue = rawValue }
+        /// The whole diffuse IBL — interior bands, room gains, interior scalars (frame bit 16).
+        public static let bands = GIRoomFillHandoff(rawValue: 1)
+        /// The ambient supplement (frame bit 32).
+        public static let ambient = GIRoomFillHandoff(rawValue: 2)
+        /// Area lights flagged `isAperture` — window portals (frame bit 64).
+        public static let apertures = GIRoomFillHandoff(rawValue: 4)
+        public static let all: GIRoomFillHandoff = [.bands, .ambient, .apertures]
+    }
+    public var rtGIOwnsRoomFill: GIRoomFillHandoff = []
+    /// **Daydream DH-1320 — a one-bounce GI hit is lit by the host's room fill.** The one-bounce
+    /// estimator shades a hit with its sun, lamps, apertures and emission but NO indirect of its
+    /// own (`giBounceParams`), because the receiving pixel used to carry the room fill itself.
+    /// Once that fill is handed to the traced GI (`rtGIOwnsRoomFill`), the hit needs its own
+    /// incoming indirect or every second-and-later bounce goes missing. True: an uncached hit
+    /// takes the full secondary fill estimate (`secondaryIndirectFill` on the full-radiance
+    /// params — the same stand-in a non-resident surface-cache card falls back to), so the
+    /// estimate is one traced bounce onto surfaces lit the way the deferred pass lights them
+    /// (a final gather), and a cached hit keeps the cache's traced multi-bounce. Default false ⇒
+    /// byte-identical. Ignored on the path lane.
+    public var rtGIHitFill: Bool = false
     /// **The path-traced GI lane (Daydream DH-0989; DH-0642's reference is the same lane at a deep
     /// budget).** When true each of `rtGIRays` is a whole multi-bounce path — next-event estimation
     /// of the sun, the local lights and ONE window aperture per vertex, a cosine continuation,
@@ -9808,6 +9841,7 @@ public final class IlluminatoramaRenderer {
         // DH-1014 — the layered weights apply to the one-bounce GI too, so NOT gated on `pathOn`.
         u.pathFlags |= (dfgLUTEnabled && layeredMultiscatter ? 256 : 0)
             | (dfgLUTEnabled && layeredClothSheen ? 512 : 0)
+            | (!pathOn && rtGIHitFill ? 1024 : 0)            // DH-1320 — `kPathFlagOneBounceHitFill`
         // DH-1293 — the lamps' near-field levers (0 ⇒ the shipped point-source law).
         u.pathLampMinDist = pathOn ? rtPathLampMinDistance : 0
         u.pathLampSourceRadius = pathOn ? max(0, rtPathLampSourceRadius) : 0
@@ -15594,6 +15628,10 @@ public final class IlluminatoramaRenderer {
         // path-traced lane owns the diffuse indirect this frame, so the lighting pass hands ALL of
         // it over (`kFrameFlagPathOwnsIndirect`).
         if rtPathTracedGI && diffSkyHandoffActive { u.shadowEnabled |= 2 }
+        // DH-1320 — the one-bounce lane's hand-off of the host's room-fill stand-ins (bits 16/32/64).
+        if !rtPathTracedGI && rtGIReplacesDiffuseSky && diffSkyHandoffActive {
+            u.shadowEnabled |= (rtGIOwnsRoomFill.rawValue & 7) << 4
+        }
         // DH-1014 — the layered BSDF (`kFrameFlagLayeredMultiscatter` 4 / `…Sheen` 8).
         if dfgLUTEnabled && layeredMultiscatter { u.shadowEnabled |= 4 }
         if dfgLUTEnabled && layeredClothSheen { u.shadowEnabled |= 8 }

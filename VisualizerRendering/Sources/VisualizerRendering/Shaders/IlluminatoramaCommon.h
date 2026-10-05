@@ -47,6 +47,16 @@ using namespace metal;
 /// diffuse indirect: the lighting pass writes its diffuse IBL (bands included) + ambient + area-light
 /// share to `diffSkyOut`, and the traced pass subtracts it where it ran (DH-0989).
 #define kFrameFlagPathOwnsIndirect 2u
+/// FrameUniforms.frameFlags bits 4–6 (16/32/64) — the ONE-BOUNCE traced GI owns a host's room-fill
+/// stand-ins this frame (Daydream DH-1320, `IlluminatoramaRenderer.rtGIOwnsRoomFill`): the lighting
+/// pass adds the named share to `diffSkyOut` beside the outdoor-cube sky, and the traced pass
+/// subtracts it where its GI ran — the one-bounce sibling of `kFrameFlagPathOwnsIndirect`, one bit
+/// per stand-in so each can be measured on its own. 16 = the whole diffuse IBL (interior bands and
+/// room gains included), 32 = the ambient supplement, 64 = the window APERTURES (area lights flagged
+/// `isAperture`). All clear ⇒ the outdoor-cube share alone, exactly as before.
+#define kFrameFlagGIOwnsBands      16u
+#define kFrameFlagGIOwnsAmbient    32u
+#define kFrameFlagGIOwnsApertures  64u
 
 struct FrameUniforms {
     float4x4 viewProjection;
@@ -616,9 +626,12 @@ struct PointLight {
     // rejection) leaks its full un-occluded, facade-calibrated brightness onto nearby
     // interior GI bounces — read as a locally saturated colour cast next to that window.
     // Ignored by this deferred kernel; consumed only by the RT mirror. Default 1 ⇒
-    // byte-identical for every light that never opts out.
+    // byte-identical for every light that never opts out. Daydream DH-1320 — 2
+    // (`kGIVisibleSecondaryOnly`, point lights): the OTHER way round — secondary hits only,
+    // and the deferred kernel skips it (a stand-in for the light a traced bounce's hit receives).
     uint   giVisible;
 };
+#define kGIVisibleSecondaryOnly 2u
 
 // Rectangular area light (#60 task 5). Mirror of Swift IlluminatoramaAreaLight.
 // Rectangle corners = center ± ex ± ey; emitting normal = normalize(cross(ex,ey)).

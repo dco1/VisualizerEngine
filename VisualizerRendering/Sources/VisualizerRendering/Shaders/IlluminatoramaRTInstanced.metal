@@ -184,6 +184,12 @@ struct RTInstUniforms {
 /// with `bulbRadius` 0 keeps the point law. Off ⇒ every lamp a point (the shipped-before law).
 #define kPathFlagLampBulbs         4u
 #define kPathFlagDebugPrimaryLocal 128u
+/// Daydream DH-1320 — `kPathFlagOneBounceHitFill` (`IlluminatoramaRenderer.rtGIHitFill`): the
+/// ONE-BOUNCE estimator only (never set with `pathBounces` > 0). An uncached GI hit takes the full
+/// secondary fill estimate as its own incoming indirect — the stand-in a non-resident cache card
+/// already falls back to — instead of none, because the receiving pixel no longer carries the
+/// room fill that used to stand in for it.
+#define kPathFlagOneBounceHitFill 1024u
 /// INSTRUMENT: a continuation that hits an emissive surface adds nothing — the share of a still's
 /// noise the glowing shades are, measured by its absence. Never set by a host.
 #define kPathFlagDebugNoEmissionHits 64u
@@ -1196,9 +1202,17 @@ kernel void illumi_rt_lighting_tlas(
                     }
                 }
                 surfStat(surfHitStats, u.surfStatsEnabled, cardState);
+                // DH-1320 — an uncached hit (no cache, or no card) lit by the room fill: the same
+                // full-radiance estimate the FALLBACK above uses, through the same slot.
+                bool hitFill = (u.pathFlags & kPathFlagOneBounceHitFill) != 0u
+                            && (cardState == SURF_STAT_RESHADE || cardState == SURF_STAT_NOCARD);
+                if (hitFill) {
+                    cacheIrr = secondaryIndirectFill(h.N, secondaryLayerBits(res.instance_id, insts),
+                                                     secFull, irrCube);
+                }
                 float3 cacheTerm;
                 indirect += shadeSecondarySurface(isect, accel, h, secBounce, sec, irrCube, albedoAtlas, seed,
-                                                  cardState == SURF_STAT_CACHED || cardState == SURF_STAT_FALLBACK,
+                                                  hitFill || cardState == SURF_STAT_CACHED || cardState == SURF_STAT_FALLBACK,
                                                   cacheIrr, cacheTerm);
                 cacheGI += cacheTerm;
             } else if (kRTCurvesEnabled && res.type == intersection_type::curve) {

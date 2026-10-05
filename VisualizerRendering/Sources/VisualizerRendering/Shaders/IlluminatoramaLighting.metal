@@ -1423,6 +1423,10 @@ kernel void illumi_lighting(
         // so applying the coarse position-based room mask on top would double-darken
         // and re-introduce the doorway over-block the shadow exists to fix.
         if (pl.castsShadow == 0u && (pl.layerMask & fragLayer) == 0u) continue;
+        // Daydream DH-1320 — `giVisible == 2`: a stand-in for light arriving at a SECONDARY hit
+        // only (a lamp's first bounce, lighting the surfaces a traced GI bounce lands on); the
+        // traced bounce itself delivers that light to the primary, so this pass must not.
+        if (pl.giVisible == kGIVisibleSecondaryOnly) continue;
         float3 toLight = pl.position - worldPos;
         float  dist    = length(toLight);
         if (dist > pl.radius) continue;
@@ -2040,6 +2044,12 @@ kernel void illumi_lighting(
         // ambient supplement — not only the outdoor-cube share.
         if ((frame.frameFlags & kFrameFlagPathOwnsIndirect) != 0u) {
             diffSkyInComposite = dbgDiffuseIBL + dbgAmbient;
+        } else {
+            // DH-1320 — the one-bounce GI's share of the same hand-off, per stand-in (see
+            // `kFrameFlagGIOwns*`). Its misses are the sky through the window and its hits the lit
+            // room, so a band or supplement left here would be the room's bounce counted twice.
+            if ((frame.frameFlags & kFrameFlagGIOwnsBands) != 0u) diffSkyInComposite = dbgDiffuseIBL;
+            if ((frame.frameFlags & kFrameFlagGIOwnsAmbient) != 0u) diffSkyInComposite += dbgAmbient;
         }
         // Ambient sheen — the same lobe against the flat ambient term, so a scene that lights
         // its interior with `ambientColor` rather than an IBL probe still gets fabric. Uses
@@ -2059,7 +2069,7 @@ kernel void illumi_lighting(
         float3 amb = mix(ambCol * 0.4, ambCol, upness) * albedo;
         indirect = amb * ao * interiorAmbK;
         dbgAmbient = amb * ao * interiorAmbK;
-        if ((frame.frameFlags & kFrameFlagPathOwnsIndirect) != 0u) diffSkyInComposite = dbgAmbient;
+        if ((frame.frameFlags & (kFrameFlagPathOwnsIndirect | kFrameFlagGIOwnsAmbient)) != 0u) diffSkyInComposite = dbgAmbient;
     }
 
     // Issue #65 — fold the indirect DIFFUSE (diffuse-IBL irradiance + ambient
@@ -2195,7 +2205,7 @@ kernel void illumi_lighting(
     // DH-0989 — and the area lights: in this lane they are the window APERTURES the path samples
     // directly (their glossy share comes back through the traced reflections, which see the sky
     // through the same opening).
-    if ((frame.frameFlags & kFrameFlagPathOwnsIndirect) != 0u) diffSkyInComposite += apertureSum;
+    if ((frame.frameFlags & (kFrameFlagPathOwnsIndirect | kFrameFlagGIOwnsApertures)) != 0u) diffSkyInComposite += apertureSum;
 
     // Per-term split-render: isolate ONE contribution so a flooded/flat scene
     // can be decomposed. Surfaces only — sky already returned above.
