@@ -4377,7 +4377,8 @@ public final class IlluminatoramaRenderer {
         /// GI, and has the SAME raw-sample leak). Mirrors `scotopicDesaturation`. Repurposes
         /// `_scPad1` — same 4 bytes. 0 (day) ⇒ byte-identical.
         var scotopicDesaturation: Float = 0
-        var _scPad2: UInt32 = 0
+        /// DH-1314 — mirrors `surfaceCacheCardlessReshade` (repurposes `_scPad2`, same 4 bytes).
+        var cardlessReshade: UInt32 = 1
     }
     private let surfCachePipeline: MTLComputePipelineState?
     /// §3 endpoint — TLAS-traced cache-update (traces the per-frame-refit instance
@@ -4933,6 +4934,8 @@ public final class IlluminatoramaRenderer {
     // so a TLAS hit resolves `soupTriBase[instance_id] + primitive_id` → card.
     private var rtSoupTriBaseBuffer: MTLBuffer?
     private var rtSoupTriBaseCount: Int = 0
+    /// Instances the last card bake left cardless (DH-1314) — read-only diagnostic.
+    public private(set) var surfaceCacheCardlessInstances: Int = 0
     private var rtInstanceDataBuffer: MTLBuffer? // RTInstanceData[], grouped order
     private var rtInstanceDescBuffer: MTLBuffer? // MTLAccelerationStructureInstanceDescriptor[]
     private var rtTLAS: MTLAccelerationStructure?
@@ -5152,6 +5155,30 @@ public final class IlluminatoramaRenderer {
     /// Atlas texels per side of a per-triangle card tile, read at each card bake. A large triangle's
     /// texels span tens of cm at 6, which is what DH-0849 (light along junctions) is being A/B'd against.
     public var surfaceCachePerTriangleTileSize: Int = 6
+    /// DH-1314 — how the cache update treats a bounce ray that lands on a CARDLESS mesh
+    /// (`IlluminatoramaMesh.surfaceCacheCards = false`): true (default) re-shades it once — its
+    /// own sun plus the gathering texel's indirect, times its albedo; false brings back nothing
+    /// (a black occluder — the A/B arm). Inert in a scene with no cardless mesh.
+    public var surfaceCacheCardlessReshade: Bool = true
+
+    /// What the surface cache would card on the current instance set (DH-1314): the
+    /// instance-EXPANDED triangles of meshes that take cards — the number the bake compares with
+    /// `surfaceCacheMaxTriangles` — and those of meshes that opted out (`surfaceCacheCards =
+    /// false`). `carded + excluded` = `frameDrawCensus.expandedTriangles`.
+    public var surfaceCacheTriangleCensus: (carded: Int, excluded: Int) {
+        var carded = 0, excluded = 0
+        for g in meshGroups {
+            guard let m = meshes[g.kind] else { continue }
+            let t = g.count * (m.indexCount / 3)
+            if m.surfaceCacheCards { carded += t } else { excluded += t }
+        }
+        return (carded, excluded)
+    }
+    /// `soupTriBase` value of an instance whose mesh takes no cards (DH-1314). Every consumer
+    /// resolves a TLAS hit as `soupTriBase[instance] + primitive`, bounds-checked against the
+    /// soup's triangle count, so this reads "no card" everywhere; the cache-update kernel keys its
+    /// cardless re-shade off it. Mirror of the Metal `SC_NO_CARD_SOUP_BASE`.
+    static let surfaceCacheNoCardSoupBase: UInt32 = 0x8000_0000
 
     /// Reset the RT auto-disable guard. Called on every scene attach (via
     /// `IlluminatoramaOverlay.setExtractedSceneRT`) so a freshly-shown scene
@@ -8417,6 +8444,7 @@ public final class IlluminatoramaRenderer {
             // DH-0872 — same coefficient the tonemap pass uses, applied to this pass's own
             // raw sky-miss sample (see the kernel's miss branch).
             u.scotopicDesaturation = max(0, scotopicDesaturation)
+            u.cardlessReshade = surfaceCacheCardlessReshade ? 1 : 0
             memcpy(surfCacheUniformBuffer.contents(), &u, MemoryLayout<SurfCacheUniforms>.stride)
 
             // Warm passes go untimed: the per-pass GPU timer holds 48 passes a frame.
@@ -8450,6 +8478,9 @@ public final class IlluminatoramaRenderer {
                 // buffers (and the curve BLASes the pooled curve buffers) — all must
                 // be resident for the intersector.
                 enc.setBuffer(rtSoupTriBaseBuffer, offset: 0, index: 9)
+                // DH-1314 — a cardless hit is re-shaded from the RT instance rows + object normals.
+                enc.setBuffer(rtInstanceDataBuffer ?? cdirty, offset: 0, index: 11)
+                enc.setBuffer(rtObjNormalBuffer ?? cdirty, offset: 0, index: 12)
                 for blas in rtBLASList { enc.useResource(blas, usage: .read) }
                 for blas in rtCurveBLASList { enc.useResource(blas, usage: .read) }
                 for buf in rtResidentBuffers { enc.useResource(buf, usage: .read) }
@@ -9344,12 +9375,14 @@ public final class IlluminatoramaRenderer {
     /// + the hit's local `primitive_id` resolves to the global card index.
     private func buildGroupedSurfaceSoup(total: Int) {
         surfHasDeformingCards = false   // recomputed below; cleared so an early return can't leave it stale
-        // Cost gate: the instance-expanded triangle count, not the per-mesh count.
-        var expandedTris = 0
-        for g in meshGroups { if let m = meshes[g.kind] { expandedTris += g.count * (m.indexCount / 3) } }
+        surfaceCacheCardlessInstances = 0
+        // Cost gate: the instance-expanded triangle count, not the per-mesh count — of the meshes
+        // that take cards. A mesh that opted out (`surfaceCacheCards = false`, DH-1314) adds no
+        // soup triangles and no cards, so it does not count against the cap.
+        let (expandedTris, excludedTris) = surfaceCacheTriangleCensus
         guard expandedTris > 0, expandedTris <= surfaceCacheMaxTriangles else {
             if expandedTris > surfaceCacheMaxTriangles {
-                Self.log.notice("Surface cache (TLAS) skipped: \(expandedTris) tris > cap \(self.surfaceCacheMaxTriangles)")
+                Self.log.notice("Surface cache (TLAS) skipped: \(expandedTris) tris > cap \(self.surfaceCacheMaxTriangles) (\(excludedTris) cardless tris not counted)")
             }
             // Leave the cache off for this scene; the kernel gates on the uniform.
             surfCardCount = 0; rtSoupTriBaseBuffer = nil; rtSoupTriBaseCount = 0
@@ -9392,8 +9425,16 @@ public final class IlluminatoramaRenderer {
             let base = UInt32(indices.count / 3)
             for k in 0..<group.count where group.start + k < total { soupBase[group.start + k] = base }
         }
+        // DH-1314 — instances of a cardless mesh: an empty soup range here (so `soupBase` stays
+        // monotonic for every CPU consumer), and the no-card sentinel in the GPU copy below.
+        var cardlessInstances: [Int] = []
         for group in meshGroups {
             guard let mesh = meshes[group.kind] else { markEmptyRange(group); continue }
+            if !mesh.surfaceCacheCards {
+                markEmptyRange(group)
+                for k in 0..<group.count where group.start + k < total { cardlessInstances.append(group.start + k) }
+                continue
+            }
             let isDeforming = deformingKinds.contains(group.kind)
             let soup: (positions: [SIMD3<Float>], indices: [UInt32])
             if isDeforming {
@@ -9618,8 +9659,13 @@ public final class IlluminatoramaRenderer {
                 }
             }
         }
+        // The GPU copy: a cardless instance's slot holds the sentinel, so a TLAS hit on it resolves
+        // to "no card" in every consumer instead of to its neighbour's triangles.
+        var gpuSoupBase = soupBase
+        for i in cardlessInstances { gpuSoupBase[i] = Self.surfaceCacheNoCardSoupBase }
+        surfaceCacheCardlessInstances = cardlessInstances.count
         rtSoupTriBaseBuffer = device.makeBuffer(
-            bytes: soupBase, length: MemoryLayout<UInt32>.stride * soupBase.count,
+            bytes: gpuSoupBase, length: MemoryLayout<UInt32>.stride * gpuSoupBase.count,
             options: .storageModeShared)
         rtSoupTriBaseBuffer?.label = "Illuminatorama.rt.soupTriBase"
         rtSoupTriBaseCount = soupBase.count

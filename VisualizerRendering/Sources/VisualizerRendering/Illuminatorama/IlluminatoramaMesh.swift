@@ -67,6 +67,24 @@ public final class IlluminatoramaMesh {
     /// default-off flag that only genuinely open geometry opts into.
     public var shadowCastsBothFaces: Bool = false
 
+    /// Whether this mesh's instances get SURFACE-CACHE cards (DH-1314). Default true — an unset
+    /// mesh is carded exactly as before, so a scene that never clears it is byte-identical.
+    ///
+    /// The cache cards every soup triangle (~18 atlas texels each across five half-float
+    /// atlases) and is skipped outright past `surfaceCacheMaxTriangles`. Dense non-planar
+    /// geometry — a tree's leaf cards, draped cloth — is most of a furnished house's triangles
+    /// and almost none of its bounce light, and chart merging cannot shrink it (it is not
+    /// coplanar). Clearing this leaves such a mesh OUT of the cache only: it still rasterises,
+    /// casts shadows, sits in the TLAS (so it occludes and is hit by every ray), and is lit by
+    /// everything — including the cache's light, through the ordinary gather at its own pixels.
+    /// What it loses is a card of its own: an RT GI / reflection hit on it is shaded through the
+    /// uncached secondary path (as Standard shades every hit), and the cache update re-shades a
+    /// bounce ray that lands on it once (its own sun + the gathering texel's indirect) instead of
+    /// reading its card. It does not count against `surfaceCacheMaxTriangles`.
+    ///
+    /// Read when the cache bakes (a TLAS topology change); set it before `registerMesh`.
+    public var surfaceCacheCards: Bool = true
+
     /// Object-space AABB, computed once from the vertex buffer and cached.
     ///
     /// Diagnostic-path only (the geometry auditors) — nothing per-frame reads

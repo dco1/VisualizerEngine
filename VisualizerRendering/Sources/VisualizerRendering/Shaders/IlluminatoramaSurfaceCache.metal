@@ -81,7 +81,10 @@ struct SurfCacheUniforms {
     // .scotopicDesaturation`. 0 (day, the default) ⇒ byte-identical. Repurposes `_scPad1` —
     // same 4 bytes, stride unchanged.
     float  scotopicDesaturation;
-    uint   _scPad2;
+    // DH-1314 — 1 ⇒ a bounce ray that lands on a CARDLESS instance is re-shaded once
+    // (`sc_cardlessRadiance`); 0 ⇒ it brings back no light (the black-occluder A/B arm).
+    // Only reachable when a host opted a mesh out of the cache. Repurposes `_scPad2`.
+    uint   cardlessReshade;
 };
 
 // ── shared helpers (kept local; Metal has no cross-file linkage) ──────────────
@@ -138,6 +141,59 @@ static inline float2 sc_dirToEquirectUV(float3 d) {
 // format change. This is the signal B1's à-trous filter keys its step width off.
 static inline float sc_luminance(float3 c) {
     return dot(c, float3(0.2126, 0.7152, 0.0722));
+}
+
+// DH-1314 — CARDLESS INSTANCES. A mesh registered with `surfaceCacheCards = false` (a host's
+// tree foliage, draped bedding cloth) contributes no triangles to the soup and no cards; the
+// renderer writes `SC_NO_CARD_SOUP_BASE` into its `soupTriBase` slot, so every consumer's
+// `soupTriBase[iid] + prim` lands past the soup's triangle count and reads "no card" (the RT
+// lighting kernels then shade the hit through the ordinary uncached path). In THIS kernel a
+// cardless hit must not count as black — that would darken every card that sees a bed or a
+// canopy — so it is re-shaded once (`sc_cardlessRadiance`). Mirror of the Swift
+// `IlluminatoramaRenderer.surfaceCacheNoCardSoupBase`.
+constant uint SC_NO_CARD_SOUP_BASE = 0x80000000u;
+
+// Field-for-field mirror of `RTInstanceData` (IlluminatoramaSecondary.h — not included here,
+// its `SurfCard` would collide with this file's). Only the normal matrix, albedo, the
+// per-triangle normal base and emission are read.
+struct SCInstanceRow {
+    float4 nrm0; float4 nrm1; float4 nrm2;
+    float4 albedoTriBase;    // xyz = instance albedo; w = first object-normal entry
+    float4 emissionPad;      // xyz = emission radiance
+};
+
+// The radiance LEAVING a cardless hit, in the stored basis `sampleSurfCache` returns
+// (`albedo · irr + emission`, irr in the albedo-free 1/π-scaled form the atlas stores): the
+// hit's own direct sun (one shadow ray, transport mask) plus `indirectProxy` — the receiving
+// texel's own previous indirect irradiance, standing in for the indirect the cardless surface
+// would have cached. One bounce of sun from the cardless surface is exact; its multi-bounce
+// share is the neighbour's. Albedo is the instance's solid colour, the same stand-in a card
+// bakes (`instPtr[i].albedo`).
+static inline float3 sc_cardlessRadiance(
+    intersector<triangle_data, instancing, curve_data> thread& isect,
+    instance_acceleration_structure accel,
+    uint iid, uint prim, float3 hitP, float3 dir, float3 Ld, float3 sunColor,
+    float3 indirectProxy, float rayTMin,
+    const device SCInstanceRow* insts, const device float4* objNormal)
+{
+    SCInstanceRow d = insts[iid];
+    float3 nObj = objNormal[uint(d.albedoTriBase.w) + prim].xyz;
+    float3 n = float3x3(d.nrm0.xyz, d.nrm1.xyz, d.nrm2.xyz) * nObj;
+    float len = length(n);
+    n = len > 1e-8 ? n / len : float3(0.0, 1.0, 0.0);
+    if (dot(n, dir) > 0.0) n = -n;                 // the side facing the gathering texel
+    float3 irr = indirectProxy;
+    float hL = saturate(dot(n, Ld));
+    if (hL > 0.0) {
+        isect.accept_any_intersection(true);
+        ray sr;
+        sr.origin = hitP + n * max(rayTMin, 2e-3); sr.direction = Ld;
+        sr.min_distance = max(rayTMin, 2e-3); sr.max_distance = 1e4;
+        bool occ = isect.intersect(sr, accel, 0x05u).type != intersection_type::none;
+        isect.accept_any_intersection(false);
+        if (!occ) irr += (1.0 / M_PI_F) * sunColor * hL;
+    }
+    return d.emissionPad.xyz + d.albedoTriBase.xyz * irr;
 }
 
 // B3-spline à-trous tap weight (the SVGF spatial kernel) for an offset in
@@ -428,6 +484,10 @@ kernel void illumi_surfcache_update_tlas(
     device atomic_uint*               atlasStats  [[buffer(10)]],  // DH-0653: [0] reused, [1] refreshed (gated)
     texture2d<float, access::write>   outIndirect   [[texture(4)]],   // DH-0622: what the consumers read
     texture2d<float, access::read>    prevIndirectR [[texture(5)]],
+    // DH-1314 — what a CARDLESS hit is re-shaded from (`sc_cardlessRadiance`): the RT instance
+    // rows and per-triangle object normals the lighting pass already binds.
+    const device SCInstanceRow*       rtInsts     [[buffer(11)]],
+    const device float4*              objNormal   [[buffer(12)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.atlasW || gid.y >= u.atlasH) return;
@@ -496,6 +556,10 @@ kernel void illumi_surfcache_update_tlas(
     }
 
     // ── One-bounce indirect (reads PREVIOUS atlas at hits) ───────
+    // DH-1314 — read once, up front: the EMA below needs it anyway, and a cardless hit uses its
+    // rgb as the stand-in for the indirect light the cardless surface would have cached.
+    float4 prevInd = prevIndirectR.read(gid);
+    float3 prevIndirectProxy = prevInd.rgb;
     float3 indirect = float3(0.0);
     uint rays = max(1u, u.indirectRays);
     isect.accept_any_intersection(false);
@@ -508,6 +572,17 @@ kernel void illumi_surfcache_update_tlas(
         auto res = isect.intersect(r, accel, 0x05u);
         if (res.type == intersection_type::triangle) {
             uint prim = soupTriBase[res.instance_id] + res.primitive_id;
+            if (prim >= SC_NO_CARD_SOUP_BASE) {
+                // DH-1314 — a cardless instance (foliage / cloth): re-shade it once rather than
+                // let it read as black. Only reachable when a host opted a mesh out of the
+                // cache, so a scene that never does is byte-identical.
+                if (u.cardlessReshade == 0u) continue;
+                indirect += sc_cardlessRadiance(isect, accel, res.instance_id, res.primitive_id,
+                                                r.origin + dir * res.distance, dir, Ld,
+                                                u.sunColor.xyz, prevIndirectProxy, u.rayTMin,
+                                                rtInsts, objNormal);
+                continue;
+            }
             if (prim >= u.triangleCount) continue;
             // DH-0849 — kept line-for-line with the soup variant.
             if (u.backFaceGuard != 0u && sc_backFaceHit(prim, dir, cards, triCard, triUVa)) continue;
@@ -547,7 +622,7 @@ kernel void illumi_surfcache_update_tlas(
     // DH-0622 — the indirect term alone, same α (a dirty card resets both in lockstep), with
     // its OWN luminance² in .a, so the consumer-side denoiser keys off the variance of the
     // term the consumers actually read.
-    float4 prevInd = prevIndirectR.read(gid);
+    // (`prevInd` hoisted above the bounce loop — a cardless hit reads it as its proxy.)
     float indL = sc_luminance(indirect);
     outIndirect.write(float4(mix(prevInd.rgb, indirect, alpha), mix(prevInd.a, indL * indL, alpha)), gid);
 }
