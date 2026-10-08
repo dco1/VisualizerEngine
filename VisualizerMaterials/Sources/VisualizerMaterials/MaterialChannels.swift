@@ -61,6 +61,9 @@ public struct MaterialChannels: Equatable, Sendable {
     /// the shader only ever reads that map's xy, so B was baked and discarded. No new atlas
     /// slice, no extra fetch, no G-buffer channel. `nil` ⇒ B encodes 255 ⇒ exactly neutral.
     public var detailOcclusion: [Double]? = nil
+    /// **DH-1339 — this cloth's detail band carries real thread/fibre relief** (`addFibreDetail`), so a host may switch its
+    /// micro-occlusion on at upholstery scale without the pepper the generic fBm band makes. Set by `addFibreDetail` only.
+    public var fibreDetail: Bool = false
 
     /// **S2.5 half 2 — the coherent categories' de-repeat metadata.** Pattern cells per
     /// macro UV tile, per axis — e.g. a stack-bond 4×4 tile grid is `(4, 4)`; a 4-plank

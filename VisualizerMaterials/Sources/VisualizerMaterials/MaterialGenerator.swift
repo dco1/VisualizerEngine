@@ -1034,9 +1034,10 @@ public enum MaterialGenerator {
             for x in 0..<size {
                 let u = Double(x) / Double(size), v = Double(y) / Double(size)
                 // fine weave: two high-frequency bands cross to make the nap
-                let warp = Noise.fbmTiled(u * 48, v, baseCells: 4, octaves: 2, seed: seed)
-                let weft = Noise.fbmTiled(u, v * 48, baseCells: 4, octaves: 2, seed: seed ^ 0x5E)
-                let nap = (warp + weft) * 0.5
+                // DH-1339: was two crossed 48-cycle bands (a basket weave — velvet has NO visible weave). Now an isotropic fine
+                // nap field of the same frequency, so the base carries pile tone, not a lattice.
+                let nap = 0.5 * Noise.fbmTiled(u * 48, v * 48, baseCells: 4, octaves: 2, seed: seed)
+                        + 0.5 * Noise.fbmTiled(u * 31, v * 37, baseCells: 4, octaves: 2, seed: seed ^ 0x5E)
                 let macro = 0.82 + 0.36 * Noise.fbmTiled(u, v, baseCells: 2, octaves: 3, seed: seed ^ 0x6F)
                 ch.albedo[ch.idx(x, y)] = clampBand(base * macro * (0.85 + 0.3 * nap))
                 ch.roughness[ch.idx(x, y)] = clamp01(0.84 + (nap - 0.5) * 0.16)   // matte cloth, nap-broken
@@ -1046,9 +1047,13 @@ public enum MaterialGenerator {
         ch.sheen = 0.85                            // velvet is sheen-dominated
         ch.sheenRoughness = 0.45                    // dense cut pile → a BROAD, soft grazing glow
                                                     // (DH-0081; was the 0.30 library default)
-        ch.deriveNormals(strength: 2)
+        ch.deriveNormals(strength: 0.7)      // was 2 on the crossed-band weave; on the isotropic nap that read as crushed suede
         // Very fine sub-thread nap so the pile catches grazing light as fuzz, not plastic.
-        addMicroDetail(&ch, seed: seed ^ 0xB3, baseCells: 120, strength: 0.40)
+        // DH-1339: real pile fibre. ~1 mm cut fibres (14 texels at ~0.07 mm) ~0.13 mm wide, laid mostly one way with a wide
+        // scatter — the nap — added (not layered) so they pile into a soft fuzz rather than read as hairs.
+        addFibreDetail(&ch, seed: seed ^ 0xB3, fibres: [
+            .init(count: 26000, length: 14, width: 1.8, angle: 0.6, spread: 1.1, layered: false, widthJitter: 0.3)],
+            baseCells: 120, strength: 0.7, occlusionStrength: 0.4)
         return ch
     }
 
@@ -1087,7 +1092,11 @@ public enum MaterialGenerator {
                                                     // nap of the fabric set (DH-0081)
         ch.deriveNormals(strength: 4)
         // Soft fibrous fuzz over the chunky loops — the between-loop wool haze at close range.
-        addMicroDetail(&ch, seed: seed ^ 0xB4, baseCells: 60, strength: 0.70)
+        // DH-1339: the fuzzy halo of real wool — 3–5 mm loose fibres (~0.2 mm wide) in every direction over the loops.
+        addFibreDetail(&ch, seed: seed ^ 0xB4, fibres: [
+            .init(count: 5500, length: 60, width: 3.0, angle: 0, spread: .pi, layered: false, widthJitter: 0.5),
+            .init(count: 600, length: 110, width: 4.5, angle: 0, spread: .pi, layered: true, widthJitter: 0.4)],
+            baseCells: 60, strength: 1.0, occlusionStrength: 0.45)   // retuned after the 2 cm A/B preferred the old wool
         return ch
     }
 
@@ -3020,7 +3029,13 @@ public enum MaterialGenerator {
         // 3 % deep — and the occlusion has no sparkle failure mode, so it takes the weave's
         // real depth. Measured at the grazing gate: 1.01 (normal-only) → 1.04 inheriting 0.03,
         // → 1.2× at the weave's own strength, which is what a linen cushion should do.
-        addMicroDetail(&ch, seed: seed ^ 0xBC, baseCells: 100, strength: 0.03, occlusionStrength: 0.6)
+        // DH-1339: a real plain weave in the detail band — 8 texels (~0.55 mm) per thread, warp over weft alternating, each
+        // thread its own width, with a slow slub along it — plus a thin haze of loose fibres over the top. The normal stays
+        // modest (the old note: a strong detail normal sparkles on a dim grazing panel); the occlusion carries the depth.
+        addFibreDetail(&ch, seed: seed ^ 0xBC, fibres: [
+            .init(count: 2600, length: 34, width: 2.0, angle: 0, spread: .pi, layered: false, widthJitter: 0.5)],
+            baseCells: 100, weave: .init(pitch: 8, depth: 0.8, threadJitter: 0.35, slub: 0.6),
+            strength: 0.25, occlusionStrength: 0.55)
         return ch
     }
 

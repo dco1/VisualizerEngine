@@ -152,7 +152,10 @@ extension MaterialGenerator {
         // Fine sub-fibre fuzz (the pile at grazing range) as the detail band. A carpet is matte,
         // so the diffuse-visible occlusion companion is what actually reads (detail normals are a
         // specular-band effect on a matte dielectric — see setDetailRelief).
-        addMicroDetail(&ch, seed: sh ^ 0xC7, baseCells: 96, octaves: 2, strength: reliefStrength)
+        // DH-1339: individual yarn fibres on top of the tuft field — ~3 mm, ~0.2 mm wide, lying along the nap.
+        addFibreDetail(&ch, seed: sh ^ 0xC7, fibres: [
+            .init(count: 9000, length: 40, width: 3.0, angle: 0.4, spread: 0.7, layered: false, widthJitter: 0.4)],
+            baseCells: 96, strength: reliefStrength, occlusionStrength: nil)
 
         // Pile-lay tone bands (DH-0472). The metre-scale nap variation the ~0.30 m tile can't carry:
         // the in-tile `drift` above repeats every tile and dissolves under the hex de-repeat, so at
