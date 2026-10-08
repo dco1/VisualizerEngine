@@ -3182,11 +3182,11 @@ public enum MaterialGenerator {
                 let macro = 0.88 + 0.24 * Noise.fbmTiled(u, v, baseCells: 2, octaves: 3, seed: sh)
                 // Fine pore dimples — very high frequency Voronoi cell borders
                 let pore = Noise.voronoiTiled(u, v, cells: 38, jitter: 0.8, seed: sh ^ 0x22)
-                let poreDark = smoothstep(0.0, 0.12, pore.f2 - pore.f1)
+                let poreDark = smoothstep(0.0, 0.45, pore.f2 - pore.f1)     // DH-1339: was 0.12 — a crisp 8 mm polygon network (dried mud); now a soft mottle
                 // Pull-up: where creases occur (low macro noise), leather lightens
                 let pullUp = smoothstep(0.6, 0.9, macro) * 0.12
-                let poreDepth = (1 - poreDark) * 0.08
-                ch.albedo[ch.idx(x, y)] = clampBand(base * macro * (0.88 + poreDark * 0.12 + pullUp))
+                let poreDepth = (1 - poreDark) * 0.02      // DH-1339: was 0.08 — the 8 mm cells read as dried mud once the real grain exists
+                ch.albedo[ch.idx(x, y)] = clampBand(base * macro * (0.93 + poreDark * 0.07 + pullUp))
                 ch.roughness[ch.idx(x, y)] = clamp01(0.45 + poreDark * 0.22
                     + (Noise.fbmTiled(u, v, baseCells: 8, octaves: 2, seed: sh ^ 0x55) - 0.5) * 0.08)
                 ch.height[ch.idx(x, y)] = clamp01(0.55 - poreDepth
@@ -3197,7 +3197,8 @@ public enum MaterialGenerator {
         ch.deriveNormals(strength: 4)
         // Fine pebbled top-grain — the dimpled hide texture reads at grazing angles; without
         // it, top-grain leather flattens to a plastic vinyl look.
-        addMicroDetail(&ch, seed: seed ^ 0xBF, baseCells: 90, strength: 0.55)
+        // DH-1339: real pebbled top-grain — ~1.5 mm irregular cells with sunken creases, fine secondary grain, sparse pores.
+        addPebbleGrainDetail(&ch, seed: seed ^ 0xBF, cells: 26, strength: 0.9, occlusionStrength: 0.6)
         return ch
     }
 

@@ -129,6 +129,36 @@ extension MaterialGenerator {
         ch.fibreDetail = true
     }
 
+    /// **Pebble grain for a hide** (leather) — the detail band's equivalent of the fibre layer: irregular rounded cells
+    /// ~1–2 mm across (`cells` per detail repeat; the repeat is 3.75 cm on a 0.30 m tile) separated by sunken creases, a
+    /// finer secondary grain inside them, and a few fine pores. Written through `setDetailRelief`, so it feeds the detail
+    /// normal AND the micro-occlusion, and opts into the cloth relief (`fibreDetail`) like the fibre layer does.
+    static func addPebbleGrainDetail(_ ch: inout MaterialChannels, seed: UInt64, cells: Int = 26,
+                                     strength: Double, occlusionStrength: Double? = nil) {
+        guard ch.detailNormal == nil else { return }
+        let n = ch.size
+        var h = [Double](repeating: 0, count: n * n)
+        for y in 0..<n {
+            for x in 0..<n {
+                let u = Double(x) / Double(n), v = Double(y) / Double(n)
+                // primary pebble: a rounded cell crown, creased at the Voronoi borders (irregular: high jitter)
+                let a = Noise.voronoiTiled(u, v, cells: cells, jitter: 0.8, seed: seed)
+                let edgeA = min(1, (a.f2 - a.f1) / 0.5)     // wide, soft crease: rounded pebbles, not polygons
+                let crownA = edgeA * edgeA * (3 - 2 * edgeA)
+                // secondary: finer, weaker grain
+                let b = Noise.voronoiTiled(u, v, cells: cells * 3, jitter: 0.85, seed: seed ^ 0x77)
+                let edgeB = min(1, (b.f2 - b.f1) / 0.55)
+                let crownB = edgeB * edgeB * (3 - 2 * edgeB)
+                // pores: sparse small pits
+                let pore = Noise.fbmTiled(u * 4, v * 4, baseCells: 48, octaves: 1, seed: seed ^ 0xA1)
+                let pit = pore > 0.74 ? (pore - 0.74) / 0.26 : 0
+                h[ch.idx(x, y)] = 0.62 * crownA + 0.28 * crownB * crownA - 0.35 * pit
+            }
+        }
+        setDetailRelief(&ch, height: h, strength: strength, occlusionStrength: occlusionStrength)
+        ch.fibreDetail = true
+    }
+
     /// SplitMix64 — tiny, deterministic, stable across launches (never `hashValue`).
     private struct FibreRNG {
         var state: UInt64
