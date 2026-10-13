@@ -244,7 +244,7 @@ struct SVGFAtrousUniforms {
     // Daydream DH-0966 — bit 0: the input is IRRADIANCE (the still's GI history, albedo divided out
     // in `illumi_rt_gi_temporal`), so multiply the centre pixel's albedo back in on write — set on
     // the LAST level only. Clear ⇒ the filter returns what it was handed, exactly as before.
-    // Was `_pad0` — same 4 bytes.
+    // Was `_pad0` — same 4 bytes. DH-1344 — bit 1: skip the luminance edge-stop (every level).
     uint  flags;
     float sigmaL;  float sigmaZ;  float sigmaN;  float lumFloor;
 };
@@ -398,7 +398,12 @@ kernel void illumi_svgf_atrous(
             float3 giN  = float3(giIn.read(np).rgb);
             float  lumN = dot(giN, float3(0.2126, 0.7152, 0.0722));
             float  lDif = abs(lumCenter - lumN);
-            float  wLum = exp(-lDif / lumSigma);
+            // DH-1344 — bit 1: no luminance edge-stop (the still's irradiance, every level). The
+            // relative floor above scales with the CENTRE's luminance, so a bright GI sample
+            // accepts its dark neighbours while they reject it: a sparse bounce (a wall lit only by
+            // rays that find the sunlit floor) lost up to 65 % of its light. Depth + normal still
+            // guard real edges; the still's history is already a running mean of irradiance.
+            float  wLum = ((u.flags & 2u) != 0u) ? 1.0 : exp(-lDif / lumSigma);
 
             float w    = hW * wDepth * wNorm * wLum;
             colorSum  += giN * w;

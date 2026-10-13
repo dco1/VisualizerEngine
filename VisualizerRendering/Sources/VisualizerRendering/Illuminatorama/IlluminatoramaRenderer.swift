@@ -3986,6 +3986,14 @@ public final class IlluminatoramaRenderer {
     /// is re-read every frame and shared by every window. Runs `svgfStillLevels` levels.
     /// Default `false`: byte-identical for every other host.
     public var svgfStillForced: Bool = false
+    /// **DH-1344 — whether the still's SVGF keeps its LUMINANCE edge-stop.** Only consulted while the
+    /// still filters irradiance (`giIrradianceMode`). The stop's bandwidth floor is relative to the
+    /// CENTRE pixel's luminance, so the filter is asymmetric: a bright GI sample accepts its dark
+    /// neighbours while each of them rejects it, and light leaks out in proportion to how sparse
+    /// the bounce is. Measured on a bounce-lit alcove at 1 GI ray: 35 % of the converged GI
+    /// arrived with the stop, 102 % without (16 rays: 91 %), mottle 6.4 % → 3.9 %, same cost.
+    /// `true` = the shipped behaviour (the A/B lever); depth + normal still stop at real edges.
+    public var svgfStillLuminanceEdgeStop: Bool = true
     /// À-trous levels while `svgfStillForced` (2: the still lane's measured trade between
     /// residual noise and edge ringing, DH-0858).
     public var svgfStillLevels: Int = 2
@@ -13805,6 +13813,7 @@ public final class IlluminatoramaRenderer {
 
     private struct SVGFAtrousUniforms {
         /// `flags` (DH-0966): bit 0 ⇒ the input is irradiance; multiply the centre albedo back in (last level).
+    /// DH-1344: bit 1 ⇒ no luminance edge-stop at any level (`svgfStillLuminanceEdgeStop == false`).
         var width: UInt32; var height: UInt32; var stepSize: UInt32; var flags: UInt32 = 0
         var sigmaL: Float; var sigmaZ: Float; var sigmaN: Float; var lumFloor: Float = 0
     }
@@ -13867,7 +13876,8 @@ public final class IlluminatoramaRenderer {
             enc.setTexture(cOut,             index: 4)
             enc.setTexture(vOut,             index: 5)
             enc.setTexture(gbufferAlbedoMet, index: 6)
-            let flags: UInt32 = giIrradianceMode && level == levels - 1 ? 1 : 0
+            var flags: UInt32 = giIrradianceMode && level == levels - 1 ? 1 : 0
+            if giIrradianceMode && !svgfStillLuminanceEdgeStop { flags |= 2 }
             var u = SVGFAtrousUniforms(width: W, height: H, stepSize: stepSize, flags: flags,
                                         sigmaL: svgfSigmaL, sigmaZ: svgfSigmaZ, sigmaN: svgfSigmaN,
                                         lumFloor: effectiveSVGFLumFloor)
