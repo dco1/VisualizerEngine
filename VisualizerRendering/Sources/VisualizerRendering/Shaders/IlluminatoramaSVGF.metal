@@ -245,6 +245,7 @@ struct SVGFAtrousUniforms {
     // in `illumi_rt_gi_temporal`), so multiply the centre pixel's albedo back in on write — set on
     // the LAST level only. Clear ⇒ the filter returns what it was handed, exactly as before.
     // Was `_pad0` — same 4 bytes.
+    // Daydream DH-1344 — bit 2: NO luminance edge-stop (`wLum = 1`; depth + normal stops kept).
     uint  flags;
     float sigmaL;  float sigmaZ;  float sigmaN;  float lumFloor;
 };
@@ -398,7 +399,13 @@ kernel void illumi_svgf_atrous(
             float3 giN  = float3(giIn.read(np).rgb);
             float  lumN = dot(giN, float3(0.2126, 0.7152, 0.0722));
             float  lDif = abs(lumCenter - lumN);
-            float  wLum = exp(-lDif / lumSigma);
+            // Daydream DH-1344 — a STILL's filter can drop this stop (flags bit 2). Weighting a
+            // neighbour by how close its NOISY luminance is to the centre's rejects exactly the rare
+            // bright samples a path tracer's mean depends on, so the filter removed energy and grouped
+            // the noise into blotches. Measured against an unfiltered 256-path reference (Oak Credenza
+            // Hall, Sunset Gallery): with the stop −0.09…−0.24 st on every surface, without it
+            // 0.00 ± 0.03 st, and no in-plane indirect shadow edge any wider.
+            float  wLum = (u.flags & 4u) != 0u ? 1.0 : exp(-lDif / lumSigma);
 
             float w    = hW * wDepth * wNorm * wLum;
             colorSum  += giN * w;

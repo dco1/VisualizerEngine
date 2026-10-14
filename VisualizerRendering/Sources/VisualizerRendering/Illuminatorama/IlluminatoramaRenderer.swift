@@ -1170,6 +1170,13 @@ public final class IlluminatoramaRenderer {
     /// re-injects low-frequency crawl by yanking clean history toward the noisy
     /// current 3×3 mean. Only meant to catch gross on-screen disocclusions.
     public var rtGITemporalClamp: Float = 4.0
+    /// Daydream DH-1344 — whether a STILL's GI filter (`rtGIStaticAccumulation`) keeps the SVGF
+    /// luminance edge-stop. The stop weighs neighbours by their NOISY luminance, so it rejects the rare
+    /// bright samples a path tracer's mean depends on: against an unfiltered 256-path reference it
+    /// darkened every surface by 0.09–0.24 st and grouped the leftover noise into blotches, while
+    /// protecting no in-plane indirect shadow edge (Oak Credenza Hall, Sunset Gallery, 2026-10-14).
+    /// Depth and normal stops keep geometric edges either way. Default `true`: byte-identical.
+    public var svgfStillLuminanceStop: Bool = true
 
     // ── Hardware-RT reflections ──────────────────────────────────────
     //
@@ -13867,7 +13874,8 @@ public final class IlluminatoramaRenderer {
             enc.setTexture(cOut,             index: 4)
             enc.setTexture(vOut,             index: 5)
             enc.setTexture(gbufferAlbedoMet, index: 6)
-            let flags: UInt32 = giIrradianceMode && level == levels - 1 ? 1 : 0
+            let flags: UInt32 = (giIrradianceMode && level == levels - 1 ? 1 : 0)
+                | (!svgfStillLuminanceStop && rtGIStaticAccumulation ? 4 : 0)
             var u = SVGFAtrousUniforms(width: W, height: H, stepSize: stepSize, flags: flags,
                                         sigmaL: svgfSigmaL, sigmaZ: svgfSigmaZ, sigmaN: svgfSigmaN,
                                         lumFloor: effectiveSVGFLumFloor)
