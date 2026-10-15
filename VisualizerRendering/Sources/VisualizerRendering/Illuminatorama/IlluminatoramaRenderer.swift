@@ -1183,8 +1183,10 @@ public final class IlluminatoramaRenderer {
     /// The build frames must be held out of the still's accumulation (their full walks are the noisy ones):
     /// `resetRTGIAccumulation(keepingRadianceCache: true)` after them. Only with `rtPathTracedGI`.
     public var rtPathRadianceCacheCell: Float = 0
-    /// Frames the cache BUILDS (writes only) after it is cleared, before paths start reading it.
-    public var rtPathRadianceCacheBuildFrames: Int = 8
+    /// Frames the cache BUILDS (writes only) after it is cleared, before paths start reading it. 4 measured
+    /// the same as 8 and 16 for wall mottle against a 4000-path reference (Oak Credenza Hall 1.52 % at all
+    /// three; Sunset Gallery within 0.06 points), and each build frame is a full-walk frame (~3.5 s at hero size).
+    public var rtPathRadianceCacheBuildFrames: Int = 4
     /// Paths per pixel on a build frame.
     public var rtPathRadianceCacheBuildRays: Int = 1
     private var rcFramesSinceReset = 0

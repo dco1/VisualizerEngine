@@ -473,10 +473,11 @@ constant uint kRCCap = 1u << 21;      // slots (power of two)
 constant uint kRCProbe = 8u;          // linear-probe length
 constant uint kRCMinVertex = 2u;      // first path vertex that always may read the cache
 constant uint kRCMinCount = 8u;       // samples a cell needs before it is read
-constant uint kRCMaxVerts = 18u;      // vertices recorded per path
 // Only the first hits write: a deep hit has spent most of the bounce budget, so its suffix is a shorter
-// walk than the one a shallow reader replaces.
+// walk than the one a shallow reader replaces. Only those are recorded, too — three entries per thread,
+// not one per bounce: the record arrays live in every path thread, cache on or off.
 constant uint kRCMaxWriteVertex = 3u;
+constant uint kRCMaxVerts = kRCMaxWriteVertex;   // vertices recorded per path
 // The first bounce reads too when its hit is at least this many cells away, so the cell's averaging
 // cannot reach back to the shaded point (a corner's darkening stays traced): raw noise 9.6 → 8.5 %.
 constant float kRCFirstMinCells = 4.0;
@@ -1017,7 +1018,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
     }
     // DH-1344 — write every recorded vertex's own suffix estimate (the radiance it sent back along the path).
     if (rcWrite) {
-        for (uint k = 0u; k < min(rcN, kRCMaxWriteVertex); ++k) {
+        for (uint k = 0u; k < rcN; ++k) {
             uint s = rcSlot[k];
             if (s == 0xFFFFFFFFu) continue;
             float3 t = rcT[k];
