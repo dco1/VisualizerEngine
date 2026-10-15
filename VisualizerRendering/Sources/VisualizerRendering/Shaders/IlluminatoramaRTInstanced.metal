@@ -1895,7 +1895,10 @@ kernel void illumi_volumetric_rt(
                     float area4 = 4.0 * length(nL);
                     float cosL = abs(dot(normalize(nL), d));
                     if (cosL > 1e-4 && dist > 1e-3) {
-                        isect.accept_any_intersection(false);
+                        // A visibility question (only `type == none` is read), so any-hit: the first
+                        // blocker ends the traversal. It was closest-hit to 10 km — the same answer
+                        // for the price of finding the NEAREST blocker of every occluded step.
+                        isect.accept_any_intersection(true);
                         ray pr; pr.origin = X; pr.direction = d; pr.min_distance = tMin; pr.max_distance = 1e4;
                         auto h = isect.intersect(pr, accel, u.transportMask);
                         if (h.type == intersection_type::none) {
