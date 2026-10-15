@@ -1504,6 +1504,9 @@ public final class IlluminatoramaRenderer {
     public var volRTAnisotropy: Float = 0.5
     /// March samples per pixel per frame (stratified; a still's frames fill in the rest).
     public var volRTSteps: Int = 6
+    /// Trace the haze on a random 1/`volRTPixelStride` of the pixels each frame, at that many times the
+    /// weight — for a still, which accumulates its frames (1 ⇒ every pixel, as before).
+    public var volRTPixelStride: Int = 1
     /// The march's reach along a view ray (metres) — an interior is a few metres deep.
     public var volRTMaxDistance: Float = 20
     /// How far above an air sample a roof may be for the sample to count as indoors (metres).
@@ -1557,6 +1560,7 @@ public final class IlluminatoramaRenderer {
         var maxDist: Float; var roofReach: Float; var areaLightCount: UInt32; var transportMask: UInt32
         var sunScatter: Float; var skyScatter: Float; var scotopicDesaturation: Float; var rayTMin: Float
         var dustDensity: Float; var dustAnisotropy: Float; var dustAdmittanceRef: Float; var admittanceGrid: UInt32
+        var pixelStride: UInt32 = 1
     }
 
     // ── Spot-light beam scattering (issue: CK5 concert beams) ───────
@@ -14047,7 +14051,8 @@ public final class IlluminatoramaRenderer {
             scotopicDesaturation: max(0, scotopicDesaturation), rayTMin: 0.004,
             dustDensity: max(0, volRTDustDensity), dustAnisotropy: max(-0.95, min(0.95, volRTDustAnisotropy)),
             dustAdmittanceRef: max(1e-4, volRTDustAdmittanceRef),
-            admittanceGrid: UInt32(max(1, min(512, volRTAdmittanceGrid))))
+            admittanceGrid: UInt32(max(1, min(512, volRTAdmittanceGrid))),
+            pixelStride: UInt32(max(1, min(16, volRTPixelStride))))
         volRTProgressiveIndex &+= 1
         guard let counts = volRTAdmittanceBuffer else { return }
         // DH-0999 — measure the direct sun entering the view's air BEFORE the march reads it. The

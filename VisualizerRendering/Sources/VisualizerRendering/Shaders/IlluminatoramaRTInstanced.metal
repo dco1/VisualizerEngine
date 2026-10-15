@@ -1727,6 +1727,7 @@ struct VolRTUniforms {
     float maxDist; float roofReach; uint areaLightCount; uint transportMask;
     float sunScatter; float skyScatter; float scotopicDesaturation; float rayTMin;
     float dustDensity; float dustAnisotropy; float dustAdmittanceRef; uint admittanceGrid;
+    uint pixelStride;      // 1 ⇒ every pixel every frame; K ⇒ a random 1/K of them, weighted K
 };
 
 /// The view ray through pixel `gid` and its march end (depth-terminated, capped at maxDist).
@@ -1821,6 +1822,14 @@ kernel void illumi_volumetric_rt(
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height || u.density <= 0.0) return;
+    // A still accumulates its frames, so the haze can be traced on 1/K of the pixels each frame at K×
+    // weight: the same expectation, a K-th of the rays (Daydream DH-1344). Chosen per 32-pixel ROW
+    // SEGMENT — one SIMD group under `dispatch` (threadgroup width = execution width) — because a random
+    // pixel in four left nearly every SIMD group with live threads, and it ran the whole march anyway
+    // (measured −14 % for K = 4). Each segment takes every K-th frame from its own phase, so every one
+    // gets exactly 1/K of the frames (no random count to print a pattern of segments).
+    uint K = max(u.pixelStride, 1u);
+    if (K > 1u && (rcHash((gid.x >> 5u) * 0x8DA6B343u ^ gid.y * 0xD8163841u) + u.progressiveIndex) % K != 0u) return;
     float3 ro = u.cameraWorldPos;
     float3 rd;
     float tEnd = volRTViewRay(gDepth, u, gid, rd);
@@ -1917,5 +1926,7 @@ kernel void illumi_volumetric_rt(
     if (roofedLen <= 0.0) return;
     half4 prev = outHDR.read(gid);
     float Tbg = exp(-sigmaT * roofedLen);
-    outHDR.write(half4(half3(float3(prev.rgb) * Tbg + Ls), prev.a), gid);
+    // K× the change the air makes: prev·(1 − K(1 − T)) + K·Ls (exact in expectation; T near 1 indoors).
+    float kf = float(K);
+    outHDR.write(half4(half3(float3(prev.rgb) * max(0.0, 1.0 - kf * (1.0 - Tbg)) + Ls * kf), prev.a), gid);
 }
