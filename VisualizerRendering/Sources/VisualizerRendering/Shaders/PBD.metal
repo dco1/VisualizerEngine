@@ -91,7 +91,8 @@ static bool ringSeamCrosses(uint i, uint j, uint stride, constant PBDUniforms& u
 //   a.xyz = primary point (centre or endpoint A); a.w = type tag, bit-cast from
 //           uint (0 = sphere, 1 = capsule, 2 = box).
 //   b.xyz = secondary point (capsule endpoint B / box halfExtents); b.w = radius.
-//   meta.x = ownerID (skip-self filter); meta.yzw unused.
+//   meta.x = ownerID (skip-self filter); meta.y = a box's yaw about +Y (bit-cast float, 0 =
+//   axis-aligned); meta.zw unused.
 struct PBDCollider {
     float4 a;
     float4 b;
@@ -814,6 +815,22 @@ static float3 closestOnSegment(float3 p, float3 a, float3 b) {
 // `prev` so the next Verlet velocity reflects a proper inelastic contact.
 // Pulled out of pbdSDFCollide so we can call it for the particle position AND
 // for the two segment-midpoint probes that catch crossing-segment overlaps.
+// ── Oriented boxes ───────────────────────────────────────────────────────────
+//
+// A box collider may be turned about +Y: its yaw (radians) rides in `meta.y`, bit-cast. 0 — what
+// every caller wrote before this existed — is the historical axis-aligned box, exactly. World from
+// box-local: x' = c·x + s·z, z' = −s·x + c·z (a plan angle `a` is yaw `a`, since world z = −plan y).
+static inline float2 pbdBoxYaw(PBDCollider col) {
+    float yaw = as_type<float>(col.meta.y);
+    return float2(cos(yaw), sin(yaw));
+}
+static inline float3 pbdBoxToLocal(float3 v, float2 cs) {
+    return float3(cs.x * v.x - cs.y * v.z, v.y, cs.y * v.x + cs.x * v.z);
+}
+static inline float3 pbdBoxToWorld(float3 v, float2 cs) {
+    return float3(cs.x * v.x + cs.y * v.z, v.y, -cs.y * v.x + cs.x * v.z);
+}
+
 static void sdfContact(float3 probe,
                        PBDCollider col,
                        constant PBDUniforms& u,
@@ -836,15 +853,16 @@ static void sdfContact(float3 probe,
         closest = closestOnSegment(probe, col.a.xyz, col.b.xyz);
     } else {
         // Box (kind == 2u). Probe-vs-box uses the same standard logic, just
-        // with `probe` in place of the historical pos.
-        float3 d  = probe - col.a.xyz;
+        // with `probe` in place of the historical pos — in the box's own (yawed) frame.
+        float2 cs = pbdBoxYaw(col);
+        float3 d  = pbdBoxToLocal(probe - col.a.xyz, cs);
         float3 he = col.b.xyz;
         float3 q  = clamp(d, -he, he);
         float3 outside = d - q;
         float  outLen  = length(outside);
         if (outLen > 1e-6) {
             if (outLen >= radius) return;
-            float3 n    = outside / outLen;
+            float3 n    = pbdBoxToWorld(outside / outLen, cs);
             float  disp = min((radius - outLen) * u.collideStiffness, maxPush);
             pos  += n * disp;
             prev += n * disp * 0.5;
@@ -861,6 +879,7 @@ static void sdfContact(float3 probe,
             } else {
                 n = float3(0, 0, sign(d.z)); push = dist.z + radius;
             }
+            n = pbdBoxToWorld(n, cs);
             // CLAMP: a deep-interior sheet vertex would otherwise be shoved the
             // full half-thickness in one step, tearing it from its outside
             // neighbour. Climb out coherently instead (see maxSDFPush docstring).
@@ -1086,15 +1105,16 @@ static void sdfContactBatch(float3 probe,
         // Capsule.
         closest = closestOnSegment(probe, col.a.xyz, col.b.xyz);
     } else {
-        // Box (kind == 2u).
-        float3 d  = probe - col.a.xyz;
+        // Box (kind == 2u), in its own (yawed) frame.
+        float2 cs = pbdBoxYaw(col);
+        float3 d  = pbdBoxToLocal(probe - col.a.xyz, cs);
         float3 he = col.b.xyz;
         float3 q  = clamp(d, -he, he);
         float3 outside = d - q;
         float  outLen  = length(outside);
         if (outLen > 1e-6) {
             if (outLen >= radius) return;
-            float3 n    = outside / outLen;
+            float3 n    = pbdBoxToWorld(outside / outLen, cs);
             float  push = (radius - outLen) * collideStiffness;
             // Tangential friction (same model as the capsule path below) — without
             // it the box WALLS are frictionless and a stuffed column just slides
@@ -1119,6 +1139,7 @@ static void sdfContactBatch(float3 probe,
             } else {
                 n = float3(0, 0, sign(d.z)); push = dist.z + radius;
             }
+            n = pbdBoxToWorld(n, cs);
             push *= collideStiffness;
             float3 vel  = pos - prev;
             float  vN   = dot(vel, n);

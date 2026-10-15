@@ -87,7 +87,7 @@ public struct PBDConstraint {
 public struct PBDCollider {
     public var a:    SIMD4<Float>   // xyz = primary point, w = type tag (bit-cast)
     public var b:    SIMD4<Float>   // xyz = secondary point / extents, w = radius
-    public var meta: SIMD4<UInt32>  // x = ownerID, yzw = reserved
+    public var meta: SIMD4<UInt32>  // x = ownerID, y = box yaw (bit-cast Float), zw = reserved
 
     public enum Kind: UInt32 { case sphere = 0, capsule = 1, box = 2, sdfVolume = 3 }
 
@@ -115,14 +115,19 @@ public struct PBDCollider {
         )
     }
 
+    /// A box, optionally turned by `yaw` radians about +Y (world from box-local:
+    /// x' = c·x + s·z, z' = −s·x + c·z). The yaw rides in `meta.y`; 0 is the historical
+    /// axis-aligned box, bit for bit. Honoured by the per-solver and batch SDF kernels.
     public static func box(center: SIMD3<Float>, halfExtents: SIMD3<Float>,
-                           ownerID: UInt32 = .max) -> PBDCollider {
-        PBDCollider(
+                           yaw: Float = 0, ownerID: UInt32 = .max) -> PBDCollider {
+        var c = PBDCollider(
             a: SIMD4(center.x, center.y, center.z,
                      Float(bitPattern: Kind.box.rawValue)),
             b: SIMD4(halfExtents.x, halfExtents.y, halfExtents.z, 0),
             ownerID: ownerID
         )
+        c.meta.y = yaw.bitPattern
+        return c
     }
 
     /// A SIGNED DISTANCE VOLUME — collide with a real mesh rather than a primitive standing in
