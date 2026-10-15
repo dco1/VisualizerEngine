@@ -1148,7 +1148,13 @@ public final class IlluminatoramaRenderer {
     /// Restart the RT GI accumulation on the next frame (its history reprojects against nothing),
     /// WITHOUT `resetTemporalHistory`'s exposure re-seed. For a host whose still discards warm-up
     /// frames: in `rtGIStaticAccumulation` mode nothing forgets them otherwise (DH-0887).
-    public func resetRTGIAccumulation() { rtGINeedsFirstFrame = true }
+    /// `keepingRadianceCache` — restart the GI running mean but keep the path lane's radiance cache (a
+    /// still that has just BUILT it in held-out frames, DH-1344).
+    public func resetRTGIAccumulation(keepingRadianceCache: Bool = false) {
+        let rcClear = rcNeedsClear
+        rtGINeedsFirstFrame = true
+        if keepingRadianceCache { rcNeedsClear = rcClear }
+    }
     /// Daydream DH-0887 — STILL mode for the colour TAA resolve: the camera is frozen, so average
     /// (current weight `taaHistoryBlend`) with NO neighbourhood clip, read the history at the same
     /// pixel instead of re-sampling it, and take the display sharpen from the accumulation rather
@@ -1170,6 +1176,22 @@ public final class IlluminatoramaRenderer {
     /// re-injects low-frequency crawl by yanking clean history toward the noisy
     /// current 3×3 mean. Only meant to catch gross on-screen disocclusions.
     public var rtGITemporalClamp: Float = 4.0
+    /// Daydream DH-1344 — the path-traced still's RADIANCE CACHE cell size (m); 0 ⇒ off (byte-identical).
+    /// Build frames' paths write the light they find leaving each surface into a hashed world grid; later
+    /// frames' paths end at the grid instead of continuing a long random walk — in a pale room, where most
+    /// light has bounced four or more times, that walk is where the per-pixel noise (the mottle) came from.
+    /// The build frames must be held out of the still's accumulation (their full walks are the noisy ones):
+    /// `resetRTGIAccumulation(keepingRadianceCache: true)` after them. Only with `rtPathTracedGI`.
+    public var rtPathRadianceCacheCell: Float = 0
+    /// Frames the cache BUILDS (writes only) after it is cleared, before paths start reading it.
+    public var rtPathRadianceCacheBuildFrames: Int = 8
+    /// Paths per pixel on a build frame.
+    public var rtPathRadianceCacheBuildRays: Int = 1
+    private var rcFramesSinceReset = 0
+    private var rcKeysBuffer: MTLBuffer?
+    private var rcDataBuffer: MTLBuffer?
+    private var rcDummyKeys: MTLBuffer?
+    private var rcDummyData: MTLBuffer?
     /// Daydream DH-1344 — whether a STILL's GI filter (`rtGIStaticAccumulation`) keeps the SVGF
     /// luminance edge-stop. The stop weighs neighbours by their NOISY luminance, so it rejects the rare
     /// bright samples a path tracer's mean depends on: against an unfiltered 256-path reference it
@@ -3925,7 +3947,13 @@ public final class IlluminatoramaRenderer {
     private var rtGIHistoryA: MTLTexture          // full-res, rgba16Float
     private var rtGIHistoryB: MTLTexture
     private var rtGIHistoryToggle: Bool = false
-    private var rtGINeedsFirstFrame: Bool = true
+    private var rtGINeedsFirstFrame: Bool = true {
+        // DH-1344 — every GI-history reset also clears the radiance cache. Its own flag, because the
+        // history flag is never lowered while the temporal pass is off (an unfiltered still), which
+        // would wipe the cache every frame and it would never be read.
+        didSet { if rtGINeedsFirstFrame { rcNeedsClear = true } }
+    }
+    private var rcNeedsClear = true
     private var previousRTGITemporalEnabled: Bool = false
     private var currentRTGIHistoryTexture: MTLTexture { rtGIHistoryToggle ? rtGIHistoryB : rtGIHistoryA }
     private var previousRTGIHistoryTexture: MTLTexture { rtGIHistoryToggle ? rtGIHistoryA : rtGIHistoryB }
@@ -4778,7 +4806,9 @@ public final class IlluminatoramaRenderer {
         /// DH-1011 — `kPathFlag*` (Metal twin appended last; three pads keep the 16-byte tail).
         var pathFlags: UInt32 = 0
         /// DH-1293 — the lamps' near field at path vertices (were `padPath0/padPath1`, same bytes).
-        var pathLampMinDist: Float = 0, pathLampSourceRadius: Float = 0, padPath2: UInt32 = 0
+        var pathLampMinDist: Float = 0, pathLampSourceRadius: Float = 0
+        /// DH-1344 — the path lane's radiance-cache cell (m); 0 ⇒ off (was `padPath2`).
+        var radCacheCell: Float = 0
 
         mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
             let p = InteriorRoomGains.pack(gains, enabled: enabled)
@@ -9852,6 +9882,14 @@ public final class IlluminatoramaRenderer {
         // DH-1293 — the lamps' near-field levers (0 ⇒ the shipped point-source law).
         u.pathLampMinDist = pathOn ? rtPathLampMinDistance : 0
         u.pathLampSourceRadius = pathOn ? max(0, rtPathLampSourceRadius) : 0
+        // DH-1344 — build (+cell) for the first frames after a reset, then use (−cell).
+        if rcNeedsClear { rcFramesSinceReset = 0 }
+        let rcCell = pathOn ? max(0, rtPathRadianceCacheCell) : 0
+        u.radCacheCell = rcCell > 0 ? (rcFramesSinceReset < rtPathRadianceCacheBuildFrames ? rcCell : -rcCell) : 0
+        if rcCell > 0 { rcFramesSinceReset += 1 }
+        // A build frame needs one full walk per pixel, not `giRays` of them: the cache averages
+        // millions of walks either way, and the reads are where the extra paths pay.
+        if u.radCacheCell > 0 { u.giRays = min(u.giRays, UInt32(max(1, rtPathRadianceCacheBuildRays))) }
         // Surface cache read (P1c): on only when the grouped soup + cards + base
         // are all live this topology. The kernel gates every atlas read on this.
         let cacheOn = surfCacheActive && surfCardCount > 0
@@ -9954,7 +9992,29 @@ public final class IlluminatoramaRenderer {
         u.scotopicDesaturation = max(0, scotopicDesaturation)
         memcpy(rtInstUniformBuffer.contents(), &u, MemoryLayout<RTInstUniforms>.stride)
 
+        // DH-1344 — the radiance cache: allocated on first use, cleared with the GI history.
+        let rcOn = u.radCacheCell != 0
+        if rcOn {
+            let cap = 1 << 21
+            if rcKeysBuffer == nil {
+                rcKeysBuffer = device.makeBuffer(length: cap * 4, options: .storageModePrivate)
+                rcDataBuffer = device.makeBuffer(length: cap * 16, options: .storageModePrivate)
+                rcNeedsClear = true
+            }
+            if rcNeedsClear, let k = rcKeysBuffer, let d = rcDataBuffer, let blit = cb.makeBlitCommandEncoder() {
+                blit.fill(buffer: k, range: 0..<k.length, value: 0)
+                blit.fill(buffer: d, range: 0..<d.length, value: 0)
+                blit.endEncoding()
+                rcNeedsClear = false
+            }
+        }
+        if rcDummyKeys == nil {
+            rcDummyKeys = device.makeBuffer(length: 16, options: .storageModePrivate)
+            rcDummyData = device.makeBuffer(length: 16, options: .storageModePrivate)
+        }
         guard let enc = timedComputeEncoder(cb, "rtLightingTLAS") else { return }
+        enc.setBuffer(rcOn ? rcKeysBuffer : rcDummyKeys, offset: 0, index: 21)
+        enc.setBuffer(rcOn ? rcDataBuffer : rcDummyData, offset: 0, index: 22)
         enc.label = "Illuminatorama.rt.tlas"
         enc.setComputePipelineState(pipeline)
         enc.setTexture(depthTexture, index: 0)

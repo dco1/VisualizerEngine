@@ -161,7 +161,11 @@ struct RTInstUniforms {
     // falloff becomes 1/(d² + r²), the on-axis law of a luminous DISC of radius r (a can's aperture,
     // a shade's opening), combined with the light's own `softRadius` by max. Both 0 ⇒ the shipped
     // point-source law exactly (byte-identical). Were `_padPath0/_padPath1`.
-    float pathLampMinDist; float pathLampSourceRadius; uint _padPath2;
+    float pathLampMinDist; float pathLampSourceRadius;
+    // Daydream DH-1344 — the path lane's RADIANCE CACHE cell size (m): > 0 ⇒ this frame BUILDS it (full paths
+    // write, nothing reads), < 0 ⇒ this frame USES it (paths read from their second bounce, nothing writes);
+    // 0 ⇒ off (byte-identical). Was `_padPath2`.
+    float radCacheCell;
 };
 
 /// DH-1011 — `RTInstUniforms.pathFlags` bits.
@@ -451,6 +455,59 @@ constant uint kPathPortalCache = 32u;   // per-vertex aperture-weight cache (thr
 
 static inline float pathLuma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
+// ── Daydream DH-1344 — a world-space RADIANCE CACHE for the path lane (a still's) ───────────────────
+// In a pale room most of a wall's light has bounced four or more times (measured: Oak Credenza Hall's
+// alcove — 34 % of its light within 3 bounces), so one path is a long random walk and the per-pixel
+// estimate is spiky; filtered, that is the mottle. A hashed grid of `radCacheCell`-sized cells, kept apart
+// by the surface's dominant normal axis, holds the mean light LEAVING each patch of surface.
+//   BUILD frames (`radCacheCell` > 0, held out of the still's accumulation by the app): full paths, each
+//   writing at its first `kRCMaxWriteVertex` hits the light it then found leaving that hit (its suffix).
+//   USE frames (< 0): a path ends at the first hit whose cell holds `kRCMinCount` samples — from the second
+//   bounce on, or the first when it is far (`kRCFirstMinCells`) — adding the cell's mean.
+// The read sits at the hit, BEFORE its albedo and its Russian roulette, because the mean already includes
+// both: read after the roulette (with the throughput from before its 1/q), every cached value came out q×
+// dark — −0.17 st at 8 build frames, −1.9 st when reads fed writes. Cleared with the GI history.
+// Measured on Oak Credenza Hall, Maximum: level vs a 256-path reference ±0.01 st; alcove mottle 1.78 →
+// 1.26 %; 160 → 135 s (32 frames) or 97 s (16). (SHaRC — NVIDIA's hashed radiance cache — is the same idea.)
+constant uint kRCCap = 1u << 21;      // slots (power of two)
+constant uint kRCProbe = 8u;          // linear-probe length
+constant uint kRCMinVertex = 2u;      // first path vertex that always may read the cache
+constant uint kRCMinCount = 8u;       // samples a cell needs before it is read
+constant uint kRCMaxVerts = 18u;      // vertices recorded per path
+// Only the first hits write: a deep hit has spent most of the bounce budget, so its suffix is a shorter
+// walk than the one a shallow reader replaces.
+constant uint kRCMaxWriteVertex = 3u;
+// The first bounce reads too when its hit is at least this many cells away, so the cell's averaging
+// cannot reach back to the shaded point (a corner's darkening stays traced): raw noise 9.6 → 8.5 %.
+constant float kRCFirstMinCells = 4.0;
+
+static inline uint rcHash(uint x) { x ^= x >> 16; x *= 0x7feb352du; x ^= x >> 15; x *= 0x846ca68bu; x ^= x >> 16; return x; }
+static inline uint2 rcKey(float3 P, float3 N, float cell) {
+    int3 c = int3(floor(P / cell));
+    float3 a = abs(N);
+    uint ax = (a.x >= a.y && a.x >= a.z) ? 0u : (a.y >= a.z ? 1u : 2u);
+    uint bin = ax * 2u + ((ax == 0u ? N.x : (ax == 1u ? N.y : N.z)) < 0.0 ? 1u : 0u);
+    uint h = rcHash(uint(c.x) * 73856093u ^ rcHash(uint(c.y) * 19349663u ^ rcHash(uint(c.z) * 83492791u ^ bin)));
+    uint check = rcHash(h ^ 0x9E3779B9u ^ (bin << 24)) | 1u;            // never 0 (0 = empty slot)
+    return uint2(h, check);
+}
+/// The slot holding `key`, inserting it when asked; 0xFFFFFFFF when absent / the probe is full.
+static inline uint rcFind(device atomic_uint* keys, uint2 key, bool insert) {
+    for (uint i = 0u; i < kRCProbe; ++i) {
+        uint slot = (key.x + i) & (kRCCap - 1u);
+        uint cur = atomic_load_explicit(&keys[slot], memory_order_relaxed);
+        if (cur == key.y) return slot;
+        if (cur == 0u) {
+            if (!insert) return 0xFFFFFFFFu;
+            uint expected = 0u;
+            if (atomic_compare_exchange_weak_explicit(&keys[slot], &expected, key.y,
+                                                      memory_order_relaxed, memory_order_relaxed)) return slot;
+            if (expected == key.y) return slot;
+        }
+    }
+    return 0xFFFFFFFFu;
+}
+
 /// Distance along (o, d) to area light `al`'s rectangle when the ray leaves its EMITTING side
 /// through it (the side whose receivers it lights), or −1.
 static inline float pathPortalCrossing(RTAreaLight al, float3 o, float3 d) {
@@ -739,9 +796,16 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                                              texture2d<float, access::sample> skyEquirect,
                                              texturecube<float, access::sample> irrCube,
                                              texture2d_array<float, access::sample> albedoAtlas,
-                                             thread uint& seed)
+                                             thread uint& seed,
+                                             device atomic_uint* rcKeys, device atomic_float* rcData)
 {
     uint portalCount = uint(max(0.0, u.interiorRoomGainMeta.y));
+    // DH-1344 — radiance cache: per recorded vertex, its cell, the throughput arriving at it (before its
+    // albedo) and the radiance gathered before it, so its own suffix estimate can be written at the end.
+    bool rcWrite = u.radCacheCell > 0.0, rcRead = u.radCacheCell < 0.0;
+    float rcCell = abs(u.radCacheCell);
+    uint rcSlot[kRCMaxVerts]; float3 rcT[kRCMaxVerts]; float3 rcL[kRCMaxVerts];
+    uint rcN = 0u;
     // Outdoor radiance seen THROUGH an aperture: full radiance of whatever is out there, with
     // no area lights of its own (they are this lane's apertures, not outdoor sources).
     SecondaryShadeParams pOut = pFull;
@@ -776,7 +840,6 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         uint lightSalt = 0x4C495445u + v * kPathLightDimsPerVertex;   // 'LITE' (DH-1011)
         float3 Pofs = P + N * tMin;
         float3 Lv = float3(0.0);
-
         // ── NEE: sun + local lights (secondary vertices) ──
         if (v > 0u) {
             float nl = saturate(dot(N, Ld));
@@ -921,6 +984,26 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         h.bary = res.triangle_barycentric_coord;
         h.instanceID = res.instance_id; h.primitiveID = res.primitive_id;
         if ((u.pathFlags & kPathFlagDebugNoEmissionHits) == 0u) L += T * secondaryEmission(h.instanceID, sec.insts);
+        // DH-1344 — the radiance cache at this vertex (vertex index v + 1), BEFORE its albedo and its Russian
+        // roulette: the cached mean is the vertex's whole outgoing radiance, roulette included, so a read after
+        // the roulette (with the throughput from before its 1/q) came out q× dark — 0.17 st, at any cell size.
+        if (rcRead && (v + 1u >= kRCMinVertex || res.distance > kRCFirstMinCells * rcCell)) {
+            uint s = rcFind(rcKeys, rcKey(h.P, h.N, rcCell), false);
+            if (s != 0xFFFFFFFFu) {
+                float cnt = atomic_load_explicit(&rcData[s * 4u + 3u], memory_order_relaxed);
+                if (cnt >= float(kRCMinCount)) {
+                    L += T * float3(atomic_load_explicit(&rcData[s * 4u + 0u], memory_order_relaxed),
+                                    atomic_load_explicit(&rcData[s * 4u + 1u], memory_order_relaxed),
+                                    atomic_load_explicit(&rcData[s * 4u + 2u], memory_order_relaxed)) / cnt;
+                    break;
+                }
+            }
+        }
+        if (rcWrite && rcN < kRCMaxVerts) {                 // record it, to write its suffix at the end
+            rcSlot[rcN] = rcFind(rcKeys, rcKey(h.P, h.N, rcCell), true);
+            rcT[rcN] = T; rcL[rcN] = L;
+            ++rcN;
+        }
         float3 A = saturate(secondaryAlbedo(h, pFull, sec, albedoAtlas));
         T *= A;
         P = h.P; N = h.N;
@@ -930,6 +1013,20 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
             float2 rr = illumiSobolOwen2DShuffled(sampleIndex, illumiPixelSeed(gid, dimSalt + 2u));
             if (rr.y >= q) break;
             T /= q;
+        }
+    }
+    // DH-1344 — write every recorded vertex's own suffix estimate (the radiance it sent back along the path).
+    if (rcWrite) {
+        for (uint k = 0u; k < min(rcN, kRCMaxWriteVertex); ++k) {
+            uint s = rcSlot[k];
+            if (s == 0xFFFFFFFFu) continue;
+            float3 t = rcT[k];
+            if (any(t <= 1e-6)) continue;
+            float3 Lo = max(float3(0.0), (L - rcL[k]) / t);
+            atomic_fetch_add_explicit(&rcData[s * 4u + 0u], Lo.r, memory_order_relaxed);
+            atomic_fetch_add_explicit(&rcData[s * 4u + 1u], Lo.g, memory_order_relaxed);
+            atomic_fetch_add_explicit(&rcData[s * 4u + 2u], Lo.b, memory_order_relaxed);
+            atomic_fetch_add_explicit(&rcData[s * 4u + 3u], 1.0, memory_order_relaxed);
         }
     }
     if (u.pathClamp > 0.0) {
@@ -993,6 +1090,9 @@ kernel void illumi_rt_lighting_tlas(
     // sheen), read only under `kPathFlagLayered*` (`layeredRTWeights`).
     texture2d<half, access::sample>       dfgLUT      [[texture(11)]],
     texture2d<half, access::read>         gEmission   [[texture(12)]],
+    // DH-1344 — the path lane's radiance cache (keys, rgb+count); tiny dummies when `u.radCacheCell` is 0.
+    device atomic_uint*                   rcKeys      [[buffer(21)]],
+    device atomic_float*                  rcData      [[buffer(22)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -1142,7 +1242,7 @@ kernel void illumi_rt_lighting_tlas(
             for (uint g = 0; g < u.giRays; ++g) {
                 indirect += illumiPathTraceIncoming(isect, accel, Pofs - N * max(u.rayTMin, 1e-3), N, primaryLayer,
                                                     u.giProgressiveIndex * u.giRays + g, gid, u, sec,
-                                                    secFull, skyEquirect, irrCube, albedoAtlas, seed);
+                                                    secFull, skyEquirect, irrCube, albedoAtlas, seed, rcKeys, rcData);
             }
         } else
         for (uint g = 0; g < u.giRays; ++g) {
