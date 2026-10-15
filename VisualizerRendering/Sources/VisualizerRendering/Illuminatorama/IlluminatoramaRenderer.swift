@@ -215,7 +215,7 @@ public final class IlluminatoramaRenderer {
         for g in meshGroups { if let m = meshes[g.kind] { tris += m.indexCount / 3 } }
         for g in (rtGlassEnabled ? flattenGlass() : []) { if let m = meshes[g.kind] { tris += m.indexCount / 3 } }
         let strictLive = buildRTFromExtractedScene && rtEnabled && !rtStillCapsRelaxed
-        return (tris, strictLive ? Self.rtMaxTrianglesForLiveRT : Self.rtMaxTrianglesForGlassOnlyRT)
+        return (tris, strictLive ? Self.rtMaxTrianglesForLiveRT : rtGlassOnlyTriangleCap)
     }
     private var lastUploadedInstances: [InstanceRef] = []
     private var instanceStableFrames: Int = 0
@@ -961,7 +961,7 @@ public final class IlluminatoramaRenderer {
     /// **S4.4 — a STILL may build the extracted-scene TLAS under the glass-arm caps.** The
     /// live-RT caps (128 mesh groups / 150 k triangles) exist because a live loop's first
     /// rebuild of a heavy scene never returns; a still that accumulates pays that rebuild
-    /// once, off the vsync budget, so it can carry the same 512-group / 1.2 M-triangle
+    /// once, off the vsync budget, so it can carry the same 512-group / 2.5 M-triangle
     /// ceiling the glass-only arm already trusts. A furnished document (200+ groups) is
     /// exactly what the live caps auto-disable RT GI on — which is why the shipped photo
     /// export never had bounce. Default `false`: every live host is byte-identical.
@@ -5182,7 +5182,33 @@ public final class IlluminatoramaRenderer {
     /// this higher ceiling lets its windows refract the real room without tripping
     /// the hang-guard. Still bounded so a pathological scene auto-disables rather
     /// than stalling the first BLAS build. Only consulted on the glass-only path.
-    private static let rtMaxTrianglesForGlassOnlyRT: Int = 1_200_000
+    ///
+    /// **2.5 M is measured; the old 1.2 M was not** (Daydream DH-1367, `DocumentRTCensusTests
+    /// .testRTBuildCostVersusTriangleCount`: the real 4000 Sunset (north side) document — which
+    /// sat at 1.247 M and lost every RT pass, its mirrors showing the sky — padded with distinct
+    /// ~250 k-triangle meshes, live lane, 1600×1000, Debug):
+    ///
+    ///     unique tris │ 1.25 M  1.50 M  2.00 M  2.49 M  3.24 M
+    ///     rebuild     │   75     114     193     170     240  ms
+    ///     steady      │   92.1   90.3    85.9    94.6    90.5 ms
+    ///     GPU alloc   │ 4879    4931    5034    5137    5291  MB
+    ///
+    /// The steady frame does not move (BVH traversal is logarithmic); the rebuild frame grows
+    /// ~8 ms per 100 k triangles and memory ~0.2 KB per triangle. A rebuild runs only on a
+    /// TOPOLOGY change, which a host's settled lane sees once per committed edit. Nowhere on
+    /// the ladder is the seconds-to-minutes stall this guard exists to prevent; 2.5 M is ~2× the
+    /// heaviest real document and keeps the worst rebuild near 200 ms.
+    private static let rtMaxTrianglesForGlassOnlyRT: Int = 2_500_000
+    /// Diagnostic override for the glass-only TRIANGLE ceiling (`VIZ_ILLUMI_RT_TRICAP`, e.g.
+    /// 4000000) — the triangle-axis sibling of `VIZ_ILLUMI_RT_GROUPCAP`: lets a harness measure
+    /// what the TLAS rebuild and the steady frame cost past the shipped ceiling. An instrument,
+    /// not a shipped setting; nil (unset/invalid) = the shipped ceiling. The live-RT 150 k cap is
+    /// never overridden.
+    private lazy var rtGlassOnlyTriangleCap: Int = {
+        if let s = ProcessInfo.processInfo.environment["VIZ_ILLUMI_RT_TRICAP"],
+           let v = Int(s), v > 0 { return v }
+        return Self.rtMaxTrianglesForGlassOnlyRT
+    }()
     /// Mesh-GROUP cap for the GLASS-ONLY TLAS — the exact asymmetry the triangle caps
     /// above already encode (150 k live vs 1.2 M glass-only), applied to the other axis.
     ///
@@ -8820,7 +8846,7 @@ public final class IlluminatoramaRenderer {
         // extracted-RT path (see the flag's note); the live loop keeps the strict pair.
         let strictLive = extractedRT && !rtStillCapsRelaxed
         let triCap = strictLive ? Self.rtMaxTrianglesForLiveRT
-                                : Self.rtMaxTrianglesForGlassOnlyRT
+                                : rtGlassOnlyTriangleCap
         // …and the same asymmetry on the mesh-GROUP axis. A furnished architectural
         // document carries 200+ distinct geometries (one group per wall edge / room floor /
         // millwork sub-part), so the live-RT 128 turned AAA glass off scene-wide on every
