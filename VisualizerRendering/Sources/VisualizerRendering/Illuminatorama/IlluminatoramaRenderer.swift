@@ -6452,6 +6452,7 @@ public final class IlluminatoramaRenderer {
             pool.append(extra)
         }
         self.ldrPool = pool
+        Self.clearLDRTextures(pool, on: engine.commandQueue)   // nothing unwritten may ever be presented — see `clearLDRTextures`
         timing.mark("render targets (internal \(self.width)×\(self.height) + LDR pool)")
 
         // ── Buffers ──────────────────────────────────────────────────────
@@ -10424,11 +10425,19 @@ public final class IlluminatoramaRenderer {
                         pool.append(extra)
                     }
                 }
+                Self.clearLDRTextures(pool, on: commandQueue)
                 self.ldrPool = pool
-                self.presentedIdx = 0
+                // KEEP PRESENTING THE LAST FINISHED FRAME until one at the new size completes.
+                // `outputTexture` used to become `t.ldr` here — a texture no frame has written —
+                // and the very next `present(to:)` blitted it: a fresh private texture reads back
+                // as solid 255,0,255, so every live-resize step flashed fuchsia. The old texture is
+                // fully written and still retained here; `present` samples it in normalised UVs, so
+                // for the frame or two until the new size lands it is merely stretched. No pool
+                // slot is "presented" yet (-1), so every new slot is writable and the first one to
+                // complete is promoted.
+                self.presentedIdx = -1
                 self.prevPresentedIdx = -1
                 self.presentSync.reset()
-                self.outputTexture = t.ldr
                 self.tonemapWriteTarget = t.ldr
             }
             self.width        = inW
@@ -10963,6 +10972,7 @@ public final class IlluminatoramaRenderer {
         // (next tick, main actor) reads this and swaps `outputTexture`. Capturing
         // a plain `Int` keeps the handler `Sendable`-clean.
         let completedIdx = writeIdx
+        let completedGeneration = presentSync.currentGeneration
         let raceSlot = Self.raceProbeEnabled ? frameRingIndex : -1
         let sync = presentSync
         let sem = inFlightSemaphore
@@ -10990,7 +11000,7 @@ public final class IlluminatoramaRenderer {
                     } else { try? data.write(to: URL(fileURLWithPath: p)) }
                 }
             }
-            sync.markCompleted(completedIdx)
+            sync.markCompleted(completedIdx, generation: completedGeneration)
             if raceSlot >= 0 { sync.raceProbeCompleteFrame(slot: raceSlot) }
             // Adaptive latency guard (replaces a plain `sem.signal()`): update the
             // GPU-time EMA and release THIS frame's permit — UNLESS frames are heavy
@@ -11121,6 +11131,28 @@ public final class IlluminatoramaRenderer {
     /// non-sRGB format + a manual `pow(1/2.2)` in the shader double-encoded
     /// against SceneKit's pass and washed the colours out.) sRGB targets don't
     /// support `.shaderWrite`; the tonemap is a render pass, so we don't need it.
+    /// Clear freshly allocated presentable textures to opaque black, on this renderer's own queue
+    /// (so the clear is ordered ahead of any later `present` / render of them).
+    ///
+    /// A new `.private` texture's contents are undefined, and on macOS they read back as solid
+    /// 255,0,255 — measured 2026-10-15: every sampled texel of six freshly made 1600×1000
+    /// `bgra8Unorm_srgb` targets, with and without API validation. Anything that can reach the
+    /// screen before a frame writes it (the first present after init; a slot promoted early) must
+    /// therefore be initialised, or it shows as a fuchsia flash.
+    private static func clearLDRTextures(_ textures: [MTLTexture], on queue: MTLCommandQueue) {
+        guard !textures.isEmpty, let cb = queue.makeCommandBuffer() else { return }
+        cb.label = "Illuminatorama.ldr.clear"
+        for tex in textures {
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = tex
+            pass.colorAttachments[0].loadAction = .clear
+            pass.colorAttachments[0].storeAction = .store
+            pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+            cb.makeRenderCommandEncoder(descriptor: pass)?.endEncoding()
+        }
+        cb.commit()
+    }
+
     private static func makeLDRTexture(device: MTLDevice, w: Int, h: Int,
                                         label: String) -> MTLTexture? {
         let d = MTLTextureDescriptor()
@@ -17162,11 +17194,26 @@ private final class IlluminatoramaPresentSync: @unchecked Sendable {
         return inFlight.contains(idx)
     }
 
+    /// Bumped by `reset()`. A frame captures it when it claims a pool slot; its completion is
+    /// ignored if the pool was rebuilt in between (see `markCompleted`).
+    private var generation = 0
+    var currentGeneration: Int { lock.lock(); defer { lock.unlock() }; return generation }
+
     /// Record (from the GPU completion thread) that pool buffer `idx` is done.
-    func markCompleted(_ idx: Int) {
+    ///
+    /// **A completion from a pool that no longer exists is dropped.** A resize rebuilds the LDR
+    /// pool at the new size and resets this object, but a frame committed just before it is still
+    /// on the GPU, writing a slot of the OLD pool. Accepting its index would promote the NEW
+    /// pool's texture at that index — one nothing has ever written — and present it. A fresh
+    /// private texture reads back as solid 255,0,255 on macOS, which is the fuchsia flash a
+    /// window resize showed. It must not clear `inFlight[idx]` either: after the reset that entry
+    /// belongs to a new-pool frame that may still be writing it.
+    func markCompleted(_ idx: Int, generation frameGeneration: Int) {
         lock.lock()
-        completedIdx = idx
-        inFlight.remove(idx)
+        if frameGeneration == generation {
+            completedIdx = idx
+            inFlight.remove(idx)
+        }
         lock.unlock()
     }
 
@@ -17182,6 +17229,7 @@ private final class IlluminatoramaPresentSync: @unchecked Sendable {
 
     func reset() {
         lock.lock()
+        generation &+= 1          // in-flight frames of the old pool must not promote (markCompleted)
         completedIdx = -1
         inFlight.removeAll()
         // Reset the adaptive-depth EMA/target; leave `heldPermits` alone so no
