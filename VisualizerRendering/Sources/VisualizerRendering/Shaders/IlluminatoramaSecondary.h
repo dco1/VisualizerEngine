@@ -117,6 +117,10 @@ struct RTPointLight {
     // local-light-fill path too; 0 ⇒ skipped here (see `secondaryLocalLightFill` and the
     // field's own doc comment on `PointLight` for why).
     uint   giVisible;
+    // Daydream DH-1363 — the luminous OPENING's radius (m; 0 ⇒ none), read by the path lane's
+    // falloff at path vertices (`pathLampAtten`): `1/(d² + r²)`, a disc's on-axis law. Same offset
+    // and width as `PointLight.openingRadius` (size 72 → 76, stride 80 unchanged).
+    float  openingRadius;
 };
 struct RTSpotLight {
     float3   position;   float innerCone;
@@ -131,6 +135,8 @@ struct RTSpotLight {
     uint     giVisible;
     // DH-1295 — mirrors `SpotLight.bulbRadius` (size 184, stride 192); see `RTPointLight.bulbRadius`.
     float    bulbRadius;
+    // Daydream DH-1363 — mirrors `SpotLight.openingRadius` (size 188, stride 192); see `RTPointLight.openingRadius`.
+    float    openingRadius;
 };
 /// Mirror of `AreaLight` (IlluminatoramaCommon.h) — the SAME Swift-uploaded
 /// `IlluminatoramaAreaLight` buffer the deferred kernel reads (stride 144). Keep in

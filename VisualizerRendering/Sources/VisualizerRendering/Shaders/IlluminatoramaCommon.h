@@ -632,6 +632,11 @@ struct PointLight {
     // (`kGIVisibleSecondaryOnly`, point lights): the OTHER way round — secondary hits only,
     // and the deferred kernel skips it (a stand-in for the light a traced bounce's hit receives).
     uint   giVisible;
+    // Daydream DH-1363 — the radius of the luminous OPENING the light leaves through (m; 0 ⇒ none).
+    // Read ONLY by the path-traced still lane (`RTPointLight.openingRadius`); this deferred kernel
+    // ignores it. Appended after `giVisible` (size 72 → 76) inside the stride's tail padding:
+    // stride 80, unchanged. Keep in lockstep with `RTPointLight` and the Swift struct.
+    float  openingRadius;
 };
 #define kGIVisibleSecondaryOnly 2u
 
@@ -706,6 +711,10 @@ struct SpotLight {
     // tail padding: size 184, stride 192, unchanged. Keep in lockstep with `RTSpotLight` and
     // `VolSpotLight`.
     float    bulbRadius;
+    // Daydream DH-1363 — see `PointLight.openingRadius` (path lane only; ignored here). Size
+    // 184 → 188, still inside the tail padding: stride 192, unchanged. Keep in lockstep with
+    // `RTSpotLight` and `VolSpotLight`.
+    float    openingRadius;
 };
 
 struct Instance {

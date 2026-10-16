@@ -811,11 +811,21 @@ public struct IlluminatoramaPointLight {
     /// receives (a lamp's first bounce, while the traced bounce delivers that bounce to the primary).
     public var giVisible: UInt32 = 1
     public static let secondaryOnly: UInt32 = 2
+    /// **The radius of the luminous OPENING the light leaves through** (metres; 0 ⇒ none). Read ONLY
+    /// by the path-traced still lane at path vertices, beside `bulbRadius` (`rtPathLampBulbs`): the
+    /// falloff is `1/max(d² + max(softRadius, openingRadius)², bulbRadius²)` — `1/(d² + r²)` is the
+    /// exact on-axis irradiance of a Lambertian DISC of radius r (a shade's rim, a can's aperture, a
+    /// pane), `1/d²` far away and finite at the rim. A host authors it per fixture from the same
+    /// geometry it builds the fixture with (Daydream DH-1363); unset, the law is DH-1295's exactly.
+    /// Appended after `giVisible` (size 72 → 76): inside the float3-aligned stride's tail padding,
+    /// so the stride stays 80 on both sides. Mirrors the Metal `PointLight` / `RTPointLight
+    /// .openingRadius` — keep in lockstep.
+    public var openingRadius: Float = 0
 
     public init(position: SIMD3<Float>, radius: Float, color: SIMD3<Float>,
                 layerMask: UInt32 = 0xFFFF_FFFF,
                 castsShadow: Bool = false, softRadius: Float = 0, giVisible: Bool = true,
-                bulbRadius: Float = 0) {
+                bulbRadius: Float = 0, openingRadius: Float = 0) {
         self.position = position
         self.radius = radius
         self.color = color
@@ -824,6 +834,7 @@ public struct IlluminatoramaPointLight {
         self.softRadius = softRadius
         self.giVisible = giVisible ? 1 : 0
         self.bulbRadius = bulbRadius
+        self.openingRadius = openingRadius
     }
 }
 
@@ -902,14 +913,21 @@ public struct IlluminatoramaSpotLight {
     /// the stride stays 192 on both sides. Mirrors the Metal `SpotLight` / `RTSpotLight` /
     /// `VolSpotLight.bulbRadius` — keep all four in lockstep.
     public var bulbRadius: Float = 0
+    /// The radius of the luminous OPENING at this cone's apex — see `IlluminatoramaPointLight
+    /// .openingRadius`; same field, same law, read only by the path-traced still lane. Appended
+    /// after `bulbRadius` (size 184 → 188): still inside the float4x4-aligned stride's tail
+    /// padding, so the stride stays 192 on both sides. Mirrors the Metal `SpotLight` /
+    /// `RTSpotLight` / `VolSpotLight.openingRadius` — keep all four in lockstep.
+    public var openingRadius: Float = 0
 
     public init(position: SIMD3<Float>, direction: SIMD3<Float>,
                 innerCone: Float, outerCone: Float,
                 color: SIMD3<Float>, radius: Float,
                 layerMask: UInt32 = 0xFFFF_FFFF,
                 castsShadow: Bool = true, softRadius: Float = 0, giVisible: Bool = true,
-                bulbRadius: Float = 0) {
+                bulbRadius: Float = 0, openingRadius: Float = 0) {
         self.bulbRadius = bulbRadius
+        self.openingRadius = openingRadius
         self.position = position
         self.direction = direction
         self.innerCone = innerCone

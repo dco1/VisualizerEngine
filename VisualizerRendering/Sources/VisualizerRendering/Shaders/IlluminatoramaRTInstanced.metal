@@ -593,19 +593,24 @@ static inline float pathPortalWeightAt(RTAreaLight al, float3 P, float3 N, uint 
 /// at all closer than |it|. DH-1295 — `bulb` is the light's own `bulbRadius` when `near.z` is set
 /// (0 otherwise): the falloff is floored at it, `1/max(d² + soft², bulb²)` — the irradiance of a
 /// luminous SPHERE of radius `bulb`, which is exactly `1/d²` outside the sphere and capped at its
-/// surface exitance inside, where no real surface can be.
-static inline float pathLampAtten(float dist, float softRadius, float bulb, float3 near) {
+/// surface exitance inside, where no real surface can be. Daydream DH-1363 — `opening` is the
+/// light's own `openingRadius` (the luminous disc it leaves through — a shade's rim, a can's
+/// aperture, a pane), honoured with `bulb` under the same `near.z`: the falloff becomes
+/// `1/(d² + r²)`, the exact on-axis irradiance of a Lambertian disc of radius r — `1/d²` far
+/// away, finite at the rim. A light with `openingRadius` 0 keeps DH-1295's law exactly.
+static inline float pathLampAtten(float dist, float softRadius, float bulb, float opening, float3 near) {
     if (near.x < 0.0 && dist < -near.x) return 0.0;
-    float r2 = max(softRadius * softRadius, near.y * near.y);
+    float r = max(softRadius, max(near.y, near.z > 0.0 ? opening : 0.0));
     float floorD = max(max(near.x, 0.0), near.z > 0.0 ? bulb : 0.0);
-    return 1.0 / max(dist * dist + r2, max(floorD * floorD, 1e-4));
+    return 1.0 / max(dist * dist + r * r, max(floorD * floorD, 1e-4));
 }
 
 /// DH-1395 — a lamp's physical radius at a path vertex: the largest of its own `softRadius`, the
-/// `pathLampSourceRadius` lever and (with `kPathFlagLampBulbs`) its `bulbRadius` — the same size
-/// `pathLampAtten` floors the falloff with. The glossy lobe sees the lamp as a sphere this big.
-static inline float pathLampSize(float softRadius, float bulb, float3 near) {
-    return max(max(softRadius, near.y), near.z > 0.0 ? bulb : 0.0);
+/// `pathLampSourceRadius` lever and (with `kPathFlagLampBulbs`) its `bulbRadius` and its
+/// `openingRadius` (DH-1363) — the same sizes `pathLampAtten` shapes the falloff with. The glossy
+/// lobe sees the lamp as a sphere this big.
+static inline float pathLampSize(float softRadius, float bulb, float opening, float3 near) {
+    return max(max(softRadius, near.y), near.z > 0.0 ? max(bulb, opening) : 0.0);
 }
 
 static inline float3 pathPointContribution(RTPointLight pl, float3 P, float3 N, uint layerBits, float3 near) {
@@ -615,7 +620,7 @@ static inline float3 pathPointContribution(RTPointLight pl, float3 P, float3 N, 
     if (dist > pl.radius) return float3(0.0);
     float nl = saturate(dot(N, toL / max(dist, 1e-4)));
     if (nl <= 0.0) return float3(0.0);
-    float atten = pathLampAtten(dist, pl.softRadius, pl.bulbRadius, near);
+    float atten = pathLampAtten(dist, pl.softRadius, pl.bulbRadius, pl.openingRadius, near);
     float window = saturate(1.0 - pow(dist / pl.radius, 4.0));
     return pl.color * (atten * window * window * nl * (1.0 / M_PI_F));
 }
@@ -630,7 +635,7 @@ static inline float3 pathSpotContribution(RTSpotLight sl, float3 P, float3 N, ui
     if (coneAtten <= 0.0) return float3(0.0);
     float nl = saturate(dot(N, L));
     if (nl <= 0.0) return float3(0.0);
-    float atten = pathLampAtten(dist, sl.softRadius, sl.bulbRadius, near);
+    float atten = pathLampAtten(dist, sl.softRadius, sl.bulbRadius, sl.openingRadius, near);
     float window = saturate(1.0 - pow(dist / sl.radius, 4.0));
     return sl.color * (atten * window * window * coneAtten * nl * (1.0 / M_PI_F));
 }
@@ -753,8 +758,8 @@ static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceler
         float pdfB;
         if (j < nP + nS) {
             // DH-1395 — a lamp is a SPHERE of its physical radius to a glossy lobe, not a point.
-            float lampR = j < nP ? pathLampSize(sec.pointLights[j].softRadius, sec.pointLights[j].bulbRadius, near)
-                                 : pathLampSize(sec.spotLights[j - nP].softRadius, sec.spotLights[j - nP].bulbRadius, near);
+            float lampR = j < nP ? pathLampSize(sec.pointLights[j].softRadius, sec.pointLights[j].bulbRadius, sec.pointLights[j].openingRadius, near)
+                                 : pathLampSize(sec.spotLights[j - nP].softRadius, sec.spotLights[j - nP].bulbRadius, sec.spotLights[j - nP].openingRadius, near);
             float3 f = pathGlossyEvalSource(lobe, wi, u.pathGlossyLampSize * lampR * rsqrt(d2), u.pathGlossyLampMinRoughness * u.pathGlossyLampMinRoughness, pdfB);
             c *= M_PI_F * f;
         } else {
@@ -802,9 +807,10 @@ static inline float3 pathLampSumGlossy(float3 P, float3 N, uint layerBits, Secon
         if (all(c <= 0.0)) continue;
         bool isPoint = k < p.pointLightCount;
         float3 pos = isPoint ? sec.pointLights[k].position : sec.spotLights[k - p.pointLightCount].position;
-        float R = isPoint ? pathLampSize(sec.pointLights[k].softRadius, sec.pointLights[k].bulbRadius, near)
+        float R = isPoint ? pathLampSize(sec.pointLights[k].softRadius, sec.pointLights[k].bulbRadius, sec.pointLights[k].openingRadius, near)
                           : pathLampSize(sec.spotLights[k - p.pointLightCount].softRadius,
-                                         sec.spotLights[k - p.pointLightCount].bulbRadius, near);
+                                         sec.spotLights[k - p.pointLightCount].bulbRadius,
+                                         sec.spotLights[k - p.pointLightCount].openingRadius, near);
         float3 toL = pos - P;
         float dl = max(length(toL), 1e-4);
         float pdfB;
