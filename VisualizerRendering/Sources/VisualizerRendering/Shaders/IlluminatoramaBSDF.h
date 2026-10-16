@@ -357,6 +357,36 @@ static inline float3 pathGlossyEval(PathGlossyLobe b, float3 wi, thread float& p
     return F * b.scale * (D * G / (4.0 * b.NdotV * NdotL));
 }
 
+/// DH-1395 — `pathGlossyEval` against a SPHERICAL SOURCE of angular radius `rho` (radians, as seen from the
+/// shaded point: radius / distance), instead of a point. A lamp here is a point light with a physical
+/// bulb radius, and the lobe's value toward a point is the lobe's peak whenever the point sits in the
+/// mirror direction: 1/(π α²) is 8e4 at the 0.045 roughness floor, over a patch of surface a few
+/// millimetres across — so a diffuse path that lands in it carries a value 10⁴ times the mean, and the
+/// frame is full of fireflies (a polished counter reflecting a can onto a plain door: soft pale discs
+/// once the GI filter has spread them). Averaging the lobe over the source's disc IS the physical
+/// quantity — the source subtends ρ, so the half-vector sweeps ±ρ/2 — and it is a convolution of two
+/// narrow distributions: for GGX (width α in tanθ_h) the result is a lobe of width √(α² + (ρ/2)²) that
+/// still integrates to 1, so there is no energy factor to fix. Only the NDF widens (G and F are slow).
+/// `rho = 0`, `minAlpha = 0` is `pathGlossyEval` exactly. `minAlpha` floors the lobe's own α for THIS light
+/// only (the lamp regularisation, `RTInstUniforms.pathGlossyLampMinRoughness`). Used for lamps only: the sun's cone and the apertures are
+/// sampled by the continuation too, and MIS already bounds them.
+static inline float3 pathGlossyEvalSource(PathGlossyLobe b, float3 wi, float rho, float minAlpha, thread float& pdf) {
+    pdf = 0.0;
+    float NdotL = dot(b.N, wi);
+    if (NdotL <= 0.0) return float3(0.0);
+    float3 H = normalize(wi + b.wo);
+    float NdotH = saturate(dot(b.N, H));
+    float VdotH = saturate(dot(b.wo, H));
+    float half_ = 0.5 * rho;
+    float a0 = max(b.alpha, minAlpha);   // the lamp-NEE regularisation floor (DH-1395), on top of the source's size
+    float alphaEff = min(1.0, sqrt(a0 * a0 + half_ * half_));
+    float D = pathGGXD(alphaEff, NdotH);
+    pdf = pathGGXD(b.alpha, NdotH) * b.G1v / (4.0 * b.NdotV);
+    float G = layeredSmithG_IBL(b.NdotV, NdotL, b.roughness);
+    float3 F = b.F0 + (1.0 - b.F0) * pow(1.0 - VdotH, 5.0);
+    return F * b.scale * (D * G / (4.0 * b.NdotV * NdotL));
+}
+
 /// A tangent frame about `n` (Duff et al.) — local to this header so it has no dependencies.
 static inline void pathBasis(float3 n, thread float3& t, thread float3& bt) {
     float s = n.z >= 0.0 ? 1.0 : -1.0; float a = -1.0 / (s + n.z); float d = n.x * n.y * a;

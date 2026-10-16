@@ -172,7 +172,15 @@ struct RTInstUniforms {
     // always a caustic path (camera → diffuse → glossy → light); a near-mirror lobe aimed at a small
     // light (the sun, a bulb) is the classic firefly. 0 ⇒ the material's own roughness (the 0.045
     // G-buffer floor still applies). Three pads keep the 16-byte tail.
-    float pathGlossyMinRoughness; float _padGlossy0; float _padGlossy1; float _padGlossy2;
+    float pathGlossyMinRoughness;
+    // Daydream DH-1395 — the scale on a lamp's angular radius when a GLOSSY vertex evaluates its lobe toward
+    // it (`pathGlossyEvalSource`): 1 ⇒ the lamp's own size (physical), 0 ⇒ a point (the DH-1308 original,
+    // which fills a polished kitchen with fireflies). Was `_padGlossy0`.
+    float pathGlossyLampSize;
+    // Daydream DH-1395 — a roughness floor (perceptual; α = r²) applied ONLY when a glossy lobe is evaluated toward a
+    // LAMP (not to lobe sampling, not to the sun or the windows, which MIS already bounds): path regularisation of the
+    // caustic camera → diffuse → glossy → lamp. 0 ⇒ the material's own. Was `_padGlossy1`.
+    float pathGlossyLampMinRoughness; float _padGlossy2;
 };
 
 /// DH-1011 — `RTInstUniforms.pathFlags` bits.
@@ -593,6 +601,13 @@ static inline float pathLampAtten(float dist, float softRadius, float bulb, floa
     return 1.0 / max(dist * dist + r2, max(floorD * floorD, 1e-4));
 }
 
+/// DH-1395 — a lamp's physical radius at a path vertex: the largest of its own `softRadius`, the
+/// `pathLampSourceRadius` lever and (with `kPathFlagLampBulbs`) its `bulbRadius` — the same size
+/// `pathLampAtten` floors the falloff with. The glossy lobe sees the lamp as a sphere this big.
+static inline float pathLampSize(float softRadius, float bulb, float3 near) {
+    return max(max(softRadius, near.y), near.z > 0.0 ? bulb : 0.0);
+}
+
 static inline float3 pathPointContribution(RTPointLight pl, float3 P, float3 N, uint layerBits, float3 near) {
     if (pl.giVisible == 0u || (pl.layerMask & layerBits) == 0u) return float3(0.0);
     float3 toL = pl.position - P;
@@ -736,10 +751,14 @@ static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceler
         float d2 = max(dot(toT, toT), 1e-8);
         float3 wi = toT * rsqrt(d2);
         float pdfB;
-        float3 f = pathGlossyEval(lobe, wi, pdfB);
         if (j < nP + nS) {
+            // DH-1395 — a lamp is a SPHERE of its physical radius to a glossy lobe, not a point.
+            float lampR = j < nP ? pathLampSize(sec.pointLights[j].softRadius, sec.pointLights[j].bulbRadius, near)
+                                 : pathLampSize(sec.spotLights[j - nP].softRadius, sec.spotLights[j - nP].bulbRadius, near);
+            float3 f = pathGlossyEvalSource(lobe, wi, u.pathGlossyLampSize * lampR * rsqrt(d2), u.pathGlossyLampMinRoughness * u.pathGlossyLampMinRoughness, pdfB);
             c *= M_PI_F * f;
         } else {
+            float3 f = pathGlossyEval(lobe, wi, pdfB);
             RTAreaLight al = sec.areaLights[j - nP - nS];
             float3 nL = cross(al.ex, al.ey);
             float area4 = 4.0 * length(nL);
@@ -775,16 +794,21 @@ static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceler
 /// DH-1308 — `pathLampSum` for a vertex that sampled a GGX lobe: each lamp's Lambert term (which
 /// carries `1/π`) × `π·f(ωi)` toward the lamp. Lamps are points here, so there is nothing to MIS.
 static inline float3 pathLampSumGlossy(float3 P, float3 N, uint layerBits, SecondaryShadeParams p,
-                                       SecondaryScene sec, float3 near, PathGlossyLobe lobe) {
+                                       SecondaryScene sec, float3 near, PathGlossyLobe lobe, float lampSizeScale, float lampMinAlpha) {
     float3 s = float3(0.0);
     uint n = p.pointLightCount + p.spotLightCount;
     for (uint k = 0u; k < n; ++k) {
         float3 c = pathLocalContribution(k, true, P, N, layerBits, p, sec, near);
         if (all(c <= 0.0)) continue;
-        float3 pos = k < p.pointLightCount ? sec.pointLights[k].position
-                                           : sec.spotLights[k - p.pointLightCount].position;
+        bool isPoint = k < p.pointLightCount;
+        float3 pos = isPoint ? sec.pointLights[k].position : sec.spotLights[k - p.pointLightCount].position;
+        float R = isPoint ? pathLampSize(sec.pointLights[k].softRadius, sec.pointLights[k].bulbRadius, near)
+                          : pathLampSize(sec.spotLights[k - p.pointLightCount].softRadius,
+                                         sec.spotLights[k - p.pointLightCount].bulbRadius, near);
+        float3 toL = pos - P;
+        float dl = max(length(toL), 1e-4);
         float pdfB;
-        s += c * M_PI_F * pathGlossyEval(lobe, normalize(pos - P), pdfB);
+        s += c * M_PI_F * pathGlossyEvalSource(lobe, toL / dl, lampSizeScale * R / dl, lampMinAlpha, pdfB);
     }
     return s;
 }
@@ -964,7 +988,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
             } else {
                 // DH-1011 — the lamps stay the deterministic unshadowed sum unless they are to be
                 // shadowed; the emitters (and then the lamps) are ONE pick + ONE ray.
-                if (!lampShadows) Lv += specV ? pathLampSumGlossy(P, N, layerBits, pVert, sec, nearLevers, lobe)
+                if (!lampShadows) Lv += specV ? pathLampSumGlossy(P, N, layerBits, pVert, sec, nearLevers, lobe, u.pathGlossyLampSize, u.pathGlossyLampMinRoughness * u.pathGlossyLampMinRoughness)
                                       : lampNear ? pathLampSum(P, N, layerBits, pVert, sec, nearLevers)
                                                  : secondaryLocalLightFill(P, N, layerBits, pVert, sec);
                 Lv += pathSampleLocalLights(isect, accel, P, N, Pofs, layerBits, lampShadows, true,

@@ -961,6 +961,23 @@ public final class IlluminatoramaRenderer {
     public var rtPathGlossyMinRoughness: Float = 0 {
         didSet { if rtPathGlossyMinRoughness != oldValue { rcNeedsClear = true } }
     }
+    /// DH-1395 — how large a glossy path vertex's lobe sees a lamp: the scale on the lamp's angular
+    /// radius (its physical size — `bulbRadius` / `softRadius` / `rtPathLampSourceRadius`, over distance).
+    /// 1 ⇒ physical: the lobe is evaluated toward the lamp's SPHERE (a lobe of width √(α² + (ρ/2)²), same
+    /// energy). 0 ⇒ a point, the DH-1308 original: toward a point a near-mirror lobe is 8e4 at its peak
+    /// and a diffuse path that lands in the patch of surface in the mirror direction is a firefly (a
+    /// polished counter reflecting a can onto a plain door). Unbiased relative to a true sphere lamp.
+    public var rtPathGlossyLampSize: Float = 1 {
+        didSet { if rtPathGlossyLampSize != oldValue { rcNeedsClear = true } }
+    }
+    /// DH-1395 — a roughness FLOOR (perceptual; α = r²) on a glossy path vertex's lobe, applied ONLY where it is
+    /// evaluated toward a LAMP (the NEE term), not to lobe sampling nor to the sun / window estimators (MIS
+    /// bounds those). Path regularisation of the caustic camera → diffuse → glossy → lamp, which the
+    /// estimator can only find by luck: the lamp's image in a polished surface becomes a little broader, the
+    /// light's total is unchanged. 0 ⇒ the material's own roughness.
+    public var rtPathGlossyLampMinRoughness: Float = 0 {
+        didSet { if rtPathGlossyLampMinRoughness != oldValue { rcNeedsClear = true } }
+    }
     /// Cone-sampled shadow rays per pixel per frame for `rtSunSoftShadowsEnabled`'s traced
     /// sun visibility, host-clamped (`rtSunShadowRayCount`'s write, below) and shader-clamped
     /// (`rtSunSoftVisibility`, IlluminatoramaLighting.metal) to 1…32. DH-0856 measured this
@@ -4858,7 +4875,7 @@ public final class IlluminatoramaRenderer {
         /// DH-1308 — the glossy vertices' roughness floor (Metal twin appended last; three pads keep the
         /// 16-byte tail).
         var pathGlossyMinRoughness: Float = 0
-        var padGlossy0: Float = 0, padGlossy1: Float = 0, padGlossy2: Float = 0
+        var pathGlossyLampSize: Float = 1, pathGlossyLampMinRoughness: Float = 0, padGlossy2: Float = 0
 
         mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
             let p = InteriorRoomGains.pack(gains, enabled: enabled)
@@ -9972,6 +9989,8 @@ public final class IlluminatoramaRenderer {
             // DH-1308 — `kPathFlagGlossyVertices`: only with light sampling + the DFG LUT (the lobe's albedo).
             | (pathOn && rtPathGlossyVertices && rtPathLightSampling && dfgLUTEnabled ? 2048 : 0)
         u.pathGlossyMinRoughness = pathOn ? max(0, rtPathGlossyMinRoughness) : 0
+        u.pathGlossyLampSize = pathOn ? max(0, rtPathGlossyLampSize) : 1   // DH-1395
+        u.pathGlossyLampMinRoughness = pathOn ? max(0, rtPathGlossyLampMinRoughness) : 0
         // DH-1293 — the lamps' near-field levers (0 ⇒ the shipped point-source law).
         u.pathLampMinDist = pathOn ? rtPathLampMinDistance : 0
         u.pathLampSourceRadius = pathOn ? max(0, rtPathLampSourceRadius) : 0
