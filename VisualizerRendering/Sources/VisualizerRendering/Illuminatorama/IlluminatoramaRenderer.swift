@@ -939,6 +939,28 @@ public final class IlluminatoramaRenderer {
     /// many-lights station (5 cm lamps), −40 % of a 16-spp still's variance at night (−39 % by day)
     /// for a converged-mean shift ≤ 0.001 stops (Daydream DH-1293 → DH-1295).
     public var rtPathLampBulbs: Bool = true
+    /// **Daydream DH-1308 — glossy path vertices.** True: a path vertex past the primary samples the
+    /// SAME layered stack the deferred kernel shades — coat (clearcoat), GGX specular (F0 = mix(0.04,
+    /// albedo, metallic), VNDF-sampled, multiple scattering put back) and Lambert under them — one lobe
+    /// per vertex picked ∝ its albedo, each lobe's NEE (sun, lamps, windows) MIS'd against its own
+    /// density. A polished floor then throws a window's light onto the wall and a metal bounces its
+    /// coloured F0, where every vertex used to be Lambert × albedo. The radiance cache keeps only
+    /// the diffuse picks (a glossy lobe's light is view-dependent; a cell is not). Needs
+    /// `rtPathLightSampling` and `dfgLUTEnabled` (the lobe's albedo is the DFG LUT's); off with
+    /// either. Independent of `layeredMultiscatter` (the deferred pass's switch — Daydream ships it
+    /// off, DH-1331): the primary keeps whatever weights that switch gives it. Default FALSE: byte-identical until the look is approved. The material comes
+    /// from the per-instance `metallic` / `roughness` / `clearcoat` / `clearcoatRoughness` SCALARS
+    /// (a textured roughness or metalness is not tapped at a path vertex — the albedo is).
+    public var rtPathGlossyVertices: Bool = false {
+        didSet { if rtPathGlossyVertices != oldValue { rcNeedsClear = true } }   // the cache changes meaning
+    }
+    /// DH-1308 — the roughness FLOOR of a glossy path vertex's lobes (perceptual; ≤ 0.045 ⇒ the
+    /// material's own). Path regularisation: every glossy vertex here is reached through the primary's
+    /// diffuse integral, so a near-mirror aimed at the sun or a bulb is a caustic path the estimator
+    /// finds only by luck — fireflies. A floor trades that for a slightly broader reflection. Biased.
+    public var rtPathGlossyMinRoughness: Float = 0 {
+        didSet { if rtPathGlossyMinRoughness != oldValue { rcNeedsClear = true } }
+    }
     /// Cone-sampled shadow rays per pixel per frame for `rtSunSoftShadowsEnabled`'s traced
     /// sun visibility, host-clamped (`rtSunShadowRayCount`'s write, below) and shader-clamped
     /// (`rtSunSoftVisibility`, IlluminatoramaLighting.metal) to 1…32. DH-0856 measured this
@@ -1461,6 +1483,15 @@ public final class IlluminatoramaRenderer {
     /// or temporal blend), for per-sample statistics: with the path lane at one path per pixel per
     /// frame, each texel IS one path sample. Read-only diagnostics; internal resolution, rgba16Float.
     public var rtDiffuseTextureForDiagnostics: MTLTexture { rtDiffuseTexture }
+    /// Daydream DH-1360 — the TAA ACCUMULATOR the last rendered frame wrote (linear HDR, internal size,
+    /// before bloom and the tonemap; rgba16Float, read + write): the history the NEXT resolve reads. Only
+    /// meaningful between frames, and only after a frame that ran TAA. `IlluminatoramaStillBatches` folds
+    /// it per batch and writes a batch mean back into it.
+    public var latestTAAHistoryTexture: MTLTexture { previousHistoryTexture }
+    /// Daydream DH-1360 — the G-buffer's octahedral normal (xy) + roughness (z), and its emission (rgb),
+    /// for per-tile classification. Internal size, rgba16Float, read-only.
+    public var gbufferNormalRoughnessTexture: MTLTexture { gbufferNormalRgh }
+    public var gbufferEmissionTexture: MTLTexture { gbufferEmission }
 
     /// **Pin the auto-exposure meter's sample grid** (opt-in, VZ-0197; nil = the internal render size,
     /// as always). `illumi_exposure_estimate` samples 256 × 32 cells by LINEAR index over an
@@ -2671,6 +2702,10 @@ public final class IlluminatoramaRenderer {
     /// TAA contributes denoise of SSAO/SSR/DDGI noise without adding any
     /// motion. Set back to 0.5 to re-enable temporal supersample AA.
     public var taaJitterPixels: Float = 0.0
+    /// The internal → output reduction (Daydream DH-1365): `.legacy` (default, byte-identical) is the
+    /// tonemap's 4-tap bilinear; a declared kernel gathers every internal texel within its radius
+    /// in linear HDR. See `IlluminatoramaReconstructionFilter`. Rides `FrameUniforms.taaJitterDelta.zw`.
+    public var reconstructionFilter: IlluminatoramaReconstructionFilter = .legacy
 
     // ── Spatial supersample (SSAA) ───────────────────────────────────
     /// Internal rendering scale. Internal targets (G-buffer, depth, HDR,
@@ -4815,6 +4850,10 @@ public final class IlluminatoramaRenderer {
         var pathLampMinDist: Float = 0, pathLampSourceRadius: Float = 0
         /// DH-1344 — the path lane's radiance-cache cell (m); 0 ⇒ off (was `padPath2`).
         var radCacheCell: Float = 0
+        /// DH-1308 — the glossy vertices' roughness floor (Metal twin appended last; three pads keep the
+        /// 16-byte tail).
+        var pathGlossyMinRoughness: Float = 0
+        var padGlossy0: Float = 0, padGlossy1: Float = 0, padGlossy2: Float = 0
 
         mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
             let p = InteriorRoomGains.pack(gains, enabled: enabled)
@@ -4848,11 +4887,24 @@ public final class IlluminatoramaRenderer {
     /// value already in the row.
     private static func rtInstanceRow(_ inst: IlluminatoramaInstance, normalBase: Float) -> RTInstanceData {
         var c0 = inst.normalMatrix.columns.0, c1 = inst.normalMatrix.columns.1
+        var c2 = inst.normalMatrix.columns.2
         c0.w = Float(inst.albedoTextureSlice + 1)
         c1.w = Float(bitPattern: inst.layer)
-        return RTInstanceData(nrm0: c0, nrm1: c1, nrm2: inst.normalMatrix.columns.2,
+        // DH-1308 — the layered stack a path vertex samples (`secondaryMaterial` / `secondaryCoat`):
+        // the base's metalness + roughness in `emissionPad.w`, the clearcoat's strength + roughness in
+        // `nrm2.w` (0 strength ⇒ no coat). Read only under `kPathFlagGlossyVertices`.
+        c2.w = inst.clearcoat > 0 ? rtPackMaterialLane(inst.clearcoat, inst.clearcoatRoughness) : 0
+        return RTInstanceData(nrm0: c0, nrm1: c1, nrm2: c2,
                               albedoTriBase: SIMD4(inst.albedo, normalBase),
-                              emissionPad: SIMD4(inst.emission, 0))
+                              emissionPad: SIMD4(inst.emission, rtPackMaterialLane(inst.metallic, inst.roughness)))
+    }
+
+    /// DH-1308 — two [0, 1] material scalars in ONE float lane, `−(1 + 2·round(a·1000) + min(b, 0.999))`:
+    /// always ≤ −1, so a glass row's corner-normal base (≥ 0) and an unpacked row's 0 both decode to
+    /// "absent" (`secondaryUnpackMaterialLane`, IlluminatoramaSecondary.h). `a` keeps 1/1000, `b` ~1e-4.
+    nonisolated static func rtPackMaterialLane(_ a: Float, _ b: Float) -> Float {
+        let aq = (min(max(a, 0), 1) * 1000).rounded()
+        return -(1 + 2 * aq + min(max(b, 0), 0.999))
     }
 
     /// Glass sibling of `rtInstanceRow`. A dielectric boundary is never a shaded hit
@@ -9907,11 +9959,14 @@ public final class IlluminatoramaRenderer {
         u.pathFlags = !pathOn ? 0 : (rtPathLightSampling ? 1 : 0)
             | (rtPathLightSampling && rtPathLampShadows ? 2 : 0)
             | (rtPathLampBulbs ? 4 : 0)                       // DH-1295 — `kPathFlagLampBulbs`
-            | (rtPathDebugFlags & 0xF8)
+            | (rtPathDebugFlags & 0x30F8)                       // + 4096: DH-1308's glossy instrument
         // DH-1014 — the layered weights apply to the one-bounce GI too, so NOT gated on `pathOn`.
         u.pathFlags |= (dfgLUTEnabled && layeredMultiscatter ? 256 : 0)
             | (dfgLUTEnabled && layeredClothSheen ? 512 : 0)
             | (!pathOn && rtGIHitFill ? 1024 : 0)            // DH-1320 — `kPathFlagOneBounceHitFill`
+            // DH-1308 — `kPathFlagGlossyVertices`: only with light sampling + the DFG LUT (the lobe's albedo).
+            | (pathOn && rtPathGlossyVertices && rtPathLightSampling && dfgLUTEnabled ? 2048 : 0)
+        u.pathGlossyMinRoughness = pathOn ? max(0, rtPathGlossyMinRoughness) : 0
         // DH-1293 — the lamps' near-field levers (0 ⇒ the shipped point-source law).
         u.pathLampMinDist = pathOn ? rtPathLampMinDistance : 0
         u.pathLampSourceRadius = pathOn ? max(0, rtPathLampSourceRadius) : 0
@@ -15895,8 +15950,10 @@ public final class IlluminatoramaRenderer {
         // `previousViewProjection`), so the delta of the two offsets is what is
         // left over on top of the surface's real motion. Zero whenever jitter is
         // off, which is every frame of every scene that never opts in.
+        // zw — DH-1365: the reconstruction filter (kernel, radius); (0, 0) ⇒ the legacy 4-tap.
         u.taaJitterDelta = SIMD4(jitterNDC.x - previousJitterNDC.x,
-                                 jitterNDC.y - previousJitterNDC.y, 0, 0)
+                                 jitterNDC.y - previousJitterNDC.y,
+                                 reconstructionFilter.uniform.x, reconstructionFilter.uniform.y)
         // Phase 9 — film LUT strength: 0 when no LUT is bound (bypasses the shader branch).
         u.filmLUTStrength = filmLUTTexture != nil ? max(0, min(1, filmLUTStrength)) : 0
         u.filmLUTSize = max(2, filmLUTSize)

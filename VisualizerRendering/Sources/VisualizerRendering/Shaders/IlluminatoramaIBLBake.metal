@@ -203,15 +203,13 @@ kernel void illumi_prefilter_bake(
 // roughness 0.12 and NdotV ≈ 0.3 the analytic form gives G ≈ 0.54 against the IBL
 // form's ≈ 1.0, i.e. the LUT was reporting that a MIRROR loses ~40 % of its energy.
 //
-// This is defined locally rather than fixed in the shared header on purpose: the
-// header's `geometrySmith` is the analytic-light G and must stay that way.
-static inline float dfgSchlickGGX_IBL(float NdotX, float k) {
-    return NdotX / (NdotX * (1.0 - k) + k);
-}
+// This is NOT `geometrySmith` on purpose: the Common header's `geometrySmith` is the
+// analytic-light G and must stay that way. The IBL form is `layeredSmithG_IBL`
+// (IlluminatoramaBSDF.h), shared with the path lane's vertex BSDF (DH-1308).
 static inline float dfgSmith_IBL(float NdotV, float NdotL, float roughness) {
-    float alpha = roughness * roughness;
-    float k     = alpha * 0.5;
-    return dfgSchlickGGX_IBL(NdotV, k) * dfgSchlickGGX_IBL(NdotL, k);
+    // The ONE definition lives in IlluminatoramaBSDF.h (DH-1308): the path lane's vertex BSDF
+    // samples a GGX lobe built on this G, so its albedo is the LUT's (A, B) by construction.
+    return layeredSmithG_IBL(NdotV, NdotL, roughness);
 }
 
 /// Which `k` remap the bake integrates with. 1 = the correct IBL form (`k = α/2`),

@@ -166,6 +166,13 @@ struct RTInstUniforms {
     // write, nothing reads), < 0 ⇒ this frame USES it (paths read from their second bounce, nothing writes);
     // 0 ⇒ off (byte-identical). Was `_padPath2`.
     float radCacheCell;
+    // Daydream DH-1308 — the glossy vertices' roughness FLOOR (`kPathFlagGlossyVertices`): every GGX lobe
+    // met past the primary is at least this rough (path regularisation — biased on purpose, a lever).
+    // Every path vertex here is reached through the primary's DIFFUSE integral, so a glossy vertex is
+    // always a caustic path (camera → diffuse → glossy → light); a near-mirror lobe aimed at a small
+    // light (the sun, a bulb) is the classic firefly. 0 ⇒ the material's own roughness (the 0.045
+    // G-buffer floor still applies). Three pads keep the 16-byte tail.
+    float pathGlossyMinRoughness; float _padGlossy0; float _padGlossy1; float _padGlossy2;
 };
 
 /// DH-1011 — `RTInstUniforms.pathFlags` bits.
@@ -203,6 +210,12 @@ struct RTInstUniforms {
 #define kPathFlagDebugNoLocal     32u
 #define kPathFlagDebugNoSun       16u
 #define kPathFlagDebugNoApertures 8u
+/// DH-1308 INSTRUMENT: glossy vertices never pick a glossy lobe (their diffuse share alone). Never set by a host.
+#define kPathFlagDebugGlossyDiffuseOnly 4096u
+/// DH-1308 INSTRUMENT: an independent estimator of the same vertex BSDF — no lobe pick, no VNDF: a cosine
+/// continuation weighted by the WHOLE stack, Wd·A + π·(f_spec + f_coat). Its NEE keeps only the diffuse
+/// share, so it is a valid cross-check only with the vertex light sources off (16 | 32 | 8). Never set by a host.
+#define kPathFlagDebugGlossyBrute 8192u
 
 // ── Curve primitives (#60 item 7) ────────────────────────────────────────────
 // `kRTCurvesEnabled` specializes the kernel for a TLAS that contains curve
@@ -656,13 +669,20 @@ static inline float3 pathLampSum(float3 P, float3 N, uint layerBits, SecondarySh
 /// visibility ray when the light casts a shadow: an unbiased estimate of Σ_i c_i·V_i. The weights
 /// are recomputed on the second pass rather than cached — an ALU-only pass over the room's lights
 /// is noise next to one traced ray, and it keeps the cost flat in light count for thread memory.
+///
+/// DH-1308 — `spec`: the vertex sampled a GGX lobe (`lobe`), so the picked light is weighted by
+/// that lobe instead of Lambert. The pick keeps the Lambert weights (zero exactly where the lobe's
+/// term is zero too — behind the surface, out of range, outside the cone — so it stays unbiased):
+/// a lamp returns `c·π·f(ωi)` (its Lambert term carries the `1/π`), an area emitter the point
+/// estimate `Le·window·f·cosθ·cosθ_L·A/d²` at the point already drawn for its shadow ray (its
+/// Lambert term is the LTC form factor, an integral the lobe has no closed form for).
 template <typename Isect>
 static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceleration_structure accel,
                                            float3 P, float3 N, float3 Pofs, uint layerBits,
                                            bool lamps, bool lampVisibility, uint areaCount,
                                            SecondaryShadeParams p, SecondaryScene sec,
                                            constant RTInstUniforms& u, uint sampleIndex, uint lightSalt,
-                                           uint2 gid)
+                                           uint2 gid, bool spec, PathGlossyLobe lobe)
 {
     uint nP = lamps ? p.pointLightCount : 0u;
     uint nS = lamps ? p.spotLightCount : 0u;
@@ -709,6 +729,29 @@ static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceler
         target = al.center + al.ex * (q.x * 2.0 - 1.0) + al.ey * (q.y * 2.0 - 1.0);
         gap = 0.02;                                        // never the pane / lens itself
     }
+    if (spec) {
+        // DH-1308 — the lobe's term for the picked light (see the header comment).
+        float3 toT = target - P;
+        float d2 = max(dot(toT, toT), 1e-8);
+        float3 wi = toT * rsqrt(d2);
+        float pdfB;
+        float3 f = pathGlossyEval(lobe, wi, pdfB);
+        if (j < nP + nS) {
+            c *= M_PI_F * f;
+        } else {
+            RTAreaLight al = sec.areaLights[j - nP - nS];
+            float3 nL = cross(al.ex, al.ey);
+            float area4 = 4.0 * length(nL);
+            float cosL = dot(normalize(nL), -wi);
+            if (al.twoSided > 0.5) cosL = abs(cosL);
+            float dc = length(al.center - P);
+            float window = saturate(1.0 - pow(dc / max(al.radius, 1e-6), 4.0));
+            window *= window;
+            c = (cosL > 0.0 && dc <= al.radius)
+                ? al.color * f * (window * saturate(dot(N, wi)) * cosL * area4 / d2) : float3(0.0);
+        }
+        if (all(c <= 0.0)) return float3(0.0);
+    }
     if (castsShadow) {
         // Off the surface on the light's side — the area fill's convention (a back-facing rect
         // is skipped by its weight, so this is N for every light that can be picked).
@@ -726,6 +769,23 @@ static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceler
         }
     }
     return c / pj;
+}
+
+/// DH-1308 — `pathLampSum` for a vertex that sampled a GGX lobe: each lamp's Lambert term (which
+/// carries `1/π`) × `π·f(ωi)` toward the lamp. Lamps are points here, so there is nothing to MIS.
+static inline float3 pathLampSumGlossy(float3 P, float3 N, uint layerBits, SecondaryShadeParams p,
+                                       SecondaryScene sec, float3 near, PathGlossyLobe lobe) {
+    float3 s = float3(0.0);
+    uint n = p.pointLightCount + p.spotLightCount;
+    for (uint k = 0u; k < n; ++k) {
+        float3 c = pathLocalContribution(k, true, P, N, layerBits, p, sec, near);
+        if (all(c <= 0.0)) continue;
+        float3 pos = k < p.pointLightCount ? sec.pointLights[k].position
+                                           : sec.spotLights[k - p.pointLightCount].position;
+        float pdfB;
+        s += c * M_PI_F * pathGlossyEval(lobe, normalize(pos - P), pdfB);
+    }
+    return s;
 }
 
 /// The radiance the aperture estimator reads along a ray that has crossed a portal — the sky, or
@@ -798,7 +858,8 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                                              texturecube<float, access::sample> irrCube,
                                              texture2d_array<float, access::sample> albedoAtlas,
                                              thread uint& seed,
-                                             device atomic_uint* rcKeys, device atomic_float* rcData)
+                                             device atomic_uint* rcKeys, device atomic_float* rcData,
+                                             texture2d<half, access::sample> dfgLUT)
 {
     uint portalCount = uint(max(0.0, u.interiorRoomGainMeta.y));
     // DH-1344 — radiance cache: per recorded vertex, its cell, the throughput arriving at it (before its
@@ -830,11 +891,33 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
     float3 nearLevers = float3(u.pathLampMinDist, u.pathLampSourceRadius,
                                (u.pathFlags & kPathFlagLampBulbs) != 0u ? 1.0 : 0.0);
     bool lampNear = nearLevers.x != 0.0 || nearLevers.y > 0.0 || nearLevers.z > 0.0;
+    // DH-1308 — GLOSSY VERTICES (the vertex-BSDF block in IlluminatoramaBSDF.h). A vertex past the
+    // primary samples ONE lobe of its layered stack (coat / specular / diffuse, picked ∝ albedo):
+    // `specV` ⇒ this vertex samples `lobe` (GGX) — its NEE terms are weighted by f(ωi) and MIS'd
+    // against the lobe's VNDF density, its continuation is a VNDF sample. The PRIMARY (v = 0) stays
+    // the diffuse integral it always was: this lane returns the primary's diffuse incoming, and the
+    // primary's specular is the RT reflection pass's. Needs light sampling (the partition would drop
+    // every glossy continuation through a window) and the DFG LUT (the lobe's albedo is the LUT's);
+    // the host sets the bit only with both. It does NOT need the deferred pass's layered switch
+    // (`kPathFlagLayeredMultiscatter`): the vertex stack is self-contained, and the app ships with
+    // that switch off (DH-1331).
+    bool glossy = (u.pathFlags & kPathFlagGlossyVertices) != 0u && lightSampling;
+    float glossyMinR = max(0.045, u.pathGlossyMinRoughness);
+    bool specV = false;
+    bool bruteV = false; float3 bruteWdA = float3(0.0);     // the brute-force instrument (8192)
+    PathGlossyLobe lobe = pathGlossyLobe(N0, N0, float3(0.04), 1.0, float3(0.0), float4(1.0, 0.0, 1.0, 0.0));
+    PathGlossyLobe lobeC = lobe;
+    // The sun as a light of finite size for the lobe's MIS: a cone of half-angle θ (the same cone the
+    // NEE ray is drawn from, uniform in solid angle) of solid angle 4π·sin²(θ/2), chord 2·sin(θ/2).
+    float sunHalf = sin(0.5 * u.sunSoftnessRad);
+    float sunOmega = max(4.0 * M_PI_F * sunHalf * sunHalf, 1e-12);
+    float sunChord = 2.0 * sunHalf;
+    bool sunOn = any(u.sunColor > 0.0) && (u.pathFlags & kPathFlagDebugNoSun) == 0u;
     if ((u.pathFlags & kPathFlagDebugPrimaryLocal) != 0u) {
         // INSTRUMENT: the primary's own local-light NEE and nothing else — the traced lamp
         // visibility, readable against the deferred pass's shadow-mapped lamps (DH-1011).
         return pathSampleLocalLights(isect, accel, P0, N0, P0 + N0 * tMin, layerBits, true, lampShadows,
-                                     0u, pVert, sec, u, sampleIndex, 0x4C495445u, gid);
+                                     0u, pVert, sec, u, sampleIndex, 0x4C495445u, gid, false, lobe);
     }
     for (uint v = 0u; v <= maxB; ++v) {
         uint dimSalt = 0x50415448u + v * kPathDimsPerVertex;   // 'PATH'
@@ -852,7 +935,18 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 sr.min_distance = tMin; sr.max_distance = 1e4;
                 bool blocked = isect.intersect(sr, accel, u.transportRayMask).type != intersection_type::none;
                 isect.accept_any_intersection(false);
-                if (!blocked) Lv += u.sunColor * nl * (1.0 / M_PI_F);
+                if (!blocked) {
+                    if (!specV) {
+                        Lv += u.sunColor * nl * (1.0 / M_PI_F);
+                    } else {
+                        // DH-1308 — the lobe's sun: E·f·cosθ, power-heuristic against the lobe's own
+                        // chance of finding the sun's cone (the continuation below adds the other half).
+                        float pdfB;
+                        float3 f = pathGlossyEval(lobe, sr.direction, pdfB);
+                        float rB = pdfB * sunOmega;                           // p_B / p_L
+                        Lv += u.sunColor * f * (saturate(dot(N, sr.direction)) / (1.0 + rB * rB));
+                    }
+                }
             }
             if ((u.pathFlags & kPathFlagDebugNoLocal) != 0u) {
                 // instrument: no local lights at path vertices
@@ -868,10 +962,11 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
             } else {
                 // DH-1011 — the lamps stay the deterministic unshadowed sum unless they are to be
                 // shadowed; the emitters (and then the lamps) are ONE pick + ONE ray.
-                if (!lampShadows) Lv += lampNear ? pathLampSum(P, N, layerBits, pVert, sec, nearLevers)
+                if (!lampShadows) Lv += specV ? pathLampSumGlossy(P, N, layerBits, pVert, sec, nearLevers, lobe)
+                                      : lampNear ? pathLampSum(P, N, layerBits, pVert, sec, nearLevers)
                                                  : secondaryLocalLightFill(P, N, layerBits, pVert, sec);
                 Lv += pathSampleLocalLights(isect, accel, P, N, Pofs, layerBits, lampShadows, true,
-                                            portalCount, pVert, sec, u, sampleIndex, lightSalt, gid);
+                                            portalCount, pVert, sec, u, sampleIndex, lightSalt, gid, specV, lobe);
             }
         }
 
@@ -914,6 +1009,14 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                         // The aperture's OPACITY (1 − pane transmittance): 0 ⇒ an open hole.
                         float tPane = 1.0 - saturate(al.apertureOpacity);
                         float pdfW = dist * dist / (area4 * cosL);          // area → solid angle
+                        if (specV) {
+                            // DH-1308 — the lobe's view of the window: f(ωi)·cosθ, MIS'd against the
+                            // lobe's VNDF density (a near-mirror's continuation owns its reflection).
+                            float pdfB;
+                            float3 f = pathGlossyEval(lobe, d, pdfB);
+                            float rB = pdfB / max(pj * pdfW, 1e-30);           // p_B / p_L
+                            Lv += Lo * tPane * f * (cosR / ((1.0 + rB * rB) * pj * pdfW));
+                        } else {
                         // DH-1011 — power-heuristic weight against the continuation's density.
                         float misW = 1.0;
                         if (lightSampling) {
@@ -921,16 +1024,38 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                             misW = (pL * pL) / max(pL * pL + pB * pB, 1e-30);
                         }
                         Lv += Lo * tPane * cosR * misW / (M_PI_F * pj * pdfW);
+                        }
                     }
                 }
             }
         }
+        if (bruteV) Lv *= bruteWdA;              // instrument: the diffuse share's NEE only
         L += T * Lv;
         if (v == maxB) break;
 
         // ── Continuation (cosine) ──
         float2 bq = illumiSobolOwen2DShuffled(sampleIndex, illumiPixelSeed(gid, dimSalt + 0u));
-        float3 dir = illumiCosineHemisphereAxisSafe(N, bq);
+        float3 dir;
+        float pdfSpec = 0.0;                     // DH-1308 — the VNDF density of `dir` (spec vertices)
+        if (bruteV) {
+            dir = illumiCosineHemisphereAxisSafe(N, bq);
+            float pd0, pd1;
+            T *= bruteWdA + M_PI_F * (pathGlossyEval(lobe, dir, pd0) + pathGlossyEval(lobeC, dir, pd1));
+        } else if (!specV) {
+            dir = illumiCosineHemisphereAxisSafe(N, bq);
+        } else {
+            float3 w = pathGlossySample(lobe, bq, dir, pdfSpec);
+            if (pdfSpec <= 0.0 || all(w <= 0.0)) break;     // reflected below the horizon: no light
+            T *= w;                                          // f·cosθ / pdf
+        }
+        // DH-1308 — the sun's cone found by a GLOSSY continuation that escapes to the sky: the other
+        // half of the sun's MIS (NEE above). Unshadowed by construction (the ray escaped); like the
+        // NEE ray, a pane does not attenuate it.
+        float3 sunHit = float3(0.0);
+        if (specV && sunOn && length(dir - Ld) <= sunChord && dot(N, Ld) > 0.0) {
+            float rB = pdfSpec * sunOmega;                   // p_B / p_L
+            sunHit = (u.sunColor / sunOmega) * (rB * rB / (1.0 + rB * rB));
+        }
         isect.accept_any_intersection(false);
         ray r; r.origin = Pofs; r.direction = dir; r.min_distance = tMin; r.max_distance = 1e4;
         auto res = isect.intersect(r, accel, u.transportRayMask);
@@ -954,12 +1079,13 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 float cosL = abs(dot(normalize(nL), dir));
                 if (wSum > 0.0 && wk > 0.0 && cosL > 1e-4 && area4 > 0.0)
                     pL = (wk / wSum) * (tcMin * tcMin) / (area4 * cosL);
-                float pB = max(dot(N, dir), 0.0) * (1.0 / M_PI_F);
+                float pB = specV ? pdfSpec : max(dot(N, dir), 0.0) * (1.0 / M_PI_F);
                 float misW = (pB * pB) / max(pB * pB + pL * pL, 1e-30);
                 float tPane = 1.0 - saturate(al.apertureOpacity);
                 float3 Lo = pathOutdoorFromResult(isect, accel, res, Pofs, dir, u, pOut, sec,
                                                   skyEquirect, irrCube, albedoAtlas, seed);
                 L += T * Lo * tPane * misW;
+                if (specV && res.type == intersection_type::none) L += T * sunHit;   // DH-1308
                 break;
             }
         } else {
@@ -975,6 +1101,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
             float3 sky = skyEquirect.sample(skySamp, dirToEquirectUV(dir)).rgb;
             if (u.scotopicDesaturation > 0.0) sky = mix(sky, float3(pathLuma(sky)), u.scotopicDesaturation);
             L += T * sky * u.skyIntensity;
+            if (specV) L += T * sunHit;                      // DH-1308
             break;
         }
         if (res.type != intersection_type::triangle) break;   // curves: opaque, unlit (rare)
@@ -985,32 +1112,102 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         h.bary = res.triangle_barycentric_coord;
         h.instanceID = res.instance_id; h.primitiveID = res.primitive_id;
         if ((u.pathFlags & kPathFlagDebugNoEmissionHits) == 0u) L += T * secondaryEmission(h.instanceID, sec.insts);
+        // DH-1308 — the hit's LOBE, picked before the radiance cache is consulted: the cache holds the
+        // light a surface sends back DIFFUSELY (view-independent), so only a diffuse pick may read or
+        // write it. Picks ∝ the layer albedos (coat Ec, specular (1−Ec)·envSpec, diffuse (1−Ec)(1−m)
+        // (1−envSpec)·A); the pick's weight `lobeW` divides by its probability. A row without material
+        // data (glass, a curve, a host that never packs) stays the legacy Lambert vertex.
+        float3 Ahit = float3(0.0);
+        float3 lobeW = float3(1.0);              // diffuse: × Ahit as well; spec: 1 / its pick probability
+        float3 rrAlb = float3(1.0);              // the picked lobe's albedo — the roulette's estimate
+        bool specNext = false, bruteNext = false;
+        float3 bruteWdANext = float3(0.0);
+        PathGlossyLobe nextLobe = lobe, nextLobeC = lobeC;
+        if (glossy) {
+            Ahit = saturate(secondaryAlbedo(h, pFull, sec, albedoAtlas));
+            float2 mr = secondaryMaterial(h.instanceID, sec.insts);
+            if (mr.x >= 0.0) {
+                constexpr sampler lutSmp(filter::linear, address::clamp_to_edge);
+                float3 wo = -dir;
+                float NdotVh = saturate(dot(h.N, wo));
+                float m = mr.x, rB = max(glossyMinR, mr.y);
+                float4 lutB = float4(dfgLUT.sample(lutSmp, float2(NdotVh, rB)));
+                float3 F0 = mix(float3(0.04), Ahit, m);
+                float3 Es = saturate(layeredEnvSpecular(F0, lutB.xy));
+                float2 cc = secondaryCoat(h.instanceID, sec.insts);
+                float ccS = max(cc.x, 0.0), rC = max(glossyMinR, cc.y), Ec = 0.0;
+                float4 lutC = lutB;
+                if (ccS > 0.0) {
+                    lutC = float4(dfgLUT.sample(lutSmp, float2(NdotVh, rC)));
+                    Ec = saturate(ccS * layeredEnvSpecular(float3(0.04), lutC.xy).x);
+                }
+                float under = 1.0 - Ec;
+                float3 Wd = under * (1.0 - m) * (1.0 - Es);
+                float wD = pathLuma(Wd * Ahit), wS = pathLuma(under * Es), wC = Ec;
+                // INSTRUMENT (`kPathFlagDebugGlossyDiffuseOnly`): never pick a glossy lobe — the vertex is
+                // the layered model's diffuse share alone, so a frame reads (1 − Es)·A against the Lambert A.
+                if ((u.pathFlags & kPathFlagDebugGlossyDiffuseOnly) != 0u) { wS = 0.0; wC = 0.0; }
+                float wT = wD + wS + wC;
+                if (wT <= 0.0) break;                       // a black metal: nothing leaves this hit
+                float xi = illumiSobolOwen2DShuffled(sampleIndex, illumiPixelSeed(gid, 0x474C4F53u + v)).x * wT;   // 'GLOS'
+                if ((u.pathFlags & kPathFlagDebugGlossyBrute) != 0u) {
+                    bruteNext = true;
+                    nextLobe = pathGlossyLobe(h.N, wo, F0, rB, float3(under), lutB);
+                    nextLobeC = pathGlossyLobe(h.N, wo, float3(0.04), rC, float3(ccS), lutC);
+                    bruteWdANext = Wd * Ahit;
+                    lobeW = float3(1.0); rrAlb = Wd * Ahit + under * Es + Ec;
+                } else if (xi < wS && wS > 0.0) {
+                    specNext = true;
+                    nextLobe = pathGlossyLobe(h.N, wo, F0, rB, float3(under), lutB);
+                    lobeW = float3(wT / wS); rrAlb = under * Es;
+                } else if (xi < wS + wC && wC > 0.0) {
+                    specNext = true;
+                    nextLobe = pathGlossyLobe(h.N, wo, float3(0.04), rC, float3(ccS), lutC);
+                    lobeW = float3(wT / wC); rrAlb = float3(Ec);
+                } else {
+                    if (wD <= 0.0) break;
+                    lobeW = Wd * (wT / wD);
+                }
+            }
+        }
         // DH-1344 — the radiance cache at this vertex (vertex index v + 1), BEFORE its albedo and its Russian
         // roulette: the cached mean is the vertex's whole outgoing radiance, roulette included, so a read after
         // the roulette (with the throughput from before its 1/q) came out q× dark — 0.17 st, at any cell size.
-        if (rcRead && (v + 1u >= kRCMinVertex || res.distance > kRCFirstMinCells * rcCell)) {
+        // DH-1308 — with glossy vertices a cell holds the LAMBERT radiance A·E/π of the diffuse picks only,
+        // and a diffuse pick reads it × its own layer weight / pick probability (`lobeW`).
+        if (rcRead && !specNext && (v + 1u >= kRCMinVertex || res.distance > kRCFirstMinCells * rcCell)) {
             uint s = rcFind(rcKeys, rcKey(h.P, h.N, rcCell), false);
             if (s != 0xFFFFFFFFu) {
                 float cnt = atomic_load_explicit(&rcData[s * 4u + 3u], memory_order_relaxed);
                 if (cnt >= float(kRCMinCount)) {
-                    L += T * float3(atomic_load_explicit(&rcData[s * 4u + 0u], memory_order_relaxed),
-                                    atomic_load_explicit(&rcData[s * 4u + 1u], memory_order_relaxed),
-                                    atomic_load_explicit(&rcData[s * 4u + 2u], memory_order_relaxed)) / cnt;
+                    float3 Tr = glossy ? T * lobeW : T;
+                    L += Tr * float3(atomic_load_explicit(&rcData[s * 4u + 0u], memory_order_relaxed),
+                                     atomic_load_explicit(&rcData[s * 4u + 1u], memory_order_relaxed),
+                                     atomic_load_explicit(&rcData[s * 4u + 2u], memory_order_relaxed)) / cnt;
                     break;
                 }
             }
         }
-        if (rcWrite && rcN < kRCMaxVerts) {                 // record it, to write its suffix at the end
+        if (rcWrite && !specNext && rcN < kRCMaxVerts) {    // record it, to write its suffix at the end
             rcSlot[rcN] = rcFind(rcKeys, rcKey(h.P, h.N, rcCell), true);
-            rcT[rcN] = T; rcL[rcN] = L;
+            rcT[rcN] = glossy ? T * lobeW : T; rcL[rcN] = L;
             ++rcN;
         }
+        if (glossy) {
+            T *= (specNext || bruteNext) ? lobeW : lobeW * Ahit;
+            specV = specNext; lobe = nextLobe;
+            bruteV = bruteNext; lobeC = nextLobeC; bruteWdA = bruteWdANext;
+        } else {
         float3 A = saturate(secondaryAlbedo(h, pFull, sec, albedoAtlas));
         T *= A;
+        }
         P = h.P; N = h.N;
         layerBits = secondaryLayerBits(h.instanceID, sec.insts);
         if (v >= 1u) {
-            float q = clamp(max(T.r, max(T.g, T.b)), 0.05, 0.95);
+            // DH-1308 — a glossy pick's T is still 1/p (its lobe weight lands with the continuation), so
+            // the roulette judges it by the lobe's albedo instead; 1 for every other vertex (unchanged).
+            float3 Tq = (specNext || bruteNext) ? T * rrAlb : T;
+            float q = clamp(max(Tq.r, max(Tq.g, Tq.b)), 0.05, 0.95);
             float2 rr = illumiSobolOwen2DShuffled(sampleIndex, illumiPixelSeed(gid, dimSalt + 2u));
             if (rr.y >= q) break;
             T /= q;
@@ -1243,7 +1440,8 @@ kernel void illumi_rt_lighting_tlas(
             for (uint g = 0; g < u.giRays; ++g) {
                 indirect += illumiPathTraceIncoming(isect, accel, Pofs - N * max(u.rayTMin, 1e-3), N, primaryLayer,
                                                     u.giProgressiveIndex * u.giRays + g, gid, u, sec,
-                                                    secFull, skyEquirect, irrCube, albedoAtlas, seed, rcKeys, rcData);
+                                                    secFull, skyEquirect, irrCube, albedoAtlas, seed, rcKeys, rcData,
+                                                    dfgLUT);
             }
         } else
         for (uint g = 0; g < u.giRays; ++g) {

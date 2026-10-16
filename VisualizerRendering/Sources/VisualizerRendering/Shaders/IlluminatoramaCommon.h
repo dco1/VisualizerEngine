@@ -415,7 +415,9 @@ struct FrameUniforms {
     float4   diagramEdge;
     // ── TAA jitter, subtracted back out of the motion vectors (S4.2) ─────────
     // xy = THIS frame's sub-pixel projection jitter minus the PREVIOUS frame's,
-    // in NDC units; zw reserved.
+    // in NDC units. zw = the RECONSTRUCTION FILTER (Daydream DH-1365, the still's other sampling
+    // knob): z = kernel (0 ⇒ the legacy 4-tap reduction, byte-identical), w = radius in output
+    // pixels — read only by `illumi_tonemap_fs`; see IlluminatoramaReconstructionFilter.swift.
     //
     // `previousViewProjection` is the previous frame's JITTERED VP and the
     // current VP is jittered too, so `currNDC − prevNDC` carries the difference

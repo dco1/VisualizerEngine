@@ -73,9 +73,11 @@ using namespace raytracing;
 /// Mirror of Swift `IlluminatoramaRenderer.RTInstanceData` — and of the copy in
 /// IlluminatoramaCaustics.metal, which reads the same buffer.
 struct RTInstanceData {
-    float4 nrm0; float4 nrm1; float4 nrm2;
+    float4 nrm0; float4 nrm1; float4 nrm2;   // nrm2.w: OPAQUE rows — clearcoat (`secondaryCoat`)
     float4 albedoTriBase;
-    float4 emissionPad;      // xyz = emission radiance; w = GLASS rows only: corner-normal base + 1 (0 = none)
+    // xyz = emission radiance; w = GLASS rows: corner-normal base + 1 (0 = none) — always ≥ 0;
+    // OPAQUE rows: the base layer's metalness + roughness (`secondaryMaterial`) — always < 0.
+    float4 emissionPad;
 };
 
 /// Surface-cache card material. Mirror of `SurfCard` in
@@ -333,6 +335,26 @@ static inline uint secondaryLayerBits(uint iid, const device RTInstanceData* ins
 /// modulated by albedo, N·L or visibility).
 static inline float3 secondaryEmission(uint iid, const device RTInstanceData* insts) {
     return insts[iid].emissionPad.xyz;
+}
+
+/// Daydream DH-1308 — two material scalars packed into ONE float lane as
+/// `−(1 + 2·round(a·1000) + min(b, 0.999))` by `IlluminatoramaRenderer.rtPackMaterialLane`: always
+/// negative, so a GLASS row's corner-normal base (≥ 0) and an old row's 0 both decode to "absent".
+/// Returns (a, b), or (−1, −1) when the lane carries nothing.
+static inline float2 secondaryUnpackMaterialLane(float w) {
+    if (w > -0.5) return float2(-1.0);
+    float x = -w - 1.0;
+    float aq = floor(x * 0.5);
+    return float2(aq * 0.001, clamp(x - 2.0 * aq, 0.0, 1.0));
+}
+/// The base layer at a hit: (metallic, roughness) from `emissionPad.w`, or (−1, −1) when the row
+/// carries none (glass, a curve set, a host that never packs) — the path lane then keeps Lambert.
+static inline float2 secondaryMaterial(uint iid, const device RTInstanceData* insts) {
+    return secondaryUnpackMaterialLane(insts[iid].emissionPad.w);
+}
+/// The clearcoat at a hit: (strength, roughness) from `nrm2.w`, or (−1, −1) for none.
+static inline float2 secondaryCoat(uint iid, const device RTInstanceData* insts) {
+    return secondaryUnpackMaterialLane(insts[iid].nrm2.w);
 }
 
 // ── Surface cache ────────────────────────────────────────────────────────────

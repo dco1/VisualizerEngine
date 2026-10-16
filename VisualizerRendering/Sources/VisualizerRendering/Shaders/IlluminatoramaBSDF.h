@@ -260,3 +260,134 @@ static inline LayeredRTWeights layeredRTWeights(uint pathFlags, float3 albedo, f
     w.reflection *= e.baseUnderSheen;
     return w;
 }
+
+// ── The path lane's VERTEX BSDF (Daydream DH-1308) ───────────────────────────────────────────
+//
+// Until DH-1308 every vertex of the path-traced lane past the primary was Lambert × albedo: a
+// chrome fixture, a mirror or a lacquered floor met in the second bounce scattered the light
+// like matte paint. Energy was right (a white furnace returns 1 either way) but the LOBE was
+// wrong — no specular inter-reflection, so a polished floor never threw a window's light onto
+// the wall opposite and a metal's coloured F0 bounced diffusely.
+//
+// With `kPathFlagGlossyVertices` a path vertex is the SAME layered stack the deferred kernel
+// shades (and `layeredRTWeights` weights the primary by), sampled rather than weighted:
+//
+//   coat     — dielectric GGX (F0 0.04, the material's clearcoat roughness), albedo
+//              Ec = cc · E_env(0.04, r_coat)                         [only where clearcoat > 0]
+//   specular — GGX with F0 = mix(0.04, albedo, m), α = r², VNDF-sampled, its single-scatter
+//              albedo put back to the layered model's `envSpec` (Fdez-Agüera multiple scattering)
+//   diffuse  — Lambert × albedo × (1 − m)(1 − envSpec)  (exactly `layeredEnergy.diffuseEnv`)
+//   …with everything under the coat × (1 − Ec) (albedo scaling, as the sheen layer does).
+//
+// ONE lobe is picked per vertex ∝ its albedo (a one-sample estimator: each lobe's integral is
+// estimated by its own strategies and divided by its pick probability, so the sum is unbiased).
+// The GGX lobe's G is the IBL-remapped separable Smith the DFG LUT's (A, B) integrate
+// (`layeredSmithG_IBL`, k = α/2) and it is sampled through the EXACT Smith G1 visible-normal
+// distribution: the estimator F·G_IBL/G1 then has expectation F0·A + B — the LUT's own number —
+// so a white dielectric returns (1 − envSpec) + envSpec = 1 and a white metal envSpec = 1.
+
+/// RTInstUniforms.pathFlags bit — sample the layered BSDF at path vertices (needs light
+/// sampling + a bound DFG LUT; the host only sets it with both). Independent of the deferred
+/// pass's `kPathFlagLayeredMultiscatter`.
+#define kPathFlagGlossyVertices 2048u
+
+/// Separable Smith-GGX with the IBL remap k = α/2 — THE G the DFG LUT's (A, B) integrate
+/// (`illumi_dfg_bake` calls this), so a lobe built on it has the LUT's albedo by construction.
+static inline float layeredSmithG_IBL(float NdotV, float NdotL, float roughness) {
+    float alpha = roughness * roughness;
+    float k = alpha * 0.5;
+    return (NdotV / (NdotV * (1.0 - k) + k)) * (NdotL / (NdotL * (1.0 - k) + k));
+}
+
+/// GGX NDF with a RELATIVE guard. The deferred `distributionGGX`'s `+1e-7` clips the peak below
+/// roughness ~0.2 (DH-1306); at a path vertex the lobe is sampled and evaluated against its own
+/// pdf, so a clipped D would bias every polished bounce.
+static inline float pathGGXD(float alpha, float NdotH) {
+    float a2 = alpha * alpha;
+    float d = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / max(M_PI_F * d * d, 1e-30);
+}
+
+/// The exact Smith-GGX masking term G1 — the normaliser of the visible-normal distribution.
+static inline float pathSmithG1(float alpha, float NdotX) {
+    float c = max(NdotX, 1e-6);
+    float a2 = alpha * alpha;
+    return 2.0 * c / (c + sqrt(a2 + (1.0 - a2) * c * c));
+}
+
+/// One GGX lobe at a path vertex: the view, the Fresnel, the roughness, and the scale that turns
+/// the sampled single-scatter lobe into the layered model's share (multiscatter × layer weight).
+struct PathGlossyLobe {
+    float3 N;         // the vertex's shading normal (faces the incoming ray)
+    float3 wo;        // toward where the path came from
+    float3 F0;
+    float3 scale;     // layerWeight · envSpec / (F0·A + B)
+    float  roughness; // perceptual (the LUT's axis); α = roughness²
+    float  alpha;
+    float  NdotV;
+    float  G1v;       // pathSmithG1(alpha, NdotV)
+};
+
+static inline PathGlossyLobe pathGlossyLobe(float3 N, float3 wo, float3 F0, float roughness,
+                                            float3 layerWeight, float4 lut) {
+    PathGlossyLobe b;
+    b.N = N; b.wo = wo; b.F0 = F0;
+    b.roughness = roughness;
+    b.alpha = roughness * roughness;
+    b.NdotV = max(dot(N, wo), 1e-4);
+    b.G1v = pathSmithG1(b.alpha, b.NdotV);
+    float3 ss = max(F0 * lut.x + lut.y, float3(1e-4));
+    b.scale = layerWeight * layeredEnvSpecular(F0, lut.xy) / ss;
+    return b;
+}
+
+/// f(wi, wo) of the lobe — the BRDF value, NOT × cos — and the VNDF sampler's density of `wi`
+/// per steradian, for MIS against the vertex's light sampling. Zero below either horizon.
+static inline float3 pathGlossyEval(PathGlossyLobe b, float3 wi, thread float& pdf) {
+    pdf = 0.0;
+    float NdotL = dot(b.N, wi);
+    if (NdotL <= 0.0) return float3(0.0);
+    float3 H = normalize(wi + b.wo);
+    float NdotH = saturate(dot(b.N, H));
+    float VdotH = saturate(dot(b.wo, H));
+    float D = pathGGXD(b.alpha, NdotH);
+    pdf = D * b.G1v / (4.0 * b.NdotV);
+    float G = layeredSmithG_IBL(b.NdotV, NdotL, b.roughness);
+    float3 F = b.F0 + (1.0 - b.F0) * pow(1.0 - VdotH, 5.0);
+    return F * b.scale * (D * G / (4.0 * b.NdotV * NdotL));
+}
+
+/// A tangent frame about `n` (Duff et al.) — local to this header so it has no dependencies.
+static inline void pathBasis(float3 n, thread float3& t, thread float3& bt) {
+    float s = n.z >= 0.0 ? 1.0 : -1.0; float a = -1.0 / (s + n.z); float d = n.x * n.y * a;
+    t = float3(1.0 + s * n.x * n.x * a, s * d, -s * n.x);
+    bt = float3(d, s + n.y * n.y * a, -n.y);
+}
+
+/// Visible-normal sample (Heitz 2018 stretch; Dupuy & Benyoub 2023 spherical caps) in the
+/// local frame (z = N), from a view `Vl` with Vl.z > 0.
+static inline float3 pathSampleGGXVNDF(float3 Vl, float alpha, float2 u) {
+    float3 Vh = normalize(float3(alpha * Vl.x, alpha * Vl.y, Vl.z));
+    float phi = 2.0 * M_PI_F * u.x;
+    float z = (1.0 - u.y) * (1.0 + Vh.z) - Vh.z;
+    float sinT = sqrt(saturate(1.0 - z * z));
+    float3 Hh = float3(sinT * cos(phi), sinT * sin(phi), z) + Vh;
+    return normalize(float3(alpha * Hh.x, alpha * Hh.y, max(Hh.z, 0.0)));
+}
+
+/// Sample the lobe: returns the throughput weight f·cos/pdf (= F·G_IBL/G1 · scale), the
+/// direction and its density; weight 0 (and pdf 0) when the reflection falls below the horizon.
+static inline float3 pathGlossySample(PathGlossyLobe b, float2 u, thread float3& wi, thread float& pdf) {
+    float3 t, bt; pathBasis(b.N, t, bt);
+    float3 Vl = float3(dot(b.wo, t), dot(b.wo, bt), b.NdotV);
+    float3 Hl = pathSampleGGXVNDF(Vl, b.alpha, u);
+    float3 H = normalize(t * Hl.x + bt * Hl.y + b.N * Hl.z);
+    wi = reflect(-b.wo, H);
+    float NdotL = dot(b.N, wi);
+    pdf = 0.0;
+    if (NdotL <= 0.0) return float3(0.0);
+    float VdotH = saturate(dot(b.wo, H));
+    pdf = pathGGXD(b.alpha, saturate(Hl.z)) * b.G1v / (4.0 * b.NdotV);
+    float3 F = b.F0 + (1.0 - b.F0) * pow(1.0 - VdotH, 5.0);
+    return F * b.scale * (layeredSmithG_IBL(b.NdotV, NdotL, b.roughness) / b.G1v);
+}

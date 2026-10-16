@@ -505,6 +505,8 @@ public struct IlluminatoramaFrameUniforms {
     /// every scene that never opts in — so the subtraction is an IEEE no-op and
     /// the velocity buffer is byte-identical. ONE new 16-byte cluster
     /// (stride 1312 → 1328); mirror of the Metal `FrameUniforms.taaJitterDelta`.
+    /// `zw` (DH-1365) = `IlluminatoramaRenderer.reconstructionFilter.uniform`: (kernel, radius in
+    /// output px); (0, 0) ⇒ the tonemap's legacy 4-tap reduction.
     public var taaJitterDelta: SIMD4<Float> = .zero
     /// Interior irradiance bands — the lawn-green-ceiling fix. xyz = irradiance,
     /// `interiorIrrUp.w` = band blend weight (0 = the exact cube sample, the default;

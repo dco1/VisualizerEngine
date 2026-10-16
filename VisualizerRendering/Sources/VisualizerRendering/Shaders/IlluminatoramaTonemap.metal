@@ -544,10 +544,15 @@ static inline float3 toneCurve(float3 c, float contrast, float shadows, float hi
 // thanks to `filter::linear`; placing the 4 taps at ±0.5 input-texel
 // offsets around the output pixel's centre covers a 3×3 input-texel
 // footprint with a smooth, ringing-free tent kernel — exactly the shape
-// you want for 1.5× downscale. At `internalRenderScale == 1.0` the four
-// taps collapse to a single bilinear read at the texel centre, so the
-// path is correct (if slightly more expensive than the original
-// `read(gid)`) at the no-SSAA setting too.
+// you want for 1.5× downscale.
+//
+// ⚠ Measured on the CPU mirror (Daydream DH-1365, `ReconstructionFilterTests`), the shape is
+// NOT the same at every scale: at exactly 2.0× the taps land on texel centres and the reduction
+// is a 2 × 2 BOX; at 1.0× they land on texel CORNERS and the four together are a 3 × 3
+// [1 2 1]⊗[1 2 1]/16 tent — a blur (MTF 0.02 at 0.45 cycles/px), not the single bilinear read
+// this comment used to promise; at a fractional scale (1.5, ~1.6–1.78 on a 4K export) the taps
+// walk across the texel grid and the kernel changes per output pixel (a 5–7 % fixed pattern on
+// fine detail). The declared kernels below (`taaJitterDelta.z > 0`) are phase-exact at any scale.
 // Phase 4.28 — the tonemap is a RENDER PASS (fullscreen triangle + fragment),
 // not a compute kernel. The output texture is sampled by SceneKit as
 // `background.contents` on its OWN command queue; a compute `texture.write`
@@ -680,6 +685,81 @@ static inline float3 illumiDiagramColor(float2 uv,
     float  edge = max(depthEdge, normalEdge) * clamp(frame.diagramParams.z, 0.0, 1.0);
     float3 ink  = frame.diagramOutline.rgb;
     return mix(base, ink, edge);
+}
+
+// ── Declared reconstruction filter (Daydream DH-1365) ────────────────────────
+//
+// Opt-in replacement for the 4-tap reduction below: a separable gather over every INTERNAL texel
+// within `radius` OUTPUT pixels of this output pixel's centre, each weighted by the kernel at its
+// centre's distance (in output pixels) and normalised by the weights' sum — a flat field is exact at
+// any scale and phase, and the kernel's width is fixed on the PICTURE's grid whatever the
+// supersample. It reads the scene-referred linear HDR, before exposure and the display transform:
+// the sensor's place in the chain (see IlluminatoramaReconstructionFilter.swift for why there).
+//
+// `frame.taaJitterDelta.zw` = (kernel, radius in output px); z == 0 ⇒ the legacy 4-tap path, so
+// every host that never sets `reconstructionFilter` is byte-identical.
+//
+// MIRROR of `IlluminatoramaReconstructionFilter.weight(_:)` / `gather1D` — keep the two in step
+// (`ReconstructionFilterTests.testShaderSourceMirrorsTheSwiftKernelCoefficients` checks the constants).
+constant int kReconMaxHalf = 8;   // IlluminatoramaReconstructionFilter.maxTapHalfWidth
+
+static inline float illumiReconWeight(uint kern, float r, float x) {
+    float ax = abs(x);
+    if (r <= 0.0) return 0.0;
+    if (kern == 1u) return ax < r ? 1.0 : (ax == r ? 0.5 : 0.0);          // box
+    if (kern == 2u) return max(0.0, 1.0 - ax / r);                          // tent
+    if (kern == 3u) {                                                       // Mitchell–Netravali, B = C = 1/3
+        const float B = 1.0 / 3.0, C = 1.0 / 3.0;
+        float t = ax * 2.0 / r;
+        if (t < 1.0) return ((12.0 - 9.0 * B - 6.0 * C) * t * t * t + (-18.0 + 12.0 * B + 6.0 * C) * t * t + (6.0 - 2.0 * B)) / 6.0;
+        if (t < 2.0) return ((-B - 6.0 * C) * t * t * t + (6.0 * B + 30.0 * C) * t * t + (-12.0 * B - 48.0 * C) * t + (8.0 * B + 24.0 * C)) / 6.0;
+        return 0.0;
+    }
+    if (kern == 4u) {                                                       // 4-term Blackman–Harris
+        if (ax > r) return 0.0;
+        float p = M_PI_F * x / r;
+        return 0.35875 + 0.48829 * cos(p) + 0.14128 * cos(2.0 * p) + 0.01168 * cos(3.0 * p);
+    }
+    return 0.0;
+}
+
+/// One output pixel's reconstruction at `uv`. `s` = internal texels per output pixel, per axis.
+static inline float3 illumiReconstructGather(texture2d<half, access::sample> inHDR,
+                                             float2 uv, float2 s, uint kern, float radius) {
+    int W = int(inHDR.get_width()), H = int(inHDR.get_height());
+    float2 inSize = float2(W, H);
+    // Narrow (never truncate) a kernel that would reach past the tap budget — `effectiveRadius`.
+    float2 r = min(float2(radius), float(kReconMaxHalf) / max(s, float2(1e-3)));
+    float2 c = uv * inSize - 0.5;            // continuous texel coordinate; texel j's centre is j
+    float2 reach = r * s;
+    int2 lo = int2(ceil(c - reach)), hi = int2(floor(c + reach));
+
+    float wx[2 * kReconMaxHalf + 2]; int ix[2 * kReconMaxHalf + 2]; int nx = 0; float sx = 0.0;
+    for (int j = lo.x; j <= hi.x && nx < 2 * kReconMaxHalf + 2; ++j) {
+        float w = illumiReconWeight(kern, r.x, (float(j) - c.x) / s.x);
+        if (w != 0.0) { wx[nx] = w; ix[nx] = clamp(j, 0, W - 1); sx += w; ++nx; }
+    }
+    if (sx == 0.0) { wx[0] = 1.0; ix[0] = clamp(int(rint(c.x)), 0, W - 1); sx = 1.0; nx = 1; }
+
+    float wy[2 * kReconMaxHalf + 2]; int iy[2 * kReconMaxHalf + 2]; int ny = 0; float sy = 0.0;
+    for (int j = lo.y; j <= hi.y && ny < 2 * kReconMaxHalf + 2; ++j) {
+        float w = illumiReconWeight(kern, r.y, (float(j) - c.y) / s.y);
+        if (w != 0.0) { wy[ny] = w; iy[ny] = clamp(j, 0, H - 1); sy += w; ++ny; }
+    }
+    if (sy == 0.0) { wy[0] = 1.0; iy[0] = clamp(int(rint(c.y)), 0, H - 1); sy = 1.0; ny = 1; }
+
+    float3 acc = float3(0.0);
+    for (int b = 0; b < ny; ++b) {
+        float3 row = float3(0.0);
+        for (int a = 0; a < nx; ++a) {
+            row += wx[a] * float3(inHDR.read(uint2(ix[a], iy[b])).rgb);
+        }
+        acc += wy[b] * row;
+    }
+    // A negative-lobed kernel (Mitchell) can undershoot below zero beside a bright source; light
+    // cannot be negative. (This removes a negative PIXEL, not the dark halo — which is why the
+    // Maximum contract asks for the non-negative Blackman–Harris.)
+    return max(acc / (sx * sy), float3(0.0));
 }
 
 fragment float4 illumi_tonemap_fs(
@@ -823,6 +903,22 @@ fragment float4 illumi_tonemap_fs(
             acc += float3(inHDR.sample(downSampler, in.uv + vel * t).rgb);
         }
         hdr = acc / float(MB);
+    } else if (frame.taaJitterDelta.z > 0.5) {
+        // Daydream DH-1365 — the declared reconstruction filter (see `illumiReconstructGather`).
+        // The scale comes from the UV's own screen derivative: on this fullscreen triangle uv is
+        // affine, so d(uv)/d(output px) is exactly 1/outputSize and × inSize is texels per pixel.
+        uint   kern  = uint(frame.taaJitterDelta.z + 0.5);
+        float  rad   = frame.taaJitterDelta.w;
+        float2 recon = max(abs(float2(dfdx(in.uv.x), dfdy(in.uv.y))) * inSize, float2(1e-3));
+        if (frame.chromaticAberration > 0.0) {
+            // Same lateral split as the legacy CA branch below, one gather per channel.
+            float2 caOff = (in.uv - 0.5) * (frame.chromaticAberration * 0.03);
+            hdr.r = illumiReconstructGather(inHDR, in.uv + caOff, recon, kern, rad).r;
+            hdr.g = illumiReconstructGather(inHDR, in.uv,         recon, kern, rad).g;
+            hdr.b = illumiReconstructGather(inHDR, in.uv - caOff, recon, kern, rad).b;
+        } else {
+            hdr = illumiReconstructGather(inHDR, in.uv, recon, kern, rad);
+        }
     } else if (frame.chromaticAberration > 0.0) {
         // Lens-style transverse chromatic aberration: split the red channel
         // outward and the blue channel inward along the radius from the frame
