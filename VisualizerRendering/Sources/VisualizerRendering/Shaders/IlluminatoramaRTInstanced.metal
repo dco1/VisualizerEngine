@@ -213,8 +213,9 @@ struct RTInstUniforms {
 /// DH-1308 INSTRUMENT: glossy vertices never pick a glossy lobe (their diffuse share alone). Never set by a host.
 #define kPathFlagDebugGlossyDiffuseOnly 4096u
 /// DH-1308 INSTRUMENT: an independent estimator of the same vertex BSDF — no lobe pick, no VNDF: a cosine
-/// continuation weighted by the WHOLE stack, Wd·A + π·(f_spec + f_coat). Its NEE keeps only the diffuse
-/// share, so it is a valid cross-check only with the vertex light sources off (16 | 32 | 8). Never set by a host.
+/// continuation weighted by the WHOLE stack, Wd·A + π·(f_spec + f_coat). Its window (aperture) NEE is the whole
+/// stack too; its sun and lamp NEE keep only the diffuse share, so it is a valid cross-check only with those
+/// off (16 | 32). Never set by a host.
 #define kPathFlagDebugGlossyBrute 8192u
 
 // ── Curve primitives (#60 item 7) ────────────────────────────────────────────
@@ -924,6 +925,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         uint lightSalt = 0x4C495445u + v * kPathLightDimsPerVertex;   // 'LITE' (DH-1011)
         float3 Pofs = P + N * tMin;
         float3 Lv = float3(0.0);
+        float3 LvBrute = float3(0.0);            // DH-1308 instrument (8192): window NEE with the whole stack
         // ── NEE: sun + local lights (secondary vertices) ──
         if (v > 0u) {
             float nl = saturate(dot(N, Ld));
@@ -1023,13 +1025,18 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                             float pL = pj * pdfW, pB = cosR * (1.0 / M_PI_F);   // both per steradian
                             misW = (pL * pL) / max(pL * pL + pB * pB, 1e-30);
                         }
+                        if (bruteV) {   // instrument: the whole stack against the window (pB = cosθ/π above)
+                            float pd0, pd1;
+                            float3 fT = bruteWdA + M_PI_F * (pathGlossyEval(lobe, d, pd0) + pathGlossyEval(lobeC, d, pd1));
+                            LvBrute += Lo * tPane * cosR * misW * fT / (M_PI_F * pj * pdfW);
+                        } else
                         Lv += Lo * tPane * cosR * misW / (M_PI_F * pj * pdfW);
                         }
                     }
                 }
             }
         }
-        if (bruteV) Lv *= bruteWdA;              // instrument: the diffuse share's NEE only
+        if (bruteV) Lv = Lv * bruteWdA + LvBrute;   // instrument: sun/lamps the diffuse share only
         L += T * Lv;
         if (v == maxB) break;
 

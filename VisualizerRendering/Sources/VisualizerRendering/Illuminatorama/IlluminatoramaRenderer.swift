@@ -1186,13 +1186,18 @@ public final class IlluminatoramaRenderer {
     /// With `taaStillAccumulation`: keep the Karis 1/(1+Y) sample weights (damps fireflies at the
     /// cost of a slight darkening bias in noisy highlights). Default `false`.
     public var taaStillKarisWeights: Bool = false
+    /// With `taaStillAccumulation`: apply the still branch's display sharpen (+0.25 luma unsharp over the
+    /// accumulation's 3×3, clamped to its range) to the frame handed downstream. Default `true` (the
+    /// shipped still); Daydream's Maximum turns it off — its 2× render + declared reconstruction filter
+    /// carry the detail (DH-1365). Rides `TAAStillParams.noSharpen`.
+    public var taaStillSharpen: Bool = true
     /// The unjittered view-projection of the last frozen-camera resolve (see the camera-cut guard
     /// in `render`); nil while still mode is off.
     private var lastStillViewProjection: simd_float4x4?
     private var previousRTGIStatic = false
     /// Mirror of `TAAStillParams` (IlluminatoramaTAA.metal), 16 bytes.
     private struct TAAStillParams {
-        var still: UInt32; var karis: UInt32; var reserved0: UInt32 = 0; var reserved1: UInt32 = 0
+        var still: UInt32; var karis: UInt32; var noSharpen: UInt32 = 0; var reserved1: UInt32 = 0
     }
     /// Neighborhood clamp width (sigmas). WIDE on purpose (~4): a tight clamp
     /// re-injects low-frequency crawl by yanking clean history toward the noisy
@@ -14367,7 +14372,8 @@ public final class IlluminatoramaRenderer {
         // compounding inside the history every frame.
         enc.setTexture(taaResolvedTexture,      index: 6)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
-        var still = TAAStillParams(still: taaStillAccumulation ? 1 : 0, karis: taaStillKarisWeights ? 1 : 0)
+        var still = TAAStillParams(still: taaStillAccumulation ? 1 : 0, karis: taaStillKarisWeights ? 1 : 0,
+                                   noSharpen: taaStillSharpen ? 0 : 1)
         enc.setBytes(&still, length: MemoryLayout<TAAStillParams>.stride, index: 1)
         dispatch(enc, pipeline: taaResolvePipeline, width: width, height: height)
         enc.endEncoding()

@@ -122,7 +122,7 @@ static inline float3 clipHistoryToAABB(float3 boxMin, float3 boxMax, float3 hist
 struct TAAStillParams {
     uint still;    // 1 ⇒ frozen-camera running average
     uint karis;    // 1 ⇒ keep the Karis 1/(1+Y) weights in still mode (firefly damping, biased)
-    uint _r0;
+    uint noSharpen; // 1 ⇒ hand the accumulation downstream unsharpened (Daydream DH-1365, Maximum)
     uint _r1;
 };
 
@@ -174,6 +174,10 @@ kernel void illumi_taa_resolve(
         }
         result = max(float3(0.0), result);
         outHistory.write(half4(half3(result), 1.0h), gid);
+        if (still.noSharpen != 0u) {
+            outResolved.write(half4(half3(result), 1.0h), gid);
+            return;
+        }
         // Acutance from the accumulation's own neighbourhood (last frame's history), clamped
         // to its range — never from the current noisy frame.
         float3 rY = RGBtoYCoCg(result);
