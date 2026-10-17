@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include "IlluminatoramaSpotProfile.h"
 using namespace metal;
 
 // ── ILLUMINATORAMA VOLUMETRIC LIGHT SHAFT ────────────────────────────────────
@@ -124,6 +125,7 @@ kernel void illumi_volumetric(
 struct VolSpotLight {
     float3   position;
     float    innerCone;
+    int      profileIndex;    // DH-0540 — see `SpotLight.profileIndex` (offset 20, stride 192)
     float3   direction;       // away from apex, normalized host-side
     float    outerCone;
     float3   color;           // premultiplied intensity
@@ -233,6 +235,7 @@ kernel void illumi_volumetric_spots(
     depth2d_array<float, access::sample> spotShadowAtlas [[texture(2)]],
     constant VolSpotUniforms&            u      [[buffer(0)]],
     const device VolSpotLight*           spots  [[buffer(1)]],
+    const device float*                  spotProfiles [[buffer(2)]],   // DH-0540 — the spot-profile rows
     uint2 gid [[thread_position_in_grid]])
 {
     constexpr sampler beamShadowSampler(filter::linear, compare_func::less_equal,
@@ -318,8 +321,10 @@ kernel void illumi_volumetric_spots(
             if (distL < 1e-4) continue;
             float3 Ln = L / distL;
             // Soft cone edge: full inside innerCone, zero outside outerCone.
-            float cone = smoothstep(sl.outerCone, sl.innerCone, dot(Ln, sl.direction));
+            float coneCos = dot(Ln, sl.direction);
+            float cone = smoothstep(sl.outerCone, sl.innerCone, coneCos);
             if (cone <= 0.0) continue;
+            cone *= illumiSpotProfile(spotProfiles, sl.profileIndex, coneCos);   // DH-0540 — the beam shows the profile too
             // Volumetric shadow: this sample only scatters if the spot can see it. One
             // hardware-filtered compare per sample; the per-step jitter + TAA soften the edge.
             if (u.beamShadows != 0u && sl.shadowSliceIndex >= 0) {

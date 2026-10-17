@@ -4,6 +4,7 @@
 // the deferred resolve kernel, and the subsurface blur/composite that follows it.
 
 #include <metal_stdlib>
+#include "IlluminatoramaSpotProfile.h"
 #include "IlluminatoramaCommon.h"
 #include "IlluminatoramaDDGI.h"
 // S4.1 — ray-traced soft sun shadows in this kernel's `kLightingRTSunShadow`
@@ -1120,6 +1121,8 @@ kernel void illumi_lighting(
     // the host binds it exactly when it selects that variant (the bit requires a
     // live TLAS, so there is always a real accel to bind).
     instance_acceleration_structure         rtSunAccel      [[buffer(8), function_constant(kLightingRTSunShadow)]],
+    // Daydream DH-0540 — the host's spot-profile rows (`illumiSpotProfile`); a 1-float dummy when no spot names one.
+    const device float*                     spotProfiles    [[buffer(9)]],
     // The defocus shading-rate tile map (least |CoC| of each 16×16 tile's geometry) — exists only in
     // the coarse / skip variants (`kLightingShadingRate`), which the host binds it for.
     texture2d<float, access::read>          rateTiles       [[texture(24), function_constant(kLightingShadingRate)]],
@@ -1506,6 +1509,8 @@ kernel void illumi_lighting(
         float coneCos   = dot(normalize(sl.direction), -L);
         float coneAtten = smoothstep(sl.outerCone, sl.innerCone, coneCos);
         if (coneAtten <= 0.0) continue;
+        // DH-0540 — the luminaire's measured distribution within the cone (1 for the analytic cone).
+        coneAtten *= illumiSpotProfile(spotProfiles, sl.profileIndex, coneCos);
         // Source-size softening (see the point-light path): `1/(d² + r²)` flattens the
         // near field into a soft halo. r == 0 ⇒ exactly `1/d²`, byte-identical.
         float atten = 1.0 / max(dist * dist + sl.softRadius * sl.softRadius, 1e-4);

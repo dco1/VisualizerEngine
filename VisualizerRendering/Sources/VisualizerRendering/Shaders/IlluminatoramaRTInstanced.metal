@@ -625,14 +625,16 @@ static inline float3 pathPointContribution(RTPointLight pl, float3 P, float3 N, 
     return pl.color * (atten * window * window * nl * (1.0 / M_PI_F));
 }
 
-static inline float3 pathSpotContribution(RTSpotLight sl, float3 P, float3 N, uint layerBits, float3 near) {
+static inline float3 pathSpotContribution(RTSpotLight sl, float3 P, float3 N, uint layerBits, float3 near, SecondaryScene sec) {
     if (sl.giVisible == 0u || (sl.layerMask & layerBits) == 0u) return float3(0.0);
     float3 toL = sl.position - P;
     float dist = length(toL);
     if (dist > sl.radius) return float3(0.0);
     float3 L = toL / max(dist, 1e-4);
-    float coneAtten = smoothstep(sl.outerCone, sl.innerCone, dot(normalize(sl.direction), -L));
+    float coneCos = dot(normalize(sl.direction), -L);
+    float coneAtten = smoothstep(sl.outerCone, sl.innerCone, coneCos);
     if (coneAtten <= 0.0) return float3(0.0);
+    coneAtten *= illumiSpotProfile(sec.spotProfiles, sl.profileIndex, coneCos);   // DH-0540
     float nl = saturate(dot(N, L));
     if (nl <= 0.0) return float3(0.0);
     float atten = pathLampAtten(dist, sl.softRadius, sl.bulbRadius, sl.openingRadius, near);
@@ -670,7 +672,7 @@ static inline float3 pathLocalContribution(uint k, bool lamps, float3 P, float3 
     uint nS = lamps ? p.spotLightCount : 0u;
     if (k < nP) return pathPointContribution(sec.pointLights[k], P, N, layerBits, near);
     k -= nP;
-    if (k < nS) return pathSpotContribution(sec.spotLights[k], P, N, layerBits, near);
+    if (k < nS) return pathSpotContribution(sec.spotLights[k], P, N, layerBits, near, sec);
     k -= nS;
     return pathEmitterContribution(sec.areaLights[k], P, N, layerBits);
 }
@@ -1328,6 +1330,7 @@ kernel void illumi_rt_lighting_tlas(
     // DH-1344 — the path lane's radiance cache (keys, rgb+count); tiny dummies when `u.radCacheCell` is 0.
     device atomic_uint*                   rcKeys      [[buffer(21)]],
     device atomic_float*                  rcData      [[buffer(22)]],
+    const device float*                   spotProfiles [[buffer(23)]],  // DH-0540 — the spot-profile rows
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -1384,6 +1387,7 @@ kernel void illumi_rt_lighting_tlas(
     sec.objUV = objUV;        sec.uvScale = albedoUVScale;
     sec.pointLights = pointLights; sec.spotLights = spotLights;
     sec.areaLights = areaLights;
+    sec.spotProfiles = spotProfiles;   // DH-0540
     SecondaryShadeParams secFull   = fullRadianceParams(u);   // reflections + cache fallbacks
     SecondaryShadeParams secBounce = giBounceParams(u);       // GI bounces (no sky double-count)
 

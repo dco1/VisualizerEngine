@@ -35,6 +35,7 @@
 //
 // Metal has NO cross-file linkage for `static inline`, so a shared header is the
 // only mechanism available; the alternative (`#include` of a .metal, or a fourth
+#include "IlluminatoramaSpotProfile.h"
 // hand-kept copy) is strictly worse. Callers include this AFTER declaring nothing
 // of their own by these names — the mirror structs, RNG, cone and surface-cache
 // helpers that used to be duplicated per file now live here too, so "keep in
@@ -124,6 +125,7 @@ struct RTPointLight {
 };
 struct RTSpotLight {
     float3   position;   float innerCone;
+    int      profileIndex;                     // DH-0540 — see `SpotLight.profileIndex` (offset 20, stride 192)
     float3   direction;  float outerCone;
     float3   color;      float radius;
     float4x4 shadowMatrix;
@@ -457,6 +459,7 @@ struct SecondaryScene {
     const device RTPointLight*   pointLights;
     const device RTSpotLight*    spotLights;
     const device RTAreaLight*    areaLights;   // DH-0718; read only when `areaLightCount` > 0
+    const device float*          spotProfiles; // DH-0540 — the host's spot-profile rows (a 1-float dummy when none)
 };
 
 /// One opaque triangle hit, however the ray that found it was fired.
@@ -646,9 +649,10 @@ static inline float3 secondaryLocalLightFill(float3 P, float3 N, uint layerBits,
         float dist = length(toL);
         if (dist > sl.radius) continue;
         float3 L = toL / max(dist, 1e-4);
-        float coneAtten = smoothstep(sl.outerCone, sl.innerCone,
-                                     dot(normalize(sl.direction), -L));
+        float coneCos = dot(normalize(sl.direction), -L);
+        float coneAtten = smoothstep(sl.outerCone, sl.innerCone, coneCos);
         if (coneAtten <= 0.0) continue;
+        coneAtten *= illumiSpotProfile(sc.spotProfiles, sl.profileIndex, coneCos);   // DH-0540
         float nl = saturate(dot(N, L));
         if (nl <= 0.0) continue;
         float atten = 1.0 / max(dist * dist + sl.softRadius * sl.softRadius, 1e-4);

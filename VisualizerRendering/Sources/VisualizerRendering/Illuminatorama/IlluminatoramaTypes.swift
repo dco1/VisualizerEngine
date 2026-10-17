@@ -842,10 +842,20 @@ public struct IlluminatoramaPointLight {
 /// half-angles so the lighting kernel can compare a `dot()` result
 /// directly. `direction` points AWAY from the apex (the way light
 /// travels), matching the convention `SCNLight` uses for `.spot`.
+/// DH-0540 — the length of one row of the spot-profile table (`setSpotLightProfiles`): samples uniformly over
+/// 0..90° off the cone axis. Mirrors `ILLUMI_SPOT_PROFILE_SAMPLES`.
+public let illuminatoramaSpotProfileSampleCount = 128
+
 public struct IlluminatoramaSpotLight {
     public var position: SIMD3<Float>
     /// `cos(spotInnerAngle / 2)` — full intensity inside this cone.
     public var innerCone: Float
+    /// Daydream DH-0540 — the row of the host's spot-profile table (`setSpotLightProfiles`) this cone's
+    /// intensity is shaped by, or −1 for the analytic cone (byte-identical to before the field existed).
+    /// Sits in the 12-byte alignment gap between `innerCone` (offset 16) and the float3 `direction`
+    /// (offset 32), so the stride stays 192 in Swift and in every Metal mirror (`SpotLight`,
+    /// `RTSpotLight`, `VolSpotLight`) — keep all four in lockstep.
+    public var profileIndex: Int32 = -1
     public var direction: SIMD3<Float>
     /// `cos(spotOuterAngle / 2)` — zero intensity outside this cone.
     /// `innerCone >= outerCone` since smaller angles → larger cosines.
@@ -925,9 +935,10 @@ public struct IlluminatoramaSpotLight {
                 color: SIMD3<Float>, radius: Float,
                 layerMask: UInt32 = 0xFFFF_FFFF,
                 castsShadow: Bool = true, softRadius: Float = 0, giVisible: Bool = true,
-                bulbRadius: Float = 0, openingRadius: Float = 0) {
+                bulbRadius: Float = 0, openingRadius: Float = 0, profileIndex: Int32 = -1) {
         self.bulbRadius = bulbRadius
         self.openingRadius = openingRadius
+        self.profileIndex = profileIndex
         self.position = position
         self.direction = direction
         self.innerCone = innerCone

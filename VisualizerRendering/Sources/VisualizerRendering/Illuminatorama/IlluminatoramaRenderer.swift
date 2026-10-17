@@ -5597,6 +5597,13 @@ public final class IlluminatoramaRenderer {
     private var pointLightCapacity: Int
     private var spotLightRing: [MTLBuffer]
     private var spotLightBuffer: MTLBuffer { spotLightRing[frameRingIndex] }
+    /// Daydream DH-0540 — the host's spot-profile table: `spotLightProfileRowCount` rows of
+    /// `illuminatoramaSpotProfileSampleCount` floats each, a luminaire's measured distribution over 0..90° off
+    /// axis, which a spot names with `profileIndex`. Allocated as a NEW buffer on every `setSpotLightProfiles`
+    /// (never mutated in place — an in-flight frame may still read the old one); a 1-float placeholder when the
+    /// host never calls it, so every kernel can bind it unconditionally.
+    private var spotProfileBuffer: MTLBuffer
+    public private(set) var spotLightProfileRowCount: Int = 0
     private var spotLightCapacity: Int
     private var areaLightRing: [MTLBuffer]
     private var areaLightBuffer: MTLBuffer { areaLightRing[frameRingIndex] }
@@ -6580,6 +6587,12 @@ public final class IlluminatoramaRenderer {
             MemoryLayout<IlluminatoramaSpotLight>.stride * initLightCap,
             "Illuminatorama.spotLights", "spotLights")
         self.spotLightCapacity = initLightCap
+        // DH-0540 — the spot-profile placeholder (one float, 1.0): every kernel binds it; no spot reads it.
+        guard let profilePlaceholder = device.makeBuffer(length: MemoryLayout<Float>.stride, options: .storageModeShared)
+        else { throw IlluminatoramaError.bufferAllocationFailed("spotProfiles") }
+        profilePlaceholder.contents().storeBytes(of: Float(1), as: Float.self)
+        profilePlaceholder.label = "Illuminatorama.spotProfiles"
+        self.spotProfileBuffer = profilePlaceholder
 
         // Area lights are bound at lighting kernel buffer(4). Few per scene
         // (one softbox / window pane is typical); grow-on-demand covers more.
@@ -10165,6 +10178,7 @@ public final class IlluminatoramaRenderer {
         enc.setBuffer(albedoAtlas.uvScaleBuffer, offset: 0, index: 16)
         enc.setBuffer(pointLightBuffer, offset: 0, index: 17)
         enc.setBuffer(spotLightBuffer, offset: 0, index: 18)
+        enc.setBuffer(spotProfileBuffer, offset: 0, index: 23)   // DH-0540 — the spot-profile rows
         // DH-0718 — area lights (buffer 20); a dummy when none are read.
         enc.setBuffer(secondaryAreaLightCount > 0 ? areaLightBuffer : instData, offset: 0, index: 20)
         enc.setTexture(irradianceCube, index: 6)
@@ -12542,6 +12556,7 @@ public final class IlluminatoramaRenderer {
                 // window. Same ring buffers the lighting kernel reads this frame.
                 enc.setFragmentBuffer(pointLightBuffer, offset: 0, index: 14)
                 enc.setFragmentBuffer(spotLightBuffer, offset: 0, index: 15)
+                enc.setFragmentBuffer(spotProfileBuffer, offset: 0, index: 18)   // DH-0540 — the spot-profile rows
                 // Smooth refraction: glass hits interpolate these corner normals (a dummy with
                 // every row's base 0 means "face normal" — see `rtGlassCornerNormalBuffer`).
                 enc.setFragmentBuffer(rtGlassCornerNormalBuffer ?? instData, offset: 0, index: 16)
@@ -13638,6 +13653,7 @@ public final class IlluminatoramaRenderer {
         enc.setBuffer(spotLightBuffer, offset: 0, index: 3)
         enc.setBuffer(areaLightBuffer, offset: 0, index: 4)
         enc.setBuffer(extraDirectionalBuffer, offset: 0, index: 5)
+        enc.setBuffer(spotProfileBuffer, offset: 0, index: 9)   // DH-0540 — the spot-profile rows
         // Point-light cube-face view-projection matrices (6 per shadowed light).
         // Placeholder-bound to `pointLightBuffer` when the feature is off / not yet
         // allocated — never read, because the kernel only indexes it for lights with
@@ -14277,6 +14293,7 @@ public final class IlluminatoramaRenderer {
         // reading (the per-frame emissive column — its front, scroll, position — made that tear).
         enc.setBytes(&u, length: MemoryLayout<VolSpotUniforms>.stride, index: 0)
         enc.setBuffer(spotLightBuffer, offset: 0, index: 1)
+        enc.setBuffer(spotProfileBuffer, offset: 0, index: 2)   // DH-0540 — the beam carries the profile too
         dispatch(enc, pipeline: pipeline, width: width, height: height)
         enc.endEncoding()
     }
@@ -16297,6 +16314,30 @@ public final class IlluminatoramaRenderer {
                 MemoryLayout<IlluminatoramaSpotLight>.stride * spotLights.count
             )
         }
+        // DH-0540 — a `profileIndex` past the table the host actually supplied is the analytic cone, never an
+        // out-of-bounds read; clamped in the COPY so the host's array keeps what it authored.
+        let rows = spotLightProfileRowCount
+        let dst = spotLightBuffer.contents().bindMemory(to: IlluminatoramaSpotLight.self, capacity: spotLights.count)
+        for i in 0..<spotLights.count where dst[i].profileIndex >= Int32(rows) { dst[i].profileIndex = -1 }
+    }
+
+    /// Daydream DH-0540 — hand the renderer the spot-profile table: one row per curated luminaire + hemisphere,
+    /// each exactly `illuminatoramaSpotProfileSampleCount` floats (intensity multiplier over 0..90° off the cone
+    /// axis, flux-matched by the host). A spot names its row with `IlluminatoramaSpotLight.profileIndex`; −1 or a
+    /// row past this table keeps the analytic cone. Allocates a fresh buffer each call.
+    public func setSpotLightProfiles(_ rows: [[Float]]) {
+        for r in rows {
+            precondition(r.count == illuminatoramaSpotProfileSampleCount,
+                         "a spot-profile row has \(illuminatoramaSpotProfileSampleCount) samples, got \(r.count)")
+        }
+        let flat = rows.flatMap { $0 }
+        let length = max(1, flat.count) * MemoryLayout<Float>.stride
+        guard let buf = device.makeBuffer(length: length, options: .storageModeShared) else { return }
+        if flat.isEmpty { buf.contents().storeBytes(of: Float(1), as: Float.self) }
+        else { flat.withUnsafeBufferPointer { memcpy(buf.contents(), $0.baseAddress!, flat.count * MemoryLayout<Float>.stride) } }
+        buf.label = "Illuminatorama.spotProfiles"
+        spotProfileBuffer = buf
+        spotLightProfileRowCount = rows.count
     }
 
     private func uploadInteriorApertures() {

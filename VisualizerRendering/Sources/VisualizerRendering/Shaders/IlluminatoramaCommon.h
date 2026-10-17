@@ -680,6 +680,10 @@ struct InteriorAperture {
 struct SpotLight {
     float3   position;
     float    innerCone;       // cos(spotInnerAngle / 2)
+    // Daydream DH-0540 — the spot-profile row (−1 ⇒ analytic cone). In the alignment gap before the
+    // float3 `direction` (offset 20 of 32): stride 192, unchanged. Keep in lockstep with the Swift
+    // struct, `RTSpotLight` and `VolSpotLight`.
+    int      profileIndex;
     float3   direction;       // points AWAY from apex (same as SCNLight)
     float    outerCone;       // cos(spotOuterAngle / 2)
     float3   color;           // premultiplied intensity
