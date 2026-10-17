@@ -625,9 +625,19 @@ static inline float3 pathPointContribution(RTPointLight pl, float3 P, float3 N, 
     return pl.color * (atten * window * window * nl * (1.0 / M_PI_F));
 }
 
-static inline float3 pathSpotContribution(RTSpotLight sl, float3 P, float3 N, uint layerBits, float3 near, SecondaryScene sec) {
+/// DH-1363 inc. 2 — the centre of a spot's emitting OPENING (the apex when it has none).
+static inline float3 pathSpotOpeningCenter(RTSpotLight sl) {
+    return sl.position + normalize(sl.direction) * (sl.openingRadius > 0.0 ? sl.openingOffset : 0.0);
+}
+
+/// A spot's unshadowed contribution at (P, N) evaluated FROM the emitting point `o` with the cone's own law — the
+/// rim feather, the IES row (DH-0540) and 1/d² from `o`. `discLaw` keeps the `1/(d² + r²)` opening proxy in the
+/// falloff (the pick-weight pass, which uses the opening's centre); a point SAMPLED on the opening (DH-1363 inc. 2)
+/// carries the geometry itself and only the bulb floor.
+static inline float3 pathSpotContributionFrom(RTSpotLight sl, float3 o, float3 P, float3 N, uint layerBits, float3 near,
+                                              SecondaryScene sec, bool discLaw) {
     if (sl.giVisible == 0u || (sl.layerMask & layerBits) == 0u) return float3(0.0);
-    float3 toL = sl.position - P;
+    float3 toL = o - P;
     float dist = length(toL);
     if (dist > sl.radius) return float3(0.0);
     float3 L = toL / max(dist, 1e-4);
@@ -637,9 +647,13 @@ static inline float3 pathSpotContribution(RTSpotLight sl, float3 P, float3 N, ui
     coneAtten *= illumiSpotProfile(sec.spotProfiles, sl.profileIndex, coneCos);   // DH-0540
     float nl = saturate(dot(N, L));
     if (nl <= 0.0) return float3(0.0);
-    float atten = pathLampAtten(dist, sl.softRadius, sl.bulbRadius, sl.openingRadius, near);
+    float atten = pathLampAtten(dist, sl.softRadius, sl.bulbRadius, discLaw ? sl.openingRadius : 0.0, near);
     float window = saturate(1.0 - pow(dist / sl.radius, 4.0));
     return sl.color * (atten * window * window * coneAtten * nl * (1.0 / M_PI_F));
+}
+
+static inline float3 pathSpotContribution(RTSpotLight sl, float3 P, float3 N, uint layerBits, float3 near, SecondaryScene sec) {
+    return pathSpotContributionFrom(sl, pathSpotOpeningCenter(sl), P, N, layerBits, near, sec, true);
 }
 
 /// An area EMITTER's (not an aperture's) unshadowed term — `secondaryAreaLightFill`'s per-light
@@ -794,7 +808,20 @@ static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceler
         castsShadow = lampVisibility && pl.castsShadow != 0u; target = pl.position; gap = kPathLampShadowGap;
     } else if (j < nP + nS) {
         RTSpotLight sl = sec.spotLights[j - nP];
-        castsShadow = lampVisibility && sl.castsShadow != 0; target = sl.position; gap = kPathLampShadowGap;
+        castsShadow = lampVisibility && sl.castsShadow != 0; target = pathSpotOpeningCenter(sl); gap = kPathLampShadowGap;
+        if (sl.openingRadius > 0.0) {
+            // DH-1363 inc. 2 — the NEE target is a point drawn uniformly on the emitting OPENING (the shade's rim,
+            // the can's aperture), and the cone's law is evaluated from it: the far field is the cone's by
+            // construction, the near field, the penumbra and the housing's own occlusion are the opening's.
+            float2 q = illumiSobolOwen2DShuffled(sampleIndex, illumiPixelSeed(gid, lightSalt + 1u));
+            float3 ax = normalize(sl.direction), t, bt;
+            pathBasis(ax, t, bt);
+            float rr = sl.openingRadius * sqrt(q.x), ph = 2.0 * M_PI_F * q.y;
+            target += t * (rr * cos(ph)) + bt * (rr * sin(ph));
+            float3 cs = pathSpotContributionFrom(sl, target, P, N, layerBits, near, sec, false);
+            if (all(cs <= 0.0)) return float3(0.0);
+            c = cs;
+        }
     } else {
         RTAreaLight al = sec.areaLights[j - nP - nS];
         castsShadow = al.castsShadow != 0 && p.areaShadowRays > 0u;

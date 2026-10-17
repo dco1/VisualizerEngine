@@ -821,11 +821,14 @@ public struct IlluminatoramaPointLight {
     /// so the stride stays 80 on both sides. Mirrors the Metal `PointLight` / `RTPointLight
     /// .openingRadius` — keep in lockstep.
     public var openingRadius: Float = 0
+    /// Daydream DH-1363 inc. 2 — where the opening sits along the light's travel direction, from `position` (m;
+    /// a point light has no axis, so this is carried for the layout only and ignored). Size 76 → 80 = the stride.
+    public var openingOffset: Float = 0
 
     public init(position: SIMD3<Float>, radius: Float, color: SIMD3<Float>,
                 layerMask: UInt32 = 0xFFFF_FFFF,
                 castsShadow: Bool = false, softRadius: Float = 0, giVisible: Bool = true,
-                bulbRadius: Float = 0, openingRadius: Float = 0) {
+                bulbRadius: Float = 0, openingRadius: Float = 0, openingOffset: Float = 0) {
         self.position = position
         self.radius = radius
         self.color = color
@@ -835,6 +838,7 @@ public struct IlluminatoramaPointLight {
         self.giVisible = giVisible ? 1 : 0
         self.bulbRadius = bulbRadius
         self.openingRadius = openingRadius
+        self.openingOffset = openingOffset
     }
 }
 
@@ -929,15 +933,20 @@ public struct IlluminatoramaSpotLight {
     /// padding, so the stride stays 192 on both sides. Mirrors the Metal `SpotLight` /
     /// `RTSpotLight` / `VolSpotLight.openingRadius` — keep all four in lockstep.
     public var openingRadius: Float = 0
+    /// Daydream DH-1363 inc. 2 — where the opening disc sits along `direction` from `position` (m; 0 ⇒ at the apex).
+    /// The path lane draws a lamp's NEE target on that disc and evaluates the cone's law from it. Appended after
+    /// `openingRadius` (size 188 → 192 = the stride). Mirrors `SpotLight` / `RTSpotLight` / `VolSpotLight.openingOffset`.
+    public var openingOffset: Float = 0
 
     public init(position: SIMD3<Float>, direction: SIMD3<Float>,
                 innerCone: Float, outerCone: Float,
                 color: SIMD3<Float>, radius: Float,
                 layerMask: UInt32 = 0xFFFF_FFFF,
                 castsShadow: Bool = true, softRadius: Float = 0, giVisible: Bool = true,
-                bulbRadius: Float = 0, openingRadius: Float = 0, profileIndex: Int32 = -1) {
+                bulbRadius: Float = 0, openingRadius: Float = 0, profileIndex: Int32 = -1, openingOffset: Float = 0) {
         self.bulbRadius = bulbRadius
         self.openingRadius = openingRadius
+        self.openingOffset = openingOffset
         self.profileIndex = profileIndex
         self.position = position
         self.direction = direction

@@ -122,6 +122,7 @@ struct RTPointLight {
     // falloff at path vertices (`pathLampAtten`): `1/(d² + r²)`, a disc's on-axis law. Same offset
     // and width as `PointLight.openingRadius` (size 72 → 76, stride 80 unchanged).
     float  openingRadius;
+    float  openingOffset;   // Daydream DH-1363 inc. 2 — layout only for a point (76 → 80)
 };
 struct RTSpotLight {
     float3   position;   float innerCone;
@@ -139,6 +140,7 @@ struct RTSpotLight {
     float    bulbRadius;
     // Daydream DH-1363 — mirrors `SpotLight.openingRadius` (size 188, stride 192); see `RTPointLight.openingRadius`.
     float    openingRadius;
+    float    openingOffset;   // Daydream DH-1363 inc. 2 — the opening disc along `direction` from the apex (188 → 192)
 };
 /// Mirror of `AreaLight` (IlluminatoramaCommon.h) — the SAME Swift-uploaded
 /// `IlluminatoramaAreaLight` buffer the deferred kernel reads (stride 144). Keep in

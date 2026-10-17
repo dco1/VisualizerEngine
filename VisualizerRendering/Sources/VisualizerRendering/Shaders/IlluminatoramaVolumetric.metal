@@ -138,6 +138,7 @@ struct VolSpotLight {
     uint     giVisible;       // unused here — present for the stride (see above)
     float    bulbRadius;      // unused here — DH-1295, path lane only (size 184, stride 192)
     float    openingRadius;   // unused here — Daydream DH-1363, path lane only (size 188, stride 192)
+    float    openingOffset;   // unused here — Daydream DH-1363 inc. 2 (size 192 = the stride)
 };
 
 struct VolSpotUniforms {

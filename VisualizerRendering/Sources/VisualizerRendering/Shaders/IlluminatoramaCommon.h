@@ -637,6 +637,7 @@ struct PointLight {
     // ignores it. Appended after `giVisible` (size 72 → 76) inside the stride's tail padding:
     // stride 80, unchanged. Keep in lockstep with `RTPointLight` and the Swift struct.
     float  openingRadius;
+    float  openingOffset;   // Daydream DH-1363 inc. 2 — layout only for a point (76 → 80 = the stride)
 };
 #define kGIVisibleSecondaryOnly 2u
 
@@ -719,6 +720,9 @@ struct SpotLight {
     // 184 → 188, still inside the tail padding: stride 192, unchanged. Keep in lockstep with
     // `RTSpotLight` and `VolSpotLight`.
     float    openingRadius;
+    // Daydream DH-1363 inc. 2 — the opening disc's place along `direction` from the apex (path lane only;
+    // 188 → 192 = the stride). Keep in lockstep with `RTSpotLight` and `VolSpotLight`.
+    float    openingOffset;
 };
 
 struct Instance {
