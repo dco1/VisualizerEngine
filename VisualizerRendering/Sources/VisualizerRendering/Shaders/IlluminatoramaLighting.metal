@@ -6,6 +6,7 @@
 #include <metal_stdlib>
 #include "IlluminatoramaSpotProfile.h"
 #include "IlluminatoramaCommon.h"
+#include "IlluminatoramaAOV.h"
 #include "IlluminatoramaDDGI.h"
 // S4.1 — ray-traced soft sun shadows in this kernel's `kLightingRTSunShadow`
 // variant. The header carries the shared RNG (`pcgHash`/`rnd`) and disc sampling
@@ -114,6 +115,13 @@ constant bool kLightingDDGIIrrCacheEnabled [[function_constant(4)]];
 // (`rtSunSoftShadowsEnabled && rtTLASActive`), so the accel binding below is
 // present exactly when the bit is.
 constant bool kLightingRTSunShadow         [[function_constant(5)]];
+// Daydream DH-1304 — the per-term AOV capture (`IlluminatoramaAOV.h`). Defined and true ONLY in
+// the capture variants the host builds while `aovCaptureEnabled`; every other variant (the
+// default, the rate variants, every Visualizer host) leaves it undefined ⇒ false ⇒ the writes
+// below are dead code and the kernel is the one it always was. (Indices 6 / 7 are the shading-rate
+// pair, declared further down beside the code they gate.)
+constant bool kLightingAOVEnabledFC        [[function_constant(8)]];
+constant bool kLightingAOVEnabled = is_function_constant_defined(kLightingAOVEnabledFC) && kLightingAOVEnabledFC;
 
 // One cascade's answer, everything that depends on the cascade index in one place.
 // Factored out of `sunVisibility` for S1.4 (cascade-split blending), which needs to
@@ -1049,6 +1057,19 @@ static inline void lightingStore(texture2d<T, access::write> tex, vec<T, 4> v, u
     }
 }
 
+/// Daydream DH-1304 — one AOV slice's running mean: this pixel, or — in the coarse variant — the
+/// whole 2×2 quad it leads (each quad pixel keeps its own history). `w` is the frame's 1/N.
+static inline void aovStore(texture2d_array<float, access::read_write> aov, uint slice,
+                            float3 v, float w, uint2 gid) {
+    aov.write(float4(mix(aov.read(gid, slice).rgb, v, w), 1.0), gid, slice);
+    if (kLightingCoarse) {
+        uint2 p1 = gid + uint2(1u, 0u), p2 = gid + uint2(0u, 1u), p3 = gid + uint2(1u, 1u);
+        aov.write(float4(mix(aov.read(p1, slice).rgb, v, w), 1.0), p1, slice);
+        aov.write(float4(mix(aov.read(p2, slice).rgb, v, w), 1.0), p2, slice);
+        aov.write(float4(mix(aov.read(p3, slice).rgb, v, w), 1.0), p3, slice);
+    }
+}
+
 kernel void illumi_lighting(
     texture2d<half,  access::read>          gAlbedoMet      [[texture(0)]],
     texture2d<half,  access::read>          gNormalRgh      [[texture(1)]],
@@ -1126,6 +1147,11 @@ kernel void illumi_lighting(
     // The defocus shading-rate tile map (least |CoC| of each 16×16 tile's geometry) — exists only in
     // the coarse / skip variants (`kLightingShadingRate`), which the host binds it for.
     texture2d<float, access::read>          rateTiles       [[texture(24), function_constant(kLightingShadingRate)]],
+    // Daydream DH-1304 — the per-term AOV capture (running means, one slice per term — see
+    // IlluminatoramaAOV.h) and its frame parameters. Exist only in the `kLightingAOVEnabled`
+    // variants, which the host builds and binds for only while capturing.
+    texture2d_array<float, access::read_write> aovOut       [[texture(25), function_constant(kLightingAOVEnabled)]],
+    constant AOVUniforms&                   aovU            [[buffer(10), function_constant(kLightingAOVEnabled)]],
     uint2                                   gidIn           [[thread_position_in_grid]]
 ) {
     uint w = outHDR.get_width();
@@ -1167,6 +1193,12 @@ kernel void illumi_lighting(
         lightingStore(outHDR, half4(half3(sky), 1.0h), gid);
         // Issue #65 — sky is never SSS; clear its mask so the composite skips it.
         if (frame.sssStrength > 0.0) lightingStore(sssOut, half4(0.0h), gid);
+        if (kLightingAOVEnabled) {   // DH-1304 — the background is `environment`; every other term 0
+            float w = aovU.blend;
+            for (uint s = 0u; s < kAOVCount; ++s) {
+                aovStore(aovOut, s, (s == kAOVEnvironment || s == kAOVBeauty) ? sky : float3(0.0), w, gid);
+            }
+        }
         return;
     }
 
@@ -1757,6 +1789,12 @@ kernel void illumi_lighting(
     // IBL only — an interior band is the room's own light, which no traced ray re-supplies.
     float3 diffSkyInComposite = float3(0.0);
     float3 dbgAmbient = float3(0.0);
+    // DH-1304 — AOV bookkeeping (capture variants only; dead otherwise): the outdoor-cube diffuse
+    // share as written before the hand-off flags rewrite `diffSkyInComposite`, and the ENVIRONMENT
+    // halves of the two coat lobes, whose sun halves are `direct`.
+    float3 aovEnvDiffuse = float3(0.0), aovCoatEnv = float3(0.0);
+    float  baseAttenForAOV = 1.0;                                   // the clearcoat's base attenuation, if any
+    float  aovAirT = 1.0; float3 aovAirlight = float3(0.0);         // aerial perspective's transmittance + airlight
     if (kLightingIBLEnabled) {  // function_constant(0)
         constexpr sampler cubeSampler(filter::linear, mip_filter::linear);
 
@@ -2013,6 +2051,7 @@ kernel void illumi_lighting(
         dbgDiffuseIBL = diffuseIBL * frame.iblIntensity * ao * interiorIBLKd;
         diffSkyInComposite = kD * irradianceCubeSat * albedo * (1.0 - interiorBandW)
                            * ao * interiorIBLKd * frame.iblIntensity;
+        if (kLightingAOVEnabled) aovEnvDiffuse = diffSkyInComposite;   // DH-1304 — the outdoor cube's share, before the hand-off flags
         dbgSpecularIBL = specularIBL * frame.iblIntensity * specOcc * interiorIBLKs;
         specIBLInComposite = dbgSpecularIBL;
         // ── Cloth sheen, environment arm ─────────────────────────────────────
@@ -2128,10 +2167,12 @@ kernel void illumi_lighting(
             // S1.3 is scoped to the specular IBL term. Left as a follow-up rather than
             // an unmeasured side effect.
             clearcoat += env * Fcc * frame.iblIntensity * ao * interiorIBLK;
+            if (kLightingAOVEnabled) aovCoatEnv += env * Fcc * frame.iblIntensity * ao * interiorIBLK * houseCC;   // DH-1304
         }
         clearcoat *= houseCC;
         // Energy conservation: clearcoat layer attenuates the base for grazing V.
         float baseAtten = 1.0 - houseCC * (ccF0 + (1.0 - ccF0) * pow(1.0 - saturate(dot(N, V)), 5.0));
+        if (kLightingAOVEnabled) baseAttenForAOV = baseAtten;   // DH-1304
         directSun    *= baseAtten;
         indirect     *= baseAtten;
         specIBLInComposite *= baseAtten;   // DH-0896
@@ -2172,6 +2213,7 @@ kernel void illumi_lighting(
                                                         level(ccRough * (mips - 1.0))).rgb);
             float  Fcc  = ccF0 + (1.0 - ccF0) * pow(1.0 - ccNdotV, 5.0);
             hotdogCC += env * Fcc * frame.iblIntensity * ao;
+            if (kLightingAOVEnabled) aovCoatEnv += env * Fcc * frame.iblIntensity * ao * ccStrength;   // DH-1304
         }
         hotdogCC *= ccStrength;
     }
@@ -2239,6 +2281,8 @@ kernel void illumi_lighting(
     // term-decomposition instrument in this project inherits a distance-dependent bias.
     // At the physically-plausible σ ≈ 1e-4 an interior (< 20 m) sits at T > 0.998 —
     // invisible — so this is a statement about the far field, not a fog look.
+    float3 aovSpecPre = float3(0.0), aovDiffSkyPre = float3(0.0);
+    if (kLightingAOVEnabled) { aovSpecPre = specIBLInComposite; aovDiffSkyPre = diffSkyInComposite; }   // DH-1304
     if (frame.aerialPerspectiveDensity > 0.0 && frame.debugTerm == 0u && kLightingIBLEnabled) {
         float viewDist = length(frame.cameraWorldPos - worldPos);
         float t = exp(-frame.aerialPerspectiveDensity * viewDist);
@@ -2266,10 +2310,43 @@ kernel void illumi_lighting(
                 color = mix(airlight, color, t);
                 specIBLInComposite *= t;   // DH-0896 — what of it survives the extinction
                 diffSkyInComposite *= t;
+                if (kLightingAOVEnabled) { aovAirT = t; aovAirlight = airlight; }   // DH-1304
             }
         }
     }
     lightingStore(outHDR, half4(half3(color), 1.0h), gid);
+    if (kLightingAOVEnabled) {
+        // ── DH-1304 — the per-term split of EXACTLY the `color` written above (IlluminatoramaAOV.h) ──
+        // Every variable is taken as it entered `color` (clearcoat attenuation included), in the
+        // PRE-aerial-perspective frame (`aovSpecPre` / `aovDiffSkyPre` were saved before the mix
+        // above scaled them), so the slices sum to the composite by construction; the aerial mix is
+        // then applied to every term alike, with the airlight itself as `environment`.
+        // `HouseRenderBridgeGPUTests_AOV` proves the sum. `debugTerm` isolation views replace
+        // `color` and are not captured (the host never pairs them with a capture).
+        bool handed = aovU.handoff != 0u;
+        // What of the composite the traced pass will REPLACE this frame: the whole `diffSkyInComposite`
+        // (the hand-off flags decide its make-up), of which the outdoor-cube diffuse is always a part,
+        // and the window apertures when the flags hand those over too.
+        float3 handedAp = ((frame.frameFlags & (kFrameFlagPathOwnsIndirect | kFrameFlagGIOwnsApertures)) != 0u)
+                        ? apertureSum : float3(0.0);
+        float3 envShare  = aovEnvDiffuse * baseAttenForAOV;
+        float3 handoff   = handed ? aovDiffSkyPre : float3(0.0);
+        float3 tDirect   = directSun + transmission + dirFillSum + pointSum + spotSum + (areaSum - apertureSum)
+                         + (clearcoat + hotdogCC - aovCoatEnv) + plushSheenTerm;
+        float3 tSpecular = aovSpecPre + aovCoatEnv;
+        float3 tEnv      = envShare + apertureSum - (handed ? envShare + handedAp : float3(0.0));
+        float3 tIndirect = indirect - aovSpecPre - envShare
+                         - (handed ? aovDiffSkyPre - envShare - handedAp : float3(0.0));
+        float w = aovU.blend, t = aovAirT;
+        aovStore(aovOut, kAOVDirect,       tDirect   * t, w, gid);
+        aovStore(aovOut, kAOVIndirect,     tIndirect * t, w, gid);
+        aovStore(aovOut, kAOVEmission,     emission  * t, w, gid);
+        aovStore(aovOut, kAOVEnvironment,  tEnv * t + aovAirlight * (1.0 - t), w, gid);
+        aovStore(aovOut, kAOVSpecular,     tSpecular * t, w, gid);
+        aovStore(aovOut, kAOVTransmission, float3(0.0), w, gid);
+        aovStore(aovOut, kAOVHandoff,      handoff * t, w, gid);
+        aovStore(aovOut, kAOVBeauty,       color, w, gid);
+    }
     if (specIBLOut.get_width() == outHDR.get_width() && frame.debugTerm == 0u) {
         lightingStore(specIBLOut, half4(half3(specIBLInComposite), 0.0h), gid);
     }

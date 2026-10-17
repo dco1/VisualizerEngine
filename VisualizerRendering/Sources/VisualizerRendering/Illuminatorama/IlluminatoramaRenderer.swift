@@ -916,6 +916,104 @@ public final class IlluminatoramaRenderer {
     /// (the glowing shades' share of the noise, by its absence); 32 / 16 / 8: no local lights /
     /// no sun / no window apertures at the path's vertices (the noise budget by source).
     public var rtPathDebugFlags: UInt32 = 0
+
+    // ── Daydream DH-1304 — the per-term AOV capture ──────────────────────────────────────────
+    /// Capture every lighting term of every frame into its own running mean (`IlluminatoramaAOV`,
+    /// `Shaders/IlluminatoramaAOV.h` for the set and the contract). DEBUG / MEASURE ONLY: while
+    /// false — every host's default — no variant, no texture and no binding exist, and the lighting
+    /// kernels are byte-for-byte the pre-DH-1304 code (every tag is behind a function constant).
+    /// While true the frame runs the `-aov` variants of `illumi_lighting` and
+    /// `illumi_rt_lighting_tlas` (compiled blocking on first use) and accumulates
+    /// `aovLightingTexture` as a per-pixel mean over the frames since the last reset. The mean
+    /// restarts whenever the GI running mean does (`resetRTGIAccumulation`, the still's held-out
+    /// warm-up / cache-build frames) and on `resetAOVAccumulation()`. Σ(lighting slices) == beauty
+    /// per pixel on every frame — `HouseRenderBridgeGPUTests_AOV` is the gate.
+    /// Only the TLAS lane is tagged: the soup kernel (`illumi_rt_lighting`) and the isolation
+    /// `debugTerm` views write no AOVs.
+    public var aovCaptureEnabled: Bool = false
+    /// The captured means: `texture2d_array`, rgba32Float, internal size, `IlluminatoramaAOV.sliceCount`
+    /// slices (`IlluminatoramaAOV.slice`). Nil until a frame has rendered with the capture on. Private
+    /// storage — `readAOV` blits it.
+    public var aovLightingTexture: MTLTexture? { aovTexture }
+    /// Frames in the current mean (0 ⇒ nothing captured since the last reset).
+    public private(set) var aovAccumulatedFrames: Int = 0
+    /// Restart the AOV running mean on the next captured frame.
+    public func resetAOVAccumulation() { aovResetPending = true }
+    private var aovTexture: MTLTexture?
+    private var aovResetPending = true
+    private var aovActiveThisFrame = false
+    private var aovFrameBlend: Float = 1
+    private var rtTLASAOVPipeline: MTLComputePipelineState?
+    private var rtTLASAOVCurvePipeline: MTLComputePipelineState?
+    /// Mirror of `AOVUniforms` in IlluminatoramaAOV.h (16 B).
+    private struct AOVUniforms { var blend: Float; var handoff: UInt32; var pad0: UInt32 = 0; var pad1: UInt32 = 0 }
+    /// Function-constant indices: `kLightingAOVEnabled` (illumi_lighting) / `kRTAOVEnabled` (TLAS kernel).
+    private static let lightingAOVFunctionConstantIndex = 8
+    private static let rtAOVFunctionConstantIndex = 31
+
+    /// Decide this frame's capture BEFORE the lighting pass: allocate the means at the internal size,
+    /// restart them when asked or when the GI mean restarts, and fix the frame's 1/N.
+    private func prepareAOVFrame() {
+        guard aovCaptureEnabled else { aovActiveThisFrame = false; return }
+        if let t = aovTexture, t.width == width, t.height == height {
+        } else {
+            let d = MTLTextureDescriptor()
+            d.textureType = .type2DArray
+            d.pixelFormat = .rgba32Float
+            d.width = width; d.height = height
+            d.arrayLength = IlluminatoramaAOV.sliceCount
+            d.usage = [.shaderRead, .shaderWrite]
+            d.storageMode = .private
+            aovTexture = device.makeTexture(descriptor: d)
+            aovTexture?.label = "Illuminatorama.aov"
+            aovResetPending = true
+        }
+        guard aovTexture != nil else { aovActiveThisFrame = false; return }
+        // The GI mean's restart is honoured only when that flag will be consumed this frame (with the
+        // GI accumulator off it stays raised forever, which would restart this mean every frame).
+        let giRestarts = rtGINeedsFirstFrame && rtGITemporalEnabled && rtEnabled && rtSupported
+        if aovResetPending || giRestarts { aovAccumulatedFrames = 0; aovResetPending = false }
+        aovAccumulatedFrames += 1
+        aovFrameBlend = 1 / Float(aovAccumulatedFrames)
+        aovActiveThisFrame = true
+    }
+
+    /// The `kRTAOVEnabled` variant of the TLAS lighting kernel (with / without curves), compiled
+    /// BLOCKING on first use — a capture lane, never a vsync one.
+    private func rtTLASAOVVariant(curves: Bool) -> MTLComputePipelineState? {
+        if curves, let p = rtTLASAOVCurvePipeline { return p }
+        if !curves, let p = rtTLASAOVPipeline { return p }
+        let cv = MTLFunctionConstantValues()
+        var on = true
+        cv.setConstantValue(&on, type: .bool, index: Self.rtAOVFunctionConstantIndex)
+        if curves { cv.setConstantValue(&on, type: .bool, index: Self.curveFunctionConstantIndex) }
+        let p = engine.pipelineCache.pipelineState(name: "illumi_rt_lighting_tlas", device: device,
+                                                   constants: cv, variantKey: curves ? "aov-curves" : "aov")
+        if curves { rtTLASAOVCurvePipeline = p } else { rtTLASAOVPipeline = p }
+        return p
+    }
+
+    /// One slice of the captured means, read back as rgba32Float rows (`width × height × 4`).
+    /// Waits for the GPU — diagnostics only.
+    public func readAOV(_ aov: IlluminatoramaAOV) -> (width: Int, height: Int, rgba: [Float])? {
+        guard let slice = aov.slice, let tex = aovTexture else { return nil }
+        let w = tex.width, h = tex.height
+        let rowBytes = w * MemoryLayout<Float>.stride * 4
+        guard let buf = device.makeBuffer(length: rowBytes * h, options: .storageModeShared),
+              let cb = commandQueue.makeCommandBuffer(), let blit = cb.makeBlitCommandEncoder() else { return nil }
+        blit.copy(from: tex, sourceSlice: slice, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: w, height: h, depth: 1),
+                  to: buf, destinationOffset: 0, destinationBytesPerRow: rowBytes, destinationBytesPerImage: rowBytes * h)
+        blit.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()   // gpu-ok: diagnostics readback, never the per-frame lane
+        let n = w * h * 4
+        let out = [Float](unsafeUninitializedCapacity: n) { dst, count in
+            memcpy(dst.baseAddress!, buf.contents(), n * MemoryLayout<Float>.stride)
+            count = n
+        }
+        return (w, h, out)
+    }
     /// **DH-1293 INSTRUMENT — floor the lamps' `1/d²` at path vertices** (metres; 0 ⇒ off,
     /// byte-identical). A lamp / can / sconce reaching a path vertex closer than this lights it as
     /// if it were this far away. BIASED by construction — it removes the near-field energy it
@@ -9954,7 +10052,9 @@ public final class IlluminatoramaRenderer {
             && rtCurveSetDataBuffer != nil && rtCurvePoolPoints != nil
             && rtCurvePoolRadii != nil && rtCurvePoolSegments != nil
         let pipeline: MTLComputePipelineState
-        if curvesOn {
+        if aovActiveThisFrame, let ap = rtTLASAOVVariant(curves: curvesOn) {
+            pipeline = ap   // DH-1304 — the capture variant (the same kernel, its tags live)
+        } else if curvesOn {
             guard let cp = rtTLASCurvePipeline else { return }
             pipeline = cp
         } else {
@@ -10195,6 +10295,12 @@ public final class IlluminatoramaRenderer {
         // DH-0653 hit/miss counters (buffer 19). Dummy = instData, never added to while
         // `surfStatsEnabled` is 0.
         enc.setBuffer(hitStats ?? instData, offset: 0, index: 19)
+        // DH-1304 — the AOV capture (texture 13 + buffer 24 exist only in the `aov` variants).
+        if aovActiveThisFrame, let aovTex = aovTexture {
+            enc.setTexture(aovTex, index: 13)
+            var au = AOVUniforms(blend: aovFrameBlend, handoff: diffSkyOn ? 1 : 0)
+            enc.setBytes(&au, length: MemoryLayout<AOVUniforms>.stride, index: 24)
+        }
         // The TLAS references the BLASes, which reference the mesh vertex/index
         // buffers (and the curve BLASes the pooled curve buffers) — all must be
         // resident for the intersector.
@@ -10917,6 +11023,7 @@ public final class IlluminatoramaRenderer {
         encodeSSAOPass(cb)
         encodeSSAOSpatialFilter(cb)
         encodeSSAOTemporalPass(cb)
+        prepareAOVFrame()   // DH-1304 — this frame's capture (no-op unless `aovCaptureEnabled`)
         encodeLightingPass(cb)
         // Issue #65 — screen-space SSS: diffuse the lit irradiance of SSS-flagged
         // pixels and blend it back into hdrTexture BEFORE SSR/RT/TAA/bloom read it,
@@ -13467,7 +13574,8 @@ public final class IlluminatoramaRenderer {
     /// uniforms written in `updateFrameUniforms` — both derive from the same Bools.
     static func lightingFeatureConstants(ibl: Bool, shadow: Bool, dfg: Bool,
                                          ddgi: Bool, ddgiIrrCache: Bool,
-                                         rtSunShadow: Bool = false)
+                                         rtSunShadow: Bool = false,
+                                         aov: Bool = false)
         -> (key: String, constants: MTLFunctionConstantValues) {
         // The irradiance cache is only meaningful while DDGI is on — mirror the
         // exact derivation in updateFrameUniforms (`ddgiIrrCacheEnabled && ddgiEnabled`).
@@ -13483,7 +13591,14 @@ public final class IlluminatoramaRenderer {
                 cv.setConstantValue(buf.baseAddress! + i, type: .bool, index: i)
             }
         }
-        let key = flags.map { $0 ? "1" : "0" }.joined()
+        var key = flags.map { $0 ? "1" : "0" }.joined()
+        // Daydream DH-1304 — the AOV capture variant (index 8): set only while capturing, so every
+        // other key (and every other host) keeps the constant undefined.
+        if aov {
+            var on = true
+            cv.setConstantValue(&on, type: .bool, index: lightingAOVFunctionConstantIndex)
+            key += "-aov"
+        }
         return (key, cv)
     }
 
@@ -13518,23 +13633,26 @@ public final class IlluminatoramaRenderer {
     private func currentLightingPipeline() -> MTLComputePipelineState {
         let irrCache = ddgiIrrCacheEnabled && ddgiEnabled
         let rtSun = rtSunShadowLightingActive
+        let aov = aovActiveThisFrame
         let bits: UInt8 = (iblEnabled     ? 1  : 0)
                         | (shadowsEnabled ? 2  : 0)
                         | (dfgLUTEnabled  ? 4  : 0)
                         | (ddgiEnabled    ? 8  : 0)
                         | (irrCache       ? 16 : 0)
                         | (rtSun          ? 32 : 0)
+                        | (aov            ? 64 : 0)
         if bits == lastLightingFlags, let p = lastLightingPipeline { return p }
 
         let (key, cv) = Self.lightingFeatureConstants(
             ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
             ddgi: ddgiEnabled, ddgiIrrCache: ddgiIrrCacheEnabled,
-            rtSunShadow: rtSun)
+            rtSunShadow: rtSun, aov: aov)
         // Headless/settled lane (no runloop to land the async completion — a
         // @MainActor render loop starves the MainActor hop): compile the variant
         // BLOCKING so the frame actually runs the specialized path instead of the
         // init-time uber fallback. DH-0552.
-        if blockingLightingCompile {
+        // DH-1304 — a capture frame compiles BLOCKING too: the uber fallback writes no AOVs.
+        if blockingLightingCompile || aov {
             if let built = engine.pipelineCache.pipelineState(
                 name: "illumi_lighting", device: device, constants: cv, variantKey: key) {
                 lastLightingFlags = bits
@@ -13647,6 +13765,12 @@ public final class IlluminatoramaRenderer {
         let diffSkyTarget = diffSkyHandoffTarget()
         diffSkyWrittenThisFrame = diffSkyTarget != nil
         enc.setTexture(diffSkyTarget ?? diffSkyDummyTexture, index: 23)
+        // DH-1304 — the AOV capture (texture 25 + buffer 10 exist only in the `-aov` variants).
+        if aovActiveThisFrame, let aovTex = aovTexture {
+            enc.setTexture(aovTex, index: 25)
+            var au = AOVUniforms(blend: aovFrameBlend, handoff: diffSkyTarget != nil ? 1 : 0)
+            enc.setBytes(&au, length: MemoryLayout<AOVUniforms>.stride, index: 10)
+        }
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
         enc.setBuffer(pointLightBuffer, offset: 0, index: 1)
         enc.setBuffer(ddgiUniformBuffer, offset: 0, index: 2)
@@ -13737,18 +13861,20 @@ public final class IlluminatoramaRenderer {
     /// still is deterministic.
     private func lightingShadingRatePipelines() -> (coarse: MTLComputePipelineState, skip: MTLComputePipelineState)? {
         let rtSun = rtSunShadowLightingActive
+        let aov = aovActiveThisFrame
         let bits: UInt8 = (iblEnabled ? 1 : 0) | (shadowsEnabled ? 2 : 0) | (dfgLUTEnabled ? 4 : 0)
                         | (ddgiEnabled ? 8 : 0) | (ddgiIrrCacheEnabled && ddgiEnabled ? 16 : 0) | (rtSun ? 32 : 0)
+                        | (aov ? 64 : 0)
         if bits == lastRatePipelines.flags, let memo = lastRatePipelines.pair { return memo }
         func variant(coarse: Bool) -> MTLComputePipelineState? {
             let (key, cv) = Self.lightingFeatureConstants(
                 ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
-                ddgi: ddgiEnabled, ddgiIrrCache: ddgiIrrCacheEnabled, rtSunShadow: rtSun)
+                ddgi: ddgiEnabled, ddgiIrrCache: ddgiIrrCacheEnabled, rtSunShadow: rtSun, aov: aov)
             var c = coarse, k = !coarse
             cv.setConstantValue(&c, type: .bool, index: 6)
             cv.setConstantValue(&k, type: .bool, index: 7)
             let vkey = key + (coarse ? "-rateCoarse" : "-rateSkip")
-            if blockingLightingCompile || rtSun {
+            if blockingLightingCompile || rtSun || aov {
                 return engine.pipelineCache.pipelineState(name: "illumi_lighting", device: device,
                                                           constants: cv, variantKey: vkey)
             }

@@ -10,6 +10,8 @@
 // DH-1014 — the layered BSDF's weights, so the traced diffuse / reflection replace the deferred
 // terms by the same numbers those terms carry (`layeredRTWeights`, kPathFlagLayered*).
 #include "IlluminatoramaBSDF.h"
+// Daydream DH-1304 — the per-term AOV set (slice indices + the capture's frame parameters).
+#include "IlluminatoramaAOV.h"
 using namespace metal;
 using namespace raytracing;
 
@@ -233,6 +235,18 @@ struct RTInstUniforms {
 // scenes run the exact code they always did.
 constant bool kRTCurvesEnabledFC [[function_constant(30)]];
 constant bool kRTCurvesEnabled = is_function_constant_defined(kRTCurvesEnabledFC) && kRTCurvesEnabledFC;
+// Daydream DH-1304 — the per-term AOV capture (IlluminatoramaAOV.h). Defined and true ONLY in the
+// capture variants the host builds while `aovCaptureEnabled`; undefined everywhere else ⇒ every
+// tagging line below is dead code and the kernel — the path tracer included — is byte-for-byte
+// the one it always was. Composes with `kRTCurvesEnabled` (four variants at most).
+constant bool kRTAOVEnabledFC [[function_constant(31)]];
+constant bool kRTAOVEnabled = is_function_constant_defined(kRTAOVEnabledFC) && kRTAOVEnabledFC;
+
+/// DH-1304 — add this frame's share of one term into its running mean (the deferred pass wrote
+/// the mean's deferred share with the same weight this frame, so `+= v·w` keeps the mean exact).
+static inline void aovAdd(texture2d_array<float, access::read_write> aov, uint slice, float3 v, float w, uint2 gid) {
+    aov.write(float4(aov.read(gid, slice).rgb + v * w, 1.0), gid, slice);
+}
 
 // Mirror of the Swift `RTCurveSetData` (112 B). m0..m3 = the set's
 // object→world matrix columns; meta.x = the set's first segment index into the
@@ -971,9 +985,16 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                                              texture2d_array<float, access::sample> albedoAtlas,
                                              thread uint& seed,
                                              device atomic_uint* rcKeys, device atomic_float* rcData,
-                                             texture2d<half, access::sample> dfgLUT)
+                                             texture2d<half, access::sample> dfgLUT,
+                                             // DH-1304 — OUT: the part of the returned radiance that reached the
+                                             // primary WITHOUT a bounce off geometry (the sky its first segment
+                                             // found, a window aperture sampled from the primary): `environment`.
+                                             // The rest is `indirect`. Written only in the AOV variant.
+                                             thread float3& LenvOut)
 {
     uint portalCount = uint(max(0.0, u.interiorRoomGainMeta.y));
+    float3 Lenv = float3(0.0);
+    if (kRTAOVEnabled) LenvOut = float3(0.0);
     // DH-1344 — radiance cache: per recorded vertex, its cell, the throughput arriving at it (before its
     // albedo) and the radiance gathered before it, so its own suffix estimate can be written at the end.
     bool rcWrite = u.radCacheCell > 0.0, rcRead = u.radCacheCell < 0.0;
@@ -1161,6 +1182,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         }
         if (bruteV) Lv = Lv * bruteWdA + LvBrute;   // instrument: sun/lamps the diffuse share only
         L += (st.on ? Tnee : T) * Lv;               // DH-1363 inc. 2b — the stack's NEE rides the arriving throughput
+        if (kRTAOVEnabled && v == 0u) Lenv += (st.on ? Tnee : T) * Lv;   // DH-1304 — at the primary, `Lv` is the window aperture alone
         if (v == maxB) break;
 
         // ── Continuation (cosine) ──
@@ -1221,6 +1243,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 float3 Lo = pathOutdoorFromResult(isect, accel, res, Pofs, dir, u, pOut, sec,
                                                   skyEquirect, irrCube, albedoAtlas, seed);
                 L += T * Lo * tPane * misW;
+                if (kRTAOVEnabled && v == 0u) Lenv += T * Lo * tPane * misW;   // DH-1304 — the outdoors through a window, from the primary
                 if (specV && res.type == intersection_type::none) L += T * sunHit;   // DH-1308
                 break;
             }
@@ -1237,6 +1260,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
             float3 sky = skyEquirect.sample(skySamp, dirToEquirectUV(dir)).rgb;
             if (u.scotopicDesaturation > 0.0) sky = mix(sky, float3(pathLuma(sky)), u.scotopicDesaturation);
             L += T * sky * u.skyIntensity;
+            if (kRTAOVEnabled && v == 0u) Lenv += T * sky * u.skyIntensity;   // DH-1304 — the sky the primary's own segment found
             if (specV) L += T * sunHit;                      // DH-1308
             break;
         }
@@ -1375,8 +1399,9 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
     }
     if (u.pathClamp > 0.0) {
         float l = pathLuma(L);
-        if (l > u.pathClamp) L *= u.pathClamp / l;
+        if (l > u.pathClamp) { L *= u.pathClamp / l; if (kRTAOVEnabled) Lenv *= u.pathClamp / l; }
     }
+    if (kRTAOVEnabled) LenvOut = Lenv;
     return L;
 }
 
@@ -1438,6 +1463,10 @@ kernel void illumi_rt_lighting_tlas(
     device atomic_uint*                   rcKeys      [[buffer(21)]],
     device atomic_float*                  rcData      [[buffer(22)]],
     const device float*                   spotProfiles [[buffer(23)]],  // DH-0540 — the spot-profile rows
+    // Daydream DH-1304 — the per-term AOV capture (running means the deferred pass started this
+    // frame) and its frame parameters. Exist only in the `kRTAOVEnabled` variants.
+    texture2d_array<float, access::read_write> aovOut   [[texture(13), function_constant(kRTAOVEnabled)]],
+    constant AOVUniforms&                 aovU        [[buffer(24), function_constant(kRTAOVEnabled)]],
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -1558,6 +1587,9 @@ kernel void illumi_rt_lighting_tlas(
 
     // ── One-bounce indirect (GI) ──────────────────────────────────
     float3 indirect = float3(0.0);
+    // DH-1304 — the share of `indirect` that is `environment` (sky / a window seen from the primary
+    // with no bounce); AOV variant only.
+    float3 indirectEnv = float3(0.0);
     // B0 — variance accumulated across cache hits when the variance debug term
     // is on (zero cost otherwise; the sample sites guard on u.debugSurfCacheVar).
     float surfVarAcc = 0.0; uint surfVarN = 0u;
@@ -1586,10 +1618,12 @@ kernel void illumi_rt_lighting_tlas(
                 if (pres.type == intersection_type::triangle) primaryLayer = secondaryLayerBits(pres.instance_id, insts);
             }
             for (uint g = 0; g < u.giRays; ++g) {
+                float3 envPart = float3(0.0);
                 indirect += illumiPathTraceIncoming(isect, accel, Pofs - N * max(u.rayTMin, 1e-3), N, primaryLayer,
                                                     u.giProgressiveIndex * u.giRays + g, gid, u, sec,
                                                     secFull, skyEquirect, irrCube, albedoAtlas, seed, rcKeys, rcData,
-                                                    dfgLUT);
+                                                    dfgLUT, envPart);
+                if (kRTAOVEnabled) indirectEnv += envPart;
             }
         } else
         for (uint g = 0; g < u.giRays; ++g) {
@@ -1708,9 +1742,11 @@ kernel void illumi_rt_lighting_tlas(
                 // Replacing the deferred sky: a miss carries the sky at the SAME intensity
                 // the deferred diffuse term used, so the host's sky-fill dial stays live.
                 indirect += (u.giReplacesDiffuseSky != 0u) ? sky * u.skyIntensity : sky;
+                if (kRTAOVEnabled) indirectEnv += (u.giReplacesDiffuseSky != 0u) ? sky * u.skyIntensity : sky;   // DH-1304
             }
         }
         indirect = (indirect / float(u.giRays)) * albedo * lw.diffuse * u.giStrength;
+        if (kRTAOVEnabled) indirectEnv = (indirectEnv / float(u.giRays)) * albedo * lw.diffuse * u.giStrength;
         cacheTerms += (cacheGI / float(u.giRays)) * albedo * u.giStrength;
         if (u.pathBounces > 0u && (u.pathFlags & kPathFlagDebugPrimaryLocal) != 0u) {
             // DH-1011 INSTRUMENT — isolation view: the primary's traced local-light estimate ALONE
@@ -1922,6 +1958,20 @@ kernel void illumi_rt_lighting_tlas(
     }
     outHDR.write(half4(max(prev.rgb - half3(skySeenThrough) - half3(diffSkyReplaced), half3(0.0h)) + half3(reflection), prev.a), gid);
     rtDiffuse.write(half4(half3(direct + indirect), 1.0h), gid);
+    if (kRTAOVEnabled) {
+        // ── DH-1304 — this pass's share of every term, into the means the deferred pass began ──
+        // Its diffuse (`direct` + `indirect`) goes out raw, its reflection replaces the sky the
+        // deferred specular IBL put there, and the deferred stand-in it owns comes out of the
+        // bookkeeping slice the deferred pass parked it in (`handoff` ⇒ 0 once both have run).
+        float w = aovU.blend;
+        float3 specDelta = reflection - skySeenThrough;
+        aovAdd(aovOut, kAOVDirect,      direct, w, gid);
+        aovAdd(aovOut, kAOVIndirect,    indirect - indirectEnv, w, gid);
+        aovAdd(aovOut, kAOVEnvironment, indirectEnv, w, gid);
+        aovAdd(aovOut, kAOVSpecular,    specDelta, w, gid);
+        aovAdd(aovOut, kAOVHandoff,     -diffSkyReplaced, w, gid);
+        aovAdd(aovOut, kAOVBeauty,      direct + indirect + specDelta - diffSkyReplaced, w, gid);
+    }
 }
 
 // ── RAY-TRACED AMBIENT OCCLUSION (RTAO) — photo/export lane (DH-0528) ─────────
