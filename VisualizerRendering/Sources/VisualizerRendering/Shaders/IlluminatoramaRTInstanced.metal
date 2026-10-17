@@ -688,6 +688,55 @@ static inline float3 pathLampSum(float3 P, float3 N, uint layerBits, SecondarySh
     return s;
 }
 
+/// DH-1363 inc. 2a — the pick weight of light `k` at a vertex: its unshadowed Lambert luma, and at a GLOSSY
+/// vertex that luma × (0.1 + π·luma f(ω_k)) with f the vertex's lobe toward the light (a lamp as the sphere
+/// of its physical size, DH-1395). Before this a glossy vertex PICKED a lamp by its Lambert weight and PAID
+/// it by its lobe value, so the lamp sitting in the mirror direction of a polished counter was picked rarely
+/// and landed with a huge 1/p — the firefly the GI filter spreads into a pale disc (DH-1395: 4 discs on the
+/// living room, soft discs on the bedroom ceiling, with the roughness floor in). Weighting the pick by the
+/// lobe bounds c/p by Σ w: the estimate stays unbiased (every light with a Lambert weight keeps a weight ≥
+/// 0.1× it, so nothing the lobe could see is ever left out) and the heavy tail is gone at the source.
+/// DH-1363 inc. 2b — the vertex's lobe STACK for its NEE: `WdA` the diffuse share × albedo, `lobe` the specular
+/// lobe, `lobeC` the coat (scale 0 when there is none), `on` false ⇒ the plain Lambert vertex.
+struct PathStack { bool on; float3 WdA; PathGlossyLobe lobe; PathGlossyLobe lobeC; };
+
+/// The stack's BSDF toward a LAMP (as the sphere of its size, with the lamp roughness floor) over the Lambert
+/// term's own 1/π: `c_lambert × this` is the vertex's full NEE for that lamp.
+static inline float3 pathStackLamp(PathStack st, float3 wi, float rho, float minAlpha) {
+    float p0, p1;
+    return st.WdA + M_PI_F * (pathGlossyEvalSource(st.lobe, wi, rho, minAlpha, p0)
+                              + pathGlossyEvalSource(st.lobeC, wi, rho, minAlpha, p1));
+}
+/// The stack's BSDF toward a direction (an area emitter's point, a window, the sky) over 1/π, and its mixture
+/// density `pMix` for MIS: pD·cos/π + pS·pdf_spec + pC·pdf_coat with the continuation's pick probabilities.
+static inline float3 pathStackEval(PathStack st, float3 N, float3 wi, float3 pick, thread float& pMix) {
+    float ps, pc;
+    float3 fs = pathGlossyEval(st.lobe, wi, ps), fc = pathGlossyEval(st.lobeC, wi, pc);
+    pMix = pick.x * max(dot(N, wi), 0.0) * (1.0 / M_PI_F) + pick.y * ps + pick.z * pc;
+    return st.WdA + M_PI_F * (fs + fc);
+}
+
+static inline float pathPickWeight(uint k, bool lamps, float3 P, float3 N, uint layerBits,
+                                   SecondaryShadeParams p, SecondaryScene sec, float3 near,
+                                   bool spec, PathStack st, float lampSizeScale, float lampMinAlpha) {
+    float3 c = pathLocalContribution(k, lamps, P, N, layerBits, p, sec, near);
+    float w = pathLuma(c);
+    if (!spec || w <= 0.0) return w;
+    uint nP = lamps ? p.pointLightCount : 0u;
+    uint nS = lamps ? p.spotLightCount : 0u;
+    float3 target; float R = 0.0;
+    if (k < nP) { target = sec.pointLights[k].position; R = pathLampSize(sec.pointLights[k].softRadius, sec.pointLights[k].bulbRadius, sec.pointLights[k].openingRadius, near); }
+    else if (k < nP + nS) { target = sec.spotLights[k - nP].position; R = pathLampSize(sec.spotLights[k - nP].softRadius, sec.spotLights[k - nP].bulbRadius, sec.spotLights[k - nP].openingRadius, near); }
+    else { target = sec.areaLights[k - nP - nS].center; }
+    float3 toT = target - P;
+    float d2 = max(dot(toT, toT), 1e-8);
+    float3 wi = toT * rsqrt(d2);
+    float pMix;
+    float3 f = (k < nP + nS) ? pathStackLamp(st, wi, lampSizeScale * R * rsqrt(d2), lampMinAlpha)
+                             : pathStackEval(st, N, wi, float3(1.0, 0.0, 0.0), pMix);
+    return w * max(pathLuma(f), 0.05);
+}
+
 /// ONE light from the vertex's local emitters, picked ∝ its unshadowed contribution, with ONE
 /// visibility ray when the light casts a shadow: an unbiased estimate of Σ_i c_i·V_i. The weights
 /// are recomputed on the second pass rather than cached — an ALU-only pass over the room's lights
@@ -705,7 +754,7 @@ static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceler
                                            bool lamps, bool lampVisibility, uint areaCount,
                                            SecondaryShadeParams p, SecondaryScene sec,
                                            constant RTInstUniforms& u, uint sampleIndex, uint lightSalt,
-                                           uint2 gid, bool spec, PathGlossyLobe lobe)
+                                           uint2 gid, bool spec, PathStack st)
 {
     uint nP = lamps ? p.pointLightCount : 0u;
     uint nS = lamps ? p.spotLightCount : 0u;
@@ -718,8 +767,9 @@ static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceler
     // as the shadow ray itself.
     float wc[kPathLightCache];
     float W = 0.0;
+    float lampSizeScale = u.pathGlossyLampSize, lampMinAlpha = u.pathGlossyLampMinRoughness * u.pathGlossyLampMinRoughness;
     for (uint k = 0u; k < n; ++k) {
-        float wk = pathLuma(pathLocalContribution(k, lamps, P, N, layerBits, p, sec, near));
+        float wk = pathPickWeight(k, lamps, P, N, layerBits, p, sec, near, spec, st, lampSizeScale, lampMinAlpha);
         if (k < kPathLightCache) wc[k] = wk;
         W += wk;
     }
@@ -729,7 +779,7 @@ static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceler
     uint j = n; float wj = 0.0;
     for (uint k = 0u; k < n; ++k) {
         float wk = (k < kPathLightCache) ? wc[k]
-                                          : pathLuma(pathLocalContribution(k, lamps, P, N, layerBits, p, sec, near));
+                                          : pathPickWeight(k, lamps, P, N, layerBits, p, sec, near, spec, st, lampSizeScale, lampMinAlpha);
         acc += wk;
         if (wk > 0.0 && (pick < acc || k + 1u == n)) { j = k; wj = wk; break; }
     }
@@ -753,19 +803,21 @@ static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceler
         gap = 0.02;                                        // never the pane / lens itself
     }
     if (spec) {
-        // DH-1308 — the lobe's term for the picked light (see the header comment).
+        // DH-1363 inc. 2b — the whole STACK's term for the picked light: Lambert × Wd·A + π·(f_spec + f_coat),
+        // with the throughput that arrived at the vertex (the caller's), never a lobe pick's 1/p.
         float3 toT = target - P;
         float d2 = max(dot(toT, toT), 1e-8);
         float3 wi = toT * rsqrt(d2);
-        float pdfB;
         if (j < nP + nS) {
             // DH-1395 — a lamp is a SPHERE of its physical radius to a glossy lobe, not a point.
             float lampR = j < nP ? pathLampSize(sec.pointLights[j].softRadius, sec.pointLights[j].bulbRadius, sec.pointLights[j].openingRadius, near)
                                  : pathLampSize(sec.spotLights[j - nP].softRadius, sec.spotLights[j - nP].bulbRadius, sec.spotLights[j - nP].openingRadius, near);
-            float3 f = pathGlossyEvalSource(lobe, wi, u.pathGlossyLampSize * lampR * rsqrt(d2), u.pathGlossyLampMinRoughness * u.pathGlossyLampMinRoughness, pdfB);
-            c *= M_PI_F * f;
+            c *= pathStackLamp(st, wi, u.pathGlossyLampSize * lampR * rsqrt(d2), u.pathGlossyLampMinRoughness * u.pathGlossyLampMinRoughness);
         } else {
-            float3 f = pathGlossyEval(lobe, wi, pdfB);
+            // The diffuse share keeps the LTC form factor `c`; the glossy lobes take the point estimate at the
+            // point already drawn for the shadow ray.
+            float pMix;
+            float3 fS = pathStackEval(st, N, wi, float3(1.0, 0.0, 0.0), pMix) - st.WdA;   // π·(f_spec + f_coat)
             RTAreaLight al = sec.areaLights[j - nP - nS];
             float3 nL = cross(al.ex, al.ey);
             float area4 = 4.0 * length(nL);
@@ -774,8 +826,9 @@ static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceler
             float dc = length(al.center - P);
             float window = saturate(1.0 - pow(dc / max(al.radius, 1e-6), 4.0));
             window *= window;
-            c = (cosL > 0.0 && dc <= al.radius)
-                ? al.color * f * (window * saturate(dot(N, wi)) * cosL * area4 / d2) : float3(0.0);
+            float3 glossyPart = (cosL > 0.0 && dc <= al.radius)
+                ? al.color * fS * (1.0 / M_PI_F) * (window * saturate(dot(N, wi)) * cosL * area4 / d2) : float3(0.0);
+            c = c * st.WdA + glossyPart;
         }
         if (all(c <= 0.0)) return float3(0.0);
     }
@@ -801,7 +854,7 @@ static inline float3 pathSampleLocalLights(thread Isect& isect, instance_acceler
 /// DH-1308 — `pathLampSum` for a vertex that sampled a GGX lobe: each lamp's Lambert term (which
 /// carries `1/π`) × `π·f(ωi)` toward the lamp. Lamps are points here, so there is nothing to MIS.
 static inline float3 pathLampSumGlossy(float3 P, float3 N, uint layerBits, SecondaryShadeParams p,
-                                       SecondaryScene sec, float3 near, PathGlossyLobe lobe, float lampSizeScale, float lampMinAlpha) {
+                                       SecondaryScene sec, float3 near, PathStack st, float lampSizeScale, float lampMinAlpha) {
     float3 s = float3(0.0);
     uint n = p.pointLightCount + p.spotLightCount;
     for (uint k = 0u; k < n; ++k) {
@@ -815,8 +868,7 @@ static inline float3 pathLampSumGlossy(float3 P, float3 N, uint layerBits, Secon
                                          sec.spotLights[k - p.pointLightCount].openingRadius, near);
         float3 toL = pos - P;
         float dl = max(length(toL), 1e-4);
-        float pdfB;
-        s += c * M_PI_F * pathGlossyEvalSource(lobe, toL / dl, lampSizeScale * R / dl, lampMinAlpha, pdfB);
+        s += c * pathStackLamp(st, toL / dl, lampSizeScale * R / dl, lampMinAlpha);   // DH-1363 inc. 2b — the whole stack
     }
     return s;
 }
@@ -940,6 +992,13 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
     bool bruteV = false; float3 bruteWdA = float3(0.0);     // the brute-force instrument (8192)
     PathGlossyLobe lobe = pathGlossyLobe(N0, N0, float3(0.04), 1.0, float3(0.0), float4(1.0, 0.0, 1.0, 0.0));
     PathGlossyLobe lobeC = lobe;
+    // DH-1363 inc. 2b — the vertex's whole stack for its NEE (`st.on` at a vertex with material data), the
+    // continuation's lobe pick probabilities (diffuse, spec, coat) for the MIS mixture density, and `Tnee`: the
+    // throughput that ARRIVED at the vertex — the NEE's throughput, without the continuation's lobe weight.
+    PathStack st; st.on = false; st.WdA = float3(0.0); st.lobe = lobe; st.lobeC = lobe;
+    float3 pick = float3(1.0, 0.0, 0.0);
+    float3 Tnee = T;
+    float lampMinAlpha = u.pathGlossyLampMinRoughness * u.pathGlossyLampMinRoughness;
     // The sun as a light of finite size for the lobe's MIS: a cone of half-angle θ (the same cone the
     // NEE ray is drawn from, uniform in solid angle) of solid angle 4π·sin²(θ/2), chord 2·sin(θ/2).
     float sunHalf = sin(0.5 * u.sunSoftnessRad);
@@ -950,7 +1009,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         // INSTRUMENT: the primary's own local-light NEE and nothing else — the traced lamp
         // visibility, readable against the deferred pass's shadow-mapped lamps (DH-1011).
         return pathSampleLocalLights(isect, accel, P0, N0, P0 + N0 * tMin, layerBits, true, lampShadows,
-                                     0u, pVert, sec, u, sampleIndex, 0x4C495445u, gid, false, lobe);
+                                     0u, pVert, sec, u, sampleIndex, 0x4C495445u, gid, false, st);
     }
     for (uint v = 0u; v <= maxB; ++v) {
         uint dimSalt = 0x50415448u + v * kPathDimsPerVertex;   // 'PATH'
@@ -970,15 +1029,19 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 bool blocked = isect.intersect(sr, accel, u.transportRayMask).type != intersection_type::none;
                 isect.accept_any_intersection(false);
                 if (!blocked) {
-                    if (!specV) {
+                    if (!st.on) {
                         Lv += u.sunColor * nl * (1.0 / M_PI_F);
                     } else {
-                        // DH-1308 — the lobe's sun: E·f·cosθ, power-heuristic against the lobe's own
-                        // chance of finding the sun's cone (the continuation below adds the other half).
-                        float pdfB;
-                        float3 f = pathGlossyEval(lobe, sr.direction, pdfB);
-                        float rB = pdfB * sunOmega;                           // p_B / p_L
-                        Lv += u.sunColor * f * (saturate(dot(N, sr.direction)) / (1.0 + rB * rB));
+                        // DH-1363 inc. 2b — the whole stack's sun: the diffuse share at full weight (its
+                        // continuation never credits a sun hit), the glossy lobes toward the sun's DISC with
+                        // the lamp roughness floor, power-heuristic against the continuation's chance of finding
+                        // the cone (the mixture density, `sunHit` below is the other half).
+                        float ps, pc;
+                        float3 fS = pathGlossyEvalSource(st.lobe, sr.direction, 0.5 * u.sunSoftnessRad, lampMinAlpha, ps)
+                                  + pathGlossyEvalSource(st.lobeC, sr.direction, 0.5 * u.sunSoftnessRad, lampMinAlpha, pc);
+                        float rB = (pick.y * ps + pick.z * pc) * sunOmega;    // p_B / p_L
+                        float nlS = saturate(dot(N, sr.direction));
+                        Lv += u.sunColor * nlS * (st.WdA * (1.0 / M_PI_F) + fS / (1.0 + rB * rB));
                     }
                 }
             }
@@ -996,11 +1059,11 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
             } else {
                 // DH-1011 — the lamps stay the deterministic unshadowed sum unless they are to be
                 // shadowed; the emitters (and then the lamps) are ONE pick + ONE ray.
-                if (!lampShadows) Lv += specV ? pathLampSumGlossy(P, N, layerBits, pVert, sec, nearLevers, lobe, u.pathGlossyLampSize, u.pathGlossyLampMinRoughness * u.pathGlossyLampMinRoughness)
+                if (!lampShadows) Lv += st.on ? pathLampSumGlossy(P, N, layerBits, pVert, sec, nearLevers, st, u.pathGlossyLampSize, lampMinAlpha)
                                       : lampNear ? pathLampSum(P, N, layerBits, pVert, sec, nearLevers)
                                                  : secondaryLocalLightFill(P, N, layerBits, pVert, sec);
                 Lv += pathSampleLocalLights(isect, accel, P, N, Pofs, layerBits, lampShadows, true,
-                                            portalCount, pVert, sec, u, sampleIndex, lightSalt, gid, specV, lobe);
+                                            portalCount, pVert, sec, u, sampleIndex, lightSalt, gid, st.on, st);
             }
         }
 
@@ -1043,13 +1106,14 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                         // The aperture's OPACITY (1 − pane transmittance): 0 ⇒ an open hole.
                         float tPane = 1.0 - saturate(al.apertureOpacity);
                         float pdfW = dist * dist / (area4 * cosL);          // area → solid angle
-                        if (specV) {
-                            // DH-1308 — the lobe's view of the window: f(ωi)·cosθ, MIS'd against the
-                            // lobe's VNDF density (a near-mirror's continuation owns its reflection).
-                            float pdfB;
-                            float3 f = pathGlossyEval(lobe, d, pdfB);
-                            float rB = pdfB / max(pj * pdfW, 1e-30);           // p_B / p_L
-                            Lv += Lo * tPane * f * (cosR / ((1.0 + rB * rB) * pj * pdfW));
+                        if (st.on) {
+                            // DH-1363 inc. 2b — the whole stack's view of the window, MIS'd against the
+                            // continuation's MIXTURE density (the crossing below uses the same density).
+                            float pMix;
+                            float3 fT = pathStackEval(st, N, d, pick, pMix);      // π·f_total
+                            float pL = pj * pdfW;
+                            float misW = (pL * pL) / max(pL * pL + pMix * pMix, 1e-30);
+                            Lv += Lo * tPane * cosR * misW * fT / (M_PI_F * pL);
                         } else {
                         // DH-1011 — power-heuristic weight against the continuation's density.
                         float misW = 1.0;
@@ -1069,7 +1133,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
             }
         }
         if (bruteV) Lv = Lv * bruteWdA + LvBrute;   // instrument: sun/lamps the diffuse share only
-        L += T * Lv;
+        L += (st.on ? Tnee : T) * Lv;               // DH-1363 inc. 2b — the stack's NEE rides the arriving throughput
         if (v == maxB) break;
 
         // ── Continuation (cosine) ──
@@ -1093,6 +1157,11 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         float3 sunHit = float3(0.0);
         if (specV && sunOn && length(dir - Ld) <= sunChord && dot(N, Ld) > 0.0) {
             float rB = pdfSpec * sunOmega;                   // p_B / p_L
+            if (st.on) {                                     // DH-1363 inc. 2b — the mixture density, as the NEE's weight
+                float ps, pc;
+                pathGlossyEval(st.lobe, dir, ps); pathGlossyEval(st.lobeC, dir, pc);
+                rB = (pick.y * ps + pick.z * pc) * sunOmega;
+            }
             sunHit = (u.sunColor / sunOmega) * (rB * rB / (1.0 + rB * rB));
         }
         isect.accept_any_intersection(false);
@@ -1119,6 +1188,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 if (wSum > 0.0 && wk > 0.0 && cosL > 1e-4 && area4 > 0.0)
                     pL = (wk / wSum) * (tcMin * tcMin) / (area4 * cosL);
                 float pB = specV ? pdfSpec : max(dot(N, dir), 0.0) * (1.0 / M_PI_F);
+                if (st.on) { float pMix; pathStackEval(st, N, dir, pick, pMix); pB = pMix; }   // DH-1363 inc. 2b
                 float misW = (pB * pB) / max(pB * pB + pL * pL, 1e-30);
                 float tPane = 1.0 - saturate(al.apertureOpacity);
                 float3 Lo = pathOutdoorFromResult(isect, accel, res, Pofs, dir, u, pOut, sec,
@@ -1162,6 +1232,8 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         bool specNext = false, bruteNext = false;
         float3 bruteWdANext = float3(0.0);
         PathGlossyLobe nextLobe = lobe, nextLobeC = lobeC;
+        PathStack stNext; stNext.on = false; stNext.WdA = float3(0.0); stNext.lobe = lobe; stNext.lobeC = lobe;
+        float3 pickNext = float3(1.0, 0.0, 0.0);
         if (glossy) {
             Ahit = saturate(secondaryAlbedo(h, pFull, sec, albedoAtlas));
             float2 mr = secondaryMaterial(h.instanceID, sec.insts);
@@ -1188,6 +1260,12 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 if ((u.pathFlags & kPathFlagDebugGlossyDiffuseOnly) != 0u) { wS = 0.0; wC = 0.0; }
                 float wT = wD + wS + wC;
                 if (wT <= 0.0) break;                       // a black metal: nothing leaves this hit
+                // DH-1363 inc. 2b — the next vertex's NEE sees the whole stack; the pick below is the continuation's.
+                stNext.on = (u.pathFlags & kPathFlagDebugGlossyBrute) == 0u;
+                stNext.WdA = Wd * Ahit;
+                stNext.lobe = pathGlossyLobe(h.N, wo, F0, rB, float3(under), lutB);
+                stNext.lobeC = pathGlossyLobe(h.N, wo, float3(0.04), rC, float3(ccS), lutC);
+                pickNext = float3(wD, wS, wC) / wT;
                 float xi = illumiSobolOwen2DShuffled(sampleIndex, illumiPixelSeed(gid, 0x474C4F53u + v)).x * wT;   // 'GLOS'
                 if ((u.pathFlags & kPathFlagDebugGlossyBrute) != 0u) {
                     bruteNext = true;
@@ -1232,10 +1310,12 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
             rcT[rcN] = glossy ? T * lobeW : T; rcL[rcN] = L;
             ++rcN;
         }
+        Tnee = T;                                       // DH-1363 inc. 2b — what arrived at this vertex
         if (glossy) {
             T *= (specNext || bruteNext) ? lobeW : lobeW * Ahit;
             specV = specNext; lobe = nextLobe;
             bruteV = bruteNext; lobeC = nextLobeC; bruteWdA = bruteWdANext;
+            st = stNext; pick = pickNext;
         } else {
         float3 A = saturate(secondaryAlbedo(h, pFull, sec, albedoAtlas));
         T *= A;
@@ -1249,7 +1329,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
             float q = clamp(max(Tq.r, max(Tq.g, Tq.b)), 0.05, 0.95);
             float2 rr = illumiSobolOwen2DShuffled(sampleIndex, illumiPixelSeed(gid, dimSalt + 2u));
             if (rr.y >= q) break;
-            T /= q;
+            T /= q; Tnee /= q;
         }
     }
     // DH-1344 — write every recorded vertex's own suffix estimate (the radiance it sent back along the path).
