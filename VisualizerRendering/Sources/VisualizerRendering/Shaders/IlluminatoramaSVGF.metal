@@ -177,6 +177,13 @@ kernel void illumi_rt_gi_temporal(
             outGI.write(half4(half3(current), 1.0h), gid);
             return;
         }
+        // Daydream DH-1388 — bit 2: no GI mean here; the colour resolve's frozen-camera average is the
+        // one mean, so this frame's own irradiance goes to the cascade (see `rtGIStillPerFrame`).
+        if ((u.staticAccumulation & 4u) != 0u) {
+            sampleCount.write(half4(1.0h), gid);
+            outGI.write(half4(half3(current), 1.0h), gid);
+            return;
+        }
         // The first-frame branch above stores 0 while the history already holds that frame, so
         // a stored count below 1 still means one sample.
         float Ns = min(max(N, 1.0) + 1.0, 2048.0);

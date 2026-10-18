@@ -1282,6 +1282,15 @@ public final class IlluminatoramaRenderer {
     /// noisy frame. The host must reset (`resetTemporalHistory`, or toggle `rtGITemporalEnabled`)
     /// when the picture changes. Default `false`: byte-identical for every other host.
     public var rtGIStaticAccumulation: Bool = false
+    /// Daydream DH-1388 / DH-1386 — with `rtGIStaticAccumulation`, do NOT keep the GI's own running mean:
+    /// hand every frame's own (albedo-demodulated) sample to the à-trous cascade and let the colour
+    /// resolve's frozen-camera average be the ONE mean. Otherwise the composite of frame k carries
+    /// F(G_k), G_k = mean(g_1..g_k), and the colour average of those composites weights GI sample i by
+    /// (H_K − H_{i−1})/K (harmonic) — ~K/2 effective GI samples in a K-frame still instead of K. The
+    /// cascade is linear in its input (still lanes have no luminance edge-stop), so filter-then-average
+    /// equals average-then-filter; only the weights change. Needs `taaStillAccumulation` to be the
+    /// averager. Default `false`: byte-identical for every host.
+    public var rtGIStillPerFrame: Bool = false
     /// Restart the RT GI accumulation on the next frame (its history reprojects against nothing),
     /// WITHOUT `resetTemporalHistory`'s exposure re-seed. For a host whose still discards warm-up
     /// frames: in `rtGIStaticAccumulation` mode nothing forgets them otherwise (DH-0887).
@@ -14136,7 +14145,8 @@ public final class IlluminatoramaRenderer {
             isFirstFrame: rtGINeedsFirstFrame ? 1 : 0,
             blend: max(0.01, min(1.0, rtGITemporalBlend)),
             gammaClamp: max(1.0, rtGITemporalClamp),
-            staticAccumulation: (rtGIStaticAccumulation ? 1 : 0) | (giIrradianceMode ? 2 : 0))
+            staticAccumulation: (rtGIStaticAccumulation ? 1 : 0) | (giIrradianceMode ? 2 : 0)
+                | (rtGIStaticAccumulation && rtGIStillPerFrame && taaStillAccumulation ? 4 : 0))
         guard let enc = timedComputeEncoder(cb, "rt.giTemporal") else { return }
         enc.label = "Illuminatorama.rt.giTemporal"
         enc.setComputePipelineState(rtGITemporalPipeline)
