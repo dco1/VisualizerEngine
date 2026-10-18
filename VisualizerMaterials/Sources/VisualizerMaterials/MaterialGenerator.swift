@@ -95,7 +95,7 @@ public enum MaterialGenerator {
         /// The cement binder — a warm near-white (sRGB ≈ #f2efe9). The old 0.66 grey binder is
         /// half the reason the material read as "confetti on concrete": a poured terrazzo matrix
         /// is a pale cement, and the chips read as chips because they sit DARKER than it.
-        public static let classicMatrix = Vec3(0.86, 0.84, 0.80)
+        public static let classicMatrix = Vec3(0.76, 0.74, 0.70)
 
         /// Curated starting points (Roominate-style named looks) — pick one, then tweak.
         public static let presets: [(name: String, params: TerrazzoParams)] = [
@@ -572,7 +572,9 @@ public enum MaterialGenerator {
     //                          not-mirror sheen.
     //   • `ceramicRoughness` — base glaze roughness. Low = glossy. Lower toward ~0.06 for
     //                          a wetter mirror; raise toward ~0.20 for a soft matte glaze.
-    public static let ceramicAlbedo    = Vec3(0.905, 0.910, 0.915)
+    // DH-1397: was (0.905, 0.910, 0.915) — brighter than any real glaze (white porcelain/sanitaryware
+    // reads 0.80-0.88 linear, nothing diffuse >0.9).
+    public static let ceramicAlbedo    = Vec3(0.855, 0.860, 0.865)
     public static let ceramicClearcoat = 0.60
     public static let ceramicRoughness = 0.11
 
@@ -1125,7 +1127,7 @@ public enum MaterialGenerator {
                 let cell = Noise.voronoiTiled(u + Self.grainPhase, v + Self.grainPhase,
                                               cells: 26, jitter: 1.0, seed: seed)  // fine angular grains
                 var grain = palette[Int(cell.cellId % UInt64(palette.count))]
-                grain *= 0.90 + 0.18 * Noise.unit(Noise.mix(cell.cellId))                // per-grain value
+                grain *= 0.82 * (0.90 + 0.18 * Noise.unit(Noise.mix(cell.cellId)))        // per-grain value; 0.82 = DH-1397 (polished granite 0.1-0.5, was 0.56)
                 let macro = 0.95 + 0.10 * Noise.fbmTiled(u, v, baseCells: 2, octaves: 3, seed: seed ^ 0x2D)
                 ch.albedo[ch.idx(x, y)] = clampBand(grain * macro)
 
@@ -1587,8 +1589,9 @@ public enum MaterialGenerator {
                 // Base albedo: light gray with substantial weathering range to pass macroCV.
                 // clean ≈ 0.72, stained ≈ 0.50 → ~30% patches give sufficient luma swing.
                 let stainFrac = clamp01((weather - 0.2) * 0.7)  // stronger stain coverage
-                let cleanLum  = clamp01(0.72 + 0.04 * broom)
-                let stainLum  = clamp01(0.48 + 0.06 * weather)
+                // DH-1397: weathered pavement concrete reads 0.30-0.55 (was clean 0.72 / stained 0.48 ⇒ mean 0.70).
+                let cleanLum  = clamp01(0.52 + 0.04 * broom)
+                let stainLum  = clamp01(0.34 + 0.05 * weather)
                 let lum = cleanLum + (stainLum - cleanLum) * stainFrac
                 // Staining gives slight greenish cast.
                 ch.albedo[ch.idx(x, y)] = Vec3(clamp01(lum - 0.010 * stainFrac),
@@ -2217,7 +2220,7 @@ public enum MaterialGenerator {
         public static let groundTiling = SurfaceTiling(2.0, isAdjustable: false)
 
         public init(bodyColor: Vec3 = Vec3(0.58, 0.35, 0.24),
-                    mortarColor: Vec3 = Vec3(0.72, 0.70, 0.66),
+                    mortarColor: Vec3 = Vec3(0.52, 0.50, 0.47),
                     // 0.25 m × 0.125 m — a standard brick, and the same 8-across grid the old
                     // `unitWidth: 0.125` UV fraction produced at the ground's 2 m period.
                     unitSizeMeters: Double = 0.25,
@@ -2971,7 +2974,7 @@ public enum MaterialGenerator {
     /// sun-facing seat — not a dark gridded screen), and the weave never beats into moiré on
     /// grazing panels. Every band is a smooth band-limited sinusoid (TAA-stable).
     public static func linen(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 107,
-                             base: Vec3 = Vec3(0.90, 0.86, 0.78)) -> MaterialChannels {
+                             base: Vec3 = Vec3(0.76, 0.72, 0.65)) -> MaterialChannels {
         var ch = MaterialChannels(size: size, category: .fabric)
         let sh = seed
         let tau = 2.0 * Double.pi
@@ -3051,7 +3054,8 @@ public enum MaterialGenerator {
     /// The colourway a bare `matteBlack()` bakes — the near-neutral powder-coat black, luma 0.10
     /// with the historical faint-warm tint (×0.98 green, ×0.96 blue). Declared once so the
     /// registry's `matte-black` default and the generator's default `color:` cannot drift apart.
-    public static let matteBlackDefaultColor = Vec3(0.10, 0.098, 0.096)
+    // DH-1397: was luma 0.10; black powder coat / black paint measures 0.03-0.06.
+    public static let matteBlackDefaultColor = Vec3(0.062, 0.060, 0.058)
 
     /// Matte black — powder-coat / anodized finish. Deep absorptive, micro-textured.
     ///
@@ -3112,7 +3116,8 @@ public enum MaterialGenerator {
     public static func chrome(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 121) -> MaterialChannels {
         var ch = MaterialChannels(size: size, category: .metal)
         let sh = seed
-        let base = Vec3(0.90, 0.89, 0.88)
+        // DH-1397: F0 of chromium (n≈3.2, k≈3.3) is 0.55-0.66; the old 0.90 was aluminium/silver.
+        let base = Vec3(0.67, 0.66, 0.65)
         for y in 0..<size {
             for x in 0..<size {
                 let u = (Double(x) + 0.5) / Double(size)
