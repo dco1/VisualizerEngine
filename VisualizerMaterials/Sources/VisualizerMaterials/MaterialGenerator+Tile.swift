@@ -172,6 +172,41 @@ public enum SurfaceFinish: String, Equatable, Hashable, Sendable, Codable, CaseI
     }
 }
 
+/// **Where a unit pattern's per-unit tone spread is carried: the bake, or the shader's per-unit hash.**
+///
+/// The bake repeats every `TileLayout.runMeters` (~1.2 m); the engine's `patternCells` hash
+/// (`floor(uv * cells)`) is unique per physical unit over the whole surface. A tone spread carried
+/// ONLY by the bake therefore stamps the same pattern of light and dark units every metre and a bit
+/// (DH-1409: self-correlation 0.77 at one period on a 4 m mosaic wall). Carrying most of it in the
+/// hash leaves the same total spread but a different draw per period.
+///
+/// The total half-range stays `toneVariation / 2` (variances add), split so the bake holds only
+/// `bakedShare` of the variance, which is also the expected correlation one period over.
+public struct TileToneSplit: Equatable, Sendable {
+    /// Share of the tone VARIANCE left in the bake == the expected correlation at one period.
+    public static let bakedShare = 0.2
+    /// Above this the per-cell hash reads as patchwork (`PatternCellsTests` holds the same line).
+    public static let maxJitter = 0.08
+    /// The floor the engine has always applied to a unit grid: batch-to-batch variation.
+    public static let minJitter = 0.04
+
+    /// The `toneVariation` the baked tile should use.
+    public let bakedToneVariation: Double
+    /// The `MaterialChannels.patternJitter` to ship.
+    public let patternJitter: Double
+
+    public init(toneVariation tv: Double, perUnitHash: Bool) {
+        guard perUnitHash else {
+            bakedToneVariation = tv; patternJitter = Self.minJitter; return
+        }
+        let j = 0.5 * tv * (1 - Self.bakedShare).squareRoot()
+        patternJitter = Swift.min(Self.maxJitter, Swift.max(Self.minJitter, j))
+        // Whatever the cap clipped is given back to the bake so the total spread is honoured.
+        let bakedVar = Swift.max(0, tv * tv - 4 * patternJitter * patternJitter)
+        bakedToneVariation = Swift.max(tv * Self.bakedShare.squareRoot(), bakedVar.squareRoot())
+    }
+}
+
 /// **The joint/unit spine shared by tile, pavers, brick and plank.** Every one of those is
 /// the same object: rectangular UNITS of a real-world size, laid in a BOND, separated by a
 /// JOINT of some colour and width, with per-unit tone variation. `TileParams` and
@@ -538,7 +573,16 @@ public extension MaterialGenerator {
         ch.patternCells = p.run == .vertical
             ? Vec2(Double(rows), bonded ? 0 : Double(cols))
             : Vec2(bonded ? 0 : Double(cols), Double(rows))
-        ch.patternJitter = 0.04
+        // DH-1409 — where the per-unit tone lives. A tone baked into the tile repeats at the tile's
+        // pitch (~1.2 m): measured on the 4000 Sunset bath, the same 24 x 24 pattern of unit tones
+        // correlates 0.77 with itself one period over, which is the "visible repetition" in the
+        // mosaic wall. The shader's `patternCells` hash is unique per PHYSICAL unit across the whole
+        // surface, so it carries most of the spread (`TileToneSplit`) and the bake only a minority.
+        // Bonded layouts keep the bake in full: their u axis ships no cells (see above), so a split
+        // there would trade tone for nothing.
+        let split = TileToneSplit(toneVariation: p.toneVariation, perUnitHash: !bonded)
+        let bakedToneVariation = split.bakedToneVariation
+        ch.patternJitter = split.patternJitter
 
         // Joint half-widths per axis. `jointFraction` is a fraction of the LONG edge; the v
         // axis is measured in short-edge units, so its half-width scales by the aspect — that
@@ -599,7 +643,7 @@ public extension MaterialGenerator {
 
                 // Per-unit discrete tone — the thing that stops a grid reading as clones.
                 let th = Noise.hash2(tiW, tjW, p.seed)
-                let tone = 1 + (Noise.unit(th) - 0.5) * p.toneVariation
+                let tone = 1 + (Noise.unit(th) - 0.5) * bakedToneVariation
                 let warp = Noise.fbmTiled(u, v, baseCells: Swift.max(cols, 2) * 3, octaves: 3,
                                           seed: p.seed ^ 0x11)
                 let macro = 0.97 + 0.06 * Noise.fbmTiled(u, v, baseCells: 2, octaves: 3,

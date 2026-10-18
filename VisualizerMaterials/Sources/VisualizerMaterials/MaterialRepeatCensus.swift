@@ -115,6 +115,70 @@ public struct MaterialRepeatCensus: Equatable, Sendable {
             perRepeatToneVariation: perRepeat, periodRepeatResidual: residual)
     }
 
+    // MARK: - period self-correlation (DH-1409)
+
+    /// **How strongly a unit grid's pattern of tones repeats one period over**, as a Pearson
+    /// correlation of the per-unit tone with itself shifted by one bake (`cols` units). The surface
+    /// is modelled exactly as the render builds it: the baked tone of unit `(i mod cols, j mod rows)`
+    /// times the shader's `patternCellHash` multiplier of the physical unit `(I, J)`.
+    /// 1 = the same stamp every period (the defect), ~0 = every period is a fresh draw.
+    /// `bake` must be a unit-grid bake (`MaterialGenerator.tile`) of `cols x rows` units.
+    public static func unitTonePeriodCorrelation(_ bake: MaterialChannels, cols: Int, rows: Int,
+                                                 periods: Int = 4) -> Double {
+        let n = bake.size
+        var tone = [Double](repeating: 1, count: cols * rows)
+        var mean = 0.0
+        for j in 0..<rows { for i in 0..<cols {
+            let x = Int((Double(i) + 0.5) / Double(cols) * Double(n))
+            let y = Int((Double(j) + 0.5) / Double(rows) * Double(n))
+            tone[j * cols + i] = TextureAudit.luma(bake.albedo[bake.idx(x, y)])
+            mean += tone[j * cols + i]
+        } }
+        mean /= Double(cols * rows)
+        guard mean > 1e-9 else { return 0 }
+        for k in tone.indices { tone[k] /= mean }
+        let w = cols * Swift.max(2, periods), h = rows * 2
+        let hashed = bake.patternJitter > 0 && bake.patternCells.x >= 1
+        func surface(_ i: Int, _ j: Int) -> Double {
+            let m = hashed
+                ? 1 + bake.patternJitter * patternCellHash(Double(i) / Double(cols) * bake.patternCells.x,
+                                                           Double(j) / Double(rows) * bake.patternCells.y)
+                : 1
+            return tone[(j % rows) * cols + i % cols] * m
+        }
+        var a = [Double](), b = [Double]()
+        for j in 0..<h { for i in 0..<(w - cols) { a.append(surface(i, j)); b.append(surface(i + cols, j)) } }
+        let ma = a.reduce(0, +) / Double(a.count), mb = b.reduce(0, +) / Double(b.count)
+        var sab = 0.0, saa = 0.0, sbb = 0.0
+        for k in a.indices { let da = a[k] - ma, db = b[k] - mb; sab += da * db; saa += da * da; sbb += db * db }
+        return saa > 1e-12 && sbb > 1e-12 ? sab / (saa * sbb).squareRoot() : 0
+    }
+
+    /// **Stochastic materials: correlation of the rendered surface with itself one tile over**, with
+    /// the hex de-repeat blended in at `antiTilingStrength` the way the frame does (the product
+    /// ships 0.85, `HouseRenderBridge.antiTilingStrength`). 1 = a visible clone every tile.
+    public static func stochasticPeriodCorrelation(_ bake: MaterialChannels, antiTilingStrength: Double,
+                                                   tiles: Int = 4, pixelsPerTile: Int = 32) -> Double {
+        let res = pixelsPerTile, n = tiles * res
+        let mean = bake.albedoMean
+        let st = Swift.min(1, Swift.max(0, antiTilingStrength))
+        var f = [Double](repeating: 0, count: n * n)
+        for y in 0..<n { for x in 0..<n {
+            let u = Double(x) / Double(res), v = Double(y) / Double(res)
+            let c = bake.sampleAlbedo(u, v) * (1 - st) + bake.sampleAlbedoHex(u, v, mean: mean) * st
+            f[y * n + x] = TextureAudit.luma(c)
+        } }
+        var a = [Double](), b = [Double]()
+        for y in 0..<n { for x in 0..<(n - res) { a.append(f[y * n + x]); b.append(f[y * n + x + res]) } }
+        let ma = a.reduce(0, +) / Double(a.count), mb = b.reduce(0, +) / Double(b.count)
+        var sab = 0.0, saa = 0.0, sbb = 0.0
+        for k in a.indices { let da = a[k] - ma, db = b[k] - mb; sab += da * db; saa += da * da; sbb += db * db }
+        return saa > 1e-12 && sbb > 1e-12 ? sab / (saa * sbb).squareRoot() : 0
+    }
+
+    /// A unit grid whose tones correlate above this with themselves one period over reads as a stamp.
+    public static let maxPeriodCorrelation = 0.35
+
     /// The tone multiplier the shader applies to the U-cell that starts copy `copy`.
     /// `m = 1 + jitter · patternCellHash(floor(copy · cells.x), 0)`.
     static func toneMultiplier(copy: Int, cells: Vec2, jitter: Double) -> Double {
