@@ -1275,7 +1275,12 @@ public struct IlluminatoramaInstance {
     /// default, and an exact no-op for every host that never sets it; 1 = a pinnate, looping fig.
     /// Was `_padGrain1`: same 4 bytes, the stride is unchanged. Mirrors `Instance.leafVenation`.
     public var leafVenation: Int32 = 0
-    public var _padGrain2: Int32 = 0
+    /// **DH-1275 — surface wear**: amplitude of a fine, world-space scuff/streak field drawn per
+    /// pixel in the G-buffer (thin streaks a few mm across, cm long; faded out analytically when
+    /// the pixel footprint can no longer resolve them, so it never aliases and never becomes a
+    /// blotch). It darkens albedo a few % and roughens along the streak. 0 (default) ⇒ exact
+    /// no-op. Was `_padGrain2` — same 4 bytes, stride unchanged. Mirrors `Instance.surfaceWear`.
+    public var surfaceWear: Float = 0
 
     // ── Animated UV DOMAIN WARP (per instance) ────────────────────────────────
     // NEW 16-byte cluster (offsets 336-351): stride 336 → 352. (Landed at 288 on a

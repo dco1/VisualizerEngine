@@ -902,7 +902,9 @@ struct Instance {
     // fig (`leafVeinMask`). Was `_padGrain1`: same 4 bytes, so the stride is unchanged.
     // Mirrors `IlluminatoramaInstance.leafVenation`.
     int      leafVenation;
-    int      _padGrain2;
+    // DH-1275 — surface wear dial (was `_padGrain2`; same 4 bytes, stride unchanged). 0 = exact no-op.
+    // Mirrors `IlluminatoramaInstance.surfaceWear`. Read only by the G-buffer fragment.
+    float    surfaceWear;
 
     // ── Animated UV DOMAIN WARP (see `warpUV` in IlluminatoramaGBuffer.metal) ──
     // NEW 16-byte cluster (offsets 336-351): stride 336 -> 352.
@@ -961,7 +963,7 @@ inline Instance illumiDefaultInstance() {
     d.woodKnots = float4(0.0f);      d.macroTone = 1.0f;             d.macroRoughnessDelta = 0.0f;
     d.uvPhase = float2(0.0f);        d.sheenRoughness = 0.30f;       d.carpetMacro = float2(0.0f);
     d.grainTangentTextureSlice = -1; d.thinTransmission = 0.0f;
-    d.leafVenation = 0;              d._padGrain2 = 0;
+    d.leafVenation = 0;              d.surfaceWear = 0.0f;
     d.uvWarp = float4(0.0f);         d.hueCycle = float4(0.0f);      d.tagGlow = float4(0.0f);
     return d;
 }

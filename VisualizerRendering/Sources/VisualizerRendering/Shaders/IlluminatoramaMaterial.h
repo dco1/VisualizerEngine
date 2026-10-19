@@ -152,6 +152,23 @@ static inline float patternCellHash(float2 cell) {
 }
 
 
+// DH-1275 — value noise in [0,1] for the surface-wear streaks (consumed in IlluminatoramaGBuffer.metal;
+// contract on `Instance.surfaceWear`). Integer-lattice hash at the four corners, smooth-interpolated.
+static inline float wearLatticeHash(int2 c) {
+    uint h = uint(c.x) * 73856093u ^ uint(c.y) * 19349663u;
+    h ^= h >> 13; h *= 0x45d9f3bu; h ^= h >> 16;
+    return float(h & 0xFFFFu) / 65535.0f;
+}
+static inline float wearValueNoise(float2 p) {
+    float2 i = floor(p), f = p - i;
+    f = f * f * (3.0f - 2.0f * f);
+    int2 c = int2(i);
+    float a = wearLatticeHash(c),               b = wearLatticeHash(c + int2(1, 0));
+    float d = wearLatticeHash(c + int2(0, 1)),  e = wearLatticeHash(c + int2(1, 1));
+    return mix(mix(a, b, f.x), mix(d, e, f.x), f.y);
+}
+
+
 // ── Wood knots, in WORLD SPACE (not baked into the tile) ─────────────────────────────────
 //
 // **Why this cannot be a texture.** A knot is a sparse LANDMARK, and a landmark baked into a

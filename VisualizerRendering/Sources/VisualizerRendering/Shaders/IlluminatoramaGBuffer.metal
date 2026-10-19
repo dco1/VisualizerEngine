@@ -739,6 +739,31 @@ fragment GBufferOut illumi_fs(
     // slightly more/less worn surface per object. 0 by default ⇒ an exact no-op.
     roughness = saturate(roughness + inst.macroRoughnessDelta);
 
+    // ── DH-1275 — surface wear: world-space scuffs, HIGH FREQUENCY ONLY ────────────────────────
+    // Danny has rejected decimetre tone blotching twice (it reads as grime, not material; DH-1204
+    // I3), so this is thin streaks ~4 mm across and a few cm long, drawn in WORLD space (no tile
+    // period to grid at) and band-limited by the pixel's own footprint: once a pixel spans more
+    // than the streak width the term fades to ZERO (never to a mean), so it cannot alias into
+    // moiré or low-frequency mottle at any distance. Walls and risers streak vertically (furniture
+    // and shoulders), tops streak along x (things dragged across them); a second, shorter set at
+    // another angle breaks the parallel look.
+    if (inst.surfaceWear > 0.0f) {
+        float fw = length(fwidth(in.worldPos));                 // metres per pixel
+        float fade = 1.0f - smoothstep(0.0012f, 0.0035f, fw);
+        if (fade > 0.0f) {
+            float3 wp = in.worldPos;
+            float2 a, b;
+            if (fabs(n.y) > 0.7f) { a = float2(wp.z / 0.004f, wp.x / 0.05f);  b = float2(wp.x / 0.003f, wp.z / 0.02f); }
+            else { float h = dot(wp.xz, normalize(float2(-n.z, n.x) + 1e-5f));
+                   a = float2(h / 0.004f, wp.y / 0.06f);  b = float2(wp.y / 0.003f, h / 0.025f); }
+            float s1 = smoothstep(0.74f, 0.95f, wearValueNoise(a));
+            float s2 = smoothstep(0.80f, 0.96f, wearValueNoise(b + 17.3f));
+            float scuff = saturate(s1 + 0.7f * s2) * fade * saturate(inst.surfaceWear);
+            albedo *= 1.0f - 0.11f * scuff;
+            roughness = saturate(roughness + 0.18f * scuff);
+        }
+    }
+
     // ── World-space wood knots: the branch, drawn on top of the wood it grew through ──────
     // Placed after roughness so both channels are in hand, and expressed as a modification of
     // the SAMPLED wood rather than as a colour of its own — which is what lets one shader term
