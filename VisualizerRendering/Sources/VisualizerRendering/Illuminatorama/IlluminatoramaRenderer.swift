@@ -1139,6 +1139,11 @@ public final class IlluminatoramaRenderer {
     /// Test-only: offsets the progressive sequence's streams so two otherwise identical settles
     /// sample independently (production sampling is deterministic). 0 = production.
     public var aoAccumulationScramble: UInt32 = 0
+    /// Daydream DH-1410 — with `aoAccumulationEnabled` AND `taaStillAccumulation` (the averager), do not keep
+    /// the AO's own running mean: each frame's occlusion is filtered (at the converged ½ strength) and handed
+    /// to the lighting, and the colour resolve's frozen-camera average is the one mean — the AO twin of
+    /// `rtGIStillPerFrame`. Default `false`: byte-identical for every host.
+    public var aoStillPerFrame: Bool = false
     /// Frames in the current accumulated AO mean (0 = none; the per-frame path is in use).
     public var aoAccumulatedFrames: Int { aoAccumulator?.frames ?? 0 }
     /// Restart the accumulated AO mean — for a host that changed the scene without moving the
@@ -13533,7 +13538,8 @@ public final class IlluminatoramaRenderer {
                                  depth: depthTexture, rawAO: aoTexture, tlas: tlas,
                                  key: key, shapeChanged: instanceShapeStableFrames == 0,
                                  rays: rays, intensity: intensity,
-                                 uniforms: u, invProjection: fu.invProjection)
+                                 uniforms: u, invProjection: fu.invProjection,
+                                 perFrame: aoStillPerFrame && taaStillAccumulation)
         guard encoded else { return false }
         rtaoDidRunLastFrame = true
         aoAccumulatorOwnsAO = true

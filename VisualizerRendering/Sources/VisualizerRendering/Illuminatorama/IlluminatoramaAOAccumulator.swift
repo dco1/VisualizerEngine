@@ -143,7 +143,8 @@ final class IlluminatoramaAOAccumulator {
                 rays: Int,
                 intensity: Float,
                 uniforms: RTAOv2Uniforms,
-                invProjection: simd_float4x4) -> Bool {
+                invProjection: simd_float4x4,
+                perFrame: Bool = false) -> Bool {
         guard let rtao = rtaoPipeline, let accumulate = accumulatePipeline,
               let denoise = denoisePipeline,
               ensureTextures(device: device, width: newKey.halfWidth, height: newKey.halfHeight),
@@ -167,7 +168,11 @@ final class IlluminatoramaAOAccumulator {
             dispatch(enc, rtao, newKey.halfWidth, newKey.halfHeight)
             enc.endEncoding()
         }
-        var a = AccumulateUniforms(weight: Float(rayCount) / Float(samples + rayCount))
+        // `perFrame` (Daydream DH-1410): no AO running mean — each frame's own occlusion (weight 1 ⇒ restart)
+        // is filtered and handed to the lighting, so the colour resolve's frozen-camera average is the ONE
+        // mean (otherwise it re-averages the AO's mean-of-k, weighting AO sample i harmonically). The
+        // progressive sample index still advances, so the frames' rays stay one stratified sequence.
+        var a = AccumulateUniforms(weight: perFrame ? 1 : Float(rayCount) / Float(samples + rayCount))
         if let enc = encoder("ao.accum") {
             enc.label = "Illuminatorama.ao.accum"
             enc.setComputePipelineState(accumulate)
@@ -180,7 +185,7 @@ final class IlluminatoramaAOAccumulator {
         frames += 1
         samples += rayCount
         var d = DenoiseUniforms(invProjection: invProjection,
-                                strength: Self.denoiseStrength(frames: frames),
+                                strength: perFrame ? Self.denoiseStrength(frames: Int.max / 2) : Self.denoiseStrength(frames: frames),
                                 fullWidth: UInt32(depth.width), fullHeight: UInt32(depth.height),
                                 intensity: max(0, min(1, intensity)))
         if let enc = encoder("ao.denoise") {
