@@ -368,15 +368,29 @@ static inline float carpetMacroNoise(float2 p) {
     float d = carpetMacroHash(cx + 1, cy + 1);
     return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);      // [0,1]
 }
-static inline float sampleCarpetMacro(float2 uv, float2 macro) {
-    if (macro.x <= 0.0f || macro.y <= 0.0f) { return 1.0f; }
+/// The signed pile-lay value in [-1, 1] at `uv` — the ONE field both the tone swell
+/// (`sampleCarpetMacro`) and the sheen swell (`carpetLaySheenScale`) read, so a patch where the pile
+/// leans toward the viewer is lighter AND glossier together, as a real broadloom is. 0 when `macro`
+/// is the default (no carpet).
+static inline float carpetLayValue(float2 uv, float2 macro) {
+    if (macro.x <= 0.0f || macro.y <= 0.0f) { return 0.0f; }
     // Elongate the field along the lay direction so the tone varies as broad STREAKS (the pile
     // laid one way), not isotropic blobs. Two octaves so the banding is organic, not a sine grid.
     float2 p = uv * macro.x;
     p.x *= 0.35f;
     float n = carpetMacroNoise(p) * 0.65f + carpetMacroNoise(p * 2.3f + 7.1f) * 0.35f;
-    float sgn = n * 2.0f - 1.0f;                          // [-1,1]
-    return 1.0f + sgn * macro.y;
+    return n * 2.0f - 1.0f;                               // [-1,1]
+}
+static inline float sampleCarpetMacro(float2 uv, float2 macro) {
+    if (macro.x <= 0.0f || macro.y <= 0.0f) { return 1.0f; }
+    return 1.0f + carpetLayValue(uv, macro) * macro.y;
+}
+/// Multiplier on the cloth-sheen STRENGTH from the pile lay. Deep cut pile (macro.y ≈ 0.14) swings
+/// the sheen ±70 %, a loop ±50 %, a flatweave ±20 % — proportional to how much standing pile there
+/// is to lay. Exactly 1.0 for every non-carpet instance.
+static inline float carpetLaySheenScale(float2 uv, float2 macro) {
+    if (macro.x <= 0.0f || macro.y <= 0.0f) { return 1.0f; }
+    return 1.0f + carpetLayValue(uv, macro) * min(macro.y * 5.0f, 0.7f);
 }
 
 // `strength` gates the whole effect. When strength <= 0 (the DEFAULT for every

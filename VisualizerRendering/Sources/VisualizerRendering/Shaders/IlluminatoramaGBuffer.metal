@@ -1454,8 +1454,11 @@ fragment GBufferOut illumi_fs(
     // DH-0081 — the sheen value folds the roughness BAND into its integer part and the STRENGTH
     // into its fraction: `-(band + strength)`. Band 0 (default 0.30 nap) makes this `-strength`,
     // byte-for-byte the pre-band encoding, so every non-opting material is unchanged.
+    // A carpet's sheen swells with the pile lay (same field as the tone swell above): the nap that
+    // leans toward the eye is lighter and glossier, the nap that leans away is darker and flatter.
+    float sheenStrength = inst.sheen * carpetLaySheenScale(in.uv, inst.carpetMacro);
     float sheenAlpha = (inst.sheen > 0.0f)
-        ? float(clothSheenBandForRoughness(inst.sheenRoughness)) + min(inst.sheen, 0.98f)
+        ? float(clothSheenBandForRoughness(inst.sheenRoughness)) + min(sheenStrength, 0.98f)
         : 0.0f;
     o.emission        = half4(half3(emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -sheenAlpha));
     if (kExtendedGBuffer) {
