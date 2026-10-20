@@ -1805,3 +1805,56 @@ extension IlluminatoramaRenderer {
         s.colorLUT = lut
     }
 }
+
+// MARK: - Frame / init steps extracted from the main file
+
+extension IlluminatoramaRenderer {
+    /// Install the completion handler (present-sync, GPU meter, pass timer, adaptive latency guard, awaited-frame signal) and commit. `addCompletedHandler` is only legal before `commit()`.
+    func commitFrame(_ cb: MTLCommandBuffer, writeIdx: Int, awaited: Bool) {
+        let completedIdx = writeIdx
+        let completedGeneration = pfx.presentSync.currentGeneration
+        let raceSlot = Self.raceProbeEnabled ? lts.frameRingIndex : -1
+        let sync = pfx.presentSync
+        let sem = gbs.inFlightSemaphore
+        let meter = gbs.gpuMeter
+        let pt = gbs.passTimer!
+        let errPath = Self.frameEnv("VIZ_ILLUMI_CBERROR_PATH")
+        // The awaited-frame signal, if `renderAwaited()` armed one. It must be created and
+        // installed HERE — `addCompletedHandler` is only legal before `commit()`, so a caller
+        // cannot decide to wait asynchronously after the fact.
+        let completion: FrameCompletionSignal? = awaited ? FrameCompletionSignal() : nil
+        gbs.pendingFrameCompletion = completion
+        cb.addCompletedHandler { buf in
+            meter.record(buf)
+            let gpuMs = (buf.gpuEndTime - buf.gpuStartTime) * 1000.0
+            pt.resolve(frameGpuMs: gpuMs)
+            // Diagnostic (sandbox eats os_log): on a GPU fault, write the error +
+            // status to a sidecar file so the headless harness can read WHY the
+            // frame faulted (vs the swallowed magenta). No-op without the env var.
+            if buf.status == .error || buf.error != nil, let p = errPath {
+                let nsErr = buf.error as NSError?
+                let line = "frame status=\(buf.status.rawValue) domain=\(nsErr?.domain ?? "?") code=\(nsErr?.code ?? 0) \(nsErr?.localizedDescription ?? "")\n"
+                if let data = line.data(using: .utf8) {
+                    if let h = FileHandle(forWritingAtPath: p) {
+                        h.seekToEndOfFile(); h.write(data); try? h.close()
+                    } else { try? data.write(to: URL(fileURLWithPath: p)) }
+                }
+            }
+            sync.markCompleted(completedIdx, generation: completedGeneration)
+            if raceSlot >= 0 { sync.raceProbeCompleteFrame(slot: raceSlot) }
+            // Adaptive latency guard (replaces a plain `sem.signal()`): update the
+            // GPU-time EMA and release THIS frame's permit — UNLESS frames are heavy
+            // enough that a 2nd pipelined frame only adds ~one frame of input latency
+            // without raising throughput (GPU frame >> tick). In that case HOLD the
+            // permit, shrinking the effective in-flight depth from 2 to 1 so heavy RT
+            // scenes stay responsive. Converges back to 2 when frames get light again.
+            sync.frameCompletedAdaptive(gpuMs: gpuMs, semaphore: sem)
+            // LAST, and after `markCompleted` above: an awaiter resumes into
+            // `promoteCompletedBuffer()`, which can only find this frame once `writeIdx` is
+            // published. Same ordering `waitUntilCompleted()` gives the blocking path.
+            completion?.signal()
+        }
+        gbs.lastCommittedFrameCB = cb
+        cb.commit()
+    }
+}
