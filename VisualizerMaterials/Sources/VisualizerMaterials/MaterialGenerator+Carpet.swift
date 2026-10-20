@@ -68,8 +68,8 @@ extension MaterialGenerator {
                                       // nap swells lighter/darker as it turns. Deep cut pile shows
                                       // it most; a flatweave has almost no standing pile to lay.
         switch pile {
-        case .cutPile:   gauge = 120; crownPower = 0.55; gloss = 0.50; napJitter = 0.22; reliefStrength = 0.85; macroStrength = 0.14
-        case .loop:      gauge = 150; crownPower = 0.85; gloss = 0.62; napJitter = 0.16; reliefStrength = 0.70; macroStrength = 0.10
+        case .cutPile:   gauge = 120; crownPower = 0.55; gloss = 0.50; napJitter = 0.22; reliefStrength = 0.85; macroStrength = 0.28
+        case .loop:      gauge = 150; crownPower = 0.85; gloss = 0.62; napJitter = 0.16; reliefStrength = 0.70; macroStrength = 0.20
         case .flatweave: gauge = 180; crownPower = 1.10; gloss = 0.30; napJitter = 0.10; reliefStrength = 0.55; macroStrength = 0.04
         }
 
@@ -161,9 +161,10 @@ extension MaterialGenerator {
         // the in-tile `drift` above repeats every tile and dissolves under the hex de-repeat, so at
         // room distance the rug is one even tone. This declares a low-frequency value field the
         // renderer draws on the rug's UNWRAPPED uv (`sampleCarpetMacro`), which never repeats at the
-        // tile period — the same shape of change as the wood-knot path. ~0.85 m bands read as the
-        // broad "shading" a real broadloom shows even brand-new.
-        ch.carpetMacro = CarpetMacroField(bandMeters: 0.85, strength: macroStrength)
+        // tile period — the same shape of change as the wood-knot path. ~0.7 m bands read as the
+        // broad "shading" a real broadloom shows even brand-new. Strong lay (Danny, 2026-10-20: "strong pile
+        // lay"): cut pile swings ±28 %, a loop ±20 %; the sheen swell scales with it (`carpetLaySheenScale`).
+        ch.carpetMacro = CarpetMacroField(bandMeters: 0.70, strength: macroStrength)
         return ch
     }
 }
