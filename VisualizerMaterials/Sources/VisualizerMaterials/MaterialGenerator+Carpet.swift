@@ -118,7 +118,15 @@ extension MaterialGenerator {
                 let tid = Double(tuft.cellId & 0xFFFF) / 65535.0
                 // Per-yarn colour jitter: ±6% value, plus a faint hue wander so a wool pile
                 // reads as many dyed strands, not one flat fill.
-                let yarn = 0.90 + 0.16 * tid
+                let yarn = 0.88 + 0.24 * tid
+                // Pile BRUSH marks: clumps of tufts that lean the same way, ~6 cm long along the nap
+                // and ~1.2 cm across. This is the band a plastic carpet is missing — the tuft field
+                // (2.5 mm) averages away at room distance and the 15 cm drift is too soft to read as
+                // fibre, so the floor came out one smooth tone ("plastic rather than natural
+                // fibres", Danny 2026-10-20). Elongated ALONG the nap (K << L in `fbmTiled`'s
+                // convention), band-limited to 1-6 cm: fibre-scale structure, not a blotch.
+                let lay = Noise.fbmTiled(u, v * 5, baseCells: 5, octaves: 2, seed: sh ^ 0x51)
+                let layTone = 1.0 + 0.34 * (lay - 0.5)
                 let hue = Vec3(1.0 + (tid - 0.5) * 0.06,
                                1.0 + (Double((tuft.cellId >> 16) & 0xFF) / 255.0 - 0.5) * 0.05,
                                1.0 + (Double((tuft.cellId >> 24) & 0xFF) / 255.0 - 0.5) * 0.06)
@@ -134,12 +142,12 @@ extension MaterialGenerator {
                     + 0.08 * (Noise.fbmTiled(u, v, baseCells: 6, octaves: 2, seed: sh ^ 0x99) - 0.5)
                 // Pile self-shadow: darker in the gap, where light doesn't reach the backing.
                 let shade = 0.62 + 0.38 * (crown * 0.6 + gap * 0.4)
-                let a = base * yarn * drift * shade
+                let a = base * yarn * drift * shade * layTone
                 ch.albedo[ch.idx(x, y)] = clampBand(Vec3(a.x * hue.x, a.y * hue.y, a.z * hue.z))
                 // Matte, high, broken tuft-by-tuft. Crowns are slightly less rough (the fibre
                 // tips catch a soft specular); gaps are rougher, matte shadow.
                 ch.roughness[ch.idx(x, y)] = clamp01(0.90 - crown * 0.10
-                    + (tid - 0.5) * 0.08
+                    + (tid - 0.5) * 0.08 - (lay - 0.5) * 0.10
                     + (Noise.fbmTiled(u * 3, v * 3, baseCells: 2, octaves: 2, seed: sh ^ 0x3D) - 0.5) * 0.10)
             }
         }
