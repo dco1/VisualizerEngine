@@ -939,16 +939,16 @@ public final class IlluminatoramaRenderer {
     public private(set) var aovAccumulatedFrames: Int = 0
     /// Restart the AOV running mean on the next captured frame.
     public func resetAOVAccumulation() { aovResetPending = true }
-    private var aovTexture: MTLTexture?
+    var aovTexture: MTLTexture?
     private var aovResetPending = true
-    private var aovActiveThisFrame = false
-    private var aovFrameBlend: Float = 1
+    var aovActiveThisFrame = false
+    var aovFrameBlend: Float = 1
     private var rtTLASAOVPipeline: MTLComputePipelineState?
     private var rtTLASAOVCurvePipeline: MTLComputePipelineState?
     /// Mirror of `AOVUniforms` in IlluminatoramaAOV.h (16 B).
-    private struct AOVUniforms { var blend: Float; var handoff: UInt32; var pad0: UInt32 = 0; var pad1: UInt32 = 0 }
+    struct AOVUniforms { var blend: Float; var handoff: UInt32; var pad0: UInt32 = 0; var pad1: UInt32 = 0 }
     /// Function-constant indices: `kLightingAOVEnabled` (illumi_lighting) / `kRTAOVEnabled` (TLAS kernel).
-    private static let lightingAOVFunctionConstantIndex = 8
+    static let lightingAOVFunctionConstantIndex = 8
     private static let rtAOVFunctionConstantIndex = 31
 
     /// Decide this frame's capture BEFORE the lighting pass: allocate the means at the internal size,
@@ -3293,7 +3293,7 @@ public final class IlluminatoramaRenderer {
     private let gpuMeter = IlluminatoramaGPUMeter()
     // #60 task 4 / #6 — per-compute-pass GPU timer (env-gated). Assigned in init
     // once `device` exists. Off by default; no-ops without VIZ_ILLUMI_PASS_PROFILE.
-    private let passTimer: IlluminatoramaPassTimer
+    let passTimer: IlluminatoramaPassTimer
     /// #60 task 4 — occupancy-tuning override for the RT lighting pass's
     /// threadgroup total thread count (`VIZ_ILLUMI_RT_TG`, e.g. 64/128/256). nil =
     /// the full threadgroup (default). Reproducible tuning hook for the
@@ -3655,12 +3655,12 @@ public final class IlluminatoramaRenderer {
     }()
     private var causticFrameSeed: UInt32 = 0
 
-    private var gbufferAlbedoMet: MTLTexture
+    var gbufferAlbedoMet: MTLTexture
     var gbufferNormalRgh: MTLTexture
-    private var gbufferEmission: MTLTexture
+    var gbufferEmission: MTLTexture
     /// DH-0140 — the photo-lane sixth G-buffer target (`GBufferOut.material`, RGBA16F). nil until
     /// `extendedGBufferEnabled` first asks for it; dropped by `resize`.
-    private var gbufferMaterial: MTLTexture?
+    var gbufferMaterial: MTLTexture?
     var depthTexture: MTLTexture
     /// Last frame's G-buffer depth, blit-copied from `depthTexture` at the end of
     /// each frame and read by the TAA resolve for disocclusion rejection (so a
@@ -3670,7 +3670,7 @@ public final class IlluminatoramaRenderer {
     /// one queue execute in order, so it is ordered against the next frame's G-buffer
     /// regardless of the in-flight pool depth.
     private var previousDepthTexture: MTLTexture
-    private var hdrTexture: MTLTexture
+    var hdrTexture: MTLTexture
     // Phase 2 — half-res visibility map from SSAO, fed to the lighting pass.
     var aoTexture: MTLTexture
     // RT diffuse (soft shadow + 1-bounce GI) buffer — written by the RT pass,
@@ -3684,7 +3684,7 @@ public final class IlluminatoramaRenderer {
     private var specIBLTexture: MTLTexture?
     /// 1×1 stand-in bound to both kernels whenever the hand-off is off — the lighting kernel
     /// skips its write when the target is not full-size, the RT kernel skips its read on the flag.
-    private lazy var specIBLDummyTexture: MTLTexture? = {
+    lazy var specIBLDummyTexture: MTLTexture? = {
         let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1, height: 1,
                                                          mipmapped: false)
         d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private
@@ -3693,10 +3693,10 @@ public final class IlluminatoramaRenderer {
     }()
     /// Whether THIS frame's lighting pass wrote `specIBLTexture` — the RT kernel's read is
     /// gated on it, so a frame that skipped the write can never subtract a stale sky.
-    private var specIBLWrittenThisFrame = false
+    var specIBLWrittenThisFrame = false
 
     /// The full-size hand-off target when RT reflections will composite this frame, else nil.
-    private func specIBLHandoffTarget() -> MTLTexture? {
+    func specIBLHandoffTarget() -> MTLTexture? {
         // A debug-term frame isolates one term; the kernel skips the write then, so no target.
         guard rtReflectionsEnabled, rtEnabled, rtTLASSupported, debugTerm == .normal else { return nil }
         let w = hdrTexture.width, h = hdrTexture.height
@@ -3711,7 +3711,7 @@ public final class IlluminatoramaRenderer {
     /// The deferred composite's diffuse SKY share, handed to the traced GI pass (see
     /// `rtGIReplacesDiffuseSky`). Lazily allocated at the HDR size, dropped on resize.
     private var diffSkyTexture: MTLTexture?
-    private lazy var diffSkyDummyTexture: MTLTexture? = {
+    lazy var diffSkyDummyTexture: MTLTexture? = {
         let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1, height: 1,
                                                          mipmapped: false)
         d.usage = [.shaderRead, .shaderWrite]; d.storageMode = .private
@@ -3720,7 +3720,7 @@ public final class IlluminatoramaRenderer {
     }()
     /// Whether THIS frame's lighting pass wrote `diffSkyTexture` — the traced pass only
     /// subtracts a share that was written this frame.
-    private var diffSkyWrittenThisFrame = false
+    var diffSkyWrittenThisFrame = false
     /// Whether the traced GI will replace a deferred diffuse share this frame (the sky, or with
     /// `rtPathTracedGI` the whole diffuse indirect). The frame uniforms read it to set
     /// `kFrameFlagPathOwnsIndirect`; `diffSkyHandoffTarget` allocates on it.
@@ -3729,7 +3729,7 @@ public final class IlluminatoramaRenderer {
             && rtEnabled && rtTLASSupported && debugTerm == .normal
     }
     /// The full-size hand-off target when the traced GI will replace the diffuse sky this frame.
-    private func diffSkyHandoffTarget() -> MTLTexture? {
+    func diffSkyHandoffTarget() -> MTLTexture? {
         guard diffSkyHandoffActive else { return nil }
         let w = hdrTexture.width, h = hdrTexture.height
         if let t = diffSkyTexture, t.width == w, t.height == h { return t }
@@ -3770,8 +3770,8 @@ public final class IlluminatoramaRenderer {
 
     // Phase 3 — sky-probe IBL. The irradiance + prefiltered cubes are baked
     // from `equirectSky` each frame (or whenever the sky texture changes).
-    private let irradianceCube: MTLTexture
-    private let prefilteredCube: MTLTexture
+    let irradianceCube: MTLTexture
+    let prefilteredCube: MTLTexture
     private let prefilteredMipViews: [MTLTexture]
     /// 1×1 RGBA16F texture used in place of `equirectSky` when the host
     /// hasn't supplied one. Means the bake kernels and lighting pass can
@@ -3782,7 +3782,7 @@ public final class IlluminatoramaRenderer {
     // scene-independent so it never rebakes. Texture is bound at slot 10 of
     // the lighting kernel; the `dfgLUTEnabled` knob above gates sampling so
     // we can A/B against the Lagarde fallback without recompiling.
-    private let dfgLUT: MTLTexture
+    let dfgLUT: MTLTexture
     // Issue #65 — 3D colour-grading LUT slot. A `type3D` cube sampled in the
     // tonemap pass AFTER all other post (display-space grade). Baked to identity
     // on init so the default is an EXACT no-op; a scene replaces it via
@@ -3854,8 +3854,8 @@ public final class IlluminatoramaRenderer {
     // baked once on init. `ltcValidated` is true only when the bake matched
     // brute-force ground truth; the lighting kernel falls back to MRP otherwise.
     // Bound at slots 16/17 of the lighting kernel.
-    private let ltcMatTexture: MTLTexture
-    private let ltcMagTexture: MTLTexture
+    let ltcMatTexture: MTLTexture
+    let ltcMagTexture: MTLTexture
     private let ltcValidated: Bool
 
     // Phase 4.0 — diffuse-albedo texture atlas, bound at G-buffer fragment
@@ -3942,7 +3942,7 @@ public final class IlluminatoramaRenderer {
     // resolved current frame into the other.
     var velocityTexture: MTLTexture
     /// Light-layer G-buffer target (R32Uint) — see `Targets.layer`.
-    private var gbufferLayer: MTLTexture
+    var gbufferLayer: MTLTexture
     private var historyA: MTLTexture
     private var historyB: MTLTexture
     /// The TAA resolve's downstream output (see `Targets.taaResolved`).
@@ -4037,7 +4037,7 @@ public final class IlluminatoramaRenderer {
     // Uniform buffer for DDGI — allocated once, written each frame.
     let ddgiUniformBuffer: MTLBuffer
     // 1×1 rg16Float placeholder bound to the depth atlas slot when DDGI is off.
-    private let ddgiDummyDepthAtlas: MTLTexture
+    let ddgiDummyDepthAtlas: MTLTexture
 
     // ── Phase 4.39: denoiser textures ────────────────────────────────
     // AO spatiotemporal: raw AO → spatial filter → temporal → lighting.
@@ -4051,8 +4051,8 @@ public final class IlluminatoramaRenderer {
     private var irrCacheA: MTLTexture
     private var irrCacheB: MTLTexture
     private var irrCacheToggle: Bool = false
-    private var irrCacheCurrent: MTLTexture { irrCacheToggle ? irrCacheB : irrCacheA }
-    private var irrCachePrevious: MTLTexture { irrCacheToggle ? irrCacheA : irrCacheB }
+    var irrCacheCurrent: MTLTexture { irrCacheToggle ? irrCacheB : irrCacheA }
+    var irrCachePrevious: MTLTexture { irrCacheToggle ? irrCacheA : irrCacheB }
     /// When true, the lighting kernel blends the fresh DDGI probe lookup with
     /// the previous-frame per-pixel cache (EMA), cutting the 8-probe trilinear
     /// blend to 1 texture read in steady state. Only effective when DDGI is on.
@@ -4112,7 +4112,7 @@ public final class IlluminatoramaRenderer {
     // the separable blur ping-pongs sssDiffuse → sssBlurTmp (H) → sssBlurOut (V);
     // the composite reads sssDiffuse (sharp) + sssBlurOut (blurred). Idle unless a
     // scene sets `sssStrength > 0` (the blur/composite passes aren't even encoded).
-    private var sssDiffuseTexture: MTLTexture
+    var sssDiffuseTexture: MTLTexture
     private var sssBlurTmpTexture: MTLTexture
     private var sssBlurOutTexture: MTLTexture
 
@@ -4255,7 +4255,7 @@ public final class IlluminatoramaRenderer {
     // ── Phase 4.39: denoiser source selectors ────────────────────────
     // These let the lighting and composite passes bind the right texture
     // depending on whether the per-signal denoiser is on.
-    private var aoSourceTexture: MTLTexture {
+    var aoSourceTexture: MTLTexture {
         // SSAO skipped this frame ⇒ read the neutral 1.0 source, never a stale
         // history. Falls back to the normal path if the neutral texture could
         // not be allocated (correctness over the saving — `encodeSSAOPass` runs
@@ -4290,7 +4290,7 @@ public final class IlluminatoramaRenderer {
     private var gbufferPipelineInteriorExt: MTLRenderPipelineState?
     let shadowPipeline: MTLRenderPipelineState
     let depthState: MTLDepthStencilState
-    private let lightingPipeline: MTLComputePipelineState
+    let lightingPipeline: MTLComputePipelineState
     let ssaoPipeline: MTLComputePipelineState
     private let ssrGatherPipeline: MTLComputePipelineState   // was ssrPipeline; now writes ssrRaw
     private let irradianceBakePipeline: MTLComputePipelineState
@@ -5477,7 +5477,7 @@ public final class IlluminatoramaRenderer {
     }
 
     // ── Depth-of-field state ─────────────────────────────────────────
-    private struct DOFParams {
+    struct DOFParams {
         var invProjection: simd_float4x4
         var focusDist: Float; var cocCoefficient: Float; var maxRadius: Float
         var blades: Float; var bladeRotation: Float; var catsEye: Float
@@ -5506,7 +5506,7 @@ public final class IlluminatoramaRenderer {
     }
     /// Tile size for the max-CoC reduction. Must match nothing in the shader but the
     /// value passed in `DOFParams.tileSize` — the kernel reads it from there.
-    private static let dofTileSize = 16
+    static let dofTileSize = 16
     private let dofPipeline: MTLComputePipelineState?
     private let dofTilePipeline: MTLComputePipelineState?
     private let dofDilatePipeline: MTLComputePipelineState?
@@ -5522,8 +5522,8 @@ public final class IlluminatoramaRenderer {
     private let dofQuarterPipeline: MTLComputePipelineState?
     /// `lightingDefocusShadingMinCoC`: the least-|CoC|-per-tile reduction the lighting pass gates on,
     /// and its target (r32Float, one texel per 16×16 tile; allocated on first use).
-    private let dofShadingTilesPipeline: MTLComputePipelineState?
-    private var lightingRateTileTexture: MTLTexture?
+    let dofShadingTilesPipeline: MTLComputePipelineState?
+    var lightingRateTileTexture: MTLTexture?
     private var dofHalfTexture: MTLTexture?
     /// `dofQuarterResMinCoC`'s target (a quarter of the internal size; allocated on first use).
     private var dofQuarterTexture: MTLTexture?
@@ -5705,20 +5705,20 @@ public final class IlluminatoramaRenderer {
     // LDR present pool uses (`acquireWriteTarget`). Each property below resolves
     // to the current ring slot so the bind sites are unchanged.
     private var pointLightRing: [MTLBuffer]
-    private var pointLightBuffer: MTLBuffer { pointLightRing[frameRingIndex] }
+    var pointLightBuffer: MTLBuffer { pointLightRing[frameRingIndex] }
     private var pointLightCapacity: Int
     private var spotLightRing: [MTLBuffer]
-    private var spotLightBuffer: MTLBuffer { spotLightRing[frameRingIndex] }
+    var spotLightBuffer: MTLBuffer { spotLightRing[frameRingIndex] }
     /// Daydream DH-0540 — the host's spot-profile table: `spotLightProfileRowCount` rows of
     /// `illuminatoramaSpotProfileSampleCount` floats each, a luminaire's measured distribution over 0..90° off
     /// axis, which a spot names with `profileIndex`. Allocated as a NEW buffer on every `setSpotLightProfiles`
     /// (never mutated in place — an in-flight frame may still read the old one); a 1-float placeholder when the
     /// host never calls it, so every kernel can bind it unconditionally.
-    private var spotProfileBuffer: MTLBuffer
+    var spotProfileBuffer: MTLBuffer
     public private(set) var spotLightProfileRowCount: Int = 0
     private var spotLightCapacity: Int
     private var areaLightRing: [MTLBuffer]
-    private var areaLightBuffer: MTLBuffer { areaLightRing[frameRingIndex] }
+    var areaLightBuffer: MTLBuffer { areaLightRing[frameRingIndex] }
     /// DH-0718 — how many area lights a secondary hit reads this frame (0 ⇒ none bound).
     /// Gated by the local-lights switch too: that is the ablation lever every secondary
     /// light term already answers to.
@@ -5727,10 +5727,10 @@ public final class IlluminatoramaRenderer {
     }
     private var areaLightCapacity: Int
     private var extraDirectionalRing: [MTLBuffer]
-    private var extraDirectionalBuffer: MTLBuffer { extraDirectionalRing[frameRingIndex] }
+    var extraDirectionalBuffer: MTLBuffer { extraDirectionalRing[frameRingIndex] }
 
     private var interiorApertureRing: [MTLBuffer]
-    private var interiorApertureBuffer: MTLBuffer { interiorApertureRing[frameRingIndex] }
+    var interiorApertureBuffer: MTLBuffer { interiorApertureRing[frameRingIndex] }
     private var interiorApertureCapacity: Int = 0
     private var extraDirectionalCapacity: Int
     private var frameUniformRing: [MTLBuffer]
@@ -12351,329 +12351,15 @@ public final class IlluminatoramaRenderer {
         enc.endEncoding()
     }
 
-    // MARK: - Lighting kernel specialization (WWDC23 #10127)
-
-    /// Builds the `(variantKey, constants)` pair for `illumi_lighting`'s
-    /// function-constant specialization from the host feature flags. The booleans
-    /// bind at indices 0–5 matching the `kLighting*` declarations in
-    /// Illuminatorama.metal; the key is the 6-bit string that disambiguates the
-    /// variant in the pipeline cache. These MUST agree with the `frame.*Enabled`
-    /// uniforms written in `updateFrameUniforms` — both derive from the same Bools.
-    static func lightingFeatureConstants(ibl: Bool, shadow: Bool, dfg: Bool,
-                                         ddgi: Bool, ddgiIrrCache: Bool,
-                                         rtSunShadow: Bool = false,
-                                         aov: Bool = false)
-        -> (key: String, constants: MTLFunctionConstantValues) {
-        // The irradiance cache is only meaningful while DDGI is on — mirror the
-        // exact derivation in updateFrameUniforms (`ddgiIrrCacheEnabled && ddgiEnabled`).
-        let irrCache = ddgiIrrCache && ddgi
-        // index 5 — S4.1 ray-traced soft sun shadows. The caller passes the fully
-        // derived bit (`rtSunShadowLightingActive`), never the raw flag: the RT
-        // variant's TLAS argument only exists when this is true, so selecting it
-        // without a live TLAS would be an unbindable pipeline.
-        var flags = [ibl, shadow, dfg, ddgi, irrCache, rtSunShadow]
-        let cv = MTLFunctionConstantValues()
-        flags.withUnsafeMutableBufferPointer { buf in
-            for i in 0..<buf.count {
-                cv.setConstantValue(buf.baseAddress! + i, type: .bool, index: i)
-            }
-        }
-        var key = flags.map { $0 ? "1" : "0" }.joined()
-        // Daydream DH-1304 — the AOV capture variant (index 8): set only while capturing, so every
-        // other key (and every other host) keeps the constant undefined.
-        if aov {
-            var on = true
-            cv.setConstantValue(&on, type: .bool, index: lightingAOVFunctionConstantIndex)
-            key += "-aov"
-        }
-        return (key, cv)
-    }
-
     // One-entry memo of the last resolved lighting variant, so the steady-state
     // path (flags unchanged frame-to-frame, the overwhelmingly common case) is a
     // single UInt8 compare with zero allocation — no MTLFunctionConstantValues or
     // key string built. 0xFF is an impossible 6-bit value, so the first call misses.
-    private var lastLightingFlags: UInt8 = 0xFF
-    private var lastLightingPipeline: MTLComputePipelineState?
+    var lastLightingFlags: UInt8 = 0xFF
+    var lastLightingPipeline: MTLComputePipelineState?
 
-    /// The fully derived S4.1 pipeline bit: soft sun shadows requested AND a TLAS
-    /// is genuinely live to trace. `rtTLASActive` is set by `updateRTAccel`, which
-    /// runs AFTER the lighting pass in the frame graph — so the kernel traces the
-    /// PREVIOUS frame's TLAS, and on the very first frame (or any frame the RT
-    /// hang-guard trips) this is false and lighting falls back to the shadow-map
-    /// variant instead of selecting a pipeline whose accel argument cannot bind.
-    private var rtSunShadowLightingActive: Bool {
-        rtSunSoftShadowsEnabled && rtTLASActive && rtTLAS != nil
-    }
-
-    /// The specialized `illumi_lighting` pipeline for the current feature flags.
-    /// The shared cache compiles each flag combination once and returns the
-    /// memoised state thereafter; this method additionally short-circuits the
-    /// common no-change frame before touching the cache.
-    ///
-    /// WWDC23 #10127 lever 2 (async compilation): when a flag toggle first needs
-    /// a not-yet-compiled variant, we compile it in the BACKGROUND (no frame
-    /// hitch) and run the init-time uber-variant (`lightingPipeline`) meanwhile —
-    /// it renders identical pixels, just without that combination's dead-code
-    /// elimination. The fallback is deliberately NOT memoised, so once the
-    /// background compile lands the next frame picks up the specialized variant.
-    private func currentLightingPipeline() -> MTLComputePipelineState {
-        let irrCache = ddgiIrrCacheEnabled && ddgiEnabled
-        let rtSun = rtSunShadowLightingActive
-        let aov = aovActiveThisFrame
-        let bits: UInt8 = (iblEnabled     ? 1  : 0)
-                        | (shadowsEnabled ? 2  : 0)
-                        | (dfgLUTEnabled  ? 4  : 0)
-                        | (ddgiEnabled    ? 8  : 0)
-                        | (irrCache       ? 16 : 0)
-                        | (rtSun          ? 32 : 0)
-                        | (aov            ? 64 : 0)
-        if bits == lastLightingFlags, let p = lastLightingPipeline { return p }
-
-        let (key, cv) = Self.lightingFeatureConstants(
-            ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
-            ddgi: ddgiEnabled, ddgiIrrCache: ddgiIrrCacheEnabled,
-            rtSunShadow: rtSun, aov: aov)
-        // Headless/settled lane (no runloop to land the async completion — a
-        // @MainActor render loop starves the MainActor hop): compile the variant
-        // BLOCKING so the frame actually runs the specialized path instead of the
-        // init-time uber fallback. DH-0552.
-        // DH-1304 — a capture frame compiles BLOCKING too: the uber fallback writes no AOVs.
-        if blockingLightingCompile || aov {
-            if let built = engine.pipelineCache.pipelineState(
-                name: "illumi_lighting", device: device, constants: cv, variantKey: key) {
-                lastLightingFlags = bits
-                lastLightingPipeline = built
-                return built
-            }
-            return lightingPipeline
-        }
-        // Non-blocking: ready variant → memoise + use it; still compiling → run
-        // the uber-variant this frame and re-check next frame (no memo).
-        if let ready = engine.pipelineCache.pipelineStateAsync(
-            name: "illumi_lighting", device: device, constants: cv, variantKey: key) {
-            lastLightingFlags = bits
-            lastLightingPipeline = ready
-            return ready
-        }
-        // S4.1 — the RT-sun variant compiles BLOCKING instead of falling back. The
-        // bit is only ever set in a settled/photo lane (no vsync budget), and the
-        // fallback there is not benign: the still's accumulator would blend
-        // shadow-map frames into the RT penumbra while the background compile
-        // lands. The variant is deliberately NOT in the init pre-warm either —
-        // every Visualizer host would pay its compile for a feature none of them
-        // set. (Not memoised on failure; a nil build falls through to the uber
-        // variant exactly as before.)
-        if rtSun, let built = engine.pipelineCache.pipelineState(
-            name: "illumi_lighting", device: device, constants: cv, variantKey: key) {
-            lastLightingFlags = bits
-            lastLightingPipeline = built
-            return built
-        }
-        return lightingPipeline
-    }
-
-    /// Compute encoder that records this pass's GPU time when the pass timer is
-    /// enabled (env-gated; #60 task 4 / #6), else a plain encoder. The `label`
-    /// keys the per-pass breakdown.
-    func timedComputeEncoder(_ cb: MTLCommandBuffer, _ label: String) -> MTLComputeCommandEncoder? {
-        if let pd = passTimer.descriptor(label: label) {
-            return cb.makeComputeCommandEncoder(descriptor: pd)
-        }
-        return cb.makeComputeCommandEncoder()
-    }
-
-    /// Raster counterpart of `timedComputeEncoder` — brackets the render pass with
-    /// the same GPU timestamp pair so the G-buffer / shadow / glass / tonemap
-    /// passes appear in the per-pass breakdown instead of vanishing into an
-    /// untimed remainder. No-op (plain encoder) when the pass timer is off.
-    func timedRenderEncoder(_ cb: MTLCommandBuffer,
-                                    _ pass: MTLRenderPassDescriptor,
-                                    _ label: String) -> MTLRenderCommandEncoder? {
-        cb.makeRenderCommandEncoder(descriptor: passTimer.attach(to: pass, label: label))
-    }
-
-    private func encodeLightingPass(_ cb: MTLCommandBuffer) {
-        // Defocus shading rate (opt-in): the tile map first, then the coarse + skip variants below.
-        let rate = lightingShadingRateRequested ? encodeLightingRateTiles(cb) : nil
-        guard let enc = timedComputeEncoder(cb, "lighting") else { return }
-        enc.label = "Illuminatorama.lighting"
-        let pipe = currentLightingPipeline()
-        enc.setComputePipelineState(pipe)
-        enc.setTexture(gbufferAlbedoMet, index: 0)
-        enc.setTexture(gbufferNormalRgh, index: 1)
-        enc.setTexture(gbufferEmission, index: 2)
-        enc.setTexture(depthTexture, index: 3)
-        enc.setTexture(hdrTexture, index: 4)
-        enc.setTexture(aoSourceTexture, index: 5)  // denoised AO (or raw when off)
-        enc.setTexture(equirectSky ?? dummySkyTexture, index: 6)
-        enc.setTexture(irradianceCube, index: 7)
-        enc.setTexture(prefilteredCube, index: 8)
-        enc.setTexture(shadowMap, index: 9)
-        enc.setTexture(dfgLUT, index: 10)
-        // Phase 3.1 — DDGI atlas slots (always bind; enabled flag gates sampling).
-        // Phase 3.3 — read the ping-pong `Current` atlases, which hold the
-        // freshest writes from `encodeDDGIFrame` above. `Previous` is what
-        // the trace kernel sampled for the second bounce.
-        enc.setTexture(ddgiIrradianceCurrent ?? dummySkyTexture, index: 11)
-        enc.setTexture(ddgiDepthCurrent ?? ddgiDummyDepthAtlas, index: 12)
-        // Phase 4.10 — per-spot shadow atlas. Always bound (the kernel
-        // gates per-spot on `spotShadowSliceIndex >= 0`, which is set by
-        // `updateSpotShadows` only when `spotShadowsEnabled` is on AND
-        // the spot is within atlas capacity).
-        enc.setTexture(spotShadowAtlas, index: 13)
-        // Point-light cube depth atlas (6 slices/light). When the feature is off
-        // its `pointShadowAtlas` is nil → bind the always-allocated spot atlas as a
-        // same-type (depth2d_array) placeholder; the kernel never samples it because
-        // every point light's `shadowCubeIndex` is -1. When on, real cube depth.
-        enc.setTexture(pointShadowAtlas ?? spotShadowAtlas, index: 19)
-        // Phase 3.4 — irradiance EMA cache. Previous = read, current = write.
-        // When cache is disabled the kernel still writes current (fresh lookup),
-        // so the toggle and bind are always active regardless of the flag.
-        enc.setTexture(irrCachePrevious, index: 14)
-        enc.setTexture(irrCacheCurrent,  index: 15)
-        enc.setTexture(ltcMatTexture, index: 16)
-        enc.setTexture(ltcMagTexture, index: 17)
-        // Light-layer G-buffer target — per-fragment layer bitfield the kernel
-        // masks each light against. When no scene sets layers this reads all-bits
-        // everywhere, so every light passes the mask (no behaviour change).
-        enc.setTexture(gbufferLayer, index: 18)
-        // Issue #65 — SSS diffuse side buffer. Always bound (the kernel only writes
-        // it when frame.sssStrength > 0, so non-SSS scenes leave it idle).
-        // (index 20: 18/19 went to gLayer/pointShadowAtlas in the merge.)
-        enc.setTexture(sssDiffuseTexture, index: 20)
-        // DH-0140 — the kernel reads this only when frame.extendedGBuffer != 0; any texture
-        // satisfies the binding otherwise.
-        enc.setTexture((extendedGBufferActive ? gbufferMaterial : nil) ?? gbufferEmission, index: 21)
-        // DH-0896 — the specular-IBL hand-off to the RT reflection pass (see `specIBLTexture`).
-        let specTarget = specIBLHandoffTarget()
-        specIBLWrittenThisFrame = specTarget != nil
-        enc.setTexture(specTarget ?? specIBLDummyTexture, index: 22)
-        let diffSkyTarget = diffSkyHandoffTarget()
-        diffSkyWrittenThisFrame = diffSkyTarget != nil
-        enc.setTexture(diffSkyTarget ?? diffSkyDummyTexture, index: 23)
-        // DH-1304 — the AOV capture (texture 25 + buffer 10 exist only in the `-aov` variants).
-        if aovActiveThisFrame, let aovTex = aovTexture {
-            enc.setTexture(aovTex, index: 25)
-            var au = AOVUniforms(blend: aovFrameBlend, handoff: diffSkyTarget != nil ? 1 : 0)
-            enc.setBytes(&au, length: MemoryLayout<AOVUniforms>.stride, index: 10)
-        }
-        enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
-        enc.setBuffer(pointLightBuffer, offset: 0, index: 1)
-        enc.setBuffer(ddgiUniformBuffer, offset: 0, index: 2)
-        enc.setBuffer(spotLightBuffer, offset: 0, index: 3)
-        enc.setBuffer(areaLightBuffer, offset: 0, index: 4)
-        enc.setBuffer(extraDirectionalBuffer, offset: 0, index: 5)
-        enc.setBuffer(spotProfileBuffer, offset: 0, index: 9)   // DH-0540 — the spot-profile rows
-        // Point-light cube-face view-projection matrices (6 per shadowed light).
-        // Placeholder-bound to `pointLightBuffer` when the feature is off / not yet
-        // allocated — never read, because the kernel only indexes it for lights with
-        // `shadowCubeIndex >= 0`, and those exist only when the feature is on.
-        enc.setBuffer(pointShadowFaceBuffer ?? pointLightBuffer, offset: 0, index: 6)
-        // Interior daylight apertures (S3.5 Stage D). Always bound — the kernel gates
-        // on the count/strength packed in frame.interiorIrrDown.w / interiorIrrSide.w,
-        // both 0 for every scene that never opts in.
-        enc.setBuffer(interiorApertureBuffer, offset: 0, index: 7)
-        // S4.1 — the TLAS for ray-traced soft sun shadows. Bound exactly when the
-        // pipeline bit is set (the accel argument only exists in that variant; if
-        // the specialized variant is still compiling and the uber fallback runs
-        // this frame, the extra binding is simply unread).
-        if rtSunShadowLightingActive, let tlas = rtTLAS {
-            enc.setAccelerationStructure(tlas, bufferIndex: 8)
-        }
-        if let rate, let variants = lightingShadingRatePipelines() {
-            // Same bindings; the tile map at texture(24). Coarse quads first (a thread per quad),
-            // then every other pixel — the two variants' pixel sets partition the frame.
-            enc.setTexture(rate, index: 24)
-            enc.setComputePipelineState(variants.coarse)
-            dispatch(enc, pipeline: variants.coarse, width: (width + 1) / 2, height: (height + 1) / 2)
-            enc.setComputePipelineState(variants.skip)
-            dispatch(enc, pipeline: variants.skip, width: width, height: height)
-        } else {
-            dispatch(enc, pipeline: pipe, width: width, height: height)
-        }
-        enc.endEncoding()
-    }
-
-    /// Whether this frame asks for the defocus shading rate (the host's knob, with a live lens).
-    private var lightingShadingRateRequested: Bool {
-        lightingDefocusShadingMinCoC > 0 && dofEnabled && dofCoCCoefficient > 0 && !camera.isOrthographic
-            && dofShadingTilesPipeline != nil
-    }
-
-    /// The defocus shading rate's tile map: the least |CoC| of each 16×16 tile's geometry, under the
-    /// DOF's own lens (the same `DOFParams` the gather will use this frame). Nil if it cannot run.
-    private func encodeLightingRateTiles(_ cb: MTLCommandBuffer) -> MTLTexture? {
-        guard let pipe = dofShadingTilesPipeline else { return nil }
-        let tile = Self.dofTileSize
-        let tileW = max(1, (width + tile - 1) / tile), tileH = max(1, (height + tile - 1) / tile)
-        if lightingRateTileTexture?.width != tileW || lightingRateTileTexture?.height != tileH {
-            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: tileW, height: tileH,
-                                                             mipmapped: false)
-            d.usage = [.shaderRead, .shaderWrite]
-            d.storageMode = .private
-            lightingRateTileTexture = device.makeTexture(descriptor: d)
-            lightingRateTileTexture?.label = "Illuminatorama.lighting.rateTiles"
-        }
-        guard let tiles = lightingRateTileTexture,
-              let enc = timedComputeEncoder(cb, "lighting.rateTiles") else { return nil }
-        enc.label = "Illuminatorama.lighting.rateTiles"
-        let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
-        var p = DOFParams(
-            invProjection: fu.invProjection,
-            focusDist: max(0.05, dofFocusDistance),
-            cocCoefficient: max(0, dofCoCCoefficient),
-            maxRadius: max(1, dofMaxRadius),
-            blades: dofBlades >= 3 ? Float(dofBlades) : 0,
-            bladeRotation: dofBladeRotation,
-            catsEye: max(0, min(1, dofCatsEye)),
-            width: UInt32(width), height: UInt32(height),
-            tileW: UInt32(tileW), tileH: UInt32(tileH), tileSize: UInt32(tile),
-            prefilterScale: 0,
-            cocFloor: max(0, dofDiffractionCoCPixels))
-        enc.setComputePipelineState(pipe)
-        enc.setTexture(depthTexture, index: 0)
-        enc.setTexture(tiles, index: 1)
-        enc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
-        let side = min(tile, max(1, Int(sqrt(Double(pipe.maxTotalThreadsPerThreadgroup)))))
-        enc.dispatchThreadgroups(MTLSize(width: tileW, height: tileH, depth: 1),
-                                 threadsPerThreadgroup: MTLSize(width: side, height: side, depth: 1))
-        enc.endEncoding()
-        return tiles
-    }
-
-    /// The coarse and skip lighting variants for this frame's feature bits (+ function constants 6 /
-    /// 7). Compiled in the background on first use (nil meanwhile — the frame then lights every pixel,
-    /// exactly as with the feature off); BLOCKING in a `blockingLightingCompile` lane, so a settled
-    /// still is deterministic.
-    private func lightingShadingRatePipelines() -> (coarse: MTLComputePipelineState, skip: MTLComputePipelineState)? {
-        let rtSun = rtSunShadowLightingActive
-        let aov = aovActiveThisFrame
-        let bits: UInt8 = (iblEnabled ? 1 : 0) | (shadowsEnabled ? 2 : 0) | (dfgLUTEnabled ? 4 : 0)
-                        | (ddgiEnabled ? 8 : 0) | (ddgiIrrCacheEnabled && ddgiEnabled ? 16 : 0) | (rtSun ? 32 : 0)
-                        | (aov ? 64 : 0)
-        if bits == lastRatePipelines.flags, let memo = lastRatePipelines.pair { return memo }
-        func variant(coarse: Bool) -> MTLComputePipelineState? {
-            let (key, cv) = Self.lightingFeatureConstants(
-                ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
-                ddgi: ddgiEnabled, ddgiIrrCache: ddgiIrrCacheEnabled, rtSunShadow: rtSun, aov: aov)
-            var c = coarse, k = !coarse
-            cv.setConstantValue(&c, type: .bool, index: 6)
-            cv.setConstantValue(&k, type: .bool, index: 7)
-            let vkey = key + (coarse ? "-rateCoarse" : "-rateSkip")
-            if blockingLightingCompile || rtSun || aov {
-                return engine.pipelineCache.pipelineState(name: "illumi_lighting", device: device,
-                                                          constants: cv, variantKey: vkey)
-            }
-            return engine.pipelineCache.pipelineStateAsync(name: "illumi_lighting", device: device,
-                                                           constants: cv, variantKey: vkey)
-        }
-        guard let c = variant(coarse: true), let k = variant(coarse: false) else { return nil }
-        lastRatePipelines = (bits, (c, k))
-        return (c, k)
-    }
     /// One-entry memo of `lightingShadingRatePipelines` (flags as `currentLightingPipeline` packs them).
-    private var lastRatePipelines: (flags: UInt8, pair: (coarse: MTLComputePipelineState, skip: MTLComputePipelineState)?) = (0xFF, nil)
+    var lastRatePipelines: (flags: UInt8, pair: (coarse: MTLComputePipelineState, skip: MTLComputePipelineState)?) = (0xFF, nil)
 
     // Phase 4.39: SSR is now split into three passes.
     // 1) Gather  — ray march → write pre-weighted SSR delta to ssrRawTexture.
