@@ -68,9 +68,9 @@ extension MaterialGenerator {
                                       // nap swells lighter/darker as it turns. Deep cut pile shows
                                       // it most; a flatweave has almost no standing pile to lay.
         switch pile {
-        case .cutPile:   gauge = 120; crownPower = 0.55; gloss = 0.50; napJitter = 0.22; reliefStrength = 0.85; macroStrength = 0.28
-        case .loop:      gauge = 150; crownPower = 0.85; gloss = 0.62; napJitter = 0.16; reliefStrength = 0.70; macroStrength = 0.20
-        case .flatweave: gauge = 180; crownPower = 1.10; gloss = 0.30; napJitter = 0.10; reliefStrength = 0.55; macroStrength = 0.04
+        case .cutPile:   gauge = 120; crownPower = 0.55; gloss = 0.20; napJitter = 0.22; reliefStrength = 0.85; macroStrength = 0.28
+        case .loop:      gauge = 150; crownPower = 0.85; gloss = 0.28; napJitter = 0.16; reliefStrength = 0.70; macroStrength = 0.20
+        case .flatweave: gauge = 180; crownPower = 1.10; gloss = 0.14; napJitter = 0.10; reliefStrength = 0.55; macroStrength = 0.04
         }
 
         // The nap: a dominant lay direction plus a small per-tuft wobble. Coherent (the whole
@@ -145,7 +145,7 @@ extension MaterialGenerator {
         }
 
         ch.sheen = gloss
-        ch.sheenRoughness = 0.45                     // upright pile → a broad, soft grazing sheen
+        ch.sheenRoughness = 0.60                     // upright pile → a broad, soft grazing sheen
                                                      // (DH-0081; broader than a flat weave)
         // Strong relief from the pile field — the tufts stand up; the normal should read them.
         ch.deriveNormals(strength: 6)
