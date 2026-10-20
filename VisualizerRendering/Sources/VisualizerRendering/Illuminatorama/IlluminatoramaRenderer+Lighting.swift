@@ -50,7 +50,7 @@ extension IlluminatoramaRenderer {
     /// hang-guard trips) this is false and lighting falls back to the shadow-map
     /// variant instead of selecting a pipeline whose accel argument cannot bind.
     private var rtSunShadowLightingActive: Bool {
-        rtSunSoftShadowsEnabled && rtTLASActive && rtTLAS != nil
+        rtSunSoftShadowsEnabled && rts.rtTLASActive && rts.rtTLAS != nil
     }
 
     /// The specialized `illumi_lighting` pipeline for the current feature flags.
@@ -66,13 +66,13 @@ extension IlluminatoramaRenderer {
     /// background compile lands the next frame picks up the specialized variant.
     private func currentLightingPipeline() -> MTLComputePipelineState {
         let rtSun = rtSunShadowLightingActive
-        let aov = aovActiveThisFrame
+        let aov = aovs.aovActiveThisFrame
         let bits: UInt8 = (iblEnabled     ? 1  : 0)
                         | (shadowsEnabled ? 2  : 0)
                         | (dfgLUTEnabled  ? 4  : 0)
                         | (rtSun          ? 32 : 0)
                         | (aov            ? 64 : 0)
-        if bits == lastLightingFlags, let p = lastLightingPipeline { return p }
+        if bits == gbs.lastLightingFlags, let p = gbs.lastLightingPipeline { return p }
 
         let (key, cv) = Self.lightingFeatureConstants(
             ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
@@ -85,18 +85,18 @@ extension IlluminatoramaRenderer {
         if blockingLightingCompile || aov {
             if let built = engine.pipelineCache.pipelineState(
                 name: "illumi_lighting", device: device, constants: cv, variantKey: key) {
-                lastLightingFlags = bits
-                lastLightingPipeline = built
+                gbs.lastLightingFlags = bits
+                gbs.lastLightingPipeline = built
                 return built
             }
-            return lightingPipeline
+            return gbs.lightingPipeline
         }
         // Non-blocking: ready variant → memoise + use it; still compiling → run
         // the uber-variant this frame and re-check next frame (no memo).
         if let ready = engine.pipelineCache.pipelineStateAsync(
             name: "illumi_lighting", device: device, constants: cv, variantKey: key) {
-            lastLightingFlags = bits
-            lastLightingPipeline = ready
+            gbs.lastLightingFlags = bits
+            gbs.lastLightingPipeline = ready
             return ready
         }
         // S4.1 — the RT-sun variant compiles BLOCKING instead of falling back. The
@@ -109,18 +109,18 @@ extension IlluminatoramaRenderer {
         // variant exactly as before.)
         if rtSun, let built = engine.pipelineCache.pipelineState(
             name: "illumi_lighting", device: device, constants: cv, variantKey: key) {
-            lastLightingFlags = bits
-            lastLightingPipeline = built
+            gbs.lastLightingFlags = bits
+            gbs.lastLightingPipeline = built
             return built
         }
-        return lightingPipeline
+        return gbs.lightingPipeline
     }
 
     /// Compute encoder that records this pass's GPU time when the pass timer is
     /// enabled (env-gated; #60 task 4 / #6), else a plain encoder. The `label`
     /// keys the per-pass breakdown.
     func timedComputeEncoder(_ cb: MTLCommandBuffer, _ label: String) -> MTLComputeCommandEncoder? {
-        if let pd = passTimer.descriptor(label: label) {
+        if let pd = gbs.passTimer.descriptor(label: label) {
             return cb.makeComputeCommandEncoder(descriptor: pd)
         }
         return cb.makeComputeCommandEncoder()
@@ -133,7 +133,7 @@ extension IlluminatoramaRenderer {
     func timedRenderEncoder(_ cb: MTLCommandBuffer,
                                     _ pass: MTLRenderPassDescriptor,
                                     _ label: String) -> MTLRenderCommandEncoder? {
-        cb.makeRenderCommandEncoder(descriptor: passTimer.attach(to: pass, label: label))
+        cb.makeRenderCommandEncoder(descriptor: gbs.passTimer.attach(to: pass, label: label))
     }
 
     func encodeLightingPass(_ cb: MTLCommandBuffer) {
@@ -143,51 +143,51 @@ extension IlluminatoramaRenderer {
         enc.label = "Illuminatorama.lighting"
         let pipe = currentLightingPipeline()
         enc.setComputePipelineState(pipe)
-        enc.setTexture(gbufferAlbedoMet, index: 0)
-        enc.setTexture(gbufferNormalRgh, index: 1)
-        enc.setTexture(gbufferEmission, index: 2)
-        enc.setTexture(depthTexture, index: 3)
-        enc.setTexture(hdrTexture, index: 4)
+        enc.setTexture(gbs.gbufferAlbedoMet, index: 0)
+        enc.setTexture(gbs.gbufferNormalRgh, index: 1)
+        enc.setTexture(gbs.gbufferEmission, index: 2)
+        enc.setTexture(gbs.depthTexture, index: 3)
+        enc.setTexture(gbs.hdrTexture, index: 4)
         enc.setTexture(aoSourceTexture, index: 5)  // denoised AO (or raw when off)
-        enc.setTexture(equirectSky ?? dummySkyTexture, index: 6)
-        enc.setTexture(irradianceCube, index: 7)
-        enc.setTexture(prefilteredCube, index: 8)
-        enc.setTexture(shadowMap, index: 9)
-        enc.setTexture(dfgLUT, index: 10)
+        enc.setTexture(equirectSky ?? ibls.dummySkyTexture, index: 6)
+        enc.setTexture(ibls.irradianceCube, index: 7)
+        enc.setTexture(ibls.prefilteredCube, index: 8)
+        enc.setTexture(shd.shadowMap, index: 9)
+        enc.setTexture(ibls.dfgLUT, index: 10)
         // Phase 4.10 — per-spot shadow atlas. Always bound (the kernel
         // gates per-spot on `spotShadowSliceIndex >= 0`, which is set by
         // `updateSpotShadows` only when `spotShadowsEnabled` is on AND
         // the spot is within atlas capacity).
-        enc.setTexture(spotShadowAtlas, index: 13)
+        enc.setTexture(shd.spotShadowAtlas, index: 13)
         // Point-light cube depth atlas (6 slices/light). When the feature is off
         // its `pointShadowAtlas` is nil → bind the always-allocated spot atlas as a
         // same-type (depth2d_array) placeholder; the kernel never samples it because
         // every point light's `shadowCubeIndex` is -1. When on, real cube depth.
-        enc.setTexture(pointShadowAtlas ?? spotShadowAtlas, index: 19)
-        enc.setTexture(ltcMatTexture, index: 16)
-        enc.setTexture(ltcMagTexture, index: 17)
+        enc.setTexture(shd.pointShadowAtlas ?? shd.spotShadowAtlas, index: 19)
+        enc.setTexture(ibls.ltcMatTexture, index: 16)
+        enc.setTexture(ibls.ltcMagTexture, index: 17)
         // Light-layer G-buffer target — per-fragment layer bitfield the kernel
         // masks each light against. When no scene sets layers this reads all-bits
         // everywhere, so every light passes the mask (no behaviour change).
-        enc.setTexture(gbufferLayer, index: 18)
+        enc.setTexture(gbs.gbufferLayer, index: 18)
         // Issue #65 — SSS diffuse side buffer. Always bound (the kernel only writes
         // it when frame.sssStrength > 0, so non-SSS scenes leave it idle).
         // (index 20: 18/19 went to gLayer/pointShadowAtlas in the merge.)
-        enc.setTexture(sssDiffuseTexture, index: 20)
+        enc.setTexture(ssrs.sssDiffuseTexture, index: 20)
         // DH-0140 — the kernel reads this only when frame.extendedGBuffer != 0; any texture
         // satisfies the binding otherwise.
-        enc.setTexture((extendedGBufferActive ? gbufferMaterial : nil) ?? gbufferEmission, index: 21)
+        enc.setTexture((extendedGBufferActive ? gbs.gbufferMaterial : nil) ?? gbs.gbufferEmission, index: 21)
         // DH-0896 — the specular-IBL hand-off to the RT reflection pass (see `specIBLTexture`).
         let specTarget = specIBLHandoffTarget()
-        specIBLWrittenThisFrame = specTarget != nil
+        ibls.specIBLWrittenThisFrame = specTarget != nil
         enc.setTexture(specTarget ?? specIBLDummyTexture, index: 22)
         let diffSkyTarget = diffSkyHandoffTarget()
-        diffSkyWrittenThisFrame = diffSkyTarget != nil
+        ibls.diffSkyWrittenThisFrame = diffSkyTarget != nil
         enc.setTexture(diffSkyTarget ?? diffSkyDummyTexture, index: 23)
         // DH-1304 — the AOV capture (texture 25 + buffer 10 exist only in the `-aov` variants).
-        if aovActiveThisFrame, let aovTex = aovTexture {
+        if aovs.aovActiveThisFrame, let aovTex = aovs.aovTexture {
             enc.setTexture(aovTex, index: 25)
-            var au = AOVUniforms(blend: aovFrameBlend, handoff: diffSkyTarget != nil ? 1 : 0)
+            var au = AOVUniforms(blend: aovs.aovFrameBlend, handoff: diffSkyTarget != nil ? 1 : 0)
             enc.setBytes(&au, length: MemoryLayout<AOVUniforms>.stride, index: 10)
         }
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
@@ -195,7 +195,7 @@ extension IlluminatoramaRenderer {
         enc.setBuffer(spotLightBuffer, offset: 0, index: 3)
         enc.setBuffer(areaLightBuffer, offset: 0, index: 4)
         enc.setBuffer(extraDirectionalBuffer, offset: 0, index: 5)
-        enc.setBuffer(spotProfileBuffer, offset: 0, index: 9)   // DH-0540 — the spot-profile rows
+        enc.setBuffer(shd.spotProfileBuffer, offset: 0, index: 9)   // DH-0540 — the spot-profile rows
         // Point-light cube-face view-projection matrices (6 per shadowed light).
         // Placeholder-bound to `pointLightBuffer` when the feature is off / not yet
         // allocated — never read, because the kernel only indexes it for lights with
@@ -209,7 +209,7 @@ extension IlluminatoramaRenderer {
         // pipeline bit is set (the accel argument only exists in that variant; if
         // the specialized variant is still compiling and the uber fallback runs
         // this frame, the extra binding is simply unread).
-        if rtSunShadowLightingActive, let tlas = rtTLAS {
+        if rtSunShadowLightingActive, let tlas = rts.rtTLAS {
             enc.setAccelerationStructure(tlas, bufferIndex: 8)
         }
         if let rate, let variants = lightingShadingRatePipelines() {
@@ -229,24 +229,24 @@ extension IlluminatoramaRenderer {
     /// Whether this frame asks for the defocus shading rate (the host's knob, with a live lens).
     var lightingShadingRateRequested: Bool {
         lightingDefocusShadingMinCoC > 0 && dofEnabled && dofCoCCoefficient > 0 && !camera.isOrthographic
-            && dofShadingTilesPipeline != nil
+            && dofs.dofShadingTilesPipeline != nil
     }
 
     /// The defocus shading rate's tile map: the least |CoC| of each 16×16 tile's geometry, under the
     /// DOF's own lens (the same `DOFParams` the gather will use this frame). Nil if it cannot run.
     private func encodeLightingRateTiles(_ cb: MTLCommandBuffer) -> MTLTexture? {
-        guard let pipe = dofShadingTilesPipeline else { return nil }
+        guard let pipe = dofs.dofShadingTilesPipeline else { return nil }
         let tile = Self.dofTileSize
         let tileW = max(1, (width + tile - 1) / tile), tileH = max(1, (height + tile - 1) / tile)
-        if lightingRateTileTexture?.width != tileW || lightingRateTileTexture?.height != tileH {
+        if dofs.lightingRateTileTexture?.width != tileW || dofs.lightingRateTileTexture?.height != tileH {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: tileW, height: tileH,
                                                              mipmapped: false)
             d.usage = [.shaderRead, .shaderWrite]
             d.storageMode = .private
-            lightingRateTileTexture = device.makeTexture(descriptor: d)
-            lightingRateTileTexture?.label = "Illuminatorama.lighting.rateTiles"
+            dofs.lightingRateTileTexture = device.makeTexture(descriptor: d)
+            dofs.lightingRateTileTexture?.label = "Illuminatorama.lighting.rateTiles"
         }
-        guard let tiles = lightingRateTileTexture,
+        guard let tiles = dofs.lightingRateTileTexture,
               let enc = timedComputeEncoder(cb, "lighting.rateTiles") else { return nil }
         enc.label = "Illuminatorama.lighting.rateTiles"
         let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
@@ -263,7 +263,7 @@ extension IlluminatoramaRenderer {
             prefilterScale: 0,
             cocFloor: max(0, dofDiffractionCoCPixels))
         enc.setComputePipelineState(pipe)
-        enc.setTexture(depthTexture, index: 0)
+        enc.setTexture(gbs.depthTexture, index: 0)
         enc.setTexture(tiles, index: 1)
         enc.setBytes(&p, length: MemoryLayout<DOFParams>.stride, index: 0)
         let side = min(tile, max(1, Int(sqrt(Double(pipe.maxTotalThreadsPerThreadgroup)))))
@@ -279,11 +279,11 @@ extension IlluminatoramaRenderer {
     /// still is deterministic.
     private func lightingShadingRatePipelines() -> (coarse: MTLComputePipelineState, skip: MTLComputePipelineState)? {
         let rtSun = rtSunShadowLightingActive
-        let aov = aovActiveThisFrame
+        let aov = aovs.aovActiveThisFrame
         let bits: UInt8 = (iblEnabled ? 1 : 0) | (shadowsEnabled ? 2 : 0) | (dfgLUTEnabled ? 4 : 0)
                         | (rtSun ? 32 : 0)
                         | (aov ? 64 : 0)
-        if bits == lastRatePipelines.flags, let memo = lastRatePipelines.pair { return memo }
+        if bits == gbs.lastRatePipelines.flags, let memo = gbs.lastRatePipelines.pair { return memo }
         func variant(coarse: Bool) -> MTLComputePipelineState? {
             let (key, cv) = Self.lightingFeatureConstants(
                 ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
@@ -300,7 +300,7 @@ extension IlluminatoramaRenderer {
                                                            constants: cv, variantKey: vkey)
         }
         guard let c = variant(coarse: true), let k = variant(coarse: false) else { return nil }
-        lastRatePipelines = (bits, (c, k))
+        gbs.lastRatePipelines = (bits, (c, k))
         return (c, k)
     }
 }

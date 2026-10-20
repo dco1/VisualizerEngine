@@ -14,14 +14,14 @@ extension IlluminatoramaRenderer {
     func encodeSSRGather(_ cb: MTLCommandBuffer) {
         guard let enc = timedComputeEncoder(cb, "ssr.gather") else { return }
         enc.label = "Illuminatorama.ssr.gather"
-        enc.setComputePipelineState(ssrGatherPipeline)
-        enc.setTexture(hdrTexture,       index: 0)
-        enc.setTexture(gbufferAlbedoMet, index: 1)
-        enc.setTexture(gbufferNormalRgh, index: 2)
-        enc.setTexture(depthTexture,     index: 3)
-        enc.setTexture(ssrRawTexture,    index: 4)  // output: SSR delta
+        enc.setComputePipelineState(ssrs.ssrGatherPipeline)
+        enc.setTexture(gbs.hdrTexture,       index: 0)
+        enc.setTexture(gbs.gbufferAlbedoMet, index: 1)
+        enc.setTexture(gbs.gbufferNormalRgh, index: 2)
+        enc.setTexture(gbs.depthTexture,     index: 3)
+        enc.setTexture(ssrs.ssrRawTexture,    index: 4)  // output: SSR delta
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
-        dispatch(enc, pipeline: ssrGatherPipeline, width: width, height: height)
+        dispatch(enc, pipeline: ssrs.ssrGatherPipeline, width: width, height: height)
         enc.endEncoding()
     }
 
@@ -29,14 +29,14 @@ extension IlluminatoramaRenderer {
         guard ssrTemporalEnabled else { return }
         guard let enc = timedComputeEncoder(cb, "ssr.temporal") else { return }
         enc.label = "Illuminatorama.ssr.temporal"
-        enc.setComputePipelineState(ssrTemporalPipeline)
-        enc.setTexture(ssrRawTexture,             index: 0)  // current gather
+        enc.setComputePipelineState(ssrs.ssrTemporalPipeline)
+        enc.setTexture(ssrs.ssrRawTexture,             index: 0)  // current gather
         enc.setTexture(previousSSRHistoryTexture,  index: 1)  // history read
-        enc.setTexture(velocityTexture,            index: 2)
+        enc.setTexture(pfx.velocityTexture,            index: 2)
         enc.setTexture(currentSSRHistoryTexture,   index: 3)  // history write
-        enc.setTexture(ssrSampleCount,             index: 4)  // adaptive count (read_write)
+        enc.setTexture(ssrs.ssrSampleCount,             index: 4)  // adaptive count (read_write)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
-        dispatch(enc, pipeline: ssrTemporalPipeline, width: width, height: height)
+        dispatch(enc, pipeline: ssrs.ssrTemporalPipeline, width: width, height: height)
         enc.endEncoding()
     }
 
@@ -47,19 +47,19 @@ extension IlluminatoramaRenderer {
     func encodeSSRBypassCopy(_ cb: MTLCommandBuffer) {
         guard let blit = cb.makeBlitCommandEncoder() else { return }
         blit.label = "Illuminatorama.ssr.bypass"
-        blit.copy(from: hdrTexture, to: hdrCompositeTexture)
+        blit.copy(from: gbs.hdrTexture, to: pfx.hdrCompositeTexture)
         blit.endEncoding()
     }
 
     func encodeSSRComposite(_ cb: MTLCommandBuffer) {
         guard let enc = timedComputeEncoder(cb, "ssr.composite") else { return }
         enc.label = "Illuminatorama.ssr.composite"
-        enc.setComputePipelineState(ssrCompositePipeline)
-        enc.setTexture(hdrTexture,        index: 0)  // base lighting
+        enc.setComputePipelineState(ssrs.ssrCompositePipeline)
+        enc.setTexture(gbs.hdrTexture,        index: 0)  // base lighting
         enc.setTexture(ssrDenoisedTexture, index: 1)  // denoised SSR (or raw)
-        enc.setTexture(hdrCompositeTexture, index: 2) // output
+        enc.setTexture(pfx.hdrCompositeTexture, index: 2) // output
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
-        dispatch(enc, pipeline: ssrCompositePipeline, width: width, height: height)
+        dispatch(enc, pipeline: ssrs.ssrCompositePipeline, width: width, height: height)
         enc.endEncoding()
     }
 
@@ -82,27 +82,65 @@ extension IlluminatoramaRenderer {
         func blur(_ src: MTLTexture, _ dst: MTLTexture, dir: SIMD2<Float>, label: String) {
             guard let enc = timedComputeEncoder(cb, label) else { return }
             enc.label = "Illuminatorama.\(label)"
-            enc.setComputePipelineState(sssBlurPipeline)
+            enc.setComputePipelineState(ssrs.sssBlurPipeline)
             enc.setTexture(src,          index: 0)
-            enc.setTexture(depthTexture, index: 1)
+            enc.setTexture(gbs.depthTexture, index: 1)
             enc.setTexture(dst,          index: 2)
             enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
             var d = dir
             enc.setBytes(&d, length: MemoryLayout<SIMD2<Float>>.stride, index: 1)
-            dispatch(enc, pipeline: sssBlurPipeline, width: width, height: height)
+            dispatch(enc, pipeline: ssrs.sssBlurPipeline, width: width, height: height)
             enc.endEncoding()
         }
-        blur(sssDiffuseTexture, sssBlurTmpTexture, dir: SIMD2(1, 0), label: "sss.blurH")
-        blur(sssBlurTmpTexture, sssBlurOutTexture, dir: SIMD2(0, 1), label: "sss.blurV")
+        blur(ssrs.sssDiffuseTexture, ssrs.sssBlurTmpTexture, dir: SIMD2(1, 0), label: "sss.blurH")
+        blur(ssrs.sssBlurTmpTexture, ssrs.sssBlurOutTexture, dir: SIMD2(0, 1), label: "sss.blurV")
 
         guard let enc = timedComputeEncoder(cb, "sss.composite") else { return }
         enc.label = "Illuminatorama.sss.composite"
-        enc.setComputePipelineState(sssCompositePipeline)
-        enc.setTexture(hdrTexture,        index: 0)  // read_write: blurred diffuse blended in place
-        enc.setTexture(sssDiffuseTexture, index: 1)  // sharp diffuse + mask
-        enc.setTexture(sssBlurOutTexture, index: 2)  // blurred diffuse
+        enc.setComputePipelineState(ssrs.sssCompositePipeline)
+        enc.setTexture(gbs.hdrTexture,        index: 0)  // read_write: blurred diffuse blended in place
+        enc.setTexture(ssrs.sssDiffuseTexture, index: 1)  // sharp diffuse + mask
+        enc.setTexture(ssrs.sssBlurOutTexture, index: 2)  // blurred diffuse
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
-        dispatch(enc, pipeline: sssCompositePipeline, width: width, height: height)
+        dispatch(enc, pipeline: ssrs.sssCompositePipeline, width: width, height: height)
         enc.endEncoding()
     }
+}
+
+// MARK: - SSRSSSState
+
+/// Screen-space reflections and screen-space subsurface scattering.
+/// Owned by the renderer as `ssrs`; every member keeps the name it had on the renderer.
+@MainActor
+final class SSRSSSState {
+    // SSR spatiotemporal: raw gather → temporal → composite into hdrComposite.
+    var ssrRawTexture: MTLTexture!  // full-res, rgba16Float
+    var ssrHistoryA: MTLTexture!  // full-res, rgba16Float ping-pong
+    var ssrHistoryB: MTLTexture!
+    var ssrHistoryToggle: Bool = false
+    /// Tracks `ssrIntensity > 0` transitions so a re-enable re-primes the SSR
+    /// history (the whole SSR chain is skipped while intensity is 0).
+    var previousSSRIntensityActive: Bool = false
+    var ssrNeedsFirstFrame: Bool = true
+    var previousSsrEnabled: Bool = false
+
+    // Issue #65 — screen-space SSS buffers (full-res, rgba16Float). The lighting
+    // pass writes the diffuse-lit term of SSS-flagged pixels into `sssDiffuse`;
+    // the separable blur ping-pongs sssDiffuse → sssBlurTmp (H) → sssBlurOut (V);
+    // the composite reads sssDiffuse (sharp) + sssBlurOut (blurred). Idle unless a
+    // scene sets `sssStrength > 0` (the blur/composite passes aren't even encoded).
+    var sssDiffuseTexture: MTLTexture!
+    var sssBlurTmpTexture: MTLTexture!
+    var sssBlurOutTexture: MTLTexture!
+
+    var ssrSampleCount: MTLTexture!  // full-res
+
+    var ssrGatherPipeline: MTLComputePipelineState!  // was ssrPipeline; now writes ssrRaw
+
+    var ssrTemporalPipeline: MTLComputePipelineState!
+    var ssrCompositePipeline: MTLComputePipelineState!
+    // Issue #65 — screen-space SSS. One blur kernel run twice (H then V, direction
+    // passed via setBytes) + a composite kernel.
+    var sssBlurPipeline: MTLComputePipelineState!
+    var sssCompositePipeline: MTLComputePipelineState!
 }

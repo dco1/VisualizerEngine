@@ -15,7 +15,7 @@ extension IlluminatoramaRenderer {
     /// caller must fall back to actually running the SSAO passes.
     @discardableResult
     private func ensureNeutralAOTexture(_ cb: MTLCommandBuffer) -> Bool {
-        if aoNeutralTexture != nil { return true }
+        if aos.aoNeutralTexture != nil { return true }
         let d = MTLTextureDescriptor()
         d.textureType = .type2D
         d.pixelFormat = .r16Float          // matches the AO chain's format
@@ -36,7 +36,7 @@ extension IlluminatoramaRenderer {
         guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return false }
         enc.label = "Illuminatorama.ao.neutralClear"
         enc.endEncoding()
-        aoNeutralTexture = tex
+        aos.aoNeutralTexture = tex
         return true
     }
 
@@ -52,13 +52,13 @@ extension IlluminatoramaRenderer {
         // the real geometry into the SAME raw AO texture, so the bilateral + temporal chain and
         // the lighting kernel's read are untouched. A frame without a TLAS (frame 1, a tripped
         // guard) falls back to the screen-space march below, and says so.
-        if rtaoActive, let tlas = rtTLAS, let pipeline = rtaoPipeline,
+        if rtaoActive, let tlas = rts.rtTLAS, let pipeline = aos.rtaoPipeline,
            let enc = timedComputeEncoder(cb, "rtao") {
             enc.label = "Illuminatorama.rtao"
             enc.setComputePipelineState(pipeline)
-            enc.setTexture(depthTexture, index: 0)
-            enc.setTexture(gbufferNormalRgh, index: 1)
-            enc.setTexture(aoTexture, index: 2)
+            enc.setTexture(gbs.depthTexture, index: 0)
+            enc.setTexture(gbs.gbufferNormalRgh, index: 1)
+            enc.setTexture(aos.aoTexture, index: 2)
             enc.setAccelerationStructure(tlas, bufferIndex: 0)
             let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
             var u = RTAOUniforms(invViewProjection: fu.invViewProjection,
@@ -77,26 +77,26 @@ extension IlluminatoramaRenderer {
                                  rayCount: UInt32(max(1, min(4096, rtaoRays))),
                                  // Same seed contract as every other traced term: walk only
                                  // while an accumulator can average it, else freeze.
-                                 frameSeed: rtaoFrameSeed,
+                                 frameSeed: aos.rtaoFrameSeed,
                                  rayTMin: 0.004,
                                  transportRayMask: 0x01 | 0x04,
                                  fullWidth: UInt32(width), fullHeight: UInt32(height))
             enc.setBytes(&u, length: MemoryLayout<RTAOUniforms>.stride, index: 1)
             dispatch(enc, pipeline: pipeline, width: halfW, height: halfH)
             enc.endEncoding()
-            rtaoFrameSeed &+= 1
+            aos.rtaoFrameSeed &+= 1
             rtaoDidRunLastFrame = true
             return
         }
         rtaoDidRunLastFrame = false
         guard let enc = timedComputeEncoder(cb, "ssao") else { return }
         enc.label = "Illuminatorama.ssao"
-        enc.setComputePipelineState(ssaoPipeline)
-        enc.setTexture(depthTexture, index: 0)
-        enc.setTexture(gbufferNormalRgh, index: 1)
-        enc.setTexture(aoTexture, index: 2)
+        enc.setComputePipelineState(aos.ssaoPipeline)
+        enc.setTexture(gbs.depthTexture, index: 0)
+        enc.setTexture(gbs.gbufferNormalRgh, index: 1)
+        enc.setTexture(aos.aoTexture, index: 2)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
-        dispatch(enc, pipeline: ssaoPipeline, width: halfW, height: halfH)
+        dispatch(enc, pipeline: aos.ssaoPipeline, width: halfW, height: halfH)
         enc.endEncoding()
     }
 
@@ -104,11 +104,11 @@ extension IlluminatoramaRenderer {
     /// live. Returns false — encoding nothing — otherwise, and the per-frame path runs as before.
     /// A frame that falls back to GTAO (no TLAS yet) is not accumulated and does not count.
     private func encodeAccumulatedRTAO(_ cb: MTLCommandBuffer, halfW: Int, halfH: Int) -> Bool {
-        guard aoAccumulationEnabled, rtaoActive, let tlas = rtTLAS else { return false }
-        if aoAccumulator == nil {
-            aoAccumulator = IlluminatoramaAOAccumulator(device: device, cache: engine.pipelineCache)
+        guard aoAccumulationEnabled, rtaoActive, let tlas = rts.rtTLAS else { return false }
+        if aos.aoAccumulator == nil {
+            aos.aoAccumulator = IlluminatoramaAOAccumulator(device: device, cache: engine.pipelineCache)
         }
-        guard let acc = aoAccumulator, acc.isAvailable else { return false }
+        guard let acc = aos.aoAccumulator, acc.isAvailable else { return false }
         let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
         let rays = max(1, min(4096, rtaoRays))
         let radius = max(0.02, rtaoRadius)
@@ -116,7 +116,7 @@ extension IlluminatoramaRenderer {
         let key = IlluminatoramaAOAccumulator.Key(
             unjitteredViewProjection: camera.projectionMatrix * camera.viewMatrix,
             halfWidth: halfW, halfHeight: halfH, radius: radius,
-            sceneTopology: rtTLASTopologyHash, scramble: aoAccumulationScramble)
+            sceneTopology: rts.rtTLASTopologyHash, scramble: aoAccumulationScramble)
         let u = IlluminatoramaAOAccumulator.RTAOv2Uniforms(
             invViewProjection: fu.invViewProjection,
             cameraWorldPos: SIMD4(fu.cameraWorldPos, 1),
@@ -128,8 +128,8 @@ extension IlluminatoramaRenderer {
         let encoded = acc.encode(device: device,
                                  encoder: { [unowned self] label in self.timedComputeEncoder(cb, label) },
                                  dispatch: { [unowned self] enc, p, w, h in self.dispatch(enc, pipeline: p, width: w, height: h) },
-                                 depth: depthTexture, rawAO: aoTexture, tlas: tlas,
-                                 key: key, shapeChanged: instanceShapeStableFrames == 0,
+                                 depth: gbs.depthTexture, rawAO: aos.aoTexture, tlas: tlas,
+                                 key: key, shapeChanged: gbs.instanceShapeStableFrames == 0,
                                  rays: rays, intensity: intensity,
                                  uniforms: u, invProjection: fu.invProjection,
                                  perFrame: aoStillPerFrame && taaStillAccumulation)
@@ -145,13 +145,13 @@ extension IlluminatoramaRenderer {
         let halfH = max(1, height / 2)
         guard let enc = timedComputeEncoder(cb, "ssao.spatial") else { return }
         enc.label = "Illuminatorama.ssao.spatial"
-        enc.setComputePipelineState(ssaoSpatialPipeline)
-        enc.setTexture(aoTexture,        index: 0)   // raw AO input
-        enc.setTexture(depthTexture,     index: 1)
-        enc.setTexture(gbufferNormalRgh, index: 2)
-        enc.setTexture(aoFilteredTexture, index: 3)  // output
+        enc.setComputePipelineState(aos.ssaoSpatialPipeline)
+        enc.setTexture(aos.aoTexture,        index: 0)   // raw AO input
+        enc.setTexture(gbs.depthTexture,     index: 1)
+        enc.setTexture(gbs.gbufferNormalRgh, index: 2)
+        enc.setTexture(aos.aoFilteredTexture, index: 3)  // output
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
-        dispatch(enc, pipeline: ssaoSpatialPipeline, width: halfW, height: halfH)
+        dispatch(enc, pipeline: aos.ssaoSpatialPipeline, width: halfW, height: halfH)
         enc.endEncoding()
     }
 
@@ -161,14 +161,69 @@ extension IlluminatoramaRenderer {
         let halfH = max(1, height / 2)
         guard let enc = timedComputeEncoder(cb, "ssao.temporal") else { return }
         enc.label = "Illuminatorama.ssao.temporal"
-        enc.setComputePipelineState(ssaoTemporalPipeline)
-        enc.setTexture(aoFilteredTexture,        index: 0)  // filtered current
+        enc.setComputePipelineState(aos.ssaoTemporalPipeline)
+        enc.setTexture(aos.aoFilteredTexture,        index: 0)  // filtered current
         enc.setTexture(previousAOHistoryTexture,  index: 1)  // history read
-        enc.setTexture(velocityTexture,           index: 2)
+        enc.setTexture(pfx.velocityTexture,           index: 2)
         enc.setTexture(currentAOHistoryTexture,   index: 3)  // history write
-        enc.setTexture(aoSampleCount,             index: 4)  // adaptive count (read_write)
+        enc.setTexture(aos.aoSampleCount,             index: 4)  // adaptive count (read_write)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
-        dispatch(enc, pipeline: ssaoTemporalPipeline, width: halfW, height: halfH)
+        dispatch(enc, pipeline: aos.ssaoTemporalPipeline, width: halfW, height: halfH)
         enc.endEncoding()
     }
+}
+
+// MARK: - AOState
+
+/// Ambient occlusion: SSAO / RTAO targets, temporal history, pipelines.
+/// Owned by the renderer as `aos`; every member keeps the name it had on the renderer.
+@MainActor
+final class AOState {
+    var aoAccumulator: IlluminatoramaAOAccumulator?
+
+    // Phase 2 — half-res visibility map from SSAO, fed to the lighting pass.
+    var aoTexture: MTLTexture!
+
+    // ── Phase 4.39: denoiser textures ────────────────────────────────
+    // AO spatiotemporal: raw AO → spatial filter → temporal → lighting.
+    var aoFilteredTexture: MTLTexture!  // half-res, after bilateral
+    var aoHistoryA: MTLTexture!  // half-res, r16Float ping-pong
+    var aoHistoryB: MTLTexture!
+    var aoHistoryToggle: Bool = false
+    var aoNeedsFirstFrame: Bool = true
+
+    var previousSsaoEnabled: Bool = false
+    var previousSSAOIntensityActive: Bool = false
+
+    /// 1×1 white AO texture bound in place of the AO history while SSAO is
+    /// skipped. Without it, the lighting kernel would keep reading whatever
+    /// occlusion the AO history held when SSAO was last on — a frozen AO
+    /// stencil baked into the image for as long as intensity stayed at 0. Made
+    /// (and cleared to 1.0 by a clear-only render pass) the first frame it is
+    /// needed, then reused; the lighting kernel derives its sample coordinate
+    /// from `aoTex.get_width()/get_height()` and clamps, so a 1×1 source reads
+    /// as "no occlusion anywhere" at any internal resolution.
+    var aoNeutralTexture: MTLTexture?
+
+    // ── SVGF denoiser (Phase 4.44) ───────────────────────────────────
+    // Adaptive sample-count textures (r16Float) — one per temporal signal.
+    // Each kernel reads the previous frame's count and writes the updated
+    // count, driving adaptive alpha = max(minAlpha, 1/N) for faster
+    // convergence in early frames and post-disocclusion recovery.
+    var aoSampleCount: MTLTexture!  // half-res
+
+    var ssaoPipeline: MTLComputePipelineState!
+
+    var ssaoSpatialPipeline: MTLComputePipelineState!
+    var rtaoPipeline: MTLComputePipelineState?  // nil on non-RT hardware (never dispatched there)
+    var ssaoTemporalPipeline: MTLComputePipelineState!
+
+    /// RTAO's own per-dispatch seed. It rotates EVERY frame, TAA or not: the AO temporal
+    /// accumulator (`encodeSSAOTemporalPass`) exists to converge a per-frame estimator, and a
+    /// seed frozen at 0 hands it the same 32-ray realisation every frame — 42 settled frames
+    /// averaged to one sample. Measured on the DH-0528 gate (raw lane, TAA off): frozen seed
+    /// 0.861 in-band crust against GTAO's 0.474; the march is deterministic and spatially
+    /// blurred, the rays were one unconverged draw. `rtInstFrameSeed` is not reused because it
+    /// only advances when an RT lighting or glass pass encodes, which the raw lane may not.
+    var rtaoFrameSeed: UInt32 = 0
 }

@@ -10,26 +10,26 @@ extension IlluminatoramaRenderer {
     /// Instanced-RT lighting pass — traces the TLAS. Mirrors `encodeRTLightingPass`
     /// but with per-instance albedo/normal lookups. No-op unless a TLAS is live.
     func encodeRTLightingTLASPass(_ cb: MTLCommandBuffer) {
-        guard rtTLASActive, let basePipeline = rtTLASPipeline, let tlas = rtTLAS,
-              let instData = rtInstanceDataBuffer, let objN = rtObjNormalBuffer else { return }
+        guard rts.rtTLASActive, let basePipeline = rts.rtTLASPipeline, let tlas = rts.rtTLAS,
+              let instData = rts.rtInstanceDataBuffer, let objN = rts.rtObjNormalBuffer else { return }
         // Curve primitives (#60 item 7): when the TLAS contains curve
         // instances the intersector's geometry-type contract must include
         // curves, so the kRTCurvesEnabled variant is REQUIRED (rebuild only
         // appends curve instances when the variant compiled).
-        let curvesOn = rtCurveInstanceCount > 0
-            && rtCurveSetDataBuffer != nil && rtCurvePoolPoints != nil
-            && rtCurvePoolRadii != nil && rtCurvePoolSegments != nil
+        let curvesOn = rts.rtCurveInstanceCount > 0
+            && rts.rtCurveSetDataBuffer != nil && rts.rtCurvePoolPoints != nil
+            && rts.rtCurvePoolRadii != nil && rts.rtCurvePoolSegments != nil
         let pipeline: MTLComputePipelineState
-        if aovActiveThisFrame, let ap = rtTLASAOVVariant(curves: curvesOn) {
+        if aovs.aovActiveThisFrame, let ap = rtTLASAOVVariant(curves: curvesOn) {
             pipeline = ap   // DH-1304 — the capture variant (the same kernel, its tags live)
         } else if curvesOn {
-            guard let cp = rtTLASCurvePipeline else { return }
+            guard let cp = rts.rtTLASCurvePipeline else { return }
             pipeline = cp
         } else {
             pipeline = basePipeline
         }
         let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
-        rtInstFrameSeed &+= 1
+        rts.rtInstFrameSeed &+= 1
         var u = RTInstUniforms(
             invViewProjection: fu.invViewProjection,
             cameraWorldPos: fu.cameraWorldPos,
@@ -39,19 +39,19 @@ extension IlluminatoramaRenderer {
             width: UInt32(width), height: UInt32(height),
             shadowRays: UInt32(max(1, min(16, rtShadowRays))),
             giRays: UInt32(max(1, min(16, rtGIRays))),
-            frameSeed: rtInstFrameSeed, rayTMin: 0.004, maxGIDist: 60.0,
+            frameSeed: rts.rtInstFrameSeed, rayTMin: 0.004, maxGIDist: 60.0,
             reflStrength: max(0, rtReflStrength), reflMaxDist: max(0.1, rtReflMaxDistance),
             reflRoughnessCutoff: max(0, rtReflRoughnessCutoff),
             reflRays: UInt32(max(1, min(8, rtReflRays))),
             reflEnabled: rtReflectionsEnabled ? 1 : 0)
         // DH-0887 — the GI's progressive sample index: contiguous per dispatch of THIS pass.
-        u.giProgressiveIndex = rtGIProgressiveIndex
+        u.giProgressiveIndex = rts.rtGIProgressiveIndex
         u.surfaceSnapULPs = effectiveRTSurfaceSnapULPs
-        rtGIProgressiveIndex &+= 1
+        rts.rtGIProgressiveIndex &+= 1
         // DH-0896 — a reflection hit REPLACES the sky the deferred pass put there.
-        let specIBLOn = rtReflectionsEnabled && specIBLWrittenThisFrame && specIBLTexture != nil
+        let specIBLOn = rtReflectionsEnabled && ibls.specIBLWrittenThisFrame && ibls.specIBLTexture != nil
         u.reflReplacesIBL = specIBLOn ? 1 : 0
-        let diffSkyOn = (rtGIReplacesDiffuseSky || rtPathTracedGI) && diffSkyWrittenThisFrame && diffSkyTexture != nil
+        let diffSkyOn = (rtGIReplacesDiffuseSky || rtPathTracedGI) && ibls.diffSkyWrittenThisFrame && ibls.diffSkyTexture != nil
         u.giReplacesDiffuseSky = diffSkyOn ? 1 : 0
         // DH-0989 — the path lane runs ONLY where the deferred pass handed its share over this
         // frame; otherwise its whole-indirect estimate would land on top of the stand-ins.
@@ -76,25 +76,25 @@ extension IlluminatoramaRenderer {
         u.pathLampMinDist = pathOn ? rtPathLampMinDistance : 0
         u.pathLampSourceRadius = pathOn ? max(0, rtPathLampSourceRadius) : 0
         // DH-1344 — build (+cell) for the first frames after a reset, then use (−cell).
-        if rcNeedsClear { rcFramesSinceReset = 0 }
+        if rts.rcNeedsClear { rts.rcFramesSinceReset = 0 }
         let rcCell = pathOn ? max(0, rtPathRadianceCacheCell) : 0
-        u.radCacheCell = rcCell > 0 ? (rcFramesSinceReset < rtPathRadianceCacheBuildFrames ? rcCell : -rcCell) : 0
-        if rcCell > 0 { rcFramesSinceReset += 1 }
+        u.radCacheCell = rcCell > 0 ? (rts.rcFramesSinceReset < rtPathRadianceCacheBuildFrames ? rcCell : -rcCell) : 0
+        if rcCell > 0 { rts.rcFramesSinceReset += 1 }
         // A build frame needs one full walk per pixel, not `giRays` of them: the cache averages
         // millions of walks either way, and the reads are where the extra paths pay.
         if u.radCacheCell > 0 { u.giRays = min(u.giRays, UInt32(max(1, rtPathRadianceCacheBuildRays))) }
         // Surface cache read (P1c): on only when the grouped soup + cards + base
         // are all live this topology. The kernel gates every atlas read on this.
-        let cacheOn = surfCacheActive && surfCardCount > 0
-            && rtSoupTriBaseBuffer != nil && surfTriCardBuffer != nil
+        let cacheOn = surfCacheActive && scs.surfCardCount > 0
+            && rts.rtSoupTriBaseBuffer != nil && scs.surfTriCardBuffer != nil
             && surfConsumerAtlas != nil
-            && rtSoupTriBaseCount == instances.count   // base buffer matches this topology
+            && rts.rtSoupTriBaseCount == instances.count   // base buffer matches this topology
         if cacheOn {
             u.surfCacheEnabled = 1
-            u.surfTileSize = UInt32(surfActiveTileSize)
-            u.surfTilesPerRow = UInt32(surfTilesPerRow)
-            u.surfAtlasW = UInt32(surfAtlasW); u.surfAtlasH = UInt32(surfAtlasH)
-            u.surfTriCount = UInt32(rtTriangleCount)
+            u.surfTileSize = UInt32(scs.surfActiveTileSize)
+            u.surfTilesPerRow = UInt32(scs.surfTilesPerRow)
+            u.surfAtlasW = UInt32(scs.surfAtlasW); u.surfAtlasH = UInt32(scs.surfAtlasH)
+            u.surfTriCount = UInt32(rts.rtTriangleCount)
         }
         // Debug isolation of the surface-cache term (see DebugTerm.surfaceCacheGI).
         u.debugSurfCacheGI = (debugTerm == .surfaceCacheGI) ? 1 : 0
@@ -107,23 +107,23 @@ extension IlluminatoramaRenderer {
         // start) when streaming is on, else the pure-feedback logger here. Draining in
         // both would zero the buffer before the residency pass could read it.
         let needFeedback = (surfaceCacheFeedback || surfaceCacheStreaming)
-            && cacheOn && surfCardRequestedBuffer != nil
+            && cacheOn && scs.surfCardRequestedBuffer != nil
         u.surfFeedbackEnabled = needFeedback ? 1 : 0
         if surfaceCacheFeedback, !surfaceCacheStreaming,
-           let rb = surfCardRequestedBuffer, surfCardCount > 0 {
+           let rb = scs.surfCardRequestedBuffer, scs.surfCardCount > 0 {
             awaitInFlightFrameBeforeCPUCacheWrite()   // the in-flight RT pass may still be marking cards
-            let p = rb.contents().bindMemory(to: UInt32.self, capacity: surfCardCount)
+            let p = rb.contents().bindMemory(to: UInt32.self, capacity: scs.surfCardCount)
             var requested = 0
-            for i in 0..<surfCardCount where p[i] != 0 { requested += 1 }
+            for i in 0..<scs.surfCardCount where p[i] != 0 { requested += 1 }
             if requested > 0 {
-                let pct = Int((Double(requested) / Double(surfCardCount) * 100).rounded())
-                Self.recordSurfCacheStats("feedback: requestedCards=\(requested) of \(surfCardCount) (\(pct)% working set)")
+                let pct = Int((Double(requested) / Double(scs.surfCardCount) * 100).rounded())
+                Self.recordSurfCacheStats("feedback: requestedCards=\(requested) of \(scs.surfCardCount) (\(pct)% working set)")
             }
-            memset(rb.contents(), 0, surfCardCount * MemoryLayout<UInt32>.stride)
+            memset(rb.contents(), 0, scs.surfCardCount * MemoryLayout<UInt32>.stride)
         }
         if curvesOn {
             u.curveInstanceBase = UInt32(instances.count)
-            u.curveSetCount = UInt32(rtCurveInstanceCount)
+            u.curveSetCount = UInt32(rts.rtCurveInstanceCount)
         }
         // ── Secondary-hit shading parity with the deferred pass ──────────────
         // A GI / reflection hit is now shaded by the SAME body the glass pass uses
@@ -134,8 +134,8 @@ extension IlluminatoramaRenderer {
         // BOTH paths — they were never glass-specific, only glass-first.
         u.skyIntensity = max(0, iblIntensity)
         u.albedoAtlasEnabled = (glassHitTexturingEnabled
-                                && rtObjUVBuffer != nil && rtObjUVCount > 0) ? 1 : 0
-        u.objUVCount = UInt32(rtObjUVCount)
+                                && rts.rtObjUVBuffer != nil && rts.rtObjUVCount > 0) ? 1 : 0
+        u.objUVCount = UInt32(rts.rtObjUVCount)
         u.pointLightCount = glassHitLocalLightsEnabled ? UInt32(pointLights.count) : 0
         u.spotLightCount = glassHitLocalLightsEnabled ? UInt32(spotLights.count) : 0
         u.interiorMask = glassHitInteriorFillEnabled ? interiorLayerMask : 0
@@ -170,9 +170,9 @@ extension IlluminatoramaRenderer {
         u.debugSurfCacheCharts = (debugTerm == .surfaceCacheCharts) ? 1 : 0
         var hitStats: MTLBuffer? = nil
         if Self.surfCacheStatsRequested {
-            surfHitStatsBuffer = surfCounterBuffer(surfHitStatsBuffer, slots: 8,
+            scs.surfHitStatsBuffer = surfCounterBuffer(scs.surfHitStatsBuffer, slots: 8,
                                                    label: "Illuminatorama.surfcache.hitStats")
-            if let sb = surfHitStatsBuffer {
+            if let sb = scs.surfHitStatsBuffer {
                 if let line = Self.surfCacheHitLine(drainSurfCounters(sb, slots: 8)) {
                     Self.recordSurfCacheStats(line)
                 }
@@ -183,98 +183,98 @@ extension IlluminatoramaRenderer {
         // DH-0872 — same coefficient the tonemap pass uses, applied to the GI
         // pass's own raw sky-miss sample (see the kernel's miss branch).
         u.scotopicDesaturation = max(0, scotopicDesaturation)
-        memcpy(rtInstUniformBuffer.contents(), &u, MemoryLayout<RTInstUniforms>.stride)
+        memcpy(rts.rtInstUniformBuffer.contents(), &u, MemoryLayout<RTInstUniforms>.stride)
 
         // DH-1344 — the radiance cache: allocated on first use, cleared with the GI history.
         let rcOn = u.radCacheCell != 0
         if rcOn {
             let cap = 1 << 21
-            if rcKeysBuffer == nil {
-                rcKeysBuffer = device.makeBuffer(length: cap * 4, options: .storageModePrivate)
-                rcDataBuffer = device.makeBuffer(length: cap * 16, options: .storageModePrivate)
-                rcNeedsClear = true
+            if rts.rcKeysBuffer == nil {
+                rts.rcKeysBuffer = device.makeBuffer(length: cap * 4, options: .storageModePrivate)
+                rts.rcDataBuffer = device.makeBuffer(length: cap * 16, options: .storageModePrivate)
+                rts.rcNeedsClear = true
             }
-            if rcNeedsClear, let k = rcKeysBuffer, let d = rcDataBuffer, let blit = cb.makeBlitCommandEncoder() {
+            if rts.rcNeedsClear, let k = rts.rcKeysBuffer, let d = rts.rcDataBuffer, let blit = cb.makeBlitCommandEncoder() {
                 blit.fill(buffer: k, range: 0..<k.length, value: 0)
                 blit.fill(buffer: d, range: 0..<d.length, value: 0)
                 blit.endEncoding()
-                rcNeedsClear = false
+                rts.rcNeedsClear = false
             }
         }
-        if rcDummyKeys == nil {
-            rcDummyKeys = device.makeBuffer(length: 16, options: .storageModePrivate)
-            rcDummyData = device.makeBuffer(length: 16, options: .storageModePrivate)
+        if rts.rcDummyKeys == nil {
+            rts.rcDummyKeys = device.makeBuffer(length: 16, options: .storageModePrivate)
+            rts.rcDummyData = device.makeBuffer(length: 16, options: .storageModePrivate)
         }
         guard let enc = timedComputeEncoder(cb, "rtLightingTLAS") else { return }
-        enc.setBuffer(rcOn ? rcKeysBuffer : rcDummyKeys, offset: 0, index: 21)
-        enc.setBuffer(rcOn ? rcDataBuffer : rcDummyData, offset: 0, index: 22)
+        enc.setBuffer(rcOn ? rts.rcKeysBuffer : rts.rcDummyKeys, offset: 0, index: 21)
+        enc.setBuffer(rcOn ? rts.rcDataBuffer : rts.rcDummyData, offset: 0, index: 22)
         enc.label = "Illuminatorama.rt.tlas"
         enc.setComputePipelineState(pipeline)
-        enc.setTexture(depthTexture, index: 0)
-        enc.setTexture(gbufferNormalRgh, index: 1)
-        enc.setTexture(gbufferAlbedoMet, index: 2)
-        enc.setTexture(hdrCompositeTexture, index: 3)
-        enc.setTexture(equirectSky ?? dummySkyTexture, index: 4)
+        enc.setTexture(gbs.depthTexture, index: 0)
+        enc.setTexture(gbs.gbufferNormalRgh, index: 1)
+        enc.setTexture(gbs.gbufferAlbedoMet, index: 2)
+        enc.setTexture(pfx.hdrCompositeTexture, index: 3)
+        enc.setTexture(equirectSky ?? ibls.dummySkyTexture, index: 4)
         // Current radiance atlas (read at hits); dummy when the cache is off.
-        enc.setTexture(cacheOn ? surfConsumerAtlas : (equirectSky ?? dummySkyTexture), index: 5)
+        enc.setTexture(cacheOn ? surfConsumerAtlas : (equirectSky ?? ibls.dummySkyTexture), index: 5)
         enc.setAccelerationStructure(tlas, bufferIndex: 0)
         enc.setBuffer(instData, offset: 0, index: 1)
         enc.setBuffer(objN, offset: 0, index: 2)
-        enc.setBuffer(rtInstUniformBuffer, offset: 0, index: 3)
+        enc.setBuffer(rts.rtInstUniformBuffer, offset: 0, index: 3)
         // Card buffers + per-instance soup base; dummies keep the binding valid
         // when the cache is off (the kernel never reads them then).
-        enc.setBuffer(cacheOn ? surfTriCardBuffer : instData, offset: 0, index: 4)
-        enc.setBuffer(cacheOn ? surfTriUVaBuffer : instData, offset: 0, index: 5)
-        enc.setBuffer(cacheOn ? surfTriUVcBuffer : instData, offset: 0, index: 6)
-        enc.setBuffer(cacheOn ? rtSoupTriBaseBuffer : instData, offset: 0, index: 7)
-        enc.setBuffer(cacheOn ? surfCardRectBuffer : instData, offset: 0, index: 8)  // per-card atlas rect
-        enc.setBuffer(cacheOn ? surfCardBuffer : (surfCardDummyBuffer ?? instData), offset: 0, index: 9)  // per-card material (L_out reconstruction); dummy must be ≥ 1 SurfCard for arg validation
+        enc.setBuffer(cacheOn ? scs.surfTriCardBuffer : instData, offset: 0, index: 4)
+        enc.setBuffer(cacheOn ? scs.surfTriUVaBuffer : instData, offset: 0, index: 5)
+        enc.setBuffer(cacheOn ? scs.surfTriUVcBuffer : instData, offset: 0, index: 6)
+        enc.setBuffer(cacheOn ? rts.rtSoupTriBaseBuffer : instData, offset: 0, index: 7)
+        enc.setBuffer(cacheOn ? scs.surfCardRectBuffer : instData, offset: 0, index: 8)  // per-card atlas rect
+        enc.setBuffer(cacheOn ? scs.surfCardBuffer : (surfCardDummyBuffer ?? instData), offset: 0, index: 9)  // per-card material (L_out reconstruction); dummy must be ≥ 1 SurfCard for arg validation
         // Curve-set data + pooled geometry (#60 item 7); dummies keep the
         // bindings valid for the base (curve-free) pipeline variant.
-        enc.setBuffer(curvesOn ? rtCurveSetDataBuffer : instData, offset: 0, index: 10)
-        enc.setBuffer(curvesOn ? rtCurvePoolPoints : instData, offset: 0, index: 11)
-        enc.setBuffer(curvesOn ? rtCurvePoolRadii : instData, offset: 0, index: 12)
-        enc.setBuffer(curvesOn ? rtCurvePoolSegments : instData, offset: 0, index: 13)
+        enc.setBuffer(curvesOn ? rts.rtCurveSetDataBuffer : instData, offset: 0, index: 10)
+        enc.setBuffer(curvesOn ? rts.rtCurvePoolPoints : instData, offset: 0, index: 11)
+        enc.setBuffer(curvesOn ? rts.rtCurvePoolRadii : instData, offset: 0, index: 12)
+        enc.setBuffer(curvesOn ? rts.rtCurvePoolSegments : instData, offset: 0, index: 13)
         // Phase 5 / A — residency feedback (buffer 14). Bound always (kernel
         // signature requires it); written only when `surfFeedbackEnabled`. Dummy =
         // instData when the cache/feedback buffer isn't live (never written then).
-        enc.setBuffer(surfCardRequestedBuffer ?? instData, offset: 0, index: 14)
+        enc.setBuffer(scs.surfCardRequestedBuffer ?? instData, offset: 0, index: 14)
         // Secondary-hit shading parity (buffers 15–18, textures 6–7). Same
         // resources the glass pass binds for the same job; dummies keep the
         // bindings valid when a term is off (the uniforms gate every read).
-        enc.setBuffer(rtObjUVBuffer ?? instData, offset: 0, index: 15)
+        enc.setBuffer(rts.rtObjUVBuffer ?? instData, offset: 0, index: 15)
         enc.setBuffer(albedoAtlas.uvScaleBuffer, offset: 0, index: 16)
         enc.setBuffer(pointLightBuffer, offset: 0, index: 17)
         enc.setBuffer(spotLightBuffer, offset: 0, index: 18)
-        enc.setBuffer(spotProfileBuffer, offset: 0, index: 23)   // DH-0540 — the spot-profile rows
+        enc.setBuffer(shd.spotProfileBuffer, offset: 0, index: 23)   // DH-0540 — the spot-profile rows
         // DH-0718 — area lights (buffer 20); a dummy when none are read.
         enc.setBuffer(secondaryAreaLightCount > 0 ? areaLightBuffer : instData, offset: 0, index: 20)
-        enc.setTexture(irradianceCube, index: 6)
+        enc.setTexture(ibls.irradianceCube, index: 6)
         enc.setTexture(albedoAtlas.texture, index: 7)
         // C2 — the noisy diffuse (soft shadow + GI) goes to its own buffer so the
         // temporal accumulator + SVGF/bilateral can clean it, exactly as the soup
         // path does. Before this the TLAS kernel composited it inline, which is
         // why both denoisers sat in the soup-only `else` branch doing nothing.
-        enc.setTexture(rtDiffuseTexture, index: 8)
-        enc.setTexture(specIBLOn ? specIBLTexture : specIBLDummyTexture, index: 9)
-        enc.setTexture(diffSkyOn ? diffSkyTexture : diffSkyDummyTexture, index: 10)
-        enc.setTexture(dfgLUT, index: 11)              // DH-1014 — `layeredRTWeights`
-        enc.setTexture(gbufferEmission, index: 12)     // DH-1014 — the cloth-sheen decode
+        enc.setTexture(rts.rtDiffuseTexture, index: 8)
+        enc.setTexture(specIBLOn ? ibls.specIBLTexture : specIBLDummyTexture, index: 9)
+        enc.setTexture(diffSkyOn ? ibls.diffSkyTexture : diffSkyDummyTexture, index: 10)
+        enc.setTexture(ibls.dfgLUT, index: 11)              // DH-1014 — `layeredRTWeights`
+        enc.setTexture(gbs.gbufferEmission, index: 12)     // DH-1014 — the cloth-sheen decode
         // DH-0653 hit/miss counters (buffer 19). Dummy = instData, never added to while
         // `surfStatsEnabled` is 0.
         enc.setBuffer(hitStats ?? instData, offset: 0, index: 19)
         // DH-1304 — the AOV capture (texture 13 + buffer 24 exist only in the `aov` variants).
-        if aovActiveThisFrame, let aovTex = aovTexture {
+        if aovs.aovActiveThisFrame, let aovTex = aovs.aovTexture {
             enc.setTexture(aovTex, index: 13)
-            var au = AOVUniforms(blend: aovFrameBlend, handoff: diffSkyOn ? 1 : 0)
+            var au = AOVUniforms(blend: aovs.aovFrameBlend, handoff: diffSkyOn ? 1 : 0)
             enc.setBytes(&au, length: MemoryLayout<AOVUniforms>.stride, index: 24)
         }
         // The TLAS references the BLASes, which reference the mesh vertex/index
         // buffers (and the curve BLASes the pooled curve buffers) — all must be
         // resident for the intersector.
-        for blas in rtBLASList { enc.useResource(blas, usage: .read) }
-        for blas in rtCurveBLASList { enc.useResource(blas, usage: .read) }
-        for buf in rtResidentBuffers { enc.useResource(buf, usage: .read) }
+        for blas in rts.rtBLASList { enc.useResource(blas, usage: .read) }
+        for blas in rts.rtCurveBLASList { enc.useResource(blas, usage: .read) }
+        for buf in rts.rtResidentBuffers { enc.useResource(buf, usage: .read) }
         dispatch(enc, pipeline: pipeline, width: width, height: height,
                  maxThreadsOverride: rtThreadgroupMax)
         enc.endEncoding()
@@ -286,22 +286,22 @@ extension IlluminatoramaRenderer {
     /// `rtEnabled`, the device supports RT, and a geometry/AS has been built.
     func encodeRTLightingPass(_ cb: MTLCommandBuffer) {
         guard rtEnabled, rtSupported,
-              let basePipeline = rtPipeline, let accel = rtAccel,
-              let triA = rtTriAlbedoBuffer, let triN = rtTriNormalBuffer,
-              let vb = rtVertexBuffer, let ib = rtIndexBuffer,
-              rtTriangleCount > 0 else { return }
+              let basePipeline = rts.rtPipeline, let accel = rts.rtAccel,
+              let triA = rts.rtTriAlbedoBuffer, let triN = rts.rtTriNormalBuffer,
+              let vb = rts.rtVertexBuffer, let ib = rts.rtIndexBuffer,
+              rts.rtTriangleCount > 0 else { return }
         // Curve primitives (#60 item 7 incr. 2): when the soup AS holds a curve
         // geometry descriptor, the intersector's geometry-type contract must
         // include curves, so the kRTCurvesEnabled variant is REQUIRED.
-        let curvesOn = rtSoupCurvesActive && rtSoupCurvePipeline != nil
-            && rtSoupCurveSetDataBuffer != nil && rtSoupCurvePoolPoints != nil
-            && rtSoupCurveRadii != nil && rtSoupCurveSegments != nil
-        let pipeline = curvesOn ? rtSoupCurvePipeline! : basePipeline
+        let curvesOn = rts.rtSoupCurvesActive && rts.rtSoupCurvePipeline != nil
+            && rts.rtSoupCurveSetDataBuffer != nil && rts.rtSoupCurvePoolPoints != nil
+            && rts.rtSoupCurveRadii != nil && rts.rtSoupCurveSegments != nil
+        let pipeline = curvesOn ? rts.rtSoupCurvePipeline! : basePipeline
 
         // Pull the (jittered) invVP + camera position the G-buffer used so the
         // world reconstruction matches the deferred passes exactly.
         let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
-        rtFrameSeed &+= 1
+        rts.rtFrameSeed &+= 1
         var u = RTUniforms(
             invViewProjection: fu.invViewProjection,
             cameraWorldPos: fu.cameraWorldPos,
@@ -311,8 +311,8 @@ extension IlluminatoramaRenderer {
             width: UInt32(width), height: UInt32(height),
             shadowRays: UInt32(max(1, min(16, rtShadowRays))),
             giRays: UInt32(max(1, min(16, rtGIRays))),
-            frameSeed: rtFrameSeed, rayTMin: 0.004, maxGIDist: 60.0,
-            triangleCount: UInt32(rtTriangleCount),
+            frameSeed: rts.rtFrameSeed, rayTMin: 0.004, maxGIDist: 60.0,
+            triangleCount: UInt32(rts.rtTriangleCount),
             reflStrength: max(0, rtReflStrength),
             reflMaxDist: max(0.1, rtReflMaxDistance),
             reflRoughnessCutoff: max(0, rtReflRoughnessCutoff),
@@ -322,8 +322,8 @@ extension IlluminatoramaRenderer {
             // Must be the ACTIVE tile size the atlas + update pass use (6 for
             // per-triangle cards, 64 for the room), NOT the 64 default — else the
             // read samples at the wrong scale and bleeds across tiles.
-            surfTileSize: UInt32(surfActiveTileSize), surfTilesPerRow: UInt32(surfTilesPerRow),
-            surfAtlasW: UInt32(surfAtlasW), surfAtlasH: UInt32(surfAtlasH),
+            surfTileSize: UInt32(scs.surfActiveTileSize), surfTilesPerRow: UInt32(scs.surfTilesPerRow),
+            surfAtlasW: UInt32(scs.surfAtlasW), surfAtlasH: UInt32(scs.surfAtlasH),
             leafTransmission: max(0, leafTransmission))
         u.curvesEnabled = curvesOn ? 1 : 0
         // C1 — exactly one sun. See `RTSunOwnership`; `.automatic` (the default)
@@ -333,50 +333,50 @@ extension IlluminatoramaRenderer {
         // DH-0872 — same coefficient the tonemap pass uses, applied to the GI
         // pass's own raw sky-miss sample (see the kernel's miss branch).
         u.scotopicDesaturation = max(0, scotopicDesaturation)
-        memcpy(rtUniformBuffer.contents(), &u, MemoryLayout<RTUniforms>.stride)
+        memcpy(rts.rtUniformBuffer.contents(), &u, MemoryLayout<RTUniforms>.stride)
 
         guard let enc = cb.makeComputeCommandEncoder() else { return }
         enc.label = "Illuminatorama.rt"
         enc.setComputePipelineState(pipeline)
-        enc.setTexture(depthTexture, index: 0)
-        enc.setTexture(gbufferNormalRgh, index: 1)
-        enc.setTexture(gbufferAlbedoMet, index: 2)
-        enc.setTexture(hdrCompositeTexture, index: 3)
-        enc.setTexture(equirectSky ?? dummySkyTexture, index: 4)
+        enc.setTexture(gbs.depthTexture, index: 0)
+        enc.setTexture(gbs.gbufferNormalRgh, index: 1)
+        enc.setTexture(gbs.gbufferAlbedoMet, index: 2)
+        enc.setTexture(pfx.hdrCompositeTexture, index: 3)
+        enc.setTexture(equirectSky ?? ibls.dummySkyTexture, index: 4)
         // Surface-cache atlas (current) + per-triangle card-UV maps. Always
         // bound; the kernel gates reads on `surfCacheEnabled`. Dummies keep
         // Metal happy when the cache is off / unbuilt.
-        enc.setTexture(surfConsumerAtlas ?? dummySkyTexture, index: 5)
-        enc.setTexture(rtDiffuseTexture, index: 6)   // diffuse (shadow+GI) → denoise pass
+        enc.setTexture(surfConsumerAtlas ?? ibls.dummySkyTexture, index: 5)
+        enc.setTexture(rts.rtDiffuseTexture, index: 6)   // diffuse (shadow+GI) → denoise pass
         enc.setAccelerationStructure(accel, bufferIndex: 0)
         enc.setBuffer(triA, offset: 0, index: 1)
         enc.setBuffer(triN, offset: 0, index: 2)
-        enc.setBuffer(rtUniformBuffer, offset: 0, index: 3)
-        enc.setBuffer(surfTriCardBuffer ?? ib, offset: 0, index: 4)
-        enc.setBuffer(surfTriUVaBuffer ?? triA, offset: 0, index: 5)
-        enc.setBuffer(surfTriUVcBuffer ?? triA, offset: 0, index: 6)
-        enc.setBuffer(surfCardRectBuffer ?? triA, offset: 0, index: 8) // per-card atlas rect (dummy off)
-        enc.setBuffer(surfCardBuffer ?? surfCardDummyBuffer ?? triA, offset: 0, index: 9)     // per-card material (L_out reconstruction; dummy off, ≥ 1 SurfCard for arg validation)
+        enc.setBuffer(rts.rtUniformBuffer, offset: 0, index: 3)
+        enc.setBuffer(scs.surfTriCardBuffer ?? ib, offset: 0, index: 4)
+        enc.setBuffer(scs.surfTriUVaBuffer ?? triA, offset: 0, index: 5)
+        enc.setBuffer(scs.surfTriUVcBuffer ?? triA, offset: 0, index: 6)
+        enc.setBuffer(scs.surfCardRectBuffer ?? triA, offset: 0, index: 8) // per-card atlas rect (dummy off)
+        enc.setBuffer(scs.surfCardBuffer ?? surfCardDummyBuffer ?? triA, offset: 0, index: 9)     // per-card material (L_out reconstruction; dummy off, ≥ 1 SurfCard for arg validation)
         // Curve set data + pooled geometry (#60 item 7 incr. 2); dummies keep the
         // bindings valid for the base (curve-free) pipeline variant.
-        enc.setBuffer(curvesOn ? rtSoupCurveSetDataBuffer : triA, offset: 0, index: 10)
-        enc.setBuffer(curvesOn ? rtSoupCurvePoolPoints : triA, offset: 0, index: 11)
-        enc.setBuffer(curvesOn ? rtSoupCurveRadii : triA, offset: 0, index: 12)
-        enc.setBuffer(curvesOn ? rtSoupCurveSegments : triA, offset: 0, index: 13)
+        enc.setBuffer(curvesOn ? rts.rtSoupCurveSetDataBuffer : triA, offset: 0, index: 10)
+        enc.setBuffer(curvesOn ? rts.rtSoupCurvePoolPoints : triA, offset: 0, index: 11)
+        enc.setBuffer(curvesOn ? rts.rtSoupCurveRadii : triA, offset: 0, index: 12)
+        enc.setBuffer(curvesOn ? rts.rtSoupCurveSegments : triA, offset: 0, index: 13)
         // Curve-only primitive AS (#60 item 7 incr. 2) — a SECOND acceleration
         // structure the kernel traces alongside the triangle soup. Bind the
         // triangle `accel` as a harmless dummy for the base (curve-free) variant.
-        enc.setAccelerationStructure((curvesOn ? rtSoupCurveAccel : nil) ?? accel, bufferIndex: 14)
+        enc.setAccelerationStructure((curvesOn ? rts.rtSoupCurveAccel : nil) ?? accel, bufferIndex: 14)
         // The intersector reads triangle vertex positions (and, when curves are
         // active, the curve control points) through the AS; Metal needs explicit
         // residency hints for the buffers it can't statically prove are referenced.
         enc.useResource(vb, usage: .read)
         enc.useResource(ib, usage: .read)
         if curvesOn {
-            if let ca = rtSoupCurveAccel { enc.useResource(ca, usage: .read) }
-            if let p = rtSoupCurvePoolPoints { enc.useResource(p, usage: .read) }
-            if let r = rtSoupCurveRadii { enc.useResource(r, usage: .read) }
-            if let s = rtSoupCurveSegments { enc.useResource(s, usage: .read) }
+            if let ca = rts.rtSoupCurveAccel { enc.useResource(ca, usage: .read) }
+            if let p = rts.rtSoupCurvePoolPoints { enc.useResource(p, usage: .read) }
+            if let r = rts.rtSoupCurveRadii { enc.useResource(r, usage: .read) }
+            if let s = rts.rtSoupCurveSegments { enc.useResource(s, usage: .read) }
         }
         dispatch(enc, pipeline: pipeline, width: width, height: height)
         enc.endEncoding()
@@ -391,8 +391,8 @@ extension IlluminatoramaRenderer {
         // A live TLAS routes to `encodeRTLightingTLASPass`, which only runs (and only
         // writes the buffer) when the opaque lighting pass is enabled. A glass-only
         // TLAS therefore correctly reports false.
-        if rtTLASActive { return rtOpaqueLightingEnabled }
-        return rtPipeline != nil && rtAccel != nil && rtTriangleCount > 0
+        if rts.rtTLASActive { return rtOpaqueLightingEnabled }
+        return rts.rtPipeline != nil && rts.rtAccel != nil && rts.rtTriangleCount > 0
     }
 
     /// Clean the RT diffuse (soft shadow + 1-bounce GI) and composite it. Shared by
@@ -431,17 +431,17 @@ extension IlluminatoramaRenderer {
                 | (rtGIStaticAccumulation && rtGIStillPerFrame && taaStillAccumulation ? 4 : 0))
         guard let enc = timedComputeEncoder(cb, "rt.giTemporal") else { return }
         enc.label = "Illuminatorama.rt.giTemporal"
-        enc.setComputePipelineState(rtGITemporalPipeline)
-        enc.setTexture(rtDiffuseTexture,           index: 0)  // current raw GI
+        enc.setComputePipelineState(rts.rtGITemporalPipeline)
+        enc.setTexture(rts.rtDiffuseTexture,           index: 0)  // current raw GI
         enc.setTexture(previousRTGIHistoryTexture, index: 1)  // history read
-        enc.setTexture(velocityTexture,            index: 2)
+        enc.setTexture(pfx.velocityTexture,            index: 2)
         enc.setTexture(currentRTGIHistoryTexture,  index: 3)  // accumulated write
-        enc.setTexture(giSampleCount,              index: 4)  // adaptive count (read_write)
-        enc.setTexture(gbufferAlbedoMet,           index: 5)  // still: irradiance demodulation (DH-0966)
+        enc.setTexture(rts.giSampleCount,              index: 4)  // adaptive count (read_write)
+        enc.setTexture(gbs.gbufferAlbedoMet,           index: 5)  // still: irradiance demodulation (DH-0966)
         // `setBytes`, not the shared single buffer: with two frames in flight a memcpy into one
         // buffer can hand the GPU the NEXT frame's `isFirstFrame` / mode (DH-0887 audit).
         enc.setBytes(&u, length: MemoryLayout<RTGITemporalUniforms>.stride, index: 0)
-        dispatch(enc, pipeline: rtGITemporalPipeline, width: width, height: height)
+        dispatch(enc, pipeline: rts.rtGITemporalPipeline, width: width, height: height)
         enc.endEncoding()
     }
 
@@ -470,13 +470,13 @@ extension IlluminatoramaRenderer {
         do {
             guard let enc = cb.makeComputeCommandEncoder() else { return }
             enc.label = "Illuminatorama.svgf.variance"
-            enc.setComputePipelineState(svgfVariancePipeline)
+            enc.setComputePipelineState(rts.svgfVariancePipeline)
             enc.setTexture(currentRTGIHistoryTexture, index: 0)  // accumulated GI
-            enc.setTexture(giVariance,                index: 1)  // variance output
+            enc.setTexture(rts.giVariance,                index: 1)  // variance output
             var u = SVGFAtrousUniforms(width: W, height: H, stepSize: 1,
                                         sigmaL: svgfSigmaL, sigmaZ: svgfSigmaZ, sigmaN: svgfSigmaN)
             enc.setBytes(&u, length: MemoryLayout<SVGFAtrousUniforms>.stride, index: 0)
-            dispatch(enc, pipeline: svgfVariancePipeline, width: width, height: height)
+            dispatch(enc, pipeline: rts.svgfVariancePipeline, width: width, height: height)
             enc.endEncoding()
         }
 
@@ -492,25 +492,25 @@ extension IlluminatoramaRenderer {
         //   level 1: cIn=giAtrousA  vIn=giVarianceB → cOut=giAtrousB  vOut=giVariance
         //   level 2: cIn=giAtrousB  vIn=giVariance  → cOut=giAtrousA  vOut=giVarianceB
         //   … colour and variance never share a texture. Result in `lastColorOut`.
-        var lastColorOut = giAtrousA
+        var lastColorOut = rts.giAtrousA!
         for level in 0..<levels {
             let stepSize = UInt32(1 << level)
-            let cIn  = level == 0 ? currentRTGIHistoryTexture : (level % 2 == 1 ? giAtrousA : giAtrousB)
-            let cOut = level % 2 == 0 ? giAtrousA  : giAtrousB
-            let vIn  = level % 2 == 0 ? giVariance : giVarianceB
-            let vOut = level % 2 == 0 ? giVarianceB : giVariance
-            lastColorOut = cOut
+            let cIn  = level == 0 ? currentRTGIHistoryTexture : (level % 2 == 1 ? rts.giAtrousA : rts.giAtrousB)
+            let cOut = level % 2 == 0 ? rts.giAtrousA  : rts.giAtrousB
+            let vIn  = level % 2 == 0 ? rts.giVariance : rts.giVarianceB
+            let vOut = level % 2 == 0 ? rts.giVarianceB : rts.giVariance
+            lastColorOut = cOut!
 
             guard let enc = cb.makeComputeCommandEncoder() else { return }
             enc.label = "Illuminatorama.svgf.atrous.\(level)"
-            enc.setComputePipelineState(svgfAtrousPipeline)
+            enc.setComputePipelineState(rts.svgfAtrousPipeline)
             enc.setTexture(cIn,              index: 0)
             enc.setTexture(vIn,              index: 1)
-            enc.setTexture(depthTexture,     index: 2)
-            enc.setTexture(gbufferNormalRgh, index: 3)
+            enc.setTexture(gbs.depthTexture,     index: 2)
+            enc.setTexture(gbs.gbufferNormalRgh, index: 3)
             enc.setTexture(cOut,             index: 4)
             enc.setTexture(vOut,             index: 5)
-            enc.setTexture(gbufferAlbedoMet, index: 6)
+            enc.setTexture(gbs.gbufferAlbedoMet, index: 6)
             let flags: UInt32 = (giIrradianceMode && level == levels - 1 ? 1 : 0)
                 | (!svgfStillLuminanceStop && rtGIStaticAccumulation ? 4 : 0)
             var u = SVGFAtrousUniforms(width: W, height: H, stepSize: stepSize, flags: flags,
@@ -518,7 +518,7 @@ extension IlluminatoramaRenderer {
                                         lumFloor: effectiveSVGFLumFloor)
             enc.setBytes(&u, length: MemoryLayout<SVGFAtrousUniforms>.stride, index: 0)
             enc.setBuffer(frameUniformBuffer, offset: 0, index: 1)  // invProjection for linear depth
-            dispatch(enc, pipeline: svgfAtrousPipeline, width: width, height: height)
+            dispatch(enc, pipeline: rts.svgfAtrousPipeline, width: width, height: height)
             enc.endEncoding()
         }
 
@@ -531,17 +531,17 @@ extension IlluminatoramaRenderer {
         var du = RTDenoiseUniforms(width: UInt32(width), height: UInt32(height),
                                    enabled: 0, radius: 0,
                                    kDepth: 0, kNorm: 0)
-        memcpy(rtDenoiseUniformBuffer.contents(), &du, MemoryLayout<RTDenoiseUniforms>.stride)
+        memcpy(rts.rtDenoiseUniformBuffer.contents(), &du, MemoryLayout<RTDenoiseUniforms>.stride)
         guard let enc = timedComputeEncoder(cb, "svgf.composite") else { return }
         enc.label = "Illuminatorama.svgf.composite"
-        enc.setComputePipelineState(rtDenoisePipeline)
+        enc.setComputePipelineState(rts.rtDenoisePipeline)
         enc.setTexture(source,              index: 0)
-        enc.setTexture(depthTexture,        index: 1)
-        enc.setTexture(gbufferNormalRgh,    index: 2)
-        enc.setTexture(hdrCompositeTexture, index: 3)
+        enc.setTexture(gbs.depthTexture,        index: 1)
+        enc.setTexture(gbs.gbufferNormalRgh,    index: 2)
+        enc.setTexture(pfx.hdrCompositeTexture, index: 3)
         enc.setBuffer(frameUniformBuffer,       offset: 0, index: 0)
-        enc.setBuffer(rtDenoiseUniformBuffer,   offset: 0, index: 1)
-        dispatch(enc, pipeline: rtDenoisePipeline, width: width, height: height)
+        enc.setBuffer(rts.rtDenoiseUniformBuffer,   offset: 0, index: 1)
+        dispatch(enc, pipeline: rts.rtDenoisePipeline, width: width, height: height)
         enc.endEncoding()
     }
 
@@ -559,17 +559,217 @@ extension IlluminatoramaRenderer {
             radius: UInt32(max(0, min(4, rtDenoiseRadius))),
             kDepth: max(0, rtDenoiseDepthSensitivity),
             kNorm: max(0, rtDenoiseNormalSharpness))
-        memcpy(rtDenoiseUniformBuffer.contents(), &u, MemoryLayout<RTDenoiseUniforms>.stride)
+        memcpy(rts.rtDenoiseUniformBuffer.contents(), &u, MemoryLayout<RTDenoiseUniforms>.stride)
         guard let enc = timedComputeEncoder(cb, "rt.denoise") else { return }
         enc.label = "Illuminatorama.rt.denoise"
-        enc.setComputePipelineState(rtDenoisePipeline)
+        enc.setComputePipelineState(rts.rtDenoisePipeline)
         enc.setTexture(rtDiffuseDenoiseSource, index: 0)
-        enc.setTexture(depthTexture,        index: 1)
-        enc.setTexture(gbufferNormalRgh,    index: 2)
-        enc.setTexture(hdrCompositeTexture, index: 3)
+        enc.setTexture(gbs.depthTexture,        index: 1)
+        enc.setTexture(gbs.gbufferNormalRgh,    index: 2)
+        enc.setTexture(pfx.hdrCompositeTexture, index: 3)
         enc.setBuffer(frameUniformBuffer,     offset: 0, index: 0)
-        enc.setBuffer(rtDenoiseUniformBuffer, offset: 0, index: 1)
-        dispatch(enc, pipeline: rtDenoisePipeline, width: width, height: height)
+        enc.setBuffer(rts.rtDenoiseUniformBuffer, offset: 0, index: 1)
+        dispatch(enc, pipeline: rts.rtDenoisePipeline, width: width, height: height)
         enc.endEncoding()
     }
+}
+
+// MARK: - RTState
+
+/// Hardware ray tracing: acceleration structures, TLAS/curve pools, GI history + denoise, radiance cache, RT uniform buffers.
+/// Owned by the renderer as `rts`; every member keeps the name it had on the renderer.
+@MainActor
+final class RTState {
+    /// The unjittered view-projection of the last frozen-camera resolve (see the camera-cut guard
+    /// in `render`); nil while still mode is off.
+    var lastStillViewProjection: simd_float4x4?
+    var previousRTGIStatic = false
+
+    var rcFramesSinceReset = 0
+    var rcKeysBuffer: MTLBuffer?
+    var rcDataBuffer: MTLBuffer?
+    var rcDummyKeys: MTLBuffer?
+    var rcDummyData: MTLBuffer?
+
+    // RT diffuse (soft shadow + 1-bounce GI) buffer — written by the RT pass,
+    // bilateral-filtered into the composite by `encodeRTDenoiseComposite`.
+    var rtDiffuseTexture: MTLTexture!
+
+    // RT-GI temporal accumulation: the rtDiffuse term gets its own
+    // velocity-reprojected exponential history so the 1-bounce GI keeps
+    // converging under camera motion (the main TAA can't). Ping-pong, full-res.
+    var rtGIHistoryA: MTLTexture!  // full-res, rgba16Float
+    var rtGIHistoryB: MTLTexture!
+    var rtGIHistoryToggle: Bool = false
+
+    var rcNeedsClear = true
+    var previousRTGITemporalEnabled: Bool = false
+
+    var giSampleCount: MTLTexture!  // full-res
+    // SVGF à-trous cascade textures for RT GI (when svgfEnabled).
+    // Color ping-pongs {giAtrousA, giAtrousB}; variance ping-pongs {giVariance,
+    // giVarianceB}. The two pairs MUST stay disjoint — an à-trous level reads one
+    // signal at dilated neighbour taps while writing the other to its own texel, so
+    // any shared texture is an in-place read/write race that corrupts colour in a
+    // dilated-stride pattern (the issue-#65 masonry). Three buffers can't keep both
+    // ping-pongs disjoint; hence the fourth.
+    var giVariance: MTLTexture!  // full-res r16Float (variance A)
+    var giVarianceB: MTLTexture!  // full-res r16Float (variance B)
+    var giAtrousA: MTLTexture!  // full-res rgba16Float
+    var giAtrousB: MTLTexture!  // full-res rgba16Float
+
+    var previousGIIrradianceMode = false
+
+    var rtDenoisePipeline: MTLComputePipelineState!
+    var rtGITemporalPipeline: MTLComputePipelineState!
+    var svgfVariancePipeline: MTLComputePipelineState!  // Phase 4.44 SVGF
+    var svgfAtrousPipeline: MTLComputePipelineState!  // Phase 4.44 SVGF
+
+    var rtProxyMeshKinds: Set<IlluminatoramaRenderer.MeshKind> = []
+
+    var rtPipeline: MTLComputePipelineState?
+    var rtAccel: MTLAccelerationStructure?
+    var rtScratch: MTLBuffer?
+    var rtVertexBuffer: MTLBuffer?
+    var rtIndexBuffer: MTLBuffer?
+    var rtTriAlbedoBuffer: MTLBuffer?
+    var rtTriNormalBuffer: MTLBuffer?
+    var rtTriangleCount: Int = 0
+    var rtUniformBuffer: MTLBuffer!
+    var rtDenoiseUniformBuffer: MTLBuffer!
+    var rtGITemporalUniformBuffer: MTLBuffer!
+    var rtFrameSeed: UInt32 = 0
+
+    var rtTLASPipeline: MTLComputePipelineState?
+
+    var rtMeshCache: [ObjectIdentifier: IlluminatoramaRenderer.RTMeshEntry] = [:]
+    /// Whether any cached mesh needs the per-frame refit. Stored rather than derived so the
+    /// per-frame static-skip test stays O(1); maintained by `pruneRTMeshCache()`, which runs
+    /// on every rebuild — the only occasion the answer can change.
+    var rtHasDeformingBLAS = false
+
+    var rtResidentBuffers: [MTLBuffer] = []   // mesh vb/ib the BLASes reference
+    var rtBLASList: [MTLAccelerationStructure] = []   // index = accelerationStructureIndex
+    var rtObjNormalBuffer: MTLBuffer?  // concatenated object-space per-tri normals (float4)
+    var rtObjNormalCount: Int = 0
+    /// Concatenated per-triangle MESH UVs (3 × `float2` per triangle), built in
+    /// lockstep with `rtObjNormalBuffer` so a hit reads its texture coordinates at
+    /// `(normalBase + primitive_id) * 3`. Lets a ray-traced hit take a REAL albedo
+    /// atlas sample instead of the instance's mean albedo — the through-glass
+    /// "flat slabs" fix. Nil when no mesh exposed CPU-readable vertices.
+    var rtObjUVBuffer: MTLBuffer?
+    var rtObjUVCount: Int = 0
+
+    // Surface cache (P1c): per-TLAS-instance base offset into the grouped soup
+    // triangle list (== the `triCard`/`triUVa`/`triUVc` index space). Built
+    // alongside the world-space soup in `rebuildRTAccel` when the cache is on,
+    // so a TLAS hit resolves `soupTriBase[instance_id] + primitive_id` → card.
+    var rtSoupTriBaseBuffer: MTLBuffer?
+    var rtSoupTriBaseCount: Int = 0
+
+    var rtInstanceDataBuffer: MTLBuffer?  // RTInstanceData[], grouped order
+    var rtInstanceDescBuffer: MTLBuffer?  // MTLAccelerationStructureInstanceDescriptor[]
+    var rtTLAS: MTLAccelerationStructure?
+    var rtTLASScratch: MTLBuffer?
+    var rtTLASCapacity: Int = 0
+    var rtTLASInstanceCount: Int = 0
+    var rtTLASTopologyHash: Int = .min
+    // ── Curve primitives (#60 item 7, increment 1) ──
+    // Sets adopted from `IlluminatoramaCurveRegistry` (synced per frame by
+    // version). Control points / radii / segment indices for ALL sets are
+    // pooled into three shared buffers (segment index values are ABSOLUTE into
+    // the pool, so every curve BLAS and the shading kernels read the same
+    // pool with only a per-set segment base). One curve BLAS per set; one TLAS
+    // instance per set, appended AFTER the triangle instances — a curve hit's
+    // `instance_id - curveInstanceBase` is its set index. Kernels that trace
+    // the TLAS switch to a `kRTCurvesEnabled` function-constant variant when
+    // curves are present (the intersector's geometry-type contract must match
+    // the AS content), so curve-free scenes keep the exact pipelines they had.
+    var rtCurveSets: [IlluminatoramaCurveSet] = []
+    var rtCurveSyncVersion: Int = 0
+    var rtCurveBLASList: [MTLAccelerationStructure] = []
+    var rtCurvePoolPoints: MTLBuffer?  // packed float3 (stride 12)
+    var rtCurvePoolRadii: MTLBuffer?  // float
+    var rtCurvePoolSegments: MTLBuffer?  // uint32, absolute into the pool
+    var rtCurvePoolPointCount: Int = 0
+    var rtCurveSetSegmentBase: [Int] = [] // per set: first segment in the pool
+    var rtCurveSetDataBuffer: MTLBuffer?  // RTCurveSetData per set
+    var rtCurveInstanceCount: Int = 0     // sets in the CURRENT TLAS topology
+    var rtTLASCurvePipeline: MTLComputePipelineState?
+
+    // ── Curve primitives on the SOUP path (#60 item 7, increment 2) ──
+    // Forest et al. are native soup scenes (`setRTGeometry` → primitive AS,
+    // `encodeRTLightingPass`), not the TLAS path. The soup AS gains a SECOND
+    // geometry descriptor (a curve geometry) alongside the triangle soup; a hit
+    // is a curve iff `res.type == curve` (single set, identity-placed, so no
+    // instance_id). The pooled rest points are re-displaced per frame by the
+    // wind kernel and the AS is refit, so the RT wood sways with the raster tubes.
+    var rtSoupCurveSet: IlluminatoramaCurveSet?
+    var rtSoupCurveSyncVersion: Int = 0
+    var rtSoupCurvesActive: Bool = false
+    var rtSoupCurveRestPoints: MTLBuffer?  // packed float3, un-swayed (kernel input)
+    var rtSoupCurvePoolPoints: MTLBuffer?  // packed float3, AS-referenced (kernel output / rest copy)
+    var rtSoupCurveRadii: MTLBuffer?  // float
+    var rtSoupCurveSegments: MTLBuffer?  // uint32 (relative — single geometry descriptor)
+    var rtSoupCurveWindAttr: MTLBuffer?  // float4 per point (empty set ⇒ nil ⇒ rigid)
+    var rtSoupCurveSetDataBuffer: MTLBuffer?  // single RTCurveSetData
+    var rtSoupCurvePointCount: Int = 0
+    var rtSoupCurveSegmentCount: Int = 0
+    /// SEPARATE curve-only primitive AS (#60 item 7 incr. 2). Metal forbids mixing
+    /// triangle + curve geometry descriptors in ONE primitive AS ("must be the
+    /// same type"), so curves live in their own AS and the kernel traces BOTH
+    /// (any-hit occludes; nearest-hit compares distance). `.refit` usage for sway.
+    var rtSoupCurveAccel: MTLAccelerationStructure?
+    var rtSoupRefitScratch: MTLBuffer?
+    var rtSoupCurvePipeline: MTLComputePipelineState?
+
+    var curveWindDisplacePipeline: MTLComputePipelineState?
+
+    /// Freeze curves at rest pose (A/B for the sway refit). `VIZ_ILLUMI_NO_CURVE_REFIT=1`.
+    let noCurveRefit = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_CURVE_REFIT"] == "1"
+    var curveDbgPrinted = false   // VIZ_CURVE_DEBUG one-shot
+    var rtInstUniformBuffer: MTLBuffer!
+    var rtInstFrameSeed: UInt32 = 0
+    /// DH-0887 — +1 per TLAS lighting dispatch, never by any other pass, so the GI's Sobol index
+    /// is contiguous (`rtInstFrameSeed` also advances in the glass pass, and every-other Sobol
+    /// index covers only half of the unit square).
+    var rtGIProgressiveIndex: UInt32 = 0
+
+    /// True after a successful TLAS (re)build/refit this frame — the RT pass
+    /// then traces the instance AS instead of the primitive-AS soup.
+    var rtTLASActive: Bool = false
+
+    // ── Phase 4.37a — RT hang-proof guard ────────────────────────────────
+    // A scene whose geometry is GPU-fed (regenerated `IlluminatoramaMesh`
+    // identities each frame) or whose mesh set/topology otherwise changes
+    // every frame makes `rtTopologyHash()` differ every frame → `updateRTAccel`
+    // takes the REBUILD branch each frame (new per-mesh BLAS builds, each with
+    // a `waitUntilCompleted`, + a TLAS rebuild) → the main thread hangs and a
+    // faulted AS traces to magenta. The descriptor-driven per-scene RT opt-in
+    // (Phase 4.36/4.37) runs RT in the live tick loop, so any flagged scene
+    // could trip this. Two gates make RT fail safe (fall back to non-RT, never
+    // hang): an UP-FRONT size cap, and a rebuild-THRASH counter.
+    //
+    // The guard used to LATCH until the next scene attach, and that was wrong
+    // for an editor. In a document app the model mutates on every tick of a
+    // drag (push/pull a wall ⇒ new wall meshes ⇒ a new topology hash every
+    // frame), so seven frames into the drag the thrash counter tripped, RT
+    // glass switched off mid-gesture, and it NEVER came back: a perf spike
+    // followed by a permanent visual pop, with no user-reachable way to restore
+    // it short of reopening the document. The guard's real job is "don't rebuild
+    // a thrashing TLAS", which stops being true the moment the scene settles.
+    //
+    // So the trip is now RECOVERABLE. While disabled the renderer keeps
+    // evaluating cheap evidence each frame — the size caps (a scene can shrink
+    // back under them) and the topology hash — and re-arms RT once the topology
+    // has held still for `rtRecoveryStableFrames`. A genuinely thrashing scene
+    // (Forest: GPU-fed leaf geometry, a different hash every single frame) never
+    // satisfies that and stays disabled exactly as before, which is the
+    // property the hang-proofing depends on.
+    /// The guard's whole state, as one testable value (see
+    /// `IlluminatoramaRTHangGuard` for the recovery semantics and why they
+    /// changed from a permanent latch).
+    var rtGuard = IlluminatoramaRTHangGuard()
+
+    var rtConsecutiveRebuilds: Int = 0
 }

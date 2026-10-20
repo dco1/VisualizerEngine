@@ -414,14 +414,14 @@ extension IlluminatoramaRenderer {
                                      tileSize overrideTileSize: Int? = nil,
                                      adaptiveTiles: Bool = false,
                                      texelsPerMeter: Float = 6.0) {
-        guard rtSupported, surfCachePipeline != nil else { return }
-        guard !cards.isEmpty, triCard.count == rtTriangleCount,
-              triUVa.count == rtTriangleCount, triUVc.count == rtTriangleCount else {
+        guard rtSupported, scs.surfCachePipeline != nil else { return }
+        guard !cards.isEmpty, triCard.count == rts.rtTriangleCount,
+              triUVa.count == rts.rtTriangleCount, triUVc.count == rts.rtTriangleCount else {
             Self.log.error("setSurfaceCacheCards: counts must match triangle/card sizes")
             return
         }
-        let baseTile = max(2, overrideTileSize ?? surfTileSize)
-        surfActiveTileSize = baseTile
+        let baseTile = max(2, overrideTileSize ?? scs.surfTileSize)
+        scs.surfActiveTileSize = baseTile
 
         // (1) Per-card desired tile size (w,h) in texels.
         let minTile = 4, maxTile = 48
@@ -461,24 +461,24 @@ extension IlluminatoramaRenderer {
             shelfH = max(shelfH, h)
         }
         let atlasH = penY + shelfH
-        surfResidentCardCount = residentCount
+        scs.surfResidentCardCount = residentCount
         // Phase 5 / A1 — slot maps (only when a budget is active). A "slot" is a
         // bake-time resident card's atlas rect; A1 reassigns occupants per frame.
         if residentCount < cards.count {
-            surfSlotRect = (0..<residentCount).map { rects[$0] }
-            surfSlotCard = Array(0..<residentCount)
-            surfCardSlot = (0..<cards.count).map { $0 < residentCount ? $0 : -1 }
-            surfCardHeat = [Int](repeating: 0, count: cards.count)   // A2 — all cold at bake
+            scs.surfSlotRect = (0..<residentCount).map { rects[$0] }
+            scs.surfSlotCard = Array(0..<residentCount)
+            scs.surfCardSlot = (0..<cards.count).map { $0 < residentCount ? $0 : -1 }
+            scs.surfCardHeat = [Int](repeating: 0, count: cards.count)   // A2 — all cold at bake
             // A4 — bake-time world centroid per card (origin + ½(uAxis + vAxis)).
-            surfCardCentroid = cards.map {
+            scs.surfCardCentroid = cards.map {
                 let o = SIMD3($0.origin.x, $0.origin.y, $0.origin.z)
                 let u = SIMD3($0.uAxis.x, $0.uAxis.y, $0.uAxis.z)
                 let v = SIMD3($0.vAxis.x, $0.vAxis.y, $0.vAxis.z)
                 return o + 0.5 * (u + v)
             }
         } else {
-            surfSlotRect = []; surfSlotCard = []; surfCardSlot = []; surfCardHeat = []
-            surfCardCentroid = []
+            scs.surfSlotRect = []; scs.surfSlotCard = []; scs.surfCardSlot = []; scs.surfCardHeat = []
+            scs.surfCardCentroid = []
         }
         guard atlasW > 0, atlasH > 0 else { Self.log.error("setSurfaceCacheCards: empty atlas"); return }
 
@@ -521,58 +521,58 @@ extension IlluminatoramaRenderer {
         txb.label = "Illuminatorama.surfcache.texelCard"
         atlasA.label = "Illuminatorama.surfcache.atlasA"
         atlasB.label = "Illuminatorama.surfcache.atlasB"
-        surfCardBuffer = cb
-        surfTriCardBuffer = tcb
-        surfTriUVaBuffer = tab
-        surfTriUVcBuffer = tcc
-        surfCardRectBuffer = crb
-        surfTexelCardBuffer = txb
+        scs.surfCardBuffer = cb
+        scs.surfTriCardBuffer = tcb
+        scs.surfTriUVaBuffer = tab
+        scs.surfTriUVcBuffer = tcc
+        scs.surfCardRectBuffer = crb
+        scs.surfTexelCardBuffer = txb
         // Incremental-invalidation per-card dirty buffer (all clean initially).
-        surfCardDirtyBuffer = device.makeBuffer(
+        scs.surfCardDirtyBuffer = device.makeBuffer(
             length: max(1, MemoryLayout<UInt32>.stride * cards.count), options: .storageModeShared)
-        surfCardDirtyBuffer?.label = "Illuminatorama.surfcache.cardDirty"
-        if let d = surfCardDirtyBuffer { memset(d.contents(), 0, d.length) }
-        surfIncrementalReady = false   // bake site repopulates the CPU maps
-        surfChartIncremental = nil     // ditto (chart path repopulates if it bakes)
-        surfChartMovedScratch = []     // re-sized at the chart bake site
+        scs.surfCardDirtyBuffer?.label = "Illuminatorama.surfcache.cardDirty"
+        if let d = scs.surfCardDirtyBuffer { memset(d.contents(), 0, d.length) }
+        scs.surfIncrementalReady = false   // bake site repopulates the CPU maps
+        scs.surfChartIncremental = nil     // ditto (chart path repopulates if it bakes)
+        scs.surfChartMovedScratch = []     // re-sized at the chart bake site
         // GPU-diff maps are topology-keyed too; the bake site rebuilds them.
-        surfGPUDiffTriOwnerBuffer = nil; surfGPUDiffTriFlagsBuffer = nil
-        surfGPUDiffObjVertsBuffer = nil; surfGPUDiffTriCount = 0
-        surfGPUDiffChartOwnerBuffer = nil; surfGPUDiffChartFrameBuffer = nil
-        surfGPUDiffDeformIdxBuffer = nil; surfGPUDiffDeformDispatches = []
-        surfAtlasA = atlasA
-        surfAtlasB = atlasB
+        scs.surfGPUDiffTriOwnerBuffer = nil; scs.surfGPUDiffTriFlagsBuffer = nil
+        scs.surfGPUDiffObjVertsBuffer = nil; scs.surfGPUDiffTriCount = 0
+        scs.surfGPUDiffChartOwnerBuffer = nil; scs.surfGPUDiffChartFrameBuffer = nil
+        scs.surfGPUDiffDeformIdxBuffer = nil; scs.surfGPUDiffDeformDispatches = []
+        scs.surfAtlasA = atlasA
+        scs.surfAtlasB = atlasB
         // DH-0622 — nil on alloc failure leaves the update (and every consumer) off.
-        surfIndirectAtlasA = device.makeTexture(descriptor: texDesc)
-        surfIndirectAtlasB = device.makeTexture(descriptor: texDesc)
-        surfIndirectAtlasA?.label = "Illuminatorama.surfcache.indirectA"
-        surfIndirectAtlasB?.label = "Illuminatorama.surfcache.indirectB"
-        surfCacheWarmPending = max(0, surfaceCacheWarmIterations)   // fresh textures are empty
+        scs.surfIndirectAtlasA = device.makeTexture(descriptor: texDesc)
+        scs.surfIndirectAtlasB = device.makeTexture(descriptor: texDesc)
+        scs.surfIndirectAtlasA?.label = "Illuminatorama.surfcache.indirectA"
+        scs.surfIndirectAtlasB?.label = "Illuminatorama.surfcache.indirectB"
+        scs.surfCacheWarmPending = max(0, surfaceCacheWarmIterations)   // fresh textures are empty
         // Phase 5 / B1 — denoiser output (same descriptor; not ping-ponged). nil on
         // alloc failure just leaves consumers on the raw atlas (the filter no-ops).
-        surfAtlasDenoised = device.makeTexture(descriptor: texDesc)
-        surfAtlasDenoised?.label = "Illuminatorama.surfcache.atlasDenoised"
+        scs.surfAtlasDenoised = device.makeTexture(descriptor: texDesc)
+        scs.surfAtlasDenoised?.label = "Illuminatorama.surfcache.atlasDenoised"
         // Phase 5 / A — residency feedback buffer (uint per card; 1 = sampled).
         // Shared so the host can drain + zero it per frame. nil ⇒ feedback no-ops.
-        surfCardRequestedBuffer = device.makeBuffer(
+        scs.surfCardRequestedBuffer = device.makeBuffer(
             length: max(1, MemoryLayout<UInt32>.stride * cards.count), options: .storageModeShared)
-        surfCardRequestedBuffer?.label = "Illuminatorama.surfcache.cardRequested"
-        if let r = surfCardRequestedBuffer { memset(r.contents(), 0, r.length) }
-        surfCardCount = cards.count
-        surfTilesPerRow = 1
-        surfAtlasW = atlasW
-        surfAtlasH = atlasH
-        surfUseAtlasA = true
+        scs.surfCardRequestedBuffer?.label = "Illuminatorama.surfcache.cardRequested"
+        if let r = scs.surfCardRequestedBuffer { memset(r.contents(), 0, r.length) }
+        scs.surfCardCount = cards.count
+        scs.surfTilesPerRow = 1
+        scs.surfAtlasW = atlasW
+        scs.surfAtlasH = atlasH
+        scs.surfUseAtlasA = true
         let fillPct = Int((Double(totalArea) / Double(atlasW * atlasH) * 100).rounded())
         let budgetNote = residentCount < cards.count ? " [budget: \(residentCount)/\(cards.count) resident]" : ""
         Self.log.notice("Surface cache: \(cards.count) cards, \(atlasW)×\(atlasH) atlas (\(fillPct)% packed)\(budgetNote)")
-        Self.recordSurfCacheStats("cards=\(cards.count) resident=\(residentCount) tris=\(rtTriangleCount) adaptive=\(adaptiveTiles) atlas=\(atlasW)x\(atlasH) texels=\(atlasW * atlasH) used=\(totalArea) fill=\(fillPct)% bytesRGBA16F=\(atlasW * atlasH * 8)")
+        Self.recordSurfCacheStats("cards=\(cards.count) resident=\(residentCount) tris=\(rts.rtTriangleCount) adaptive=\(adaptiveTiles) atlas=\(atlasW)x\(atlasH) texels=\(atlasW * atlasH) used=\(totalArea) fill=\(fillPct)% bytesRGBA16F=\(atlasW * atlasH * 8)")
     }
 
     /// Whether the surface-cache update should run this frame.
     var surfCacheActive: Bool {
         surfaceCacheEnabled && rtEnabled && rtSupported
-            && surfCachePipeline != nil && surfCardCount > 0 && rtAccel != nil
+            && scs.surfCachePipeline != nil && scs.surfCardCount > 0 && rts.rtAccel != nil
     }
 
     /// Read a deforming (DynamicMesh / GPU-fed) mesh's CURRENT object-space
@@ -586,7 +586,7 @@ extension IlluminatoramaRenderer {
         -> (positions: [SIMD3<Float>], indices: [UInt32])?
     {
         guard let mesh = meshes[kind],
-              let task = gpuRepackTasks.first(where: { $0.kind == kind }),
+              let task = fxs.gpuRepackTasks.first(where: { $0.kind == kind }),
               task.positionBuffer.storageMode == .shared,
               mesh.indexBuffer.storageMode == .shared else { return nil }
         let n = task.vertexCount
@@ -652,18 +652,18 @@ extension IlluminatoramaRenderer {
     /// reference (and the safety fallback when a map or live buffer is
     /// unresolvable mid-topology).
     func applyIncrementalSurfaceCacheUpdate(_ cb: MTLCommandBuffer) {
-        guard surfCacheActive, surfIncrementalReady,
-              let dirtyBuf = surfCardDirtyBuffer, let cardBuf = surfCardBuffer else { return }
+        guard surfCacheActive, scs.surfIncrementalReady,
+              let dirtyBuf = scs.surfCardDirtyBuffer, let cardBuf = scs.surfCardBuffer else { return }
         // Chart path (`VIZ_SURFCACHE_CHARTS=1`): re-frame each moved rigid instance's
         // cards by a single affine transform of their baked object-space frame.
-        if let chart = surfChartIncremental {
+        if let chart = scs.surfChartIncremental {
             if surfaceCacheIncremental, !Self.surfCacheGPUDiffDisabled,
-               let pipe = surfReframeChartPipeline,
-               let ownerBuf = surfGPUDiffChartOwnerBuffer,
-               let frameBuf = surfGPUDiffChartFrameBuffer,
+               let pipe = scs.surfReframeChartPipeline,
+               let ownerBuf = scs.surfGPUDiffChartOwnerBuffer,
+               let frameBuf = scs.surfGPUDiffChartFrameBuffer,
                let statsBuf = surfGPUDiffStatsBuffer,
                chart.instCardLo.count == instances.count {
-                encodeGPUDiffReframe(cb, pipeline: pipe, threadCount: surfCardCount,
+                encodeGPUDiffReframe(cb, pipeline: pipe, threadCount: scs.surfCardCount,
                                      dirtyBuf: dirtyBuf, cardBuf: cardBuf,
                                      ownerBuf: ownerBuf, statsBuf: statsBuf,
                                      chartFrameBuf: frameBuf, tag: "[chart gpu]")
@@ -682,12 +682,12 @@ extension IlluminatoramaRenderer {
            encodeGPUDiffPerTriPath(cb, dirtyBuf: dirtyBuf, cardBuf: cardBuf) {
             return
         }
-        guard surfSoupBaseCPU.count == instances.count,        // topology matches the baked maps
-              !surfTriCardCPU.isEmpty else { return }
+        guard scs.surfSoupBaseCPU.count == instances.count,        // topology matches the baked maps
+              !scs.surfTriCardCPU.isEmpty else { return }
 
         // Which kinds deform in place this frame? (Phase C re-frames them always.)
         let deformingKinds: Set<MeshKind> =
-            (surfHasDeformingCards && !noDeformCardsOverride) ? Set(gpuRepackTasks.map(\.kind)) : []
+            (scs.surfHasDeformingCards && !scs.noDeformCardsOverride) ? Set(fxs.gpuRepackTasks.map(\.kind)) : []
         let rigidIncremental = surfaceCacheIncremental
         // Nothing dynamic → leave every card fully accumulating (cheapest path).
         guard rigidIncremental || !deformingKinds.isEmpty else { return }
@@ -707,9 +707,9 @@ extension IlluminatoramaRenderer {
         awaitInFlightFrameBeforeCPUCacheWrite()
         // Clear last frame's dirty flags; cards that stop moving revert to EMA.
         memset(dirtyBuf.contents(), 0, dirtyBuf.length)
-        let dirty = dirtyBuf.contents().bindMemory(to: UInt32.self, capacity: surfCardCount)
-        let cards = cardBuf.contents().bindMemory(to: SurfCard.self, capacity: surfCardCount)
-        let soupTriTotal = surfTriCardCPU.count
+        let dirty = dirtyBuf.contents().bindMemory(to: UInt32.self, capacity: scs.surfCardCount)
+        let cards = cardBuf.contents().bindMemory(to: SurfCard.self, capacity: scs.surfCardCount)
+        let soupTriTotal = scs.surfTriCardCPU.count
 
         func moved(_ a: simd_float4x4, _ b: simd_float4x4) -> Bool {
             let e: Float = 1e-5
@@ -724,7 +724,7 @@ extension IlluminatoramaRenderer {
         var deformedInstances = 0
         var dirtiedCards = 0
         for i in 0..<total {
-            let kind = surfInstanceKind[i]
+            let kind = scs.surfInstanceKind[i]
             let isDeforming = deformingKinds.contains(kind)
             let model = curPtr[i].modelMatrix
             // Re-frame when: a deforming instance (its verts changed — always), OR
@@ -735,12 +735,12 @@ extension IlluminatoramaRenderer {
                 deformedInstances += 1
             } else {
                 guard rigidIncremental, moved(model, prevPtr[i].modelMatrix) else { continue }
-                soup = surfObjectSoupByKind[kind]
+                soup = scs.surfObjectSoupByKind[kind]
                 movedInstances += 1
             }
             guard let soup, !soup.indices.isEmpty else { continue }
-            let firstTri = Int(surfSoupBaseCPU[i])
-            let nextTri = (i + 1 < total) ? Int(surfSoupBaseCPU[i + 1]) : soupTriTotal
+            let firstTri = Int(scs.surfSoupBaseCPU[i])
+            let nextTri = (i + 1 < total) ? Int(scs.surfSoupBaseCPU[i + 1]) : soupTriTotal
             let localCount = min(nextTri - firstTri, soup.indices.count / 3)
             for j in 0..<max(0, localCount) {
                 let gt = firstTri + j
@@ -751,11 +751,11 @@ extension IlluminatoramaRenderer {
                 let v0 = world(soup.positions[i0]), v1 = world(soup.positions[i1]), v2 = world(soup.positions[i2])
                 var n = simd_cross(v1 - v0, v2 - v0)
                 let len = simd_length(n); n = len > 1e-8 ? n / len : SIMD3<Float>(0, 1, 0)
-                let card = Int(surfTriCardCPU[gt])
-                guard card < surfCardCount else { continue }
+                let card = Int(scs.surfTriCardCPU[gt])
+                guard card < scs.surfCardCount else { continue }
                 // Re-frame only this triangle's half of its (possibly packed) card;
                 // preserve the packed flag (normal.w) + albedo/emission.
-                if surfTriIsFrameB[gt] {
+                if scs.surfTriIsFrameB[gt] {
                     cards[card].originB = SIMD4(v0, 0); cards[card].uAxisB = SIMD4(v1 - v0, 0)
                     cards[card].vAxisB = SIMD4(v2 - v0, 0); cards[card].normalB = SIMD4(n, cards[card].normalB.w)
                 } else {
@@ -770,7 +770,7 @@ extension IlluminatoramaRenderer {
         // fired this frame and how much it touched. No-op without
         // VIZ_ILLUMI_SURFCACHE_STATS_PATH.
         if movedInstances > 0 || deformedInstances > 0 {
-            Self.recordSurfCacheStats("dynamic: moved=\(movedInstances) deformed=\(deformedInstances) dirtiedCards=\(dirtiedCards) of \(surfCardCount)")
+            Self.recordSurfCacheStats("dynamic: moved=\(movedInstances) deformed=\(deformedInstances) dirtiedCards=\(dirtiedCards) of \(scs.surfCardCount)")
         }
     }
 
@@ -792,7 +792,7 @@ extension IlluminatoramaRenderer {
         awaitInFlightFrameBeforeCPUCacheWrite()   // in-place card/dirty rewrite below
         let total = instances.count
         guard chart.instCardLo.count == total, chart.instCardHi.count == total,
-              chart.objectFrame.count == surfCardCount else { return }
+              chart.objectFrame.count == scs.surfCardCount else { return }
         let curPtr = currentInstanceBuffer.contents().bindMemory(to: IlluminatoramaInstance.self, capacity: total)
         let prevPtr = previousInstanceBuffer.contents().bindMemory(to: IlluminatoramaInstance.self, capacity: total)
 
@@ -808,26 +808,26 @@ extension IlluminatoramaRenderer {
         // Which instances moved this frame? (Decide before clearing dirty flags.)
         // Reuse the bake-time scratch buffer (no per-frame allocation); reset in
         // place. Fall back to a fresh buffer only if it's somehow mis-sized.
-        if surfChartMovedScratch.count != total {
-            surfChartMovedScratch = [Bool](repeating: false, count: total)
+        if scs.surfChartMovedScratch.count != total {
+            scs.surfChartMovedScratch = [Bool](repeating: false, count: total)
         } else {
-            for i in 0..<total { surfChartMovedScratch[i] = false }
+            for i in 0..<total { scs.surfChartMovedScratch[i] = false }
         }
         var movedInstances = 0
         for i in 0..<total where moved(curPtr[i].modelMatrix, prevPtr[i].modelMatrix) {
-            surfChartMovedScratch[i] = true; movedInstances += 1
+            scs.surfChartMovedScratch[i] = true; movedInstances += 1
         }
         // Clear last frame's dirty flags so cards that stopped moving revert to EMA
         // (same reset semantics as the per-triangle path); skip the rest if static.
         memset(dirtyBuf.contents(), 0, dirtyBuf.length)
         guard movedInstances > 0 else { return }
 
-        let dirty = dirtyBuf.contents().bindMemory(to: UInt32.self, capacity: surfCardCount)
-        let cards = cardBuf.contents().bindMemory(to: SurfCard.self, capacity: surfCardCount)
+        let dirty = dirtyBuf.contents().bindMemory(to: UInt32.self, capacity: scs.surfCardCount)
+        let cards = cardBuf.contents().bindMemory(to: SurfCard.self, capacity: scs.surfCardCount)
         var dirtiedCards = 0
-        for i in 0..<total where surfChartMovedScratch[i] {
+        for i in 0..<total where scs.surfChartMovedScratch[i] {
             let lo = Int(chart.instCardLo[i]), hi = Int(chart.instCardHi[i])
-            guard lo >= 0, hi > lo, hi <= surfCardCount else { continue }
+            guard lo >= 0, hi > lo, hi <= scs.surfCardCount else { continue }
             let m = curPtr[i].modelMatrix
             for c in lo..<hi {
                 let f = chart.objectFrame[c]
@@ -845,7 +845,7 @@ extension IlluminatoramaRenderer {
                 dirty[c] = 1
             }
         }
-        Self.recordSurfCacheStats("dynamic: moved=\(movedInstances) deformed=0 dirtiedCards=\(dirtiedCards) of \(surfCardCount) [chart]")
+        Self.recordSurfCacheStats("dynamic: moved=\(movedInstances) deformed=0 dirtiedCards=\(dirtiedCards) of \(scs.surfCardCount) [chart]")
     }
 
     /// Bake the per-triangle GPU-diff maps (#60 item 1 + Phase D): owner
@@ -859,15 +859,15 @@ extension IlluminatoramaRenderer {
                                            isFrameB: [Bool],
                                            triIdx: [SIMD4<UInt32>],
                                            deforming: [Bool]) {
-        surfGPUDiffChartOwnerBuffer = nil; surfGPUDiffChartFrameBuffer = nil
-        surfGPUDiffTriOwnerBuffer = nil; surfGPUDiffTriFlagsBuffer = nil
-        surfGPUDiffObjVertsBuffer = nil; surfGPUDiffTriCount = 0
-        surfGPUDiffDeformIdxBuffer = nil; surfGPUDiffDeformDispatches = []
+        scs.surfGPUDiffChartOwnerBuffer = nil; scs.surfGPUDiffChartFrameBuffer = nil
+        scs.surfGPUDiffTriOwnerBuffer = nil; scs.surfGPUDiffTriFlagsBuffer = nil
+        scs.surfGPUDiffObjVertsBuffer = nil; scs.surfGPUDiffTriCount = 0
+        scs.surfGPUDiffDeformIdxBuffer = nil; scs.surfGPUDiffDeformDispatches = []
         let triCount = triOwner.count
-        guard triCount > 0, triCount == rtTriangleCount,
+        guard triCount > 0, triCount == rts.rtTriangleCount,
               objVerts.count == triCount * 3, isFrameB.count == triCount,
               triIdx.count == triCount, deforming.count == triCount,
-              surfReframeTriPipeline != nil else { return }
+              scs.surfReframeTriPipeline != nil else { return }
         var flags = [UInt32](repeating: 0, count: triCount)
         for t in 0..<triCount {
             flags[t] = (isFrameB[t] ? Self.scFlagFrameB : 0)
@@ -886,25 +886,25 @@ extension IlluminatoramaRenderer {
         fb.label = "Illuminatorama.surfcache.gpuDiff.triFlags"
         vb.label = "Illuminatorama.surfcache.gpuDiff.objVerts"
         ib.label = "Illuminatorama.surfcache.gpuDiff.triIdx"
-        surfGPUDiffTriOwnerBuffer = ob
-        surfGPUDiffTriFlagsBuffer = fb
-        surfGPUDiffObjVertsBuffer = vb
-        surfGPUDiffDeformIdxBuffer = ib
-        surfGPUDiffTriCount = triCount
-        for sb in surfGPUDiffStatsRing { memset(sb.contents(), 0, sb.length) }
+        scs.surfGPUDiffTriOwnerBuffer = ob
+        scs.surfGPUDiffTriFlagsBuffer = fb
+        scs.surfGPUDiffObjVertsBuffer = vb
+        scs.surfGPUDiffDeformIdxBuffer = ib
+        scs.surfGPUDiffTriCount = triCount
+        for sb in scs.surfGPUDiffStatsRing { memset(sb.contents(), 0, sb.length) }
     }
 
     /// Chart-path GPU-diff maps (#60 item 1): per-card owner instance (−1 =
     /// static / degenerate, never re-framed) + bake-pose object-space frame,
     /// flattened to 4×float4 per card for the kernel.
     func buildGPUDiffChartBuffers(objFrames: [SurfCardFrame], cardOwner: [Int32]) {
-        surfGPUDiffTriOwnerBuffer = nil; surfGPUDiffTriFlagsBuffer = nil
-        surfGPUDiffObjVertsBuffer = nil; surfGPUDiffTriCount = 0
-        surfGPUDiffChartOwnerBuffer = nil; surfGPUDiffChartFrameBuffer = nil
-        guard surfCardCount > 0, objFrames.count == surfCardCount,
-              cardOwner.count == surfCardCount,
-              surfReframeChartPipeline != nil else { return }
-        var frames = [SIMD4<Float>](); frames.reserveCapacity(surfCardCount * 4)
+        scs.surfGPUDiffTriOwnerBuffer = nil; scs.surfGPUDiffTriFlagsBuffer = nil
+        scs.surfGPUDiffObjVertsBuffer = nil; scs.surfGPUDiffTriCount = 0
+        scs.surfGPUDiffChartOwnerBuffer = nil; scs.surfGPUDiffChartFrameBuffer = nil
+        guard scs.surfCardCount > 0, objFrames.count == scs.surfCardCount,
+              cardOwner.count == scs.surfCardCount,
+              scs.surfReframeChartPipeline != nil else { return }
+        var frames = [SIMD4<Float>](); frames.reserveCapacity(scs.surfCardCount * 4)
         for f in objFrames {
             frames.append(SIMD4(f.origin, 0)); frames.append(SIMD4(f.uAxis, 0))
             frames.append(SIMD4(f.vAxis, 0));  frames.append(SIMD4(f.normal, 0))
@@ -916,9 +916,9 @@ extension IlluminatoramaRenderer {
         else { return }
         ob.label = "Illuminatorama.surfcache.gpuDiff.cardOwner"
         fb.label = "Illuminatorama.surfcache.gpuDiff.cardFrame"
-        surfGPUDiffChartOwnerBuffer = ob
-        surfGPUDiffChartFrameBuffer = fb
-        for sb in surfGPUDiffStatsRing { memset(sb.contents(), 0, sb.length) }
+        scs.surfGPUDiffChartOwnerBuffer = ob
+        scs.surfGPUDiffChartFrameBuffer = fb
+        for sb in scs.surfGPUDiffStatsRing { memset(sb.contents(), 0, sb.length) }
     }
 
     /// Phase D + #60 item 1 — the full GPU per-triangle dynamic-card pass.
@@ -928,31 +928,31 @@ extension IlluminatoramaRenderer {
     /// card) followed by one deform dispatch per deforming instance.
     private func encodeGPUDiffPerTriPath(_ cb: MTLCommandBuffer,
                                          dirtyBuf: MTLBuffer, cardBuf: MTLBuffer) -> Bool {
-        let deformingActive = surfHasDeformingCards && !noDeformCardsOverride
+        let deformingActive = scs.surfHasDeformingCards && !scs.noDeformCardsOverride
         guard surfaceCacheIncremental || deformingActive,
-              let pipe = surfReframeTriPipeline,
-              let ownerBuf = surfGPUDiffTriOwnerBuffer,
-              let flagsBuf = surfGPUDiffTriFlagsBuffer,
-              let vertsBuf = surfGPUDiffObjVertsBuffer,
+              let pipe = scs.surfReframeTriPipeline,
+              let ownerBuf = scs.surfGPUDiffTriOwnerBuffer,
+              let flagsBuf = scs.surfGPUDiffTriFlagsBuffer,
+              let vertsBuf = scs.surfGPUDiffObjVertsBuffer,
               let statsBuf = surfGPUDiffStatsBuffer,
-              let triCardBuf = surfTriCardBuffer,
-              surfGPUDiffTriCount == rtTriangleCount,
-              surfSoupBaseCPU.count == instances.count else { return false }
+              let triCardBuf = scs.surfTriCardBuffer,
+              scs.surfGPUDiffTriCount == rts.rtTriangleCount,
+              scs.surfSoupBaseCPU.count == instances.count else { return false }
         // Resolve every deform dispatch's live position buffer up front — if any
         // is missing (solver unregistered ahead of the re-bake), take the CPU
         // path this frame rather than half-updating the dirty flags.
         var deformBindings: [(d: SurfDeformDispatch, positions: MTLBuffer, vertexCount: Int)] = []
         if deformingActive {
-            guard surfReframeDeformPipeline != nil, surfGPUDiffDeformIdxBuffer != nil
+            guard scs.surfReframeDeformPipeline != nil, scs.surfGPUDiffDeformIdxBuffer != nil
             else { return false }
-            for d in surfGPUDiffDeformDispatches {
+            for d in scs.surfGPUDiffDeformDispatches {
                 guard d.instanceIndex < instances.count,
-                      let task = gpuRepackTasks.first(where: { $0.kind == d.kind })
+                      let task = fxs.gpuRepackTasks.first(where: { $0.kind == d.kind })
                 else { return false }
                 deformBindings.append((d, task.positionBuffer, task.vertexCount))
             }
         }
-        encodeGPUDiffReframe(cb, pipeline: pipe, threadCount: surfGPUDiffTriCount,
+        encodeGPUDiffReframe(cb, pipeline: pipe, threadCount: scs.surfGPUDiffTriCount,
                              dirtyBuf: dirtyBuf, cardBuf: cardBuf,
                              ownerBuf: ownerBuf, statsBuf: statsBuf,
                              rigidEnabled: surfaceCacheIncremental,
@@ -974,10 +974,10 @@ extension IlluminatoramaRenderer {
                                      bindings: [(d: SurfDeformDispatch, positions: MTLBuffer, vertexCount: Int)],
                                      dirtyBuf: MTLBuffer, cardBuf: MTLBuffer,
                                      statsBuf: MTLBuffer) {
-        guard let pipeline = surfReframeDeformPipeline,
-              let idxBuf = surfGPUDiffDeformIdxBuffer,
-              let triCardBuf = surfTriCardBuffer,
-              let flagsBuf = surfGPUDiffTriFlagsBuffer else { return }
+        guard let pipeline = scs.surfReframeDeformPipeline,
+              let idxBuf = scs.surfGPUDiffDeformIdxBuffer,
+              let triCardBuf = scs.surfTriCardBuffer,
+              let flagsBuf = scs.surfGPUDiffTriFlagsBuffer else { return }
         guard let enc = timedComputeEncoder(cb, "surfcacheReframeDeform") else { return }
         enc.label = "Illuminatorama.surfcache.gpuDiff.deform"
         enc.setComputePipelineState(pipeline)
@@ -1017,7 +1017,7 @@ extension IlluminatoramaRenderer {
     /// writes those buffers from kernels on THIS frame's command buffer, which hazard
     /// tracking orders, and never calls this.
     func awaitInFlightFrameBeforeCPUCacheWrite() {
-        lastCommittedFrameCB?.waitUntilCompleted()   // gpu-ok: opt-in CPU cache paths only, never the default per-frame lane
+        gbs.lastCommittedFrameCB?.waitUntilCompleted()   // gpu-ok: opt-in CPU cache paths only, never the default per-frame lane
     }
 
     private func encodeGPUDiffReframe(_ cb: MTLCommandBuffer,
@@ -1034,11 +1034,11 @@ extension IlluminatoramaRenderer {
         guard threadCount > 0 else { return }
         let stats = statsBuf.contents().bindMemory(to: UInt32.self, capacity: 4)
         if stats[0] > 0 || stats[1] > 0 || stats[2] > 0 {
-            Self.recordSurfCacheStats("dynamic: moved=\(stats[0]) deformed=\(stats[2]) dirtiedCards=\(stats[1]) of \(surfCardCount) \(tag)")
+            Self.recordSurfCacheStats("dynamic: moved=\(stats[0]) deformed=\(stats[2]) dirtiedCards=\(stats[1]) of \(scs.surfCardCount) \(tag)")
         }
         stats[0] = 0; stats[1] = 0; stats[2] = 0; stats[3] = 0
         var u = SCReframeUniforms(count: UInt32(threadCount),
-                                  cardCount: UInt32(surfCardCount),
+                                  cardCount: UInt32(scs.surfCardCount),
                                   instanceCount: UInt32(instances.count),
                                   epsilon: 1e-5,   // matrix-diff threshold, mirrors the CPU loop
                                   rigidEnabled: rigidEnabled ? 1 : 0)
@@ -1070,37 +1070,37 @@ extension IlluminatoramaRenderer {
     /// writes CURRENT. The RT pass then samples CURRENT at its hits.
     func encodeSurfaceCacheUpdate(_ cb: MTLCommandBuffer) {
         guard surfCacheActive,
-              let cards = surfCardBuffer, let tc = surfTriCardBuffer,
-              let ta = surfTriUVaBuffer, let tcc = surfTriUVcBuffer,
-              let crect = surfCardRectBuffer, let txcard = surfTexelCardBuffer,
-              let cdirty = surfCardDirtyBuffer else { return }
+              let cards = scs.surfCardBuffer, let tc = scs.surfTriCardBuffer,
+              let ta = scs.surfTriUVaBuffer, let tcc = scs.surfTriUVcBuffer,
+              let crect = scs.surfCardRectBuffer, let txcard = scs.surfTexelCardBuffer,
+              let cdirty = scs.surfCardDirtyBuffer else { return }
         // §3 endpoint — trace the per-frame-refit TLAS when one is live (a moved
         // object's shadow/bounce-occlusion then tracks its motion); otherwise fall
         // back to the static-soup primitive AS (the soup-path scenes, no TLAS).
-        let useTLAS = rtTLASActive && surfCacheTLASPipeline != nil
-            && rtTLAS != nil && rtSoupTriBaseBuffer != nil
-            && rtSoupTriBaseCount == instances.count
+        let useTLAS = rts.rtTLASActive && scs.surfCacheTLASPipeline != nil
+            && rts.rtTLAS != nil && rts.rtSoupTriBaseBuffer != nil
+            && rts.rtSoupTriBaseCount == instances.count
         let pipeline: MTLComputePipelineState
         let accel: MTLAccelerationStructure
         if useTLAS {
             // Curve primitives (#60 item 7): a TLAS holding curve instances
             // must be traced with the curve-contract variant (curve hits then
             // occlude sun rays and terminate indirect rays — see the kernel).
-            if rtCurveInstanceCount > 0 {
-                guard let cp = surfCacheTLASCurvePipeline else { return }
+            if rts.rtCurveInstanceCount > 0 {
+                guard let cp = scs.surfCacheTLASCurvePipeline else { return }
                 pipeline = cp
             } else {
-                pipeline = surfCacheTLASPipeline!
+                pipeline = scs.surfCacheTLASPipeline!
             }
-            accel = rtTLAS!
+            accel = rts.rtTLAS!
         } else {
-            guard let soupAccel = rtAccel else { return }
+            guard let soupAccel = rts.rtAccel else { return }
             // Curve primitives (#60 item 7 incr. 2): a soup AS holding a curve
             // geometry descriptor must be traced with the curve-contract variant
             // (curve hits occlude the sun ray + terminate indirect rays).
-            if rtSoupCurvesActive, let cp = surfCacheSoupCurvePipeline {
+            if rts.rtSoupCurvesActive, let cp = scs.surfCacheSoupCurvePipeline {
                 pipeline = cp
-            } else if let soupPipe = surfCachePipeline {
+            } else if let soupPipe = scs.surfCachePipeline {
                 pipeline = soupPipe
             } else { return }
             accel = soupAccel
@@ -1109,7 +1109,7 @@ extension IlluminatoramaRenderer {
         // for either dynamic source: rigid incremental invalidation OR Phase-C
         // deforming meshes (whose cards `applyIncrementalSurfaceCacheUpdate`
         // re-frames every frame). Both require the per-triangle CPU maps.
-        let incremental = (surfaceCacheIncremental || surfHasDeformingCards) && surfIncrementalReady
+        let incremental = (surfaceCacheIncremental || scs.surfHasDeformingCards) && scs.surfIncrementalReady
 
         // DH-0622 — WARM-UP. A freshly baked (or freshly enabled) atlas holds no light, and every
         // bounce builds on the previous update's atlas, so at the normal blend a still's first frames
@@ -1117,15 +1117,15 @@ extension IlluminatoramaRenderer {
         // 32-frame export against a ~+22 % level-off. So the frame after a bake or an enable runs
         // `surfaceCacheWarmIterations` extra updates at α = 1 first: each carries the light one bounce
         // further, and the normal update then resumes smoothing from a filled atlas.
-        let warm = surfCacheWarmPending
-        surfCacheWarmPending = 0
+        let warm = scs.surfCacheWarmPending
+        scs.surfCacheWarmPending = 0
 
         // DH-0653 — atlas reuse counter: report the previous frame's, arm this frame's final update.
         var atlasStats: MTLBuffer? = nil
         if Self.surfCacheStatsRequested {
-            surfAtlasStatsBuffer = surfCounterBuffer(surfAtlasStatsBuffer, slots: 2,
+            scs.surfAtlasStatsBuffer = surfCounterBuffer(scs.surfAtlasStatsBuffer, slots: 2,
                                                      label: "Illuminatorama.surfcache.atlasStats")
-            if let sb = surfAtlasStatsBuffer {
+            if let sb = scs.surfAtlasStatsBuffer {
                 let c = drainSurfCounters(sb, slots: 2)
                 if let line = Self.surfCacheAtlasLine(reused: c[0], refreshed: c[1]) {
                     Self.recordSurfCacheStats(line)
@@ -1139,22 +1139,22 @@ extension IlluminatoramaRenderer {
             // Ping-pong swap at the START (mirrors DDGI): Current is what we write
             // AND what the RT pass reads after we return; Previous is the bounce
             // source. First frame after (re)alloc both are empty → indirect = 0.
-            surfUseAtlasA.toggle()
+            scs.surfUseAtlasA.toggle()
             guard let curAtlas = surfCacheCurrentAtlas,
                   let prevAtlas = surfCachePreviousAtlas,
                   let curIndirect = surfCacheCurrentIndirectAtlas,
                   let prevIndirect = surfCachePreviousIndirectAtlas else { return }
 
-            surfFrameSeed &+= 1
+            scs.surfFrameSeed &+= 1
             var u = SurfCacheUniforms(
                 sunDir: SIMD4(simd_normalize(rtSunDirection), 0),
                 sunColor: SIMD4(rtSunColor, 0),
                 skyAmbient: SIMD4(ambientColor, 0),
-                atlasW: UInt32(surfAtlasW), atlasH: UInt32(surfAtlasH),
-                tileSize: UInt32(surfActiveTileSize), tilesPerRow: UInt32(surfTilesPerRow),
-                cardCount: UInt32(surfCardCount), triangleCount: UInt32(rtTriangleCount),
+                atlasW: UInt32(scs.surfAtlasW), atlasH: UInt32(scs.surfAtlasH),
+                tileSize: UInt32(scs.surfActiveTileSize), tilesPerRow: UInt32(scs.surfTilesPerRow),
+                cardCount: UInt32(scs.surfCardCount), triangleCount: UInt32(rts.rtTriangleCount),
                 indirectRays: UInt32(max(1, min(16, surfCacheIndirectRays))),
-                frameSeed: surfFrameSeed,
+                frameSeed: scs.surfFrameSeed,
                 alpha: warming ? 1.0 : max(0.02, min(1.0, surfCacheAlpha)), rayTMin: 0.004, maxDist: 60.0,
                 incrementalEnabled: incremental ? 1 : 0)
             if !warming, atlasStats != nil { u.statsEnabled = 1 }
@@ -1163,7 +1163,7 @@ extension IlluminatoramaRenderer {
             // raw sky-miss sample (see the kernel's miss branch).
             u.scotopicDesaturation = max(0, scotopicDesaturation)
             u.cardlessReshade = surfaceCacheCardlessReshade ? 1 : 0
-            memcpy(surfCacheUniformBuffer.contents(), &u, MemoryLayout<SurfCacheUniforms>.stride)
+            memcpy(scs.surfCacheUniformBuffer.contents(), &u, MemoryLayout<SurfCacheUniforms>.stride)
 
             // Warm passes go untimed: the per-pass GPU timer holds 48 passes a frame.
             guard let enc = warming ? cb.makeComputeCommandEncoder() : timedComputeEncoder(cb, "surfcacheUpdate")
@@ -1173,7 +1173,7 @@ extension IlluminatoramaRenderer {
             enc.setTexture(curAtlas, index: 0)
             enc.setTexture(prevAtlas, index: 1)   // read access
             enc.setTexture(prevAtlas, index: 2)   // sample access
-            enc.setTexture(equirectSky ?? dummySkyTexture, index: 3)
+            enc.setTexture(equirectSky ?? ibls.dummySkyTexture, index: 3)
             enc.setTexture(curIndirect, index: 4)    // DH-0622 — write: the indirect-only EMA
             enc.setTexture(prevIndirect, index: 5)   // read
             enc.setAccelerationStructure(accel, bufferIndex: 0)
@@ -1195,29 +1195,29 @@ extension IlluminatoramaRenderer {
                 // The TLAS references the BLASes, which reference the mesh vertex/index
                 // buffers (and the curve BLASes the pooled curve buffers) — all must
                 // be resident for the intersector.
-                enc.setBuffer(rtSoupTriBaseBuffer, offset: 0, index: 9)
+                enc.setBuffer(rts.rtSoupTriBaseBuffer, offset: 0, index: 9)
                 // DH-1314 — a cardless hit is re-shaded from the RT instance rows + object normals.
-                enc.setBuffer(rtInstanceDataBuffer ?? cdirty, offset: 0, index: 11)
-                enc.setBuffer(rtObjNormalBuffer ?? cdirty, offset: 0, index: 12)
-                for blas in rtBLASList { enc.useResource(blas, usage: .read) }
-                for blas in rtCurveBLASList { enc.useResource(blas, usage: .read) }
-                for buf in rtResidentBuffers { enc.useResource(buf, usage: .read) }
-            } else if let vb = rtVertexBuffer, let ib = rtIndexBuffer {
+                enc.setBuffer(rts.rtInstanceDataBuffer ?? cdirty, offset: 0, index: 11)
+                enc.setBuffer(rts.rtObjNormalBuffer ?? cdirty, offset: 0, index: 12)
+                for blas in rts.rtBLASList { enc.useResource(blas, usage: .read) }
+                for blas in rts.rtCurveBLASList { enc.useResource(blas, usage: .read) }
+                for buf in rts.rtResidentBuffers { enc.useResource(buf, usage: .read) }
+            } else if let vb = rts.rtVertexBuffer, let ib = rts.rtIndexBuffer {
                 // Curve-only primitive AS at buffer(9) — the SOUP kernel's slot (the
                 // TLAS variant uses 9 for soupTriBase; different pipeline). Dummy =
                 // the triangle `accel` for the base (curve-free) variant.
-                enc.setAccelerationStructure((rtSoupCurvesActive ? rtSoupCurveAccel : nil) ?? accel, bufferIndex: 9)
+                enc.setAccelerationStructure((rts.rtSoupCurvesActive ? rts.rtSoupCurveAccel : nil) ?? accel, bufferIndex: 9)
                 enc.useResource(vb, usage: .read)
                 enc.useResource(ib, usage: .read)
                 // Curve AS + pool buffers the soup curve trace references (#60 item 7 incr. 2).
-                if rtSoupCurvesActive {
-                    if let ca = rtSoupCurveAccel { enc.useResource(ca, usage: .read) }
-                    if let p = rtSoupCurvePoolPoints { enc.useResource(p, usage: .read) }
-                    if let r = rtSoupCurveRadii { enc.useResource(r, usage: .read) }
-                    if let s = rtSoupCurveSegments { enc.useResource(s, usage: .read) }
+                if rts.rtSoupCurvesActive {
+                    if let ca = rts.rtSoupCurveAccel { enc.useResource(ca, usage: .read) }
+                    if let p = rts.rtSoupCurvePoolPoints { enc.useResource(p, usage: .read) }
+                    if let r = rts.rtSoupCurveRadii { enc.useResource(r, usage: .read) }
+                    if let s = rts.rtSoupCurveSegments { enc.useResource(s, usage: .read) }
                 }
             }
-            dispatch(enc, pipeline: pipeline, width: surfAtlasW, height: surfAtlasH)
+            dispatch(enc, pipeline: pipeline, width: scs.surfAtlasW, height: scs.surfAtlasH)
             enc.endEncoding()
         }
     }
@@ -1237,11 +1237,11 @@ extension IlluminatoramaRenderer {
     /// allocated — consumers fall back to the raw atlas via `surfConsumerAtlas`.
     func encodeSurfaceCacheDenoise(_ cb: MTLCommandBuffer) {
         guard surfaceCacheDenoise,
-              let pipeline = surfAtrousPipeline,
+              let pipeline = scs.surfAtrousPipeline,
               let src = surfCacheCurrentIndirectAtlas,
-              let dst = surfAtlasDenoised,
-              let txcard = surfTexelCardBuffer,
-              surfCardCount > 0 else { return }
+              let dst = scs.surfAtlasDenoised,
+              let txcard = scs.surfTexelCardBuffer,
+              scs.surfCardCount > 0 else { return }
         guard let enc = timedComputeEncoder(cb, "surfcacheDenoise") else { return }
         enc.label = "Illuminatorama.surfcache.atrous"
         enc.setComputePipelineState(pipeline)
@@ -1249,10 +1249,154 @@ extension IlluminatoramaRenderer {
         enc.setTexture(src, index: 1)   // read (current atlas)
         enc.setBuffer(txcard, offset: 0, index: 0)
         var u = SurfAtrousUniforms(
-            atlasW: UInt32(surfAtlasW), atlasH: UInt32(surfAtlasH),
+            atlasW: UInt32(scs.surfAtlasW), atlasH: UInt32(scs.surfAtlasH),
             stepSize: 1, radius: 2, phi: 4.0)
         enc.setBytes(&u, length: MemoryLayout<SurfAtrousUniforms>.stride, index: 1)
-        dispatch(enc, pipeline: pipeline, width: surfAtlasW, height: surfAtlasH)
+        dispatch(enc, pipeline: pipeline, width: scs.surfAtlasW, height: scs.surfAtlasH)
         enc.endEncoding()
     }
+}
+
+// MARK: - SurfaceCacheState
+
+/// Surface cache (Lumen-style card atlas): cards, atlases, charts, GPU diff buffers.
+/// Owned by the renderer as `scs`; every member keeps the name it had on the renderer.
+@MainActor
+final class SurfaceCacheState {
+    var surfCachePipeline: MTLComputePipelineState?
+    /// §3 endpoint — TLAS-traced cache-update (traces the per-frame-refit instance
+    /// AS so a moved object's shadow/bounce-occlusion tracks). Used in place of
+    /// `surfCachePipeline` when a TLAS is live (`rtTLASActive`); the soup path keeps
+    /// the primitive-AS `surfCachePipeline`.
+    var surfCacheTLASPipeline: MTLComputePipelineState?
+    var surfCardBuffer: MTLBuffer?
+
+    var surfTriCardBuffer: MTLBuffer?  // uint per triangle → card index
+    var surfTriUVaBuffer: MTLBuffer?  // float4 (uvA.xy, uvB.xy)
+    var surfTriUVcBuffer: MTLBuffer?  // float4 (uvC.xy, 0, 0)
+    // P2 — per-card atlas RECT addressing (replaces the uniform tilesPerRow×tileSize
+    // grid). `cardRect[card]` = (atlasX, atlasY, tileW, tileH) in atlas pixels;
+    // `texelCard[y·atlasW + x]` = the card owning that texel (0xFFFFFFFF = gap).
+    // Lets charts of different world extent get different-sized tiles, shelf-packed
+    // into one atlas — the uniform grid is just the special case (all tiles equal).
+    var surfCardRectBuffer: MTLBuffer?  // float4 per card (x,y,w,h px)
+    var surfTexelCardBuffer: MTLBuffer?  // uint per atlas texel → card index
+
+    var surfAtrousPipeline: MTLComputePipelineState?
+
+    var surfCardRequestedBuffer: MTLBuffer?  // uint per card (1 = sampled this frame)
+
+    var surfResidentCardCount: Int = 0   // ≤ surfCardCount; == it when budget disabled
+
+    var surfSlotRect: [SIMD4<Float>] = []   // per slot: atlas rect (bake-time resident-card rects)
+    var surfSlotCard: [Int] = []            // slot → occupant card index
+    var surfCardSlot: [Int] = []            // card → slot (−1 = non-resident)
+    let surfMaxSwapsPerFrame = 256          // bound the per-frame texelCard rewrite + anti-thrash
+    // Phase 5 / A2 — eviction hysteresis. Per-card "heat": set to `surfStreamHeatFull`
+    // when sampled, decremented each frame otherwise. A resident card is demotable only
+    // once its heat hits 0 (unsampled for HeatFull consecutive frames), so a card
+    // sampled intermittently (grazing rays, the moving box's trail) stays resident
+    // instead of flipping in/out every frame — cuts the steady-state swap churn.
+    var surfCardHeat: [Int] = []
+    let surfStreamHeatFull =
+        Int(ProcessInfo.processInfo.environment["VIZ_ILLUMI_SURFCACHE_HEAT"] ?? "") ?? 4
+
+    var surfCardCentroid: [SIMD3<Float>] = []   // bake-time world centroid per card
+    var surfCardDirtyBuffer: MTLBuffer?  // uint per card (1 = re-light fresh)
+    var surfTriCardCPU: [UInt32] = []       // triCard mirror (per soup triangle)
+    var surfTriIsFrameB: [Bool] = []        // per triangle: B-half of its packed card?
+    var surfSoupBaseCPU: [UInt32] = []       // per instance: first soup-triangle index
+    var surfInstanceKind: [IlluminatoramaRenderer.MeshKind] = []    // per instance: mesh kind (for object soup)
+    var surfObjectSoupByKind: [IlluminatoramaRenderer.MeshKind: (positions: [SIMD3<Float>], indices: [UInt32])] = [:]
+    var surfIncrementalReady: Bool = false   // CPU maps valid for this topology
+
+    var surfChartIncremental: IlluminatoramaRenderer.ChartIncremental?
+    // Reused per-frame scratch for the chart incremental path's "which instances
+    // moved" pass — sized once at bake time (when instance count is known) and
+    // reset in place each frame, so the steady-state loop allocates nothing.
+    var surfChartMovedScratch: [Bool] = []
+
+    var surfReframeTriPipeline: MTLComputePipelineState?
+    var surfReframeChartPipeline: MTLComputePipelineState?
+    var surfReframeDeformPipeline: MTLComputePipelineState?
+    var surfGPUDiffTriOwnerBuffer: MTLBuffer?  // uint per soup tri → instance
+    var surfGPUDiffTriFlagsBuffer: MTLBuffer?  // uint per soup tri: SC_FLAG_* bits
+    var surfGPUDiffObjVertsBuffer: MTLBuffer?  // float4 ×3 per soup tri (object space)
+    var surfGPUDiffTriCount: Int = 0
+    var surfGPUDiffChartOwnerBuffer: MTLBuffer?  // int32 per card (−1 = static)
+    var surfGPUDiffChartFrameBuffer: MTLBuffer?  // float4 ×4 per card (object frame)
+    // ── Phase D — deforming meshes, GPU-resident ──
+    /// Vertex-index triple per GLOBAL soup triangle (topology constant per bake);
+    /// the deform kernel reads these + the LIVE packed_float3 position buffer.
+    var surfGPUDiffDeformIdxBuffer: MTLBuffer?
+
+    var surfGPUDiffDeformDispatches: [IlluminatoramaRenderer.SurfDeformDispatch] = []
+    /// 4×uint written by the kernels via relaxed atomics ([0] moved instances,
+    /// [1] dirtied cards, [2] deformed instances, [3] spare), read + zeroed by the CPU
+    /// for the `recordSurfCacheStats` sidecar. RING-buffered (DH-0537 #1): with
+    /// `maxFramesInFlight == 2` the previous frame's kernel can still be incrementing while
+    /// this frame's CPU reads and zeroes, so one buffer was a read-during-write race. A slot
+    /// is reused every `maxFramesInFlight` frames, and the in-flight semaphore guarantees the
+    /// frame that last wrote it has COMPLETED before this frame's encode begins.
+    var surfGPUDiffStatsRing: [MTLBuffer] = []
+
+    // Phase C — a deforming (DynamicMesh / GPU-fed) mesh contributed surface cards
+    // this topology. Its cards are re-framed from LIVE vertices every frame
+    // (`objectTriangleSoup()` is empty for its private vertex buffer, so it's
+    // otherwise excluded from the cache), and the update kernel must honour the
+    // per-card dirty flags (α=1) just as for rigid incremental invalidation.
+    var surfHasDeformingCards: Bool = false
+    /// Dev A/B override (`VIZ_ILLUMI_NO_DEFORM_CARDS=1`) — freeze deforming cards
+    /// at their build pose (pre-Phase-C behaviour) so the catch/cast win is
+    /// directly comparable. Off by default; the re-frame is on whenever a
+    /// deforming mesh drives the cache.
+    let noDeformCardsOverride =
+        ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_DEFORM_CARDS"] == "1"
+    var surfAtlasA: MTLTexture?
+    var surfAtlasB: MTLTexture?
+    /// DH-0622 — the INDIRECT term alone, ping-ponged in lockstep with the full atlas. The
+    /// full atlas (direct + indirect) is only the update kernel's multi-bounce feedback; every
+    /// consumer (GI, reflection, glass) shades its hit itself and reads only this.
+    var surfIndirectAtlasA: MTLTexture?
+    var surfIndirectAtlasB: MTLTexture?
+    // Phase 5 / B1 — cache-domain denoiser output. NOT ping-ponged: recomputed
+    // each frame from the just-updated current INDIRECT atlas (display-only; the EMA
+    // feedback keeps reading the raw atlases). Bound to the GI/reflection consumers
+    // in place of the current indirect atlas when `surfaceCacheDenoise` is on.
+    var surfAtlasDenoised: MTLTexture?
+    var surfUseAtlasA: Bool = true
+    var surfCacheUniformBuffer: MTLBuffer!
+    var surfCardCount: Int = 0
+    /// Default per-card atlas tile size — sized for the room's big planar cards.
+    var surfTileSize: Int = 64
+    /// Tile size of the CURRENTLY-registered card set. Per-triangle micro-cards
+    /// (Phase 4.38) pass a much smaller tile (a triangle doesn't need 64²), so
+    /// the atlas stays bounded; the room keeps 64. Set by `setSurfaceCacheCards`.
+    var surfActiveTileSize: Int = 64
+    var surfTilesPerRow: Int = 1
+    var surfAtlasW: Int = 1
+    var surfAtlasH: Int = 1
+    var surfFrameSeed: UInt32 = 0
+    /// The (TLAS topology, triangle budget) the cards were last baked — or skipped — for. Lets a
+    /// host turn the cache on over an already-built TLAS and get cards on the next frame, without
+    /// an over-budget scene re-attempting the bake every frame (DH-0622).
+    var surfCacheBakeKey: Int?
+    /// Warm-up updates still owed by the latest bake or enable (DH-0622) — see `surfaceCacheWarmIterations`.
+    var surfCacheWarmPending = 0
+
+    var surfCacheTLASCurvePipeline: MTLComputePipelineState?
+
+    var surfCacheSoupCurvePipeline: MTLComputePipelineState?
+
+    // ── DH-0653: surface-cache hit/miss + atlas reuse counters ────────────────
+    //
+    // Two atomic counter buffers the kernels add to only while the stats sidecar is
+    // set: `surfHitStatsBuffer` (8 slots, `illumi_rt_lighting_tlas` — what each GI /
+    // reflection triangle hit was served by) and `surfAtlasStatsBuffer` (2 slots, the
+    // update kernel — texels EMA-reused vs refreshed at α = 1). Each is drained at the
+    // NEXT frame's encode, after the in-flight frame completes, and written as one
+    // `hits:` / `atlas:` line. The DH-0622 trade ("cheaper than re-shade" → "richer
+    // than re-shade") is the `cached` share of the `hits:` line.
+    var surfHitStatsBuffer: MTLBuffer?
+    var surfAtlasStatsBuffer: MTLBuffer?
 }

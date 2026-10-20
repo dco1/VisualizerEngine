@@ -203,17 +203,17 @@ extension IlluminatoramaRenderer {
 
         // Lazily register the shared impostor box (extent-independent).
         let boxKind = MeshKind.custom("__sqImpostorBox")
-        if !impostorMeshKinds.contains(boxKind) {
+        if !gbs.impostorMeshKinds.contains(boxKind) {
             setMesh(boxKind, .biunitBox(device: device))
-            impostorMeshKinds.insert(boxKind)
+            gbs.impostorMeshKinds.insert(boxKind)
         }
         // Lazily register the proxy for this roundness pair (one mesh serves all
         // sizes — extents ride in the modelMatrix, so the BLAS is reused).
         let key = String(format: "__sqProxy:%.3f_%.3f", ce1, ce2)
         let proxyKind = MeshKind.custom(key)
-        if !rtProxyMeshKinds.contains(proxyKind) {
+        if !rts.rtProxyMeshKinds.contains(proxyKind) {
             setMesh(proxyKind, .superquadricProxy(device: device, e1: ce1, e2: ce2))
-            rtProxyMeshKinds.insert(proxyKind)
+            rts.rtProxyMeshKinds.insert(proxyKind)
         }
 
         // Shared model matrix: object-space unit shape → scale by extents → place.

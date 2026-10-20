@@ -29,7 +29,7 @@ extension IlluminatoramaRenderer {
         // a shadow regardless of which lighting variant is live. (DH-0619)
         for cascade in 0..<Self.cascadeCount {
             let pass = MTLRenderPassDescriptor()
-            pass.depthAttachment.texture = shadowMap
+            pass.depthAttachment.texture = shd.shadowMap
             pass.depthAttachment.slice = cascade
             pass.depthAttachment.loadAction = .clear
             pass.depthAttachment.storeAction = .store
@@ -39,8 +39,8 @@ extension IlluminatoramaRenderer {
             enc.label = "Illuminatorama.shadow.c\(cascade)"
             // Disabled → the clear above already made this a fully-lit slice; no draws.
             guard shadowsEnabled else { enc.endEncoding(); continue }
-            enc.setRenderPipelineState(shadowPipeline)
-            enc.setDepthStencilState(depthState)
+            enc.setRenderPipelineState(shd.shadowPipeline)
+            enc.setDepthStencilState(gbs.depthState)
             // Front-face cull keeps the shadow projection biased on the
             // back faces of geometry, which combats acne on lit surfaces
             // without the peter-panning a constant bias alone would cause.
@@ -51,7 +51,7 @@ extension IlluminatoramaRenderer {
             enc.setFrontFacing(.counterClockwise)
             applyShadowRasterBias(enc)
 
-            var lightVP = cascadeVPs[cascade]
+            var lightVP = shd.cascadeVPs[cascade]
             enc.setVertexBytes(&lightVP,
                                length: MemoryLayout<simd_float4x4>.stride,
                                index: 3)
@@ -66,7 +66,7 @@ extension IlluminatoramaRenderer {
             // per spot.
             let instStride = MemoryLayout<IlluminatoramaInstance>.stride
             let cullClip = cullVolume(lightVP)   // DH-0534
-            for (gi, group) in meshGroups.enumerated() {
+            for (gi, group) in gbs.meshGroups.enumerated() {
                 if directionalShadowExcludedKinds.contains(group.kind) { continue }  // e.g. lamps — no sun shadow
                 guard let mesh = meshes[group.kind] else { continue }
                 if shouldCull(gi, group, mesh, cullClip, drawn: \.cascadeDrawn, culled: \.cascadeCulled) { continue }
@@ -111,7 +111,7 @@ extension IlluminatoramaRenderer {
             splitsPos[i] = lambda * logSplit + (1 - lambda) * uniSplit
         }
         // Expose far-Z of each cascade to the lighting kernel.
-        cascadeSplitsView = SIMD4(splitsPos[1], splitsPos[2], splitsPos[3], 0)
+        shd.cascadeSplitsView = SIMD4(splitsPos[1], splitsPos[2], splitsPos[3], 0)
 
         let invView = camera.viewMatrix.inverse
 
@@ -206,16 +206,16 @@ extension IlluminatoramaRenderer {
             // together, so the blend stays seamless.
             var cascadeVP = lightProj * lightView
             if taaEnabled {
-                if c == 0 { jitterTexelWorld0 = 2 * radius / Float(shadowMap.width) }
-                let jh2 = Self.halton(taaFrameIndex &+ 1, base: 2) - 0.5
-                let jh3 = Self.halton(taaFrameIndex &+ 1, base: 3) - 0.5
+                if c == 0 { jitterTexelWorld0 = 2 * radius / Float(shd.shadowMap.width) }
+                let jh2 = Self.halton(pfx.taaFrameIndex &+ 1, base: 2) - 0.5
+                let jh3 = Self.halton(pfx.taaFrameIndex &+ 1, base: 3) - 0.5
                 let jx = jh2 * jitterTexelWorld0 / radius
                 let jy = jh3 * jitterTexelWorld0 / radius
                 var shadowJitter = matrix_identity_float4x4
                 shadowJitter.columns.3 = SIMD4(jx, jy, 0, 1)
                 cascadeVP = shadowJitter * cascadeVP
             }
-            cascadeVPs[c] = cascadeVP
+            shd.cascadeVPs[c] = cascadeVP
         }
     }
 
@@ -245,7 +245,7 @@ extension IlluminatoramaRenderer {
         //
         // Every spot starts unshadowed so a light that loses (or never wanted) a slice cannot
         // sample a stale one — the same reset `updatePointShadows` does.
-        spotShadowCasters.removeAll(keepingCapacity: true)
+        shd.spotShadowCasters.removeAll(keepingCapacity: true)
         for i in 0..<spotLights.count { spotLights[i].shadowSliceIndex = -1 }
         for i in 0..<areaLights.count { areaLights[i].shadowSliceIndex = -1 }
         guard enabled else { return }
@@ -256,8 +256,8 @@ extension IlluminatoramaRenderer {
         // loop is a no-op for them (and for Visualizer softboxes).
         for i in 0..<areaLights.count {
             guard areaLights[i].castsShadow != 0 else { continue }
-            guard spotShadowCasters.count < capacity else { break }
-            let slice = spotShadowCasters.count
+            guard shd.spotShadowCasters.count < capacity else { break }
+            let slice = shd.spotShadowCasters.count
             areaLights[i].shadowSliceIndex = Int32(slice)
             var m = areaShadowMatrix(areaLights[i])
             // DH-0889 — sub-texel jitter of the portal's projection, the DH-0858 cascade fix
@@ -270,10 +270,10 @@ extension IlluminatoramaRenderer {
             // static-slice reuse (`mats == lastSpotShadowMats`), so nothing reads a stale map.
             // Off by default: the live canvas keeps its reuse; a host enables it for stills.
             if areaShadowJitterEnabled && taaEnabled {
-                let texel = 2 / Float(max(1, spotShadowAtlas.width))
+                let texel = 2 / Float(max(1, shd.spotShadowAtlas.width))
                 var j = matrix_identity_float4x4
-                j.columns.3 = SIMD4((Self.halton(taaFrameIndex &+ 1, base: 2) - 0.5) * texel,
-                                    (Self.halton(taaFrameIndex &+ 1, base: 3) - 0.5) * texel, 0, 1)
+                j.columns.3 = SIMD4((Self.halton(pfx.taaFrameIndex &+ 1, base: 2) - 0.5) * texel,
+                                    (Self.halton(pfx.taaFrameIndex &+ 1, base: 3) - 0.5) * texel, 0, 1)
                 m = j * m
             }
             areaLights[i].shadowMatrix = m
@@ -281,12 +281,12 @@ extension IlluminatoramaRenderer {
             // the exterior lawn (the only GPU-fed geometry) can never enter it, so the slice
             // is reusable while the CPU-visible scene holds (same argument as an interior cone,
             // DH-0631).
-            spotShadowCasters.append(ShadowCaster(matrix: m, reuseBit: true, owner: .area(i)))
+            shd.spotShadowCasters.append(ShadowCaster(matrix: m, reuseBit: true, owner: .area(i)))
         }
         for i in 0..<spotLights.count {
             guard spotLights[i].castsShadow != 0 else { continue }
-            guard spotShadowCasters.count < capacity else { break }
-            let slice = spotShadowCasters.count
+            guard shd.spotShadowCasters.count < capacity else { break }
+            let slice = shd.spotShadowCasters.count
             spotLights[i].shadowSliceIndex = Int32(slice)
             // Light view: apex at spot.position, looking down the spot's
             // direction (which already points the way light travels).
@@ -322,14 +322,14 @@ extension IlluminatoramaRenderer {
             let proj = Self.perspectiveRH(fovY: fovY, aspect: 1.0, near: near, far: far)
             spotLights[i].shadowMatrix = proj * lightView
             let reuse = spotLights[i].castsShadow & IlluminatoramaSpotLight.castsShadowIgnoresGPUGeometry != 0
-            spotShadowCasters.append(ShadowCaster(matrix: spotLights[i].shadowMatrix,
+            shd.spotShadowCasters.append(ShadowCaster(matrix: spotLights[i].shadowMatrix,
                                                   reuseBit: reuse, owner: .spot(i)))
         }
-        ensureSpotShadowAtlas(casting: spotShadowCasters.count)
+        ensureSpotShadowAtlas(casting: shd.spotShadowCasters.count)
         // If the reallocation could not happen, no slice index may point past the atlas —
         // trim the surplus back to unshadowed (the same state a caster past the cap is in).
-        while spotShadowCasters.count > spotShadowAtlasCapacity {
-            switch spotShadowCasters.removeLast().owner {
+        while shd.spotShadowCasters.count > shd.spotShadowAtlasCapacity {
+            switch shd.spotShadowCasters.removeLast().owner {
             case .spot(let i): spotLights[i].shadowSliceIndex = -1
             case .area(let i): areaLights[i].shadowSliceIndex = -1
             }
@@ -370,10 +370,10 @@ extension IlluminatoramaRenderer {
     private func ensureSpotShadowAtlas(casting: Int) {
         let request = spotShadowCapacityRequest
         let floor = Self.spotShadowCapacityDefault
-        var want = spotShadowAtlasCapacity
+        var want = shd.spotShadowAtlasCapacity
         if casting > want { want = min(request, ((casting + 7) / 8) * 8) }
         if request < want && want > floor { want = max(floor, request) }
-        guard want != spotShadowAtlasCapacity else { return }
+        guard want != shd.spotShadowAtlasCapacity else { return }
         reallocateSpotShadowAtlas(resolution: spotShadowMapResolution, capacity: want)
     }
 
@@ -387,16 +387,16 @@ extension IlluminatoramaRenderer {
                                                  resolution: resolution,
                                                  capacity: capacity)
         } catch {
-            Self.log.error("spot-shadow atlas reallocation to \(capacity) slices at \(resolution)² failed: \(error.localizedDescription); keeping \(self.spotShadowAtlasCapacity)")
+            Self.log.error("spot-shadow atlas reallocation to \(capacity) slices at \(resolution)² failed: \(error.localizedDescription); keeping \(self.shd.spotShadowAtlasCapacity)")
             return
         }
-        spotShadowAtlas = fresh
-        spotShadowAtlasCapacity = capacity
+        shd.spotShadowAtlas = fresh
+        shd.spotShadowAtlasCapacity = capacity
         // The cached pass descriptors point at the OLD texture, and the static-scene skip
         // would otherwise believe the (empty) new atlas already holds this frame's maps.
-        spotShadowPassDescs.removeAll()
-        spotShadowPassLabels.removeAll()
-        lastSpotShadowMats.removeAll()
+        shd.spotShadowPassDescs.removeAll()
+        shd.spotShadowPassLabels.removeAll()
+        shd.lastSpotShadowMats.removeAll()
     }
 
     /// Render the depth-only pass for each shadowed spot into its slice
@@ -404,15 +404,15 @@ extension IlluminatoramaRenderer {
     /// spots are present, or when the host hasn't pushed any instances
     /// (no occluders → no shadow data needed).
     func encodeSpotShadowPasses(_ cb: MTLCommandBuffer) {
-        guard spotShadowsEnabled, !spotShadowCasters.isEmpty, !instances.isEmpty else { return }
-        let count = spotShadowCasters.count
+        guard spotShadowsEnabled, !shd.spotShadowCasters.isEmpty, !instances.isEmpty else { return }
+        let count = shd.spotShadowCasters.count
         // PERF (static-scene skip): spot shadow maps are LIGHT-space — a camera
         // orbit re-rendered every slice (up to 8 full scene depth passes) into
         // byte-identical maps every frame. When the scene content held (see
         // `sceneStaticForShadows`) and every slice's light matrix is unchanged,
         // the atlas already contains exactly these maps — reuse them.
-        let mats = spotShadowCasters.map { $0.matrix }
-        if sceneStaticForShadows && mats == lastSpotShadowMats {
+        let mats = shd.spotShadowCasters.map { $0.matrix }
+        if sceneStaticForShadows && mats == shd.lastSpotShadowMats {
             staticSkipStats.spotShadowPassesSkipped += count
             return
         }
@@ -422,45 +422,45 @@ extension IlluminatoramaRenderer {
         // instance held, (b) either no GPU geometry is live or the owner asserts none can enter its
         // cone, and (c) no swaying instance's swing-sphere intersects its cone. Slices that fail
         // (b) or (c) — exterior cones, the can above a swinging pendant — re-render as before.
-        let gpuGeometryLive = !gpuRepackTasks.isEmpty || onEncodeGPUInstances != nil
+        let gpuGeometryLive = !fxs.gpuRepackTasks.isEmpty || onEncodeGPUInstances != nil
         let perSliceBase = spotShadowGPUGeometryOptOutEnabled
-            && instanceShapeStableFrames >= 1 && mats == lastSpotShadowMats
-        lastSpotShadowMats = mats
+            && gbs.instanceShapeStableFrames >= 1 && mats == shd.lastSpotShadowMats
+        shd.lastSpotShadowMats = mats
         // Pass descriptors + labels are cached per slice (they never change after
         // the atlas exists) — this loop used to allocate a fresh descriptor and
         // interpolate a fresh label string per slice per frame.
-        while spotShadowPassDescs.count < count {
-            let slice = spotShadowPassDescs.count
+        while shd.spotShadowPassDescs.count < count {
+            let slice = shd.spotShadowPassDescs.count
             let pass = MTLRenderPassDescriptor()
-            pass.depthAttachment.texture = spotShadowAtlas
+            pass.depthAttachment.texture = shd.spotShadowAtlas
             pass.depthAttachment.slice = slice
             pass.depthAttachment.loadAction = .clear
             pass.depthAttachment.storeAction = .store
             pass.depthAttachment.clearDepth = 1.0
-            spotShadowPassDescs.append(pass)
-            spotShadowPassLabels.append("Illuminatorama.spotShadow.s\(slice)")
+            shd.spotShadowPassDescs.append(pass)
+            shd.spotShadowPassLabels.append("Illuminatorama.spotShadow.s\(slice)")
         }
         for slice in 0..<count {
             if perSliceBase {
                 // (b) GPU geometry: none live, or the owner asserted none can enter its frustum.
                 // (c) Sway (DH-0637): no swaying instance's swing-sphere intersects a spot's cone; an
                 //     area-light slice has no cone to test, so it re-renders while anything sways.
-                let caster = spotShadowCasters[slice]
+                let caster = shd.spotShadowCasters[slice]
                 let gpuOK = !gpuGeometryLive || caster.reuseBit
                 let swayOK: Bool
                 switch caster.owner {
                 case .spot(let li): swayOK = !swayingGeometryCanEnter(spotLights[li])
-                case .area:         swayOK = swayingSpheres.isEmpty
+                case .area:         swayOK = shd.swayingSpheres.isEmpty
                 }
                 if gpuOK && swayOK {
                     staticSkipStats.spotShadowPassesSkipped += 1
                     continue
                 }
             }
-            guard let enc = timedRenderEncoder(cb, spotShadowPassDescs[slice], "shadow.spot") else { continue }
-            enc.label = spotShadowPassLabels[slice]
-            enc.setRenderPipelineState(shadowPipeline)
-            enc.setDepthStencilState(depthState)
+            guard let enc = timedRenderEncoder(cb, shd.spotShadowPassDescs[slice], "shadow.spot") else { continue }
+            enc.label = shd.spotShadowPassLabels[slice]
+            enc.setRenderPipelineState(shd.shadowPipeline)
+            enc.setDepthStencilState(gbs.depthState)
             // Same back-face-cast trick as the cascaded path, and the same per-group
             // opt-out for open shells (`shadowCullMode`).
             var cull: MTLCullMode = shadowInitialCullMode
@@ -468,7 +468,7 @@ extension IlluminatoramaRenderer {
             enc.setFrontFacing(.counterClockwise)
             applyShadowRasterBias(enc)
 
-            var lightVP = spotShadowCasters[slice].matrix
+            var lightVP = shd.spotShadowCasters[slice].matrix
             enc.setVertexBytes(&lightVP,
                                length: MemoryLayout<simd_float4x4>.stride,
                                index: 3)
@@ -483,7 +483,7 @@ extension IlluminatoramaRenderer {
             // per spot.
             let instStride = MemoryLayout<IlluminatoramaInstance>.stride
             let cullClip = cullVolume(lightVP)   // DH-0534
-            for (gi, group) in meshGroups.enumerated() {
+            for (gi, group) in gbs.meshGroups.enumerated() {
                 guard let mesh = meshes[group.kind] else { continue }
                 if shouldCull(gi, group, mesh, cullClip, drawn: \.spotDrawn, culled: \.spotCulled) { continue }
                 let want = shadowCullMode(mesh)
@@ -554,13 +554,13 @@ extension IlluminatoramaRenderer {
             .filter { pointLights[$0].castsShadow != 0 }
             .sorted { simd_distance(pointLights[$0].position, cam)
                     < simd_distance(pointLights[$1].position, cam) }
-        let chosen = Array(casters.prefix(pointShadowCubeCapacity))
+        let chosen = Array(casters.prefix(shd.pointShadowCubeCapacity))
 
         // Everyone starts unshadowed; chosen lights claim a cube page below.
         for i in pointLights.indices { pointLights[i].shadowCubeIndex = -1 }
 
         let faces = faceBuffer.contents().bindMemory(
-            to: simd_float4x4.self, capacity: pointShadowCubeCapacity * 6)
+            to: simd_float4x4.self, capacity: shd.pointShadowCubeCapacity * 6)
         let near: Float = 0.05
         for (cube, lightIdx) in chosen.enumerated() {
             pointLights[lightIdx].shadowCubeIndex = Int32(cube)
@@ -582,7 +582,7 @@ extension IlluminatoramaRenderer {
     /// claimed a cube, or when there are no occluders.
     func encodePointShadowPasses(_ cb: MTLCommandBuffer) {
         guard pointShadowsEnabled, !instances.isEmpty,
-              let atlas = pointShadowAtlas, let faceBuffer = pointShadowFaceBuffer
+              let atlas = shd.pointShadowAtlas, let faceBuffer = pointShadowFaceBuffer
         else { return }
         let cubeCount = pointLights.reduce(0) { $0 + (($1.shadowCubeIndex >= 0) ? 1 : 0) }
         guard cubeCount > 0 else { return }
@@ -599,36 +599,36 @@ extension IlluminatoramaRenderer {
             sig.append(SIMD4(pl.position, pl.radius))
             assigns.append(pl.shadowCubeIndex)
         }
-        if sceneStaticForShadows && sig == lastPointShadowSig && assigns == lastPointCubeAssign {
+        if sceneStaticForShadows && sig == shd.lastPointShadowSig && assigns == shd.lastPointCubeAssign {
             staticSkipStats.pointShadowPassesSkipped += cubeCount * 6
             return
         }
-        lastPointShadowSig = sig
-        lastPointCubeAssign = assigns
+        shd.lastPointShadowSig = sig
+        shd.lastPointCubeAssign = assigns
 
         let faces = faceBuffer.contents().bindMemory(
-            to: simd_float4x4.self, capacity: pointShadowCubeCapacity * 6)
+            to: simd_float4x4.self, capacity: shd.pointShadowCubeCapacity * 6)
         let instStride = MemoryLayout<IlluminatoramaInstance>.stride
         // Pass descriptors + labels cached per cube-face slice (fixed atlas).
-        while pointShadowPassDescs.count < pointShadowCubeCapacity * 6 {
-            let slice = pointShadowPassDescs.count
+        while shd.pointShadowPassDescs.count < shd.pointShadowCubeCapacity * 6 {
+            let slice = shd.pointShadowPassDescs.count
             let pass = MTLRenderPassDescriptor()
             pass.depthAttachment.texture = atlas
             pass.depthAttachment.slice = slice
             pass.depthAttachment.loadAction = .clear
             pass.depthAttachment.storeAction = .store
             pass.depthAttachment.clearDepth = 1.0
-            pointShadowPassDescs.append(pass)
-            pointShadowPassLabels.append("Illuminatorama.pointShadow.c\(slice / 6).f\(slice % 6)")
+            shd.pointShadowPassDescs.append(pass)
+            shd.pointShadowPassLabels.append("Illuminatorama.pointShadow.c\(slice / 6).f\(slice % 6)")
         }
         for pl in pointLights where pl.shadowCubeIndex >= 0 {
             let cube = Int(pl.shadowCubeIndex)
             for f in 0..<6 {
                 let slice = cube * 6 + f
-                guard let enc = timedRenderEncoder(cb, pointShadowPassDescs[slice], "shadow.point") else { continue }
-                enc.label = pointShadowPassLabels[slice]
-                enc.setRenderPipelineState(shadowPipeline)
-                enc.setDepthStencilState(depthState)
+                guard let enc = timedRenderEncoder(cb, shd.pointShadowPassDescs[slice], "shadow.point") else { continue }
+                enc.label = shd.pointShadowPassLabels[slice]
+                enc.setRenderPipelineState(shd.shadowPipeline)
+                enc.setDepthStencilState(gbs.depthState)
                 // Back-face cast, same acne mitigation as the sun / spot maps, and the
                 // same per-group opt-out for open shells (`shadowCullMode`).
                 var cull: MTLCullMode = shadowInitialCullMode
@@ -642,7 +642,7 @@ extension IlluminatoramaRenderer {
                 enc.setVertexBytes(&shadowClock, length: MemoryLayout<SIMD4<Float>>.stride, index: 4)
 
                 let cullClip = cullVolume(lightVP)   // DH-0534
-                for (gi, group) in meshGroups.enumerated() {
+                for (gi, group) in gbs.meshGroups.enumerated() {
                     guard let mesh = meshes[group.kind] else { continue }
                     if shouldCull(gi, group, mesh, cullClip, drawn: \.pointDrawn, culled: \.pointCulled) { continue }
                     let want = shadowCullMode(mesh)
@@ -671,29 +671,136 @@ extension IlluminatoramaRenderer {
     /// allocated. Never called on a Visualizer frame (feature stays off), so the
     /// memory is only paid where the app opts in.
     private func ensurePointShadowResources() {
-        if pointShadowAtlas == nil {
+        if shd.pointShadowAtlas == nil {
             let d = MTLTextureDescriptor()
             d.textureType = .type2DArray
             d.pixelFormat = .depth32Float
-            d.width = pointShadowMapResolution
-            d.height = pointShadowMapResolution
-            d.arrayLength = pointShadowCubeCapacity * 6
+            d.width = shd.pointShadowMapResolution
+            d.height = shd.pointShadowMapResolution
+            d.arrayLength = shd.pointShadowCubeCapacity * 6
             d.usage = [.renderTarget, .shaderRead]
             d.storageMode = .private
             if let t = device.makeTexture(descriptor: d) {
                 t.label = "Illuminatorama.pointShadowAtlas"
-                pointShadowAtlas = t
+                shd.pointShadowAtlas = t
             }
         }
-        if pointShadowFaceBufferA == nil || pointShadowFaceBufferB == nil {
-            let len = MemoryLayout<simd_float4x4>.stride * pointShadowCubeCapacity * 6
+        if shd.pointShadowFaceBufferA == nil || shd.pointShadowFaceBufferB == nil {
+            let len = MemoryLayout<simd_float4x4>.stride * shd.pointShadowCubeCapacity * 6
             if let a = device.makeBuffer(length: len, options: .storageModeShared),
                let b = device.makeBuffer(length: len, options: .storageModeShared) {
                 a.label = "Illuminatorama.pointShadowFacesA"
                 b.label = "Illuminatorama.pointShadowFacesB"
-                pointShadowFaceBufferA = a
-                pointShadowFaceBufferB = b
+                shd.pointShadowFaceBufferA = a
+                shd.pointShadowFaceBufferB = b
             }
         }
     }
+}
+
+// MARK: - ShadowState
+
+/// Shadow maps: sun cascades, spot atlas, point cubes, static-scene reuse bookkeeping.
+/// Owned by the renderer as `shd`; every member keeps the name it had on the renderer.
+@MainActor
+final class ShadowState {
+    /// Spot-shadow skip signature: the atlas slices currently hold depth maps
+    /// rendered with exactly these light matrices (and the stable content).
+    var lastSpotShadowMats: [simd_float4x4] = []
+
+    var spotShadowCasters: [IlluminatoramaRenderer.ShadowCaster] = []
+    /// Point-shadow skip signature: (position, radius) per cube-holding light in
+    /// enumeration order + the cube-page assignment vector. Any ranking change,
+    /// light move, or radius change breaks equality → re-render.
+    var lastPointShadowSig: [SIMD4<Float>] = []
+    var lastPointCubeAssign: [Int32] = []
+    /// Cached per-slice shadow pass descriptors + labels (spot atlas slices and
+    /// point cube-face slices) — built once, reused every re-render; the encode
+    /// loops used to allocate ~35 descriptors + label strings per frame.
+    var spotShadowPassDescs: [MTLRenderPassDescriptor] = []
+    var spotShadowPassLabels: [String] = []
+    var pointShadowPassDescs: [MTLRenderPassDescriptor] = []
+    var pointShadowPassLabels: [String] = []
+
+    /// World-space spheres that bound every SWAYING instance's whole swing (DH-0637): the mesh's
+    /// bounding sphere under the instance's matrix, grown by the pendulum's reach (amplitude ×
+    /// diameter, an upper bound on how far a top-pivot pendant's foot travels) and its jostle.
+    /// Rebuilt with `contentHasSway`, i.e. only when the instance SHAPE changed — never per frame.
+    /// A swaying instance whose mesh has no CPU-readable vertices contributes an unbounded entry
+    /// (`radius = .infinity`), which blocks every cone, the old behaviour.
+    var swayingSpheres: [(center: SIMD3<Float>, radius: Float)] = []
+
+    // Phase 2.5 — cascaded shadow maps. One depth array (3 slices) shared
+    // across cascades; per-slice views aren't required because we attach a
+    // single slice at a time via `pass.depthAttachment.slice`. The cascade
+    // VP matrices are recomputed per frame and stuffed into FrameUniforms.
+    var shadowMap: MTLTexture!
+    var cascadeVPs: [simd_float4x4] = Array(repeating: matrix_identity_float4x4, count: 3)
+
+    // Phase 4.10 — depth atlas for spot light shadow maps. One slice per
+    // shadowed spot. 8 slices × 512² × 4-byte depth = 8 MB at rest. NOT fixed any more
+    // (DH-0134): `ensureSpotShadowAtlas` reallocates toward the host's
+    // `spotShadowCapacityRequest` when a caster needs a slice it does not have, and shrinks
+    // back when the request drops. Every binding reads the var at encode time, and the
+    // cached per-slice pass descriptors are dropped on reallocation.
+    var spotShadowAtlas: MTLTexture!
+    var spotShadowAtlasCapacity: Int = IlluminatoramaRenderer.spotShadowCapacityDefault
+
+    var cascadeSplitsView: SIMD4<Float> = .zero
+
+    // ── Point-light cubemap shadows (lazy — allocated on first enable) ─────────
+    // A single depth 2D-array texture holds every shadowed point light's cube as
+    // 6 consecutive slices (light c, face f → slice c*6 + f). Reusing a 2D-array
+    // (not a native cube) lets the depth PASS reuse the exact spot-shadow slice
+    // mechanism, and the SAMPLE reuse the exact matrix-projection + PCF path
+    // (per-face perspective VP, dominant-axis face select). Nil until the first
+    // frame `pointShadowsEnabled` is true → Visualizer never allocates it.
+    var pointShadowAtlas: MTLTexture?
+    /// The 6 face view-projection matrices per shadow-casting light, uploaded to
+    /// the GPU so the kernel can project a fragment into the chosen face. Layout:
+    /// `[cube0.face0 … cube0.face5, cube1.face0 …]`. Grown with the atlas.
+    // A/B ring pair (see the MFIF ring block) — `updatePointShadows` rewrites the
+    // face matrices on the CPU every frame, so the slot must alternate with the
+    // frame parity or the in-flight frame's kernel reads mid-write matrices.
+    var pointShadowFaceBufferA: MTLBuffer?
+    var pointShadowFaceBufferB: MTLBuffer?
+
+    let pointShadowCubeCapacity: Int = 4      // N nearest shadow-casting lights
+    let pointShadowMapResolution: Int = 512
+
+    var shadowPipeline: MTLRenderPipelineState!
+
+    // ── Per-frame input buffers — ring-buffered (maxFramesInFlight) ─────────────
+    // These hold the frame's uniforms + lights + impostor params. They are
+    // `memcpy`'d in place at the top of every `render()` and bound (read-only)
+    // by that frame's GPU passes. At `maxFramesInFlight == 1` an in-place
+    // single buffer was safe. At 2 the CPU encodes frame N+1 (overwriting the
+    // buffer) while the GPU still reads it for frame N → torn lighting (the
+    // blocky floor-reflection band on the eggs) and uneven cadence (POV
+    // jitter, because the camera matrices in the frame uniforms get half-stomped
+    // mid-read). Fix: cycle one slot per accepted frame via `frameRingIndex`,
+    // the same scheme the instance buffer already uses (`useBufferA`) and the
+    // LDR present pool uses (`acquireWriteTarget`). Each property below resolves
+    // to the current ring slot so the bind sites are unchanged.
+    var pointLightRing: [MTLBuffer]!
+
+    var pointLightCapacity: Int!
+    var spotLightRing: [MTLBuffer]!
+
+    /// Daydream DH-0540 — the host's spot-profile table: `spotLightProfileRowCount` rows of
+    /// `illuminatoramaSpotProfileSampleCount` floats each, a luminaire's measured distribution over 0..90° off
+    /// axis, which a spot names with `profileIndex`. Allocated as a NEW buffer on every `setSpotLightProfiles`
+    /// (never mutated in place — an in-flight frame may still read the old one); a 1-float placeholder when the
+    /// host never calls it, so every kernel can bind it unconditionally.
+    var spotProfileBuffer: MTLBuffer!
+
+    var spotLightCapacity: Int!
+
+    /// Side length (px) of each directional (sun) cascade shadow map, set once at
+    /// init (see `IlluminatoramaRenderer.init`). Default 2048 — a larger value
+    /// halves the outer-cascade ground texel per doubling (finer, less-aliased sun
+    /// shadow edges) at 4× shadow-map memory. The lighting shader derives its PCF
+    /// texel size from `shadowMap.get_width()`, so this scales safely with no
+    /// shader change.
+    var shadowMapResolution: Int!
 }
