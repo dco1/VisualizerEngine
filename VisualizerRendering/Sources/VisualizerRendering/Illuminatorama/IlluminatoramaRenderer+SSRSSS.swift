@@ -144,3 +144,28 @@ final class SSRSSSState {
     var sssBlurPipeline: MTLComputePipelineState!
     var sssCompositePipeline: MTLComputePipelineState!
 }
+
+// MARK: - Code moved out of the main renderer file
+
+extension IlluminatoramaRenderer {
+    // Issue #65 — headless SSS override. SSS is otherwise driven only by the panel.
+    // `VIZ_ILLUMI_SSS` (a float strength, e.g. `1.0`) forces `sssStrength` for every
+    // renderer in the process so the light-bleed can be render-verified A/B; the
+    // optional `VIZ_ILLUMI_SSS_FORCEALL=1` companion treats EVERY opaque pixel as
+    // SSS-flagged (so any scene's props can be verified without re-tagging a mesh).
+    // `nil` when unset.
+    nonisolated static let sssStrengthEnvOverride: Float? = {
+        guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SSS"] else { return nil }
+        return Float(v)
+    }()
+
+    nonisolated static let sssForceAllEnv: Bool =
+        (ProcessInfo.processInfo.environment["VIZ_ILLUMI_SSS_FORCEALL"] == "1")
+
+    // Optional headless radius override (mm), so a verify run can crank the
+    // diffusion reach without re-authoring panel state. `nil` when unset.
+    nonisolated static let sssRadiusEnvOverride: Float? = {
+        guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SSS_RADIUS"] else { return nil }
+        return Float(v)
+    }()
+}

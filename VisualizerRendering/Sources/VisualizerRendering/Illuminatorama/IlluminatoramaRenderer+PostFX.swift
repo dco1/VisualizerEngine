@@ -1066,3 +1066,657 @@ final class PostFXState {
     /// the same half-life regardless of the host's frame rate.
     var lastExposureTickTime: CFTimeInterval = CACurrentMediaTime()
 }
+
+// MARK: - Code moved out of the main renderer file
+
+extension IlluminatoramaRenderer {
+    /// Per-level scatter for the up-chain that realises `bloomPSFExponent` (nil ⇒ the shared
+    /// scatter). Level i's down texture ends up weighted (1−s_i)·Π_{k<i} s_k, so for target
+    /// weights a_i (Σ = 1): s_i = 1 − a_i / (1 − Σ_{k<i} a_k). Public for the gate.
+    public static func bloomPSFScatters(levels: Int, exponent: Float) -> [Float]? {
+        guard exponent > 0, levels >= 2 else { return nil }
+        let raw = (0..<levels).map { i in pow(Float(1 << (i + 1)), 2 - exponent) }
+        let total = raw.reduce(0, +)
+        let a = raw.map { $0 / total }
+        var remaining: Float = 1
+        var s: [Float] = []
+        for i in 0..<levels {
+            s.append(remaining > 1e-6 ? min(1, max(0, 1 - a[i] / remaining)) : 1)
+            remaining -= a[i]
+        }
+        return s
+    }
+
+    /// Mirror of `TAAStillParams` (IlluminatoramaTAA.metal), 16 bytes.
+    struct TAAStillParams {
+        var still: UInt32; var karis: UInt32; var noSharpen: UInt32 = 0; var reserved1: UInt32 = 0
+    }
+
+    /// **Which scene → display rendering the tonemap applies** (DH-0881).
+    ///
+    /// The shipped one, `.acesRec709`, is Narkowicz's fitted RRT+ODT curve applied PER CHANNEL
+    /// in Rec.709 primaries — no AP0/AP1 transform anywhere, i.e. ACES in name only. A
+    /// per-channel curve desaturates by driving the dominant channel into its shoulder first,
+    /// so hue rotates as intensity rises: saturated blue → purple, hot red → orange. The other
+    /// two options fix that; `.acesRec709` stays the default and is byte-identical.
+    public enum DisplayTransform: UInt32, Sendable, CaseIterable, Equatable, Hashable {
+        /// The shipped curve, per channel in Rec.709. Byte-identical to every prior build.
+        case acesRec709 = 0
+        /// The SAME curve evaluated in ACEScg (AP1) and brought back. Same contrast, same
+        /// shoulder; the channel clipping now happens in a wide gamut, so hue holds. The
+        /// minimal, conservative fix.
+        case acesAP1 = 1
+        /// AgX — an inset matrix that desaturates before the sigmoid (so no channel enters the
+        /// shoulder alone, the blue-light case) and a log2-domain contrast curve. What Blender
+        /// moved to, for these reasons.
+        case agx = 2
+    }
+
+    // ── DH-0655 — the luminance histogram and percentile metering ────────────
+    //
+    // The mean meter cannot see what it is about to clip; a percentile can, but needs a
+    // distribution the reduction never had. `illumi_exposure_estimate` now builds a 64-bin
+    // log-luminance histogram (0.25 EV a bin over its [−8, +8] clamp) from the SAME samples the
+    // mean averages, when asked. Both levers default OFF and the shipped meter is untouched.
+
+    /// How the auto-exposure target is chosen. `.mean` (default) is the geometric mean it has
+    /// always been. `.percentile` meters `autoExposureKeyPercentile` of the log-luminance
+    /// distribution instead, and — when `autoExposureGuardPercentile > 0` — caps exposure so
+    /// that percentile lands at `autoExposureGuardEV` (a `min`, never a boost).
+    public enum AutoExposureMetering: Sendable { case mean, percentile }
+
+    /// One frame's histogram as the meter saw it. Log-luminance is log2 of the metered
+    /// brightness (max of luma and half the max channel), pre-exposure.
+    public struct ExposureHistogram: Sendable {
+        public static let bins = 64, minLogLum: Float = -8, binEV: Float = 0.25
+        public let counts: [Float]
+        public let total: Float
+        public let p50: Float, p95: Float, p99: Float
+        /// The kernel's own geometric-mean statistic, for comparing the two meters.
+        public let meanLogLum: Float
+        /// The percentile the key asked for.
+        public let keyLogLum: Float
+    }
+
+    // ── Per-term split-render diagnostic ─────────────────────────────
+    /// Isolates ONE lighting term in the deferred kernel so a flooded /
+    /// flat scene can be decomposed (which term dominates the colour).
+    /// `.normal` is the production composite. NOTE: the SSR and any planar-RT
+    /// reflections composite in *separate* passes after this kernel, so to
+    /// isolate them, A/B `ssrIntensity` rather than this enum.
+    public enum DebugTerm: UInt32 {
+        case normal = 0, directSun = 1, pointLights = 2, spotLights = 3
+        case diffuseIBL = 4, specularIBL = 5, emission = 6, ambient = 7
+        /// Isolates the RT surface-cache contribution (GI + reflection atlas
+        /// reads) in the instanced/TLAS path — REPLACES the composite with just
+        /// that term so a moving object's stale-vs-fresh cache is pixel-obvious.
+        /// Unlike cases 1–7 (deferred-shading terms in `illumi_lighting`) this is
+        /// wired in `illumi_rt_lighting_tlas`; it only shows with RT + surface
+        /// cache on. See docs/illuminatorama/surface-cache-incremental-invalidation.md.
+        case surfaceCacheGI = 8
+        /// Isolates the surface cache's per-texel VARIANCE (E[L²] − μ², tracked in
+        /// the atlas .w channel) at GI/reflection hits — a convergence heatmap:
+        /// freshly-reset/cold cards bright, long-static cards near-black. Phase 5 /
+        /// B0 instrumentation for the cache-domain denoiser. TLAS path only, like
+        /// `surfaceCacheGI`. See docs/illuminatorama/phase5-radiance-cache-streaming.md.
+        case surfaceCacheVariance = 9
+        /// Raw G-buffer channels (issue #65). Unlike 1–9 these are NOT lighting
+        /// terms: the deferred kernel's `switch` defaults to the full composite
+        /// for them, and a debug branch in `illumi_tonemap_fs` instead REPLACES
+        /// the image with the stored G-buffer channel *before* tonemapping, so
+        /// the readout is the true value (albedo/normal/roughness/metalness/
+        /// depth/velocity). Drives the app's Debug-view picker; exact no-op for
+        /// `.normal` (0). `velocity` reuses the same colourisation as the env
+        /// `VIZ_ILLUMI_MV_DEBUG` motion-vector overlay.
+        case albedo = 10, gbufferNormal = 11, roughness = 12
+        case metalness = 13, depth = 14, velocity = 15
+        /// RAW ambient-occlusion field — the exact half-res value `illumi_lighting`
+        /// multiplies the indirect terms by, read BEFORE tonemapping so the readout
+        /// is the true multiplier and not a tone-curve-compressed ratio. Greyscale:
+        /// white = 1.0 (unoccluded), black = 0 (fully occluded).
+        ///
+        /// This is the instrument that indicted `kSsaoKernel` (2026-08-05): a flat
+        /// wall in the middle of a room MUST read ≈1.0 here, and before the
+        /// hemisphere fix it read ≈0.44 — the whole room sat on an occlusion
+        /// pedestal. Composite views cannot show that, because albedo, the
+        /// illumination gradient and the tonemapper all ride on top of it. Reach for
+        /// this before theorising about any AO complaint.
+        case ssao = 16
+        /// Isolates the per-material **cloth sheen** lobe (velvet / linen / wool — strength
+        /// arrives packed as a NEGATIVE `emission.a`, see `IlluminatoramaGBuffer.metal`).
+        /// Unlike 10–16 this is a LIGHTING term, not a G-buffer channel: `illumi_lighting`
+        /// handles it and the tonemap's `>= 10` G-buffer branch deliberately has no case for
+        /// it, so it falls through and the term is tonemapped like cases 1–7.
+        ///
+        /// This is the instrument that measured gap #8 (2026-08-09): before the lobe moved
+        /// into `brdf()` it was evaluated ONCE, after the point/spot loops had closed, from
+        /// the sun and `frame.ambientColor` alone — so a lamp-lit sofa received exactly zero
+        /// sheen and read as plaster. A night-with-lamps frame MUST show fabric here.
+        case clothSheen = 17
+        /// **Chart-assignment overlay** (DH-0653): REPLACES the composite with one hashed
+        /// colour per surface-cache CARD at each pixel's own (primary) surface — the chart
+        /// decomposition `VIZ_SURFCACHE_CHARTS` builds, made visible, so merge quality and
+        /// residual GI seams are read off topology instead of eyeballed off the composite.
+        /// A non-resident card keeps its hue at near-black; near-black grey = no card.
+        /// Wired in `illumi_rt_lighting_tlas` like 8/9, so it needs RT + the surface cache
+        /// (a TLAS scene). The per-frame hit/miss numbers that go with it are in the
+        /// `VIZ_ILLUMI_SURFCACHE_STATS_PATH` sidecar (`hits:` / `atlas:` lines).
+        case surfaceCacheCharts = 18
+    }
+
+    /// Set the film stock's colour cube.
+    ///
+    /// The size is read OFF THE TEXTURE, not passed in and not assumed: the cube used to
+    /// be a hardcoded 16 on both sides, so shipping the 33-cube the stocks are actually
+    /// authored at would have silently sampled a 33³ texture on 16-cell coordinates —
+    /// wrong everywhere, and wrong in a way that reads as a grade rather than as a bug.
+    /// - Parameters:
+    ///   - texture: An N×N×N 3D texture (any sampleable colour format — the app ships
+    ///     `rgba16Float`). Non-cubic or non-3D textures are rejected. `nil` disables.
+    ///   - strength: Blend weight toward the stock's rendering [0, 1]. Defaults 1.
+    public func setFilmLUT(_ texture: MTLTexture?, strength: Float = 1.0) {
+        guard let texture else {
+            filmLUTTexture = nil
+            filmLUTStrength = strength
+            return
+        }
+        guard texture.textureType == .type3D,
+              texture.width == texture.height, texture.height == texture.depth,
+              texture.width >= 2 else {
+            assertionFailure("film LUT must be a cubic 3D texture, got \(texture.textureType) \(texture.width)×\(texture.height)×\(texture.depth)")
+            filmLUTTexture = nil
+            return
+        }
+        filmLUTTexture = texture
+        filmLUTStrength = strength
+        filmLUTSize = Float(texture.width)
+    }
+
+    /// Diagnostic A/B override: `VIZ_ILLUMI_TAA=1`/`0` forces the TAA toggle for
+    /// every Illuminatorama renderer in the process, bypassing both the panel and
+    /// any scene `sharedTAAOverride`. Lets a headless render exercise the TAA path
+    /// without UI. `nil` when the env var is unset. Read once.
+    static let taaEnvOverride: Bool? = {
+        guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_TAA"] else { return nil }
+        return v == "1" || v.lowercased() == "true"
+    }()
+
+    // Issue #65 — headless motion-blur override. Motion blur is otherwise driven
+    // only by the panel, so a headless render can't exercise it; `VIZ_ILLUMI_MOTIONBLUR`
+    // (a float, e.g. `1.0`) forces `motionBlurStrength` for every renderer in the
+    // process so the velocity-buffer streak can be render-verified. `nil` when unset.
+    nonisolated static let motionBlurEnvOverride: Float? = {
+        guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_MOTIONBLUR"] else { return nil }
+        return Float(v)
+    }()
+
+    // Issue #65 — headless contact-shadow override. Contact shadows are otherwise
+    // driven only by the panel, so a headless render can't exercise them;
+    // `VIZ_ILLUMI_CONTACTSHADOW` (a float strength, e.g. `0.85`) forces
+    // `contactShadowStrength` for every renderer in the process so the contact
+    // darkening can be render-verified A/B. `nil` when unset.
+    nonisolated static let contactShadowEnvOverride: Float? = {
+        guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_CONTACTSHADOW"] else { return nil }
+        return Float(v)
+    }()
+
+    /// Present the current `outputTexture` directly into an `MTKView`
+    /// drawable, bypassing SceneKit entirely. Applies a cover-fill UV crop
+    /// (same math as the SceneKit `contentsTransform` path) so the fixed
+    /// render canvas fills the drawable without stretching or letterboxing.
+    ///
+    /// Call this from the scene's tick loop INSTEAD of assigning
+    /// `scene.background.contents = outputTexture`. The two paths are
+    /// mutually exclusive — calling both wastes a full GPU pass.
+    ///
+    /// Safe to call when `drawable` is nil (no-ops). The blit is
+    /// fire-and-forget on the renderer's own command queue; no CPU wait.
+    public func present(to drawable: (any CAMetalDrawable)?) {
+        guard let drawable,
+              let pipeline = pfx.coverBlitPipeline,
+              let cb = commandQueue.makeCommandBuffer() else { return }
+        cb.label = "Illuminatorama.coverBlit"
+        let w = drawable.texture.width
+        let h = drawable.texture.height
+        // A zero-size drawable means the MTKView has no window yet (tick loop
+        // fires before MetalViewRenderer.makeNSView). Presenting it produces a
+        // nil `priv` in the system's IOSurface callback → EXC_BAD_ACCESS in
+        // layer_private_present_impl. Skip until the view is live.
+        guard w > 0, h > 0 else { return }
+        var uvRect = coverUVRect(viewportWidth: w, viewportHeight: h)
+
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture    = drawable.texture
+        pass.colorAttachments[0].loadAction  = .dontCare
+        pass.colorAttachments[0].storeAction = .store
+
+        guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return }
+        enc.setRenderPipelineState(pipeline)
+        enc.setFragmentTexture(outputTexture, index: 0)
+        enc.setFragmentBytes(&uvRect,
+                             length: MemoryLayout<SIMD4<Float>>.stride,
+                             index: 0)
+        enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
+        enc.endEncoding()
+        cb.present(drawable)
+        cb.commit()
+
+        // Feed the recorder (if any). Fired after the present commit so the
+        // tap's copy enqueues behind it on the same queue — the texture is
+        // fully written by then.
+        onFramePresented?(outputTexture, commandQueue)
+    }
+
+    /// Test / determinism hook — force every temporal accumulator and the
+    /// auto-exposure EMA back to a cold-start state on the **next** frame,
+    /// exactly as a fresh renderer would begin.
+    ///
+    /// Why this exists: `IlluminatoramaRenderer(engine: .shared)` is a
+    /// process-global engine. Its TAA history, SSAO/SSR/RT-GI temporal
+    /// accumulators, post-FX easing state, and auto-exposure EMA all persist
+    /// across renderer instances, so absolute-threshold GPU tests that build a
+    /// fresh bridge can flake by suite position (the previous test's converged
+    /// history bleeds into the next test's first frame). Calling this between
+    /// tests makes each test start from the same cold history, restoring
+    /// determinism.
+    ///
+    /// It is **purely additive**: it does nothing to normal per-frame rendering
+    /// unless explicitly invoked, so production callers (e.g. Visualizer) are
+    /// unaffected. Under the hood it composes the *same* reset paths the engine
+    /// already runs on a resize (the four `…NeedsFirstFrame` flags, which make
+    /// the next frame reproject against nothing), re-seeds the GPU
+    /// `ExposureState` buffer to its constructor cold-start values, and clears
+    /// the host-side post-FX easing / exposure-tick timers so the next frame
+    /// snaps to targets rather than gliding from stale ones.
+    public func resetTemporalHistory() {
+        // Temporal reprojection passes: reproject against nothing next frame,
+        // identical to the post-resize reset above.
+        pfx.taaNeedsFirstFrame  = true
+        aos.aoNeedsFirstFrame   = true
+        ssrs.ssrNeedsFirstFrame  = true
+        rtGINeedsFirstFrame = true
+        aos.aoAccumulator?.reset()
+
+        // Auto-exposure EMA — re-seed the GPU ExposureState buffer to the exact
+        // cold-start values written once in the constructor:
+        //   [prevTargetLogLum = -2.0, smoothedExposure = 1.0,
+        //    newTargetLogLum = -2.0, deltaTime = 1/60].
+        let initialExposureState: [Float] = [-2.0, 1.0, -2.0, 1.0 / 60.0]
+        memcpy(pfx.exposureBuffer.contents(), initialExposureState,
+               MemoryLayout<Float>.stride * initialExposureState.count)
+
+        // Host-side post-FX easing: clear the tick timer so the next
+        // `advancePostFXEasing` sees dt == 0 → k == 1 and snaps every eased
+        // value to its current target (no startup glide from stale eased state).
+        pfx.lastPostFXEaseTime   = 0
+        // Re-seed the self-timed exposure/particle tick clocks to now so the
+        // first post-reset frame reports a sane dt rather than a huge gap.
+        pfx.lastExposureTickTime = CACurrentMediaTime()
+        fxs.lastParticleTickTime = CACurrentMediaTime()
+    }
+
+    // ── Presented-buffer pool helpers ─────────────────────────────────────────
+
+    // 4 = presented + previously-presented (both still readable by consumers) +
+    // the two frames that may be in flight at once (`maxFramesInFlight = 2`).
+    static let ldrPoolCount = 4
+
+    /// Allocate one LDR (`bgra8Unorm_srgb`) output texture for the present pool.
+    /// sRGB format: the tonemap writes LINEAR and the GPU store applies the sRGB
+    /// OETF. SceneKit samples this as `background.contents`, decodes it back to
+    /// linear, then re-encodes for its drawable — one correct round-trip. (A
+    /// non-sRGB format + a manual `pow(1/2.2)` in the shader double-encoded
+    /// against SceneKit's pass and washed the colours out.) sRGB targets don't
+    /// support `.shaderWrite`; the tonemap is a render pass, so we don't need it.
+    /// Clear freshly allocated presentable textures to opaque black, on this renderer's own queue
+    /// (so the clear is ordered ahead of any later `present` / render of them).
+    ///
+    /// A new `.private` texture's contents are undefined, and on macOS they read back as solid
+    /// 255,0,255 — measured 2026-10-15: every sampled texel of six freshly made 1600×1000
+    /// `bgra8Unorm_srgb` targets, with and without API validation. Anything that can reach the
+    /// screen before a frame writes it (the first present after init; a slot promoted early) must
+    /// therefore be initialised, or it shows as a fuchsia flash.
+    static func clearLDRTextures(_ textures: [MTLTexture], on queue: MTLCommandQueue) {
+        guard !textures.isEmpty, let cb = queue.makeCommandBuffer() else { return }
+        cb.label = "Illuminatorama.ldr.clear"
+        for tex in textures {
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = tex
+            pass.colorAttachments[0].loadAction = .clear
+            pass.colorAttachments[0].storeAction = .store
+            pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+            cb.makeRenderCommandEncoder(descriptor: pass)?.endEncoding()
+        }
+        cb.commit()
+    }
+
+    static func makeLDRTexture(device: MTLDevice, w: Int, h: Int,
+                                        label: String) -> MTLTexture? {
+        let d = MTLTextureDescriptor()
+        d.textureType = .type2D
+        d.pixelFormat = .bgra8Unorm_srgb
+        d.width = max(1, w)
+        d.height = max(1, h)
+        d.usage = [.shaderRead, .renderTarget]
+        d.storageMode = .private
+        let t = device.makeTexture(descriptor: d)
+        t?.label = label
+        return t
+    }
+
+    /// Promote the most-recently-completed pool buffer to `outputTexture`.
+    /// Called at the top of each `render()` (and after the snapshot barrier)
+    /// so consumers always bind a fully-rendered buffer. No-op until a buffer
+    /// finishes. Internal (not private) so `IlluminatoramaOverlay.renderForSnapshot`
+    /// can promote the just-rendered frame after its completion barrier.
+    func promoteCompletedBuffer() {
+        guard let idx = pfx.presentSync.takeCompleted(),
+              idx >= 0, idx < pfx.ldrPool.count, idx != pfx.presentedIdx else { return }
+        pfx.prevPresentedIdx = pfx.presentedIdx
+        pfx.presentedIdx = idx
+        outputTexture = pfx.ldrPool[idx]
+        if Self.swapProbeEnabled { recordSwapInterval() }   // issue #65 jitter probe
+    }
+
+    /// Choose a pool index to render into this frame: anything that is neither
+    /// the currently presented buffer, NOR the previously presented buffer
+    /// (SceneKit / the cover blit may still be sampling either), NOR a buffer
+    /// whose own render is STILL IN FLIGHT. The in-flight exclusion matters now
+    /// that `maxFramesInFlight = 2`: two consecutive `render()` calls can both be
+    /// queued before either completes, and they must target DIFFERENT buffers or
+    /// the second would clobber the first before it is ever presented. With the
+    /// 4-buffer pool the worst case is presented + prev + one already in flight =
+    /// 3 excluded, leaving exactly one free slot for this frame.
+    func acquireWriteTarget() -> Int {
+        for i in 0..<pfx.ldrPool.count
+        where i != pfx.presentedIdx && i != pfx.prevPresentedIdx && !pfx.presentSync.isInFlight(i) {
+            return i
+        }
+        // Degenerate fallback (pool too small or all excluded): avoid the presented.
+        return (pfx.presentedIdx + 1) % max(1, pfx.ldrPool.count)
+    }
+
+    // ── Issue #65: colour-grading LUT ─────────────────────────────────────────
+
+    /// IEEE-754 binary32 → binary16 (half) bit pattern for `rgba16Float` uploads.
+    /// Software conversion: Swift's `Float16` is unavailable under Mac Catalyst.
+    /// LUT values are finite and in [0, 1], so the round-to-nearest-even path is
+    /// all that matters; sub-normals/inf/NaN are handled for completeness.
+    @inline(__always)
+    static func float32to16(_ v: Float) -> UInt16 {
+        let bits = v.bitPattern
+        let sign = UInt16((bits >> 16) & 0x8000)
+        let expo = Int32((bits >> 23) & 0xFF) - 127 + 15
+        let mant = bits & 0x7F_FFFF
+        if expo >= 0x1F {                                   // overflow / inf / NaN
+            let isNaN = (bits & 0x7F80_0000) == 0x7F80_0000 && mant != 0
+            return sign | (isNaN ? 0x7E00 : 0x7C00)
+        }
+        if expo <= 0 {                                      // sub-normal / zero
+            guard expo > -11 else { return sign }
+            let m = (mant | 0x80_0000) >> UInt32(1 - expo + 13)
+            return sign | UInt16(m)
+        }
+        // Normal: round mantissa to 10 bits, nearest-even.
+        var half = UInt32(expo) << 10 | (mant >> 13)
+        let roundBits = mant & 0x1FFF
+        if roundBits > 0x1000 || (roundBits == 0x1000 && (half & 1) == 1) { half += 1 }
+        return sign | UInt16(truncatingIfNeeded: half)
+    }
+
+    /// Build an identity 3D LUT (`rgba16Float`, `size³`) where the texel at
+    /// (r,g,b) holds the colour (r,g,b)/(size-1). Sampling it with a colour in
+    /// [0,1]³ (half-texel-corrected) returns that colour unchanged — an exact
+    /// no-op grade. Uploaded once; `.shared` storage so the CPU bake is visible.
+    static func makeIdentityColorLUT(device: MTLDevice, size: Int) -> MTLTexture? {
+        let d = MTLTextureDescriptor()
+        d.textureType = .type3D
+        d.pixelFormat = .rgba16Float
+        d.width = size; d.height = size; d.depth = size
+        d.usage = [.shaderRead]
+        d.storageMode = .shared
+        guard let tex = device.makeTexture(descriptor: d) else { return nil }
+        tex.label = "Illuminatorama.colorLUT"
+        var data = [UInt16](repeating: 0, count: size * size * size * 4)
+        let inv = 1.0 / Float(size - 1)
+        var i = 0
+        for b in 0..<size {
+            for g in 0..<size {
+                for r in 0..<size {
+                    data[i+0] = float32to16(Float(r) * inv)
+                    data[i+1] = float32to16(Float(g) * inv)
+                    data[i+2] = float32to16(Float(b) * inv)
+                    data[i+3] = float32to16(1.0)
+                    i += 4
+                }
+            }
+        }
+        let bpr = size * 4 * MemoryLayout<UInt16>.size
+        let bpi = bpr * size
+        data.withUnsafeBytes { raw in
+            tex.replace(region: MTLRegionMake3D(0, 0, 0, size, size, size),
+                        mipmapLevel: 0, slice: 0,
+                        withBytes: raw.baseAddress!,
+                        bytesPerRow: bpr, bytesPerImage: bpi)
+        }
+        return tex
+    }
+
+    /// Replace the colour-grade LUT from packed RGBA float data laid out as the
+    /// standard .cube ordering (red fastest, then green, then blue). `rgba` must
+    /// hold `size³` SIMD4 entries. Pass `nil` to reset to identity. The grade only
+    /// shows when `colorLUTAmount > 0`. Display-space (the LUT is sampled after
+    /// tonemapping, on the sRGB-encoded colour).
+    @discardableResult
+    public func setColorLUT(size: Int, rgba: [SIMD4<Float>]?) -> Bool {
+        guard let rgba else {
+            if let id = Self.makeIdentityColorLUT(device: device, size: Self.colorLUTDefaultSize) {
+                pfx.colorLUT = id; pfx.colorLUTSize = Self.colorLUTDefaultSize; return true
+            }
+            return false
+        }
+        guard size >= 2, rgba.count == size * size * size else { return false }
+        let d = MTLTextureDescriptor()
+        d.textureType = .type3D
+        d.pixelFormat = .rgba16Float
+        d.width = size; d.height = size; d.depth = size
+        d.usage = [.shaderRead]
+        d.storageMode = .shared
+        guard let tex = device.makeTexture(descriptor: d) else { return false }
+        tex.label = "Illuminatorama.colorLUT(custom)"
+        var data = [UInt16](repeating: 0, count: rgba.count * 4)
+        for (j, c) in rgba.enumerated() {
+            data[j*4+0] = Self.float32to16(c.x)
+            data[j*4+1] = Self.float32to16(c.y)
+            data[j*4+2] = Self.float32to16(c.z)
+            data[j*4+3] = Self.float32to16(1.0)
+        }
+        let bpr = size * 4 * MemoryLayout<UInt16>.size
+        let bpi = bpr * size
+        data.withUnsafeBytes { raw in
+            tex.replace(region: MTLRegionMake3D(0, 0, 0, size, size, size),
+                        mipmapLevel: 0, slice: 0,
+                        withBytes: raw.baseAddress!,
+                        bytesPerRow: bpr, bytesPerImage: bpi)
+        }
+        pfx.colorLUT = tex; pfx.colorLUTSize = size
+        return true
+    }
+
+    /// Parse an Adobe/Resolve `.cube` 3D LUT and install it. Returns false on a
+    /// malformed file. Supports `LUT_3D_SIZE` + `r g b` rows (the common subset).
+    @discardableResult
+    public func loadCubeLUT(contentsOf url: URL) -> Bool {
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return false }
+        var size = 0
+        var entries: [SIMD4<Float>] = []
+        for raw in text.split(separator: "\n") {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty || line.hasPrefix("#") { continue }
+            if line.uppercased().hasPrefix("LUT_3D_SIZE") {
+                size = Int(line.split(separator: " ").last.map(String.init) ?? "") ?? 0
+                if size > 1 { entries.reserveCapacity(size*size*size) }
+                continue
+            }
+            let comps = line.split(separator: " ").compactMap { Float($0) }
+            if comps.count == 3 { entries.append(SIMD4(comps[0], comps[1], comps[2], 1)) }
+        }
+        guard size > 1, entries.count == size*size*size else { return false }
+        return setColorLUT(size: size, rgba: entries)
+    }
+
+    /// Generate one of the built-in procedural grades as packed RGBA LUT data
+    /// (.cube order, red fastest). Returns nil for `.none` (caller installs the
+    /// identity LUT). The grade is computed in DISPLAY (~sRGB) space, matching how
+    /// the tonemap samples the LUT.
+    static func generateColorGradeLUT(look: IlluminatoramaColorGradeLook,
+                                      size: Int) -> [SIMD4<Float>]? {
+        guard look != .none, size >= 2 else { return nil }
+        func luma(_ c: SIMD3<Float>) -> Float { c.x*0.2126 + c.y*0.7152 + c.z*0.0722 }
+        func contrast(_ c: SIMD3<Float>, _ k: Float) -> SIMD3<Float> { (c - 0.5) * k + 0.5 }
+        func smooth(_ e0: Float, _ e1: Float, _ x: Float) -> Float {
+            let t = max(0, min(1, (x - e0) / (e1 - e0))); return t * t * (3 - 2 * t)
+        }
+        var out = [SIMD4<Float>](); out.reserveCapacity(size*size*size)
+        let inv = 1.0 / Float(size - 1)
+        for b in 0..<size { for g in 0..<size { for r in 0..<size {
+            var c = SIMD3(Float(r), Float(g), Float(b)) * inv
+            switch look {
+            case .none: break
+            case .tealOrange:
+                let t = smooth(0.2, 0.85, luma(c))
+                let shadow = SIMD3<Float>(-0.02, 0.03, 0.08)   // push shadows teal
+                let high   = SIMD3<Float>( 0.09, 0.02, -0.07)  // push highlights orange
+                c += shadow * (1 - t) + high * t
+                c = contrast(c, 1.10)
+            case .warm:
+                c *= SIMD3<Float>(1.07, 1.01, 0.90); c = contrast(c, 1.05)
+            case .cool:
+                c *= SIMD3<Float>(0.92, 1.00, 1.09); c = contrast(c, 1.05)
+            case .noir:
+                let l = luma(c); c = contrast(SIMD3(l, l, l), 1.22)
+            case .vibrant:
+                let l = luma(c); c = l + (c - l) * 1.45; c = contrast(c, 1.06)
+            }
+            c = simd_clamp(c, SIMD3<Float>(repeating: 0), SIMD3<Float>(repeating: 1))
+            out.append(SIMD4(c, 1))
+        }}}
+        return out
+    }
+
+    /// Apply the shared panel's colour grade (issue #65). Rebakes the LUT only when
+    /// the chosen look changes (the CPU bake is a per-frame no-op in steady state),
+    /// and sets `colorLUTAmount` each frame. Called from `render()` alongside the
+    /// other shared-FX appliers, so every Illuminatorama scene inherits it.
+    func applySharedColorGrade(_ s: IlluminatoramaSharedSettings = .shared) {
+        if s.colorGradeLook != pfx.appliedColorGradeLook {
+            pfx.appliedColorGradeLook = s.colorGradeLook
+            let data = Self.generateColorGradeLUT(look: s.colorGradeLook,
+                                                  size: Self.colorLUTDefaultSize)
+            setColorLUT(size: Self.colorLUTDefaultSize, rgba: data)
+        }
+        colorLUTAmount = (s.colorGradeLook == .none) ? 0 : Float(s.colorLUTAmount)
+    }
+
+    /// Advance the eased Post-FX shadows toward their slider targets. `Instant`
+    /// (tau = 0) snaps; otherwise exponential smoothing `k = 1 − e^(−dt/tau)`.
+    /// Self-timed off `CACurrentMediaTime` so it needs no dt from the caller, and
+    /// the first call (lastEaseTime == 0 → dt 0 → k 1) seeds the shadows at the
+    /// current targets (no startup glide). Mirrors AspectTest's `easeCamera`.
+    func advancePostFXEasing() {
+        let now = CACurrentMediaTime()
+        let dt = pfx.lastPostFXEaseTime == 0 ? 0 : max(0, min(0.1, fixedFrameDelta ?? (now - pfx.lastPostFXEaseTime)))
+        pfx.lastPostFXEaseTime = now
+        let k = (postFXEasingTau <= 0 || dt == 0) ? 1.0 : 1 - exp(-dt / postFXEasingTau)
+        let kf = Float(k)
+        pfx.easedExposure          += (exposure              - pfx.easedExposure)          * kf
+        pfx.easedBloomThreshold    += (bloomThreshold        - pfx.easedBloomThreshold)    * kf
+        pfx.easedBloomIntensity    += (bloomIntensity        - pfx.easedBloomIntensity)    * kf
+        pfx.easedChromaticAberration += (max(0, chromaticAberration) - pfx.easedChromaticAberration) * kf
+        pfx.easedFringe            += (max(0, fringe)        - pfx.easedFringe)            * kf
+        pfx.easedFringeTint        += (fringeTint            - pfx.easedFringeTint)        * kf
+        pfx.easedSphericalAberration += (max(0, sphericalAberration) - pfx.easedSphericalAberration) * kf
+        pfx.easedHalationIntensity += (max(0, halationIntensity) - pfx.easedHalationIntensity) * kf
+        pfx.easedHalationThreshold += (halationThreshold        - pfx.easedHalationThreshold) * kf
+        pfx.easedHalationRadius    += (max(0, halationRadius)   - pfx.easedHalationRadius)    * kf
+        pfx.easedHalationTint      += (halationTint             - pfx.easedHalationTint)      * kf
+        // Exponential easing approaches 0 asymptotically, so a scene that turns halation
+        // OFF would keep encoding three dispatches forever on a residue of ~1e-9. Snap
+        // the last sliver: `encodeHalationPasses` and the shader branch both key off
+        // this value, so the effect switches off exactly when the passes stop.
+        if halationIntensity <= 0 && pfx.easedHalationIntensity < 1e-3 { pfx.easedHalationIntensity = 0 }
+    }
+
+    /// Halton low-discrepancy sequence, one dimension. Index 0 is excluded
+    /// (the algorithm degenerates there) — callers pass `frameIndex + 1`.
+    static func halton(_ index: UInt32, base: UInt32) -> Float {
+        var f: Float = 1
+        var r: Float = 0
+        var i = index
+        while i > 0 {
+            f /= Float(base)
+            r += f * Float(i % base)
+            i /= base
+        }
+        return r
+    }
+
+    // ── Bloom pyramid geometry (S1.2) ─────────────────────────────────────────
+
+    /// Deepest level a bloom pyramid over an `halfW × halfH` mip0 may have.
+    ///
+    /// Two bounds, both about the filter rather than about memory. The 13-tap box
+    /// reaches ±2 texels and the tent ±1, so a level whose SHORT side is under 8
+    /// texels has clamped edge taps on most of its rows — past that the halo
+    /// stops widening and starts smearing the frame border inward. And the reach
+    /// doubles per level, so 7 levels is the cap: the coarsest mip is then a
+    /// handful of texels covering the whole frame, a formless wash rather than a
+    /// halo.
+    ///
+    /// **8, not 16, and that is a MEASURED number.** Each level restores one
+    /// octave of the profile's self-similar ~0.45–0.5 falloff and the last level
+    /// always falls off a cliff, so the pyramid's useful reach is one octave
+    /// short of its depth. Cutting at a 16-texel short side gives 5 levels on a
+    /// 1200 × 900 frame, and the gate measured exactly the predicted cliff there:
+    /// octave ratios 0.53 · 0.52 · 0.44 · **0.21 · 0.02** — a halo dead by ~120
+    /// output px, which cannot carry the "tail past 200 px" this pass exists to
+    /// produce. Halving the bound buys the octave back.
+    ///
+    /// **DH-0998 — that rule is now the GLARE FIT's (`bloomGlareFitLevelCount`), not the pyramid's.**
+    /// "The last level always falls off a cliff" was true of every depth: the coarsest level's kernel
+    /// ends ~2^(levels+1.2) texels out, so wherever the pyramid stopped, the halo stopped — on the
+    /// BloomProfile lamp (1200 × 900, 6 levels) the last octave measured Δ(128)/Δ(64) = 0.125 against
+    /// ~0.5 for every octave before it. The pyramid now keeps halving until its coarsest level's
+    /// reach (1.5·2^levels) covers the whole mip0 DIAGONAL (or the level is one texel), so no cliff
+    /// is left inside the frame; the extra levels are a handful of texels each (≤ 15 × 9 at a hero
+    /// still) and cost a few µs. The physical glare still fits only the levels this filter can
+    /// realise cleanly — its far field is `illumi_bloom_glare_tail`, exact in angle, not more levels.
+    static func bloomLevelCount(halfW: Int, halfH: Int) -> Int {
+        let maxSide = max(1, max(halfW, halfH))
+        let diagonal = Double(halfW * halfW + halfH * halfH).squareRoot()
+        var levels = max(1, bloomGlareFitLevelCount(halfW: halfW, halfH: halfH))
+        while 1.5 * pow(2, Double(levels)) < diagonal && (maxSide >> levels) >= 1 { levels += 1 }
+        return levels
+    }
+
+    /// The levels the physical glare (DH-1001) is FITTED over: the pre-DH-0998 pyramid rule — short
+    /// side ≥ 8 texels, at most 7 levels, the depth the GPU-measured kernel table describes without
+    /// the frame border clamping into them. The pyramid may be deeper (`bloomLevelCount`); the fit
+    /// gives the extra levels no weight.
+    static func bloomGlareFitLevelCount(halfW: Int, halfH: Int) -> Int {
+        let minSide = max(1, min(halfW, halfH))
+        var levels = 1
+        while levels < 7 && (minSide >> levels) >= 8 { levels += 1 }
+        return levels
+    }
+
+    /// Pixel size of pyramid level `level` (0 = mip0 at internal/2). Floored at 1
+    /// so an extreme aspect ratio can't ask for a zero-width texture.
+    static func bloomLevelSize(halfW: Int, halfH: Int, level: Int) -> (Int, Int) {
+        (max(1, halfW >> level), max(1, halfH >> level))
+    }
+
+    // Issue #65 — colour-grade LUT default per-axis resolution. 33 is the .cube
+    // de-facto standard (matches DaVinci / most authoring tools).
+    static let colorLUTDefaultSize: Int = 33
+}

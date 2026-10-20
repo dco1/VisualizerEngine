@@ -227,3 +227,26 @@ final class AOState {
     /// only advances when an RT lighting or glass pass encodes, which the raw lane may not.
     var rtaoFrameSeed: UInt32 = 0
 }
+
+// MARK: - Code moved out of the main renderer file
+
+extension IlluminatoramaRenderer {
+    static let rtAOVFunctionConstantIndex = 31
+
+    /// Restart the accumulated AO mean — for a host that changed the scene without moving the
+    /// camera or the scene's topology (e.g. moved an object) and keeps accumulation on.
+    public func resetAOAccumulation() { aos.aoAccumulator?.reset() }
+
+    /// Mirror of the Metal `RTAOUniforms` (IlluminatoramaRTInstanced.metal) — field for field.
+    struct RTAOUniforms {
+        var invViewProjection: simd_float4x4
+        var radius: Float
+        var intensity: Float
+        var rayCount: UInt32
+        var frameSeed: UInt32
+        var rayTMin: Float
+        var transportRayMask: UInt32
+        var fullWidth: UInt32
+        var fullHeight: UInt32
+    }
+}

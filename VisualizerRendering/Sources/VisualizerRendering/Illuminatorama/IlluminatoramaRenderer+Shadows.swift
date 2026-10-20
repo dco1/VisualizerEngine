@@ -804,3 +804,245 @@ final class ShadowState {
     /// shader change.
     var shadowMapResolution: Int!
 }
+
+// MARK: - Code moved out of the main renderer file
+
+extension IlluminatoramaRenderer {
+    /// Who owns each shadow-atlas slice, in slice order (DH-0601 — the atlas is shared by
+    /// spot cones AND window-portal area lights). Set by `updateSpotShadows`;
+    /// `encodeSpotShadowPasses` renders through it. A slice is no longer a light's array
+    /// index — see `IlluminatoramaSpotLight.castsShadow`.
+    enum ShadowOwner { case spot(Int); case area(Int) }
+
+    /// One caster per atlas slice, in slice order. `matrix` is the light-space VP the depth
+    /// pass rasterises with; `reuseBit` = the DH-0631 "no GPU-fed geometry can enter this
+    /// frustum" assertion; `owner` maps back to the light so a trimmed slice can be reset.
+    struct ShadowCaster { var matrix: simd_float4x4; var reuseBit: Bool; var owner: ShadowOwner }
+
+    func rebuildSwayingSpheres() {
+        shd.swayingSpheres.removeAll(keepingCapacity: true)
+        guard gbs.contentHasSway else { return }
+        for ref in instances where ref.data.swayMode >= 2 {
+            let m = ref.data.modelMatrix
+            guard let mesh = meshes[ref.meshKind], let local = mesh.boundingSphere else {
+                shd.swayingSpheres.append((SIMD3<Float>(m.columns.3.x, m.columns.3.y, m.columns.3.z), .infinity))
+                continue
+            }
+            let c4 = m * SIMD4<Float>(local.center, 1)
+            let scale = max(simd_length(SIMD3(m.columns.0.x, m.columns.0.y, m.columns.0.z)),
+                            simd_length(SIMD3(m.columns.1.x, m.columns.1.y, m.columns.1.z)),
+                            simd_length(SIMD3(m.columns.2.x, m.columns.2.y, m.columns.2.z)))
+            let r = local.radius * scale
+            // Mode 3's flap scales with the frame's wind, which has no upper clamp.
+            let reach = ref.data.swayMode == 3 ? max(1, treeWindStrength) : 1
+            let swing = abs(ref.data.swayLean) * reach * 2 * r + abs(ref.data.swayJostle)
+            shd.swayingSpheres.append((SIMD3(c4.x, c4.y, c4.z), r + swing))
+        }
+    }
+
+    /// Does any swaying instance's swing-sphere intersect this spot's shadow frustum (the cone
+    /// `updateSpotShadows` fits the map to: outer half-angle × 1.1, out to `radius`)? A slice whose
+    /// cone none of them can enter still holds a valid map while everything CPU-visible holds.
+    func swayingGeometryCanEnter(_ spot: IlluminatoramaSpotLight) -> Bool {
+        guard !shd.swayingSpheres.isEmpty else { return false }
+        let apex = spot.position
+        let axis = simd_normalize(spot.direction)
+        let half = min(1.475, acos(min(0.9999, max(0.01, spot.outerCone))) * 1.1)
+        let cosT = cos(half), sinT = sin(half)
+        let range = max(0.5, spot.radius)
+        for s in shd.swayingSpheres {
+            if s.radius == .infinity { return true }
+            let v = s.center - apex
+            let along = simd_dot(v, axis)
+            if along > range + s.radius || along < -s.radius { continue }
+            let perp = simd_length(v - axis * along)
+            // Signed distance from the cone's surface (negative inside the cone).
+            if perp * cosT - along * sinT <= s.radius { return true }
+        }
+        return false
+    }
+
+    /// Cull mode for `mesh` in a shadow pass. `.front` (second-depth casting) is the
+    /// renderer's primary acne defence and the default for everything; a mesh that is an
+    /// OPEN shell has no second depth to store and opts into `.none` — see
+    /// `IlluminatoramaMesh.shadowCastsBothFaces`.
+    func shadowCullMode(_ mesh: IlluminatoramaMesh) -> MTLCullMode {
+        let bothFaces = shadowCullFollowsDoubleSidedForTest ? mesh.doubleSided
+                                                            : mesh.shadowCastsBothFaces
+        if bothFaces { return .none }
+        return shadowStoresFrontFaces ? .back : .front
+    }
+
+    /// **Raster-time depth bias for the shadow passes — the acne defence that PAIRS with
+    /// front-face storage.**
+    ///
+    /// Second-depth needs none: the stored depth is a whole solid behind any lit surface, so
+    /// `shadowBias` is a hair of float slop and `shadowSlopeBias` is 0. Storing FRONT faces
+    /// removes that margin, and a flat surface then self-shadows wherever the depth ramp ACROSS
+    /// one shadow texel exceeds the bias — the ripple that reads as sand-bar banding on a plain
+    /// wall (Danny, 2026-08-19: "banding all over … looks like a beach-ocean floor").
+    ///
+    /// This is *not* the receiver-side `shadowSlopeBias` that was tried and reverted. That one
+    /// scales with `(1 - NdotL)`, so it dumps its full value onto grazing WALLS and detaches
+    /// their shadows from the contact line. This scales with the occluder primitive's own depth
+    /// gradient in the shadow map — dz/dtexel, exactly the quantity that produces acne — and is
+    /// applied while the caster is rasterised, so a receiver's own orientation never enters into
+    /// it. `clamp` caps the push so a face seen edge-on by the light (infinite slope) cannot
+    /// bias itself out of shadowing altogether, which is what would re-open the wall-foot leak.
+    public struct ShadowRasterBias: Equatable, Sendable {
+        /// Constant offset in depth-buffer units (see `MTLRenderCommandEncoder.setDepthBias`).
+        public var constant: Float
+        /// Multiplier on the primitive's maximum depth slope.
+        public var slopeScale: Float
+        /// Upper bound on the total bias. 0 = unbounded.
+        public var clamp: Float
+        public init(constant: Float, slopeScale: Float, clamp: Float) {
+            self.constant = constant; self.slopeScale = slopeScale; self.clamp = clamp
+        }
+        /// What second-depth needs: nothing. Named `off` rather than `none` on purpose — this
+        /// type is nearly always handled as `ShadowRasterBias?`, where `.none` is Optional's own
+        /// case and silently means "derive from the convention", i.e. the exact opposite of
+        /// switching the bias off.
+        public static let off = ShadowRasterBias(constant: 0, slopeScale: 0, clamp: 0)
+        /// **The front-face profile, and the window it sits in the middle of.** Swept on
+        /// Daydream's `4000 Sunset` (2026-08-19) against two measurements at once — wall ripple
+        /// on a patch of plain wall, and sunlit pixels on a ceilinged pantry floor, the leak
+        /// that front-face storage exists to close:
+        ///
+        /// | slopeScale | wall ripple | wall-foot leak |
+        /// |---|---|---|
+        /// | second-depth (reference) | 1.53 | 2 565 px |
+        /// | 0 | **3.52** | 0 px |
+        /// | 1 | 1.57 | — |
+        /// | **2** | **1.51** | **0 px** |
+        /// | 4 | 1.53 | 528 px |
+        /// | 8 | 1.51 | 2 675 px |
+        ///
+        /// The two failure modes bound it from both sides: under ~1 the ripple survives, at 4
+        /// and up the bias lifts the wall's stored depth clear of the floor and the leak comes
+        /// back. 2 is the middle of that window, and it lands the wall at the second-depth
+        /// reference — flat, with the contact still sealed.
+        ///
+        /// `constant` is 0 because it bought nothing (100 depth units read 1.50, inside the
+        /// run-to-run spread), and `clamp` is 0 because 0.02 was measured NON-binding: the
+        /// slopeScale-4 arm is identical to three decimal places with and without it. A guard
+        /// that never fires would only suggest a safety this profile does not have — the guard
+        /// here is slopeScale itself, and the gate that pins it.
+        public static let frontFace = ShadowRasterBias(constant: 0, slopeScale: 2, clamp: 0)
+    }
+
+    /// Apply `effectiveShadowRasterBias` to a shadow-pass encoder.
+    func applyShadowRasterBias(_ enc: MTLRenderCommandEncoder) {
+        let b = effectiveShadowRasterBias
+        enc.setDepthBias(b.constant, slopeScale: b.slopeScale, clamp: b.clamp)
+    }
+
+    /// The live-lane allocation every host gets without asking. Mirrored by hosts that ration
+    /// slices on the CPU (Daydream Home's `ShadowSlotBudget.engineSpotShadowCapacity`).
+    public static let spotShadowCapacityDefault = 8
+
+    /// The most slices the atlas will ever hold. Metal allows 2048 array slices, but each one
+    /// is a full-scene depth pass per frame (~0.5 ms) plus 1 MiB, so "no limit" still needs an
+    /// implementation cap; 64 cones is far past any house's fixture count.
+    public static let spotShadowCapacityHardMax = 64
+
+    // ── Phase 2.5 cascade constants ───────────────────────────────────────────
+    // Three cascades is the sweet spot — four is more "correct" but the extra
+    // pass cost (one render pass per cascade) isn't visible at typical scene
+    // scale. 2048² per cascade matches what UE / Frostbite use for their inner
+    // cascade and gives clean PCF at 3×3.
+    static let cascadeCount: Int = 3
+
+    /// Allocate the cascaded shadow depth array. depth32Float gives us plenty
+    /// of precision for the comparison test; `.shaderRead` is required so the
+    /// lighting kernel can sample it, and `.renderTarget` lets us write into
+    /// each slice via a render pass.
+    static func makeShadowMap(device: MTLDevice, resolution: Int) throws -> MTLTexture {
+        let d = MTLTextureDescriptor()
+        d.textureType = .type2DArray
+        d.pixelFormat = .depth32Float
+        d.width = resolution
+        d.height = resolution
+        d.arrayLength = cascadeCount
+        d.usage = [.renderTarget, .shaderRead]
+        d.storageMode = .private
+        guard let t = device.makeTexture(descriptor: d) else {
+            throw IlluminatoramaError.bufferAllocationFailed("Illuminatorama.shadowMap")
+        }
+        t.label = "Illuminatorama.shadowMap"
+        return t
+    }
+
+    /// Phase 4.10 — depth atlas for spot light shadows. Same format /
+    /// usage as the cascaded shadow map; smaller per-slice resolution
+    /// and N slices (one per shadowed spot).
+    static func makeSpotShadowAtlas(device: MTLDevice,
+                                             resolution: Int,
+                                             capacity: Int) throws -> MTLTexture {
+        let d = MTLTextureDescriptor()
+        d.textureType = .type2DArray
+        d.pixelFormat = .depth32Float
+        d.width = resolution
+        d.height = resolution
+        d.arrayLength = capacity
+        d.usage = [.renderTarget, .shaderRead]
+        d.storageMode = .private
+        guard let t = device.makeTexture(descriptor: d) else {
+            throw IlluminatoramaError.bufferAllocationFailed("Illuminatorama.spotShadowAtlas")
+        }
+        t.label = "Illuminatorama.spotShadowAtlas"
+        return t
+    }
+
+    // ── Cascade math helpers ──────────────────────────────────────────────────
+
+    /// Right-handed look-at, depth conventions matching the rest of
+    /// IlluminatoramaCamera's matrices.
+    static func lookAtRH(eye: SIMD3<Float>,
+                                 target: SIMD3<Float>,
+                                 up: SIMD3<Float>) -> simd_float4x4 {
+        let f = simd_normalize(target - eye)
+        let s = simd_normalize(simd_cross(f, up))
+        let u = simd_cross(s, f)
+        return simd_float4x4(
+            SIMD4( s.x,  u.x, -f.x, 0),
+            SIMD4( s.y,  u.y, -f.y, 0),
+            SIMD4( s.z,  u.z, -f.z, 0),
+            SIMD4(-simd_dot(s, eye),
+                  -simd_dot(u, eye),
+                   simd_dot(f, eye), 1)
+        )
+    }
+
+    /// Right-handed orthographic projection with depth range [0, 1] —
+    /// matches `IlluminatoramaCamera.projectionMatrix`'s convention.
+    static func orthoRH(left l: Float, right r: Float,
+                                bottom b: Float, top t: Float,
+                                near n: Float, far f: Float) -> simd_float4x4 {
+        let zRange = f - n
+        return simd_float4x4(
+            SIMD4(2 / (r - l), 0, 0, 0),
+            SIMD4(0, 2 / (t - b), 0, 0),
+            SIMD4(0, 0, -1 / zRange, 0),
+            SIMD4(-(r + l) / (r - l),
+                  -(t + b) / (t - b),
+                  -n / zRange, 1)
+        )
+    }
+
+    /// Right-handed perspective projection with depth range [0, 1] —
+    /// matches `IlluminatoramaCamera.projectionMatrix`'s convention. Used
+    /// by `updateSpotShadows` to build per-spot light-space VPs.
+    static func perspectiveRH(fovY: Float, aspect: Float,
+                                       near: Float, far: Float) -> simd_float4x4 {
+        let yScale = 1 / tan(fovY * 0.5)
+        let xScale = yScale / aspect
+        let zRange = far - near
+        return simd_float4x4(
+            SIMD4(xScale, 0, 0, 0),
+            SIMD4(0, yScale, 0, 0),
+            SIMD4(0, 0, -far / zRange, -1),
+            SIMD4(0, 0, -(far * near) / zRange, 0)
+        )
+    }
+}

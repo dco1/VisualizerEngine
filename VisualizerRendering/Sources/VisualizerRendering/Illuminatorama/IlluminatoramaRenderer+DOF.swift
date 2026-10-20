@@ -58,3 +58,43 @@ final class DOFState {
     /// tonemap read its output instead of the raw post-FX source).
     var dofApplied: Bool = false
 }
+
+// MARK: - Code moved out of the main renderer file
+
+extension IlluminatoramaRenderer {
+    /// Zero the accumulator; takes effect on the next frame's DOF pass.
+    public func resetDOFReferenceAccumulation() { dofs.dofReferenceNeedsReset = true }
+
+    // ── Depth-of-field state ─────────────────────────────────────────
+    struct DOFParams {
+        var invProjection: simd_float4x4
+        var focusDist: Float; var cocCoefficient: Float; var maxRadius: Float
+        var blades: Float; var bladeRotation: Float; var catsEye: Float
+        var width: UInt32; var height: UInt32
+        var tileW: UInt32; var tileH: UInt32; var tileSize: UInt32
+        /// Mirrors the Metal `DOFParams.prefilterScale`. It used to be declared here as
+        /// `_pad0` and never set, which is why the shader's `0 ⇒ point taps` branch was the
+        /// only one that ever ran (DH-0883).
+        var prefilterScale: Float = 0
+        /// Mirrors the Metal `DOFParams.cocFloor` — the diffraction Airy disc's CoC radius in
+        /// pixels, applied at every distance including the focus plane (DH-0882).
+        var cocFloor: Float = 0
+        /// Mirrors the Metal `DOFParams.subjectAware` (1 = `dofSharpSubjects`).
+        var subjectAware: Float = 0
+        /// Mirrors `DOFParams.fastGather` (1 = `dofFastGather`, with `dofSharpSubjects`).
+        var fastGather: Float = 0
+        /// Mirrors `DOFParams.halfMinCoC` (`dofHalfResMinCoC`).
+        var halfMinCoC: Float = 0
+        /// Mirrors `DOFParams.quarterMinCoC` (`dofQuarterResMinCoC`; 0 = no quarter tier).
+        var quarterMinCoC: Float = 0
+        /// Mirrors `DOFParams.partialOcclusion` (1 = `dofPartialOcclusion`, with `dofSharpSubjects`).
+        var partialOcclusion: Float = 0
+        /// Mirrors `DOFParams.nearPyramid` (1 = the layered composite's near-field coverage pyramid is
+        /// written and read — on whenever `partialOcclusion` is and its textures exist).
+        var nearPyramid: Float = 0
+    }
+
+    /// Tile size for the max-CoC reduction. Must match nothing in the shader but the
+    /// value passed in `DOFParams.tileSize` — the kernel reads it from there.
+    static let dofTileSize = 16
+}
