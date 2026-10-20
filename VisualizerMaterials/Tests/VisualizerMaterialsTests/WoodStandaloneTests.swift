@@ -84,6 +84,49 @@ final class WoodStandaloneTests: XCTestCase {
     }
 }
 
+/// Wall veneer is read across a room: calmer figure than the same wood on a furniture face, the
+/// same average colour, and a gloss that no longer tracks the ring.
+final class WallVeneerTests: XCTestCase {
+    private func luma(_ c: Vec3) -> Double { 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z }
+
+    private func stats(_ ch: MaterialChannels) -> (mean: Double, std: Double, corr: Double) {
+        let l = ch.albedo.map(luma)
+        let r = ch.roughness
+        let n = Double(l.count)
+        let ml = l.reduce(0, +) / n, mr = r.reduce(0, +) / n
+        var vl = 0.0, vr = 0.0, cov = 0.0
+        for i in 0 ..< l.count {
+            vl += (l[i] - ml) * (l[i] - ml); vr += (r[i] - mr) * (r[i] - mr)
+            cov += (l[i] - ml) * (r[i] - mr)
+        }
+        return (ml, (vl / n).squareRoot(), cov / max(1e-9, (vl * vr).squareRoot()))
+    }
+
+    func testWallVeneerIsCalmerThanFurnitureVeneerAtTheSameMeanColour() {
+        let p = WoodParams(species: .oak, layout: .panel)
+        let wall = stats(MaterialGenerator.wood(size: 256, params: p, tiling: .baked(2.0)))
+        let face = stats(MaterialGenerator.wood(size: 256, params: p, tiling: .prebaked(1.0)))
+        XCTAssertLessThan(wall.std, face.std * 0.85,
+                          "wall grain contrast must drop (wall \(wall.std) vs face \(face.std))")
+        XCTAssertEqual(wall.mean, face.mean, accuracy: face.mean * 0.04,
+                       "the wall's mean albedo is calibrated — calming must not move it")
+    }
+
+    func testWallVeneerGlossDoesNotTrackTheRing() {
+        let p = WoodParams(species: .oak, layout: .panel)
+        let wall = stats(MaterialGenerator.wood(size: 256, params: p, tiling: .baked(2.0)))
+        let face = stats(MaterialGenerator.wood(size: 256, params: p, tiling: .prebaked(1.0)))
+        XCTAssertLessThan(abs(wall.corr), abs(face.corr),
+                          "roughness must decorrelate from albedo (wall \(wall.corr) vs face \(face.corr))")
+    }
+
+    func testFlooringBoardsAreUntouched() {
+        let boards = MaterialGenerator.wood(size: 128, params: WoodParams(species: .oak, layout: .boards),
+                                            tiling: .baked(2.0))
+        XCTAssertEqual(boards.patternJitter, 0.05, accuracy: 1e-9)
+    }
+}
+
 /// `WoodParams.figure` — flat-sawn cathedral vs quarter-sawn straight grain. The knob must
 /// persist (tolerant decode), change the bake, and leave the figure DEFAULT flat-sawn so a
 /// document written before it existed keeps its arches.

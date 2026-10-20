@@ -268,6 +268,10 @@ struct WoodRecipe: Sendable {
     var roughBase: Double
     var roughSpread: Double
     var clearcoat: Double
+    /// Roughness variation that is NOT tied to the growth ring: an along-the-grain streak field
+    /// with its own seed, so gloss varies the way a real finish does (where the film sat thicker,
+    /// where the sander dwelt) instead of tracking the colour. 0 draws none — the flooring recipes.
+    var roughStreak: Double = 0
 
     /// Amplitude of the MACRO normal relief (seams, joints, a whisper of ring).
     var relief: Double
@@ -437,6 +441,30 @@ struct WoodRecipe: Sendable {
         r.knotsPerSquareMeter = 0
         return r
     }
+
+    /// **Wall veneer as it is read: across a room, not under a loupe.** A panelled wall is the
+    /// largest surface in a frame, and at that distance the grain's ring-to-ring light/dark swing
+    /// is the loudest thing on it — the figure reads as printed rather than sawn (outside review of
+    /// the Primary Bedroom, 2026-10-20: "high-contrast and busy while the broad colour is
+    /// uniform"). Real veneer is calmer: the rings are still there, but the early/late step is a
+    /// fraction of a floor board's.
+    ///
+    /// The contrast is compressed about the colour the bake actually AVERAGES to — mostly
+    /// earlywood, with latewood covering roughly a fifth of the face — not about the midpoint, so
+    /// the wall's mean albedo (calibrated against published veneer reflectance, DH-1397) does not
+    /// move. The ring-to-ring `prominence` swing is left alone: that irregularity is what keeps
+    /// the grain from being a metronome. Roughness is decoupled from the ring (`roughSpread` down,
+    /// an independent streak field up) so gloss and colour stop being the same picture.
+    var wallVeneer: WoodRecipe {
+        var r = self
+        let k = 0.70
+        let anchor = mix(earlywood, latewood, 0.2)
+        r.earlywood = mix(anchor, earlywood, k)
+        r.latewood = mix(anchor, latewood, k)
+        r.roughSpread *= 0.4
+        r.roughStreak = 0.07
+        return r
+    }
 }
 
 // MARK: - The generators
@@ -505,6 +533,9 @@ extension MaterialGenerator {
         let planks = params.planks(on: tiling)
         let seams = params.hasSeams(on: tiling)
         var recipe = seams ? params.species.recipe : params.species.recipe.sealed
+        // A panelled WALL (adjustable surface) is read from across the room; furniture veneer is
+        // prebaked and read up close, so it keeps the full figure.
+        if params.layout == .panel, tiling.isAdjustable { recipe = recipe.wallVeneer }
         if !params.knots { recipe.knotsPerSquareMeter = 0 }
         if params.figure == .quarterSawn {
             recipe.distort *= 0.12          // rings edge-on: the arch collapses to straight lines
@@ -535,7 +566,7 @@ extension MaterialGenerator {
         // step across a cabinet face would be a defect, not a panel joint.
         if params.layout == .panel, tiling.isAdjustable {
             ch.patternCells = Vec2(1, 0)
-            ch.patternJitter = 0.06
+            ch.patternJitter = 0.08
         }
         return ch
     }
@@ -778,11 +809,17 @@ extension MaterialGenerator {
                 // ── Roughness. Narrow on purpose (see `WoodRecipe.roughBase`): the finish is
                 // what you are looking at, and the grain only modulates it. The break-up field
                 // runs ALONG the grain like everything else. ──
-                let rough = r.roughBase
+                var rough = r.roughBase
                     + r.roughSpread * (lw - 0.5)
                     + 0.09 * pore + 0.14 * seam + 0.08 * joint - 0.03 * fleck
                     + (Noise.fbmTiled(u * 20, v * 2, baseCells: 4, octaves: 2,
                                       seed: seed ^ 0xEE) - 0.5) * 0.04
+                // Gloss that does not follow the ring: streaks ALONG the grain (K ≫ L), ~3 cm
+                // across, so it is band-limited fibre-scale variation and never a blotch.
+                if r.roughStreak > 0 {
+                    rough += (Noise.fbmTiled(u * 10, v * 2, baseCells: 3, octaves: 2,
+                                             seed: seed ^ 0x71) - 0.5) * 2 * r.roughStreak
+                }
                 ch.roughness[ch.idx(x, y)] = clamp01(rough)
 
                 // ── Height: ONLY what a ~2 mm texel can resolve — the grooves, and a whisper of
