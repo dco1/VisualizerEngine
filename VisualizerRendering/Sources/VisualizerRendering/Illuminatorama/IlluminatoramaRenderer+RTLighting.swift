@@ -2421,3 +2421,88 @@ extension IlluminatoramaRenderer {
         }
     }
 }
+
+// MARK: - Pipeline / resource construction (called from `init`, in the order it lists)
+
+extension IlluminatoramaRenderer {
+    /// RT-GI denoise, temporal accumulate and SVGF (variance + a-trous) compute pipelines.
+    @MainActor static func buildGIDenoisePipelines(into s: RTState, cache: SimPipelineCache, device: MTLDevice) throws {
+        guard let rtDenoisePipelineBuilt = cache.pipelineState(name: "illumi_rt_denoise", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_rt_denoise")
+        }
+        s.rtDenoisePipeline = rtDenoisePipelineBuilt
+        guard let rtGITemporalPipelineBuilt = cache.pipelineState(name: "illumi_rt_gi_temporal", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_rt_gi_temporal")
+        }
+        s.rtGITemporalPipeline = rtGITemporalPipelineBuilt
+        guard let svgfVariancePipelineBuilt = cache.pipelineState(name: "illumi_svgf_variance", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_svgf_variance")
+        }
+        s.svgfVariancePipeline = svgfVariancePipelineBuilt
+        guard let svgfAtrousPipelineBuilt = cache.pipelineState(name: "illumi_svgf_atrous", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_svgf_atrous")
+        }
+        s.svgfAtrousPipeline = svgfAtrousPipelineBuilt
+    }
+
+    /// Hardware RT lighting + instanced-RT (TLAS) pipelines, their uniform buffers and the curve-wind displace kernel. Returns whether RT is supported (the base RT pipeline built).
+    @MainActor static func buildRTPipelines(into s: RTState, cache: SimPipelineCache, device: MTLDevice, library: MTLLibrary) throws -> Bool {
+        let curvesOff = Self.curvesOffConstants()
+        var builtRTPipeline: MTLComputePipelineState? = nil
+        if device.supportsRaytracing,
+           let rtFn = try? library.makeFunction(name: "illumi_rt_lighting",
+                                                constantValues: curvesOff) {
+            builtRTPipeline = try? device.makeComputePipelineState(function: rtFn) // gpu-ok: one-time init, RT-capability-gated optional pipeline
+        }
+        s.rtPipeline = builtRTPipeline
+        guard let rtUB = device.makeBuffer(length: MemoryLayout<RTUniforms>.stride,
+                                            options: .storageModeShared) else {
+            throw IlluminatoramaError.bufferAllocationFailed("rtUniforms")
+        }
+        rtUB.label = "Illuminatorama.rt.uniforms"
+        s.rtUniformBuffer = rtUB
+        guard let rtDnUB = device.makeBuffer(length: MemoryLayout<RTDenoiseUniforms>.stride,
+                                             options: .storageModeShared) else {
+            throw IlluminatoramaError.bufferAllocationFailed("rtDenoiseUniforms")
+        }
+        rtDnUB.label = "Illuminatorama.rt.denoiseUniforms"
+        s.rtDenoiseUniformBuffer = rtDnUB
+        guard let rtGiUB = device.makeBuffer(length: MemoryLayout<RTGITemporalUniforms>.stride,
+                                             options: .storageModeShared) else {
+            throw IlluminatoramaError.bufferAllocationFailed("rtGITemporalUniforms")
+        }
+        rtGiUB.label = "Illuminatorama.rt.giTemporalUniforms"
+        s.rtGITemporalUniformBuffer = rtGiUB
+
+        // Curve sway displacement (#60 item 7 incr. 2) — plain compute, no RT
+        // dependency; nil leaves curves rigid (no per-frame re-displace).
+        s.curveWindDisplacePipeline =
+            cache.pipelineState(name: "illumi_curve_wind_displace", device: device)
+        // ── Instanced-RT (TLAS) pipeline ─────────────────────────────
+        // Same constant-declaring caveat as the surfcache TLAS kernel above:
+        // build the explicit kRTCurvesEnabled=false base variant.
+        var builtTLASPipeline: MTLComputePipelineState? = nil
+        if device.supportsRaytracing,
+           let tlasFn = try? library.makeFunction(name: "illumi_rt_lighting_tlas",
+                                                  constantValues: curvesOff) {
+            builtTLASPipeline = try? device.makeComputePipelineState(function: tlasFn) // gpu-ok: one-time init, RT-gated optional pipeline
+        }
+        s.rtTLASPipeline = builtTLASPipeline
+        guard let riUB = device.makeBuffer(length: MemoryLayout<RTInstUniforms>.stride,
+                                            options: .storageModeShared) else {
+            throw IlluminatoramaError.bufferAllocationFailed("rtInstUniforms")
+        }
+        riUB.label = "Illuminatorama.rt.instUniforms"
+        s.rtInstUniformBuffer = riUB
+        return builtRTPipeline != nil
+    }
+
+    /// The kRTCurvesEnabled / kSCCurvesEnabled = false base specialisation shared by every curve-declaring kernel.
+    static func curvesOffConstants() -> MTLFunctionConstantValues {
+        let curvesOff = MTLFunctionConstantValues()
+        var curvesOffValue = false
+        curvesOff.setConstantValue(&curvesOffValue, type: .bool,
+                                   index: Self.curveFunctionConstantIndex)
+        return curvesOff
+    }
+}

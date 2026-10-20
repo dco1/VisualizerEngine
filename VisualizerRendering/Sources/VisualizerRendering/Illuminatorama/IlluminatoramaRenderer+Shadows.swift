@@ -1046,3 +1046,30 @@ extension IlluminatoramaRenderer {
         )
     }
 }
+
+// MARK: - Pipeline / resource construction (called from `init`, in the order it lists)
+
+extension IlluminatoramaRenderer {
+    /// Depth-only sun/spot shadow pipeline (init order step 1).
+    @MainActor static func buildShadowPipeline(into s: ShadowState, device: MTLDevice, library: MTLLibrary) throws {
+        // Phase 2.5 — depth-only shadow pipeline. Same vertex layout as the
+        // G-buffer pass but no fragment shader and no colour attachments;
+        // depth is written into one slice of the cascade array per pass.
+        let sdesc = MTLRenderPipelineDescriptor()
+        sdesc.label = "Illuminatorama.shadow"
+        sdesc.vertexFunction = library.makeFunction(name: "illumi_shadow_vs")
+        sdesc.fragmentFunction = nil
+        sdesc.depthAttachmentPixelFormat = .depth32Float
+        s.shadowPipeline = try device.makeRenderPipelineState(descriptor: sdesc)
+    }
+
+    /// Sun cascade shadow map array + spot shadow atlas.
+    @MainActor static func buildShadowMaps(into s: ShadowState, device: MTLDevice, sunResolution: Int, spotResolution: Int) throws {
+        s.shadowMap = try Self.makeShadowMap(device: device, resolution: sunResolution)
+        s.spotShadowAtlas = try Self.makeSpotShadowAtlas(
+            device: device,
+            resolution: spotResolution,
+            capacity: s.spotShadowAtlasCapacity
+        )
+    }
+}

@@ -223,3 +223,28 @@ extension IlluminatoramaRenderer {
         }
     }
 }
+
+// MARK: - Pipeline / resource construction (called from `init`, in the order it lists)
+
+extension IlluminatoramaRenderer {
+    /// Highlight outline pipelines (optional: silently off when the shaders are absent).
+    @MainActor static func buildSelectionPipelines(into s: SelectionState, cache: SimPipelineCache, device: MTLDevice, library: MTLLibrary) {
+        // ── Highlight outline pipelines (optional — silently no-ops if shaders absent) ──
+        if let vs = library.makeFunction(name: "illumi_selection_box_vs"),
+           let fs = library.makeFunction(name: "illumi_selection_mask_fs") {
+            let d = MTLRenderPipelineDescriptor()
+            d.label = "Illuminatorama.selectionBoxMask"
+            d.vertexFunction = vs; d.fragmentFunction = fs
+            d.colorAttachments[0].pixelFormat = .r8Unorm
+            d.depthAttachmentPixelFormat = .depth32Float
+            s.selectionBoxMaskPipeline = try? device.makeRenderPipelineState(descriptor: d) // gpu-ok: optional
+        }
+        s.selectionDilateHPipeline = cache.pipelineState(name: "illumi_selection_dilate_h", device: device)
+        s.selectionDilateVPipeline = cache.pipelineState(name: "illumi_selection_dilate_v", device: device)
+        s.selectionCompositePipeline = cache.pipelineState(name: "illumi_selection_composite", device: device)
+        let selDepthDesc = MTLDepthStencilDescriptor()
+        selDepthDesc.depthCompareFunction = .lessEqual
+        selDepthDesc.isDepthWriteEnabled = false
+        s.selectionDepthState = device.makeDepthStencilState(descriptor: selDepthDesc)
+    }
+}

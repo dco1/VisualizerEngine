@@ -98,3 +98,57 @@ extension IlluminatoramaRenderer {
     /// value passed in `DOFParams.tileSize` — the kernel reads it from there.
     static let dofTileSize = 16
 }
+
+// MARK: - Pipeline / resource construction (called from `init`, in the order it lists)
+
+extension IlluminatoramaRenderer {
+    /// Depth-of-field pipelines (all optional: a missing function leaves the pass off).
+    @MainActor static func buildDOFPipelines(into s: DOFState, device: MTLDevice, library: MTLLibrary) {
+        // ── Depth-of-field pipelines ─────────────────────────────────
+        if let dofFn = library.makeFunction(name: "illumi_dof") {
+            s.dofPipeline = try? device.makeComputePipelineState(function: dofFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            s.dofPipeline = nil
+        }
+        if let dofTileFn = library.makeFunction(name: "illumi_dof_tile") {
+            s.dofTilePipeline = try? device.makeComputePipelineState(function: dofTileFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            s.dofTilePipeline = nil
+        }
+        if let dofDilateFn = library.makeFunction(name: "illumi_dof_dilate") {
+            s.dofDilatePipeline = try? device.makeComputePipelineState(function: dofDilateFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            s.dofDilatePipeline = nil
+        }
+        if let dofPrefilterFn = library.makeFunction(name: "illumi_dof_prefilter") {
+            s.dofPrefilterPipeline = try? device.makeComputePipelineState(function: dofPrefilterFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            s.dofPrefilterPipeline = nil
+        }
+        if let dofMinFn = library.makeFunction(name: "illumi_dof_mincoc") {
+            s.dofMinCoCPipeline = try? device.makeComputePipelineState(function: dofMinFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            s.dofMinCoCPipeline = nil
+        }
+        if let dofHalfFn = library.makeFunction(name: "illumi_dof_half") {
+            s.dofHalfPipeline = try? device.makeComputePipelineState(function: dofHalfFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            s.dofHalfPipeline = nil
+        }
+        if let dofTileParFn = library.makeFunction(name: "illumi_dof_tile_parallel") {
+            s.dofTileParallelPipeline = try? device.makeComputePipelineState(function: dofTileParFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            s.dofTileParallelPipeline = nil
+        }
+        if let dofQuarterFn = library.makeFunction(name: "illumi_dof_quarter") {
+            s.dofQuarterPipeline = try? device.makeComputePipelineState(function: dofQuarterFn) // gpu-ok: one-time init, optional DoF pipeline
+        } else {
+            s.dofQuarterPipeline = nil
+        }
+        if let rateFn = library.makeFunction(name: "illumi_dof_shading_tiles") {
+            s.dofShadingTilesPipeline = try? device.makeComputePipelineState(function: rateFn) // gpu-ok: one-time init, optional shading-rate pipeline
+        } else {
+            s.dofShadingTilesPipeline = nil
+        }
+    }
+}

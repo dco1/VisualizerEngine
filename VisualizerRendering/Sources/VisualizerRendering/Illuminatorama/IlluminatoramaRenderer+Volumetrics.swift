@@ -366,3 +366,43 @@ extension IlluminatoramaRenderer {
         }
     }
 }
+
+// MARK: - Pipeline / resource construction (called from `init`, in the order it lists)
+
+extension IlluminatoramaRenderer {
+    /// Volumetric shaft, spot-beam scattering and in-view cloud pipelines (+ their uniform buffers).
+    @MainActor static func buildVolumetricPipelines(into s: VolumetricState, device: MTLDevice, library: MTLLibrary) throws {
+        // ── Volumetric shaft pipeline ────────────────────────────────
+        if let volFn = library.makeFunction(name: "illumi_volumetric") {
+            s.volPipeline = try? device.makeComputePipelineState(function: volFn) // gpu-ok: one-time init, optional volumetric pipeline
+        } else {
+            s.volPipeline = nil
+        }
+        guard let volUB = device.makeBuffer(length: MemoryLayout<VolUniforms>.stride,
+                                            options: .storageModeShared) else {
+            throw IlluminatoramaError.bufferAllocationFailed("volUniforms")
+        }
+        volUB.label = "Illuminatorama.vol.uniforms"
+        s.volUniformBuffer = volUB
+
+        // ── Spot-beam scattering pipeline ────────────────────────────
+        if let volSpotFn = library.makeFunction(name: "illumi_volumetric_spots") {
+            s.volSpotPipeline = try? device.makeComputePipelineState(function: volSpotFn) // gpu-ok: one-time init, optional spot-beam pipeline
+        } else {
+            s.volSpotPipeline = nil
+        }
+        guard let volSpotUB = device.makeBuffer(length: MemoryLayout<VolSpotUniforms>.stride,
+                                                options: .storageModeShared) else {
+            throw IlluminatoramaError.bufferAllocationFailed("volSpotUniforms")
+        }
+        volSpotUB.label = "Illuminatorama.volSpot.uniforms"
+        s.volSpotUniformBuffer = volSpotUB
+
+        // ── In-view cloud pipeline (opt-in; nil-safe → pass no-ops) ──
+        if let cloudFn = library.makeFunction(name: "illumi_cloud_inview") {
+            s.cloudInViewPipeline = try? device.makeComputePipelineState(function: cloudFn) // gpu-ok: one-time init, optional in-view cloud pipeline
+        } else {
+            s.cloudInViewPipeline = nil
+        }
+    }
+}

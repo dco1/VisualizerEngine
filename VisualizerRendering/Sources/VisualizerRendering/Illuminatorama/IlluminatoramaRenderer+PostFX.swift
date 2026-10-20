@@ -1720,3 +1720,88 @@ extension IlluminatoramaRenderer {
     // de-facto standard (matches DaVinci / most authoring tools).
     static let colorLUTDefaultSize: Int = 33
 }
+
+// MARK: - Pipeline / resource construction (called from `init`, in the order it lists)
+
+extension IlluminatoramaRenderer {
+    /// TAA, bloom, halation, tonemap and exposure-estimate pipelines.
+    @MainActor static func buildPostPipelines(into s: PostFXState, cache: SimPipelineCache, device: MTLDevice, library: MTLLibrary) throws {
+        guard let taaResolvePipelineBuilt = cache.pipelineState(name: "illumi_taa_resolve", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_taa_resolve")
+        }
+        s.taaResolvePipeline = taaResolvePipelineBuilt
+        guard let bloomPrefilterPipelineBuilt = cache.pipelineState(name: "illumi_bloom_prefilter", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_bloom_prefilter")
+        }
+        s.bloomPrefilterPipeline = bloomPrefilterPipelineBuilt
+        guard let bloomDownPipelineBuilt = cache.pipelineState(name: "illumi_bloom_down", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_bloom_down")
+        }
+        s.bloomDownPipeline = bloomDownPipelineBuilt
+        guard let bloomUpPipelineBuilt = cache.pipelineState(name: "illumi_bloom_up", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_bloom_up")
+        }
+        s.bloomUpPipeline = bloomUpPipelineBuilt
+        guard let halationThresholdPipelineBuilt = cache.pipelineState(name: "illumi_halation_threshold", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_halation_threshold")
+        }
+        s.halationThresholdPipeline = halationThresholdPipelineBuilt
+        guard let halationBlurHPipelineBuilt = cache.pipelineState(name: "illumi_halation_blur_h", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_halation_blur_h")
+        }
+        s.halationBlurHPipeline = halationBlurHPipelineBuilt
+        guard let halationBlurVPipelineBuilt = cache.pipelineState(name: "illumi_halation_blur_v", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_halation_blur_v")
+        }
+        s.halationBlurVPipeline = halationBlurVPipelineBuilt
+        // Phase 4.28 — tonemap render pipeline (fullscreen triangle → fragment).
+        // Outputs into the bgra8Unorm `outputTexture` via a render pass so the
+        // write is visible to SceneKit's cross-queue background sample.
+        let tmDesc = MTLRenderPipelineDescriptor()
+        tmDesc.label = "Illuminatorama.tonemap"
+        tmDesc.vertexFunction = library.makeFunction(name: "illumi_tonemap_vs")
+        tmDesc.fragmentFunction = library.makeFunction(name: "illumi_tonemap_fs")
+        tmDesc.colorAttachments[0].pixelFormat = .bgra8Unorm_srgb
+        let tonemap = try device.makeRenderPipelineState(descriptor: tmDesc)
+        // Phase 4.21 — auto-exposure estimator.
+        s.tonemapPipeline = tonemap
+        guard let exposureEstimatePipelineBuilt = cache.pipelineState(name: "illumi_exposure_estimate", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_exposure_estimate")
+        }
+        s.exposureEstimatePipeline = exposureEstimatePipelineBuilt
+    }
+
+    /// Exposure state + histogram buffers (seeded for the first frame).
+    @MainActor static func buildExposureBuffers(into s: PostFXState, device: MTLDevice) throws {
+        // ExposureState is 16 bytes (4 floats). Storage `.shared` so
+        // the renderer can seed it once and (if needed) read it for
+        // diagnostics. The kernel updates it in place each frame.
+        guard let expoBuf = device.makeBuffer(
+            length: 16, options: .storageModeShared
+        ) else { throw IlluminatoramaError.bufferAllocationFailed("exposureState") }
+        expoBuf.label = "Illuminatorama.exposureState"
+        // Initial state: previous-frame target log lum = -2.0 (mid-grey-ish);
+        // smoothed exposure = 1.0 (the static fallback); new target same;
+        // dt = 1/60 s (host will overwrite per frame).
+        let initialState: [Float] = [-2.0, 1.0, -2.0, 1.0 / 60.0]
+        memcpy(expoBuf.contents(), initialState,
+               MemoryLayout<Float>.stride * initialState.count)
+        s.exposureBuffer = expoBuf
+        guard let histBuf = device.makeBuffer(length: MemoryLayout<Float>.stride * (ExposureHistogram.bins + 8),
+                                              options: .storageModeShared) else {
+            throw IlluminatoramaError.bufferAllocationFailed("exposureHistogram")
+        }
+        histBuf.label = "Illuminatorama.exposureHistogram"
+        memset(histBuf.contents(), 0, histBuf.length)
+        s.exposureHistogramBuffer = histBuf
+    }
+
+    /// The identity 3D colour-grade LUT (a no-op until a scene calls `setColorLUT`).
+    @MainActor static func buildIdentityColorLUT(into s: PostFXState, device: MTLDevice) throws {
+        guard let lut = Self.makeIdentityColorLUT(device: device,
+                                                  size: Self.colorLUTDefaultSize) else {
+            throw IlluminatoramaError.bufferAllocationFailed("Illuminatorama.colorLUT")
+        }
+        s.colorLUT = lut
+    }
+}

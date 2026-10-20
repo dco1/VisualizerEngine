@@ -169,3 +169,31 @@ extension IlluminatoramaRenderer {
         return Float(v)
     }()
 }
+
+// MARK: - Pipeline / resource construction (called from `init`, in the order it lists)
+
+extension IlluminatoramaRenderer {
+    /// SSR gather/temporal/composite and SSS blur/composite compute pipelines.
+    @MainActor static func buildSSRSSSPipelines(into s: SSRSSSState, cache: SimPipelineCache, device: MTLDevice) throws {
+        guard let ssrGatherPipelineBuilt = cache.pipelineState(name: "illumi_ssr_gather", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_ssr_gather")
+        }
+        s.ssrGatherPipeline = ssrGatherPipelineBuilt
+        guard let ssrTemporalPipelineBuilt = cache.pipelineState(name: "illumi_ssr_temporal", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_ssr_temporal")
+        }
+        s.ssrTemporalPipeline = ssrTemporalPipelineBuilt
+        guard let ssrCompositePipelineBuilt = cache.pipelineState(name: "illumi_ssr_composite", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_ssr_composite")
+        }
+        s.ssrCompositePipeline = ssrCompositePipelineBuilt
+        guard let sssBlurPipelineBuilt = cache.pipelineState(name: "illumi_sss_blur", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_sss_blur")
+        }
+        s.sssBlurPipeline = sssBlurPipelineBuilt
+        guard let sssCompositePipelineBuilt = cache.pipelineState(name: "illumi_sss_composite", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_sss_composite")
+        }
+        s.sssCompositePipeline = sssCompositePipelineBuilt
+    }
+}

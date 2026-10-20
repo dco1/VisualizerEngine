@@ -636,3 +636,135 @@ extension IlluminatoramaRenderer {
         enc.endEncoding()
     }
 }
+
+// MARK: - Pipeline / resource construction (called from `init`, in the order it lists)
+
+extension IlluminatoramaRenderer {
+    /// Particle step, repack, mesh-synth, particle/point-sprite/streak draw pipelines and the particle depth state.
+    @MainActor static func buildParticlePipelines(into s: ParticleState, cache: SimPipelineCache, device: MTLDevice, library: MTLLibrary) throws {
+        // ── Phase 4.11 — particle pipelines ─────────────────────────────
+        guard let partStep = cache.pipelineState(name: "illumi_particles_step",
+                                                  device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_particles_step")
+        }
+        s.particleStepPipeline = partStep
+
+        // ── Phase 4.13a — DynamicMesh repack kernel ──────────────────
+        guard let repack = cache.pipelineState(name: "illumi_repack_pos_norm",
+                                                device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_repack_pos_norm")
+        }
+        s.repackPosNormPipeline = repack
+
+        // ── Phase 4.21 — GPU mesh normal/tangent synthesis ───────────
+        guard let meshAdj = cache.pipelineState(name: "illumi_mesh_build_adjacency",
+                                                 device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_mesh_build_adjacency")
+        }
+        s.meshBuildAdjacencyPipeline = meshAdj
+        guard let meshSynth = cache.pipelineState(name: "illumi_mesh_synth",
+                                                  device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_mesh_synth")
+        }
+        s.meshSynthPipeline = meshSynth
+
+        let partDrawDesc = MTLRenderPipelineDescriptor()
+        partDrawDesc.label = "Illuminatorama.particles.draw"
+        partDrawDesc.vertexFunction   = library.makeFunction(name: "illumi_particles_vs")
+        partDrawDesc.fragmentFunction = library.makeFunction(name: "illumi_particles_fs")
+        partDrawDesc.colorAttachments[0].pixelFormat = .rgba16Float
+        // HDR additive blend. `one + one` lets bright particles accumulate
+        // into the composite; bloom & tonemap then process them with the
+        // same pipeline as direct + indirect lighting.
+        partDrawDesc.colorAttachments[0].isBlendingEnabled = true
+        partDrawDesc.colorAttachments[0].rgbBlendOperation = .add
+        partDrawDesc.colorAttachments[0].alphaBlendOperation = .add
+        partDrawDesc.colorAttachments[0].sourceRGBBlendFactor = .one
+        partDrawDesc.colorAttachments[0].destinationRGBBlendFactor = .one
+        partDrawDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+        partDrawDesc.colorAttachments[0].destinationAlphaBlendFactor = .one
+        // Depth attachment must match the G-buffer's format so we can
+        // bind that texture as a read-only depth target and have opaque
+        // scene geometry occlude particles behind it.
+        partDrawDesc.depthAttachmentPixelFormat = .depth32Float
+        s.particleDrawPipeline = try device.makeRenderPipelineState(descriptor: partDrawDesc)
+
+        // Phase 4.23 — host-owned point-sprite pipeline. Mirrors the
+        // particles pipeline's HDR additive blend but uses MTLPrimitiveType
+        // .point + a stride-parameterised vertex shader, so callers can
+        // bind their own MTLBuffer of (position, color) without first
+        // copying into Illuminatorama's particle layout.
+        let extPartDesc = MTLRenderPipelineDescriptor()
+        extPartDesc.label = "Illuminatorama.extParticles.draw"
+        extPartDesc.vertexFunction   = library.makeFunction(name: "illumi_extparticle_vs")
+        extPartDesc.fragmentFunction = library.makeFunction(name: "illumi_extparticle_fs")
+        extPartDesc.colorAttachments[0].pixelFormat = .rgba16Float
+        extPartDesc.colorAttachments[0].isBlendingEnabled = true
+        extPartDesc.colorAttachments[0].rgbBlendOperation = .add
+        extPartDesc.colorAttachments[0].alphaBlendOperation = .add
+        extPartDesc.colorAttachments[0].sourceRGBBlendFactor = .one
+        extPartDesc.colorAttachments[0].destinationRGBBlendFactor = .one
+        extPartDesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+        extPartDesc.colorAttachments[0].destinationAlphaBlendFactor = .one
+        extPartDesc.depthAttachmentPixelFormat = .depth32Float
+        s.extParticleDrawPipeline = try device.makeRenderPipelineState(descriptor: extPartDesc)
+
+        // Phase 4.44b — velocity-aligned streak pipeline. Uses the same
+        // `particleStreakVS/FS` shaders as `ParticleStreakPass` but targets
+        // the HDR composite directly so streaks participate in bloom + tonemap.
+        // Optional: if the shaders are absent the pipeline stays nil and streak
+        // draws are silently skipped — logged once here, not per-frame.
+        if let svs = library.makeFunction(name: "particleStreakVS"),
+           let sfs = library.makeFunction(name: "particleStreakFS") {
+            let streakVD = MTLVertexDescriptor()
+            // Buffer 0: FWStreakVertex (stride 32) — float3 position @ offset 0,
+            //           float4 color (w = stretchFactor) @ offset 16.
+            streakVD.attributes[0].format      = .float3
+            streakVD.attributes[0].offset      = 0
+            streakVD.attributes[0].bufferIndex = 0
+            streakVD.attributes[1].format      = .float4
+            streakVD.attributes[1].offset      = 16
+            streakVD.attributes[1].bufferIndex = 0
+            streakVD.layouts[0].stride         = 32
+            streakVD.layouts[0].stepFunction   = .perVertex
+            // Buffer 1: float2 UV (stride 8).
+            streakVD.attributes[2].format      = .float2
+            streakVD.attributes[2].offset      = 0
+            streakVD.attributes[2].bufferIndex = 1
+            streakVD.layouts[1].stride         = 8
+            streakVD.layouts[1].stepFunction   = .perVertex
+            let sd = MTLRenderPipelineDescriptor()
+            sd.label                                                  = "Illuminatorama.streaks"
+            sd.vertexFunction                                         = svs
+            sd.fragmentFunction                                       = sfs
+            sd.vertexDescriptor                                       = streakVD
+            sd.colorAttachments[0].pixelFormat                       = .rgba16Float
+            sd.colorAttachments[0].isBlendingEnabled                 = true
+            sd.colorAttachments[0].rgbBlendOperation                 = .add
+            sd.colorAttachments[0].sourceRGBBlendFactor              = .one
+            sd.colorAttachments[0].destinationRGBBlendFactor         = .one
+            sd.colorAttachments[0].alphaBlendOperation               = .add
+            sd.colorAttachments[0].sourceAlphaBlendFactor            = .one
+            sd.colorAttachments[0].destinationAlphaBlendFactor       = .one
+            sd.depthAttachmentPixelFormat                            = .depth32Float
+            s.streakPipeline = try? device.makeRenderPipelineState(descriptor: sd)
+            if s.streakPipeline == nil {
+                Self.log.error("Illuminatorama: streakPipeline compilation failed — streak draws disabled")
+            }
+        } else {
+            Self.log.warning("Illuminatorama: particleStreakVS/FS not found in library — streak draws disabled")
+        }
+
+        // Depth state: less-equal compare, NO write. Lets each particle
+        // get tested against G-buffer depth (so the cube/sphere/ground
+        // hide particles behind them) while leaving the depth buffer
+        // pristine for any subsequent passes.
+        let partDepthDesc = MTLDepthStencilDescriptor()
+        partDepthDesc.depthCompareFunction = .lessEqual
+        partDepthDesc.isDepthWriteEnabled = false
+        guard let pds = device.makeDepthStencilState(descriptor: partDepthDesc) else {
+            throw IlluminatoramaError.pipelineCreationFailed("particleDepthState")
+        }
+        s.particleDepthState = pds
+    }
+}

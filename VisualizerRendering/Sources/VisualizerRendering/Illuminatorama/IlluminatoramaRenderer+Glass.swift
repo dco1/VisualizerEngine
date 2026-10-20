@@ -615,3 +615,49 @@ extension IlluminatoramaRenderer {
         return gls.glassDefocusTexture != nil && gls.glassDefocusDepth != nil
     }
 }
+
+// MARK: - Pipeline / resource construction (called from `init`, in the order it lists)
+
+extension IlluminatoramaRenderer {
+    /// AAA glass pipelines: RT variant (RT-capable devices only), Fresnel fallback, depth state.
+    @MainActor static func buildGlassPipelines(into s: GlassState, device: MTLDevice, library: MTLLibrary) {
+        // ── AAA glass pipelines (#60, forward, src-alpha blended) ──────────
+        // Two fragment variants share one vertex stage (`illumi_glass_rt_vs`) and
+        // one blend config: `illumi_glass_rt_fs` traces the scene TLAS for true
+        // refraction/reflection (returns opaque alpha 1 → nearest pane replaces),
+        // `illumi_glass_fallback_fs` is the Fresnel+sky fallback (alpha < 1 →
+        // blends). Drawn into the HDR composite after lighting, depth-tested LE but
+        // no depth write so opaque geometry in front occludes the glass.
+        // Local-capture closure (a nested `func` would implicitly capture `self`
+        // before full init); `dev`/`library` are locals so this is init-safe.
+        let dev = device
+        let makeGlassPipeline: (String, String) -> MTLRenderPipelineState? = { fragName, label in
+            guard let gvs = library.makeFunction(name: "illumi_glass_rt_vs"),
+                  let gfs = library.makeFunction(name: fragName) else { return nil }
+            let gdesc = MTLRenderPipelineDescriptor()
+            gdesc.label = label
+            gdesc.vertexFunction = gvs
+            gdesc.fragmentFunction = gfs
+            gdesc.colorAttachments[0].pixelFormat = .rgba16Float   // hdrCompositeTexture
+            gdesc.colorAttachments[0].isBlendingEnabled = true
+            gdesc.colorAttachments[0].rgbBlendOperation = .add
+            gdesc.colorAttachments[0].alphaBlendOperation = .add
+            gdesc.colorAttachments[0].sourceRGBBlendFactor = .sourceAlpha
+            gdesc.colorAttachments[0].destinationRGBBlendFactor = .oneMinusSourceAlpha
+            gdesc.colorAttachments[0].sourceAlphaBlendFactor = .one
+            gdesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            gdesc.depthAttachmentPixelFormat = .depth32Float
+            return try? dev.makeRenderPipelineState(descriptor: gdesc)
+        }
+        // The RT fragment shader needs a device that supports ray tracing; build
+        // it only there (the function references `instance_acceleration_structure`).
+        s.glassRTPipeline = device.supportsRaytracing
+            ? makeGlassPipeline("illumi_glass_rt_fs", "Illuminatorama.glass.rt") : nil
+        s.glassFallbackPipeline = makeGlassPipeline("illumi_glass_fallback_fs",
+                                                       "Illuminatorama.glass.fallback")
+        let gds = MTLDepthStencilDescriptor()
+        gds.depthCompareFunction = .lessEqual
+        gds.isDepthWriteEnabled = false
+        s.glassDepthState = device.makeDepthStencilState(descriptor: gds)
+    }
+}

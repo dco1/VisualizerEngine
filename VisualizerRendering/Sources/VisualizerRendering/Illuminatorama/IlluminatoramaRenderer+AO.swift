@@ -250,3 +250,24 @@ extension IlluminatoramaRenderer {
         var fullHeight: UInt32
     }
 }
+
+// MARK: - Pipeline / resource construction (called from `init`, in the order it lists)
+
+extension IlluminatoramaRenderer {
+    /// SSAO + RTAO compute pipelines (RTAO is nil on non-RT hardware: it is never dispatched there).
+    @MainActor static func buildAOPipelines(into s: AOState, cache: SimPipelineCache, device: MTLDevice) throws {
+        guard let ssaoPipelineBuilt = cache.pipelineState(name: "illumi_ssao", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_ssao")
+        }
+        s.ssaoPipeline = ssaoPipelineBuilt
+        guard let ssaoSpatialPipelineBuilt = cache.pipelineState(name: "illumi_ssao_spatial", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_ssao_spatial")
+        }
+        s.ssaoSpatialPipeline = ssaoSpatialPipelineBuilt
+        guard let ssaoTemporalPipelineBuilt = cache.pipelineState(name: "illumi_ssao_temporal", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_ssao_temporal")
+        }
+        s.ssaoTemporalPipeline = ssaoTemporalPipelineBuilt
+        s.rtaoPipeline = cache.pipelineState(name: "illumi_rtao_tlas", device: device)
+    }
+}

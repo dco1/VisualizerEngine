@@ -1520,3 +1520,118 @@ extension IlluminatoramaRenderer {
         )
     }
 }
+
+// MARK: - Pipeline / resource construction (called from `init`, in the order it lists)
+
+extension IlluminatoramaRenderer {
+    /// G-buffer, superquadric-impostor pipelines and the opaque depth state (init order step 1).
+    @MainActor static func buildGBufferPipelines(into s: GBufferState, device: MTLDevice, library: MTLLibrary) throws {
+        // G-buffer render pipeline (vertex + fragment).
+        let pdesc = MTLRenderPipelineDescriptor()
+        pdesc.label = "Illuminatorama.gbuffer"
+        // Issue #65 — `illumi_vs` now references function_constant(10) kUsePrevVerts,
+        // so even the BASE variant must be specialized (a plain makeFunction(name:)
+        // aborts at pipeline validation for any referenced-but-unset constant). The
+        // base sets it false → byte-identical to the old behaviour; the prev-verts
+        // pipeline below sets it true and gains the buffer(5) per-vertex prev read.
+        let vsBaseConsts = MTLFunctionConstantValues()
+        var userPrevVertsFalse = false
+        vsBaseConsts.setConstantValue(&userPrevVertsFalse, type: .bool, index: 10)
+        pdesc.vertexFunction = try library.makeFunction(name: "illumi_vs",
+                                                        constantValues: vsBaseConsts)
+        pdesc.fragmentFunction = try Self.makeGBufferFragment(library: library, extended: false)
+        pdesc.colorAttachments[0].pixelFormat = .rgba16Float
+        pdesc.colorAttachments[1].pixelFormat = .rgba16Float
+        pdesc.colorAttachments[2].pixelFormat = .rgba16Float
+        // Phase 2.7 — velocity attachment (screen-space motion in UV space).
+        pdesc.colorAttachments[3].pixelFormat = .rg16Float
+        // Light-layer attachment (R32Uint) — carries the per-fragment layer bitfield.
+        pdesc.colorAttachments[4].pixelFormat = .r32Uint
+        pdesc.depthAttachmentPixelFormat = .depth32Float
+        // No vertex descriptor — the shader reads from a device-buffer of
+        // Vertex via [[vertex_id]]. Simpler than wiring a vertex descriptor
+        // and matches the Swift/Metal struct mirror more directly.
+        s.gbufferPipeline = try device.makeRenderPipelineState(descriptor: pdesc)
+
+        // Issue #65 — second G-buffer pipeline with kUsePrevVerts = true. Reuses
+        // the SAME descriptor (identical attachment formats / fragment); only the
+        // specialized vertex function differs. Bound for deforming GPU-mesh draws.
+        let vsPrevConsts = MTLFunctionConstantValues()
+        var usePrevVertsTrue = true
+        vsPrevConsts.setConstantValue(&usePrevVertsTrue, type: .bool, index: 10)
+        pdesc.label = "Illuminatorama.gbuffer.prevVerts"
+        pdesc.vertexFunction = try library.makeFunction(name: "illumi_vs",
+                                                        constantValues: vsPrevConsts)
+        s.gbufferPipelinePrevVerts = try device.makeRenderPipelineState(descriptor: pdesc)
+
+        // Perfect analytic superquadric impostor — same G-buffer attachment
+        // formats so it renders into the SAME G-buffer pass/encoder (no extra
+        // pass, no extra clear). The fragment writes analytic depth via
+        // `[[depth(less)]]`. Optional: if the functions are missing the impostor
+        // simply doesn't draw (the proxy still covers RT), so don't fail init.
+        if let sqVS = library.makeFunction(name: "illumi_superquadric_impostor_vs"),
+           let sqFS = library.makeFunction(name: "illumi_superquadric_impostor_fs") {
+            let sqdesc = MTLRenderPipelineDescriptor()
+            sqdesc.label = "Illuminatorama.superquadricImpostor"
+            sqdesc.vertexFunction = sqVS
+            sqdesc.fragmentFunction = sqFS
+            sqdesc.colorAttachments[0].pixelFormat = .rgba16Float
+            sqdesc.colorAttachments[1].pixelFormat = .rgba16Float
+            sqdesc.colorAttachments[2].pixelFormat = .rgba16Float
+            sqdesc.colorAttachments[3].pixelFormat = .rg16Float
+            sqdesc.colorAttachments[4].pixelFormat = .r32Uint
+            sqdesc.depthAttachmentPixelFormat = .depth32Float
+            s.superquadricImpostorPipeline =
+                try? device.makeRenderPipelineState(descriptor: sqdesc)
+        }
+
+
+        let ddesc = MTLDepthStencilDescriptor()
+        ddesc.depthCompareFunction = .less
+        ddesc.isDepthWriteEnabled = true
+        guard let ds = device.makeDepthStencilState(descriptor: ddesc) else {
+            throw IlluminatoramaError.pipelineCreationFailed("depth-stencil state")
+        }
+        s.depthState = ds
+    }
+
+    /// Warm the init compute pipelines concurrently (WWDC23 #10127 async compilation) so a cold pipeline cache compiles in parallel.
+    @MainActor static func precompileInitPipelines(cache: SimPipelineCache, device: MTLDevice) {
+        // illumi_lighting is function-constant–specialized (WWDC23 #10127). Build the
+        // variant matching the renderer's current feature flags; other variants are
+        // compiled lazily by `currentLightingPipeline()` when a flag toggles, and this
+        // init-time variant doubles as the fallback if a later build ever fails.
+        // #60 task 4 — warm the init compute pipelines concurrently (WWDC23
+        // #10127 async compilation applied to startup) so a cold pipeline cache
+        // compiles in parallel instead of 26 serial blocking calls. The guards
+        // below then hit the warm cache. (`illumi_lighting` uses the specialized
+        // variant path, so it's compiled by the guard, not here.)
+        cache.precompile([
+            "illumi_bloom_down", "illumi_bloom_prefilter", "illumi_bloom_up",
+            "illumi_dfg_bake", "illumi_exposure_estimate",
+            "illumi_halation_blur_h", "illumi_halation_blur_v", "illumi_halation_threshold",
+            "illumi_irradiance_bake",
+            "illumi_mesh_build_adjacency", "illumi_mesh_synth", "illumi_particles_step",
+            "illumi_prefilter_bake", "illumi_repack_pos_norm", "illumi_rt_denoise",
+            "illumi_rt_gi_temporal", "illumi_rtao_tlas", "illumi_ssao", "illumi_ssao_spatial",
+            "illumi_ssao_temporal", "illumi_ssr_composite", "illumi_ssr_gather",
+            "illumi_ssr_temporal", "illumi_surfcache_atrous",
+            "illumi_surfcache_reframe_chart",
+            "illumi_surfcache_reframe_deform", "illumi_surfcache_reframe_tri",
+            "illumi_svgf_atrous", "illumi_svgf_variance", "illumi_taa_resolve",
+        ], device: device)
+    }
+
+    /// The init-time `illumi_lighting` variant; doubles as the fallback if a later variant build fails.
+    @MainActor static func buildLightingPipeline(into s: GBufferState, cache: SimPipelineCache, device: MTLDevice,
+                                              ibl: Bool, shadow: Bool, dfg: Bool) throws {
+        let (initLightingKey, initLightingConstants) = Self.lightingFeatureConstants(
+            ibl: ibl, shadow: shadow, dfg: dfg)
+        guard let lighting = cache.pipelineState(name: "illumi_lighting", device: device,
+                                                 constants: initLightingConstants,
+                                                 variantKey: initLightingKey) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_lighting")
+        }
+        s.lightingPipeline = lighting
+    }
+}

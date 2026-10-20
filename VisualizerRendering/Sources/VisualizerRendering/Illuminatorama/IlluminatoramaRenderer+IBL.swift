@@ -375,3 +375,97 @@ extension IlluminatoramaRenderer {
         return t
     }
 }
+
+// MARK: - Pipeline / resource construction (called from `init`, in the order it lists)
+
+extension IlluminatoramaRenderer {
+    /// Irradiance / prefilter / DFG bake compute pipelines.
+    @MainActor static func buildBakePipelines(into s: IBLState, cache: SimPipelineCache, device: MTLDevice) throws {
+        guard let irradianceBakePipelineBuilt = cache.pipelineState(name: "illumi_irradiance_bake", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_irradiance_bake")
+        }
+        s.irradianceBakePipeline = irradianceBakePipelineBuilt
+        guard let prefilterBakePipelineBuilt = cache.pipelineState(name: "illumi_prefilter_bake", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_prefilter_bake")
+        }
+        s.prefilterBakePipeline = prefilterBakePipelineBuilt
+        guard let dfgBakePipelineBuilt = cache.pipelineState(name: "illumi_dfg_bake", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_dfg_bake")
+        }
+        s.dfgBakePipeline = dfgBakePipelineBuilt
+    }
+
+    /// Irradiance / prefilter cubemaps and the 1x1 dummy sky.
+    @MainActor static func buildCubes(into s: IBLState, device: MTLDevice) throws {
+        let (irrCube, preCube, preViews) = try Self.makeIBLCubes(device: device)
+        s.irradianceCube = irrCube
+        s.prefilteredCube = preCube
+        s.prefilteredMipViews = preViews
+        s.dummySkyTexture = Self.makeDummySky(device: device)
+    }
+
+    /// The DFG split-sum LUT texture (baked later by `encodeDFGBake`).
+    @MainActor static func makeDFGTexture(into s: IBLState, device: MTLDevice) throws -> MTLTexture {
+        // ── Phase 3.2 DFG LUT ───────────────────────────────────────────
+        // Allocate and bake immediately — the LUT is view-independent so it
+        // never needs to be rebuilt. Bake CB is enqueued on the shared queue;
+        // subsequent render CBs on the same queue are sequenced after it
+        // automatically (no waitUntilCompleted needed).
+        let dfgDesc = MTLTextureDescriptor()
+        dfgDesc.textureType = .type2D
+        // DH-1014 — four channels: (A, B) the env split sum, `.b` the direct lobe's albedo,
+        // `.a` the cloth-sheen albedo (IlluminatoramaBSDF.h documents the layout).
+        dfgDesc.pixelFormat = .rgba16Float
+        dfgDesc.width  = Self.dfgLUTSize
+        dfgDesc.height = Self.dfgLUTSize
+        dfgDesc.usage  = [.shaderRead, .shaderWrite]
+        dfgDesc.storageMode = .private
+        guard let dfg = device.makeTexture(descriptor: dfgDesc) else {
+            throw IlluminatoramaError.bufferAllocationFailed("Illuminatorama.dfgLUT")
+        }
+        dfg.label = "Illuminatorama.dfgLUT"
+        s.dfgLUT = dfg
+
+        return dfg
+    }
+
+    /// LTC area-light LUTs (self-validated); falls back to the DFG LUT as a never-sampled binding.
+    @MainActor static func buildLTC(into s: IBLState, device: MTLDevice, dfg: MTLTexture) {
+        if let ltc = IlluminatoramaLTC.makeLUTs(device: device) {
+            s.ltcMatTexture = ltc.mat
+            s.ltcMagTexture = ltc.mag
+            s.ltcValidated = ltc.validated
+        } else {
+            s.ltcMatTexture = dfg
+            s.ltcMagTexture = dfg
+            s.ltcValidated = false
+        }
+    }
+
+    /// Enqueue the one-time DFG LUT bake on the shared queue (later CBs on the queue sequence after it).
+    @MainActor static func encodeDFGBake(dfg: MTLTexture, dfgBake: MTLComputePipelineState, commandQueue: MTLCommandQueue) {
+        if let cb  = commandQueue.makeCommandBuffer(),
+           let enc = cb.makeComputeCommandEncoder() {
+            cb.label  = "Illuminatorama.dfgBake"
+            enc.label = "Illuminatorama.dfgBake"
+            enc.setComputePipelineState(dfgBake)
+            enc.setTexture(dfg, index: 0)
+            // S1.6 — pick the `k` remap the split-sum integral is baked with. Read
+            // ONCE, here, because the LUT is never rebaked.
+            var dfgUseIBLRemap: UInt32 = Self.dfgUseIBLGeometryRemap ? 1 : 0
+            enc.setBytes(&dfgUseIBLRemap, length: MemoryLayout<UInt32>.stride, index: 0)
+            let sz  = Self.dfgLUTSize
+            let tgw = dfgBake.threadExecutionWidth
+            let tgh = max(1, dfgBake.maxTotalThreadsPerThreadgroup / tgw)
+            let tg  = MTLSize(width: tgw, height: tgh, depth: 1)
+            let groups = MTLSize(
+                width:  (sz + tgw - 1) / tgw,
+                height: (sz + tgh - 1) / tgh,
+                depth:  1
+            )
+            enc.dispatchThreadgroups(groups, threadsPerThreadgroup: tg)
+            enc.endEncoding()
+            cb.commit()
+        }
+    }
+}

@@ -1957,3 +1957,58 @@ extension IlluminatoramaRenderer {
         rts.rtSoupTriBaseCount = soupBase.count
     }
 }
+
+// MARK: - Pipeline / resource construction (called from `init`, in the order it lists)
+
+extension IlluminatoramaRenderer {
+    /// Surface-cache update pipelines (RT-gated), uniforms, GPU-diff re-frame + denoise kernels and the stats ring.
+    @MainActor static func buildSurfaceCachePipelines(into s: SurfaceCacheState, cache: SimPipelineCache, device: MTLDevice, library: MTLLibrary) throws {
+        let curvesOff = Self.curvesOffConstants()
+        // ── Surface-cache update pipeline (RT-gated) ─────────────────
+        // Both kernels declare the kSCCurvesEnabled function constant (#60 item 7),
+        // so both MUST be specialized via constantValues even for the base (false)
+        // variant — Metal refuses a plain makeFunction(name:) pipeline for any
+        // constant-declaring function. `curvesOff` was built above.
+        var builtSurfCachePipeline: MTLComputePipelineState? = nil
+        var builtSurfCacheTLASPipeline: MTLComputePipelineState? = nil
+        if device.supportsRaytracing,
+           let scFn = try? library.makeFunction(name: "illumi_surfcache_update",
+                                                constantValues: curvesOff) {
+            builtSurfCachePipeline = try? device.makeComputePipelineState(function: scFn) // gpu-ok: one-time init, RT-gated optional pipeline
+        }
+        if device.supportsRaytracing,
+           let scTLASFn = try? library.makeFunction(name: "illumi_surfcache_update_tlas",
+                                                    constantValues: curvesOff) {
+            builtSurfCacheTLASPipeline = try? device.makeComputePipelineState(function: scTLASFn) // gpu-ok: one-time init, RT-gated optional pipeline
+        }
+        s.surfCachePipeline = builtSurfCachePipeline
+        s.surfCacheTLASPipeline = builtSurfCacheTLASPipeline
+        guard let scUB = device.makeBuffer(length: MemoryLayout<SurfCacheUniforms>.stride,
+                                            options: .storageModeShared) else {
+            throw IlluminatoramaError.bufferAllocationFailed("surfCacheUniforms")
+        }
+        scUB.label = "Illuminatorama.surfcache.uniforms"
+        s.surfCacheUniformBuffer = scUB
+        // #60 item 1 + Phase D — GPU-side incremental-invalidation kernels (plain
+        // compute, no RT dependency; nil leaves the CPU re-frame path in charge).
+        s.surfReframeTriPipeline =
+            cache.pipelineState(name: "illumi_surfcache_reframe_tri", device: device)
+        s.surfReframeChartPipeline =
+            cache.pipelineState(name: "illumi_surfcache_reframe_chart", device: device)
+        s.surfReframeDeformPipeline =
+            cache.pipelineState(name: "illumi_surfcache_reframe_deform", device: device)
+        // Phase 5 / B1 — cache-domain denoiser (plain compute, no RT dependency;
+        // nil leaves consumers reading the raw atlas).
+        s.surfAtrousPipeline =
+            cache.pipelineState(name: "illumi_surfcache_atrous", device: device)
+        var statsRing: [MTLBuffer] = []
+        for slot in 0..<IlluminatoramaRenderer.maxFramesInFlight {
+            guard let b = device.makeBuffer(length: MemoryLayout<UInt32>.stride * 4,
+                                            options: .storageModeShared) else { continue }
+            b.label = "Illuminatorama.surfcache.gpuDiffStats.\(slot)"
+            memset(b.contents(), 0, b.length)
+            statsRing.append(b)
+        }
+        s.surfGPUDiffStatsRing = statsRing
+    }
+}
