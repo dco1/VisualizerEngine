@@ -490,7 +490,8 @@ static inline float3 brdf(
         spec *= le.specDirectMS;
         kd = le.diffuseDirect;
     }
-    float3 diff = kd * albedo / M_PI_F;
+    // DH-1301 — Oren-Nayar diffuse roughness (le.onSigma 0 ⇒ exactly × 1.0, i.e. Lambert).
+    float3 diff = kd * albedo / M_PI_F * orenNayarDiffuseScale(N, V, L, le.onSigma);
     // THE EXACT EARLY-OUT. Everything above this line is untouched, and this is the expression
     // `brdf` has always returned; a surface with no cloth sheen therefore cannot move by a bit.
     if (!(sheenStrength > 0.0)) return (diff + spec) * lightColor * NdotL;
@@ -524,7 +525,7 @@ static inline float3 brdfDiffuse(
     // DH-1014 — must stay `brdf`'s diffuse exactly (the SSS composite subtracts it).
     if (le.multiscatter) kd = le.diffuseDirect;
     kd *= le.baseUnderSheen;
-    return kd * albedo / M_PI_F * lightColor * NdotL;
+    return kd * albedo / M_PI_F * orenNayarDiffuseScale(N, V, L, le.onSigma) * lightColor * NdotL;
 }
 
 // ── Rectangular area light (#60 task 5) ─────────────────────────────────────
@@ -1259,6 +1260,9 @@ kernel void illumi_lighting(
                         ? float(dfgLUT.sample(leSampler, float2(leNdotV, sheenRoughness)).a) : 0.0;
         le = layeredEnergy(albedo, metallic, leLUT, leSheenA, sheenStrength, layeredMS, layeredSheen);
     }
+    // DH-1301 — diffuse roughness: the DIRECT lobes below (sun, points, spots, fill directionals,
+    // and the SSS diffuse peel) take Oren-Nayar; LTC area lights and the IBL diffuse stay Lambert.
+    if ((frame.frameFlags & kFrameFlagDiffuseRoughness) != 0u) le.onSigma = diffuseRoughnessSigma(roughness);
 
     // Issue #65 — screen-space SSS. SSS-flagged pixels carry ≈0.95h in
     // normalRoughness.w (vertex-colour alpha ∈ [0.90,0.98]; above the foliage 0.0
