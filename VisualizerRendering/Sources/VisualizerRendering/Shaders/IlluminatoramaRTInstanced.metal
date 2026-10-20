@@ -1582,7 +1582,11 @@ kernel void illumi_rt_lighting_tlas(
         float3 V = normalize(u.cameraWorldPos - P);
         float3 H = normalize(Ld + V);
         float spec = pow(saturate(dot(N, H)), mix(8.0, 90.0, 1.0 - roughness)) * (1.0 - roughness) * u.specStrength;
-        direct = u.sunColor * NdotL * vis * (albedo * (1.0 / M_PI_F) + spec);
+        // DH-1301 — Oren-Nayar diffuse roughness on the traced sun, the twin of the deferred lane's
+        // `brdf` (same function, same sigma mapping); flag clear ⇒ the Lambert expression below.
+        float onScale = (u.pathFlags & kPathFlagDiffuseRoughness) != 0u
+                      ? orenNayarDiffuseScale(N, V, Ld, diffuseRoughnessSigma(roughness)) : 1.0;
+        direct = u.sunColor * NdotL * vis * (albedo * (1.0 / M_PI_F) * onScale + spec);
     }
 
     // ── One-bounce indirect (GI) ──────────────────────────────────

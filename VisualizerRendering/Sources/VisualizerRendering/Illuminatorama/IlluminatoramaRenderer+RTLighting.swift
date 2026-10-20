@@ -66,6 +66,7 @@ extension IlluminatoramaRenderer {
         // DH-1014 — the layered weights apply to the one-bounce GI too, so NOT gated on `pathOn`.
         u.pathFlags |= (dfgLUTEnabled && layeredMultiscatter ? 256 : 0)
             | (dfgLUTEnabled && layeredClothSheen ? 512 : 0)
+            | (diffuseRoughnessEnabled ? 16384 : 0)           // DH-1301 — `kPathFlagDiffuseRoughness`
             | (!pathOn && rtGIHitFill ? 1024 : 0)            // DH-1320 — `kPathFlagOneBounceHitFill`
             // DH-1308 — `kPathFlagGlossyVertices`: only with light sampling + the DFG LUT (the lobe's albedo).
             | (pathOn && rtPathGlossyVertices && rtPathLightSampling && dfgLUTEnabled ? 2048 : 0)
