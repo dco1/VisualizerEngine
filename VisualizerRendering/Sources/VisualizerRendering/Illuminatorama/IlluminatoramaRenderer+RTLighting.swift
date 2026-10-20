@@ -324,7 +324,6 @@ extension IlluminatoramaRenderer {
             // read samples at the wrong scale and bleeds across tiles.
             surfTileSize: UInt32(surfActiveTileSize), surfTilesPerRow: UInt32(surfTilesPerRow),
             surfAtlasW: UInt32(surfAtlasW), surfAtlasH: UInt32(surfAtlasH),
-            emitterCount: UInt32(activeEmitterLightCount),
             leafTransmission: max(0, leafTransmission))
         u.curvesEnabled = curvesOn ? 1 : 0
         // C1 — exactly one sun. See `RTSunOwnership`; `.automatic` (the default)
@@ -356,7 +355,6 @@ extension IlluminatoramaRenderer {
         enc.setBuffer(surfTriCardBuffer ?? ib, offset: 0, index: 4)
         enc.setBuffer(surfTriUVaBuffer ?? triA, offset: 0, index: 5)
         enc.setBuffer(surfTriUVcBuffer ?? triA, offset: 0, index: 6)
-        enc.setBuffer(ddgiEmitterBuffer ?? triA, offset: 0, index: 7) // dummy when no emitters
         enc.setBuffer(surfCardRectBuffer ?? triA, offset: 0, index: 8) // per-card atlas rect (dummy off)
         enc.setBuffer(surfCardBuffer ?? surfCardDummyBuffer ?? triA, offset: 0, index: 9)     // per-card material (L_out reconstruction; dummy off, ≥ 1 SurfCard for arg validation)
         // Curve set data + pooled geometry (#60 item 7 incr. 2); dummies keep the

@@ -427,11 +427,6 @@ public final class IlluminatoramaOverlay {
         renderer.iblIntensity = Float(s.iblIntensity)
         renderer.dfgLUTEnabled = s.dfgLUTEnabled
 
-        // DDGI
-        renderer.ddgiEnabled = s.ddgiEnabled
-        renderer.ddgiIrradianceScale = Float(s.ddgiIrradianceScale)
-        renderer.ddgiHysteresis = Float(s.ddgiHysteresis)
-        renderer.ddgiTwoBounceEnabled = s.ddgiTwoBounceEnabled
 
         // Shadows
         renderer.shadowsEnabled = s.shadowsEnabled
@@ -465,10 +460,6 @@ public final class IlluminatoramaOverlay {
         set { renderer.iblEnabled = newValue }
     }
 
-    public var ddgiEnabled: Bool {
-        get { renderer.ddgiEnabled }
-        set { renderer.ddgiEnabled = newValue }
-    }
 
     public var taaEnabled: Bool {
         get { renderer.taaEnabled }

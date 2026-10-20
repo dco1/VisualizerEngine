@@ -61,9 +61,9 @@ public extension IlluminatoramaRenderer {
     /// Deliberately still NOT handled — each scene curates these itself:
     ///   • `exposure` / `autoExposureEnabled` — House fixes its own; Room/Lab pass
     ///     the shared value through. There's no single correct policy.
-    ///   • SSAO / SSR *intensity + radius*, TAA, DDGI, shadows, IBL, internal
+    ///   • SSAO / SSR *intensity + radius*, TAA, shadows, IBL, internal
     ///     render-scale — some scenes own a subset (Room's RT path drives
-    ///     SSR/shadows/IBL; Lab installs a custom DDGI probe grid). Note the
+    ///     SSR/shadows/IBL). Note the
     ///     SSAO/SSR **denoise** flags are NOT in this list: no scene art-directs
     ///     them, so they went universal — see `applySharedDenoiser`.
     func applySharedPostFX(_ s: IlluminatoramaSharedSettings = .shared) {

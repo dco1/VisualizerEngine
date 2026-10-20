@@ -109,14 +109,6 @@ public final class IlluminatoramaParticleEmitter {
     /// the draw pass for this emitter.
     public var enabled: Bool = true
 
-    /// When set, the DDGI trace kernel treats this emitter as an analytic
-    /// point light so probe irradiance (and therefore ALL scene surfaces)
-    /// pick up the particles' glow.
-    /// - `position`: world-space centroid of the particle cloud.
-    /// - `color`: aggregate pre-multiplied HDR emission for the whole field.
-    /// - `radius`: falloff distance in metres; contribution reaches zero at this distance.
-    public var ddgiLight: (position: SIMD3<Float>, color: SIMD3<Float>, radius: Float)? = nil
-
     private let device: MTLDevice
     private var ringIndex: Int = 0
 

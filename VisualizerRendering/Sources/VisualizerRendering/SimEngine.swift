@@ -145,9 +145,6 @@ public struct ParticleFieldSource {
     /// Identity of the SCNScene that owns this field — the overlay's
     /// active-scene filter key.
     public let ownerScene: ObjectIdentifier
-    /// When set, the DDGI trace kernel treats this field as an analytic point
-    /// light so all scene surfaces pick up the particles' glow.
-    public let ddgiLight: (position: SIMD3<Float>, color: SIMD3<Float>, radius: Float)?
 
     public init(positionBuffer: MTLBuffer,
                 colorBuffer: MTLBuffer,
@@ -158,8 +155,7 @@ public struct ParticleFieldSource {
                 positionOffsetFloats: UInt32 = 0,
                 colorOffsetFloats: UInt32 = 0,
                 pointSize: Float = 2.5,
-                colorScale: Float = 1.0,
-                ddgiLight: (position: SIMD3<Float>, color: SIMD3<Float>, radius: Float)? = nil) {
+                colorScale: Float = 1.0) {
         self.positionBuffer = positionBuffer
         self.colorBuffer = colorBuffer
         self.vertexCount = vertexCount
@@ -170,7 +166,6 @@ public struct ParticleFieldSource {
         self.colorOffsetFloats = colorOffsetFloats
         self.pointSize = pointSize
         self.colorScale = colorScale
-        self.ddgiLight = ddgiLight
     }
 }
 

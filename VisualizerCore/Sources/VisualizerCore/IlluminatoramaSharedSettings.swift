@@ -159,12 +159,6 @@ public final class IlluminatoramaSharedSettings {
     public var iblIntensity: Double = 1.0
     public var dfgLUTEnabled: Bool = true
 
-    // ── DDGI (probe GI) ───────────────────────────────────────────────
-    public var ddgiEnabled: Bool = true
-    public var ddgiIrradianceScale: Double = 1.0
-    public var ddgiHysteresis: Double = 0.99
-    public var ddgiTwoBounceEnabled: Bool = false
-
     // ── Cascaded shadow maps ──────────────────────────────────────────
     public var shadowsEnabled: Bool = true
     public var shadowBias: Double = 0.0003
@@ -261,10 +255,6 @@ public final class IlluminatoramaSharedSettings {
         iblEnabled = \(iblEnabled)
         iblIntensity = \(fmt(iblIntensity))
         dfgLUTEnabled = \(dfgLUTEnabled)
-        ddgiEnabled = \(ddgiEnabled)
-        ddgiIrradianceScale = \(fmt(ddgiIrradianceScale))
-        ddgiHysteresis = \(fmt(ddgiHysteresis))
-        ddgiTwoBounceEnabled = \(ddgiTwoBounceEnabled)
         shadowsEnabled = \(shadowsEnabled)
         shadowBias = \(fmt(shadowBias))
         shadowSlopeBias = \(fmt(shadowSlopeBias))

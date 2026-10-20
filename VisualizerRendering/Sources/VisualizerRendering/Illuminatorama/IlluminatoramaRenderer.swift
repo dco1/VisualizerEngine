@@ -23,23 +23,11 @@ import VisualizerCore
 //          GGX-prefiltered specular cube from it each frame and the lighting
 //          pass consumes both. Set `equirectSky` and (optionally) toggle
 //          `iblEnabled` / `iblIntensity`.
-// Phase 3.1: DDGI probe grid. Dynamic-diffuse global-illumination probes sit
-//          on a regular grid; each frame we trace `raysPerProbe` rays per
-//          probe, hash-blend the resulting irradiance + depth into octahedral
-//          atlases with hysteresis, and the lighting kernel replaces the
-//          irradiance-cube diffuse term with the probe-grid lookup.
 // Phase 3.2: Split-sum DFG LUT. RG16Float LUT baked once at init from the
 //          pre-integrated GGX BRDF. The lighting pass samples it at
 //          (NdotV, roughness) and uses Karis's `F0 * scale + bias` for the
 //          F0-weighted specular IBL — replacing the Lagarde roughness-Schlick
 //          that Phase 3.0 shipped. Toggle via `dfgLUTEnabled` for A/B.
-// Phase 3.3: DDGI two-bounce. Irradiance + depth atlases ping-pong (A/B);
-//          the trace kernel reads PREVIOUS-frame atlases and adds a
-//          Lambertian indirect bounce to the recorded radiance. Toggle via
-//          `ddgiTwoBounceEnabled`. Atlases ping-pong unconditionally so the
-//          accessors stay simple, but the second-bounce contribution is
-//          gated by the uniform — toggling off mid-session reverts to
-//          Phase 3.1's one-bounce result within one hysteresis time-constant.
 //
 // ── BEFORE STARTING A NEW PHASE ──────────────────────────────────────────────
 // Read docs/known-issues/illuminatorama-renderer-process.md. It captures:
@@ -71,26 +59,18 @@ public final class IlluminatoramaRenderer {
     // ── Mesh kinds ────────────────────────────────────────────────────────────
     //
     // Phase 1 / 2 hard-coded three procedural primitives that both the G-buffer
-    // pass and the DDGI trace kernel knew how to draw and intersect. Phase 2.6
-    // adds `.custom(String)` for host-registered SCNGeometry conversions; the
-    // renderer treats them identically to the built-ins for G-buffer / lighting
-    // / IBL / SSR purposes, but the DDGI trace kernel can't analytically
-    // intersect them (no BVH yet — that's Phase 4). Hits on `.custom` meshes
-    // pass through DDGI silently as if the geometry weren't there; direct
-    // lighting + IBL + SSR all work fine.
+    // pass knew how to draw. Phase 2.6 adds `.custom(String)` for host-registered
+    // SCNGeometry conversions; the renderer treats them identically to the
+    // built-ins for G-buffer / lighting / IBL / SSR purposes.
     public enum MeshKind: Hashable, Sendable {
         case box
         case sphere
         case ground
         case custom(String)
 
-        /// GPU-side meshKind ID written into the per-instance struct. 0/1/2
-        /// keep the DDGI trace kernel's analytic intersection paths;
-        /// anything ≥ 3 is treated as "no analytic intersection available"
-        /// — see `illumi_ddgi_trace` in Illuminatorama.metal. All
-        /// `.custom(_)` meshes share the same GPU ID (3) because the trace
-        /// kernel skips them uniformly; the Swift-side string identity is
-        /// what disambiguates them in the mesh table.
+        /// GPU-side meshKind ID written into the per-instance struct. All
+        /// `.custom(_)` meshes share the same GPU ID (3); the Swift-side string
+        /// identity is what disambiguates them in the mesh table.
         var gpuMeshKind: UInt32 {
             switch self {
             case .box:        return 0
@@ -2833,7 +2813,7 @@ public final class IlluminatoramaRenderer {
     /// the reconstruction filter footprint, making geometry visibly walk
     /// between frames. With SSAA on (`internalRenderScale > 1`) the AA
     /// role is filled by spatial oversampling — leaving jitter at 0 so
-    /// TAA contributes denoise of SSAO/SSR/DDGI noise without adding any
+    /// TAA contributes denoise of SSAO/SSR noise without adding any
     /// motion. Set back to 0.5 to re-enable temporal supersample AA.
     public var taaJitterPixels: Float = 0.0
     /// The internal → output reduction (Daydream DH-1365): `.legacy` (default, byte-identical) is the
@@ -3014,33 +2994,6 @@ public final class IlluminatoramaRenderer {
     public var iblRebakeInterval: Float = 5.0
     public func markIBLDirty() { iblNeedsRebake = true }
 
-    // ── Phase 3.1 DDGI knobs ─────────────────────────────────────────
-    /// Toggle DDGI probe GI. When `true`, the lighting kernel samples the
-    /// probe irradiance atlas for diffuse indirect lighting instead of the
-    /// sky-probe irradiance cube. IBL specular is unaffected.
-    public var ddgiEnabled: Bool = false
-    /// Probe grid dimensions (x × y × z). Default 4×2×4 = 32 probes.
-    public var ddgiGridDims: SIMD3<Int> = SIMD3(4, 2, 4)
-    /// World-space position of the (0,0,0) corner probe.
-    public var ddgiGridOrigin: SIMD3<Float> = SIMD3(-3, 0, -3)
-    /// Distance between adjacent probes in metres.
-    public var ddgiProbeSpacing: Float = 2.0
-    /// Rays fired from each probe per frame. 64 is a good baseline.
-    public var ddgiRaysPerProbe: Int = 64
-    /// EMA weight kept from the previous irradiance frame (0.9–0.98).
-    /// Higher = smoother but slower to react to lighting changes.
-    public var ddgiHysteresis: Float = 0.97
-    /// Scale on the final DDGI irradiance contribution.
-    public var ddgiIrradianceScale: Float = 1.0
-    /// Phase 3.3 — toggle one-bounce vs two-bounce DDGI. When on, the trace
-    /// kernel reads the previous frame's irradiance atlas at every ray hit
-    /// and adds the Lambertian-re-emitted indirect bounce to the recorded
-    /// radiance, so the next probe update sees light that's been scattered
-    /// once more around the room. First frame after enable still shows
-    /// only direct light (the previous atlas is empty); subsequent frames
-    /// converge as hysteresis builds up the indirect term.
-    public var ddgiTwoBounceEnabled: Bool = false
-
     /// **Compile the `illumi_lighting` feature variant BLOCKING instead of async.**
     ///
     /// The per-frame path (`currentLightingPipeline`) normally compiles a
@@ -3054,9 +3007,8 @@ public final class IlluminatoramaRenderer {
     /// `render(blocking:)` loop STARVES that hop — the main actor never yields, so
     /// the specialized variant never lands and every frame silently runs the
     /// init-time uber-variant. The uber-variant is built with the flags present at
-    /// init (DDGI off), so a harness that flips `ddgiEnabled` on and settles a
-    /// still measures a lane whose DDGI path never ran (DH-0552 — the vacuous DDGI
-    /// gates). Same trap for any flag that differs from init.
+    /// init, so a harness that flips a flag and settles a still measures a lane
+    /// whose flag never ran (DH-0552). Same trap for any flag that differs from init.
     ///
     /// Set this in such a lane to compile the needed variant BLOCKING (the same
     /// choice the RT-sun variant makes for its settled/photo lane): the frame then
@@ -3066,76 +3018,11 @@ public final class IlluminatoramaRenderer {
     public var blockingLightingCompile: Bool = false
 
     /// TEST-OBSERVABLE (DH-0869): the specialisation flags of the lighting variant the LAST
-    /// frame actually dispatched — bit 1 ibl · 2 shadow · 4 dfg · 8 ddgi · 16 irrCache · 32 rtSun.
+    /// frame actually dispatched — bit 1 ibl · 2 shadow · 4 dfg · 32 rtSun.
     /// `0xFF` until a specialised variant has run. On the non-blocking path a not-yet-compiled
     /// combination runs the init-time variant and leaves this at the PREVIOUS value, so a test
     /// that flips a flag can assert the frame really ran it.
     public var activeLightingVariantFlags: UInt8 { lastLightingFlags }
-
-    /// **S3.2 Ultra — trace the probe field against the REAL TLAS.** The
-    /// analytic trace only intersects box/sphere/ground primitives, so a
-    /// `.custom`-mesh host stands in coarse `ddgiProxyInstances`. With this on
-    /// (and a TLAS live — `rtTLASActive`), `illumi_ddgi_trace_tlas` fills the
-    /// SAME ray buffer from the instance acceleration structure instead: real
-    /// occlusion (window holes admit light, furniture shades the floor), mean
-    /// albedo + emission at hits, and a sun shadow ray per hit. Falls back to
-    /// the analytic kernel any frame the TLAS is not available, and the settle
-    /// gate re-arms on the flip so the field re-converges rather than mixing
-    /// lanes. Default OFF — hosts opt in from a quality tier.
-    public var ddgiRTTraceEnabled: Bool = false
-
-    /// Whether the TLAS trace kernel compiled on this device — shaders build at
-    /// run time here, so a silent fallback to the analytic lane would otherwise
-    /// be indistinguishable from Ultra working. Gates assert this, not the knob.
-    public var ddgiRTTraceSupported: Bool { ddgiTraceTLASPipeline != nil }
-
-    /// **Non-rendered DDGI proxy channel.** DDGI's trace kernel can only
-    /// intersect the analytic primitives it understands — box / sphere / ground
-    /// (`MeshKind` 0/1/2). A host whose real scene is all `.custom` meshes (a
-    /// house of walls, floors, furniture ⇒ every mesh is meshKind 3, silently
-    /// skipped) therefore has NOTHING for probes to bounce off. These proxies fix
-    /// that WITHOUT drawing anything: each is an ordinary `InstanceRef` (its
-    /// `modelMatrix` places/scales the unit primitive, its material feeds the
-    /// probe's Lambertian re-emission) that is appended to the DDGI trace's
-    /// instance buffer but never enters the raster / G-buffer / RT passes. A
-    /// house feeds coarse box proxies for its walls, floor and ceiling so the
-    /// probe field sees the room's enclosure (occlusion for the Chebyshev depth
-    /// test, colour for diffuse bleed). Empty by default — a scene that already
-    /// registers analytic primitives on the render list (Visualizer's DDGI demo)
-    /// is unaffected.
-    public var ddgiProxyInstances: [InstanceRef] = [] {
-        didSet { ddgiProxiesDirty = true }
-    }
-
-    /// **View-independent settle budget for the DDGI trace (S3.2).** The probe
-    /// field is world-space and camera-independent, so a camera-only orbit does
-    /// not change it — re-tracing every frame during an orbit recomputes an
-    /// identical field and is the per-frame cost that makes a heavy scene stutter.
-    /// When positive, the trace + the two atlas-update kernels run only while the
-    /// field is settling (this many frames after any probe-field input changes —
-    /// geometry moved, sun rotated, proxies rebuilt) and are skipped once it has
-    /// converged; the last atlas is reused. **0 (default) ⇒ trace every frame**,
-    /// bit-identical to the pre-gate renderer, so no existing scene is affected.
-    /// A host with EMA hysteresis `h` wants roughly `3–5 / (1 - h)` frames here
-    /// (≈100–150 at the 0.97 default) to let the exponential average settle.
-    /// See `DDGIConvergenceGate`.
-    public var ddgiConvergenceFrames: Int = 0
-
-    /// Whether `encodeDDGIFrame` actually ran the trace on the most recent frame
-    /// (true) or reused the converged atlas (false). Test/instrument observable —
-    /// a perf gate asserts that orbiting N settled frames traces 0 of them. Always
-    /// true while `ddgiConvergenceFrames == 0`.
-    public internal(set) var ddgiDidTraceLastFrame: Bool = false
-
-    /// The settle-gate state (pure value; see `DDGIConvergenceGate`).
-    var ddgiConvergenceGate = DDGIConvergenceGate()
-    /// Set whenever `ddgiProxyInstances` is reassigned; cleared once the proxies
-    /// have been packed into the trace instance buffer. Forces a re-arm + repack.
-    var ddgiProxiesDirty = false
-    /// Monotonic counter bumped on any frame the render/proxy geometry was
-    /// unstable, folded into the settle-gate hash so a moving wall re-traces while
-    /// a still orbit does not.
-    var ddgiGeometryEpoch: UInt64 = 0
 
     // ── Phase 3.2 split-sum DFG LUT ──────────────────────────────────
     /// Toggle the pre-integrated DFG LUT for the F0-weighted IBL specular
@@ -3980,65 +3867,6 @@ public final class IlluminatoramaRenderer {
     /// IBL bake — used for the `iblRebakeInterval` fallback.
     private var iblLastBakeTime: Float = -.infinity
 
-    // Phase 3.1 — DDGI probe grid. Atlases are allocated lazily on first use
-    // (or on grid-dim change) via `ensureDDGIResources()`. They stay nil
-    // until `ddgiEnabled` is true and at least one `render()` call has run.
-    // Phase 3.3 — ping-pong the irradiance + depth atlases so the trace
-    // kernel can sample the PREVIOUS frame's atlases (for the second bounce)
-    // while the update kernels write the CURRENT frame's atlases, all
-    // within a single compute encoder. Both atlases must ping-pong because
-    // both are sampled by `sampleDDGIIrradiance` for the Chebyshev
-    // visibility test.
-    //
-    // After all three DDGI kernels finish, the lighting kernel reads the
-    // CURRENT atlases (which now hold this frame's fresh writes). At the
-    // end of `encodeDDGIFrame` we toggle `ddgiUseAtlasA` so next frame the
-    // labels swap: what was "current" becomes "previous", and the other
-    // texture gets overwritten with new data.
-    //
-    // Two-bounce off: first frame after enable sees an empty previous
-    // atlas (one-bounce result); convergence is fast because the trace
-    // kernel pumps fresh radiance into the current atlas every frame and
-    // the hysteresis EMA bakes it into the steady state over ~20-30 frames.
-    var ddgiIrradianceAtlasA: MTLTexture?
-    var ddgiIrradianceAtlasB: MTLTexture?
-    var ddgiDepthAtlasA: MTLTexture?
-    var ddgiDepthAtlasB: MTLTexture?
-    /// True ⇒ A is the current frame's write target / lighting-read source,
-    /// B is the previous-frame read source for the trace kernel. Toggles
-    /// at end of `encodeDDGIFrame`.
-    var ddgiUseAtlasA: Bool = true
-
-    var ddgiIrradianceCurrent: MTLTexture? {
-        ddgiUseAtlasA ? ddgiIrradianceAtlasA : ddgiIrradianceAtlasB
-    }
-    var ddgiIrradiancePrevious: MTLTexture? {
-        ddgiUseAtlasA ? ddgiIrradianceAtlasB : ddgiIrradianceAtlasA
-    }
-    var ddgiDepthCurrent: MTLTexture? {
-        ddgiUseAtlasA ? ddgiDepthAtlasA : ddgiDepthAtlasB
-    }
-    var ddgiDepthPrevious: MTLTexture? {
-        ddgiUseAtlasA ? ddgiDepthAtlasB : ddgiDepthAtlasA
-    }
-    var ddgiRayBuffer: MTLBuffer?
-    var ddgiInstanceDataBuffer: MTLBuffer?
-    /// Instance count last packed into `ddgiInstanceDataBuffer` (−1 = never) —
-    /// with stable content the pack loop (a 4×4 inverse per instance) is skipped.
-    var ddgiPackedInstanceCount = -1
-    var ddgiInstanceDataCapacity: Int = 0
-    var ddgiEmitterBuffer: MTLBuffer?
-    var ddgiEmitterCapacity: Int = 0
-    var activeEmitterLightCount: Int {
-        particleEmitters.filter(\.enabled).filter { $0.ddgiLight != nil }.count
-        + particleFields.filter { $0.ddgiLight != nil }.count
-    }
-    var ddgiCurrentGridDims: SIMD3<Int> = .zero
-    // Uniform buffer for DDGI — allocated once, written each frame.
-    let ddgiUniformBuffer: MTLBuffer
-    // 1×1 rg16Float placeholder bound to the depth atlas slot when DDGI is off.
-    let ddgiDummyDepthAtlas: MTLTexture
-
     // ── Phase 4.39: denoiser textures ────────────────────────────────
     // AO spatiotemporal: raw AO → spatial filter → temporal → lighting.
     var aoFilteredTexture: MTLTexture    // half-res, after bilateral
@@ -4047,19 +3875,6 @@ public final class IlluminatoramaRenderer {
     private var aoHistoryToggle: Bool = false
     private var aoNeedsFirstFrame: Bool = true
 
-    // Phase 3.4 — per-pixel DDGI irradiance EMA cache (full-res, RGBA16F).
-    private var irrCacheA: MTLTexture
-    private var irrCacheB: MTLTexture
-    private var irrCacheToggle: Bool = false
-    var irrCacheCurrent: MTLTexture { irrCacheToggle ? irrCacheB : irrCacheA }
-    var irrCachePrevious: MTLTexture { irrCacheToggle ? irrCacheA : irrCacheB }
-    /// When true, the lighting kernel blends the fresh DDGI probe lookup with
-    /// the previous-frame per-pixel cache (EMA), cutting the 8-probe trilinear
-    /// blend to 1 texture read in steady state. Only effective when DDGI is on.
-    public var ddgiIrrCacheEnabled: Bool = true
-    /// EMA blend alpha: 0 = freeze history forever, 1 = always use fresh probe
-    /// lookup (same as disabled). Default 0.05 converges in ~20 frames.
-    public var ddgiIrrCacheBlend: Float = 0.05
     private var previousSsaoEnabled: Bool = false
     private var previousSSAOIntensityActive: Bool = false
 
@@ -4506,15 +4321,6 @@ public final class IlluminatoramaRenderer {
     /// `dt` for particle integration even when the host's frame rate
     /// varies.
     private var lastParticleTickTime: CFTimeInterval = CACurrentMediaTime()
-    // Phase 3.1 — DDGI compute kernels.
-    let ddgiTracePipeline: MTLComputePipelineState
-    let ddgiUpdateIrrPipeline: MTLComputePipelineState
-    let ddgiUpdateDepthPipeline: MTLComputePipelineState
-    /// S3.2 Ultra — the TLAS-backed trace variant. Optional: a device or
-    /// metallib without it degrades to the analytic kernel, never fails init.
-    lazy var ddgiTraceTLASPipeline: MTLComputePipelineState? =
-        engine.pipelineCache.pipelineState(name: "illumi_ddgi_trace_tlas", device: device)
-
     // ── Hardware ray tracing state ───────────────────────────────────
     /// Mirror of `RTUniforms` in IlluminatoramaRT.metal.
     struct RTUniforms {
@@ -4531,7 +4337,7 @@ public final class IlluminatoramaRenderer {
         // Surface cache: read cached radiance at GI/reflection hits when enabled.
         var surfCacheEnabled: UInt32; var surfTileSize: UInt32; var surfTilesPerRow: UInt32
         var surfAtlasW: UInt32; var surfAtlasH: UInt32
-        var emitterCount: UInt32 = 0
+        var _padEmitters: UInt32 = 0
         var leafTransmission: Float = 0      // mirrors _padRT0 in the Metal struct
         // Curve primitives (#60 item 7, incr. 2): 1 ⇒ soup AS holds a curve
         // geometry descriptor; mirrors `curvesEnabled` (was `_padRT1`) in Metal.
@@ -5682,7 +5488,7 @@ public final class IlluminatoramaRenderer {
     // safety-net is `ensureBufferCapacity` setting `taaNeedsFirstFrame =
     // true` on growth — that catches count CHANGES but not REORDERS.
     //
-    // When DDGI / dynamic scene extraction lands, the right fix is a
+    // When dynamic scene extraction lands, the right fix is a
     // stable per-instance ID (UUID in the host-side struct, hashed into a
     // uint32 in the GPU struct); the renderer can then sort `prevInstances`
     // by ID at the start of each frame so `prevInstances[iid]` lines up
@@ -5950,7 +5756,6 @@ public final class IlluminatoramaRenderer {
         // variant path, so it's compiled by the guard, not here.)
         cache.precompile([
             "illumi_bloom_down", "illumi_bloom_prefilter", "illumi_bloom_up",
-            "illumi_ddgi_trace", "illumi_ddgi_update_depth", "illumi_ddgi_update_irradiance",
             "illumi_dfg_bake", "illumi_exposure_estimate",
             "illumi_halation_blur_h", "illumi_halation_blur_v", "illumi_halation_threshold",
             "illumi_irradiance_bake",
@@ -5966,8 +5771,7 @@ public final class IlluminatoramaRenderer {
         timing.mark("compute pipeline precompile (32, concurrent)")
 
         let (initLightingKey, initLightingConstants) = Self.lightingFeatureConstants(
-            ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
-            ddgi: ddgiEnabled, ddgiIrrCache: ddgiIrrCacheEnabled)
+            ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled)
         guard let lighting = cache.pipelineState(name: "illumi_lighting", device: device,
                                                  constants: initLightingConstants,
                                                  variantKey: initLightingKey) else {
@@ -6056,16 +5860,6 @@ public final class IlluminatoramaRenderer {
         guard let expoEst = cache.pipelineState(name: "illumi_exposure_estimate", device: device) else {
             throw IlluminatoramaError.pipelineCreationFailed("illumi_exposure_estimate")
         }
-        // Phase 3.1 — DDGI kernels.
-        guard let ddgiTrace = cache.pipelineState(name: "illumi_ddgi_trace", device: device) else {
-            throw IlluminatoramaError.pipelineCreationFailed("illumi_ddgi_trace")
-        }
-        guard let ddgiUpdateIrr = cache.pipelineState(name: "illumi_ddgi_update_irradiance", device: device) else {
-            throw IlluminatoramaError.pipelineCreationFailed("illumi_ddgi_update_irradiance")
-        }
-        guard let ddgiUpdateDepth = cache.pipelineState(name: "illumi_ddgi_update_depth", device: device) else {
-            throw IlluminatoramaError.pipelineCreationFailed("illumi_ddgi_update_depth")
-        }
         self.lightingPipeline = lighting
         self.ssaoPipeline = ssao
         // RTAO (DH-0528) — a TLAS kernel; on hardware without ray-tracing support the pipeline
@@ -6094,7 +5888,7 @@ public final class IlluminatoramaRenderer {
         self.halationBlurVPipeline = halBlurV
         self.tonemapPipeline = tonemap
         self.exposureEstimatePipeline = expoEst
-        timing.mark("compute pipeline fetch (lighting/ssao/ssr/svgf/bloom/ddgi)")
+        timing.mark("compute pipeline fetch (lighting/ssao/ssr/svgf/bloom)")
 
         // ── Hardware RT pipeline (optional) ──────────────────────────
         // Only build on RT-capable hardware; the intersector kernel can't be
@@ -6308,9 +6102,6 @@ public final class IlluminatoramaRenderer {
         histBuf.label = "Illuminatorama.exposureHistogram"
         memset(histBuf.contents(), 0, histBuf.length)
         self.exposureHistogramBuffer = histBuf
-        self.ddgiTracePipeline = ddgiTrace
-        self.ddgiUpdateIrrPipeline = ddgiUpdateIrr
-        self.ddgiUpdateDepthPipeline = ddgiUpdateDepth
 
         // ── Phase 4.11 — particle pipelines ─────────────────────────────
         guard let partStep = cache.pipelineState(name: "illumi_particles_step",
@@ -6535,28 +6326,7 @@ public final class IlluminatoramaRenderer {
             cb.commit()
         }
 
-        // ── Phase 3.1 DDGI shared resources ─────────────────────────────
-        // Uniform buffer — tiny, allocated once, written each frame.
-        guard let ddgiUB = device.makeBuffer(
-            length: MemoryLayout<IlluminatoramaDDGIUniforms>.stride,
-            options: .storageModeShared
-        ) else { throw IlluminatoramaError.bufferAllocationFailed("ddgiUniforms") }
-        ddgiUB.label = "Illuminatorama.ddgi.uniforms"
-        self.ddgiUniformBuffer = ddgiUB
-        // 1×1 rg16Float dummy bound to the depth atlas slot when DDGI is off
-        // (always binding a real texture avoids Metal validation warnings).
-        let dddDesc = MTLTextureDescriptor()
-        dddDesc.textureType = .type2D
-        dddDesc.pixelFormat = .rg16Float
-        dddDesc.width = 1; dddDesc.height = 1
-        dddDesc.usage = [.shaderRead, .shaderWrite]
-        dddDesc.storageMode = .private
-        guard let ddd = device.makeTexture(descriptor: dddDesc) else {
-            throw IlluminatoramaError.bufferAllocationFailed("ddgiDummyDepthAtlas")
-        }
-        ddd.label = "Illuminatorama.ddgi.dummyDepth"
-        self.ddgiDummyDepthAtlas = ddd
-        timing.mark("DFG bake dispatch + DDGI resources")
+        timing.mark("DFG bake dispatch")
 
         // ── Phase 2.5 shadow map array ──────────────────────────────────
         self.shadowMap = try Self.makeShadowMap(device: device, resolution: shadowMapResolution)
@@ -6620,8 +6390,6 @@ public final class IlluminatoramaRenderer {
         self.ssrHistoryB         = t.ssrHistoryB
         self.rtGIHistoryA        = t.rtGIHistoryA
         self.rtGIHistoryB        = t.rtGIHistoryB
-        self.irrCacheA           = t.irrCacheA
-        self.irrCacheB           = t.irrCacheB
         self.aoSampleCount       = t.aoSampleCount
         self.ssrSampleCount      = t.ssrSampleCount
         self.giSampleCount       = t.giSampleCount
@@ -9090,8 +8858,6 @@ public final class IlluminatoramaRenderer {
             self.ssrHistoryB         = t.ssrHistoryB
             self.rtGIHistoryA        = t.rtGIHistoryA
             self.rtGIHistoryB        = t.rtGIHistoryB
-            self.irrCacheA           = t.irrCacheA
-            self.irrCacheB           = t.irrCacheB
             self.aoSampleCount       = t.aoSampleCount
             self.ssrSampleCount      = t.ssrSampleCount
             self.giSampleCount       = t.giSampleCount
@@ -9179,11 +8945,6 @@ public final class IlluminatoramaRenderer {
         ssrNeedsFirstFrame  = true
         rtGINeedsFirstFrame = true
         aoAccumulator?.reset()
-
-        // S3.2 — a document swap throws away accumulated frames; force the DDGI
-        // settle gate to re-trace next frame even if the new scene happens to hash
-        // identically to the old one, so a stale converged atlas is never reused.
-        ddgiConvergenceGate.reset()
 
         // Auto-exposure EMA — re-seed the GPU ExposureState buffer to the exact
         // cold-start values written once in the constructor:
@@ -9510,7 +9271,6 @@ public final class IlluminatoramaRenderer {
         // positions, copy the current positions forward to be next frame's prev.
         encodeGPUMeshPrevCapture(cb, prime: false)
         encodeIBLBakeIfNeeded(cb)
-        encodeDDGIFrame(cb)
         // Phase 4.39: SSAO → bilateral spatial → temporal → lighting (reads denoised AO).
         encodeSSAOPass(cb)
         encodeSSAOSpatialFilter(cb)
@@ -9756,9 +9516,6 @@ public final class IlluminatoramaRenderer {
         if rtGITemporalEnabled && rtEnabled && rtSupported {
             rtGINeedsFirstFrame = false
             rtGIHistoryToggle.toggle()
-        }
-        if ddgiIrrCacheEnabled {
-            irrCacheToggle.toggle()
         }
         return true
     }
@@ -11645,8 +11402,6 @@ public final class IlluminatoramaRenderer {
             ssaoIsFirstFrame: aoNeedsFirstFrame ? 1 : 0,
             ssrIsFirstFrame: ssrNeedsFirstFrame ? 1 : 0,
             debandDitherEnabled: debandDitherEnabled ? (debandDitherExactSRGB ? 2 : 1) : 0,
-            ddgiIrrCacheEnabled: (ddgiIrrCacheEnabled && ddgiEnabled) ? 1 : 0,
-            ddgiIrrCacheBlend: max(0.0, min(1.0, ddgiIrrCacheBlend)),
             leafTransmission: max(0, leafTransmission),
             areaLightCount: UInt32(areaLights.count),
             areaLTCEnabled: (areaLTCOverride ?? ltcValidated) ? 1 : 0,
@@ -12235,8 +11990,6 @@ public final class IlluminatoramaRenderer {
         var ssrHistoryB: MTLTexture
         var rtGIHistoryA: MTLTexture // full-res rgba16Float ping-pong (RT GI temporal)
         var rtGIHistoryB: MTLTexture
-        var irrCacheA: MTLTexture    // Phase 3.4 — DDGI irradiance EMA cache (full-res rgba16Float)
-        var irrCacheB: MTLTexture
         // SVGF denoiser (Phase 4.44)
         var aoSampleCount: MTLTexture    // half-res r16Float — accumulated frame count per SSAO pixel
         var ssrSampleCount: MTLTexture   // full-res r16Float — accumulated frame count per SSR pixel
@@ -12336,12 +12089,6 @@ public final class IlluminatoramaRenderer {
     // Issue #65 — colour-grade LUT default per-axis resolution. 33 is the .cube
     // de-facto standard (matches DaVinci / most authoring tools).
     static let colorLUTDefaultSize: Int = 33
-    // Phase 3.1 — DDGI tile sizes. irrTileSize=6 is the standard minimum for
-    // diffuse irradiance (the signal is low-frequency). depthTileSize=14 is
-    // larger to reduce mean-distance bias from undersampled directions.
-    static let ddgiIrrTileSize: Int = 6
-    static let ddgiDepthTileSize: Int = 14
-
     /// Mirror of `PrefilterBakeParams` in `Illuminatorama.metal`.
     private struct PrefilterBakeParams {
         var roughness: Float
@@ -12811,13 +12558,6 @@ public final class IlluminatoramaRenderer {
         let giAtrousB = try make(label: "Illuminatorama.svgf.giAtrousB",
                                  format: .rgba16Float, w: internalW, h: internalH,
                                  usage: [.shaderRead, .shaderWrite])
-        // Phase 3.4 — DDGI irradiance EMA cache (full-res, ping-pong).
-        let irrCA = try make(label: "Illuminatorama.ddgi.irrCacheA",
-                             format: .rgba16Float, w: internalW, h: internalH,
-                             usage: [.shaderRead, .shaderWrite, .renderTarget])
-        let irrCB = try make(label: "Illuminatorama.ddgi.irrCacheB",
-                             format: .rgba16Float, w: internalW, h: internalH,
-                             usage: [.shaderRead, .shaderWrite, .renderTarget])
         // Issue #65 — screen-space SSS buffers (full-res, idle unless sssStrength > 0).
         let sssDiffuse = try make(label: "Illuminatorama.sss.diffuse",
                                   format: .rgba16Float, w: internalW, h: internalH,
@@ -12888,7 +12628,6 @@ public final class IlluminatoramaRenderer {
             aoFiltered: aoFiltered, aoHistoryA: aoHistA, aoHistoryB: aoHistB,
             ssrRaw: ssrRaw, ssrHistoryA: ssrHistA, ssrHistoryB: ssrHistB,
             rtGIHistoryA: rtGiHistA, rtGIHistoryB: rtGiHistB,
-            irrCacheA: irrCA, irrCacheB: irrCB,
             aoSampleCount: aoCount, ssrSampleCount: ssrCount, giSampleCount: giCount,
             giVariance: giVar, giVarianceB: giVarB, giAtrousA: giAtrousA, giAtrousB: giAtrousB,
             sssDiffuse: sssDiffuse, sssBlurTmp: sssBlurTmp, sssBlurOut: sssBlurOut

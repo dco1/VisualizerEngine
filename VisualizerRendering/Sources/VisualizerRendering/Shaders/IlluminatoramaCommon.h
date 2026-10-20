@@ -16,12 +16,6 @@
 //          Lighting kernel uses `F0 * scale + bias` for the F0-weighted
 //          spec response, replacing the Lagarde roughness-Schlick
 //          approximation that Phase 3.0 shipped as a placeholder.
-// Phase 3.3: DDGI two-bounce. Trace kernel now samples the previous-frame
-//          irradiance atlas at the hit point and adds it (Lambertian, ×
-//          albedo) to the recorded radiance. Host ping-pongs both atlases
-//          so the kernel's read-only `irrAtlasPrev` / `depAtlasPrev` slots
-//          never alias the update kernels' read_write writes within a
-//          single encoder. Toggle via `ddgi.twoBounceEnabled`.
 //
 // Swift mirrors of every struct in this file live in IlluminatoramaTypes.swift.
 // When changing one side, change both.
@@ -188,13 +182,13 @@ struct FrameUniforms {
     uint     ssaoIsFirstFrame;      // 1 = no valid AO history yet
     uint     ssrIsFirstFrame;       // 1 = no valid SSR history yet
     uint     debandDitherEnabled;   // 1 = TPDF dither before 8-bit store
-    // Phase 3.4 — per-pixel DDGI irradiance EMA cache.
-    uint     ddgiIrrCacheEnabled;   // 1 = blend with history, 0 = fresh probe blend
-    float    ddgiIrrCacheBlend;     // alpha for history blend (0=freeze, 1=always fresh)
+    // Former DDGI irradiance-cache pair (DH-1425) — kept as pad so the struct layout is unchanged.
+    uint     _padDDGI0;
+    float    _padDDGI1;
     // Leaf thin-sheet transmission strength (issue #58). 0 = OFF (the default for
     // every scene) so the foliage-flag branch in illumi_lighting_fs is a no-op
     // unless a scene opts in. Foliage is flagged in normalRoughness.w. Lands in
-    // the 12-byte trailing pad ddgiIrrCacheBlend opened, so stride is unchanged.
+    // the 12-byte trailing pad the old irradiance-cache blend opened, so stride is unchanged.
     float    leafTransmission;
     // #60 task 5 — rectangular LTC area-light count (buffer 4 of illumi_lighting).
     // Lands in the 4-byte trailing implicit pad; stride stays 960.

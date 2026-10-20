@@ -16,25 +16,23 @@ extension IlluminatoramaRenderer {
     /// variant in the pipeline cache. These MUST agree with the `frame.*Enabled`
     /// uniforms written in `updateFrameUniforms` — both derive from the same Bools.
     static func lightingFeatureConstants(ibl: Bool, shadow: Bool, dfg: Bool,
-                                         ddgi: Bool, ddgiIrrCache: Bool,
                                          rtSunShadow: Bool = false,
                                          aov: Bool = false)
         -> (key: String, constants: MTLFunctionConstantValues) {
-        // The irradiance cache is only meaningful while DDGI is on — mirror the
-        // exact derivation in updateFrameUniforms (`ddgiIrrCacheEnabled && ddgiEnabled`).
-        let irrCache = ddgiIrrCache && ddgi
         // index 5 — S4.1 ray-traced soft sun shadows. The caller passes the fully
         // derived bit (`rtSunShadowLightingActive`), never the raw flag: the RT
         // variant's TLAS argument only exists when this is true, so selecting it
         // without a live TLAS would be an unbindable pipeline.
-        var flags = [ibl, shadow, dfg, ddgi, irrCache, rtSunShadow]
+        var flags = [ibl, shadow, dfg]
         let cv = MTLFunctionConstantValues()
         flags.withUnsafeMutableBufferPointer { buf in
             for i in 0..<buf.count {
                 cv.setConstantValue(buf.baseAddress! + i, type: .bool, index: i)
             }
         }
-        var key = flags.map { $0 ? "1" : "0" }.joined()
+        var rtSunBit = rtSunShadow
+        cv.setConstantValue(&rtSunBit, type: .bool, index: 5)
+        var key = (flags + [rtSunShadow]).map { $0 ? "1" : "0" }.joined()
         // Daydream DH-1304 — the AOV capture variant (index 8): set only while capturing, so every
         // other key (and every other host) keeps the constant undefined.
         if aov {
@@ -67,21 +65,17 @@ extension IlluminatoramaRenderer {
     /// elimination. The fallback is deliberately NOT memoised, so once the
     /// background compile lands the next frame picks up the specialized variant.
     private func currentLightingPipeline() -> MTLComputePipelineState {
-        let irrCache = ddgiIrrCacheEnabled && ddgiEnabled
         let rtSun = rtSunShadowLightingActive
         let aov = aovActiveThisFrame
         let bits: UInt8 = (iblEnabled     ? 1  : 0)
                         | (shadowsEnabled ? 2  : 0)
                         | (dfgLUTEnabled  ? 4  : 0)
-                        | (ddgiEnabled    ? 8  : 0)
-                        | (irrCache       ? 16 : 0)
                         | (rtSun          ? 32 : 0)
                         | (aov            ? 64 : 0)
         if bits == lastLightingFlags, let p = lastLightingPipeline { return p }
 
         let (key, cv) = Self.lightingFeatureConstants(
             ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
-            ddgi: ddgiEnabled, ddgiIrrCache: ddgiIrrCacheEnabled,
             rtSunShadow: rtSun, aov: aov)
         // Headless/settled lane (no runloop to land the async completion — a
         // @MainActor render loop starves the MainActor hop): compile the variant
@@ -160,12 +154,6 @@ extension IlluminatoramaRenderer {
         enc.setTexture(prefilteredCube, index: 8)
         enc.setTexture(shadowMap, index: 9)
         enc.setTexture(dfgLUT, index: 10)
-        // Phase 3.1 — DDGI atlas slots (always bind; enabled flag gates sampling).
-        // Phase 3.3 — read the ping-pong `Current` atlases, which hold the
-        // freshest writes from `encodeDDGIFrame` above. `Previous` is what
-        // the trace kernel sampled for the second bounce.
-        enc.setTexture(ddgiIrradianceCurrent ?? dummySkyTexture, index: 11)
-        enc.setTexture(ddgiDepthCurrent ?? ddgiDummyDepthAtlas, index: 12)
         // Phase 4.10 — per-spot shadow atlas. Always bound (the kernel
         // gates per-spot on `spotShadowSliceIndex >= 0`, which is set by
         // `updateSpotShadows` only when `spotShadowsEnabled` is on AND
@@ -176,11 +164,6 @@ extension IlluminatoramaRenderer {
         // same-type (depth2d_array) placeholder; the kernel never samples it because
         // every point light's `shadowCubeIndex` is -1. When on, real cube depth.
         enc.setTexture(pointShadowAtlas ?? spotShadowAtlas, index: 19)
-        // Phase 3.4 — irradiance EMA cache. Previous = read, current = write.
-        // When cache is disabled the kernel still writes current (fresh lookup),
-        // so the toggle and bind are always active regardless of the flag.
-        enc.setTexture(irrCachePrevious, index: 14)
-        enc.setTexture(irrCacheCurrent,  index: 15)
         enc.setTexture(ltcMatTexture, index: 16)
         enc.setTexture(ltcMagTexture, index: 17)
         // Light-layer G-buffer target — per-fragment layer bitfield the kernel
@@ -209,7 +192,6 @@ extension IlluminatoramaRenderer {
         }
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
         enc.setBuffer(pointLightBuffer, offset: 0, index: 1)
-        enc.setBuffer(ddgiUniformBuffer, offset: 0, index: 2)
         enc.setBuffer(spotLightBuffer, offset: 0, index: 3)
         enc.setBuffer(areaLightBuffer, offset: 0, index: 4)
         enc.setBuffer(extraDirectionalBuffer, offset: 0, index: 5)
@@ -299,13 +281,13 @@ extension IlluminatoramaRenderer {
         let rtSun = rtSunShadowLightingActive
         let aov = aovActiveThisFrame
         let bits: UInt8 = (iblEnabled ? 1 : 0) | (shadowsEnabled ? 2 : 0) | (dfgLUTEnabled ? 4 : 0)
-                        | (ddgiEnabled ? 8 : 0) | (ddgiIrrCacheEnabled && ddgiEnabled ? 16 : 0) | (rtSun ? 32 : 0)
+                        | (rtSun ? 32 : 0)
                         | (aov ? 64 : 0)
         if bits == lastRatePipelines.flags, let memo = lastRatePipelines.pair { return memo }
         func variant(coarse: Bool) -> MTLComputePipelineState? {
             let (key, cv) = Self.lightingFeatureConstants(
                 ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
-                ddgi: ddgiEnabled, ddgiIrrCache: ddgiIrrCacheEnabled, rtSunShadow: rtSun, aov: aov)
+                rtSunShadow: rtSun, aov: aov)
             var c = coarse, k = !coarse
             cv.setConstantValue(&c, type: .bool, index: 6)
             cv.setConstantValue(&k, type: .bool, index: 7)

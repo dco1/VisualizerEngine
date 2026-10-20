@@ -218,18 +218,14 @@ public struct IlluminatoramaFrameUniforms {
     /// as a toggle so smooth-gradient banding can be A/B'd live. Repurposes
     /// the former `_padDenoise0` slot.
     public var debandDitherEnabled: UInt32 = 1
-    /// Phase 3.4 — per-pixel DDGI irradiance EMA cache. 1 = blend with
-    /// history (cuts 8-probe blend to 1 texture read in steady state); 0 =
-    /// recompute fresh probe blend every frame.
-    public var ddgiIrrCacheEnabled: UInt32 = 1
-    /// EMA blend alpha: 0 = freeze history, 1 = always fresh. Default 0.05
-    /// converges in ~20 frames (~0.33 s at 60fps).
-    public var ddgiIrrCacheBlend: Float = 0.05
+    /// Former DDGI irradiance-cache pair (DH-1425) — pad; layout unchanged.
+    public var _padDDGI0: UInt32 = 0
+    public var _padDDGI1: Float = 0
     /// Leaf thin-sheet transmission strength (issue #58 / #20 item 2). 0 = OFF —
     /// the default for every scene, so the foliage-flag branch in the lighting
     /// kernel is a no-op unless a scene opts in. Foliage fragments are flagged in
     /// `normalRoughness.w` (a scene tags its leaf vertices with colour alpha 0).
-    /// Fills the 12-byte trailing pad that `ddgiIrrCacheBlend` opened, so the
+    /// Fills the 12-byte trailing pad that the old irradiance-cache blend opened, so the
     /// struct stride is unchanged. Mirrors `leafTransmission` in the Metal
     /// `FrameUniforms` (and `RTUniforms`, which owns the sun under RT).
     public var leafTransmission: Float = 0

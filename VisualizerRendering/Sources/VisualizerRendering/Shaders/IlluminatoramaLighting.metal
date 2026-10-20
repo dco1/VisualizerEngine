@@ -7,7 +7,6 @@
 #include "IlluminatoramaSpotProfile.h"
 #include "IlluminatoramaCommon.h"
 #include "IlluminatoramaAOV.h"
-#include "IlluminatoramaDDGI.h"
 // S4.1 — ray-traced soft sun shadows in this kernel's `kLightingRTSunShadow`
 // variant. The header carries the shared RNG (`pcgHash`/`rnd`) and disc sampling
 // (`coneSample`) plus <metal_raytracing>; the non-RT variant dead-strips the
@@ -105,8 +104,6 @@ static inline float sampleCascade(
 constant bool kLightingIBLEnabled          [[function_constant(0)]];
 constant bool kLightingShadowEnabled       [[function_constant(1)]];
 constant bool kLightingDFGLUTEnabled       [[function_constant(2)]];
-constant bool kLightingDDGIEnabled         [[function_constant(3)]];
-constant bool kLightingDDGIIrrCacheEnabled [[function_constant(4)]];
 // S4.1 — ray-traced soft sun shadows (Export Photo lane, opt-in). When true the
 // kernel REPLACES `sunVisibility`'s cascade-map answer with cone-sampled shadow
 // rays traced against the TLAS at buffer(8) — a physically-sized penumbra the
@@ -1088,15 +1085,8 @@ kernel void illumi_lighting(
     // specular = prefilteredEnv * (F0 * scale + bias). Baked once on init;
     // `frame.dfgLUTEnabled == 0` falls back to Lagarde's roughness-Schlick.
     texture2d<half,  access::sample>        dfgLUT          [[texture(10)]],
-    // Phase 3.1 — DDGI probe atlases. When ddgi.enabled == 0 these are
-    // 1×1 dummies; the sampling is cheap and the enabled gate skips the loop.
-    texture2d<half,  access::sample>        ddgiIrrAtlas    [[texture(11)]],
-    texture2d<half,  access::sample>        ddgiDepthAtlas  [[texture(12)]],
     // Phase 4.10 — per-spot shadow depth atlas.
     depth2d_array<float, access::sample>    spotShadowAtlas [[texture(13)]],
-    // Phase 3.4 — per-pixel DDGI irradiance EMA cache (ping-pong).
-    texture2d<half,  access::sample>        irrCachePrev    [[texture(14)]],
-    texture2d<half,  access::write>         irrCacheCur     [[texture(15)]],
     // #60 task 5 increment 2 — LTC area-light specular LUTs (Minv + magnitude).
     texture2d<float, access::sample>        ltcMat          [[texture(16)]],
     texture2d<float, access::sample>        ltcMag          [[texture(17)]],
@@ -1128,7 +1118,6 @@ kernel void illumi_lighting(
     texture2d<half,  access::write>         diffSkyOut      [[texture(23)]],
     constant FrameUniforms&                 frame           [[buffer(0)]],
     const device PointLight*                pointLights     [[buffer(1)]],
-    constant DDGIUniforms&                  ddgi            [[buffer(2)]],
     const device SpotLight*                 spotLights      [[buffer(3)]],
     const device AreaLight*                 areaLights      [[buffer(4)]],
     const device DirectionalLight*          extraDirectionals [[buffer(5)]],
@@ -1776,7 +1765,7 @@ kernel void illumi_lighting(
     // outdoor prefiltered cube (RT reflections own the structured part of that story).
     float interiorIBLKd = mix(interiorIBLK, 1.0, interiorBandW);
 
-    // ── Indirect (IBL + optional DDGI for diffuse) ──────────────────
+    // ── Indirect (IBL for diffuse) ──────────────────
     float3 indirect;
     // Debug accumulators (frame.debugTerm split-render) — populated below.
     float3 dbgDiffuseIBL = float3(0.0);
@@ -1811,45 +1800,8 @@ kernel void illumi_lighting(
         // Estevez & Kulla 2017 §4) — 1.0 exactly for every non-cloth pixel.
         if (layeredSheen) kD *= le.baseUnderSheen;
 
-        // Diffuse: use DDGI probe irradiance when available (one-bounce GI),
-        // otherwise fall back to the sky-probe irradiance cube.
-        // Phase 3.4 — EMA irradiance cache cuts the per-pixel 8-probe blend to
-        // 1 texture read in steady state. Fresh probe lookup only on cache miss
-        // (first frame, cache disabled, or DDGI off).
-        float3 irradianceSrc;
-        if (kLightingDDGIEnabled) {  // function_constant(3) — agrees with ddgi.enabled
-            // Phase 3.4b — velocity-reproject the cache read. Sampling the
-            // history at the *current* UV means a moving camera reads the EMA
-            // that belongs to whatever world point used to sit under this pixel,
-            // so a fast move smears the cache (it reconverges over ~20 frames).
-            // Project THIS pixel's world position by the previous frame's VP to
-            // fetch the history for the SAME surface point: fast moves reconverge
-            // in ~1 frame. Off-screen reprojection (disocclusion) → fresh lookup.
-            float4 prevClip  = frame.previousViewProjection * float4(worldPos, 1.0);
-            float2 reprojUV  = (prevClip.xy / prevClip.w) * float2(0.5, -0.5) + 0.5;
-            bool   reprojOK  = prevClip.w > 1e-5
-                            && all(reprojUV >= float2(0.0))
-                            && all(reprojUV <= float2(1.0));
-            constexpr sampler cacheSmp(filter::linear, address::clamp_to_edge);
-            float3 history  = reprojOK
-                            ? float3(irrCachePrev.sample(cacheSmp, reprojUV).rgb)
-                            : float3(0.0);
-            bool   useCache = kLightingDDGIIrrCacheEnabled  // function_constant(4)
-                           && reprojOK
-                           && any(history > float3(1e-6f));
-            if (useCache) {
-                float3 fresh = sampleDDGIIrradiance(worldPos, N,
-                                                    ddgiIrrAtlas, ddgiDepthAtlas, ddgi);
-                irradianceSrc = mix(history, fresh, frame.ddgiIrrCacheBlend);
-            } else {
-                irradianceSrc = sampleDDGIIrradiance(worldPos, N,
-                                                     ddgiIrrAtlas, ddgiDepthAtlas, ddgi);
-            }
-            lightingStore(irrCacheCur, half4(half3(irradianceSrc), 1.0h), gid);
-        } else {
-            irradianceSrc = float3(irradianceCube.sample(cubeSampler, N).rgb);
-            lightingStore(irrCacheCur, half4(0.0h), gid);
-        }
+        // Diffuse: the sky-probe irradiance cube.
+        float3 irradianceSrc = float3(irradianceCube.sample(cubeSampler, N).rgb);
         // Phase 4.15 — IBL diffuse saturation boost. Procedural-gradient
         // backdrops that the extractor reuses as the IBL probe integrate
         // down to a near-grey irradiance, and `irradiance * albedo` then

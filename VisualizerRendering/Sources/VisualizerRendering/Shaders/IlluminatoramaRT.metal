@@ -44,8 +44,8 @@ struct RTUniforms {
     // Surface cache: read cached radiance at GI/reflection hits when enabled.
     uint  surfCacheEnabled;
     uint  surfTileSize; uint surfTilesPerRow; uint surfAtlasW; uint surfAtlasH;
-    // Analytic point emitters (particle fields) — entries in DDGIPointEmitter[].
-    uint  emitterCount;
+    // Former analytic point-emitter count (DDGI proxy lane, DH-1425) — pad; layout unchanged.
+    uint  _padEmitters;
     // Leaf thin-sheet transmission strength (issue #58). 0 = OFF (default) so the
     // foliage-flag branch is a no-op unless the scene opts in. Repurposes _padRT0
     // — same 4 bytes, stride unchanged. Keep in lockstep with FrameUniforms.
@@ -69,14 +69,6 @@ struct RTUniforms {
     // branch below never runs ⇒ byte-identical. Keep in lockstep with the Swift
     // RTUniforms mirror.
     float scotopicDesaturation;
-};
-
-// Analytic point emitter — mirrored from Illuminatorama.metal. Keep in lockstep.
-struct DDGIPointEmitter {
-    float3 position;
-    float  radius;
-    float3 color;
-    float  _pad;
 };
 
 // DUPLICATED from IlluminatoramaSurfaceCache.metal — keep in lockstep. Maps a
@@ -265,7 +257,6 @@ kernel void illumi_rt_lighting(
     const device uint*                    triCard     [[buffer(4)]],
     const device float4*                  triUVa      [[buffer(5)]],
     const device float4*                  triUVc      [[buffer(6)]],
-    const device DDGIPointEmitter*        emitters    [[buffer(7)]],
     const device float4*                  surfCardRect [[buffer(8)]],   // surface-cache per-card atlas rect
     const device SurfCard*                surfCards    [[buffer(9)]],   // per-card material (albedo/emission) for L_out reconstruction
     // Curve primitives (#60 item 7) — dummies bound for the base variant
@@ -459,17 +450,6 @@ kernel void illumi_rt_lighting(
                     float sv = occ ? 0.0 : 1.0;
                     hitRad = hitA * (1.0 / M_PI_F) * u.sunColor * hN * sv;
                     isect.accept_any_intersection(false);
-                }
-                // Emitter contribution at the GI bounce hit.
-                for (uint e = 0; e < u.emitterCount; ++e) {
-                    float3 toE  = emitters[e].position - hitP;
-                    float  d    = length(toE);
-                    float  rr   = max(emitters[e].radius, 0.001f);
-                    float  atten = max(0.0f, 1.0f - d / rr);
-                    atten       *= atten;
-                    if (atten < 0.001f) continue;
-                    float NdotE = max(0.0f, dot(hitN, toE / max(d, 0.001f)));
-                    hitRad += emitters[e].color * atten * NdotE * hitA * (1.0f / M_PI_F);
                 }
                 // DH-0622 — a cached card adds its multi-bounce indirect + emission to the
                 // re-shade above (sun + emitters); it never replaces it. Non-resident ⇒
