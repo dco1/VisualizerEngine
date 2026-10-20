@@ -152,6 +152,14 @@ static inline float patternCellHash(float2 cell) {
 }
 
 
+// DH-0513 — the per-panel figure shift, in tile-v units [0, 1). The seamless slice wraps in v, so any
+// shift is a valid, in-register view of the same wood; a different hash stream from the tone jitter
+// (cell.y is a constant offset) keeps a panel's tone and its figure position uncorrelated.
+static inline float panelFigureShift(float panelIndex) {
+    return 0.5f + 0.5f * patternCellHash(float2(panelIndex, 11.0f));
+}
+
+
 // DH-1275 — value noise in [0,1] for the surface-wear streaks (consumed in IlluminatoramaGBuffer.metal;
 // contract on `Instance.surfaceWear`). Integer-lattice hash at the four corners, smooth-interpolated.
 static inline float wearLatticeHash(int2 c) {

@@ -113,6 +113,14 @@ public struct MaterialChannels: Equatable, Sendable {
     /// Half-amplitude of the per-cell tone jitter (0.04 ⇒ ±4 %). 0 = exact shader no-op.
     /// Real tile/plank batch variation lives around 3–6 %; the generator owns the number.
     public var patternJitter: Double = 0
+    /// **Per-panel figure phase** (DH-0513). When true, the renderer also shifts the sampled tile
+    /// ALONG THE GRAIN (v) by a hashed whole-tile fraction per physical panel — `floor(uv.x ·
+    /// patternCells.x)` — so each veneer panel lands on a different stretch of the same seamless
+    /// slice and the cathedral arch no longer prints at every panel pitch. `patternJitter`'s tone
+    /// step cannot do this: tone is scale-invariant and leaves the figure where it was. The price is
+    /// a grain discontinuity at each panel edge, which is what a real panel joint looks like.
+    /// Needs `patternCells.x ≥ 1` and `patternJitter > 0`; the bonded v axis stays `patternCells.y = 0`.
+    public var panelFigurePhase: Bool = false
 
     public init(size: Int, category: MaterialCategory) {
         self.size = max(1, size)

@@ -567,6 +567,7 @@ extension MaterialGenerator {
         if params.layout == .panel, tiling.isAdjustable {
             ch.patternCells = Vec2(1, 0)
             ch.patternJitter = 0.08
+            ch.panelFigurePhase = true      // DH-0513: each panel shows a different stretch of the figure
         }
         return ch
     }

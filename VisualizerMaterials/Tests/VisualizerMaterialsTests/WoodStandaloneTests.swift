@@ -120,6 +120,22 @@ final class WallVeneerTests: XCTestCase {
                           "roughness must decorrelate from albedo (wall \(wall.corr) vs face \(face.corr))")
     }
 
+    /// DH-0513 — only a panelled WALL asks the renderer for a per-panel figure phase. Furniture
+    /// veneer is one continuous board, and flooring boards are staggered by their own seams.
+    func testOnlyPanelledWallsAskForPerPanelFigurePhase() {
+        let wall = MaterialGenerator.wood(size: 64, params: WoodParams(species: .oak, layout: .panel),
+                                          tiling: .baked(2.0))
+        XCTAssertTrue(wall.panelFigurePhase)
+        XCTAssertGreaterThanOrEqual(wall.patternCells.x, 1, "the phase is keyed off the panel index")
+        XCTAssertGreaterThan(wall.patternJitter, 0, "the shader gates the phase on a declared de-repeat")
+        let face = MaterialGenerator.wood(size: 64, params: WoodParams(species: .oak, layout: .panel),
+                                          tiling: .prebaked(1.0))
+        XCTAssertFalse(face.panelFigurePhase)
+        let boards = MaterialGenerator.wood(size: 64, params: WoodParams(species: .oak, layout: .boards),
+                                            tiling: .baked(2.0))
+        XCTAssertFalse(boards.panelFigurePhase)
+    }
+
     func testFlooringBoardsAreUntouched() {
         let boards = MaterialGenerator.wood(size: 128, params: WoodParams(species: .oak, layout: .boards),
                                             tiling: .baked(2.0))

@@ -525,7 +525,17 @@ fragment GBufferOut illumi_fs(
     // grid or the soil marker; the derivatives above are taken from the un-phased `in.uv`, which
     // is correct because a constant offset has zero screen-space derivative.
     WoodKnotSample knot = sampleWoodKnots(in.uv, inst.woodKnots, inst.patternCells);
-    float2 matUV = in.uv + knot.warp + inst.uvPhase;
+    // DH-0513 — per-panel FIGURE phase: `antiTilingScale < 0` flags a coherent wall veneer (the hex
+    // blend treats any strength ≤ 0 as the exact single read, so the sign is free to carry this).
+    // Each physical panel — `floor(uv.x · patternCells.x)` — samples the seamless slice shifted along
+    // the grain by a hashed fraction of the tile, so the cathedral arch lands on a different stretch
+    // of the figure in every panel instead of printing at the panel pitch. A deliberate grain
+    // discontinuity at each panel edge, like a real joint. Every other instance adds exactly zero.
+    float2 panelPhase = float2(0.0f);
+    if (inst.antiTilingScale < 0.0f && inst.patternJitter != 0.0f && inst.patternCells.x >= 1.0f) {
+        panelPhase.y = panelFigureShift(floor(in.uv.x * inst.patternCells.x));
+    }
+    float2 matUV = in.uv + knot.warp + inst.uvPhase + panelPhase;
     // `uvWarp.w >= 0.5` extends the animated domain warp to the MATERIAL maps
     // (albedo/roughness/normal) as well as emission. Default 0 = emission only,
     // which is the common case: a glow that morphs on a surface that does not.
