@@ -980,7 +980,7 @@ public final class IlluminatoramaRenderer {
 
     /// The `kRTAOVEnabled` variant of the TLAS lighting kernel (with / without curves), compiled
     /// BLOCKING on first use — a capture lane, never a vsync one.
-    private func rtTLASAOVVariant(curves: Bool) -> MTLComputePipelineState? {
+    func rtTLASAOVVariant(curves: Bool) -> MTLComputePipelineState? {
         if curves, let p = rtTLASAOVCurvePipeline { return p }
         if !curves, let p = rtTLASAOVPipeline { return p }
         let cv = MTLFunctionConstantValues()
@@ -1345,11 +1345,11 @@ public final class IlluminatoramaRenderer {
     public var rtPathRadianceCacheBuildFrames: Int = 4
     /// Paths per pixel on a build frame.
     public var rtPathRadianceCacheBuildRays: Int = 1
-    private var rcFramesSinceReset = 0
-    private var rcKeysBuffer: MTLBuffer?
-    private var rcDataBuffer: MTLBuffer?
-    private var rcDummyKeys: MTLBuffer?
-    private var rcDummyData: MTLBuffer?
+    var rcFramesSinceReset = 0
+    var rcKeysBuffer: MTLBuffer?
+    var rcDataBuffer: MTLBuffer?
+    var rcDummyKeys: MTLBuffer?
+    var rcDummyData: MTLBuffer?
     /// Daydream DH-1344 — whether a STILL's GI filter (`rtGIStaticAccumulation`) keeps the SVGF
     /// luminance edge-stop. The stop weighs neighbours by their NOISY luminance, so it rejects the rare
     /// bright samples a path tracer's mean depends on: against an unfiltered 256-path reference it
@@ -3305,7 +3305,7 @@ public final class IlluminatoramaRenderer {
     /// ray-tracing work/latency, not occupancy, so it wants max threads in flight
     /// to hide latency. Conclusion: leave the default. The override stays so the
     /// sweep can be re-run on other hardware (the answer can differ per GPU).
-    private lazy var rtThreadgroupMax: Int? = {
+    lazy var rtThreadgroupMax: Int? = {
         if let s = ProcessInfo.processInfo.environment["VIZ_ILLUMI_RT_TG"],
            let v = Int(s), v > 0 { return v }
         return nil
@@ -3675,13 +3675,13 @@ public final class IlluminatoramaRenderer {
     var aoTexture: MTLTexture
     // RT diffuse (soft shadow + 1-bounce GI) buffer — written by the RT pass,
     // bilateral-filtered into the composite by `encodeRTDenoiseComposite`.
-    private var rtDiffuseTexture: MTLTexture
+    var rtDiffuseTexture: MTLTexture
     /// **DH-0896 — the deferred composite's specular-IBL share, handed to the RT reflection
     /// pass.** `outHDR` already carries the sky cube reflected along R; a reflection ray that
     /// HITS the scene must replace that sky, not be added on top of it (which is what made a
     /// wall mirror read as a sunset with the room ghosted faintly through it). Allocated
     /// lazily at the HDR size the first frame RT reflections run, dropped on resize.
-    private var specIBLTexture: MTLTexture?
+    var specIBLTexture: MTLTexture?
     /// 1×1 stand-in bound to both kernels whenever the hand-off is off — the lighting kernel
     /// skips its write when the target is not full-size, the RT kernel skips its read on the flag.
     lazy var specIBLDummyTexture: MTLTexture? = {
@@ -3710,7 +3710,7 @@ public final class IlluminatoramaRenderer {
     }
     /// The deferred composite's diffuse SKY share, handed to the traced GI pass (see
     /// `rtGIReplacesDiffuseSky`). Lazily allocated at the HDR size, dropped on resize.
-    private var diffSkyTexture: MTLTexture?
+    var diffSkyTexture: MTLTexture?
     lazy var diffSkyDummyTexture: MTLTexture? = {
         let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1, height: 1,
                                                          mipmapped: false)
@@ -4029,7 +4029,7 @@ public final class IlluminatoramaRenderer {
     var ddgiInstanceDataCapacity: Int = 0
     var ddgiEmitterBuffer: MTLBuffer?
     var ddgiEmitterCapacity: Int = 0
-    private var activeEmitterLightCount: Int {
+    var activeEmitterLightCount: Int {
         particleEmitters.filter(\.enabled).filter { $0.ddgiLight != nil }.count
         + particleFields.filter { $0.ddgiLight != nil }.count
     }
@@ -4122,19 +4122,19 @@ public final class IlluminatoramaRenderer {
     private var rtGIHistoryA: MTLTexture          // full-res, rgba16Float
     private var rtGIHistoryB: MTLTexture
     private var rtGIHistoryToggle: Bool = false
-    private var rtGINeedsFirstFrame: Bool = true {
+    var rtGINeedsFirstFrame: Bool = true {
         // DH-1344 — every GI-history reset also clears the radiance cache. Its own flag, because the
         // history flag is never lowered while the temporal pass is off (an unfiltered still), which
         // would wipe the cache every frame and it would never be read.
         didSet { if rtGINeedsFirstFrame { rcNeedsClear = true } }
     }
-    private var rcNeedsClear = true
+    var rcNeedsClear = true
     private var previousRTGITemporalEnabled: Bool = false
-    private var currentRTGIHistoryTexture: MTLTexture { rtGIHistoryToggle ? rtGIHistoryB : rtGIHistoryA }
-    private var previousRTGIHistoryTexture: MTLTexture { rtGIHistoryToggle ? rtGIHistoryA : rtGIHistoryB }
+    var currentRTGIHistoryTexture: MTLTexture { rtGIHistoryToggle ? rtGIHistoryB : rtGIHistoryA }
+    var previousRTGIHistoryTexture: MTLTexture { rtGIHistoryToggle ? rtGIHistoryA : rtGIHistoryB }
     /// The buffer the RT denoise reads: the temporally-accumulated GI when the
     /// pass is on, else the raw RT diffuse (original behaviour).
-    private var rtDiffuseDenoiseSource: MTLTexture {
+    var rtDiffuseDenoiseSource: MTLTexture {
         (rtGITemporalEnabled && rtEnabled && rtSupported)
             ? currentRTGIHistoryTexture : rtDiffuseTexture
     }
@@ -4146,7 +4146,7 @@ public final class IlluminatoramaRenderer {
     // convergence in early frames and post-disocclusion recovery.
     var aoSampleCount: MTLTexture       // half-res
     var ssrSampleCount: MTLTexture      // full-res
-    private var giSampleCount: MTLTexture       // full-res
+    var giSampleCount: MTLTexture       // full-res
     // SVGF à-trous cascade textures for RT GI (when svgfEnabled).
     // Color ping-pongs {giAtrousA, giAtrousB}; variance ping-pongs {giVariance,
     // giVarianceB}. The two pairs MUST stay disjoint — an à-trous level reads one
@@ -4154,10 +4154,10 @@ public final class IlluminatoramaRenderer {
     // any shared texture is an in-place read/write race that corrupts colour in a
     // dilated-stride pattern (the issue-#65 masonry). Three buffers can't keep both
     // ping-pongs disjoint; hence the fourth.
-    private var giVariance: MTLTexture          // full-res r16Float (variance A)
-    private var giVarianceB: MTLTexture         // full-res r16Float (variance B)
-    private var giAtrousA: MTLTexture           // full-res rgba16Float
-    private var giAtrousB: MTLTexture           // full-res rgba16Float
+    var giVariance: MTLTexture          // full-res r16Float (variance A)
+    var giVarianceB: MTLTexture         // full-res r16Float (variance B)
+    var giAtrousA: MTLTexture           // full-res rgba16Float
+    var giAtrousB: MTLTexture           // full-res rgba16Float
     /// Enable the SVGF à-trous variance-guided cascade for the RT GI diffuse term.
     /// When off, falls back to the fixed-radius bilateral denoise (still reading the
     /// temporally-accumulated GI, so motion stability is preserved).
@@ -4208,7 +4208,7 @@ public final class IlluminatoramaRenderer {
     public var svgfDemodulateAlbedo: Bool = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SVGF_DEMOD"] != "0"
     /// The GI history is irradiance this frame: only where the SVGF cascade is what consumes it (the
     /// bilateral fallback would composite it un-remodulated) and the history is a static mean.
-    private var giIrradianceMode: Bool {
+    var giIrradianceMode: Bool {
         rtGIStaticAccumulation && svgfDemodulateAlbedo && effectiveSVGFEnabled && rtGITemporalEnabled
     }
     private var previousGIIrradianceMode = false
@@ -4243,14 +4243,14 @@ public final class IlluminatoramaRenderer {
               let f = Float(v) else { return nil }
         return f
     }()
-    private var effectiveSVGFLumFloor: Float { Self.svgfLumFloorEnv ?? svgfLumFloor }
+    var effectiveSVGFLumFloor: Float { Self.svgfLumFloorEnv ?? svgfLumFloor }
     /// Diagnostic A/B override for cascade level count (`VIZ_ILLUMI_SVGF_LEVELS`).
     private static let svgfLevelsEnv: Int? = {
         guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SVGF_LEVELS"],
               let i = Int(v) else { return nil }
         return i
     }()
-    private var effectiveSVGFLevels: Int { Self.svgfLevelsEnv ?? (svgfStillForced ? svgfStillLevels : svgfLevels) }
+    var effectiveSVGFLevels: Int { Self.svgfLevelsEnv ?? (svgfStillForced ? svgfStillLevels : svgfLevels) }
 
     // ── Phase 4.39: denoiser source selectors ────────────────────────
     // These let the lighting and composite passes bind the right texture
@@ -4305,10 +4305,10 @@ public final class IlluminatoramaRenderer {
     // passed via setBytes) + a composite kernel.
     let sssBlurPipeline: MTLComputePipelineState
     let sssCompositePipeline: MTLComputePipelineState
-    private let rtDenoisePipeline: MTLComputePipelineState
-    private let rtGITemporalPipeline: MTLComputePipelineState
-    private let svgfVariancePipeline: MTLComputePipelineState  // Phase 4.44 SVGF
-    private let svgfAtrousPipeline: MTLComputePipelineState    // Phase 4.44 SVGF
+    let rtDenoisePipeline: MTLComputePipelineState
+    let rtGITemporalPipeline: MTLComputePipelineState
+    let svgfVariancePipeline: MTLComputePipelineState  // Phase 4.44 SVGF
+    let svgfAtrousPipeline: MTLComputePipelineState    // Phase 4.44 SVGF
     private let taaResolvePipeline: MTLComputePipelineState
     // Bloom mip pyramid (S1.2): prefilter (full-res HDR → mip0) + down + up.
     private let bloomPrefilterPipeline: MTLComputePipelineState
@@ -4517,7 +4517,7 @@ public final class IlluminatoramaRenderer {
 
     // ── Hardware ray tracing state ───────────────────────────────────
     /// Mirror of `RTUniforms` in IlluminatoramaRT.metal.
-    private struct RTUniforms {
+    struct RTUniforms {
         var invViewProjection: simd_float4x4
         var cameraWorldPos: SIMD3<Float>; var _pad0: Float = 0
         var sunDir: SIMD3<Float>;         var sunSoftnessRad: Float
@@ -4545,27 +4545,27 @@ public final class IlluminatoramaRenderer {
         var scotopicDesaturation: Float = 0
     }
     /// Mirror of `RTDenoiseUniforms` in Illuminatorama.metal (stride 32, 16-aligned).
-    private struct RTDenoiseUniforms {
+    struct RTDenoiseUniforms {
         var width: UInt32; var height: UInt32; var enabled: UInt32; var radius: UInt32
         var kDepth: Float; var kNorm: Float; var _pad0: Float = 0; var _pad1: Float = 0
     }
     /// Mirror of `RTGITemporalUniforms` in Illuminatorama.metal (stride 32, 16-aligned).
-    private struct RTGITemporalUniforms {
+    struct RTGITemporalUniforms {
         var width: UInt32; var height: UInt32; var enabled: UInt32; var isFirstFrame: UInt32
         var blend: Float; var gammaClamp: Float; var staticAccumulation: UInt32 = 0; var _pad1: Float = 0
     }
-    private let rtPipeline: MTLComputePipelineState?
-    private var rtAccel: MTLAccelerationStructure?
+    let rtPipeline: MTLComputePipelineState?
+    var rtAccel: MTLAccelerationStructure?
     private var rtScratch: MTLBuffer?
-    private var rtVertexBuffer: MTLBuffer?
-    private var rtIndexBuffer: MTLBuffer?
-    private var rtTriAlbedoBuffer: MTLBuffer?
-    private var rtTriNormalBuffer: MTLBuffer?
-    private var rtTriangleCount: Int = 0
-    private let rtUniformBuffer: MTLBuffer
-    private let rtDenoiseUniformBuffer: MTLBuffer
+    var rtVertexBuffer: MTLBuffer?
+    var rtIndexBuffer: MTLBuffer?
+    var rtTriAlbedoBuffer: MTLBuffer?
+    var rtTriNormalBuffer: MTLBuffer?
+    var rtTriangleCount: Int = 0
+    let rtUniformBuffer: MTLBuffer
+    let rtDenoiseUniformBuffer: MTLBuffer
     private let rtGITemporalUniformBuffer: MTLBuffer
-    private var rtFrameSeed: UInt32 = 0
+    var rtFrameSeed: UInt32 = 0
 
     // ── Surface cache (Lumen-style on-surface lit-radiance atlas) ────
     /// Mirror of `SurfCard` in IlluminatoramaSurfaceCache.metal — one atlas tile.
@@ -4629,24 +4629,24 @@ public final class IlluminatoramaRenderer {
     /// `surfCachePipeline` when a TLAS is live (`rtTLASActive`); the soup path keeps
     /// the primitive-AS `surfCachePipeline`.
     private let surfCacheTLASPipeline: MTLComputePipelineState?
-    private var surfCardBuffer: MTLBuffer?
+    var surfCardBuffer: MTLBuffer?
     /// Placeholder bound to the `surfCards` slot (buffer 9) when the surface cache
     /// is OFF. The lighting kernel never reads it then, but Metal argument
     /// validation still requires the bound buffer to be ≥ one `SurfCard` — and the
     /// generic dummies (`instData` / `triA`) can be smaller than a 192-B card
     /// (e.g. a single-instance RT buffer), which asserts at dispatch. Sized to
     /// exactly one card so the cache-off path validates regardless of struct size.
-    private lazy var surfCardDummyBuffer: MTLBuffer? =
+    lazy var surfCardDummyBuffer: MTLBuffer? =
         device.makeBuffer(length: MemoryLayout<SurfCard>.stride, options: .storageModePrivate)
-    private var surfTriCardBuffer: MTLBuffer?   // uint per triangle → card index
-    private var surfTriUVaBuffer: MTLBuffer?    // float4 (uvA.xy, uvB.xy)
-    private var surfTriUVcBuffer: MTLBuffer?    // float4 (uvC.xy, 0, 0)
+    var surfTriCardBuffer: MTLBuffer?   // uint per triangle → card index
+    var surfTriUVaBuffer: MTLBuffer?    // float4 (uvA.xy, uvB.xy)
+    var surfTriUVcBuffer: MTLBuffer?    // float4 (uvC.xy, 0, 0)
     // P2 — per-card atlas RECT addressing (replaces the uniform tilesPerRow×tileSize
     // grid). `cardRect[card]` = (atlasX, atlasY, tileW, tileH) in atlas pixels;
     // `texelCard[y·atlasW + x]` = the card owning that texel (0xFFFFFFFF = gap).
     // Lets charts of different world extent get different-sized tiles, shelf-packed
     // into one atlas — the uniform grid is just the special case (all tiles equal).
-    private var surfCardRectBuffer: MTLBuffer?  // float4 per card (x,y,w,h px)
+    var surfCardRectBuffer: MTLBuffer?  // float4 per card (x,y,w,h px)
     private var surfTexelCardBuffer: MTLBuffer? // uint per atlas texel → card index
     // ── Incremental invalidation (default-on, per-triangle TLAS path) ──
     // When `surfaceCacheIncremental` is on and the topology is stable, each frame
@@ -4679,7 +4679,7 @@ public final class IlluminatoramaRenderer {
     // instrumentation for now (no behavior change). `VIZ_ILLUMI_SURFCACHE_FEEDBACK=1`.
     public var surfaceCacheFeedback: Bool =
         ProcessInfo.processInfo.environment["VIZ_ILLUMI_SURFCACHE_FEEDBACK"] == "1"
-    private var surfCardRequestedBuffer: MTLBuffer?   // uint per card (1 = sampled this frame)
+    var surfCardRequestedBuffer: MTLBuffer?   // uint per card (1 = sampled this frame)
     // Phase 5 / A0 (streaming) — card budget. >0 caps the number of RESIDENT cards
     // (atlas sized to the budget, not the scene); cards beyond it get no atlas slot,
     // and a GI/reflection hit on a non-resident card falls back to emission + ambient
@@ -4854,16 +4854,16 @@ public final class IlluminatoramaRenderer {
     private var surfAtlasDenoised: MTLTexture?
     private var surfUseAtlasA: Bool = true
     private let surfCacheUniformBuffer: MTLBuffer
-    private var surfCardCount: Int = 0
+    var surfCardCount: Int = 0
     /// Default per-card atlas tile size — sized for the room's big planar cards.
     private var surfTileSize: Int = 64
     /// Tile size of the CURRENTLY-registered card set. Per-triangle micro-cards
     /// (Phase 4.38) pass a much smaller tile (a triangle doesn't need 64²), so
     /// the atlas stays bounded; the room keeps 64. Set by `setSurfaceCacheCards`.
-    private var surfActiveTileSize: Int = 64
-    private var surfTilesPerRow: Int = 1
-    private var surfAtlasW: Int = 1
-    private var surfAtlasH: Int = 1
+    var surfActiveTileSize: Int = 64
+    var surfTilesPerRow: Int = 1
+    var surfAtlasW: Int = 1
+    var surfAtlasH: Int = 1
     private var surfFrameSeed: UInt32 = 0
     /// The (TLAS topology, triangle budget) the cards were last baked — or skipped — for. Lets a
     /// host turn the cache on over an already-built TLAS and get cards on the next frame, without
@@ -4881,7 +4881,7 @@ public final class IlluminatoramaRenderer {
     /// copy when the cache-domain filter is on (and allocated), else the raw
     /// current INDIRECT atlas (DH-0622). The update kernel's feedback always reads
     /// the raw full atlas.
-    private var surfConsumerAtlas: MTLTexture? {
+    var surfConsumerAtlas: MTLTexture? {
         (surfaceCacheDenoise ? surfAtlasDenoised : nil) ?? surfCacheCurrentIndirectAtlas
     }
 
@@ -4904,7 +4904,7 @@ public final class IlluminatoramaRenderer {
         var emissionPad: SIMD4<Float> = .zero
     }
     /// Mirror of `RTInstUniforms`.
-    private struct RTInstUniforms {
+    struct RTInstUniforms {
         var invViewProjection: simd_float4x4
         /// 1 ⇒ the traced GI replaces the deferred diffuse sky (`rtGIReplacesDiffuseSky`). Was `_pad0`.
         var cameraWorldPos: SIMD3<Float>; var giReplacesDiffuseSky: UInt32 = 0
@@ -5057,7 +5057,7 @@ public final class IlluminatoramaRenderer {
                               emissionPad: SIMD4(0, 0, 0, cornerBase))
     }
 
-    private let rtTLASPipeline: MTLComputePipelineState?
+    let rtTLASPipeline: MTLComputePipelineState?
     /// Whether the device + instanced-RT pipeline are available.
     public var rtTLASSupported: Bool { rtTLASPipeline != nil }
     /// Everything the RT path caches per registered mesh: its BLAS, its object-space
@@ -5183,8 +5183,8 @@ public final class IlluminatoramaRenderer {
     /// `(normalBase + primitive_id) * 3`. Lets a ray-traced hit take a REAL albedo
     /// atlas sample instead of the instance's mean albedo — the through-glass
     /// "flat slabs" fix. Nil when no mesh exposed CPU-readable vertices.
-    private var rtObjUVBuffer: MTLBuffer?
-    private var rtObjUVCount: Int = 0
+    var rtObjUVBuffer: MTLBuffer?
+    var rtObjUVCount: Int = 0
     /// Concatenated per-corner SHADING normals of the meshes glass instances use (3 × `float4`
     /// per triangle). A glass instance's slice starts at `RTInstanceData.emissionPad.w − 1`
     /// (0 = none → the bounce loop keeps the face normal). Glass-only on purpose: opaque hits
@@ -5194,8 +5194,8 @@ public final class IlluminatoramaRenderer {
     // triangle list (== the `triCard`/`triUVa`/`triUVc` index space). Built
     // alongside the world-space soup in `rebuildRTAccel` when the cache is on,
     // so a TLAS hit resolves `soupTriBase[instance_id] + primitive_id` → card.
-    private var rtSoupTriBaseBuffer: MTLBuffer?
-    private var rtSoupTriBaseCount: Int = 0
+    var rtSoupTriBaseBuffer: MTLBuffer?
+    var rtSoupTriBaseCount: Int = 0
     /// Instances the last card bake left cardless (DH-1314) — read-only diagnostic.
     public private(set) var surfaceCacheCardlessInstances: Int = 0
     var rtInstanceDataBuffer: MTLBuffer? // RTInstanceData[], grouped order
@@ -5219,14 +5219,14 @@ public final class IlluminatoramaRenderer {
     private var rtCurveSets: [IlluminatoramaCurveSet] = []
     private var rtCurveSyncVersion: Int = 0
     var rtCurveBLASList: [MTLAccelerationStructure] = []
-    private var rtCurvePoolPoints: MTLBuffer?     // packed float3 (stride 12)
-    private var rtCurvePoolRadii: MTLBuffer?      // float
-    private var rtCurvePoolSegments: MTLBuffer?   // uint32, absolute into the pool
+    var rtCurvePoolPoints: MTLBuffer?     // packed float3 (stride 12)
+    var rtCurvePoolRadii: MTLBuffer?      // float
+    var rtCurvePoolSegments: MTLBuffer?   // uint32, absolute into the pool
     private var rtCurvePoolPointCount: Int = 0
     private var rtCurveSetSegmentBase: [Int] = [] // per set: first segment in the pool
-    private var rtCurveSetDataBuffer: MTLBuffer?  // RTCurveSetData per set
-    private var rtCurveInstanceCount: Int = 0     // sets in the CURRENT TLAS topology
-    private var rtTLASCurvePipeline: MTLComputePipelineState?
+    var rtCurveSetDataBuffer: MTLBuffer?  // RTCurveSetData per set
+    var rtCurveInstanceCount: Int = 0     // sets in the CURRENT TLAS topology
+    var rtTLASCurvePipeline: MTLComputePipelineState?
     private var surfCacheTLASCurvePipeline: MTLComputePipelineState?
     /// Mirror of `RTCurveSetData` in IlluminatoramaRTInstanced.metal (112 B,
     /// SIMD4-aligned — no SIMD3 trap). m0..m3 = the set's object→world matrix
@@ -5246,22 +5246,22 @@ public final class IlluminatoramaRenderer {
     // wind kernel and the AS is refit, so the RT wood sways with the raster tubes.
     private var rtSoupCurveSet: IlluminatoramaCurveSet?
     private var rtSoupCurveSyncVersion: Int = 0
-    private var rtSoupCurvesActive: Bool = false
+    var rtSoupCurvesActive: Bool = false
     private var rtSoupCurveRestPoints: MTLBuffer?   // packed float3, un-swayed (kernel input)
-    private var rtSoupCurvePoolPoints: MTLBuffer?   // packed float3, AS-referenced (kernel output / rest copy)
-    private var rtSoupCurveRadii: MTLBuffer?        // float
-    private var rtSoupCurveSegments: MTLBuffer?     // uint32 (relative — single geometry descriptor)
+    var rtSoupCurvePoolPoints: MTLBuffer?   // packed float3, AS-referenced (kernel output / rest copy)
+    var rtSoupCurveRadii: MTLBuffer?        // float
+    var rtSoupCurveSegments: MTLBuffer?     // uint32 (relative — single geometry descriptor)
     private var rtSoupCurveWindAttr: MTLBuffer?     // float4 per point (empty set ⇒ nil ⇒ rigid)
-    private var rtSoupCurveSetDataBuffer: MTLBuffer? // single RTCurveSetData
+    var rtSoupCurveSetDataBuffer: MTLBuffer? // single RTCurveSetData
     private var rtSoupCurvePointCount: Int = 0
     private var rtSoupCurveSegmentCount: Int = 0
     /// SEPARATE curve-only primitive AS (#60 item 7 incr. 2). Metal forbids mixing
     /// triangle + curve geometry descriptors in ONE primitive AS ("must be the
     /// same type"), so curves live in their own AS and the kernel traces BOTH
     /// (any-hit occludes; nearest-hit compares distance). `.refit` usage for sway.
-    private var rtSoupCurveAccel: MTLAccelerationStructure?
+    var rtSoupCurveAccel: MTLAccelerationStructure?
     private var rtSoupRefitScratch: MTLBuffer?
-    private var rtSoupCurvePipeline: MTLComputePipelineState?
+    var rtSoupCurvePipeline: MTLComputePipelineState?
     private var surfCacheSoupCurvePipeline: MTLComputePipelineState?
     private var curveWindDisplacePipeline: MTLComputePipelineState?
     /// Mirror of `CurveWindUniforms` in IlluminatoramaRT.metal (16 B).
@@ -5271,12 +5271,12 @@ public final class IlluminatoramaRenderer {
     /// Freeze curves at rest pose (A/B for the sway refit). `VIZ_ILLUMI_NO_CURVE_REFIT=1`.
     private let noCurveRefit = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_CURVE_REFIT"] == "1"
     private var curveDbgPrinted = false   // VIZ_CURVE_DEBUG one-shot
-    private let rtInstUniformBuffer: MTLBuffer
-    private var rtInstFrameSeed: UInt32 = 0
+    let rtInstUniformBuffer: MTLBuffer
+    var rtInstFrameSeed: UInt32 = 0
     /// DH-0887 — +1 per TLAS lighting dispatch, never by any other pass, so the GI's Sobol index
     /// is contiguous (`rtInstFrameSeed` also advances in the glass pass, and every-other Sobol
     /// index covers only half of the unit square).
-    private var rtGIProgressiveIndex: UInt32 = 0
+    var rtGIProgressiveIndex: UInt32 = 0
     /// RTAO's own per-dispatch seed. It rotates EVERY frame, TAA or not: the AO temporal
     /// accumulator (`encodeSSAOTemporalPass`) exists to converge a per-frame estimator, and a
     /// seed frozen at 0 hands it the same 32-ray realisation every frame — 42 settled frames
@@ -5722,7 +5722,7 @@ public final class IlluminatoramaRenderer {
     /// DH-0718 — how many area lights a secondary hit reads this frame (0 ⇒ none bound).
     /// Gated by the local-lights switch too: that is the ablation lever every secondary
     /// light term already answers to.
-    private var secondaryAreaLightCount: Int {
+    var secondaryAreaLightCount: Int {
         (secondaryAreaLightsEnabled && glassHitLocalLightsEnabled) ? areaLights.count : 0
     }
     private var areaLightCapacity: Int
@@ -7266,12 +7266,12 @@ public final class IlluminatoramaRenderer {
     // NEXT frame's encode, after the in-flight frame completes, and written as one
     // `hits:` / `atlas:` line. The DH-0622 trade ("cheaper than re-shade" → "richer
     // than re-shade") is the `cached` share of the `hits:` line.
-    private var surfHitStatsBuffer: MTLBuffer?
+    var surfHitStatsBuffer: MTLBuffer?
     private var surfAtlasStatsBuffer: MTLBuffer?
 
     /// The counters run exactly when the sidecar they report to exists. Read per frame
     /// (not cached) so a test can scope it with `setenv`/`unsetenv`.
-    private static var surfCacheStatsRequested: Bool {
+    static var surfCacheStatsRequested: Bool {
         frameEnv("VIZ_ILLUMI_SURFCACHE_STATS_PATH") != nil
     }
 
@@ -7286,7 +7286,7 @@ public final class IlluminatoramaRenderer {
     }
 
     /// Allocate (zeroed) on first use; nil only on allocation failure (counters then no-op).
-    private func surfCounterBuffer(_ existing: MTLBuffer?, slots: Int, label: String) -> MTLBuffer? {
+    func surfCounterBuffer(_ existing: MTLBuffer?, slots: Int, label: String) -> MTLBuffer? {
         if let existing { return existing }
         let b = device.makeBuffer(length: MemoryLayout<UInt32>.stride * slots, options: .storageModeShared)
         b?.label = label
@@ -7296,7 +7296,7 @@ public final class IlluminatoramaRenderer {
 
     /// Read + zero a counter buffer. Opt-in diagnostic lane only, so it may wait for the
     /// in-flight frame whose kernel is still adding (the feedback drain does the same).
-    private func drainSurfCounters(_ b: MTLBuffer, slots: Int) -> [UInt32] {
+    func drainSurfCounters(_ b: MTLBuffer, slots: Int) -> [UInt32] {
         awaitInFlightFrameBeforeCPUCacheWrite()
         let p = b.contents().bindMemory(to: UInt32.self, capacity: slots)
         let counts = (0..<slots).map { p[$0] }
@@ -8154,7 +8154,7 @@ public final class IlluminatoramaRenderer {
     }
 
     /// Whether the surface-cache update should run this frame.
-    private var surfCacheActive: Bool {
+    var surfCacheActive: Bool {
         surfaceCacheEnabled && rtEnabled && rtSupported
             && surfCachePipeline != nil && surfCardCount > 0 && rtAccel != nil
     }
@@ -8600,7 +8600,7 @@ public final class IlluminatoramaRenderer {
     /// CPU re-frame, streaming residency and the feedback drain. The default GPU-diff lane
     /// writes those buffers from kernels on THIS frame's command buffer, which hazard
     /// tracking orders, and never calls this.
-    private func awaitInFlightFrameBeforeCPUCacheWrite() {
+    func awaitInFlightFrameBeforeCPUCacheWrite() {
         lastCommittedFrameCB?.waitUntilCompleted()   // gpu-ok: opt-in CPU cache paths only, never the default per-frame lane
     }
 
@@ -10051,279 +10051,6 @@ public final class IlluminatoramaRenderer {
             rtInstanceDataBuffer = device.makeBuffer(length: dataLen, options: .storageModeShared)
             rtInstanceDataBuffer?.label = "Illuminatorama.rt.instanceData"
         }
-    }
-
-    /// Instanced-RT lighting pass — traces the TLAS. Mirrors `encodeRTLightingPass`
-    /// but with per-instance albedo/normal lookups. No-op unless a TLAS is live.
-    private func encodeRTLightingTLASPass(_ cb: MTLCommandBuffer) {
-        guard rtTLASActive, let basePipeline = rtTLASPipeline, let tlas = rtTLAS,
-              let instData = rtInstanceDataBuffer, let objN = rtObjNormalBuffer else { return }
-        // Curve primitives (#60 item 7): when the TLAS contains curve
-        // instances the intersector's geometry-type contract must include
-        // curves, so the kRTCurvesEnabled variant is REQUIRED (rebuild only
-        // appends curve instances when the variant compiled).
-        let curvesOn = rtCurveInstanceCount > 0
-            && rtCurveSetDataBuffer != nil && rtCurvePoolPoints != nil
-            && rtCurvePoolRadii != nil && rtCurvePoolSegments != nil
-        let pipeline: MTLComputePipelineState
-        if aovActiveThisFrame, let ap = rtTLASAOVVariant(curves: curvesOn) {
-            pipeline = ap   // DH-1304 — the capture variant (the same kernel, its tags live)
-        } else if curvesOn {
-            guard let cp = rtTLASCurvePipeline else { return }
-            pipeline = cp
-        } else {
-            pipeline = basePipeline
-        }
-        let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
-        rtInstFrameSeed &+= 1
-        var u = RTInstUniforms(
-            invViewProjection: fu.invViewProjection,
-            cameraWorldPos: fu.cameraWorldPos,
-            sunDir: simd_normalize(rtSunDirection), sunSoftnessRad: max(0.0005, rtSunSoftnessRad),
-            sunColor: rtSunColor, giStrength: rtGIStrength,
-            skyAmbient: ambientColor, specStrength: rtSpecStrength,
-            width: UInt32(width), height: UInt32(height),
-            shadowRays: UInt32(max(1, min(16, rtShadowRays))),
-            giRays: UInt32(max(1, min(16, rtGIRays))),
-            frameSeed: rtInstFrameSeed, rayTMin: 0.004, maxGIDist: 60.0,
-            reflStrength: max(0, rtReflStrength), reflMaxDist: max(0.1, rtReflMaxDistance),
-            reflRoughnessCutoff: max(0, rtReflRoughnessCutoff),
-            reflRays: UInt32(max(1, min(8, rtReflRays))),
-            reflEnabled: rtReflectionsEnabled ? 1 : 0)
-        // DH-0887 — the GI's progressive sample index: contiguous per dispatch of THIS pass.
-        u.giProgressiveIndex = rtGIProgressiveIndex
-        u.surfaceSnapULPs = effectiveRTSurfaceSnapULPs
-        rtGIProgressiveIndex &+= 1
-        // DH-0896 — a reflection hit REPLACES the sky the deferred pass put there.
-        let specIBLOn = rtReflectionsEnabled && specIBLWrittenThisFrame && specIBLTexture != nil
-        u.reflReplacesIBL = specIBLOn ? 1 : 0
-        let diffSkyOn = (rtGIReplacesDiffuseSky || rtPathTracedGI) && diffSkyWrittenThisFrame && diffSkyTexture != nil
-        u.giReplacesDiffuseSky = diffSkyOn ? 1 : 0
-        // DH-0989 — the path lane runs ONLY where the deferred pass handed its share over this
-        // frame; otherwise its whole-indirect estimate would land on top of the stand-ins.
-        let pathOn = rtPathTracedGI && diffSkyOn
-        u.pathBounces = pathOn ? UInt32(max(1, min(32, rtPathBounces))) : 0
-        u.pathClamp = pathOn ? max(0, rtPathClamp) : 0
-        // DH-1011 — light sampling + MIS (bit 0), shadowed lamps (bit 1, needs bit 0), instrument (bit 7).
-        u.pathFlags = !pathOn ? 0 : (rtPathLightSampling ? 1 : 0)
-            | (rtPathLightSampling && rtPathLampShadows ? 2 : 0)
-            | (rtPathLampBulbs ? 4 : 0)                       // DH-1295 — `kPathFlagLampBulbs`
-            | (rtPathDebugFlags & 0x30F8)                       // + 4096: DH-1308's glossy instrument
-        // DH-1014 — the layered weights apply to the one-bounce GI too, so NOT gated on `pathOn`.
-        u.pathFlags |= (dfgLUTEnabled && layeredMultiscatter ? 256 : 0)
-            | (dfgLUTEnabled && layeredClothSheen ? 512 : 0)
-            | (!pathOn && rtGIHitFill ? 1024 : 0)            // DH-1320 — `kPathFlagOneBounceHitFill`
-            // DH-1308 — `kPathFlagGlossyVertices`: only with light sampling + the DFG LUT (the lobe's albedo).
-            | (pathOn && rtPathGlossyVertices && rtPathLightSampling && dfgLUTEnabled ? 2048 : 0)
-        u.pathGlossyMinRoughness = pathOn ? max(0, rtPathGlossyMinRoughness) : 0
-        u.pathGlossyLampSize = pathOn ? max(0, rtPathGlossyLampSize) : 1   // DH-1395
-        u.pathGlossyLampMinRoughness = pathOn ? max(0, rtPathGlossyLampMinRoughness) : 0
-        // DH-1293 — the lamps' near-field levers (0 ⇒ the shipped point-source law).
-        u.pathLampMinDist = pathOn ? rtPathLampMinDistance : 0
-        u.pathLampSourceRadius = pathOn ? max(0, rtPathLampSourceRadius) : 0
-        // DH-1344 — build (+cell) for the first frames after a reset, then use (−cell).
-        if rcNeedsClear { rcFramesSinceReset = 0 }
-        let rcCell = pathOn ? max(0, rtPathRadianceCacheCell) : 0
-        u.radCacheCell = rcCell > 0 ? (rcFramesSinceReset < rtPathRadianceCacheBuildFrames ? rcCell : -rcCell) : 0
-        if rcCell > 0 { rcFramesSinceReset += 1 }
-        // A build frame needs one full walk per pixel, not `giRays` of them: the cache averages
-        // millions of walks either way, and the reads are where the extra paths pay.
-        if u.radCacheCell > 0 { u.giRays = min(u.giRays, UInt32(max(1, rtPathRadianceCacheBuildRays))) }
-        // Surface cache read (P1c): on only when the grouped soup + cards + base
-        // are all live this topology. The kernel gates every atlas read on this.
-        let cacheOn = surfCacheActive && surfCardCount > 0
-            && rtSoupTriBaseBuffer != nil && surfTriCardBuffer != nil
-            && surfConsumerAtlas != nil
-            && rtSoupTriBaseCount == instances.count   // base buffer matches this topology
-        if cacheOn {
-            u.surfCacheEnabled = 1
-            u.surfTileSize = UInt32(surfActiveTileSize)
-            u.surfTilesPerRow = UInt32(surfTilesPerRow)
-            u.surfAtlasW = UInt32(surfAtlasW); u.surfAtlasH = UInt32(surfAtlasH)
-            u.surfTriCount = UInt32(rtTriangleCount)
-        }
-        // Debug isolation of the surface-cache term (see DebugTerm.surfaceCacheGI).
-        u.debugSurfCacheGI = (debugTerm == .surfaceCacheGI) ? 1 : 0
-        // Phase 5 / B0 — surface-cache variance heatmap (see DebugTerm.surfaceCacheVariance).
-        u.debugSurfCacheVar = (debugTerm == .surfaceCacheVariance) ? 1 : 0
-        // Phase 5 / A — residency feedback. The kernel marks `cardRequested[card]=1`
-        // at each cache hit when enabled. Streaming (A1) NEEDS those marks, so it
-        // implies feedback. The DRAIN (read + log + zero of the previous frame's
-        // working set) is owned by exactly one site: `runStreamingResidency` (frame
-        // start) when streaming is on, else the pure-feedback logger here. Draining in
-        // both would zero the buffer before the residency pass could read it.
-        let needFeedback = (surfaceCacheFeedback || surfaceCacheStreaming)
-            && cacheOn && surfCardRequestedBuffer != nil
-        u.surfFeedbackEnabled = needFeedback ? 1 : 0
-        if surfaceCacheFeedback, !surfaceCacheStreaming,
-           let rb = surfCardRequestedBuffer, surfCardCount > 0 {
-            awaitInFlightFrameBeforeCPUCacheWrite()   // the in-flight RT pass may still be marking cards
-            let p = rb.contents().bindMemory(to: UInt32.self, capacity: surfCardCount)
-            var requested = 0
-            for i in 0..<surfCardCount where p[i] != 0 { requested += 1 }
-            if requested > 0 {
-                let pct = Int((Double(requested) / Double(surfCardCount) * 100).rounded())
-                Self.recordSurfCacheStats("feedback: requestedCards=\(requested) of \(surfCardCount) (\(pct)% working set)")
-            }
-            memset(rb.contents(), 0, surfCardCount * MemoryLayout<UInt32>.stride)
-        }
-        if curvesOn {
-            u.curveInstanceBase = UInt32(instances.count)
-            u.curveSetCount = UInt32(rtCurveInstanceCount)
-        }
-        // ── Secondary-hit shading parity with the deferred pass ──────────────
-        // A GI / reflection hit is now shaded by the SAME body the glass pass uses
-        // (`shadeSecondarySurface`), so it gets the same inputs: the mesh UVs +
-        // albedo atlas (a reflected plank floor used to be one flat colour), the
-        // local point/spot lights, the cosine-convolved irradiance cube, and the
-        // interior day-light separation. The three `glassHit*Enabled` switches gate
-        // BOTH paths — they were never glass-specific, only glass-first.
-        u.skyIntensity = max(0, iblIntensity)
-        u.albedoAtlasEnabled = (glassHitTexturingEnabled
-                                && rtObjUVBuffer != nil && rtObjUVCount > 0) ? 1 : 0
-        u.objUVCount = UInt32(rtObjUVCount)
-        u.pointLightCount = glassHitLocalLightsEnabled ? UInt32(pointLights.count) : 0
-        u.spotLightCount = glassHitLocalLightsEnabled ? UInt32(spotLights.count) : 0
-        u.interiorMask = glassHitInteriorFillEnabled ? interiorLayerMask : 0
-        u.interiorIBLUp = max(0, interiorIBLUp)
-        u.interiorIBLSide = max(0, interiorIBLSide)
-        u.interiorAmbient = max(0, interiorAmbient)
-        // Interior irradiance bands — same values as the deferred pass, so a GI
-        // bounce or reflection at an interior hit sees the same room it would on
-        // screen (the lawn-green-ceiling fix, secondary side).
-        let rtIrrW = max(0, min(1, interiorIrradianceWeight))
-        u.interiorIrrUp = SIMD4(simd_max(interiorIrradianceUp, .zero), rtIrrW)
-        u.setInteriorRoomGains(interiorRoomGains, enabled: interiorRoomGainsEnabled)
-        // DH-0718 — area lights at secondary hits, in the room-gain meta's spare lanes.
-        let rtAreaCount = secondaryAreaLightCount
-        u.interiorRoomGainMeta.y = Float(rtAreaCount)
-        u.interiorRoomGainMeta.z = Float(max(0, min(secondaryAreaShadowRays, 8)))
-        u.interiorIrrSide = SIMD4(simd_max(interiorIrradianceSide, .zero), 0)
-        u.interiorIrrDown = SIMD4(simd_max(interiorIrradianceDown, .zero), 0)
-        // C1 — exactly one sun (see `RTSunOwnership`). This pass is ADDITIVE over a
-        // complete deferred frame; with the old "compute direct whenever
-        // shadowRays > 0" gate (default 4) and no deferred suppression, flipping
-        // `rtEnabled` added a second sun. `.automatic` reproduces every existing
-        // host; a host that keeps its deferred sun now gets GI + reflections only.
-        u.directSunEnabled = rtOwnsDirectSun ? 1 : 0
-        // C3 — shadow + GI rays see opaque (0x01) AND invisible occluders (0x04):
-        // slabs that are real to light and never drawn. Camera-visible rays
-        // (reflections here, refraction in the glass pass) deliberately don't.
-        u.transportRayMask = Self.rtTransportRayMask
-        // DH-0653 — chart-assignment overlay + hit/miss counters. The counters run with
-        // the cache OFF too: their `reshade` column is the baseline a cache-on run's
-        // `cached` column is compared against.
-        u.debugSurfCacheCharts = (debugTerm == .surfaceCacheCharts) ? 1 : 0
-        var hitStats: MTLBuffer? = nil
-        if Self.surfCacheStatsRequested {
-            surfHitStatsBuffer = surfCounterBuffer(surfHitStatsBuffer, slots: 8,
-                                                   label: "Illuminatorama.surfcache.hitStats")
-            if let sb = surfHitStatsBuffer {
-                if let line = Self.surfCacheHitLine(drainSurfCounters(sb, slots: 8)) {
-                    Self.recordSurfCacheStats(line)
-                }
-                hitStats = sb
-                u.surfStatsEnabled = 1
-            }
-        }
-        // DH-0872 — same coefficient the tonemap pass uses, applied to the GI
-        // pass's own raw sky-miss sample (see the kernel's miss branch).
-        u.scotopicDesaturation = max(0, scotopicDesaturation)
-        memcpy(rtInstUniformBuffer.contents(), &u, MemoryLayout<RTInstUniforms>.stride)
-
-        // DH-1344 — the radiance cache: allocated on first use, cleared with the GI history.
-        let rcOn = u.radCacheCell != 0
-        if rcOn {
-            let cap = 1 << 21
-            if rcKeysBuffer == nil {
-                rcKeysBuffer = device.makeBuffer(length: cap * 4, options: .storageModePrivate)
-                rcDataBuffer = device.makeBuffer(length: cap * 16, options: .storageModePrivate)
-                rcNeedsClear = true
-            }
-            if rcNeedsClear, let k = rcKeysBuffer, let d = rcDataBuffer, let blit = cb.makeBlitCommandEncoder() {
-                blit.fill(buffer: k, range: 0..<k.length, value: 0)
-                blit.fill(buffer: d, range: 0..<d.length, value: 0)
-                blit.endEncoding()
-                rcNeedsClear = false
-            }
-        }
-        if rcDummyKeys == nil {
-            rcDummyKeys = device.makeBuffer(length: 16, options: .storageModePrivate)
-            rcDummyData = device.makeBuffer(length: 16, options: .storageModePrivate)
-        }
-        guard let enc = timedComputeEncoder(cb, "rtLightingTLAS") else { return }
-        enc.setBuffer(rcOn ? rcKeysBuffer : rcDummyKeys, offset: 0, index: 21)
-        enc.setBuffer(rcOn ? rcDataBuffer : rcDummyData, offset: 0, index: 22)
-        enc.label = "Illuminatorama.rt.tlas"
-        enc.setComputePipelineState(pipeline)
-        enc.setTexture(depthTexture, index: 0)
-        enc.setTexture(gbufferNormalRgh, index: 1)
-        enc.setTexture(gbufferAlbedoMet, index: 2)
-        enc.setTexture(hdrCompositeTexture, index: 3)
-        enc.setTexture(equirectSky ?? dummySkyTexture, index: 4)
-        // Current radiance atlas (read at hits); dummy when the cache is off.
-        enc.setTexture(cacheOn ? surfConsumerAtlas : (equirectSky ?? dummySkyTexture), index: 5)
-        enc.setAccelerationStructure(tlas, bufferIndex: 0)
-        enc.setBuffer(instData, offset: 0, index: 1)
-        enc.setBuffer(objN, offset: 0, index: 2)
-        enc.setBuffer(rtInstUniformBuffer, offset: 0, index: 3)
-        // Card buffers + per-instance soup base; dummies keep the binding valid
-        // when the cache is off (the kernel never reads them then).
-        enc.setBuffer(cacheOn ? surfTriCardBuffer : instData, offset: 0, index: 4)
-        enc.setBuffer(cacheOn ? surfTriUVaBuffer : instData, offset: 0, index: 5)
-        enc.setBuffer(cacheOn ? surfTriUVcBuffer : instData, offset: 0, index: 6)
-        enc.setBuffer(cacheOn ? rtSoupTriBaseBuffer : instData, offset: 0, index: 7)
-        enc.setBuffer(cacheOn ? surfCardRectBuffer : instData, offset: 0, index: 8)  // per-card atlas rect
-        enc.setBuffer(cacheOn ? surfCardBuffer : (surfCardDummyBuffer ?? instData), offset: 0, index: 9)  // per-card material (L_out reconstruction); dummy must be ≥ 1 SurfCard for arg validation
-        // Curve-set data + pooled geometry (#60 item 7); dummies keep the
-        // bindings valid for the base (curve-free) pipeline variant.
-        enc.setBuffer(curvesOn ? rtCurveSetDataBuffer : instData, offset: 0, index: 10)
-        enc.setBuffer(curvesOn ? rtCurvePoolPoints : instData, offset: 0, index: 11)
-        enc.setBuffer(curvesOn ? rtCurvePoolRadii : instData, offset: 0, index: 12)
-        enc.setBuffer(curvesOn ? rtCurvePoolSegments : instData, offset: 0, index: 13)
-        // Phase 5 / A — residency feedback (buffer 14). Bound always (kernel
-        // signature requires it); written only when `surfFeedbackEnabled`. Dummy =
-        // instData when the cache/feedback buffer isn't live (never written then).
-        enc.setBuffer(surfCardRequestedBuffer ?? instData, offset: 0, index: 14)
-        // Secondary-hit shading parity (buffers 15–18, textures 6–7). Same
-        // resources the glass pass binds for the same job; dummies keep the
-        // bindings valid when a term is off (the uniforms gate every read).
-        enc.setBuffer(rtObjUVBuffer ?? instData, offset: 0, index: 15)
-        enc.setBuffer(albedoAtlas.uvScaleBuffer, offset: 0, index: 16)
-        enc.setBuffer(pointLightBuffer, offset: 0, index: 17)
-        enc.setBuffer(spotLightBuffer, offset: 0, index: 18)
-        enc.setBuffer(spotProfileBuffer, offset: 0, index: 23)   // DH-0540 — the spot-profile rows
-        // DH-0718 — area lights (buffer 20); a dummy when none are read.
-        enc.setBuffer(secondaryAreaLightCount > 0 ? areaLightBuffer : instData, offset: 0, index: 20)
-        enc.setTexture(irradianceCube, index: 6)
-        enc.setTexture(albedoAtlas.texture, index: 7)
-        // C2 — the noisy diffuse (soft shadow + GI) goes to its own buffer so the
-        // temporal accumulator + SVGF/bilateral can clean it, exactly as the soup
-        // path does. Before this the TLAS kernel composited it inline, which is
-        // why both denoisers sat in the soup-only `else` branch doing nothing.
-        enc.setTexture(rtDiffuseTexture, index: 8)
-        enc.setTexture(specIBLOn ? specIBLTexture : specIBLDummyTexture, index: 9)
-        enc.setTexture(diffSkyOn ? diffSkyTexture : diffSkyDummyTexture, index: 10)
-        enc.setTexture(dfgLUT, index: 11)              // DH-1014 — `layeredRTWeights`
-        enc.setTexture(gbufferEmission, index: 12)     // DH-1014 — the cloth-sheen decode
-        // DH-0653 hit/miss counters (buffer 19). Dummy = instData, never added to while
-        // `surfStatsEnabled` is 0.
-        enc.setBuffer(hitStats ?? instData, offset: 0, index: 19)
-        // DH-1304 — the AOV capture (texture 13 + buffer 24 exist only in the `aov` variants).
-        if aovActiveThisFrame, let aovTex = aovTexture {
-            enc.setTexture(aovTex, index: 13)
-            var au = AOVUniforms(blend: aovFrameBlend, handoff: diffSkyOn ? 1 : 0)
-            enc.setBytes(&au, length: MemoryLayout<AOVUniforms>.stride, index: 24)
-        }
-        // The TLAS references the BLASes, which reference the mesh vertex/index
-        // buffers (and the curve BLASes the pooled curve buffers) — all must be
-        // resident for the intersector.
-        for blas in rtBLASList { enc.useResource(blas, usage: .read) }
-        for blas in rtCurveBLASList { enc.useResource(blas, usage: .read) }
-        for buf in rtResidentBuffers { enc.useResource(buf, usage: .read) }
-        dispatch(enc, pipeline: pipeline, width: width, height: height,
-                 maxThreadsOverride: rtThreadgroupMax)
-        enc.endEncoding()
     }
 
     // ── Particle fields (SimEngine registry) ──────────────────────────
@@ -12360,301 +12087,6 @@ public final class IlluminatoramaRenderer {
 
     /// One-entry memo of `lightingShadingRatePipelines` (flags as `currentLightingPipeline` packs them).
     var lastRatePipelines: (flags: UInt8, pair: (coarse: MTLComputePipelineState, skip: MTLComputePipelineState)?) = (0xFF, nil)
-
-    /// Hardware ray-traced sun lighting (soft shadows + 1-bounce GI) added into
-    /// the HDR composite. Runs after SSR so the additive result feeds TAA /
-    /// bloom / tonemap on the same path as everything else. No-op unless
-    /// `rtEnabled`, the device supports RT, and a geometry/AS has been built.
-    private func encodeRTLightingPass(_ cb: MTLCommandBuffer) {
-        guard rtEnabled, rtSupported,
-              let basePipeline = rtPipeline, let accel = rtAccel,
-              let triA = rtTriAlbedoBuffer, let triN = rtTriNormalBuffer,
-              let vb = rtVertexBuffer, let ib = rtIndexBuffer,
-              rtTriangleCount > 0 else { return }
-        // Curve primitives (#60 item 7 incr. 2): when the soup AS holds a curve
-        // geometry descriptor, the intersector's geometry-type contract must
-        // include curves, so the kRTCurvesEnabled variant is REQUIRED.
-        let curvesOn = rtSoupCurvesActive && rtSoupCurvePipeline != nil
-            && rtSoupCurveSetDataBuffer != nil && rtSoupCurvePoolPoints != nil
-            && rtSoupCurveRadii != nil && rtSoupCurveSegments != nil
-        let pipeline = curvesOn ? rtSoupCurvePipeline! : basePipeline
-
-        // Pull the (jittered) invVP + camera position the G-buffer used so the
-        // world reconstruction matches the deferred passes exactly.
-        let fu = frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self)
-        rtFrameSeed &+= 1
-        var u = RTUniforms(
-            invViewProjection: fu.invViewProjection,
-            cameraWorldPos: fu.cameraWorldPos,
-            sunDir: simd_normalize(rtSunDirection), sunSoftnessRad: max(0.0005, rtSunSoftnessRad),
-            sunColor: rtSunColor, giStrength: rtGIStrength,
-            skyAmbient: ambientColor, specStrength: rtSpecStrength,
-            width: UInt32(width), height: UInt32(height),
-            shadowRays: UInt32(max(1, min(16, rtShadowRays))),
-            giRays: UInt32(max(1, min(16, rtGIRays))),
-            frameSeed: rtFrameSeed, rayTMin: 0.004, maxGIDist: 60.0,
-            triangleCount: UInt32(rtTriangleCount),
-            reflStrength: max(0, rtReflStrength),
-            reflMaxDist: max(0.1, rtReflMaxDistance),
-            reflRoughnessCutoff: max(0, rtReflRoughnessCutoff),
-            reflRays: UInt32(max(1, min(8, rtReflRays))),
-            reflEnabled: rtReflectionsEnabled ? 1 : 0,
-            surfCacheEnabled: surfCacheActive ? 1 : 0,
-            // Must be the ACTIVE tile size the atlas + update pass use (6 for
-            // per-triangle cards, 64 for the room), NOT the 64 default — else the
-            // read samples at the wrong scale and bleeds across tiles.
-            surfTileSize: UInt32(surfActiveTileSize), surfTilesPerRow: UInt32(surfTilesPerRow),
-            surfAtlasW: UInt32(surfAtlasW), surfAtlasH: UInt32(surfAtlasH),
-            emitterCount: UInt32(activeEmitterLightCount),
-            leafTransmission: max(0, leafTransmission))
-        u.curvesEnabled = curvesOn ? 1 : 0
-        // C1 — exactly one sun. See `RTSunOwnership`; `.automatic` (the default)
-        // reproduces every existing soup host, all of which zero
-        // `directionalLightColor` before enabling RT.
-        u.directSunEnabled = rtOwnsDirectSun ? 1 : 0
-        // DH-0872 — same coefficient the tonemap pass uses, applied to the GI
-        // pass's own raw sky-miss sample (see the kernel's miss branch).
-        u.scotopicDesaturation = max(0, scotopicDesaturation)
-        memcpy(rtUniformBuffer.contents(), &u, MemoryLayout<RTUniforms>.stride)
-
-        guard let enc = cb.makeComputeCommandEncoder() else { return }
-        enc.label = "Illuminatorama.rt"
-        enc.setComputePipelineState(pipeline)
-        enc.setTexture(depthTexture, index: 0)
-        enc.setTexture(gbufferNormalRgh, index: 1)
-        enc.setTexture(gbufferAlbedoMet, index: 2)
-        enc.setTexture(hdrCompositeTexture, index: 3)
-        enc.setTexture(equirectSky ?? dummySkyTexture, index: 4)
-        // Surface-cache atlas (current) + per-triangle card-UV maps. Always
-        // bound; the kernel gates reads on `surfCacheEnabled`. Dummies keep
-        // Metal happy when the cache is off / unbuilt.
-        enc.setTexture(surfConsumerAtlas ?? dummySkyTexture, index: 5)
-        enc.setTexture(rtDiffuseTexture, index: 6)   // diffuse (shadow+GI) → denoise pass
-        enc.setAccelerationStructure(accel, bufferIndex: 0)
-        enc.setBuffer(triA, offset: 0, index: 1)
-        enc.setBuffer(triN, offset: 0, index: 2)
-        enc.setBuffer(rtUniformBuffer, offset: 0, index: 3)
-        enc.setBuffer(surfTriCardBuffer ?? ib, offset: 0, index: 4)
-        enc.setBuffer(surfTriUVaBuffer ?? triA, offset: 0, index: 5)
-        enc.setBuffer(surfTriUVcBuffer ?? triA, offset: 0, index: 6)
-        enc.setBuffer(ddgiEmitterBuffer ?? triA, offset: 0, index: 7) // dummy when no emitters
-        enc.setBuffer(surfCardRectBuffer ?? triA, offset: 0, index: 8) // per-card atlas rect (dummy off)
-        enc.setBuffer(surfCardBuffer ?? surfCardDummyBuffer ?? triA, offset: 0, index: 9)     // per-card material (L_out reconstruction; dummy off, ≥ 1 SurfCard for arg validation)
-        // Curve set data + pooled geometry (#60 item 7 incr. 2); dummies keep the
-        // bindings valid for the base (curve-free) pipeline variant.
-        enc.setBuffer(curvesOn ? rtSoupCurveSetDataBuffer : triA, offset: 0, index: 10)
-        enc.setBuffer(curvesOn ? rtSoupCurvePoolPoints : triA, offset: 0, index: 11)
-        enc.setBuffer(curvesOn ? rtSoupCurveRadii : triA, offset: 0, index: 12)
-        enc.setBuffer(curvesOn ? rtSoupCurveSegments : triA, offset: 0, index: 13)
-        // Curve-only primitive AS (#60 item 7 incr. 2) — a SECOND acceleration
-        // structure the kernel traces alongside the triangle soup. Bind the
-        // triangle `accel` as a harmless dummy for the base (curve-free) variant.
-        enc.setAccelerationStructure((curvesOn ? rtSoupCurveAccel : nil) ?? accel, bufferIndex: 14)
-        // The intersector reads triangle vertex positions (and, when curves are
-        // active, the curve control points) through the AS; Metal needs explicit
-        // residency hints for the buffers it can't statically prove are referenced.
-        enc.useResource(vb, usage: .read)
-        enc.useResource(ib, usage: .read)
-        if curvesOn {
-            if let ca = rtSoupCurveAccel { enc.useResource(ca, usage: .read) }
-            if let p = rtSoupCurvePoolPoints { enc.useResource(p, usage: .read) }
-            if let r = rtSoupCurveRadii { enc.useResource(r, usage: .read) }
-            if let s = rtSoupCurveSegments { enc.useResource(s, usage: .read) }
-        }
-        dispatch(enc, pipeline: pipeline, width: width, height: height)
-        enc.endEncoding()
-    }
-
-    /// **True when an RT lighting pass wrote `rtDiffuseTexture` this frame** — the one
-    /// precondition every consumer of that buffer shares, in one place so they cannot
-    /// drift apart (C2: they used to guard on the SOUP path's resources, which is why
-    /// nothing denoised the TLAS path — `rtPipeline`/`rtAccel` are nil there).
-    private var rtDiffuseWrittenThisFrame: Bool {
-        guard rtEnabled, rtSupported else { return false }
-        // A live TLAS routes to `encodeRTLightingTLASPass`, which only runs (and only
-        // writes the buffer) when the opaque lighting pass is enabled. A glass-only
-        // TLAS therefore correctly reports false.
-        if rtTLASActive { return rtOpaqueLightingEnabled }
-        return rtPipeline != nil && rtAccel != nil && rtTriangleCount > 0
-    }
-
-    /// Clean the RT diffuse (soft shadow + 1-bounce GI) and composite it. Shared by
-    /// BOTH lighting paths — see the frame-graph call sites. Order matters: temporal
-    /// accumulation first (it feeds the spatial filter a far less noisy input), then
-    /// either the SVGF à-trous cascade or the fixed-radius bilateral.
-    private func encodeRTDiffuseDenoiseChain(_ cb: MTLCommandBuffer) {
-        // Temporally accumulate the RT diffuse (GI) so it keeps converging under
-        // camera motion (kills the wall crawl) BEFORE the spatial denoise reads it.
-        // No-op unless rtGITemporalEnabled.
-        encodeRTGITemporalAccum(cb)
-        // Phase 4.44 — SVGF à-trous cascade replaces the fixed-radius bilateral when
-        // enabled. Falls back to the original bilateral path.
-        if effectiveSVGFEnabled && rtGITemporalEnabled && rtEnabled && rtSupported {
-            encodeSVGFCascade(cb)
-        } else {
-            encodeRTDenoiseComposite(cb)
-        }
-    }
-
-    /// Temporal accumulation of the RT diffuse (1-bounce GI + soft shadow)
-    /// term: velocity-reprojected exponential history so the GI keeps
-    /// converging under camera motion. Reads the raw RT diffuse + previous
-    /// accumulated history, writes the new accumulated history (which the
-    /// denoise then reads via `rtDiffuseDenoiseSource`, and which becomes next
-    /// frame's history after the per-frame toggle). No-op unless enabled.
-    private func encodeRTGITemporalAccum(_ cb: MTLCommandBuffer) {
-        guard rtGITemporalEnabled, rtDiffuseWrittenThisFrame else { return }
-        var u = RTGITemporalUniforms(
-            width: UInt32(width), height: UInt32(height),
-            enabled: 1,
-            isFirstFrame: rtGINeedsFirstFrame ? 1 : 0,
-            blend: max(0.01, min(1.0, rtGITemporalBlend)),
-            gammaClamp: max(1.0, rtGITemporalClamp),
-            staticAccumulation: (rtGIStaticAccumulation ? 1 : 0) | (giIrradianceMode ? 2 : 0)
-                | (rtGIStaticAccumulation && rtGIStillPerFrame && taaStillAccumulation ? 4 : 0))
-        guard let enc = timedComputeEncoder(cb, "rt.giTemporal") else { return }
-        enc.label = "Illuminatorama.rt.giTemporal"
-        enc.setComputePipelineState(rtGITemporalPipeline)
-        enc.setTexture(rtDiffuseTexture,           index: 0)  // current raw GI
-        enc.setTexture(previousRTGIHistoryTexture, index: 1)  // history read
-        enc.setTexture(velocityTexture,            index: 2)
-        enc.setTexture(currentRTGIHistoryTexture,  index: 3)  // accumulated write
-        enc.setTexture(giSampleCount,              index: 4)  // adaptive count (read_write)
-        enc.setTexture(gbufferAlbedoMet,           index: 5)  // still: irradiance demodulation (DH-0966)
-        // `setBytes`, not the shared single buffer: with two frames in flight a memcpy into one
-        // buffer can hand the GPU the NEXT frame's `isFirstFrame` / mode (DH-0887 audit).
-        enc.setBytes(&u, length: MemoryLayout<RTGITemporalUniforms>.stride, index: 0)
-        dispatch(enc, pipeline: rtGITemporalPipeline, width: width, height: height)
-        enc.endEncoding()
-    }
-
-    // ── Phase 4.44: SVGF à-trous cascade ─────────────────────────────────────
-
-    private struct SVGFAtrousUniforms {
-        /// `flags` (DH-0966): bit 0 ⇒ the input is irradiance; multiply the centre albedo back in (last level).
-        var width: UInt32; var height: UInt32; var stepSize: UInt32; var flags: UInt32 = 0
-        var sigmaL: Float; var sigmaZ: Float; var sigmaN: Float; var lumFloor: Float = 0
-    }
-
-    /// SVGF denoiser for the RT GI term: variance estimate + N à-trous cascade
-    /// levels. Reads `currentRTGIHistoryTexture` (the temporally-accumulated GI)
-    /// and writes the final spatially-filtered result into `giAtrousA/B`, then
-    /// adds it additively into `hdrCompositeTexture`.
-    ///
-    /// Only runs when `svgfEnabled && rtGITemporalEnabled && rtEnabled`.
-    /// Replaces `encodeRTDenoiseComposite` for the GI term on this path.
-    private func encodeSVGFCascade(_ cb: MTLCommandBuffer) {
-        guard effectiveSVGFEnabled, rtGITemporalEnabled, rtDiffuseWrittenThisFrame else { return }
-
-        let levels = max(1, min(5, effectiveSVGFLevels))
-        let W = UInt32(width), H = UInt32(height)
-
-        // Pass 1: variance estimate from the accumulated GI.
-        do {
-            guard let enc = cb.makeComputeCommandEncoder() else { return }
-            enc.label = "Illuminatorama.svgf.variance"
-            enc.setComputePipelineState(svgfVariancePipeline)
-            enc.setTexture(currentRTGIHistoryTexture, index: 0)  // accumulated GI
-            enc.setTexture(giVariance,                index: 1)  // variance output
-            var u = SVGFAtrousUniforms(width: W, height: H, stepSize: 1,
-                                        sigmaL: svgfSigmaL, sigmaZ: svgfSigmaZ, sigmaN: svgfSigmaN)
-            enc.setBytes(&u, length: MemoryLayout<SVGFAtrousUniforms>.stride, index: 0)
-            dispatch(enc, pipeline: svgfVariancePipeline, width: width, height: height)
-            enc.endEncoding()
-        }
-
-        // À-trous cascade. Colour ping-pongs {giAtrousA, giAtrousB}; variance
-        // ping-pongs {giVariance, giVarianceB} — the two pairs are DISJOINT so no
-        // pass ever reads one signal at dilated neighbour taps while writing the
-        // other to the same texture at self. The old layout reused giAtrousB for
-        // both colour and variance, so each level≥1 had an in-place read/write race
-        // that corrupted colour in a dilated-stride pattern → the masonry (#65).
-        //
-        // Trace:
-        //   level 0: cIn=giHistory  vIn=giVariance  → cOut=giAtrousA  vOut=giVarianceB
-        //   level 1: cIn=giAtrousA  vIn=giVarianceB → cOut=giAtrousB  vOut=giVariance
-        //   level 2: cIn=giAtrousB  vIn=giVariance  → cOut=giAtrousA  vOut=giVarianceB
-        //   … colour and variance never share a texture. Result in `lastColorOut`.
-        var lastColorOut = giAtrousA
-        for level in 0..<levels {
-            let stepSize = UInt32(1 << level)
-            let cIn  = level == 0 ? currentRTGIHistoryTexture : (level % 2 == 1 ? giAtrousA : giAtrousB)
-            let cOut = level % 2 == 0 ? giAtrousA  : giAtrousB
-            let vIn  = level % 2 == 0 ? giVariance : giVarianceB
-            let vOut = level % 2 == 0 ? giVarianceB : giVariance
-            lastColorOut = cOut
-
-            guard let enc = cb.makeComputeCommandEncoder() else { return }
-            enc.label = "Illuminatorama.svgf.atrous.\(level)"
-            enc.setComputePipelineState(svgfAtrousPipeline)
-            enc.setTexture(cIn,              index: 0)
-            enc.setTexture(vIn,              index: 1)
-            enc.setTexture(depthTexture,     index: 2)
-            enc.setTexture(gbufferNormalRgh, index: 3)
-            enc.setTexture(cOut,             index: 4)
-            enc.setTexture(vOut,             index: 5)
-            enc.setTexture(gbufferAlbedoMet, index: 6)
-            let flags: UInt32 = (giIrradianceMode && level == levels - 1 ? 1 : 0)
-                | (!svgfStillLuminanceStop && rtGIStaticAccumulation ? 4 : 0)
-            var u = SVGFAtrousUniforms(width: W, height: H, stepSize: stepSize, flags: flags,
-                                        sigmaL: svgfSigmaL, sigmaZ: svgfSigmaZ, sigmaN: svgfSigmaN,
-                                        lumFloor: effectiveSVGFLumFloor)
-            enc.setBytes(&u, length: MemoryLayout<SVGFAtrousUniforms>.stride, index: 0)
-            enc.setBuffer(frameUniformBuffer, offset: 0, index: 1)  // invProjection for linear depth
-            dispatch(enc, pipeline: svgfAtrousPipeline, width: width, height: height)
-            enc.endEncoding()
-        }
-
-        addGIIntoComposite(cb, source: lastColorOut)
-    }
-
-    /// Additively composites the denoised GI buffer into `hdrCompositeTexture`.
-    /// Reuses `illumi_rt_denoise` with radius=0 (no bilateral — SVGF already filtered).
-    private func addGIIntoComposite(_ cb: MTLCommandBuffer, source: MTLTexture) {
-        var du = RTDenoiseUniforms(width: UInt32(width), height: UInt32(height),
-                                   enabled: 0, radius: 0,
-                                   kDepth: 0, kNorm: 0)
-        memcpy(rtDenoiseUniformBuffer.contents(), &du, MemoryLayout<RTDenoiseUniforms>.stride)
-        guard let enc = timedComputeEncoder(cb, "svgf.composite") else { return }
-        enc.label = "Illuminatorama.svgf.composite"
-        enc.setComputePipelineState(rtDenoisePipeline)
-        enc.setTexture(source,              index: 0)
-        enc.setTexture(depthTexture,        index: 1)
-        enc.setTexture(gbufferNormalRgh,    index: 2)
-        enc.setTexture(hdrCompositeTexture, index: 3)
-        enc.setBuffer(frameUniformBuffer,       offset: 0, index: 0)
-        enc.setBuffer(rtDenoiseUniformBuffer,   offset: 0, index: 1)
-        dispatch(enc, pipeline: rtDenoisePipeline, width: width, height: height)
-        enc.endEncoding()
-    }
-
-    /// Depth + normal guided bilateral over the RT diffuse buffer, adding the
-    /// cleaned soft-shadow + 1-bounce-GI term into the HDR composite (additive,
-    /// own-pixel read-modify-write) before the volumetric / TAA passes. Gated on
-    /// `rtDiffuseWrittenThisFrame`, so it only composites a buffer some lighting
-    /// pass actually wrote — EITHER path, since C2; with `rtDenoiseEnabled` off it
-    /// passes the raw diffuse straight through (the old additive behaviour).
-    private func encodeRTDenoiseComposite(_ cb: MTLCommandBuffer) {
-        guard rtDiffuseWrittenThisFrame else { return }
-        var u = RTDenoiseUniforms(
-            width: UInt32(width), height: UInt32(height),
-            enabled: rtDenoiseEnabled ? 1 : 0,
-            radius: UInt32(max(0, min(4, rtDenoiseRadius))),
-            kDepth: max(0, rtDenoiseDepthSensitivity),
-            kNorm: max(0, rtDenoiseNormalSharpness))
-        memcpy(rtDenoiseUniformBuffer.contents(), &u, MemoryLayout<RTDenoiseUniforms>.stride)
-        guard let enc = timedComputeEncoder(cb, "rt.denoise") else { return }
-        enc.label = "Illuminatorama.rt.denoise"
-        enc.setComputePipelineState(rtDenoisePipeline)
-        enc.setTexture(rtDiffuseDenoiseSource, index: 0)
-        enc.setTexture(depthTexture,        index: 1)
-        enc.setTexture(gbufferNormalRgh,    index: 2)
-        enc.setTexture(hdrCompositeTexture, index: 3)
-        enc.setBuffer(frameUniformBuffer,     offset: 0, index: 0)
-        enc.setBuffer(rtDenoiseUniformBuffer, offset: 0, index: 1)
-        dispatch(enc, pipeline: rtDenoisePipeline, width: width, height: height)
-        enc.endEncoding()
-    }
 
     /// Single-scatter volumetric light shaft, added into the HDR composite
     /// after the RT lighting (so the beam glows in the air in front of lit
