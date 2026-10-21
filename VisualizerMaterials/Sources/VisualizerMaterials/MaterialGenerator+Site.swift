@@ -139,11 +139,84 @@ extension MaterialGenerator {
                 ch.height[ch.idx(x, y)] = clamp01(0.40 + 0.30 * (grain - 0.5))
             }
         }
+        paintLawnBlades(&ch, size: size, seed: seed)
         ch.clearcoat = 0.0
         // Softer normal derivation (was 1.6): with the coherent stripe ridge gone, less relief
         // amplification keeps the remaining stochastic micro-relief from aliasing at grazing angle.
-        ch.deriveNormals(strength: 0.7)
+        ch.deriveNormals(strength: 0.35)
         return ch
+    }
+
+    /// SplitMix64 for the blade painter (deterministic, never `hashValue`).
+    private struct TurfRNG {
+        var state: UInt64
+        init(seed: UInt64) { state = seed &+ 0x9E3779B97F4A7C15 }
+        mutating func unit() -> Double {
+            state &+= 0x9E3779B97F4A7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+            z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+            return Double((z ^ (z >> 31)) >> 11) / Double(1 << 53)
+        }
+    }
+
+    /// BLADE STROKES (2026-10-20): a baked field of overlapping blades in the lawn tile.
+    ///
+    /// Geometry cannot make a mown lawn read as grass at range: a 6 mm ribbon at ~120/m² covers a
+    /// few percent of the ground and is thinner than a pixel past ~10 m, so it can only alias into
+    /// "stubble" (Danny: "a teenager growing facial hair for the first time"). The papers all say
+    /// the same thing — real blades near the camera, a textured many-blade layer in the middle,
+    /// the ground texture far off (GPU Gems ch.7 / Virtual Botany, Papavasiliou 2015). This is
+    /// that textured layer: ~1 stroke per 16 texels, each a thin tapering curved blade that is dark
+    /// at the root and lighter at the tip, painted in random order so they overlap and occlude
+    /// like a real sward, over a darker under-layer so there is depth between them. It is baked
+    /// into albedo AND height (the normals then carry the directional light response), wraps at
+    /// the tile edge (no seam), and is mip-filtered by the sampler, so at range it averages to the
+    /// tile's mean colour instead of crawling.
+    private static func paintLawnBlades(_ ch: inout MaterialChannels, size: Int, seed: UInt64) {
+        var rng = TurfRNG(seed: seed ^ 0xB1ADE5)
+        let n = size
+        // Under-layer: the gaps between blades are shaded thatch, not bare lit ground.
+        // Per-channel floor 0.042: `TextureAudit`'s dielectric band is [0.04, 0.94] on every channel and
+        // the blue of a dark olive is the first to fall through it.
+        let tileColour = ch.albedo
+        func floored(_ c: Vec3) -> Vec3 { Vec3(max(0.042, c.x), max(0.042, c.y), max(0.042, c.z)) }
+        for i in 0..<(n * n) { ch.albedo[i] = floored(tileColour[i] * 0.70) }
+        let strokes = max(200, n * n / 16)
+        let lenBase = Double(n) * 0.024, lenVar = Double(n) * 0.040
+        let width = max(1.0, Double(n) * 0.0026)
+        for _ in 0..<strokes {
+            let rx = rng.unit() * Double(n), ry = rng.unit() * Double(n)
+            var ang = rng.unit() * 2 * Double.pi
+            let len = lenBase + rng.unit() * lenVar
+            let bend = (rng.unit() - 0.5) * 0.9 / len           // radians per texel along the blade
+            let jitter = 0.80 + 0.40 * rng.unit()                // per-blade value
+            let warm = rng.unit() < 0.15 ? 1.0 : 0.0             // a few straw-leaning blades
+            let rootIdx = ((Int(ry) % n + n) % n) * n + ((Int(rx) % n + n) % n)
+            let base = tileColour[rootIdx]                       // the tile's own colour at the root
+            var x = rx, y = ry
+            let steps = Int(len / 0.5)
+            for step in 0..<steps {
+                let t = Double(step) / Double(max(1, steps - 1))   // 0 root … 1 tip
+                let r = 0.5 * width * (1.0 - 0.75 * t)             // tapers to a point
+                let shade = (0.76 + 0.66 * t) * jitter
+                let tint = Vec3(1.0 + 0.10 * warm * t, 1.0 + 0.03 * warm * t, 1.0 - 0.12 * warm * t)
+                let col = floored(Vec3(base.x * tint.x, base.y * tint.y, base.z * tint.z) * shade)
+                let hVal = 0.34 + 0.40 * t
+                let ri = Int(r.rounded(.up))
+                for dy in -ri...ri {
+                    for dx in -ri...ri where Double(dx * dx + dy * dy) <= max(r * r, 0.30) {
+                        let px = ((Int(x.rounded()) + dx) % n + n) % n
+                        let py = ((Int(y.rounded()) + dy) % n + n) % n
+                        let i = py * n + px
+                        ch.albedo[i] = col
+                        ch.height[i] = clamp01(hVal)
+                    }
+                }
+                x += cos(ang) * 0.5; y += sin(ang) * 0.5
+                ang += bend * 0.5
+            }
+        }
     }
 
     /// The per-species knobs over the ONE clipped-hedge foliage generator (`hedgeFoliage`).
