@@ -6,6 +6,22 @@ import simd
 import VisualizerCore
 
 extension IlluminatoramaRenderer {
+    /// True when EVERY instance of `group` is `rtExcludeFully` (mask 0 — no ray ever intersects it).
+    /// Such a group needs no BLAS, no refit, and must not count against the RT size ceiling: a
+    /// host that marks a huge, view-dependent mesh raster-only (the GPU tile lawn, ~1.5 M triangles,
+    /// regenerated around the camera every frame) is asking to keep it OUT of the traced structure
+    /// altogether, not merely to have its rays masked while a deforming BLAS over it is refit
+    /// every frame. Reads the grouped instance buffer, so call it only after `uploadInstances()`.
+    func rtGroupIsRayExcluded(_ group: MeshDrawGroup) -> Bool {
+        guard group.count > 0, group.start >= 0, group.start + group.count <= instances.count else { return false }
+        let ptr = currentInstanceBuffer.contents().bindMemory(to: IlluminatoramaInstance.self,
+                                                              capacity: instances.count)
+        for k in 0..<group.count where ptr[group.start + k].rtExclude != IlluminatoramaInstance.rtExcludeFully {
+            return false
+        }
+        return true
+    }
+
     /// Full rebuild: build a BLAS + object-normal slot for every not-yet-cached
     /// mesh (one setup-time command buffer), assemble the concatenated normal
     /// buffer + per-instance descriptors/data in grouped order, and build the
@@ -30,7 +46,7 @@ extension IlluminatoramaRenderer {
         let deformingKinds = Set(fxs.gpuRepackTasks.map(\.kind))
         var pending: [(MTLAccelerationStructure, MTLPrimitiveAccelerationStructureDescriptor, MTLBuffer)] = []
         for group in gbs.meshGroups {
-            guard let mesh = meshes[group.kind], mesh.indexCount >= 3 else { continue }
+            guard let mesh = meshes[group.kind], mesh.indexCount >= 3, !rtGroupIsRayExcluded(group) else { continue }
             let mid = ObjectIdentifier(mesh)
             if let cached = rts.rtMeshCache[mid] {
                 // Ownership makes this impossible; assert it anyway, because when it was
@@ -206,7 +222,7 @@ extension IlluminatoramaRenderer {
         }
         var slot: [ObjectIdentifier: (asIndex: Int, normalBase: Int)] = [:]
         for group in gbs.meshGroups {
-            guard let mesh = meshes[group.kind] else { continue }
+            guard let mesh = meshes[group.kind], !rtGroupIsRayExcluded(group) else { continue }
             let mid = ObjectIdentifier(mesh)
             if slot[mid] != nil { continue }
             guard let cached = rts.rtMeshCache[mid] else { continue }

@@ -229,7 +229,7 @@ public final class IlluminatoramaRenderer {
     /// (GI, RTAO, traced sun, glass) with nothing but a log line to say so.
     public var rtTriangleEstimate: (triangles: Int, ceiling: Int) {
         var tris = 0
-        for g in gbs.meshGroups { if let m = meshes[g.kind] { tris += m.indexCount / 3 } }
+        for g in gbs.meshGroups { if let m = meshes[g.kind], !rtGroupIsRayExcluded(g) { tris += m.indexCount / 3 } }
         for g in (rtGlassEnabled ? flattenGlass() : []) { if let m = meshes[g.kind] { tris += m.indexCount / 3 } }
         let strictLive = buildRTFromExtractedScene && rtEnabled && !rtStillCapsRelaxed
         return (tris, strictLive ? Self.rtMaxTrianglesForLiveRT : rtGlassOnlyTriangleCap)

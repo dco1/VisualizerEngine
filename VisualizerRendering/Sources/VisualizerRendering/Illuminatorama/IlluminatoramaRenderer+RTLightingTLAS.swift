@@ -128,7 +128,7 @@ extension IlluminatoramaRenderer {
         if !overCap {
             estTriangles = 0
             for g in gbs.meshGroups {
-                if let m = meshes[g.kind] { estTriangles += m.indexCount / 3 }
+                if let m = meshes[g.kind], !rtGroupIsRayExcluded(g) { estTriangles += m.indexCount / 3 }
             }
             for (kind, _) in glassGroups {
                 if let m = meshes[kind] { estTriangles += m.indexCount / 3 }
