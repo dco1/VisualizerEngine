@@ -49,6 +49,10 @@ public final class GrassTileField {
         public var foliageSSS: Bool = true
         /// How far the outer rings converge on `midColor` (0 = never, 1 = fully).
         public var farTint: Float = 0.85
+        /// Fraction of the slots the output buffers can hold. Only blades inside the view cone are
+        /// written (compacted), so the buffers need room for the worst view, not for every slot;
+        /// a blade past capacity is dropped (far rings first, as they claim space last).
+        public var visibleFraction: Float = 0.6
         public init() {}
     }
 
@@ -59,11 +63,17 @@ public final class GrassTileField {
     private let engine: SimEngine
     private let pipeline: MTLComputePipelineState
     private let uniformBuffer: MTLBuffer
-    private let positionBuffer: MTLBuffer
-    private let normalBuffer: MTLBuffer
-    private let colorBuffer: MTLBuffer
+    private let resetPipeline: MTLComputePipelineState
+    private let finalizePipeline: MTLComputePipelineState
+    /// Finished `IlluminatoramaVertex` records, written by the kernel (no engine repack).
+    private let vertexBuffer: MTLBuffer
+    private let counterBuffer: MTLBuffer
+    private let drawArgsBuffer: MTLBuffer
     private let indexBuffer: MTLBuffer
     private let indexCount: Int
+    /// Blades the vertex buffer can hold, and indices one blade draws.
+    public let capacity: Int
+    private let indicesPerBlade: Int
     private let maskTexture: MTLTexture
     private let groundTexture: MTLTexture
     private var params: Params
@@ -86,18 +96,22 @@ public final class GrassTileField {
         else { return nil }
 
         let blades = params.rings.reduce(0) { $0 + $1.window * $1.window * $1.bladesPerCell }
+        let capacity = max(1, min(blades, Int(Float(blades) * min(max(params.visibleFraction, 0.05), 1))))
         let rows = params.segments + 1
-        let verts = blades * rows * 2
-        let vecBytes = MemoryLayout<Float>.stride * 3
-        guard let pBuf = device.makeBuffer(length: verts * vecBytes, options: .storageModeShared),
-              let nBuf = device.makeBuffer(length: verts * vecBytes, options: .storageModeShared),
-              let cBuf = device.makeBuffer(length: verts * MemoryLayout<SIMD4<Float>>.stride,
-                                           options: .storageModeShared)
+        let verts = capacity * rows * 2
+        guard let vBuf = device.makeBuffer(length: verts * MemoryLayout<IlluminatoramaVertex>.stride,
+                                           options: .storageModeShared),
+              let cntBuf = device.makeBuffer(length: 4, options: .storageModeShared),
+              let argBuf = device.makeBuffer(length: 20, options: .storageModeShared),
+              let resetPSO = engine.pipelineCache.pipelineState(name: "grassTileReset", device: device),
+              let finPSO = engine.pipelineCache.pipelineState(name: "grassTileFinalize", device: device),
+              // The descriptor wants position/normal streams even though a direct mesh never reads them.
+              let dummy = device.makeBuffer(length: 16, options: .storageModePrivate)
         else { return nil }
 
         var indices = [UInt32]()
-        indices.reserveCapacity(blades * params.segments * 6)
-        for b in 0..<blades {
+        indices.reserveCapacity(capacity * params.segments * 6)
+        for b in 0..<capacity {
             let base = UInt32(b * rows * 2)
             for i in 0..<params.segments {
                 let bl = base + UInt32(i * 2)
@@ -109,15 +123,19 @@ public final class GrassTileField {
                               options: .storageModeShared)
         }) else { return nil }
 
-        uBuf.label = "GrassTiles.uniforms"; pBuf.label = "GrassTiles.positions"
-        nBuf.label = "GrassTiles.normals"; cBuf.label = "GrassTiles.colors"; iBuf.label = "GrassTiles.indices"
+        uBuf.label = "GrassTiles.uniforms"; vBuf.label = "GrassTiles.vertices"
+        cntBuf.label = "GrassTiles.counter"; argBuf.label = "GrassTiles.drawArgs"; iBuf.label = "GrassTiles.indices"
 
         self.engine = engine
         self.pipeline = pso
         self.uniformBuffer = uBuf
-        self.positionBuffer = pBuf
-        self.normalBuffer = nBuf
-        self.colorBuffer = cBuf
+        self.resetPipeline = resetPSO
+        self.finalizePipeline = finPSO
+        self.vertexBuffer = vBuf
+        self.counterBuffer = cntBuf
+        self.drawArgsBuffer = argBuf
+        self.capacity = capacity
+        self.indicesPerBlade = params.segments * 6
         self.indexBuffer = iBuf
         self.indexCount = indices.count
         self.maskTexture = maskTexture
@@ -132,13 +150,13 @@ public final class GrassTileField {
         encodeGenerate(camera: renderer.camera.position, time: 0)
 
         let desc = IlluminatoramaGPUMeshDescriptor(
-            positionBuffer: pBuf, normalBuffer: nBuf,
-            positionStride: vecBytes, normalStride: vecBytes,
+            positionBuffer: dummy, normalBuffer: dummy,
             vertexCount: verts,
             bodyIndexBuffer: iBuf, bodyIndexCount: indices.count, bodyIndexType: .uint32,
-            colorBuffer: cBuf,
             doubleSided: true,
-            shadowCastsBothFaces: true)
+            shadowCastsBothFaces: true,
+            directVertexBuffer: vBuf,
+            indirectDrawBuffer: argBuf)
         guard let handle = renderer.registerGPUMesh(desc) else { return nil }
         self.meshHandle = handle
     }
@@ -151,12 +169,13 @@ public final class GrassTileField {
         encodeGenerate(camera: camera, time: time, windScale: windScale)
     }
 
-    private func encodeGenerate(camera: SIMD3<Float>, time: Float, windScale: Float = 1) {
+    private func encodeGenerate(camera: SIMD3<Float>, time: Float, windScale: Float = 1, viewCull: Bool = true) {
         guard let cb = engine.commandQueue.makeCommandBuffer(),
               let enc = cb.makeComputeCommandEncoder() else { return }
         cb.label = "GrassTiles.generate"
         enc.label = "GrassTiles.generate"
         let p = params
+        let planes = viewCull ? viewPlanes(camera: camera) : Array(repeating: SIMD4<Float>(0, 0, 0, 1e9), count: 4)
         uniformBuffer.contents().bindMemory(to: GrassTileUniforms.self, capacity: 1).pointee =
             GrassTileUniforms(
                 camera: SIMD4(camera, time),
@@ -166,62 +185,99 @@ public final class GrassTileField {
                 rootC: SIMD4(p.rootColor, 0), midC: SIMD4(p.midColor, 0), tipC: SIMD4(p.tipColor, 0),
                 misc: SIMD4(p.foliageSSS ? 0 : 1, p.farTint, 0, 0),
                 ringInfo: GrassTileUniforms.RingInfo(p.rings),
-                ringCount: UInt32(p.rings.count), segments: UInt32(p.segments), pad0: 0, pad1: 0)
+                ringCount: UInt32(p.rings.count), segments: UInt32(p.segments),
+                capacity: UInt32(capacity), pad1: 0,
+                plane0: planes[0], plane1: planes[1], plane2: planes[2], plane3: planes[3])
+        enc.setComputePipelineState(resetPipeline)
+        enc.setBuffer(counterBuffer, offset: 0, index: 0)
+        enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
         enc.setComputePipelineState(pipeline)
-        enc.setBuffer(positionBuffer, offset: 0, index: 0)
-        enc.setBuffer(normalBuffer, offset: 0, index: 1)
-        enc.setBuffer(colorBuffer, offset: 0, index: 2)
+        enc.setBuffer(vertexBuffer, offset: 0, index: 0)
+        enc.setBuffer(counterBuffer, offset: 0, index: 1)
         enc.setBuffer(uniformBuffer, offset: 0, index: 3)
         enc.setTexture(maskTexture, index: 0)
         enc.setTexture(groundTexture, index: 1)
         let w = min(bladeCount, pipeline.maxTotalThreadsPerThreadgroup)
         enc.dispatchThreads(MTLSize(width: bladeCount, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+        enc.setComputePipelineState(finalizePipeline)
+        var info = SIMD2<UInt32>(UInt32(indicesPerBlade), UInt32(capacity))
+        enc.setBuffer(counterBuffer, offset: 0, index: 0)
+        enc.setBuffer(drawArgsBuffer, offset: 0, index: 1)
+        enc.setBytes(&info, length: MemoryLayout<SIMD2<UInt32>>.stride, index: 2)
+        enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                            threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
         enc.endEncoding()
         cb.commit()
     }
 
-    /// TEST-OBSERVABLE: world position of every KEPT blade's root. Drains the sim queue first, so the
-    /// read sees this frame's generation. A culled slot writes coincident verts (zero width); a kept
-    /// blade's root row is `2·halfWidth` wide.
-    public func readBladeRoots() -> [SIMD3<Float>] {
-        if let cb = engine.commandQueue.makeCommandBuffer() { cb.commit(); cb.waitUntilCompleted() }
-        let rows = params.segments + 1
-        let pos = positionBuffer.contents().bindMemory(to: Float.self, capacity: vertexCount * 3)
-        var roots: [SIMD3<Float>] = []
-        for b in 0..<bladeCount {
-            let v = b * rows * 2 * 3
-            let l = SIMD3<Float>(pos[v], pos[v + 1], pos[v + 2])
-            let r = SIMD3<Float>(pos[v + 3], pos[v + 4], pos[v + 5])
-            if simd_length(r - l) > 1e-6 { roots.append((l + r) * 0.5) }
+    /// Four inward-facing planes through the camera bounding its view cone, widened ~20 % so a
+    /// jittered/supersampled frame or a camera that moved since this step never exposes a missing blade.
+    /// An orthographic camera gets planes that pass everything.
+    private func viewPlanes(camera: SIMD3<Float>) -> [SIMD4<Float>] {
+        guard let cam = renderer?.camera, !cam.isOrthographic else {
+            return Array(repeating: SIMD4<Float>(0, 0, 0, 1e9), count: 4)
         }
-        return roots
+        let f = simd_normalize(cam.target - cam.position)
+        let r = simd_normalize(simd_cross(f, cam.up))
+        let u = simd_cross(r, f)
+        let tanY = tan(cam.fovYRadians * 0.5) * 1.2
+        let tanX = tanY * max(cam.aspect, 1) * 1.1
+        func plane(_ n: SIMD3<Float>) -> SIMD4<Float> {
+            let nn = simd_normalize(n)
+            return SIMD4(nn, -simd_dot(nn, camera))
+        }
+        return [plane(r + f * tanX), plane(-r + f * tanX), plane(u + f * tanY), plane(-u + f * tanY)]
     }
 
-    /// TEST-OBSERVABLE: tip positions (last row midpoint) of every KEPT blade, in slot order, after
+    /// Blades the last generate kept (drains the queue first).
+    public func keptBladeCount() -> Int {
+        if let cb = engine.commandQueue.makeCommandBuffer() { cb.commit(); cb.waitUntilCompleted() }
+        return min(Int(counterBuffer.contents().bindMemory(to: UInt32.self, capacity: 1).pointee), capacity)
+    }
+
+    /// Every kept blade as (root midpoint, tip midpoint), sorted by root so two generations compare
+    /// index-for-index (the kernel's output order is whatever the atomics produced).
+    private func readKeptBlades() -> [(root: SIMD3<Float>, tip: SIMD3<Float>)] {
+        let kept = keptBladeCount()
+        let rows = params.segments + 1
+        let verts = vertexBuffer.contents().bindMemory(to: IlluminatoramaVertex.self, capacity: capacity * rows * 2)
+        var out: [(root: SIMD3<Float>, tip: SIMD3<Float>)] = []
+        out.reserveCapacity(kept)
+        for b in 0..<kept {
+            let v = b * rows * 2
+            out.append(((verts[v].position + verts[v + 1].position) * 0.5,
+                        (verts[v + (rows - 1) * 2].position + verts[v + (rows - 1) * 2 + 1].position) * 0.5))
+        }
+        return out.sorted { a, b in
+            a.root.x != b.root.x ? a.root.x < b.root.x : (a.root.z != b.root.z ? a.root.z < b.root.z : a.root.y < b.root.y)
+        }
+    }
+
+    /// TEST-OBSERVABLE: world position of every KEPT blade's root (all views — no view cull applied by the
+    /// caller's generate; see `bladeRoots(cameraAt:)`). Drains the sim queue first.
+    public func readBladeRoots() -> [SIMD3<Float>] { readKeptBlades().map(\.root) }
+
+    /// TEST-OBSERVABLE: tip positions (last row midpoint) of every KEPT blade, sorted by root, after
     /// regenerating at `time` with the given wind scale — lets a gate compare two times/scales.
     public func bladeTips(cameraAt camera: SIMD3<Float>, time: Float, windScale: Float) -> [SIMD3<Float>] {
-        encodeGenerate(camera: camera, time: time, windScale: windScale)
-        if let cb = engine.commandQueue.makeCommandBuffer() { cb.commit(); cb.waitUntilCompleted() }
-        let rows = params.segments + 1
-        let pos = positionBuffer.contents().bindMemory(to: Float.self, capacity: vertexCount * 3)
-        var tips: [SIMD3<Float>] = []
-        for b in 0..<bladeCount {
-            let v0 = b * rows * 2 * 3
-            let w = SIMD3<Float>(pos[v0], pos[v0 + 1], pos[v0 + 2]) - SIMD3<Float>(pos[v0 + 3], pos[v0 + 4], pos[v0 + 5])
-            if simd_length(w) <= 1e-6 { continue }
-            let v = (b * rows * 2 + (rows - 1) * 2) * 3
-            tips.append((SIMD3<Float>(pos[v], pos[v + 1], pos[v + 2]) + SIMD3<Float>(pos[v + 3], pos[v + 4], pos[v + 5])) * 0.5)
-        }
-        return tips
+        encodeGenerate(camera: camera, time: time, windScale: windScale, viewCull: false)
+        return readKeptBlades().map(\.tip)
     }
 
-    /// TEST-OBSERVABLE: the roots this field would grow with the camera at `camera` (regenerates, then
-    /// reads). The field is view-dependent by design — it only exists around the viewer — so a test
-    /// asks "what grows HERE" rather than "what grows in the yard".
+    /// TEST-OBSERVABLE: the roots this field would grow with the camera at `camera` (regenerates with NO
+    /// view cull, then reads). The field is view-dependent by design — it only exists around the viewer —
+    /// so a test asks "what grows HERE" rather than "what grows in the yard".
     public func bladeRoots(cameraAt camera: SIMD3<Float>) -> [SIMD3<Float>] {
-        encodeGenerate(camera: camera, time: 0)
+        encodeGenerate(camera: camera, time: 0, viewCull: false)
         return readBladeRoots()
+    }
+
+    /// TEST-OBSERVABLE: blades kept for the CURRENT view (view cull on) with the camera at `camera`.
+    public func keptBladeCount(cameraAt camera: SIMD3<Float>) -> Int {
+        encodeGenerate(camera: camera, time: 0)
+        return keptBladeCount()
     }
 
     public func teardown() {
@@ -245,8 +301,9 @@ struct GrassTileUniforms {
     var ringInfo: RingInfo
     var ringCount: UInt32
     var segments: UInt32
-    var pad0: UInt32
+    var capacity: UInt32
     var pad1: UInt32
+    var plane0: SIMD4<Float>, plane1: SIMD4<Float>, plane2: SIMD4<Float>, plane3: SIMD4<Float>
 
     /// Eight `uint4` (x = window, y = blades per cell) laid out as a Metal `uint4[8]`.
     struct RingInfo {

@@ -219,6 +219,9 @@ extension IlluminatoramaRenderer {
         /// False until the first frame primes `prevPositionBuffer = positionBuffer`
         /// (so frame 1 reads prev == curr → zero velocity, no spurious streak).
         var primed: Bool
+        /// DIRECT mesh: a kernel writes `vertexBuffer` itself, so there is nothing to repack and no
+        /// previous-position copy. The task still exists so every "GPU geometry is live" check holds.
+        var direct: Bool = false
     }
 
     /// Register a compute-fed geometry described by an
@@ -232,8 +235,9 @@ extension IlluminatoramaRenderer {
         -> IlluminatoramaMeshHandle?
     {
         let vertexBytes = MemoryLayout<IlluminatoramaVertex>.stride * descriptor.vertexCount
-        guard let vertexBuffer = device.makeBuffer(length: vertexBytes,
-                                                    options: .storageModePrivate) else {
+        let direct = descriptor.directVertexBuffer != nil
+        guard let vertexBuffer = descriptor.directVertexBuffer
+                ?? device.makeBuffer(length: vertexBytes, options: .storageModePrivate) else {
             return nil
         }
         vertexBuffer.label = "Illuminatorama.gpuMesh.vertices"
@@ -256,13 +260,14 @@ extension IlluminatoramaRenderer {
         )
         mesh.doubleSided = descriptor.doubleSided
         mesh.shadowCastsBothFaces = descriptor.shadowCastsBothFaces
+        mesh.indirectDrawBuffer = descriptor.indirectDrawBuffer
         let kind = MeshKind.custom("gpuMesh#\(UUID().uuidString)")
         meshes[kind] = mesh
         // Issue #65 — side buffer for last frame's positions. Matches the
         // host position buffer's PACKED float3 layout (12-byte stride, NOT
         // SIMD3's 16) so the per-frame blit is a straight byte copy and the
         // `packed_float3*` shader read indexes correctly. See gpuMeshPrevStride.
-        let prevPosBytes = Self.gpuMeshPrevStride * descriptor.vertexCount
+        let prevPosBytes = direct ? 16 : Self.gpuMeshPrevStride * descriptor.vertexCount
         guard let prevPositionBuffer = device.makeBuffer(
                 length: max(prevPosBytes, 16), options: .storageModePrivate) else {
             return nil
@@ -277,7 +282,8 @@ extension IlluminatoramaRenderer {
             uvBuffer: descriptor.uvBuffer,
             colorBuffer: descriptor.colorBuffer,
             prevPositionBuffer: prevPositionBuffer,
-            primed: false
+            primed: false,
+            direct: direct
         ))
         return IlluminatoramaMeshHandle(kind: kind, mesh: mesh, renderer: self)
     }
@@ -323,11 +329,11 @@ extension IlluminatoramaRenderer {
     /// tasks dispatched back-to-back. Lives BEFORE the shadow / G-buffer
     /// passes so downstream reads see fresh interleaved vertices.
     func encodeGPURepacks(_ cb: MTLCommandBuffer) {
-        guard !fxs.gpuRepackTasks.isEmpty else { return }
+        guard fxs.gpuRepackTasks.contains(where: { !$0.direct }) else { return }
         guard let enc = timedComputeEncoder(cb, "gpuMesh.repack") else { return }
         enc.label = "Illuminatorama.gpuMesh.repack"
         enc.setComputePipelineState(fxs.repackPosNormPipeline)
-        for task in fxs.gpuRepackTasks {
+        for task in fxs.gpuRepackTasks where !task.direct {
             var count = UInt32(task.vertexCount)
             enc.setBuffer(task.positionBuffer, offset: 0, index: 0)
             enc.setBuffer(task.normalBuffer,   offset: 0, index: 1)
@@ -371,14 +377,15 @@ extension IlluminatoramaRenderer {
     ///     prev): copies THIS frame's positions forward for next frame. Metal's
     ///     automatic hazard tracking serializes this blit after the pass's reads.
     func encodeGPUMeshPrevCapture(_ cb: MTLCommandBuffer, prime: Bool) {
-        let work = prime ? fxs.gpuRepackTasks.contains { !$0.primed }
-                         : !fxs.gpuRepackTasks.isEmpty
+        let work = prime ? fxs.gpuRepackTasks.contains { !$0.primed && !$0.direct }
+                         : fxs.gpuRepackTasks.contains { !$0.direct }
         guard work else { return }
         guard let blit = cb.makeBlitCommandEncoder() else { return }
         blit.label = prime ? "Illuminatorama.gpuMesh.mvPrime"
                            : "Illuminatorama.gpuMesh.mvCapture"
         for i in fxs.gpuRepackTasks.indices {
             if prime && fxs.gpuRepackTasks[i].primed { continue }
+            if fxs.gpuRepackTasks[i].direct { continue }
             let task = fxs.gpuRepackTasks[i]
             let bytes = Self.gpuMeshPrevStride * task.vertexCount
             guard bytes > 0,

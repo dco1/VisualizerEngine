@@ -43,6 +43,12 @@ public final class IlluminatoramaMesh {
     /// its back side to the camera and would otherwise render HOLLOW.
     public var doubleSided: Bool = false
 
+    /// When set, the mesh is drawn with an INDIRECT indexed draw whose arguments
+    /// (`MTLDrawIndexedPrimitivesIndirectArguments`) a compute kernel wrote this frame — the GPU
+    /// decides how many indices are drawn (view-culled, compacted geometry). Used by
+    /// `GrassTileField`; `instanceCount` in the arguments must match the single instance.
+    public var indirectDrawBuffer: MTLBuffer?
+
     /// Cast shadows from BOTH faces (shadow passes use cull `.none` instead of the
     /// default `.front`). Opt-in, default false — an unset mesh keeps the renderer's
     /// historical behaviour byte-for-byte.
@@ -357,5 +363,23 @@ public final class IlluminatoramaMesh {
         ]
         let indices: [UInt16] = [0, 2, 1, 0, 3, 2]
         return IlluminatoramaMesh(device: device, vertices: verts, indices: indices)
+    }
+}
+
+
+extension MTLRenderCommandEncoder {
+    /// Draw `mesh` for `instanceCount` instances — or, when the mesh carries a GPU-written
+    /// indirect argument buffer, with those arguments.
+    @MainActor func drawMesh(_ mesh: IlluminatoramaMesh, instanceCount: Int) {
+        if let args = mesh.indirectDrawBuffer {
+            drawIndexedPrimitives(type: .triangle, indexType: mesh.indexType,
+                                  indexBuffer: mesh.indexBuffer, indexBufferOffset: 0,
+                                  indirectBuffer: args, indirectBufferOffset: 0)
+        } else {
+            drawIndexedPrimitives(type: .triangle, indexCount: mesh.indexCount,
+                                  indexType: mesh.indexType, indexBuffer: mesh.indexBuffer,
+                                  indexBufferOffset: 0, instanceCount: instanceCount,
+                                  baseVertex: 0, baseInstance: 0)
+        }
     }
 }

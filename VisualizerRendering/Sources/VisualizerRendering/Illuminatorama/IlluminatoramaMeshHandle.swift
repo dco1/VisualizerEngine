@@ -155,6 +155,12 @@ public struct IlluminatoramaGPUMeshDescriptor {
     /// false. See `IlluminatoramaMesh.shadowCastsBothFaces` for why this is deliberately
     /// separate from `doubleSided`.
     public let shadowCastsBothFaces: Bool
+    /// DIRECT mode: a compute kernel writes finished `IlluminatoramaVertex` records (112 B) straight
+    /// into this buffer and the arguments of an indirect indexed draw into `indirectDrawBuffer`.
+    /// The renderer then skips the per-frame repack and the previous-position copy for this mesh
+    /// (position/normal buffers are ignored) and the draw covers only what the kernel kept.
+    public let directVertexBuffer: MTLBuffer?
+    public let indirectDrawBuffer: MTLBuffer?
 
     public init(positionBuffer: MTLBuffer,
                 normalBuffer: MTLBuffer,
@@ -172,7 +178,11 @@ public struct IlluminatoramaGPUMeshDescriptor {
                 colorBuffer: MTLBuffer? = nil,
                 colorStride: Int = 16,
                 doubleSided: Bool = false,
-                shadowCastsBothFaces: Bool = false) {
+                shadowCastsBothFaces: Bool = false,
+                directVertexBuffer: MTLBuffer? = nil,
+                indirectDrawBuffer: MTLBuffer? = nil) {
+        self.directVertexBuffer = directVertexBuffer
+        self.indirectDrawBuffer = indirectDrawBuffer
         self.colorBuffer = colorBuffer
         self.colorStride = colorStride
         self.doubleSided = doubleSided

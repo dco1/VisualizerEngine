@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include "IlluminatoramaCommon.h"
 using namespace metal;
 
 // ── GrassTiles.metal ──────────────────────────────────────────────────────────
@@ -33,8 +34,9 @@ struct GrassTileUniforms {
     uint4  ringInfo[8];    // per ring: x = W (cells per side), y = K (blades per cell)
     uint   ringCount;
     uint   segments;       // S: rows = S + 1
-    uint   pad0;
+    uint   capacity;       // blades the output buffers can hold (kept blades beyond it are dropped)
     uint   pad1;
+    float4 planes[4];      // inward-facing view planes through the camera: xyz = unit normal, w = offset
 };
 
 static inline uint gt_pcg(uint v) {
@@ -58,9 +60,8 @@ static inline float gt_vnoise(float2 p) {
 }
 
 kernel void grassTileGenerate(
-    device packed_float3*        verts   [[ buffer(0) ]],
-    device packed_float3*        normals [[ buffer(1) ]],
-    device float4*               colors  [[ buffer(2) ]],
+    device Vertex*               out     [[ buffer(0) ]],
+    device atomic_uint*          counter [[ buffer(1) ]],
     constant GrassTileUniforms&  u       [[ buffer(3) ]],
     texture2d<float>             mask    [[ texture(0) ]],
     texture2d<float>             ground  [[ texture(1) ]],   // r32Float surface Y over the same rect as the mask
@@ -124,19 +125,8 @@ kernel void grassTileGenerate(
     const bool keep = gt_h01(key ^ 0x5BD1E995u) < wIn * wOut * m;
 
     const uint rows = S + 1u;
-    const uint vBase = id * rows * 2u;
 
-    if (!keep) {
-        for (uint row = 0; row < rows; ++row) {
-            verts  [vBase + row * 2u]      = root;
-            verts  [vBase + row * 2u + 1u] = root;
-            normals[vBase + row * 2u]      = float3(0, 1, 0);
-            normals[vBase + row * 2u + 1u] = float3(0, 1, 0);
-            colors [vBase + row * 2u]      = float4(0);
-            colors [vBase + row * 2u + 1u] = float4(0);
-        }
-        return;
-    }
+    if (!keep) return;   // a culled slot costs nothing: it never claims output space
 
     // ── Blade parameters (clump-coherent) ──
     const float clump  = gt_vnoise(xz * 2.5f);
@@ -165,6 +155,23 @@ kernel void grassTileGenerate(
     const float3 P2 = root + float3(dir.x * lean * (1.0f + droop), 0.0f, dir.y * lean * (1.0f + droop)) + up * ((0.90f - 0.12f * droop) * hgt);
     const float3 viewDir = toCam / max(dist, 1e-5f);
 
+    // View cull: a blade outside the (slightly widened) view cone is never written, so it is neither
+    // transformed nor shaded by any pass. Blades right under the camera always stay (shadows, turning).
+    {
+        const float3 ctr = root + up * (0.5f * hgt);
+        const float rad  = hgt * 1.4f + sway + 0.05f;
+        bool vis = distH < 0.7f;
+        if (!vis) {
+            vis = true;
+            for (uint pi = 0u; pi < 4u; ++pi)
+                vis = vis && (dot(u.planes[pi].xyz, ctr) + u.planes[pi].w >= -rad);
+        }
+        if (!vis) return;
+    }
+    const uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
+    if (slot >= u.capacity) return;
+    const uint vBase = slot * rows * 2u;
+
     for (uint row = 0; row < rows; ++row) {
         // Rows are packed toward the TIP: with 3 rows the body is one long near-parallel segment and
         // the point is its own short one, so the silhouette is a blade (ribbon + point), not a cone.
@@ -189,8 +196,7 @@ kernel void grassTileGenerate(
         const float body = mix(0.85f, 1.0f, smoothstep(0.0f, 0.25f, t));
         const float tipT = smoothstep(0.55f, 1.0f, t);
         const float w = hw * body * (1.0f - 0.94f * tipT * tipT);
-        verts  [vBase + row * 2u]      = p - perp * w;
-        verts  [vBase + row * 2u + 1u] = p + perp * w;
+        const float3 pL = p - perp * w, pR = p + perp * w;
         // Fan the edge normals outward so a flat ribbon shades like a rounded blade (the
         // Tsushima/Horizon "rounded normal" trick) instead of a cardboard cut-out.
         const float fan = 0.35f;
@@ -203,8 +209,6 @@ kernel void grassTileGenerate(
         const float toUp = mix(0.20f, 0.60f, distT);
         const float3 nL = normalize(mix(normalize(nrm - perp * fan), up, toUp));
         const float3 nR = normalize(mix(normalize(nrm + perp * fan), up, toUp));
-        normals[vBase + row * 2u]      = nL;
-        normals[vBase + row * 2u + 1u] = nR;
 
         float3 col = (t < 0.5f) ? mix(u.rootC.xyz, u.midC.xyz, t * 2.0f)
                                 : mix(u.midC.xyz,  u.tipC.xyz, (t - 0.5f) * 2.0f);
@@ -219,7 +223,35 @@ kernel void grassTileGenerate(
         // tile's brightness so the field reads as one surface instead of dark flecks on a lighter plane.
         col *= mix(1.0f, 1.9f, smoothstep(3.0f, 30.0f, dist));
         // alpha 0 = the engine's foliage thin-sheet flag (same as the PBD ribbons).
-        colors[vBase + row * 2u]      = float4(col, u.misc.x);
-        colors[vBase + row * 2u + 1u] = float4(col, u.misc.x);
+        const float4 c4 = float4(col, u.misc.x);
+        Vertex vl, vr;
+        vl.position = pL; vl._padPos = 0.0f; vl.normal = nL; vl._padNrm = 0.0f;
+        vl.uv = float2(0.0f); vl._padUv = float2(0.0f);
+        vr = vl; vr.position = pR; vr.normal = nR;
+        // Arbitrary stable tangent, as the engine's repack kernel writes (grass samples no normal map).
+        float3 axL = abs(nL.y) < 0.99f ? float3(0, 1, 0) : float3(1, 0, 0);
+        float3 axR = abs(nR.y) < 0.99f ? float3(0, 1, 0) : float3(1, 0, 0);
+        vl.tangent = float4(normalize(cross(axL, nL)), 1.0f);
+        vr.tangent = float4(normalize(cross(axR, nR)), 1.0f);
+        vl.color = c4; vr.color = c4;
+        out[vBase + row * 2u]      = vl;
+        out[vBase + row * 2u + 1u] = vr;
     }
+}
+
+kernel void grassTileReset(device atomic_uint* counter [[ buffer(0) ]]) {
+    atomic_store_explicit(counter, 0u, memory_order_relaxed);
+}
+
+// Writes the indirect draw: indexCount = kept blades × indices per blade (clamped to capacity).
+kernel void grassTileFinalize(device atomic_uint* counter [[ buffer(0) ]],
+                              device uint*        args    [[ buffer(1) ]],
+                              constant uint2&     info    [[ buffer(2) ]])   // x = indices per blade, y = capacity
+{
+    const uint kept = min(atomic_load_explicit(counter, memory_order_relaxed), info.y);
+    args[0] = kept * info.x;   // indexCount
+    args[1] = 1u;              // instanceCount
+    args[2] = 0u;              // indexStart
+    args[3] = 0u;              // baseVertex
+    args[4] = 0u;              // baseInstance
 }

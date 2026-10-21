@@ -120,7 +120,7 @@ extension IlluminatoramaRenderer {
         // buffer so those groups can draw with the kUsePrevVerts pipeline. Built
         // once per pass (gpuRepackTasks is tiny — one entry per registered mesh).
         var prevPosByKind: [MeshKind: MTLBuffer] = [:]
-        for task in fxs.gpuRepackTasks { prevPosByKind[task.kind] = task.prevPositionBuffer }
+        for task in fxs.gpuRepackTasks where !task.direct { prevPosByKind[task.kind] = task.prevPositionBuffer }
         // Track which pipeline is bound to avoid redundant state switches when the
         // groups are all ordinary meshes (the common case).
         var prevVertsBound = false
@@ -184,16 +184,7 @@ extension IlluminatoramaRenderer {
             // Issue #65 — per-vertex previous positions for the deforming-mesh
             // motion vector. Only the kUsePrevVerts pipeline reads buffer(5).
             if let prevPos { enc.setVertexBuffer(prevPos, offset: 0, index: 5) }
-            enc.drawIndexedPrimitives(
-                type: .triangle,
-                indexCount: mesh.indexCount,
-                indexType: mesh.indexType,
-                indexBuffer: mesh.indexBuffer,
-                indexBufferOffset: 0,
-                instanceCount: group.count,
-                baseVertex: 0,
-                baseInstance: 0
-            )
+            enc.drawMesh(mesh, instanceCount: group.count)
         }
 
         // ── Perfect analytic superquadric impostors ───────────────────────────
@@ -220,16 +211,7 @@ extension IlluminatoramaRenderer {
                 enc.setFragmentBuffer(currentInstanceBuffer, offset: off, index: 2)
                 enc.setFragmentBuffer(previousInstanceBuffer, offset: off, index: 4)
                 enc.setFragmentBuffer(superquadricParamBuffer, offset: poff, index: 6)
-                enc.drawIndexedPrimitives(
-                    type: .triangle,
-                    indexCount: mesh.indexCount,
-                    indexType: mesh.indexType,
-                    indexBuffer: mesh.indexBuffer,
-                    indexBufferOffset: 0,
-                    instanceCount: group.count,
-                    baseVertex: 0,
-                    baseInstance: 0
-                )
+                enc.drawMesh(mesh, instanceCount: group.count)
             }
         }
         enc.endEncoding()
