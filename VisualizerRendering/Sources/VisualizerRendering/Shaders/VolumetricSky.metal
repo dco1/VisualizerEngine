@@ -467,8 +467,20 @@ inline float cumulusWeather(float2 xz, constant SkyUniforms &u,
     return saturate((a * 0.6f + b * 0.4f - 0.58f) * 5.0f);
 }
 
+// `hd` (0…2) = how much screen-resolution DETAIL to carve on top (the in-view pass only — the
+// dome passes 0, which the compiler folds away, so the dome kernels are unchanged): two more
+// octaves of the Worley-fbm detail channel at ~4.3× and ~12.7× the billow frequency (≈ 4 m and
+// ≈ 1.5 m per texel on the default 9 km body), rotated off the lattice so the tiles never line up.
+// They erode by REMAP (Schneider): a cloud's thin rim is eaten into wisps and curls, its dense
+// core keeps its mass. `hd` above 1 fades the finest octave in (a footprint the pixel resolves).
+inline float cumulusDensityHD(float3 pos, constant SkyUniforms &u,
+                              texture3d<float, access::sample> noiseVol, float hd);
 inline float cumulusDensity(float3 pos, constant SkyUniforms &u,
                             texture3d<float, access::sample> noiseVol) {
+    return cumulusDensityHD(pos, u, noiseVol, 0.0f);
+}
+inline float cumulusDensityHD(float3 pos, constant SkyUniforms &u,
+                              texture3d<float, access::sample> noiseVol, float hd) {
     float baseY = u.cloudSlab.x, topY = u.cloudSlab.y;
     float h = (pos.y - baseY) / max(topY - baseY, 1e-3f);
     if (h <= 0.0f || h >= 1.0f) return 0.0f;
@@ -495,17 +507,45 @@ inline float cumulusDensity(float3 pos, constant SkyUniforms &u,
     float body = noiseVol.sample(volSampler, float3(p.x, p.y * 2.0f, p.z) * sc).b;
     body = saturate((body - 0.45f) * 2.9f);   // measured span ~0.45–0.80 → 0–1
     float base = (body * grad - (1.0f - lc)) / max(lc, 1e-3f);
+    // hd ≤ −2: the CONE field — what a far light-march sample should see. A light march's long
+    // tail segments (hundreds of metres) each take ONE point sample, and a point sample of a
+    // thresholded field is a step: the cloud between a sample and the sun was "all there or not
+    // there", so its shadow landed as a hard-edged flat tone — posterization, and the dark "eye"
+    // holes. The cone field is the band-limited version a cone trace would read at that range:
+    // the threshold softened into a wide ramp, no billows, no core ramp.
+    if (hd <= -2.0f) return smoothstep(-0.12f, 0.45f, base) * mix(0.55f, 1.0f, saturate(h * 2.5f));
     if (base <= 0.0f) return 0.0f;
 
     // Billows: the detail channel (Worley fbm — wispy near the base, inverted into round
     // cauliflower lobes higher up) is SUBTRACTED from the thresholded body before the core
     // ramp, so it carves the silhouette itself rather than only thinning a soft rim.
     float3 dq = float3(p.x + 13.7f, p.y * 1.5f, p.z - 7.3f) * (sc * 3.7f);
-    float det = saturate((noiseVol.sample(volSampler, dq).a - 0.2f) * 1.8f);   // span ~0.2–0.75
+    // hd < 0: the LITE field for light-march / sky-probe taps that only need optical depth — the
+    // billow tap is replaced by its mean (one texture read fewer per sample).
+    float det = hd < 0.0f ? 0.45f
+              : saturate((noiseVol.sample(volSampler, dq).a - 0.2f) * 1.8f);   // span ~0.2–0.75
     float detMod = mix(det, 1.0f - det, saturate(h * 4.0f));
     float eros = saturate(u.cloudShape.z);
     float carved = base - detMod * eros * 0.32f;
     if (carved <= 0.0f) return 0.0f;
+    if (hd > 0.0f) {
+        // Rotated about Y (and tilted) so neither octave shares the body's lattice axes.
+        float3 q1 = float3(p.x * 0.866f - p.z * 0.5f, p.y * 1.3f, p.x * 0.5f + p.z * 0.866f)
+                  * (sc * 15.9f) + float3(0.31f, 0.17f, 0.73f);
+        float h1 = saturate((noiseVol.sample(volSampler, q1).a - 0.2f) * 1.8f);
+        float hf = h1;
+        if (hd > 1.0f) {
+            float3 q2 = float3(p.x * 0.34f + p.z * 0.94f, p.y * 1.1f, -p.x * 0.94f + p.z * 0.34f)
+                      * (sc * 47.0f) + float3(0.57f, 0.43f, 0.11f);
+            float h2 = saturate((noiseVol.sample(volSampler, q2).a - 0.2f) * 1.8f);
+            hf = mix(h1, h1 * 0.62f + h2 * 0.38f, saturate(hd - 1.0f));
+        }
+        // Wispy (Worley cells → threads) near the base, billowy (inverted → round lobes) above.
+        hf = mix(hf, 1.0f - hf, saturate(h * 3.0f));
+        float k = hf * 0.30f * saturate(hd) * mix(0.6f, 1.0f, eros);
+        carved = (carved - k) / max(1.0f - k, 1e-3f);
+        if (carved <= 0.0f) return 0.0f;
+    }
     // The body only just clears the threshold at a cloud's rim and by ~0.2–0.4 in its core;
     // ramp that to a SOLID core over a soft rim, or every cloud is a thin veil.
     // A heavy deck keeps a wide ramp so its body still varies (thick and thin patches,
@@ -2482,10 +2522,98 @@ inline float cumulusLightMarch(float3 pos, float3 L, float lightSteps,
     for (int i = 0; i < steps; ++i) {
         float3 sp = pos + L * (t0 + seg * 0.5f);
         if (sp.y > u.cloudSlab.y) break;
-        od += cumulusDensity(sp, u, noiseVol) * seg;
+        od += cumulusDensityHD(sp, u, noiseVol, i < 2 ? 0.0f : -2.0f) * seg;   // cone field for the tail
         t0 += seg; seg *= 1.85f;
     }
     return od * u.cloudShape.y * 0.4f;
+}
+
+// The in-view pass's light march: a SHORT first segment (metres, not 5 % of the slab) so the
+// lit/unlit terminator and the crevices between billows resolve at pixel scale — the dome's
+// 45 m first step sampled nothing inside the outer ~20 m of a cloud, so every surface within
+// that skin got the same light and a cloud read as broad flat tonal plateaus. The first two
+// samples see the same high-frequency detail the camera ray does (`hd`), so a wisp shades
+// like a wisp.
+inline float cumulusLightMarchFine(float3 pos, float3 L, int steps, float firstSeg, float growth,
+                                   float hd, float jit, constant SkyUniforms &u,
+                                   texture3d<float, access::sample> noiseVol) {
+    float seg = firstSeg, t0 = 0.0f, od = 0.0f;
+    for (int i = 0; i < steps; ++i) {
+        // Jittered within its segment (a fresh offset per sample and per accumulated frame): with
+        // the samples at FIXED distances, the geometric steps crossed a cloud boundary all at once
+        // as the camera sample moved, and the shadow terminator became a hard step between two
+        // flat tones — posterization. Jittered and accumulated, the steps integrate to a gradient.
+        // Only the first four (short) segments: they are the ones that cross a cloud's surface
+        // and draw the terminator; jittering the long tail over hundreds of metres only adds grain.
+        float3 sp = pos + L * (t0 + seg * (i < 4 ? fract(jit + float(i) * 0.6180339f) : 0.5f));
+        if (sp.y > u.cloudSlab.y) break;
+        od += cumulusDensityHD(sp, u, noiseVol, i == 0 ? hd : (i < 3 ? 0.0f : (i < 4 ? -1.0f : -2.0f))) * seg;
+        t0 += seg; seg *= growth;
+    }
+    return od * u.cloudShape.y * 0.4f;
+}
+
+// Multiple scattering for the cumulus deck (Wrenninge's octaves, as Hillaire uses them): each
+// octave sees the optical depth thinned by `a`, contributes `b` of the last and scatters more
+// isotropically (`c`). Four octaves with a = 0.3 let light reach well into the body — the
+// shadowed flank of a cumulus is a luminous grey with structure, not one flat value — and a
+// narrow forward lobe on the single-scattered term draws the SILVER LINING: the thin rim of a
+// cloud near the sun glows brighter than its body.
+inline float cumulusMS(float od, float cosT, float gF, float gB, float absK, float strength) {
+    float a = 1.0f, b = 1.0f, c = 1.0f, lum = 0.0f;
+    for (int o = 0; o < 4; ++o) {
+        float ph = hg(cosT, gF * c) + 0.5f * hg(cosT, gB * c);
+        lum += b * exp(-od * absK * a) * ph;
+        a *= 0.25f; b *= 0.6f * strength; c *= 0.45f;
+    }
+    return lum + 0.1f * exp(-od * absK) * hg(cosT, 0.88f);
+}
+
+// Everything that lights one cumulus sample (sun + moon + sky fill), shared by the dome and the
+// in-view pass so the two agree. `fine` = the in-view pass's short-step light march (with `hd`
+// detail); the dome keeps the coarse one its texels can resolve.
+struct CumulusLightIn {
+    float3 sunIrr; float3 sunL; float cosT; bool sunActive;
+    float3 moonL; float cosM; float phaseM; float moonGain; bool moonActive;
+    float3 ambCol; float ambient;
+    float gF, gB, absK, msStrength;
+};
+inline float3 cumulusSampleLight(float3 pos, thread const CumulusLightIn &L, float lightSteps,
+                                 bool fine, float hd, float jit, constant SkyUniforms &u,
+                                 texture3d<float, access::sample> noiseVol) {
+    float baseY = u.cloudSlab.x, thickness = max(u.cloudSlab.y - u.cloudSlab.x, 1e-3f);
+    float3 c = float3(0.0f);
+    if (L.sunActive) {
+        float od = fine ? cumulusLightMarchFine(pos, L.sunL, int(lightSteps), 6.0f, 2.05f, hd, jit, u, noiseVol)
+                        : cumulusLightMarch(pos, L.sunL, lightSteps, u, noiseVol);
+        float lit = cumulusMS(od, L.cosT, L.gF, L.gB, L.absK, max(L.msStrength, 0.0f));
+        c += L.sunIrr * lit;
+        // The diffusely transmitted share (two-stream: T ≈ 1 / (1 + 0.75·τ·(1 − g))) — why a
+        // cumulus base is luminous grey rather than black; only the part above the direct term.
+        float tau = od * L.absK;
+        float tdiff = max(1.0f / (1.0f + 0.11f * tau) - exp(-tau), 0.0f);
+        float covD = saturate(u.cloudShape.x);
+        c += L.sunIrr * (tdiff * max(-u.sunDir.y, 0.0f) * 0.30f * mix(0.12f, 1.0f, covD * covD * covD));
+    }
+    if (L.moonActive) {
+        float odM = fine ? cumulusLightMarchFine(pos, L.moonL, int(lightSteps), 6.0f, 2.05f, 0.0f, jit, u, noiseVol)
+                         : cumulusLightMarch(pos, L.moonL, lightSteps, u, noiseVol);
+        float lit = (L.msStrength > 0.0f) ? cumulusMS(odM, L.cosM, L.gF, L.gB, L.absK, L.msStrength)
+                                          : exp(-odM * L.absK) * L.phaseM;
+        c += float3(0.62f, 0.70f, 0.92f) * L.moonGain * lit;
+    }
+    // Sky fill: reaches a cloud's crown and barely its base, AND is shadowed by the cloud above
+    // the sample — a two-tap probe straight up. The height ramp alone lit every flank of a
+    // cloud with one value (the flat grey interiors); the probe puts the folds between billows
+    // in their own shade and leaves the exposed crowns bright.
+    float hh = saturate((pos.y - baseY) / thickness);
+    float up = fine
+        ? cumulusDensityHD(pos + float3(0.0f, 0.06f * thickness, 0.0f), u, noiseVol, -1.0f) * (0.14f * thickness)
+        : cumulusDensity(pos + float3(0.0f, 0.035f * thickness, 0.0f), u, noiseVol) * (0.035f * thickness)
+          + cumulusDensity(pos + float3(0.0f, 0.14f * thickness, 0.0f), u, noiseVol) * (0.105f * thickness);
+    float vis = exp(-up * u.cloudShape.y * 0.4f * L.absK * 0.35f);
+    c += L.ambCol * L.ambient * mix(0.45f, 1.2f, hh * hh * (3.0f - 2.0f * hh)) * mix(0.3f, 1.0f, vis);
+    return c;
 }
 
 // Optical depth from a march position TOWARD a finite point light (a burst /
@@ -2845,69 +2973,81 @@ inline void volSkyRenderImpl(texture2d<float, access::write>  outTex,
         }
 
         if (density > (cumulus ? 1e-6f : 0.001f)) {
-            // Powder — darken the lit side of dense regions so the cumulus
-            // silhouette pops against the sky (Schneider).
-            float powder = 1.0f - exp(-density * 2.0f * (1.0f + powd * 4.0f));
-            // Cumulus: `density` is an extinction per METRE there, so the legacy formula would
-            // darken every sample by ~70 %. And no powder at all: on a sky backdrop it darkens
-            // exactly the thin rim, which then reads as a dark OUTLINE against the blue. The
-            // light march already shades the body.
-            if (cumulus) powder = 1.0f;
+            float3 sunContrib = float3(0.0f), moonContrib = float3(0.0f), ambientContrib = float3(0.0f);
+            if (kCumulus) {
+                // Shared with the in-view pass (`cumulusSampleLight`) so the two agree.
+                CumulusLightIn li;
+                li.sunIrr = sunIrr; li.sunL = -u.sunDir.xyz; li.cosT = cosT; li.sunActive = sunActive;
+                li.moonL = moonL; li.cosM = cosM; li.phaseM = phaseM; li.moonGain = moonGain;
+                li.moonActive = moonActive;
+                float  ambGreyC = clamp(u.skyZenith.w, 0.0f, 1.0f);
+                float  ambLumC  = dot(ambBase, float3(0.2126f, 0.7152f, 0.0722f));
+                li.ambCol = mix(ambBase, float3(ambLumC), ambGreyC); li.ambient = ambient;
+                li.gF = gF; li.gB = gB; li.absK = absK; li.msStrength = msStrength;
+                sunContrib = cumulusSampleLight(pos, li, lightSteps, false, 0.0f, 0.5f, u, noiseVol);
+            } else {
+                // Powder — darken the lit side of dense regions so the cumulus
+                // silhouette pops against the sky (Schneider).
+                float powder = 1.0f - exp(-density * 2.0f * (1.0f + powd * 4.0f));
+                // Cumulus: `density` is an extinction per METRE there, so the legacy formula would
+                // darken every sample by ~70 %. And no powder at all: on a sky backdrop it darkens
+                // exactly the thin rim, which then reads as a dark OUTLINE against the blue. The
+                // light march already shades the body.
+                if (cumulus) powder = 1.0f;
 
-            // Sun directional (daytime decks only).
-            float3 sunContrib = float3(0.0f);
-            if (sunActive) {
-                float od = (kCumulus ? cumulusLightMarch(pos, -u.sunDir.xyz, lightSteps, u, noiseVol)
-                                     : lightMarch(pos, -u.sunDir.xyz, lightSteps, u, noiseVol));
-                float lit = (msStrength > 0.0f)
-                    ? msLight(od, cosT, gF, gB, absK, msStrength)
-                    : exp(-od * absK) * phase;
-                sunContrib = sunIrr * lit * powder;
-                // Cumulus: the DIFFUSELY transmitted share. Deep in a thick cloud the
-                // directly-attenuated sun is ~0, but light that has scattered many times still
-                // arrives — and falls off as a power law, not exponentially (two-stream:
-                // T ≈ 1 / (1 + 0.75·τ·(1 − g))). It is why a cumulus base is luminous grey
-                // rather than black and why an overcast deck is bright. Only the part ABOVE
-                // the direct term, so thin cloud is not counted twice.
-                if (cumulus) {
-                    float tau = od * absK;
-                    float tdiff = max(1.0f / (1.0f + 0.11f * tau) - exp(-tau), 0.0f);
-                    // A lone cumulus leaks its diffuse light out of its sides; only a deck that
-                    // covers the sky keeps it (and only then is the base this bright).
-                    float covD = saturate(u.cloudShape.x);
-                    sunContrib += sunIrr * (tdiff * max(-u.sunDir.y, 0.0f) * 0.30f
-                                            * mix(0.12f, 1.0f, covD * covD * covD));
+                // Sun directional (daytime decks only).
+                if (sunActive) {
+                    float od = (kCumulus ? cumulusLightMarch(pos, -u.sunDir.xyz, lightSteps, u, noiseVol)
+                                         : lightMarch(pos, -u.sunDir.xyz, lightSteps, u, noiseVol));
+                    float lit = (msStrength > 0.0f)
+                        ? msLight(od, cosT, gF, gB, absK, msStrength)
+                        : exp(-od * absK) * phase;
+                    sunContrib = sunIrr * lit * powder;
+                    // Cumulus: the DIFFUSELY transmitted share. Deep in a thick cloud the
+                    // directly-attenuated sun is ~0, but light that has scattered many times still
+                    // arrives — and falls off as a power law, not exponentially (two-stream:
+                    // T ≈ 1 / (1 + 0.75·τ·(1 − g))). It is why a cumulus base is luminous grey
+                    // rather than black and why an overcast deck is bright. Only the part ABOVE
+                    // the direct term, so thin cloud is not counted twice.
+                    if (cumulus) {
+                        float tau = od * absK;
+                        float tdiff = max(1.0f / (1.0f + 0.11f * tau) - exp(-tau), 0.0f);
+                        // A lone cumulus leaks its diffuse light out of its sides; only a deck that
+                        // covers the sky keeps it (and only then is the base this bright).
+                        float covD = saturate(u.cloudShape.x);
+                        sunContrib += sunIrr * (tdiff * max(-u.sunDir.y, 0.0f) * 0.30f
+                                                * mix(0.12f, 1.0f, covD * covD * covD));
+                    }
                 }
-            }
 
-            // Moon directional (night decks) — gives the deck its form.
-            float3 moonContrib = float3(0.0f);
-            if (moonActive) {
-                float odM = (kCumulus ? cumulusLightMarch(pos, moonL, lightSteps, u, noiseVol)
-                                      : lightMarch(pos, moonL, lightSteps, u, noiseVol));
-                // Multi-scatter lets the moonlit crowns bleed a soft glow down
-                // into the bank instead of terminating at the lit surface.
-                float lit = (msStrength > 0.0f)
-                    ? msLight(odM, cosM, gF, gB, absK, msStrength)
-                    : exp(-odM * absK) * phaseM;
-                moonContrib = kMoonTint * moonGain * lit * powder;
-            }
+                // Moon directional (night decks) — gives the deck its form.
+                if (moonActive) {
+                    float odM = (kCumulus ? cumulusLightMarch(pos, moonL, lightSteps, u, noiseVol)
+                                          : lightMarch(pos, moonL, lightSteps, u, noiseVol));
+                    // Multi-scatter lets the moonlit crowns bleed a soft glow down
+                    // into the bank instead of terminating at the lit surface.
+                    float lit = (msStrength > 0.0f)
+                        ? msLight(odM, cosM, gF, gB, absK, msStrength)
+                        : exp(-odM * absK) * phaseM;
+                    moonContrib = kMoonTint * moonGain * lit * powder;
+                }
 
-            // Cloud underside ambient fill. skyZenith is a saturated daytime
-            // BLUE, so a thick opaque deck lit only by this reads as "deeper
-            // blue sky" from below, not overcast. skyZenith.w (cloudAmbientGrey)
-            // desaturates the fill toward a luminance-preserving neutral grey so
-            // an overcast deck reads grey (DH-0585); 0 = the legacy blue fill.
-            float  ambGrey = clamp(u.skyZenith.w, 0.0f, 1.0f);
-            float  ambLum  = dot(ambBase, float3(0.2126f, 0.7152f, 0.0722f));
-            float3 ambCol  = mix(ambBase, float3(ambLum), ambGrey);
-            float3 ambientContrib = ambCol * ambient;
-            // Cumulus: sky light reaches a cloud's crown and barely its base — darker,
-            // greyer undersides and bright tops are most of what reads as VOLUME. Scaled by
-            // how deep the sample sits below the top of the slab.
-            if (cumulus) {
-                float hh = saturate((pos.y - baseY) / max(thickness, 1e-3f));
-                ambientContrib *= mix(0.35f, 1.25f, hh * hh * (3.0f - 2.0f * hh));
+                // Cloud underside ambient fill. skyZenith is a saturated daytime
+                // BLUE, so a thick opaque deck lit only by this reads as "deeper
+                // blue sky" from below, not overcast. skyZenith.w (cloudAmbientGrey)
+                // desaturates the fill toward a luminance-preserving neutral grey so
+                // an overcast deck reads grey (DH-0585); 0 = the legacy blue fill.
+                float  ambGrey = clamp(u.skyZenith.w, 0.0f, 1.0f);
+                float  ambLum  = dot(ambBase, float3(0.2126f, 0.7152f, 0.0722f));
+                float3 ambCol  = mix(ambBase, float3(ambLum), ambGrey);
+                ambientContrib = ambCol * ambient;
+                // Cumulus: sky light reaches a cloud's crown and barely its base — darker,
+                // greyer undersides and bright tops are most of what reads as VOLUME. Scaled by
+                // how deep the sample sits below the top of the slab.
+                if (cumulus) {
+                    float hh = saturate((pos.y - baseY) / max(thickness, 1e-3f));
+                    ambientContrib *= mix(0.35f, 1.25f, hh * hh * (3.0f - 2.0f * hh));
+                }
             }
 
             // Fireworks: single-scattered radiance from the ray's culled
@@ -3522,4 +3662,267 @@ kernel void illumi_cloud_upsample(
         }
     }
     outTex.write(float4(col, 1.0f), gid);
+}
+
+// ── Cumulus in-view pass — screen-resolution clouds, ACCUMULATED (DH-0578) ──────────────────────
+//
+// The dome bakes the cumulus deck into a 2048×1024 equirect: one texel is ~0.18°, five or six
+// pixels of a hero frame, so a close cloud is a magnified, blurred texture with no detail finer
+// than ~40 m and a light march too coarse to shade its folds. This pass marches the SAME deck
+// along each pixel's own ray, with high-frequency detail erosion (`cumulusDensityHD`) and the
+// fine light march — but amortised, because a full-screen 128-step march every orbit frame is
+// far over budget:
+//
+//   • it runs only while the camera AND the sky are still (the host-side key; any change resets);
+//   • it marches into an accumulator at 1/s of the canvas resolution (s = 1 or 2), and each frame
+//     only ONE cell of an n×n interleave of it (1/16 at n = 4), with a fresh sub-texel + step
+//     jitter, adding into a float sum;
+//   • after `maxSamples` per texel it stops marching altogether — a converged sky costs one cheap
+//     resolve per frame (`illumi_cumulus_inview_resolve`).
+//
+// What it accumulates is a DELTA: (the marched twin of the dome texel — atmosphere × T + cloud,
+// the dome's soft Reinhard, horizon fade and aerial perspective) − (the dome's own cubic sample
+// along the same ray). The resolve ADDS the mean delta to the sky pixel the lighting pass shaded
+// from the dome, so every other term on that pixel (analytic stars and moon, god rays) stays put,
+// and the resolve never samples the dome itself.
+
+struct CumulusInViewUniforms {
+    float4x4 invViewProjection;  // this frame's clip → world
+    float4   cameraWorldPos;     // xyz = eye; w = one CANVAS pixel's angle (rad) — detail LOD
+    uint4    grid;               // x = interleave n, y/z = this frame's cell offset, w = sample index
+    uint4    canvas;             // x = accumulator scale s, y = dome sampled cubic (1) / bilinear (0),
+                                 // zw = canvas size (px)
+    float4   quality;            // x = detail (0…2), y = march steps, z = light steps, w = MS LUT bound
+    uint4    samples;            // x = samples per texel the host will accumulate (the strata count)
+};
+
+inline float cumulusHash(uint2 p, uint s) {
+    uint h = p.x * 1973u + p.y * 9277u + s * 26699u;
+    h = (h ^ (h >> 13u)) * 0x5bd1e995u;
+    h ^= h >> 15u;
+    return float(h & 0x00ffffffu) / 16777216.0f;
+}
+
+// The deferred lighting pass's dome sample, reproduced (VolumetricSky.metal can't include
+// IlluminatoramaCommon.h): the same equirect convention as `dirToEquirectUV`, and the cubic
+// B-spline `sampleSkyEquirectCubic` / the bilinear `sampleSkyEquirect4`.
+inline float3 cumulusDomeSample(texture2d<float, access::sample> sky, float3 dir, bool cubic) {
+    constexpr sampler s(filter::linear, s_address::repeat, t_address::clamp_to_edge);
+    float uu = atan2(dir.z, dir.x) * (0.5f / M_PI_F);
+    if (uu < 0.0f) uu += 1.0f;
+    float2 uv = float2(uu, 0.5f - asin(clamp(dir.y, -1.0f, 1.0f)) / M_PI_F);
+    if (!cubic) return sky.sample(s, uv).rgb;
+    float2 size = float2(sky.get_width(), sky.get_height());
+    float2 p = uv * size - 0.5f;
+    float2 i = floor(p), f = p - i, g = 1.0f - f;
+    float2 w0 = g * g * g / 6.0f;
+    float2 w1 = (4.0f - 6.0f * f * f + 3.0f * f * f * f) / 6.0f;
+    float2 w2 = (1.0f + 3.0f * f + 3.0f * f * f - 3.0f * f * f * f) / 6.0f;
+    float2 w3 = f * f * f / 6.0f;
+    float2 w12 = w1 + w2;
+    float2 t0 = (i - 0.5f) / size, t3 = (i + 2.5f) / size, t12 = (i + 0.5f + w2 / w12) / size;
+    float3 r = float3(0.0f);
+    r += sky.sample(s, float2(t0.x,  t0.y)).rgb  * (w0.x  * w0.y);
+    r += sky.sample(s, float2(t12.x, t0.y)).rgb  * (w12.x * w0.y);
+    r += sky.sample(s, float2(t3.x,  t0.y)).rgb  * (w3.x  * w0.y);
+    r += sky.sample(s, float2(t0.x,  t12.y)).rgb * (w0.x  * w12.y);
+    r += sky.sample(s, float2(t12.x, t12.y)).rgb * (w12.x * w12.y);
+    r += sky.sample(s, float2(t3.x,  t12.y)).rgb * (w3.x  * w12.y);
+    r += sky.sample(s, float2(t0.x,  t3.y)).rgb  * (w0.x  * w3.y);
+    r += sky.sample(s, float2(t12.x, t3.y)).rgb  * (w12.x * w3.y);
+    r += sky.sample(s, float2(t3.x,  t3.y)).rgb  * (w3.x  * w3.y);
+    return r;
+}
+
+template <bool kMS, typename M>
+inline void illumiCumulusInViewImpl(texture2d<float, access::read_write> accum,
+                                    texture3d<float, access::sample>     noiseVol,
+                                    depth2d<float,   access::read>       gDepth,
+                                    texture2d<float, access::sample>     dome,
+                                    constant SkyUniforms &u,
+                                    constant CumulusInViewUniforms &cv,
+                                    device const float4* skyLUT,
+                                    uint2 gid, M m) {
+    uint AW = accum.get_width(), AH = accum.get_height();
+    uint n = max(1u, cv.grid.x);
+    uint2 t = gid * n + uint2(cv.grid.y, cv.grid.z);
+    if (t.x >= AW || t.y >= AH) return;
+    uint sc = max(1u, cv.canvas.x);
+    uint2 dmax = uint2(gDepth.get_width() - 1, gDepth.get_height() - 1);
+    // An s×s block of the canvas marches if ANY of it is sky (the resolve only ever adds the
+    // delta to sky pixels, so a mixed block just feeds its sky pixels).
+    bool anySky = false;
+    for (uint dy = 0u; dy < sc && !anySky; ++dy)
+        for (uint dx = 0u; dx < sc && !anySky; ++dx)
+            anySky = gDepth.read(min(t * sc + uint2(dx, dy), dmax)) >= 0.99999f;
+    if (!anySky) return;
+
+    uint sIdx = cv.grid.w;
+    // Sub-texel jitter (R2 sequence, scrambled per texel) — the accumulator anti-aliases.
+    float2 j = fract(float2(0.7548777f, 0.5698403f) * float(sIdx + 1u)
+                     + float2(cumulusHash(t, 7u), cumulusHash(t, 11u))) - 0.5f;
+    float2 canvas = float2(cv.canvas.zw);
+    float2 uv = (float2(t) + 0.5f + j) * float(sc) / canvas;
+    float4 wp = cv.invViewProjection * float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 1.0f, 1.0f);
+    float3 ro = cv.cameraWorldPos.xyz;
+    float3 rayDir = normalize(wp.xyz / wp.w - ro);
+    bool lut = kMS && cv.quality.w > 0.5f;
+
+    float3 sky = (u.atmosphereParams.x > 0.5f)
+        ? nishitaAtmosphereColor(rayDir, u, skyLUT, lut, m)
+        : atmosphereColor(rayDir, u) + (rayDir.y >= 0.0f ? nightSkyGlow(rayDir, u, m) : float3(0.0f));
+    sky += sunDisk(rayDir, u);
+    sky = applyCirrus(sky, u.cameraPos.xyz, rayDir, u.lavaA.y, u, noiseVol, u.cirrusC.x, skyLUT, lut);
+
+    float yCos = rayDir.y;
+    float baseY = u.cloudSlab.x, topY = u.cloudSlab.y;
+    float3 col = sky;
+    float tEnter = 0.0f, tExit = -1.0f;
+    if (ro.y < baseY) {
+        if (yCos >= 0.01f) { tEnter = (baseY - ro.y) / yCos; tExit = (topY - ro.y) / yCos; }
+    } else if (ro.y <= topY) {
+        tEnter = 0.0f;
+        tExit = yCos > 0.001f ? (topY - ro.y) / yCos
+              : (yCos < -0.001f ? (baseY - ro.y) / yCos : (topY - baseY) * 4.0f);
+    } else if (yCos <= -0.01f) {
+        tEnter = (topY - ro.y) / yCos; tExit = (baseY - ro.y) / yCos;
+    }
+    tEnter = max(tEnter, 0.0f);
+    if (tExit > tEnter) {
+        float thickness = topY - baseY;
+        int   steps = max(8, int(cv.quality.y));
+        float marchLen = min(tExit - tEnter, thickness * 4.0f);
+        float dt = marchLen / float(steps);
+        float tEnd = tEnter + marchLen;
+        // A fresh step offset every sample: the accumulator integrates away the step banding the
+        // dome avoids only by not jittering at all.
+        // The step offset and the light-march offset are STRATIFIED across the accumulated samples
+        // (sample k of N lands at random inside stratum k, per texel) rather than white noise per
+        // texel: N white-noise samples leave grain an 8-sample still can't average away, while N
+        // strata turn a hard shading step into an N-level gradient with almost no grain.
+        float strata = float(max(1u, cv.samples.x));
+        float tc = tEnter + dt * fract((float(sIdx) + cumulusHash(t, 5u + sIdx * 13u)) / strata);
+
+        float gF = u.lighting.x, gB = u.lighting.y;
+        float absK = max(0.05f, u.lighting.z);
+        float densityScale = u.cloudShape.y;
+        bool   physLit = u.skyGrade.z > 0.5f;
+        float3 sunIrr  = physLit ? u.cloudLitSun.xyz : u.sunColor.xyz * u.sunColor.w;
+        float3 ambBase = physLit ? u.cloudLitAmbient.xyz : u.skyZenith.xyz;
+        CumulusLightIn li;
+        li.sunIrr = sunIrr; li.sunL = -u.sunDir.xyz;
+        li.cosT = clamp(dot(rayDir, -u.sunDir.xyz), -1.0f, 1.0f);
+        li.sunActive = (sunIrr.x + sunIrr.y + sunIrr.z) > 1e-3f;
+        li.moonL = normalize(u.moonParams.xyz);
+        li.cosM = clamp(dot(rayDir, li.moonL), -1.0f, 1.0f);
+        li.phaseM = mix(hg(li.cosM, gF) + 0.5f * hg(li.cosM, gB), 0.5f, 0.25f);
+        li.moonGain = u.atmosphereParams.w; li.moonActive = li.moonGain > 1e-3f;
+        float ambGrey = clamp(u.skyZenith.w, 0.0f, 1.0f);
+        li.ambCol = mix(ambBase, float3(dot(ambBase, float3(0.2126f, 0.7152f, 0.0722f))), ambGrey);
+        li.ambient = u.cloudShape.w;
+        li.gF = gF; li.gB = gB; li.absK = absK; li.msStrength = u.cloudExtra2.x;
+        float lightSteps = cv.quality.z;
+        float detail = cv.quality.x;
+        float pixAng = max(cv.cameraWorldPos.w, 1e-6f) * float(sc);
+
+        float3 lum = float3(0.0f);
+        float trans = 1.0f, hitDist = 0.0f, hitW = 0.0f;
+        // Empty-space skipping: stride 3·dt through clear air; on the first hit step back and
+        // walk the cloud at dt, returning to the long stride after 6 empty samples.
+        int empty = 6;
+        float lj = fract((float(sIdx) + cumulusHash(t, 3u + sIdx * 17u)) / strata + 0.37f);
+        for (int i = 0; i < steps * 2 && tc < tEnd; ++i) {
+            if (trans < 0.03f) break;
+            float3 pos = ro + rayDir * tc;
+            float foot = tc * pixAng;
+            // Detail LOD by footprint: the ~4 m octave while a texel spans < ~6 m, the ~1.5 m one
+            // while it spans < ~2 m — finer than the texel only aliases.
+            float hd = detail * (saturate(2.0f - foot / 6.0f) + saturate(2.0f - foot / 2.0f)) * 0.5f;
+            float density = cumulusDensityHD(pos, u, noiseVol, hd) * densityScale;
+            if (u.cloudField.w > 0.0f)
+                density *= 1.0f - smoothstep(u.cloudField.z, u.cloudField.w, length(pos.xz - u.cloudField.xy));
+            if (density > 1e-6f) {
+                if (empty >= 6 && i > 0) {       // entered from a long stride: back up, walk fine
+                    tc = max(tEnter, tc - 2.0f * dt);
+                    empty = 0;
+                    continue;
+                }
+                empty = 0;
+                float3 L = cumulusSampleLight(pos, li, lightSteps, true, min(hd, 1.0f),
+                                              fract(lj + float(i) * 0.7548777f), u, noiseVol);
+                float stepTrans = exp(-density * dt * absK * 0.4f);
+                float wgt = trans * (1.0f - stepTrans);
+                hitDist += wgt * tc; hitW += wgt;
+                lum += trans * L * (1.0f - stepTrans);
+                trans *= stepTrans;
+            } else {
+                empty = min(empty + 1, 6);
+            }
+            tc += (empty >= 6) ? 3.0f * dt : dt;
+        }
+        if (hitW > 1e-4f) {
+            float haze = 1.0f - exp(-(hitDist / hitW) / max(baseY * 12.0f, 1.0f));
+            float3 hazeCol = mix(sky, float3(dot(sky, float3(0.2126f, 0.7152f, 0.0722f))),
+                                 clamp(u.skyZenith.w, 0.0f, 1.0f));
+            lum = mix(lum, hazeCol * (1.0f - trans), haze);
+        }
+        float fadeLo = u.cloudExtra2.z > 0.0f ? u.cloudExtra2.z : 0.02f;
+        float fadeHi = u.cloudExtra2.w > 0.0f ? u.cloudExtra2.w : 0.22f;
+        float blend = smoothstep(fadeLo, fadeHi, abs(yCos));
+        col = sky * mix(1.0f, trans, blend) + lum * blend;
+    }
+    col = col / (1.0f + col * 0.10f);   // the dome's soft Reinhard, so the two are twins
+    float3 delta = col - cumulusDomeSample(dome, rayDir, cv.canvas.y > 0u);
+    accum.write(accum.read(t) + float4(delta, 1.0f), t);
+}
+
+#define CUMULUS_INVIEW_KERNEL(NAME, MS, MEDIUM)                                                  \
+kernel void NAME(texture2d<float, access::read_write> accum   [[texture(0)]],                  \
+                 texture3d<float, access::sample> noiseVol    [[texture(1)]],                  \
+                 depth2d<float,   access::read>   gDepth      [[texture(2)]],                  \
+                 texture2d<float, access::sample> dome        [[texture(3)]],                  \
+                 constant SkyUniforms &u                      [[buffer(0)]],                   \
+                 constant CumulusInViewUniforms &cv           [[buffer(1)]],                   \
+                 device const float4* skyLUT                  [[buffer(2)]],                   \
+                 uint2 gid                                    [[thread_position_in_grid]]) {   \
+    illumiCumulusInViewImpl<MS>(accum, noiseVol, gDepth, dome, u, cv, skyLUT, gid, MEDIUM);      \
+}
+CUMULUS_INVIEW_KERNEL(illumi_cumulus_inview, false, NishitaMieBuiltin())
+CUMULUS_INVIEW_KERNEL(illumi_cumulus_inview_ms, true, NishitaMieBuiltin())
+CUMULUS_INVIEW_KERNEL(illumi_cumulus_inview_aerosol, false, NishitaMieAerosol(u.aerosolA, u.aerosolB))
+CUMULUS_INVIEW_KERNEL(illumi_cumulus_inview_ms_aerosol, true, NishitaMieAerosol(u.aerosolA, u.aerosolB))
+
+// The resolve: ADD the accumulated mean delta to every sky pixel, bilinear over the accumulator
+// (texels with no samples carry no weight, so a silhouette never pulls in unmarched texels; a
+// pixel with none at all keeps the dome). Runs only once every texel has a sample (the host
+// waits a full interleave cycle), so the canvas switches from the dome to the march at once
+// rather than through a half-filled sparkle.
+kernel void illumi_cumulus_inview_resolve(
+    texture2d<float, access::read_write> hdr     [[texture(0)]],
+    texture2d<float, access::read>       accum   [[texture(1)]],
+    depth2d<float,   access::read>       gDepth  [[texture(2)]],
+    constant uint4 &cfg                          [[buffer(0)]],   // x = accumulator scale s
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    if (gid.x >= hdr.get_width() || gid.y >= hdr.get_height()) return;
+    if (gDepth.read(gid) < 0.99999f) return;
+    float sc = float(max(1u, cfg.x));
+    int2 amax = int2(accum.get_width() - 1, accum.get_height() - 1);
+    float2 p = (float2(gid) + 0.5f) / sc - 0.5f;
+    int2 p0 = int2(floor(p));
+    float2 f = p - float2(p0);
+    float3 acc = float3(0.0f);
+    float wsum = 0.0f;
+    for (int jy = 0; jy < 2; ++jy) {
+        for (int jx = 0; jx < 2; ++jx) {
+            float4 a = accum.read(uint2(clamp(p0 + int2(jx, jy), int2(0), amax)));
+            if (a.w < 0.5f) continue;
+            float w = (jx == 0 ? 1.0f - f.x : f.x) * (jy == 0 ? 1.0f - f.y : f.y);
+            acc += (a.rgb / a.w) * w;
+            wsum += w;
+        }
+    }
+    if (wsum <= 1e-5f) return;
+    float4 c = hdr.read(gid);
+    hdr.write(float4(max(c.rgb + acc / wsum, float3(0.0f)), c.a), gid);
 }

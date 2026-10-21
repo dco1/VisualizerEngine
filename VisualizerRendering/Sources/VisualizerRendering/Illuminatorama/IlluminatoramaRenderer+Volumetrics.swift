@@ -290,6 +290,7 @@ extension IlluminatoramaRenderer {
     /// v1 REPLACES sky pixels (the only opt-in scene has no opaque geometry); a
     /// depth-clipped composite-over-geometry generalisation is future work.
     func encodeCloudPass(_ cb: MTLCommandBuffer) {
+        encodeCumulusInViewPass(cb)
         guard inViewCloudsEnabled,
               let pipeline = vols.cloudInViewPipeline,
               let noise = cloudNoiseTexture,

@@ -3129,6 +3129,26 @@ public final class IlluminatoramaRenderer {
     /// composites crisp camera-ray clouds into the HDR target (issue #61). OFF
     /// by default → every scene + the dome/IBL path is byte-identical.
     public var inViewCloudsEnabled = false
+    /// DH-0578 — the ACCUMULATED screen-resolution cumulus pass (`encodeCumulusInViewPass`): a
+    /// `.cumulus` deck marched along each pixel's own ray with detail erosion and a fine light
+    /// march, one interleave cell per frame while camera and sky are still, swapped in for the
+    /// dome's sample once every pixel has one. Needs the same three handles as the legacy pass
+    /// (`cloudNoiseTexture` / `cloudSkyUniforms`; `cloudBurstLights` unused) plus `equirectSky`.
+    /// OFF by default → byte-identical.
+    public var cumulusInViewEnabled = false
+    /// Accumulator resolution divisor (1 = canvas resolution, 2 = half — a quarter of the rays,
+    /// bilinear-resolved; at the photo lane's 2× supersample, 2 is still OUTPUT resolution).
+    public var cumulusInViewScale = 2
+    /// n of the n×n interleave (1, 2 or 4): each frame marches 1/n² of the accumulator.
+    public var cumulusInViewInterleave = 4
+    /// Samples per pixel after which marching stops (the converged sky costs only the resolve).
+    public var cumulusInViewMaxSamples = 4
+    /// Camera-ray steps through the slab, and sun light-march steps per dense sample.
+    public var cumulusInViewSteps = 128
+    public var cumulusInViewLightSteps = 7
+    /// High-frequency detail erosion (0 = the dome's field, 1 = the ~4 m octave, 2 = + ~1.5 m).
+    public var cumulusInViewDetail: Float = 2
+    let cumulusInView = CumulusInViewState()
     /// The clock the in-view sky animates by (the lava lamp's wax, the cirrus threads' flow) —
     /// `nil` (the default) = `time`, byte-identical. A host that lets those speeds change live
     /// passes its own INTEGRATED phase (Σ speed·dt) and sets the sky's speed factors to 1: the
