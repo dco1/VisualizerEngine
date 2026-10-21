@@ -25,18 +25,18 @@ public final class GrassTileField {
         /// Near rings are dense; far rings use a smaller window — their cells are metres wide, so a
         /// 40-cell window still reaches tens of metres. Reach with the defaults ≈ 59 m.
         public var rings: [Ring] = [Ring(window: 64, bladesPerCell: 20), Ring(window: 64, bladesPerCell: 20),
-                                    Ring(window: 64, bladesPerCell: 20), Ring(window: 48, bladesPerCell: 16),
-                                    Ring(window: 48, bladesPerCell: 16), Ring(window: 40, bladesPerCell: 14),
-                                    Ring(window: 40, bladesPerCell: 14), Ring(window: 40, bladesPerCell: 14)]
+                                    Ring(window: 64, bladesPerCell: 22), Ring(window: 48, bladesPerCell: 32),
+                                    Ring(window: 48, bladesPerCell: 30), Ring(window: 40, bladesPerCell: 28),
+                                    Ring(window: 40, bladesPerCell: 26), Ring(window: 40, bladesPerCell: 24)]
         /// Ribbon segments per blade (rows = segments + 1).
         public var segments: Int = 2
         /// Ring-0 cell size (m); ring r uses `baseCellSize · 2^r`.
         public var baseCellSize: Float = 0.04
-        public var baseHalfWidth: Float = 0.0035
+        public var baseHalfWidth: Float = 0.0026
         public var heightMin: Float = 0.035
         public var heightRange: Float = 0.035
         /// Half-width multiplier per ring — what keeps the far field's mass as density falls.
-        public var widenPerRing: Float = 1.7
+        public var widenPerRing: Float = 1.4
         /// Wind tip amplitude (m) and heading (rad).
         public var windAmp: Float = 0.012
         public var windHeading: Float = atan2(0.6, 0.8)

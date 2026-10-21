@@ -111,8 +111,8 @@ kernel void grassTileGenerate(
     // Ring bands. Rout(r) < the window's half-extent, so the whole disc is inside the window.
     const float rOut  = 0.46f * float(W) * c;
     const float rOutPrev = (r == 0u) ? 0.0f : 0.46f * float(u.ringInfo[r - 1u].x) * (c * 0.5f);
-    const float rInThis  = rOutPrev * 0.62f;
-    const float rInNext  = rOut * 0.62f;
+    const float rInThis  = rOutPrev * 0.40f;
+    const float rInNext  = rOut * 0.40f;
     // Ring bands are HORIZONTAL radii (the ring windows are laid out on the ground). Using the 3-D
     // distance made ring 0 — the densest, within ~1.2 m — vanish entirely for an eye 1.6 m up, because
     // no ground point is closer than the eye height.
@@ -140,25 +140,36 @@ kernel void grassTileGenerate(
 
     // ── Blade parameters (clump-coherent) ──
     const float clump  = gt_vnoise(xz * 2.5f);
+    // Far blades grow in height as well as width so a widened blade keeps a blade's proportions (long and
+    // narrow) instead of fattening into a cone: aspect stays ~1:6 and above at every ring.
     const float hgt    = (u.sizes.z + u.sizes.w * gt_h01(key ^ 0x68E31DA4u))
-                       * (0.75f + 0.5f * clump) * (1.0f + 0.12f * float(r));
-    const float hw     = u.sizes.y * pow(u.shape.w, float(r)) * (0.8f + 0.4f * gt_h01(key ^ 0xB5297A4Du));
+                       * (0.75f + 0.5f * clump) * (1.0f + 0.28f * float(r));
+    const float hw     = u.sizes.y * pow(u.shape.w, float(r)) * (0.65f + 0.60f * gt_h01(key ^ 0xB5297A4Du));
     const float az     = gt_h01(key ^ 0x1B873593u) * 6.2831853f;
     const float2 dir   = float2(cos(az), sin(az));
     const float2 wdir  = float2(cos(u.shape.z), sin(u.shape.z));
     const float lean   = hgt * (0.15f + 0.55f * gt_h01(key ^ 0x2545F491u));
     const float ph     = dot(xz, wdir) * 0.35f + u.camera.w * 1.6f + 4.0f * gt_vnoise(xz * 0.1f);
-    const float sway   = u.shape.y * (0.6f + 0.4f * sin(ph));
+    // Gust (a travelling wave across the yard) + a small per-blade flutter on its own phase, so the
+    // sward ripples as a field and each blade still trembles a little on its own. Taller blades
+    // bend further (the amplitude is per 5 cm of blade).
+    const float flutter = 0.30f * sin(u.camera.w * 5.1f + 6.2831853f * gt_h01(key ^ 0x7F4A7C15u));
+    const float sway   = u.shape.y * (0.6f + 0.4f * sin(ph) + flutter) * (hgt / 0.05f);
     const float tint   = (0.85f + 0.30f * gt_h01(key ^ 0x9E3779B1u)) * (0.90f + 0.20f * clump);
 
     const float3 up = float3(0, 1, 0);
     const float3 P0 = root;
-    const float3 P1 = root + float3(dir.x * lean * 0.2f, 0.0f, dir.y * lean * 0.2f) + up * (0.6f * hgt);
-    const float3 P2 = root + float3(dir.x * lean, 0.0f, dir.y * lean) + up * (0.97f * hgt);
+    // A grass blade rises nearly straight, then ARCS over and its tip droops — a clear curve, not a lean.
+    const float droop = 0.25f + 0.45f * gt_h01(key ^ 0x6A09E667u);
+    const float3 P1 = root + float3(dir.x * lean * 0.25f, 0.0f, dir.y * lean * 0.25f) + up * (0.62f * hgt);
+    const float3 P2 = root + float3(dir.x * lean * (1.0f + droop), 0.0f, dir.y * lean * (1.0f + droop)) + up * ((0.90f - 0.12f * droop) * hgt);
     const float3 viewDir = toCam / max(dist, 1e-5f);
 
     for (uint row = 0; row < rows; ++row) {
-        const float t = float(row) / float(max(S, 1u));
+        // Rows are packed toward the TIP: with 3 rows the body is one long near-parallel segment and
+        // the point is its own short one, so the silhouette is a blade (ribbon + point), not a cone.
+        const float uRow = float(row) / float(max(S, 1u));
+        const float t = 1.0f - pow(1.0f - uRow, 1.5f);
         const float omt = 1.0f - t;
         float3 p = omt * omt * P0 + 2.0f * omt * t * P1 + t * t * P2;
         p += float3(wdir.x, 0.0f, wdir.y) * (sway * t * t);
@@ -174,7 +185,10 @@ kernel void grassTileGenerate(
         if (dot(nrm, viewDir) < 0.0f) nrm = -nrm;
         nrm = normalize(nrm);
 
-        const float w = hw * (1.0f - 0.88f * t);
+        // Parallel-sided for the first ~60 % (a hair narrower at the very base), then a point.
+        const float body = mix(0.85f, 1.0f, smoothstep(0.0f, 0.25f, t));
+        const float tipT = smoothstep(0.55f, 1.0f, t);
+        const float w = hw * body * (1.0f - 0.94f * tipT * tipT);
         verts  [vBase + row * 2u]      = p - perp * w;
         verts  [vBase + row * 2u + 1u] = p + perp * w;
         // Fan the edge normals outward so a flat ribbon shades like a rounded blade (the
