@@ -80,7 +80,13 @@ extension MaterialGenerator {
 
                 // Base green intensity: blade micro + broad tonal mottle + mild wear darkening.
                 // All terms stochastic → no ruler-band period.
-                let gLevel = clamp01(0.42 + 0.10 * blade + 0.06 * (mottle - 0.5) - 0.06 * droughtFrac)
+                // Fine turf GRAIN (2026-10-20): ~2 cm cells, ~±5 % on the green level. With the blades
+                // fading out at distance the ground carries the lawn, and a smooth tile reads as a
+                // shaved face; dense low-contrast grain is what a mown sward looks like from above
+                // (outside review: 2–10 cm mottling, 3–8 % RMS albedo, stable + mip-filtered).
+                let grain = Noise.fbmTiled(u, v, baseCells: 96, octaves: 2, seed: seed ^ 0x3D)
+                let gLevel = clamp01((0.42 + 0.10 * blade + 0.06 * (mottle - 0.5) - 0.06 * droughtFrac)
+                                     * (1.0 + 0.45 * (grain - 0.5)))
                 // REAL turf albedo, not stadium-paint green: G leads but tops out ~0.25
                 // (a lawn is a dark surface — measured turf reflectance is 8–25%). The old
                 // G≈0.5–0.7 rendered as saturated flat "bitmap" green at any distance.
@@ -94,21 +100,27 @@ extension MaterialGenerator {
                 // yellow-olive patchiness (broad, not per-pixel) so it's not a flat sheet without
                 // adding coherent-period banding or spiking the mowed-lawn's low chroma variance.
                 //
-                // CARPET PASS (DH-0077, 2026-09-13): the muted olive left the lawn's green to the
-                // blades, and from a dollhouse camera those read as "teeny little hairs" on a dull
-                // ground (Danny). A mowed lawn seen from above resolves as ONE green surface, so the
-                // tile now carries a richer turf green — G ≈0.23→0.28 at the mean, B pulled back
-                // under it (G−R ≈0.09→0.15) — still well inside measured turf reflectance and the
-                // dielectric band, and the blades are matched to THIS colour rather than out-running it.
-                // (A first cut at G−R ≈0.19 rendered as lime — the neon read 7a08a96 removed.)
-                let olive = 0.02 * (mottle - 0.5)   // ±0.01 low-freq yellow-olive patch tint on R
-                let lush = Vec3(clamp01(0.085 + gLevel * 0.12 + olive),
-                                clamp01(0.09 + gLevel * 0.46),
-                                clamp01(0.038 + gLevel * 0.06))
+                // CARPET PASS (DH-0077, 2026-09-13): the tile carries the lawn's green so the
+                // blades don't have to ("teeny hairs" on a dull ground).
+                //
+                // DE-NEON PASS (2026-10-20, Danny: "not look like a bottle of Surge"): that pass
+                // overshot. The tile mean (0.135, 0.28, 0.063) has G/R 2.1 and B only 0.22 of G —
+                // a pure yellow-green at 28 % reflectance, the top edge of the published turf
+                // canopy band (0.08–0.22, `MaterialReflectanceReference`), and under a sun it
+                // blooms to lime. Mowed turf is a darker, olive-leaning green: mean now
+                // (0.115, 0.185, 0.070) — G/R 1.6, B ~0.38 of G, luminance ≈ 0.16 mid-band —
+                // with the broad mottle carrying MORE hue travel (olive ⇄ cooler green) than
+                // brightness travel, which is what a real lawn does from above. The blade
+                // palette (`GrassBladePalette.carpet`) is matched to this colour, so the read is
+                // one continuous turf surface.
+                let olive = 0.05 * (mottle - 0.5)   // ±0.025 low-freq olive ⇄ green tint on R
+                let lush = Vec3(clamp01(0.070 + gLevel * 0.135 + olive),
+                                clamp01(0.066 + gLevel * 0.320 - 0.5 * olive),
+                                clamp01(0.034 + gLevel * 0.085))
                 // Stressed patches yellow-brown (straw): R rises toward G, B stays low.
-                let straw = Vec3(clamp01(0.10 + gLevel * 0.55),
-                                 clamp01(0.08 + gLevel * 0.62),
-                                 clamp01(0.05 + gLevel * 0.18))
+                let straw = Vec3(clamp01(0.075 + gLevel * 0.260),
+                                 clamp01(0.075 + gLevel * 0.300),
+                                 clamp01(0.040 + gLevel * 0.100))
                 let albedo = lush + (straw - lush) * droughtFrac
                 ch.albedo[ch.idx(x, y)] = albedo
 
@@ -117,17 +129,20 @@ extension MaterialGenerator {
                 // carries the roughness std-dev TextureAudit (#3) requires — the removed mow-stripe
                 // used to supply it via `-0.06·band`, so the stochastic terms are widened to match
                 // WITHOUT re-introducing a coherent period.
-                ch.roughness[ch.idx(x, y)] = clamp01(0.76 + 0.10 * (blade - 0.5) + 0.06 * (mottle - 0.5) + 0.06 * droughtFrac)
+                ch.roughness[ch.idx(x, y)] = clamp01(0.93 + 0.10 * (blade - 0.5) + 0.06 * (mottle - 0.5) + 0.06 * droughtFrac)
 
                 // Height: blade-tip micro-relief only — no coherent ridge (the stripe ridge was
                 // the normal-ripple banding source).
-                ch.height[ch.idx(x, y)] = clamp01(0.40 + 0.20 * blade)
+                // ISOTROPIC relief (the fine grain, ~2 cm cells): the old height rode `blade`, whose
+                // striations are stretched 8:1 along u, and at a grazing sun those streaks read as
+                // water ripples across the whole yard (2026-10-20 launch-look capture).
+                ch.height[ch.idx(x, y)] = clamp01(0.40 + 0.30 * (grain - 0.5))
             }
         }
         ch.clearcoat = 0.0
         // Softer normal derivation (was 1.6): with the coherent stripe ridge gone, less relief
         // amplification keeps the remaining stochastic micro-relief from aliasing at grazing angle.
-        ch.deriveNormals(strength: 1.3)
+        ch.deriveNormals(strength: 0.7)
         return ch
     }
 

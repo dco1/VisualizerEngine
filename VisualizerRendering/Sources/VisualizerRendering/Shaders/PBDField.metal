@@ -50,6 +50,7 @@ struct GrassExpandUniforms {
     float  baseHalfWidth;    // half-width at the root (metres)
     float  tipHalfWidthFrac; // tip half-width as a fraction of base (0…1)
     float4 cameraPos;        // xyz = world camera position
+    float4 distanceFade;     // x = fade start (m), y = fade end (m): width -> 0 over [x, y]; y <= x = off
 };
 
 // ── Procedural 2D wind noise ────────────────────────────────────────────────
@@ -212,6 +213,13 @@ kernel void pbdGrassExpand(
     float t = float(localIdx) / max(1.0f, float(u.particlesPerBlade - 1u));
     float halfWidth = u.baseHalfWidth * widthScales[blade] *
         mix(1.0f, max(u.tipHalfWidthFrac, 0.0f), t);
+    // Distance fade of the ribbon WIDTH (default off). Past the point where a blade is thinner
+    // than a pixel it can only alias, so the width eases to 0 over [start, end] and the ground
+    // carries the turf (Papavasiliou 2015: far vegetation is the terrain texture). Continuous in
+    // distance, so there is no popping; nothing changes when `distanceFade.y <= .x`.
+    if (u.distanceFade.y > u.distanceFade.x) {
+        halfWidth *= 1.0f - smoothstep(u.distanceFade.x, u.distanceFade.y, vLen);
+    }
 
     // Normal points "toward the camera" — orthogonal to both the blade
     // direction and the left↔right axis, so it's the front face of the

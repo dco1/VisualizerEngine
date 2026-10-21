@@ -63,6 +63,12 @@ public final class GrassRenderSet: VegetationRenderSet {
     /// Set to make the field respond to `step`'s wind argument. Nil keeps the constant breeze.
     public var windResponse: WindResponse?
 
+    /// Distance fade of blade width (x = start m, y = end m; `.zero` = off). See
+    /// `GrassRibbonRenderer.distanceFade`.
+    public var distanceFade: SIMD2<Float> = .zero {
+        didSet { ribbon.distanceFade = distanceFade }
+    }
+
     /// The field's XPBD solver. Readable because a host's own gates reach for it — Daydream
     /// Home's yard-wind A/B zeroes `windAmp` to render a still arm, and its leak gate holds a
     /// `weak` reference to prove a rebuild released the previous field. *Tuning* still belongs in

@@ -102,6 +102,11 @@ public final class GrassRibbonRenderer {
     /// per-tick before encoding.
     public var cameraPosition: SIMD3<Float> = SIMD3(0, 1, 5)
 
+    /// Distance fade of the blade width: x = start (m), y = end (m). Width eases to 0 over
+    /// `[x, y]` so blades thinner than a pixel dissolve instead of aliasing. `.zero` = off
+    /// (every existing host renders byte-identically).
+    public var distanceFade: SIMD2<Float> = .zero
+
     /// Per-blade width multiplier (×`baseHalfWidth`, same root→tip taper).
     /// Defaults to 1.0 for every blade; hosts can widen a subset so flower
     /// heads / reeds stand out from the grass without a second field.
@@ -303,7 +308,8 @@ public final class GrassRibbonRenderer {
             particlesPerBlade: UInt32(particlesPerBlade),
             baseHalfWidth: baseHalfWidth,
             tipHalfWidthFrac: tipHalfWidthFrac,
-            cameraPos: SIMD4(cameraPosition, 0)
+            cameraPos: SIMD4(cameraPosition, 0),
+            distanceFade: SIMD4(distanceFade.x, distanceFade.y, 0, 0)
         )
 
         enc.setComputePipelineState(expandPipeline)
@@ -329,4 +335,5 @@ struct GrassExpandUniforms {
     var baseHalfWidth:     Float
     var tipHalfWidthFrac:  Float
     var cameraPos:         SIMD4<Float>
+    var distanceFade:      SIMD4<Float>
 }
