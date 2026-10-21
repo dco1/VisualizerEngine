@@ -17,20 +17,26 @@ import simd
 public final class GrassTileField {
 
     public struct Params {
-        /// Cells per ring side (W). Must be ≥ 25 so a ring's disc fits its window.
-        public var windowCells: Int = 64
-        public var ringCount: Int = 3
-        /// Blade slots per cell (K).
-        public var bladesPerCell: Int = 10
+        /// One ring of tiles. `window` = cells per ring side (≥ 25 so the ring's disc fits it);
+        /// `bladesPerCell` = blade slots per cell. Ring r's cell is `baseCellSize · 2^r`, so a ring
+        /// covers a disc of radius `0.46 · window · cell`.
+        public struct Ring { public var window: Int; public var bladesPerCell: Int
+            public init(window: Int, bladesPerCell: Int) { self.window = window; self.bladesPerCell = bladesPerCell } }
+        /// Near rings are dense; far rings use a smaller window — their cells are metres wide, so a
+        /// 40-cell window still reaches tens of metres. Reach with the defaults ≈ 59 m.
+        public var rings: [Ring] = [Ring(window: 64, bladesPerCell: 20), Ring(window: 64, bladesPerCell: 20),
+                                    Ring(window: 64, bladesPerCell: 20), Ring(window: 48, bladesPerCell: 16),
+                                    Ring(window: 48, bladesPerCell: 16), Ring(window: 40, bladesPerCell: 14),
+                                    Ring(window: 40, bladesPerCell: 14), Ring(window: 40, bladesPerCell: 14)]
         /// Ribbon segments per blade (rows = segments + 1).
-        public var segments: Int = 3
+        public var segments: Int = 2
         /// Ring-0 cell size (m); ring r uses `baseCellSize · 2^r`.
-        public var baseCellSize: Float = 0.05
+        public var baseCellSize: Float = 0.04
         public var baseHalfWidth: Float = 0.0035
         public var heightMin: Float = 0.035
         public var heightRange: Float = 0.035
         /// Half-width multiplier per ring — what keeps the far field's mass as density falls.
-        public var widenPerRing: Float = 1.5
+        public var widenPerRing: Float = 1.7
         /// Wind tip amplitude (m) and heading (rad).
         public var windAmp: Float = 0.012
         public var windHeading: Float = atan2(0.6, 0.8)
@@ -72,14 +78,14 @@ public final class GrassTileField {
                  maskTexture: MTLTexture, groundTexture: MTLTexture,
                  maskMin: SIMD2<Float>, maskSize: SIMD2<Float>) {
         let device = engine.device
-        guard params.windowCells >= 25, params.ringCount >= 1, params.bladesPerCell >= 1,
-              params.segments >= 1,
+        guard !params.rings.isEmpty, params.rings.count <= 8,
+              params.rings.allSatisfy({ $0.window >= 25 && $0.bladesPerCell >= 1 }), params.segments >= 1,
               let pso = engine.pipelineCache.pipelineState(name: "grassTileGenerate", device: device),
               let uBuf = device.makeBuffer(length: MemoryLayout<GrassTileUniforms>.stride,
                                            options: .storageModeShared)
         else { return nil }
 
-        let blades = params.windowCells * params.windowCells * params.bladesPerCell * params.ringCount
+        let blades = params.rings.reduce(0) { $0 + $1.window * $1.window * $1.bladesPerCell }
         let rows = params.segments + 1
         let verts = blades * rows * 2
         let vecBytes = MemoryLayout<Float>.stride * 3
@@ -159,8 +165,8 @@ public final class GrassTileField {
                 maskRect: maskRect,
                 rootC: SIMD4(p.rootColor, 0), midC: SIMD4(p.midColor, 0), tipC: SIMD4(p.tipColor, 0),
                 misc: SIMD4(p.foliageSSS ? 0 : 1, p.farTint, 0, 0),
-                window: UInt32(p.windowCells), ringCount: UInt32(p.ringCount),
-                bladesPerCell: UInt32(p.bladesPerCell), segments: UInt32(p.segments))
+                ringInfo: GrassTileUniforms.RingInfo(p.rings),
+                ringCount: UInt32(p.rings.count), segments: UInt32(p.segments), pad0: 0, pad1: 0)
         enc.setComputePipelineState(pipeline)
         enc.setBuffer(positionBuffer, offset: 0, index: 0)
         enc.setBuffer(normalBuffer, offset: 0, index: 1)
@@ -236,8 +242,21 @@ struct GrassTileUniforms {
     var midC: SIMD4<Float>
     var tipC: SIMD4<Float>
     var misc: SIMD4<Float>
-    var window: UInt32
+    var ringInfo: RingInfo
     var ringCount: UInt32
-    var bladesPerCell: UInt32
     var segments: UInt32
+    var pad0: UInt32
+    var pad1: UInt32
+
+    /// Eight `uint4` (x = window, y = blades per cell) laid out as a Metal `uint4[8]`.
+    struct RingInfo {
+        var r0: SIMD4<UInt32>, r1: SIMD4<UInt32>, r2: SIMD4<UInt32>, r3: SIMD4<UInt32>
+        var r4: SIMD4<UInt32>, r5: SIMD4<UInt32>, r6: SIMD4<UInt32>, r7: SIMD4<UInt32>
+        init(_ rings: [GrassTileField.Params.Ring]) {
+            func v(_ i: Int) -> SIMD4<UInt32> {
+                i < rings.count ? SIMD4(UInt32(rings[i].window), UInt32(rings[i].bladesPerCell), 0, 0) : .zero
+            }
+            r0 = v(0); r1 = v(1); r2 = v(2); r3 = v(3); r4 = v(4); r5 = v(5); r6 = v(6); r7 = v(7)
+        }
+    }
 }

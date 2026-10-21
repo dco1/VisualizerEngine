@@ -30,10 +30,11 @@ struct GrassTileUniforms {
     float4 midC;
     float4 tipC;
     float4 misc;       // x = vertex alpha (0 = foliage thin-sheet flag, 1 = opaque), y = far tint strength (0…1)
-    uint   window;         // W: cells per ring side
+    uint4  ringInfo[8];    // per ring: x = W (cells per side), y = K (blades per cell)
     uint   ringCount;
-    uint   bladesPerCell;  // K
     uint   segments;       // S: rows = S + 1
+    uint   pad0;
+    uint   pad1;
 };
 
 static inline uint gt_pcg(uint v) {
@@ -65,13 +66,18 @@ kernel void grassTileGenerate(
     texture2d<float>             ground  [[ texture(1) ]],   // r32Float surface Y over the same rect as the mask
     uint id [[ thread_position_in_grid ]]
 ) {
-    const uint W = u.window, K = u.bladesPerCell, S = u.segments;
-    const uint perRing = W * W * K;
-    if (id >= perRing * u.ringCount) return;
-
-    const uint r   = id / perRing;
-    const uint rem = id - r * perRing;
-    const uint k   = rem % K;
+    const uint S = u.segments;
+    // Which ring owns this slot: rings own consecutive slot ranges of W²·K.
+    uint r = 0u, base = 0u;
+    for (uint i = 0u; i < u.ringCount; ++i) {
+        const uint n = u.ringInfo[i].x * u.ringInfo[i].x * u.ringInfo[i].y;
+        if (id < base + n) { r = i; break; }
+        base += n;
+        if (i + 1u == u.ringCount) return;   // beyond the last ring: unused slot
+    }
+    const uint W = u.ringInfo[r].x, K = u.ringInfo[r].y;
+    const uint rem = id - base;
+    const uint k = rem % K;
     const uint cell = rem / K;
     const uint ix = cell % W, iz = cell / W;
 
@@ -89,7 +95,9 @@ kernel void grassTileGenerate(
     // Host coverage mask (house slab, paving, decks, soft yard edge…) and the ground surface Y
     // (flat plane, or the terrain drape) — one UV over the same world rect.
     const float2 muv = (xz - u.maskRect.xy) * u.maskRect.zw;
-    float m = 0.0f;
+    // Outside the host's yard rect the lawn simply continues (the ground plane runs to the horizon),
+    // so coverage there is 1 on the flat ground Y — grass reaches as far as the rings do.
+    float m = 1.0f;
     float gy = u.shape.x;
     if (all(muv >= 0.0f) && all(muv <= 1.0f)) {
         constexpr sampler ms(filter::linear, address::clamp_to_edge);
@@ -102,12 +110,16 @@ kernel void grassTileGenerate(
 
     // Ring bands. Rout(r) < the window's half-extent, so the whole disc is inside the window.
     const float rOut  = 0.46f * float(W) * c;
-    const float rOutPrev = (r == 0u) ? 0.0f : 0.46f * float(W) * (c * 0.5f);
+    const float rOutPrev = (r == 0u) ? 0.0f : 0.46f * float(u.ringInfo[r - 1u].x) * (c * 0.5f);
     const float rInThis  = rOutPrev * 0.62f;
     const float rInNext  = rOut * 0.62f;
-    float wIn  = (r == 0u) ? 1.0f : smoothstep(rInThis, rOutPrev, dist);
-    float wOut = (r + 1u == u.ringCount) ? 1.0f - smoothstep(0.82f * rOut, rOut, dist)
-                                         : 1.0f - smoothstep(rInNext, rOut, dist);
+    // Ring bands are HORIZONTAL radii (the ring windows are laid out on the ground). Using the 3-D
+    // distance made ring 0 — the densest, within ~1.2 m — vanish entirely for an eye 1.6 m up, because
+    // no ground point is closer than the eye height.
+    const float distH = length(xz - cam);
+    float wIn  = (r == 0u) ? 1.0f : smoothstep(rInThis, rOutPrev, distH);
+    float wOut = (r + 1u == u.ringCount) ? 1.0f - smoothstep(0.82f * rOut, rOut, distH)
+                                         : 1.0f - smoothstep(rInNext, rOut, distH);
 
     const bool keep = gt_h01(key ^ 0x5BD1E995u) < wIn * wOut * m;
 
@@ -129,7 +141,7 @@ kernel void grassTileGenerate(
     // ── Blade parameters (clump-coherent) ──
     const float clump  = gt_vnoise(xz * 2.5f);
     const float hgt    = (u.sizes.z + u.sizes.w * gt_h01(key ^ 0x68E31DA4u))
-                       * (0.75f + 0.5f * clump) * (1.0f + 0.22f * float(r));
+                       * (0.75f + 0.5f * clump) * (1.0f + 0.12f * float(r));
     const float hw     = u.sizes.y * pow(u.shape.w, float(r)) * (0.8f + 0.4f * gt_h01(key ^ 0xB5297A4Du));
     const float az     = gt_h01(key ^ 0x1B873593u) * 6.2831853f;
     const float2 dir   = float2(cos(az), sin(az));
@@ -173,7 +185,8 @@ kernel void grassTileGenerate(
         // far more light than the horizontal ground it grows from and the field reads as glittering
         // confetti. Blending toward up makes blade and ground light alike; the blend grows with
         // the ring so the far field is almost purely ground-lit.
-        const float toUp = mix(0.20f, 0.50f, saturate(float(r) * 0.5f));
+        const float distT = smoothstep(1.5f, 45.0f, dist);   // continuous in DISTANCE, not ring index (no visible band)
+        const float toUp = mix(0.20f, 0.60f, distT);
         const float3 nL = normalize(mix(normalize(nrm - perp * fan), up, toUp));
         const float3 nR = normalize(mix(normalize(nrm + perp * fan), up, toUp));
         normals[vBase + row * 2u]      = nL;
@@ -185,8 +198,12 @@ kernel void grassTileGenerate(
         // Far rings converge on the palette's MID colour (≈ the ground tile's mean): in the distance
         // the blades are texture breakup on a ground of the same colour, not individually lit
         // flakes — Tsushima tints distant terrain toward the grass colour for the same reason.
-        const float far = saturate(float(r) * 0.5f) * u.misc.y;
+        const float far = smoothstep(2.0f, 40.0f, dist) * u.misc.y;
         col = mix(col, u.midC.xyz * tint, far);
+        // A dense sward occludes itself: with ground-blended shading each blade still reads darker than
+        // the open ground it stands on (AO from its neighbours). Lift the far blades to meet the ground
+        // tile's brightness so the field reads as one surface instead of dark flecks on a lighter plane.
+        col *= mix(1.0f, 1.9f, smoothstep(3.0f, 30.0f, dist));
         // alpha 0 = the engine's foliage thin-sheet flag (same as the PBD ribbons).
         colors[vBase + row * 2u]      = float4(col, u.misc.x);
         colors[vBase + row * 2u + 1u] = float4(col, u.misc.x);
