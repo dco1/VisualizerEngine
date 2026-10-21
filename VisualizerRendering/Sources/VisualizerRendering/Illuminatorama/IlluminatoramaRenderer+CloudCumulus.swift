@@ -83,7 +83,9 @@ extension IlluminatoramaRenderer {
         let words = SkyUniforms.hostPrefixLength / 4
         let p = skyU.contents().bindMemory(to: UInt32.self, capacity: words)
         for i in 0..<words { mix(p[i]) }
-        if st.key != h { st.key = h; st.frame = 0; st.needsClear = true }
+        // A key that changed THIS frame means the camera or sky is moving: march nothing (an orbit
+        // would otherwise pay one interleave cell every frame for an accumulator it throws away).
+        if st.key != h { st.key = h; st.frame = 0; st.needsClear = true; return }
 
         if st.needsClear {
             let rp = MTLRenderPassDescriptor()
