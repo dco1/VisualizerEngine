@@ -218,6 +218,11 @@ extension IlluminatoramaRenderer {
                             _ clip: IlluminatoramaClipVolume?,
                             drawn: WritableKeyPath<IlluminatoramaVisibilityCullStats, Int>,
                             culled: WritableKeyPath<IlluminatoramaVisibilityCullStats, Int>) -> Bool {
+        // Hidden from the camera: never rasterised (so never in frame or in a shadow map), but still in the TLAS.
+        if !cameraHiddenKinds.isEmpty, cameraHiddenKinds.contains(group.kind) {
+            visibilityCullStats[keyPath: culled] += 1
+            return true
+        }
         if let clip, gi < gbs.meshGroupCullBounds.count, clip.excludes(gbs.meshGroupCullBounds[gi]) {
             visibilityCullStats[keyPath: culled] += 1
             visibilityCullStats.trianglesCulled += (mesh.indexCount / 3) * group.count

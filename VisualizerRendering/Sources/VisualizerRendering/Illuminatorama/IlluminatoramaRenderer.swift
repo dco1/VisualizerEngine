@@ -2879,6 +2879,12 @@ public final class IlluminatoramaRenderer {
     /// Master switch. A pure skip, so ON by default; the lever is for A/B and for a host that
     /// wants the old draw-everything behaviour back.
     public var visibilityCullingEnabled = true
+    /// Mesh kinds the CAMERA does not see: the raster passes (the G-buffer and the cascade / spot / point shadow maps) skip their
+    /// groups, but the ray-tracing structure is built from the same groups and keeps them — so an instance of a hidden kind
+    /// still lights the scene (path-traced GI, emission) and still appears in RAY-TRACED reflections and refractions.
+    /// This is how a studio's light cards work (`IlluminatoramaStudio`): a polished piece mirrors a softbox that is nowhere in
+    /// frame. A kind needs a mesh of its own (`setMesh`), since a group is the unit that is skipped.
+    public var cameraHiddenKinds: Set<MeshKind> = []
     /// Draw calls each raster pass issued and skipped, cumulative since init. Take deltas.
     public internal(set) var visibilityCullStats = IlluminatoramaVisibilityCullStats()
 

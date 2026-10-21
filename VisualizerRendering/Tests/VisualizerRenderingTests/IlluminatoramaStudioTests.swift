@@ -40,6 +40,15 @@ final class IlluminatoramaStudioTests: XCTestCase {
         }
     }
 
+    func testCardsGetTheirOwnHiddenKindAndTheFloorStaysVisible() {
+        let inst = rig.instances()
+        XCTAssertEqual(inst[0].meshKind, .box, "the floor is drawn: it is what the piece stands on")
+        for i in inst.dropFirst() { XCTAssertEqual(i.meshKind, IlluminatoramaStudio.cardKind, "cards share ONE kind, so one group hides them all") }
+        XCTAssertNotEqual(IlluminatoramaStudio.cardKind, .box, "a hidden group must not swallow the scene's other boxes")
+        var visible = rig; visible.cardsHiddenFromCamera = false
+        XCTAssertTrue(visible.instances().allSatisfy { $0.meshKind == .box }, "opt out: plain boxes, as before")
+    }
+
     func testScaledKeepsTheAngularSizeAndTheRadiance() {
         let big = rig.scaled(by: 3)
         for (a, b) in zip(rig.cards, big.cards) {

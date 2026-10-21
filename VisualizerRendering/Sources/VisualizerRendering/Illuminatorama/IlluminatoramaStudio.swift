@@ -8,7 +8,10 @@
 //
 //  It is a rig of `Card`s: boxes with an albedo and an emission, lying around a piece that rests on y = 0. `instances()`
 //  turns them into ordinary renderer instances, so they light the scene (path-traced GI) AND appear in reflections
-//  (ray-traced reflections) with no special renderer support. Nothing here touches a mesh or a material.
+//  (ray-traced reflections). By default the CARDS are hidden from the camera (`cardsHiddenFromCamera`): they are lights,
+//  not set dressing, and a product shot is of the piece — not of the softbox. They give their own mesh kind to the
+//  renderer, which skips it in every raster pass (frame, shadow maps) but keeps it in the ray-tracing structure, so the
+//  lighting and the reflections are untouched. The FLOOR is always visible: it is what the piece stands on.
 //
 //  What each card is for — each one fixed a specific bad render:
 //   · floor            a dark matte slab with its TOP at exactly y = 0. The bare terrain sits lower than the origin, so a
@@ -61,13 +64,20 @@ public struct IlluminatoramaStudio: Sendable, Equatable {
     /// Recommended renderer state: ray-traced reflections on, no sun.
     public var raytracedReflections: Bool
     public var sunEnabled: Bool
+    /// The light cards light and reflect but are not drawn to the camera (needs `apply(to:)`, which registers the mesh).
+    public var cardsHiddenFromCamera: Bool
 
     public init(floor: Card, cards: [Card], whiteBalanceK: Float = 6500, exposureScale: Float = 0.55,
-                raytracedReflections: Bool = true, sunEnabled: Bool = false) {
+                raytracedReflections: Bool = true, sunEnabled: Bool = false, cardsHiddenFromCamera: Bool = true) {
         self.floor = floor; self.cards = cards
         self.whiteBalanceK = whiteBalanceK; self.exposureScale = exposureScale
         self.raytracedReflections = raytracedReflections; self.sunEnabled = sunEnabled
+        self.cardsHiddenFromCamera = cardsHiddenFromCamera
     }
+
+    /// The light cards' own mesh kind. A separate kind (not the shared `.box`) because the renderer hides a whole GROUP from
+    /// the camera, and other boxes in the scene must still draw.
+    public static let cardKind = IlluminatoramaRenderer.MeshKind.custom("illuminatorama.studio.card")
 
     /// The default: a black product studio for a piece resting on y = 0.
     public static let productShot = IlluminatoramaStudio(
@@ -100,16 +110,18 @@ public struct IlluminatoramaStudio: Sendable, Equatable {
         return out
     }
 
-    /// The floor and every card as renderer instances — hand them to the scene next to the piece.
+    /// The floor and every card as renderer instances — hand them to the scene next to the piece. Call `apply(to:)` first
+    /// when `cardsHiddenFromCamera` (the default): it registers the cards' mesh, without which they would not exist at all.
     public func instances() -> [IlluminatoramaRenderer.InstanceRef] {
-        ([floor] + cards).map { c in
+        ([floor] + cards).enumerated().map { i, c in
             var m = matrix_identity_float4x4
             m.columns.0 = SIMD4<Float>(c.size.x, 0, 0, 0)
             m.columns.1 = SIMD4<Float>(0, c.size.y, 0, 0)
             m.columns.2 = SIMD4<Float>(0, 0, c.size.z, 0)
             m.columns.3 = SIMD4<Float>(c.center.x, c.center.y, c.center.z, 1)
+            let isCard = i > 0 && cardsHiddenFromCamera
             return IlluminatoramaRenderer.InstanceRef(
-                meshKind: .box,
+                meshKind: isCard ? Self.cardKind : .box,
                 data: IlluminatoramaInstance(modelMatrix: m, albedo: SIMD3(repeating: c.albedo), metallic: 0, roughness: 0.9,
                                              emission: SIMD3(repeating: c.emission)))
         }
@@ -121,5 +133,17 @@ public struct IlluminatoramaStudio: Sendable, Equatable {
     public func apply(to renderer: IlluminatoramaRenderer) {
         renderer.rtReflectionsEnabled = raytracedReflections
         renderer.autoExposureEnabled = false
+        if cardsHiddenFromCamera {
+            renderer.setMesh(Self.cardKind, IlluminatoramaMesh.unitBox(device: renderer.device))   // a named kind: nothing to retain
+            renderer.cameraHiddenKinds.insert(Self.cardKind)
+        } else {
+            renderer.cameraHiddenKinds.remove(Self.cardKind)
+        }
+    }
+
+    /// Undo `apply`: the cards are visible to the camera again (a host leaving the studio).
+    @MainActor
+    public static func remove(from renderer: IlluminatoramaRenderer) {
+        renderer.cameraHiddenKinds.remove(cardKind)
     }
 }
