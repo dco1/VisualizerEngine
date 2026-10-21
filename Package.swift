@@ -17,6 +17,7 @@ let package = Package(
         .library(name: "VisualizerMaterials", targets: ["VisualizerMaterials"]),
         .library(name: "VisualizerRendering", targets: ["VisualizerRendering"]),
         .library(name: "VisualizerVegetation", targets: ["VisualizerVegetation"]),
+        .library(name: "VisualizerFlora", targets: ["VisualizerFlora"]),
         .library(name: "VisualizerHumans", targets: ["VisualizerHumans"]),
     ],
     targets: [
@@ -74,6 +75,18 @@ let package = Package(
             name: "VisualizerRenderingTests",
             dependencies: ["VisualizerRendering"],
             path: "VisualizerRendering/Tests/VisualizerRenderingTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "VisualizerFlora",
+            dependencies: ["VisualizerMaterials", "VisualizerRendering", "VisualizerVegetation"],
+            path: "VisualizerFlora/Sources/VisualizerFlora",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "VisualizerFloraTests",
+            dependencies: ["VisualizerFlora"],
+            path: "VisualizerFlora/Tests/VisualizerFloraTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .target(
