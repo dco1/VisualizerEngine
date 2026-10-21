@@ -438,6 +438,82 @@ inline float2 curlWarpXZ(float3 p, float scale) {
     return float2(grad.y, -grad.x);
 }
 
+// ── Cumulus model (Params.cloudModel == .cumulus → the volSkyRenderCumulus… kernels) ─────────
+//
+// A real-scale cumulus deck (Schneider/Hillaire structure) over the BAND-LIMITED channels of
+// the noise volume (B = Perlin-Worley body, A = Worley-fbm detail — see NoiseBake.metal). The
+// legacy field above samples R/G, which are white noise at one texel per lattice cell, so the
+// trilinear filter turns every threshold into axis-aligned boxes (DH-0578). Here:
+//   • a WEATHER field (two rotated, non-commensurate taps of B) decides where clouds form and
+//     how tall they grow, so the deck is separate clouds with blue between, not a sheet;
+//   • a height PROFILE (flat-ish base, rounded crown whose height follows the weather) gives
+//     each cloud a cumulus silhouette;
+//   • the body is thresholded by local coverage, then its edges are eroded by the detail
+//     channel — wispy near the base, billowy (inverted Worley) higher up.
+// Units: cloudSlab.z = body tiles per METRE (1 / body period), cloudShape.y = extinction per
+// metre at density 1 (× lighting.z × 0.4, the legacy step formula), cloudShape.z = edge
+// erosion strength, cloudDetail.x = weather period relative to the body (0 → 0.37),
+// cloudSlab.w = how much the weather lifts cloud tops (0 = all tops at mid-slab, 1 = towers).
+inline float cumulusWeather(float2 xz, constant SkyUniforms &u,
+                            texture3d<float, access::sample> noiseVol) {
+    float sc = u.cloudSlab.z;
+    float ws = sc * ((u.cloudDetail.x > 0.0f) ? u.cloudDetail.x : 0.37f);
+    float2 w0 = xz * ws;
+    float2 w1 = float2(w0.x * 0.80f - w0.y * 0.60f, w0.x * 0.60f + w0.y * 0.80f) * 1.73f
+              + float2(0.37f, 0.71f);
+    float a = noiseVol.sample(volSampler, float3(w0.x, 0.23f, w0.y)).b;
+    float b = noiseVol.sample(volSampler, float3(w1.x, 0.61f, w1.y)).b;
+    // The blend of two taps spans only ~0.57–0.78 (measured over the dome); stretch it to 0–1.
+    return saturate((a * 0.6f + b * 0.4f - 0.58f) * 5.0f);
+}
+
+inline float cumulusDensity(float3 pos, constant SkyUniforms &u,
+                            texture3d<float, access::sample> noiseVol) {
+    float baseY = u.cloudSlab.x, topY = u.cloudSlab.y;
+    float h = (pos.y - baseY) / max(topY - baseY, 1e-3f);
+    if (h <= 0.0f || h >= 1.0f) return 0.0f;
+
+    float t = u.windTime.w;
+    float2 wind = u.windTime.xy * u.windTime.z * t;
+    float3 p = float3(pos.x - wind.x, pos.y, pos.z - wind.y);
+    float sc = u.cloudSlab.z;
+
+    float weather = cumulusWeather(p.xz, u, noiseVol);
+    float cov = saturate(u.cloudShape.x);
+    // Local coverage: the weather field modulates the global amount, so cloudy and clear
+    // patches alternate across the sky. Overcast (cov → 1) saturates it everywhere.
+    float lc = saturate(cov + (weather - 0.55f) * 1.3f * (1.0f - cov * cov));
+
+    // Cumulus profile: a fast rise off a flat base, a rounded crown whose height grows with
+    // the weather (and the tower lever), so neighbouring clouds have different tops.
+    float towers = saturate(u.cloudSlab.w);
+    float topH = mix(0.5f, 1.0f, saturate((weather - 0.35f) * 2.2f) * mix(0.4f, 1.0f, towers));
+    topH = max(topH, mix(0.5f, 1.0f, cov * cov));    // a heavy deck fills the slab
+    float grad = smoothstep(0.0f, 0.06f, h) * (1.0f - smoothstep(topH * 0.6f, topH, h));
+    if (grad <= 0.0f) return 0.0f;
+
+    float body = noiseVol.sample(volSampler, float3(p.x, p.y * 2.0f, p.z) * sc).b;
+    body = saturate((body - 0.45f) * 2.9f);   // measured span ~0.45–0.80 → 0–1
+    float base = (body * grad - (1.0f - lc)) / max(lc, 1e-3f);
+    if (base <= 0.0f) return 0.0f;
+
+    // Billows: the detail channel (Worley fbm — wispy near the base, inverted into round
+    // cauliflower lobes higher up) is SUBTRACTED from the thresholded body before the core
+    // ramp, so it carves the silhouette itself rather than only thinning a soft rim.
+    float3 dq = float3(p.x + 13.7f, p.y * 1.5f, p.z - 7.3f) * (sc * 3.7f);
+    float det = saturate((noiseVol.sample(volSampler, dq).a - 0.2f) * 1.8f);   // span ~0.2–0.75
+    float detMod = mix(det, 1.0f - det, saturate(h * 4.0f));
+    float eros = saturate(u.cloudShape.z);
+    float carved = base - detMod * eros * 0.32f;
+    if (carved <= 0.0f) return 0.0f;
+    // The body only just clears the threshold at a cloud's rim and by ~0.2–0.4 in its core;
+    // ramp that to a SOLID core over a soft rim, or every cloud is a thin veil.
+    // A heavy deck keeps a wide ramp so its body still varies (thick and thin patches,
+    // darker where the light march sees more cloud) instead of one uniform opaque sheet.
+    float d = smoothstep(0.0f, mix(0.16f, 0.8f, cov * cov * cov), carved);
+    return saturate(d) * mix(0.55f, 1.0f, saturate(h * 2.5f));
+}
+
 // Sample cloud density at `pos` in world space. Returns post-shaped density in
 // [0..1] (further scaled by `cloudShape.y` at call sites).
 inline float cloudDensity(float3 pos,
@@ -2391,6 +2467,27 @@ inline float lightMarch(float3 pos,
     return od;
 }
 
+// The cumulus deck's light march (`volSkyRender…Cumulus` kernels only — the legacy `lightMarch`
+// above is untouched so the legacy kernels compile bit-identically).
+inline float cumulusLightMarch(float3 pos, float3 L, float lightSteps,
+                               constant SkyUniforms &u,
+                               texture3d<float, access::sample> noiseVol) {
+    float thickness = (u.cloudSlab.y - u.cloudSlab.x);
+    int steps = max(1, int(lightSteps));
+    // Real-scale deck: geometric segments (each sample weighted by ITS OWN length — the
+    // legacy loop weights growing gaps with one fixed stride) reaching ~2.5 slab
+    // thicknesses toward the light, and the optical depth returned in the camera march's
+    // units (density × cloudShape.y × 0.4; the caller multiplies by absK).
+    float seg = thickness * 0.05f, t0 = 0.0f, od = 0.0f;
+    for (int i = 0; i < steps; ++i) {
+        float3 sp = pos + L * (t0 + seg * 0.5f);
+        if (sp.y > u.cloudSlab.y) break;
+        od += cumulusDensity(sp, u, noiseVol) * seg;
+        t0 += seg; seg *= 1.85f;
+    }
+    return od * u.cloudShape.y * 0.4f;
+}
+
 // Optical depth from a march position TOWARD a finite point light (a burst /
 // shell head), so the burst's in-scatter can be occluded by the cloud between
 // the sample and the light. This is what turns a flat "glow added everywhere"
@@ -2516,7 +2613,7 @@ inline float3 burstLightEval(float3 worldPos, VSBurstLight L) {
 // The same holds for the Mie medium `M`: `volSkyRender` / `volSkyRenderMS` are instantiated with
 // the built-in constants, `volSkyRenderAerosol` / `volSkyRenderMSAerosol` with the host's aerosol
 // (`Params.atmosphereAerosol`) — four kernels, one body.
-template <bool kMS, typename M>
+template <bool kMS, typename M, bool kCumulus = false>
 inline void volSkyRenderImpl(texture2d<float, access::write>  outTex,
                              texture3d<float, access::sample> noiseVol,
                              constant SkyUniforms &u,
@@ -2647,10 +2744,15 @@ inline void volSkyRenderImpl(texture2d<float, access::write>  outTex,
 
     // Per-pixel jitter to break up step banding without true temporal accum.
     float jitter = fract(sin(dot(float2(gid), float2(12.9898f, 78.233f))) * 43758.5453f);
-    pos += step * (jitter * 0.6f - 0.3f);
+    // Cumulus: no per-texel jitter — neighbouring dome texels sampling different depths turned
+    // every silhouette into a ragged, texel-sized fringe once magnified onto a hero frame. Its
+    // 96-step march does not band.
+    if (!kCumulus) pos += step * (jitter * 0.6f - 0.3f);
 
     float3 lum = float3(0.0f);
     float trans = 1.0f;
+    const bool cumulus = kCumulus;   // a compile-time variant (see the kernels below)
+    float hitDist = 0.0f, hitW = 0.0f;   // opacity-weighted distance (cumulus aerial perspective)
 
     float gF   = u.lighting.x;
     float gB   = u.lighting.y;
@@ -2719,7 +2821,7 @@ inline void volSkyRenderImpl(texture2d<float, access::write>  outTex,
     for (int i = 0; i < steps; ++i) {
         if (trans < 0.01f) break;
 
-        float dRaw = cloudDensity(pos, u, noiseVol);
+        float dRaw = kCumulus ? cumulusDensity(pos, u, noiseVol) : cloudDensity(pos, u, noiseVol);
         float density = dRaw * densityScale;
 
         // World-anchored radial fade: bound the infinite slab to a finite disc
@@ -2742,25 +2844,47 @@ inline void volSkyRenderImpl(texture2d<float, access::write>  outTex,
             }
         }
 
-        if (density > 0.001f) {
+        if (density > (cumulus ? 1e-6f : 0.001f)) {
             // Powder — darken the lit side of dense regions so the cumulus
             // silhouette pops against the sky (Schneider).
             float powder = 1.0f - exp(-density * 2.0f * (1.0f + powd * 4.0f));
+            // Cumulus: `density` is an extinction per METRE there, so the legacy formula would
+            // darken every sample by ~70 %. And no powder at all: on a sky backdrop it darkens
+            // exactly the thin rim, which then reads as a dark OUTLINE against the blue. The
+            // light march already shades the body.
+            if (cumulus) powder = 1.0f;
 
             // Sun directional (daytime decks only).
             float3 sunContrib = float3(0.0f);
             if (sunActive) {
-                float od = lightMarch(pos, -u.sunDir.xyz, lightSteps, u, noiseVol);
+                float od = (kCumulus ? cumulusLightMarch(pos, -u.sunDir.xyz, lightSteps, u, noiseVol)
+                                     : lightMarch(pos, -u.sunDir.xyz, lightSteps, u, noiseVol));
                 float lit = (msStrength > 0.0f)
                     ? msLight(od, cosT, gF, gB, absK, msStrength)
                     : exp(-od * absK) * phase;
                 sunContrib = sunIrr * lit * powder;
+                // Cumulus: the DIFFUSELY transmitted share. Deep in a thick cloud the
+                // directly-attenuated sun is ~0, but light that has scattered many times still
+                // arrives — and falls off as a power law, not exponentially (two-stream:
+                // T ≈ 1 / (1 + 0.75·τ·(1 − g))). It is why a cumulus base is luminous grey
+                // rather than black and why an overcast deck is bright. Only the part ABOVE
+                // the direct term, so thin cloud is not counted twice.
+                if (cumulus) {
+                    float tau = od * absK;
+                    float tdiff = max(1.0f / (1.0f + 0.11f * tau) - exp(-tau), 0.0f);
+                    // A lone cumulus leaks its diffuse light out of its sides; only a deck that
+                    // covers the sky keeps it (and only then is the base this bright).
+                    float covD = saturate(u.cloudShape.x);
+                    sunContrib += sunIrr * (tdiff * max(-u.sunDir.y, 0.0f) * 0.30f
+                                            * mix(0.12f, 1.0f, covD * covD * covD));
+                }
             }
 
             // Moon directional (night decks) — gives the deck its form.
             float3 moonContrib = float3(0.0f);
             if (moonActive) {
-                float odM = lightMarch(pos, moonL, lightSteps, u, noiseVol);
+                float odM = (kCumulus ? cumulusLightMarch(pos, moonL, lightSteps, u, noiseVol)
+                                      : lightMarch(pos, moonL, lightSteps, u, noiseVol));
                 // Multi-scatter lets the moonlit crowns bleed a soft glow down
                 // into the bank instead of terminating at the lit surface.
                 float lit = (msStrength > 0.0f)
@@ -2778,6 +2902,13 @@ inline void volSkyRenderImpl(texture2d<float, access::write>  outTex,
             float  ambLum  = dot(ambBase, float3(0.2126f, 0.7152f, 0.0722f));
             float3 ambCol  = mix(ambBase, float3(ambLum), ambGrey);
             float3 ambientContrib = ambCol * ambient;
+            // Cumulus: sky light reaches a cloud's crown and barely its base — darker,
+            // greyer undersides and bright tops are most of what reads as VOLUME. Scaled by
+            // how deep the sample sits below the top of the slab.
+            if (cumulus) {
+                float hh = saturate((pos.y - baseY) / max(thickness, 1e-3f));
+                ambientContrib *= mix(0.35f, 1.25f, hh * hh * (3.0f - 2.0f * hh));
+            }
 
             // Fireworks: single-scattered radiance from the ray's culled
             // light list. Bursts below the slab glow the cloud base from
@@ -2824,12 +2955,30 @@ inline void volSkyRenderImpl(texture2d<float, access::write>  outTex,
             float3 stepLum  = (sunContrib + moonContrib + ambientContrib + burstContrib)
                             * (1.0f - stepTrans);
 
+            if (cumulus) {
+                float wgt = trans * (1.0f - stepTrans);
+                hitDist += wgt * length(pos - ro);
+                hitW += wgt;
+            }
             lum += trans * stepLum;
             trans *= stepTrans;
         }
 
         pos += step;
         if (pos.y > topY + 0.5f || pos.y < baseY - 0.5f) break;
+    }
+    // Cumulus: aerial perspective. A real-scale deck spans tens of kilometres, and a cloud
+    // 30 km away is seen through that much air — it fades toward the sky's own colour rather
+    // than standing as crisp as the one overhead. Visibility ∝ deck altitude (≈ 14 km at a
+    // 1.2 km base — the far field fades into the horizon haze) so the look is scale-free.
+    if (cumulus && hitW > 1e-4f) {
+        float dist = hitDist / hitW;
+        float haze = 1.0f - exp(-dist / max(baseY * 12.0f, 1.0f));
+        // Under an overcast deck (skyZenith.w = cloudAmbientGrey) the air in front of the
+        // cloud is lit by the cloud, not a clear blue sky: haze toward the sky's grey.
+        float3 hazeCol = mix(sky, float3(dot(sky, float3(0.2126f, 0.7152f, 0.0722f))),
+                             clamp(u.skyZenith.w, 0.0f, 1.0f));
+        lum = mix(lum, hazeCol * (1.0f - trans), haze);
     }
 
     // Composite: cloud luminance over sky, weighted by transmittance.
@@ -2908,6 +3057,52 @@ kernel void volSkyRenderMSAerosol(
 ) {
     volSkyRenderImpl<true>(outTex, noiseVol, u, burstLights, skyLUT, gid,
                            NishitaMieAerosol(u.aerosolA, u.aerosolB));
+}
+
+// ── The cumulus deck (Params.cloudModel = .cumulus, DH-0578) — the same four, compiled with the
+// real-scale cumulus field and its lighting. Separate instantiations rather than a runtime branch
+// in the shared body, for the reason above: the legacy kernels must stay bit-identical.
+kernel void volSkyRenderCumulus(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    volSkyRenderImpl<false, NishitaMieBuiltin, true>(outTex, noiseVol, u, burstLights,
+        reinterpret_cast<device const float4*>(burstLights), gid, NishitaMieBuiltin());
+}
+kernel void volSkyRenderCumulusMS(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    device const float4* skyLUT                  [[buffer(2)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    volSkyRenderImpl<true, NishitaMieBuiltin, true>(outTex, noiseVol, u, burstLights, skyLUT, gid,
+                                                    NishitaMieBuiltin());
+}
+kernel void volSkyRenderCumulusAerosol(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    volSkyRenderImpl<false, NishitaMieAerosol, true>(outTex, noiseVol, u, burstLights,
+        reinterpret_cast<device const float4*>(burstLights), gid, NishitaMieAerosol(u.aerosolA, u.aerosolB));
+}
+kernel void volSkyRenderCumulusMSAerosol(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    device const float4* skyLUT                  [[buffer(2)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    volSkyRenderImpl<true, NishitaMieAerosol, true>(outTex, noiseVol, u, burstLights, skyLUT, gid,
+                                                    NishitaMieAerosol(u.aerosolA, u.aerosolB));
 }
 
 // ── In-view (perspective) cloud kernel ───────────────────────────────────────

@@ -441,6 +441,27 @@ public final class VolumetricCloudRenderer {
         /// terminate on.
         public var densityContrast: Float = 1.0
 
+        // ── Cloud model ────────────────────────────────────────────────
+        /// Which density field the deck marches.
+        ///
+        /// `.legacy` (the default — every existing scene is byte-identical) reads the noise
+        /// volume's R/G channels, which are evaluated at one sample per lattice cell: white
+        /// noise that the trilinear filter turns into axis-aligned boxes, so a thresholded
+        /// cloud has rectangular edges (Daydream DH-0578). Visualizer scenes are tuned against
+        /// it, so it stays.
+        ///
+        /// `.cumulus` is a REAL-SCALE cumulus deck over the volume's band-limited B/A
+        /// channels (Perlin-Worley body + Worley-fbm detail): a weather field that places
+        /// separate clouds, a cumulus height profile whose crowns follow the weather, edge
+        /// erosion, darker undersides and aerial perspective. Its parameters are in metres:
+        /// `cloudBaseY`/`cloudTopY` a real deck (≈ 1200 / 2100), `horizontalScale` =
+        /// 1 / body period (≈ 1/9000 — one 128³ tile spans 9 km), `density` = extinction per
+        /// metre at full density (≈ 0.03), `erosion` = edge erosion (0…1), `weatherScale` =
+        /// the weather period relative to the body (0 → 0.37), `anvil` = how much the weather
+        /// lifts the crowns into towers. The march length and light march scale with the slab.
+        public enum CloudModel: Int, Sendable { case legacy = 0, cumulus = 1 }
+        public var cloudModel: CloudModel = .legacy
+
         // ── Debug ──────────────────────────────────────────────────────
         /// Paint a tiled NEON background behind the clouds instead of the sky,
         /// so the deck's silhouette + density read directly (sky gaps glow
@@ -1042,10 +1063,15 @@ public final class VolumetricCloudRenderer {
     /// changed the compiled cloud march); `volSkyRenderMS` is the same body with the LUT sky; the
     /// `…Aerosol` twins are those two with the host's aerosol as the Mie medium
     /// (`Params.atmosphereAerosol` ≠ `.builtin`).
+    ///
+    /// `Params.cloudModel == .cumulus` selects the `volSkyRenderCumulus…` twin of each (the
+    /// same body compiled with the real-scale cumulus field — a compile-time variant, so the
+    /// legacy kernels stay bit-identical).
     private func domePipeline(for params: Params) -> MTLComputePipelineState? {
         let ms = params.physicalMultipleScattering, aerosol = params.physicalAerosol
-        guard ms || aerosol else { return pipeline }
-        let name = ms ? (aerosol ? "volSkyRenderMSAerosol" : "volSkyRenderMS") : "volSkyRenderAerosol"
+        let cumulus = params.cloudModel == .cumulus
+        guard ms || aerosol || cumulus else { return pipeline }
+        let name = "volSkyRender" + (cumulus ? "Cumulus" : "") + (ms ? "MS" : "") + (aerosol ? "Aerosol" : "")
         if let p = variantPipelines[name] { return p }
         guard let p = pipelineCache.pipelineState(name: name, device: device) else { return pipeline }
         variantPipelines[name] = p

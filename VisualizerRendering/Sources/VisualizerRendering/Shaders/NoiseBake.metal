@@ -108,6 +108,72 @@ inline float nbWorley3(float3 p, int tileSize) {
     return clamp(sqrt(minD2), 0.0f, 1.0f);
 }
 
+// ── Band-limited channels (B, A) — the cumulus model's noise ────────────────
+//
+// R and G above are evaluated at ONE sample per lattice cell (p = the integer texel, lattice
+// period 1 texel): the fbm's first octave lands exactly on its own lattice points, so R is the
+// raw per-texel hash plus three octaves ABOVE Nyquist, and G is Worley at 4 cells per texel —
+// both are white noise. Trilinear filtering of white noise is a field of axis-aligned boxes, and
+// thresholding it into a cloud draws those boxes ("the clouds look like rectangles", DH-0578).
+// R and G stay exactly as they are (Visualizer scenes are tuned against them); B and A are the
+// same two ideas sampled properly: every lattice spans >= 4 texels, so the trilinear filter
+// reconstructs a smooth field, and every lattice period divides the tile, so it still wraps.
+//
+//   B = Perlin-Worley fbm — low-frequency billowy cloud BODY (4..32 cells per tile)
+//   A = Worley fbm        — high-frequency billow DETAIL for edge erosion (8..32 cells per tile)
+
+// Tileable gradient (Perlin) noise with lattice period `period` (cells). Returns ~[-1, 1].
+inline float3 nbGrad(int3 c, int period) {
+    uint h = nbHash3(c, period);
+    float3 g = float3(float(h & 0x3FFu), float((h >> 10u) & 0x3FFu), float((h >> 20u) & 0x3FFu))
+             * (2.0f / 1023.0f) - 1.0f;
+    return normalize(g + float3(1e-4f));
+}
+
+inline float nbPerlin3(float3 p, int period) {
+    int3 i = int3(floor(p));
+    float3 f = p - float3(i);
+    float3 u = float3(nbFade(f.x), nbFade(f.y), nbFade(f.z));
+    float n000 = dot(nbGrad(i + int3(0,0,0), period), f - float3(0,0,0));
+    float n100 = dot(nbGrad(i + int3(1,0,0), period), f - float3(1,0,0));
+    float n010 = dot(nbGrad(i + int3(0,1,0), period), f - float3(0,1,0));
+    float n110 = dot(nbGrad(i + int3(1,1,0), period), f - float3(1,1,0));
+    float n001 = dot(nbGrad(i + int3(0,0,1), period), f - float3(0,0,1));
+    float n101 = dot(nbGrad(i + int3(1,0,1), period), f - float3(1,0,1));
+    float n011 = dot(nbGrad(i + int3(0,1,1), period), f - float3(0,1,1));
+    float n111 = dot(nbGrad(i + int3(1,1,1), period), f - float3(1,1,1));
+    float nx00 = mix(n000, n100, u.x), nx10 = mix(n010, n110, u.x);
+    float nx01 = mix(n001, n101, u.x), nx11 = mix(n011, n111, u.x);
+    return mix(mix(nx00, nx10, u.y), mix(nx01, nx11, u.y), u.z) * 1.6f;
+}
+
+// `uvw` in [0,1) tile coordinates; `cells` lattice cells across the tile.
+inline float nbPerlinFbm(float3 uvw, int cells) {
+    float sum = 0.0f, amp = 0.5f, norm = 0.0f;
+    for (int o = 0; o < 4; ++o) {
+        int c = cells << o;
+        sum += amp * nbPerlin3(uvw * float(c), c);
+        norm += amp; amp *= 0.5f;
+    }
+    return clamp(sum / norm * 0.5f + 0.5f, 0.0f, 1.0f);
+}
+
+inline float nbWorleyCells(float3 uvw, int cells) {
+    // nbWorley3 wraps its lattice at its `tileSize` argument, so passing `cells` makes it periodic.
+    return nbWorley3(uvw * float(cells), cells);
+}
+
+inline float nbWorleyFbm(float3 uvw, int cells) {
+    float a = 1.0f - nbWorleyCells(uvw, cells);
+    float b = 1.0f - nbWorleyCells(uvw, cells * 2);
+    float c = 1.0f - nbWorleyCells(uvw, cells * 4);
+    return a * 0.625f + b * 0.25f + c * 0.125f;
+}
+
+inline float nbRemap(float v, float lo, float hi, float nlo, float nhi) {
+    return nlo + (v - lo) / max(hi - lo, 1e-5f) * (nhi - nlo);
+}
+
 kernel void noiseBake(
     texture3d<float, access::write> outTex [[texture(0)]],
     constant uint &tileSize                [[buffer(0)]],
@@ -126,5 +192,16 @@ kernel void noiseBake(
     // can then read fbm and "erosion" with a single texture sample at q.
     float erosion = 1.0f - nbWorley3(p * 4.0f, ts);
 
-    outTex.write(float4(fbm, erosion, 0.0f, 0.0f), gid);
+    // B / A — band-limited (see above). Lattice counts scale with the tile so a 64³ or 256³
+    // volume keeps >= 4 texels per finest cell.
+    float3 uvw = (p + 0.5f) / float(ts);
+    int base = max(2, ts / 32);                 // 4 cells at 128³
+    float perlin = nbPerlinFbm(uvw, base);
+    float worleyBody = nbWorleyFbm(uvw, base);
+    // Perlin-Worley (Schneider): the Perlin body, its low end pushed up into rounded Worley
+    // billows, so blobs are puffy instead of the stringy ridges plain fbm makes.
+    float perlinWorley = clamp(nbRemap(perlin, worleyBody - 1.0f, 1.0f, 0.0f, 1.0f), 0.0f, 1.0f);
+    float detail = nbWorleyFbm(uvw, base * 2);  // 8 / 16 / 32 cells at 128³
+
+    outTex.write(float4(fbm, erosion, perlinWorley, detail), gid);
 }

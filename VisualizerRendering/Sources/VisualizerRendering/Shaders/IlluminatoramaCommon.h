@@ -1144,6 +1144,40 @@ static inline float4 sampleSkyEquirect4(texture2d<float, access::sample> sky, fl
     return sky.sample(s, dirToEquirectUV(normalize(dir)));
 }
 
+// The equirect sky for a SKY PIXEL (the background, seen directly): a cubic B-spline instead
+// of bilinear. A dome texel spans several screen pixels at hero size, and bilinear
+// magnification of a sharp feature — a cloud's silhouette — draws it as a staircase of
+// texel-sized steps (DH-0578). The B-spline's weights are all positive, so unlike Catmull-Rom
+// it cannot ring a dark outline around a bright cloud on blue; it reconstructs a smooth edge
+// about two texels soft (9 bilinear taps, the separable trick). Reflections and the IBL keep
+// the bilinear sample.
+static inline float4 sampleSkyEquirectCubic(texture2d<float, access::sample> sky, float3 dir) {
+    constexpr sampler s(filter::linear, s_address::repeat, t_address::clamp_to_edge);
+    float2 size = float2(sky.get_width(), sky.get_height());
+    float2 p = dirToEquirectUV(normalize(dir)) * size - 0.5f;
+    float2 i = floor(p), f = p - i;
+    float2 g = 1.0f - f;
+    float2 w0 = g * g * g / 6.0f;
+    float2 w1 = (4.0f - 6.0f * f * f + 3.0f * f * f * f) / 6.0f;
+    float2 w2 = (1.0f + 3.0f * f + 3.0f * f * f - 3.0f * f * f * f) / 6.0f;
+    float2 w3 = f * f * f / 6.0f;
+    float2 w12 = w1 + w2;
+    float2 t0  = (i - 0.5f) / size;
+    float2 t3  = (i + 2.5f) / size;
+    float2 t12 = (i + 0.5f + w2 / w12) / size;
+    float4 r = float4(0.0f);
+    r += sky.sample(s, float2(t0.x,  t0.y))  * (w0.x  * w0.y);
+    r += sky.sample(s, float2(t12.x, t0.y))  * (w12.x * w0.y);
+    r += sky.sample(s, float2(t3.x,  t0.y))  * (w3.x  * w0.y);
+    r += sky.sample(s, float2(t0.x,  t12.y)) * (w0.x  * w12.y);
+    r += sky.sample(s, float2(t12.x, t12.y)) * (w12.x * w12.y);
+    r += sky.sample(s, float2(t3.x,  t12.y)) * (w3.x  * w12.y);
+    r += sky.sample(s, float2(t0.x,  t3.y))  * (w0.x  * w3.y);
+    r += sky.sample(s, float2(t12.x, t3.y))  * (w12.x * w3.y);
+    r += sky.sample(s, float2(t3.x,  t3.y))  * (w3.x  * w3.y);
+    return r;
+}
+
 // ── Analytic night sky — stars + moon at SCREEN resolution ──────────────────
 //
 // The equirect sky dome (VolumetricCloudRenderer, 2048×1024) is far coarser than

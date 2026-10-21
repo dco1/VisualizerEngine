@@ -1173,15 +1173,20 @@ kernel void illumi_lighting(
         float4 farClip = float4(ndc, 1.0, 1.0);
         float4 farWorld = frame.invViewProjection * farClip;
         float3 dir = normalize(farWorld.xyz / farWorld.w - frame.cameraWorldPos);
-        float4 skySample = sampleSkyEquirect4(skyEquirect, dir);
+        // Physical model: behind the dome's clouds (its alpha = cloud transmittance).
+        NightSkyParams night = frameNightSky(frame);
+        // A host that draws its stars and moon analytically (the physical model) has nothing
+        // point-sharp baked into the dome, so its background takes the smooth cubic
+        // reconstruction (no texel staircase on cloud silhouettes, DH-0578); a dome that bakes
+        // its own celestials keeps the bilinear sample those were tuned for.
+        float4 skySample = (night.model > 0.5f) ? sampleSkyEquirectCubic(skyEquirect, dir)
+                                                : sampleSkyEquirect4(skyEquirect, dir);
         float3 sky = skySample.rgb;
         // Analytic night sky (opt-in): pixel-sharp stars + a phase-correct moon
         // composited over the (celestial-free) dome. Zero params ⇒ exact no-op.
         // TAA's jittered projection supersamples the sub-pixel star cores.
         // Angular size of one pixel from the projection: tan(fovY/2) = 1/P[1][1].
         float pixAngle = (2.0f / frame.projection[1][1]) / float(h);
-        // Physical model: behind the dome's clouds (its alpha = cloud transmittance).
-        NightSkyParams night = frameNightSky(frame);
         float3 celestials = nightCelestials(dir, night, pixAngle, sky);
         if (night.model > 0.5f) celestials *= saturate(skySample.a);
         sky += celestials;
