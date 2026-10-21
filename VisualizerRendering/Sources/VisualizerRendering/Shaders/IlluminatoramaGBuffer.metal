@@ -922,6 +922,10 @@ fragment GBufferOut illumi_fs(
         float3 tang = normalize(cross(n, float3(0.0, 1.0, 0.0)) + float3(1e-4, 0, 0));
         float yW = in.worldPos.y;
         float e  = 0.14;
+        // Bark is a dry, dusty, fissured dielectric — about the roughest thing in a yard
+        // (DH-0629). At the instance's 0.82 the plate relief's steep normals caught the sky in
+        // the specular-IBL lobe, and a hero trunk read as BLUE-GREY GLOSSY SLATE.
+        roughness = max(roughness, 0.95f);
 
 #if FOREST_SPECIES_DEBUG
         // TEMP marker probe: flat colour per species marker so the contract
@@ -1029,7 +1033,7 @@ fragment GBufferOut illumi_fs(
             // floors. Per-plate value jitter so adjacent plates differ.
             float plateVal = 0.78 + 0.5 * cellID;          // 0.78..1.28 per plate
             float3 ridgeTint = float3(1.44, 1.37, 1.22) * plateVal;  // bright weathered grey
-            float3 crackTint = float3(0.135, 0.105, 0.075);          // dark damp furrow floor
+            float3 crackTint = float3(0.20, 0.155, 0.11);           // dark damp furrow floor (DH-0629: was 0.135/0.105/0.075 — over the vertex seam darkening it crushed the bole to near-black)
             albedo *= mix(crackTint, ridgeTint, ridge) * (0.90 + 0.22 * fine);
             // Sparse lichen blotches — pale grey-green, slightly SMOOTHER — only on
             // the lit plate tops, keyed to whole plates (per-cell) so they blotch a

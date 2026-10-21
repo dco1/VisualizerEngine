@@ -272,7 +272,7 @@ extension ForestTreeGeometry {
         let crownLocalCenter = SIMD3<Float>(trunkLeanX * trunkLen,
                                             trunkLen + crownH * 0.42,
                                             trunkLeanZ * trunkLen)
-        let crownWC = xf(world, crownLocalCenter)   // world-space crown centre
+        var crownWC = xf(world, crownLocalCenter)   // world-space crown centre
         // Independent ±18 % per-axis jitter breaks the cloned-lollipop silhouette
         // that the reviewer flagged: every tree was a near-identical sphere because
         // crownRX and crownRY tracked each other (both from the same site.canopyR / crownH).
@@ -282,6 +282,17 @@ extension ForestTreeGeometry {
         let ryJit = 0.82 + rng.unit() * 0.36   // independent — not correlated with rxJit
         let crownRX = site.canopyR * (look.isBirch ? 0.62 : 1.0) * look.crownWidthMult * rxJit
         let crownRY = crownH * (look.isBirch ? 0.52 : 0.46) * ryJit
+        // ── PER-TREE CROWN ASYMMETRY (DH-0629 signal 10) ──────────────────────
+        // A yard tree grows toward its light: the crown sits OFF the trunk axis, and its plan
+        // is an ellipse, not a circle. Shift the crown centre (and so the fill AND the branch
+        // clamp, which share it) 6–18 % of its radius toward a per-tree azimuth, and stretch the
+        // plan along one axis by up to 25 %. Dedicated RNG stream — the draws above are untouched.
+        var formRng = ForestRNG(seed: site.seed &+ 0xC0_17_A5_E1)
+        let shiftAz = formRng.unit() * 2 * .pi
+        let shiftMag = (look.isBirch ? 0.04 : 0.06) + formRng.unit() * 0.12
+        let crownShiftLocal = SIMD3<Float>(cos(shiftAz), 0, sin(shiftAz)) * (crownRX * shiftMag)
+        crownWC = xf(world, crownLocalCenter + crownShiftLocal)
+        let crownRZ = crownRX * (1.0 + formRng.unit() * 0.25)
 
         // Crown pivot, slightly embedded so primary collars overlap the trunk top.
         let crownEmbed = look.isBirch ? trunkTopR * 1.0 : trunkTopR * 0.35
@@ -579,7 +590,7 @@ extension ForestTreeGeometry {
         // tips). Keep them there; this call just consumes them.
         fillCrownVolume(&s, crownCX: crownWC.x, crownCY: fillCY,
                         crownCZ: crownWC.z,
-                        rx: crownRX, ry: fillRY, rz: crownRX,
+                        rx: crownRX, ry: fillRY, rz: crownRZ,
                         fillLimit: fillLimit,
                         clusters: clustersN, look: look, site: site, rng: &rng)
 

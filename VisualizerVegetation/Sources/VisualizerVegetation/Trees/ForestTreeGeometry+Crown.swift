@@ -99,10 +99,17 @@ extension ForestTreeGeometry {
     /// Build the canonical lobe field for the tree at (crownX, crownZ). Both the
     /// fill and the branch clamp call this so they share ONE silhouette. `crownRadius`
     /// damps the warp on small crowns so they don't tier into conifer spikes.
+    ///
+    /// `seed` (DH-0629 signal 10): the field used to be keyed by the crown's world position
+    /// ONLY. Daydream bakes every yard tree at the ORIGIN and places it by instance matrix, so
+    /// every tree hashed (0, 0) and got the identical lobe count, phase, droop and aspect —
+    /// one crown silhouette, stamped at different sizes. Mixing the tree's own seed in gives
+    /// each tree its own crown; position still contributes for the Forest scene.
     public static func crownLobeField(crownX: Float, crownZ: Float,
-                               crownRadius: Float = 4.0) -> CrownLobe {
+                               crownRadius: Float = 4.0, seed: UInt64 = 0) -> CrownLobe {
         // UInt hash — avoids abs(Int.min) overflow that crashed the build.
-        let h = UInt(bitPattern: Int(crownX * 10.3))
+        let seedMix = UInt(truncatingIfNeeded: (seed &* 0x9E37_79B9_7F4A_7C15) >> 17)
+        let h = seedMix ^ UInt(bitPattern: Int(crownX * 10.3))
                   .multipliedReportingOverflow(by: 2654435761).partialValue
               ^ UInt(bitPattern: Int(crownZ * 10.7))
                   .multipliedReportingOverflow(by: 2246822519).partialValue
@@ -206,7 +213,36 @@ extension ForestTreeGeometry {
         // deepened bay here never exposes a branch tip there. The deep+sharp
         // multi-mode warp + teardrop + drooping skirt all live in CrownLobe.warp;
         // this site just evaluates it per cluster and pushes the cards out.
-        let lobe = crownLobeField(crownX: crownCX, crownZ: crownCZ, crownRadius: rx)
+        let lobe = crownLobeField(crownX: crownCX, crownZ: crownCZ, crownRadius: rx, seed: site.seed)
+
+        // ── FOLIAGE CLUMPS (DH-0629 signals 3/6/7) ───────────────────────────────
+        // An evenly scattered fill reads as a CLOUD OF CONFETTI: uniform speckle, no masses,
+        // no gaps, no reason for a branch to be visible anywhere. A real crown is a set of
+        // branch-borne CLUMPS — each a lit dome over its own shadowed underside — with dark
+        // gaps between them through which the scaffold limbs show. So for a yard tree seen up
+        // close (`nearCamera`), seed K clump centres over the lobed shell and contract every
+        // cluster toward its nearest centre (a Voronoi cell, shrunk): the crown keeps its
+        // silhouette, the leaves gather into masses, and the gaps open between them. The
+        // shading normal leans out of the clump as well as out of the crown, so each mass
+        // shades as its own volume. Backdrop trees (not near) keep the even fill.
+        var clumps: [(c: SIMD3<Float>, k: Float)] = []
+        if site.nearCamera {
+            var cr = ForestRNG(seed: site.seed &+ 0xC1_0E_0C_1E)
+            let k = max(10, min(60, Int(8 + rx * rx * 2.2)))
+            for ci in 0..<k {
+                let fy = 1 - 2 * (Float(ci) + 0.5) / Float(k)       // Fibonacci sphere
+                let cTheta = acos(max(-1, min(1, fy + (cr.unit() - 0.5) * 0.25)))
+                let cPhi = Float(ci) * Phyllotaxis.goldenAngleF + (cr.unit() - 0.5) * 0.6
+                let cCos = cos(cTheta), cSin = sin(cTheta)
+                let (cw, cd) = lobe.warp(az: cPhi, cosT: cCos)
+                let cShell = min(fillLimit, fillLimit / max(1.0, cw))
+                let cr0 = cShell * (0.55 + 0.35 * cr.unit())
+                let c = SIMD3<Float>(crownCX + cr0 * rx * cw * cSin * cos(cPhi),
+                                     crownCY + cr0 * ry * lobe.aspect * cd * cCos,
+                                     crownCZ + cr0 * rz * cw * cSin * sin(cPhi))
+                clumps.append((c, 0.46 + 0.20 * cr.unit()))
+            }
+        }
 
         for i in 0..<clusters {
             // 3D Halton (bases 2, 3, 5) for cluster position.
@@ -322,7 +358,10 @@ extension ForestTreeGeometry {
             } else {
                 // POROUS CORE: unchanged interior-biased fill so the backlight glow
                 // still penetrates and the crown isn't a solid topiary ball.
-                rNorm = pow(hz, 0.42) * shellFactor
+                // A near (yard) tree is seen from OUTSIDE at 3–10 m and its leaf budget is capped,
+                // so a card buried in the core is a card the decimator could have kept on the
+                // surface: bias it outward (DH-0629). The clumping above still opens the gaps.
+                rNorm = pow(hz, site.nearCamera ? 0.26 : 0.42) * shellFactor
             }
 
             let sinT = sin(theta)
@@ -336,15 +375,31 @@ extension ForestTreeGeometry {
             // skirt cards (cosT<0, vDroop>1) reach further down, breaking the
             // ball-on-a-stick read where the crown bottom used to floor cleanly.
             let py = max(0.15, crownCY + rNorm * ryEff * cosT)
-            let pz = crownCZ + rNorm * rxEff * sinT * sin(phi)
-            let pos = SIMD3<Float>(px, py, pz)
+            // `rz` was accepted and ignored (every crown a circle in plan); honour it.
+            let pz = crownCZ + rNorm * rz * warp * sinT * sin(phi)
+            var pos = SIMD3<Float>(px, py, pz)
+            var clumpOut: SIMD3<Float>? = nil
+            if !clumps.isEmpty {
+                var best = 0
+                var bestD = Float.greatestFiniteMagnitude
+                for (ci, cl) in clumps.enumerated() {
+                    let d = simd_length_squared(pos - cl.c)
+                    if d < bestD { bestD = d; best = ci }
+                }
+                let cl = clumps[best]
+                pos = cl.c + (pos - cl.c) * cl.k
+                pos.y = max(0.15, pos.y)
+                let off = pos - cl.c
+                clumpOut = simd_length(off) > 0.02 ? simd_normalize(off) : nil
+            }
 
             let col = leafColorVary(look, frac: hz, rng: &rng)
 
             // Outward direction from the crown centre — used for bent normal.
             let toPos = pos - crownCentre
-            let outVec: SIMD3<Float> = simd_length(toPos) > 0.02
+            let crownOut: SIMD3<Float> = simd_length(toPos) > 0.02
                 ? simd_normalize(toPos) : SIMD3<Float>(0, 1, 0)
+            let outVec: SIMD3<Float> = clumpOut.map { simd_normalize(crownOut * 0.5 + $0 * 0.5) } ?? crownOut
 
             // Per-cluster base azimuth (golden angle stepping, low discrepancy).
             let baseAz = Float(i) * Phyllotaxis.goldenAngleF

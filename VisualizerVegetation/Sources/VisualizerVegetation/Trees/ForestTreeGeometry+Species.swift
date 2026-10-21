@@ -96,8 +96,9 @@ extension ForestTreeGeometry {
                 // chroma (R/B down harder than G) so the sunlit mass finishes as
                 // saturated golden-green, not cream.
                 leaf: srgbToLinear(SIMD3(0.145, 0.34, 0.11)),
-                bark: srgbToLinear(SIMD3(0.32, 0.28, 0.22)), isBirch: false,
-                species: .oak)
+                bark: srgbToLinear(SIMD3(0.40, 0.33, 0.26)), isBirch: false,   // DH-0629: was (0.32,0.28,0.22) — under the vertex seam + shader furrow darkening the bole rendered near-black
+                // An open-grown oak SPREADS — broader than it is tall (DH-0629).
+                species: .oak, crownWidthMult: 1.12)
         case .birch:
             return TreeLook(
                 trunkHeightFrac: 0.60, flareBase: 1.18, trunkTopMult: 0.78,
@@ -136,7 +137,7 @@ extension ForestTreeGeometry {
                 // LEAF round-7: −15% value, +green chroma (see oak note).
                 leaf: srgbToLinear(SIMD3(0.19, 0.38, 0.12)),
                 bark: srgbToLinear(SIMD3(0.42, 0.40, 0.36)), isBirch: false,
-                species: .maple)
+                species: .maple, crownWidthMult: 1.06)
         case .orange:
             return TreeLook(
                 // Citrus habit: a SHORT clear bole, low-branching into a DENSE, deep, rounded

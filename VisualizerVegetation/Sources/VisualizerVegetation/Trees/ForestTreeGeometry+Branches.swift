@@ -33,7 +33,7 @@ extension ForestTreeGeometry {
         // the branch's growth direction, so a tip in a bay is clamped to that bay's
         // (shorter) radius and stays buried under the leaf mass.
         let lobe = crownLobeField(crownX: crownCenter.x, crownZ: crownCenter.z,
-                                  crownRadius: crownRX)
+                                  crownRadius: crownRX, seed: site.seed)
         // Lobe evaluated in the branch's GROWTH direction (XZ azimuth + elevation).
         // cosT matches the fill convention (cos of polar angle, +1 = crown top) so
         // a horizontal branch sees cosT≈0 and a near-vertical leader sees cosT≈1.

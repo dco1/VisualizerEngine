@@ -85,12 +85,47 @@ extension ForestTreeGeometry {
         // the ground, not a celery stalk poked into the grass. Widens to 1.45–1.9×
         // at the base and relaxes over the first ~16% of height — the buttress sits
         // ABOVE the grass line (the buried skirt is only lightly sunk now).
-        let baseFlare = 1.45 + age * 0.45
+        // The symmetric swell is kept modest — the buttress lobes below carry the flare.
+        let baseFlare = 1.22 + age * 0.25
         let cps: [(t: Float, r: Float)] = [
-            (0.00, baseFlare), (0.06, 1.30 + age * 0.18), (0.16, 1.06),
+            (0.00, baseFlare), (0.06, 1.12 + age * 0.10), (0.16, 1.03),
             (0.50, 1.00), (0.85, 0.93), (1.00, max(topMult, 0.78))
         ]
         func radiusMult(_ t: Float) -> Float { hermite(cps, t) }
+
+        // ── ROOT BUTTRESSES (DH-0629 signal 4) ────────────────────────────────
+        // The flare above is a radially SYMMETRIC swell — a bulb, and on the ring grid below it
+        // barely registered (pow(t, 0.75) put ~2 rings inside its first 16 %), so the bole met
+        // the lawn as a straight post. A real trunk base is LOBED: 4–6 structural roots leave the
+        // bole as buttresses that spread outward and dive into the soil, with concave bays
+        // between them. Model that as a sum of angular lobes whose height is set in ABSOLUTE
+        // terms (a buttress rises ~2–4 trunk radii, whatever the trunk length) and whose
+        // amplitude decays to nothing above it. Per-tree root count, azimuths and strengths come
+        // from a dedicated RNG stream so the bark noise below is unchanged in sequence.
+        var rootRng = ForestRNG(seed: seed &+ 0x2007_B077)
+        let rootCount = look.isBirch ? 3 + Int(rootRng.unit() * 2.0) : 4 + Int(rootRng.unit() * 3.0)
+        let rootPhase0 = rootRng.unit() * 2 * .pi
+        var roots: [(az: Float, amp: Float, width: Float)] = []
+        for k in 0..<rootCount {
+            let az = rootPhase0 + (Float(k) + (rootRng.unit() - 0.5) * 0.55) / Float(rootCount) * 2 * .pi
+            roots.append((az, 0.55 + rootRng.unit() * 0.60, 0.28 + rootRng.unit() * 0.16))
+        }
+        let buttressAmp: Float = (look.isBirch ? 0.65 : 1.15) + age * 0.80
+        let flareRise = trunkR * (2.6 + age * 1.8)                  // metres of buttress above ground
+        let flareT = min(0.40, flareRise / max(height, 0.1))
+        /// Extra radius multiplier at angle `a`, height fraction `t` (t may go below 0 for the
+        /// buried skirt — the roots keep spreading as they dive).
+        func buttress(_ a: Float, _ t: Float) -> Float {
+            let h = max(0, 1 - t / flareT)
+            guard h > 0 else { return 0 }
+            var lobe: Float = 0
+            for r in roots {
+                var d = a - r.az
+                d -= (d / (2 * .pi)).rounded() * 2 * .pi
+                lobe += r.amp * exp(-(d * d) / (r.width * r.width))
+            }
+            return buttressAmp * pow(h, 2.4) * lobe
+        }
 
         // GROUND BEDDING (#58): the trunk base is bedded BELOW the ground surface
         // so it never floats or leaves a gap over the uneven heightfield — the
@@ -120,9 +155,10 @@ extension ForestTreeGeometry {
             var row: [(SIMD3<Float>, SIMD3<Float>, SIMD3<Float>)] = []
             for radialIdx in 0..<radialCount {
                 let angle = Float(radialIdx) / Float(radialCount) * 2 * .pi
-                let rJit = max(0.001, br.r * (1 + radialNoise[radialIdx] * 0.45))
+                let rootSpread = trunkR * buttress(angle, br.y / max(height, 0.1)) * 1.15
+                let rJit = max(0.001, br.r * (1 + radialNoise[radialIdx] * 0.45) + rootSpread)
                 let lp = SIMD3<Float>(rJit * cos(angle), br.y, rJit * sin(angle))
-                let ln = simd_normalize(SIMD3<Float>(cos(angle), 0.18, sin(angle)))
+                let ln = simd_normalize(SIMD3<Float>(cos(angle), 0.35, sin(angle)))
                 let col = barkColorAt(look, u: Float(radialIdx) / Float(radialCount),
                                       t: 0, seed: seed)
                 row.append((xf(world, lp), xfDir(world, ln), col))
@@ -131,7 +167,12 @@ extension ForestTreeGeometry {
         }
         for ringIdx in 0..<ringCount {
             let tLin = Float(ringIdx) / Float(ringCount - 1)
-            let tShaped = pow(tLin, 0.75)
+            // A third of the rings go to the buttress band (they were ~2 of 30 in it), the rest
+            // to the bole above on the old pow(·, 0.75) spacing.
+            let baseRings: Float = 0.34
+            let tShaped: Float = tLin < baseRings
+                ? flareT * 1.15 * pow(tLin / baseRings, 1.25)
+                : flareT * 1.15 + (1 - flareT * 1.15) * pow((tLin - baseRings) / (1 - baseRings), 0.80)
             let y = height * tShaped
             let r = trunkR * radiusMult(tShaped)
             let noiseScale = max(0.45, 1.0 - tShaped * 0.55)
@@ -148,7 +189,9 @@ extension ForestTreeGeometry {
                 let plate = barkPlateField(look: look, u: uFrac, t: tShaped, seed: seed)
                 let plateFade = 1.0 - smoothstepf(0.55, 0.95, tShaped)   // smooth near top
                 let plateDisp = plate.disp * plateFade
-                let rJit = max(0.001, r * (1 + radialNoise[radialIdx] * noiseScale + perRing + plateDisp))
+                let bt = buttress(angle, tShaped)
+                let rJit = max(0.001, r * (1 + radialNoise[radialIdx] * noiseScale + perRing + plateDisp)
+                                      + trunkR * bt)
                 let lp = SIMD3<Float>(rJit * cos(angle) + ringLeanX, y, rJit * sin(angle) + ringLeanZ)
                 let upBias = max(0, 0.20 - tShaped) * 0.6
                 // Bark-relief micro-normal: deep VERTICAL fissures (real bark
@@ -171,6 +214,16 @@ extension ForestTreeGeometry {
                 // undercut; seam floors tuck the normal slightly inward.
                 ln += SIMD3<Float>(0, plate.liftN * plateFade, 0)
                     + SIMD3<Float>(cos(angle), 0, sin(angle)) * (plate.disp * plateFade * 2.0)
+                // Buttress slope: the lobe surface faces UP its flank (−∂r/∂y) and away from its
+                // own crest (−∂r/∂θ / r) — without this the roots shade as a straight pipe.
+                if bt > 1e-4 {
+                    let eps: Float = 0.02
+                    let dRdA = trunkR * (buttress(angle + eps, tShaped) - buttress(angle - eps, tShaped)) / (2 * eps)
+                    let dT = flareT * 0.05
+                    let dRdY = trunkR * (buttress(angle, tShaped + dT) - buttress(angle, max(0, tShaped - dT)))
+                        / (max(height, 0.1) * (tShaped + dT - max(0, tShaped - dT)))
+                    ln += SIMD3<Float>(0, -dRdY, 0) * 1.0 - tangH * (dRdA / max(rJit, 1e-3))
+                }
                 ln = simd_normalize(ln)
                 var col = barkColorPlated(look, u: uFrac, t: tShaped, seed: seed, plate: plate)
                 // ── Moss ALBEDO wash (front 3): even where the 3D moss cushions

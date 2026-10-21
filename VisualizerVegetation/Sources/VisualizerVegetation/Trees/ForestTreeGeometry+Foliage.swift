@@ -43,8 +43,13 @@ struct TreeLeafStitch: LeafCardSink {
                                   _ c: LeafStripVertex<Float>,
                                   outward: SIMD3<Float>,
                                   geometricNormal: SIMD3<Float>) {
-        let n = ForestTreeGeometry.safeNormalize(bentNormal * 0.62 + geometricNormal * 0.38,
-                                                 fallback: bentNormal)
+        // DH-0629 signal 1: ONE normal per blade. The old 0.62 bent / 0.38 geometric blend gave
+        // the two halves of the folded blade two different normals, and the path lane shades a
+        // triangle by the mean of its three — so every leaf came back split down the midrib into
+        // a lit half and a dark half: a creased shard. The fold stays in the GEOMETRY (it still
+        // gives the blade depth in silhouette and in shadow); the shading is the leaf's own.
+        _ = geometricNormal
+        let n = bentNormal
         soup.tri(a.position, b.position, c.position,
                  n0: n, n1: n, n2: n,
                  c0: colour(a), c1: colour(b), c2: colour(c))
@@ -366,6 +371,44 @@ extension ForestTreeGeometry {
             // single-leaf scale (slight 1.05× so adjacent cards still overlap into
             // mass) so it reads as fine foliage texture, not plates. No vertex cost.
             let farEnlarge: Float = noEnlarge ? 1.05 : 1.85
+            if noEnlarge {
+                // ── NEAR-CAMERA FILL CARD (DH-0629 signal 1) ─────────────────────
+                // A yard tree's crown is mostly these 2-tri cards, seen at 2–10 m. The
+                // backdrop recipe below (deep V-fold, lift 0.46·hw, per-half normals
+                // 55 % geometric) made every one a hard-creased diamond: one half lit,
+                // the other dark, the crease a ridge — at hero range the crown read as
+                // a heap of green PYRAMID SHARDS. A real leaf is a nearly flat, softly
+                // cupped blade, about twice as long as it is wide. So: a shallow cup
+                // (margins lift ∝ u², the spine barely sunk), a leaf-proportioned ovate
+                // outline (~2:1, not a square gem) with per-leaf size and aspect variety,
+                // and ONE shading normal for the whole card. Per-vertex
+                // normals are not enough: the path lane shades a triangle by the MEAN of its
+                // three normals, so any per-half difference comes back as the crease.
+                let jitA = 0.80 + 0.40 * rng.unit()            // aspect variety
+                let jitS = 0.90 + 0.36 * rng.unit()            // size variety (a capped budget: area per triangle buys opacity)
+                let hwN = w * 0.44 * farEnlarge * jitS * jitA.squareRoot()
+                let hhN = h * 0.98 * farEnlarge * jitS / jitA.squareRoot()
+                let sink = bentNormal * (hwN * 0.04)
+                // Ovate outline from SIX points (4 triangles, fanned from the base): base,
+                // shoulder at 30 % (u .80), upper margin at 72 % (u .70), tip. A 2-triangle
+                // kite cannot be anything but a diamond, and a diamond is what made the crown
+                // read as cut glass; the hexagon reads as a leaf at every range a yard tree is
+                // seen from. The decimator removes whole cards, so the extra triangles come out
+                // of the card COUNT, not out of any one leaf.
+                func at(_ v: Float, _ u: Float) -> SIMD3<Float> {
+                    pos + yAxis * (hhN * (v - 0.45)) + xAxis * (hwN * u)
+                        + bentNormal * (hwN * 0.12 * u * u) - sink
+                }
+                let bN = at(0, 0), tN = at(1, 0)
+                let r1 = at(0.30, 0.80), r2 = at(0.72, 0.70)
+                let l1 = at(0.30, -0.80), l2 = at(0.72, -0.70)
+                let nCard = bentNormal
+                s.tri(bN, r1, r2, n0: nCard, n1: nCard, n2: nCard, c0: midribCol, c1: marginCol, c2: marginCol)
+                s.tri(bN, r2, tN, n0: nCard, n1: nCard, n2: nCard, c0: midribCol, c1: marginCol, c2: tipCol)
+                s.tri(bN, tN, l2, n0: nCard, n1: nCard, n2: nCard, c0: midribCol, c1: tipCol, c2: marginCol)
+                s.tri(bN, l2, l1, n0: nCard, n1: nCard, n2: nCard, c0: midribCol, c1: marginCol, c2: marginCol)
+                return
+            }
             let hw0 = w * 0.74 * farEnlarge
             let hh0 = h * 0.80 * farEnlarge
             // TACO-FOLD on the BACKDROP/FAR card (#20 polish item 5): the far card
@@ -471,7 +514,6 @@ extension ForestTreeGeometry {
             winding: .singleSided)
         swap(&stitch.soup, &s)
 
-        _ = rng   // reserved for future per-leaf margin jitter
     }
 
     /// Scatter ripe citrus fruit through the crown (DH-0570 — the orange/lemon signature).
