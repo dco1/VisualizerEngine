@@ -113,6 +113,16 @@ public final class FloraField {
     }
 
     /// Re-sow at a new density (drops every cache; cells rebuild on the next `update()`).
+    /// Gate every plant's wind (0 = still) and re-assemble — a host's wind switch, and a test's way to isolate the field.
+    public func setWindScale(_ w: Float) {
+        guard w != config.windScale else { return }
+        config.windScale = w
+        nearCache.removeAll()
+        composition = Composition()
+        scanDirty = true
+        update()
+    }
+
     public func setDensity(_ d: Double) {
         guard d != config.density else { return }
         config.density = d
