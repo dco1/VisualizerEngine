@@ -257,6 +257,11 @@ static inline float sunVisibility(
         float farZ  = (cascade == 0u) ? splits.x : splits.y;
         float band  = (farZ - nearZ) * kCascadeBlendFraction;
         float t = (band > 1e-4) ? saturate((viewDist - (farZ - band)) / band) : 0.0;
+        // Ease the ramp (DH-1450). A linear fade moves the edge at a constant rate across the
+        // band and then STOPS dead at the split, which is itself a slope discontinuity — the
+        // kink the blend exists to remove, relocated to the band's two ends. smoothstep has zero
+        // slope at both, so the edge's displacement leaves each cascade tangentially.
+        t = t * t * (3.0 - 2.0 * t);
         if (t > 0.0) {
             float vNext = cascadeVisibility(shadowMap, shadowSampler, frame,
                                             worldPos, N, slope, cascade + 1u,
