@@ -24,10 +24,10 @@ public final class GrassTileField {
             public init(window: Int, bladesPerCell: Int) { self.window = window; self.bladesPerCell = bladesPerCell } }
         /// Near rings are dense; far rings use a smaller window — their cells are metres wide, so a
         /// 40-cell window still reaches tens of metres. Reach with the defaults ≈ 59 m.
-        public var rings: [Ring] = [Ring(window: 64, bladesPerCell: 20), Ring(window: 64, bladesPerCell: 20),
-                                    Ring(window: 64, bladesPerCell: 22), Ring(window: 48, bladesPerCell: 32),
-                                    Ring(window: 48, bladesPerCell: 30), Ring(window: 40, bladesPerCell: 28),
-                                    Ring(window: 40, bladesPerCell: 26), Ring(window: 40, bladesPerCell: 24)]
+        public var rings: [Ring] = [Ring(window: 64, bladesPerCell: 24), Ring(window: 64, bladesPerCell: 26),
+                                    Ring(window: 64, bladesPerCell: 30), Ring(window: 48, bladesPerCell: 44),
+                                    Ring(window: 48, bladesPerCell: 48), Ring(window: 40, bladesPerCell: 48),
+                                    Ring(window: 40, bladesPerCell: 48), Ring(window: 40, bladesPerCell: 48)]
         /// Ribbon segments per blade (rows = segments + 1).
         public var segments: Int = 2
         /// Ring-0 cell size (m); ring r uses `baseCellSize · 2^r`.
