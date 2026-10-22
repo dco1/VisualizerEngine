@@ -69,6 +69,8 @@ extension MaterialGenerator {
                 ch.roughness[ch.idx(x, y)] = clamp01(0.58 - 0.10 * (grain - 0.5) + 0.12 * drift + 0.06 * band)
             }
         }
+        // The board's grain direction (TextureAudit's wood tell #7): along U for lap, V for battens.
+        ch.grainTangent = [Vec2](repeating: lap ? Vec2(1, 0) : Vec2(0, 1), count: size * size)
         ch.clearcoat = 0
         ch.deriveNormals(strength: 1.4)
         addMicroDetail(&ch, seed: seed ^ 0xD4, baseCells: 96, strength: 0.30,
