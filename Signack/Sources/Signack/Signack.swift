@@ -15,11 +15,16 @@
 ///   crack-free cut test (`isInCut`), a fixed object-space cut for ray-traced proxies, and frustum
 ///   culling; `SignackCutTracker` is the host's re-select hysteresis; `SignackDebugPalette` colours
 ///   clusters / levels.
+/// - **S2 · GPU cut selection** (the `SignackGPU` target) — `SignackGPUHierarchy` makes a DAG
+///   resident ONCE per object type; `SignackGPUCut` is one instance's GPU-written index list + two
+///   indirect records (on-screen for the camera, whole cut for shadows); `SignackGPUCutPass` encodes
+///   the per-cluster `isInCut` + padded frustum test + compaction for a batch of instances. The CPU
+///   `SignackSelection` stays the reference it is gated against (`SignackGPUParityTests`).
 /// - **Mesh utilities** — `SignackVertexWeld` (turn an unindexed soup into an indexed mesh).
 ///
 /// Everything here is pure, deterministic and seeded: the same input bakes the same output on
 /// every run, so host-side spec-keyed mesh caches stay valid.
 public enum Signack {
     /// The phase this module has reached. Bumped as phases land, so a host can log what it runs.
-    public static let phase = "S1"
+    public static let phase = "S2"
 }

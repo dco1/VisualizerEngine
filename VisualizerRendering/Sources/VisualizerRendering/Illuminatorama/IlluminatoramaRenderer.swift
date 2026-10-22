@@ -203,7 +203,9 @@ public final class IlluminatoramaRenderer {
     ///   • `meshGroups`        — distinct draw groups (≈ draw calls in the raster passes).
     ///   • `expandedTriangles` — instance-EXPANDED triangle count (Σ group.count ×
     ///                           mesh tris), i.e. what the G-buffer + shadow passes
-    ///                           actually rasterise, not the per-mesh sum.
+    ///                           actually rasterise, not the per-mesh sum. An indirect
+    ///                           mesh counts the GPU's own camera-pass count from the last
+    ///                           completed frame (`drawnTriangleEstimate`), not its capacity.
     ///   • `rtActive` / `rtAutoDisabled` — whether the ray-traced TLAS path is live,
     ///                           and whether the renderer self-disabled it (heavy /
     ///                           thrashing scene). A silently auto-disabled RT changes
@@ -219,7 +221,7 @@ public final class IlluminatoramaRenderer {
         for g in gbs.meshGroups {
             // A `tracedOnly` proxy is never rasterised — it is the RT side of an object whose
             // raster side is counted under its own (raster-only) kind.
-            if let m = meshes[g.kind], !m.tracedOnly { tris += g.count * (m.indexCount / 3) }
+            if let m = meshes[g.kind], !m.tracedOnly { tris += g.count * m.drawnTriangleEstimate }
         }
         return (instances.count, gbs.meshGroups.count, tris,
                 rts.rtTLASActive, rtAutoDisabled, fxs.gpuRepackTasks.count)

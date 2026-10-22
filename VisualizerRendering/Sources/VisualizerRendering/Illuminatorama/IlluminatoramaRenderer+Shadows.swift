@@ -75,7 +75,7 @@ extension IlluminatoramaRenderer {
                 let off = instStride * group.start
                 enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
                 enc.setVertexBuffer(currentInstanceBuffer, offset: off, index: 2)
-                enc.drawMesh(mesh, instanceCount: group.count)
+                enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow)
             }
             enc.endEncoding()
         }
@@ -482,7 +482,7 @@ extension IlluminatoramaRenderer {
                 let off = instStride * group.start
                 enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
                 enc.setVertexBuffer(currentInstanceBuffer, offset: off, index: 2)
-                enc.drawMesh(mesh, instanceCount: group.count)
+                enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow)
             }
             enc.endEncoding()
         }
@@ -632,7 +632,7 @@ extension IlluminatoramaRenderer {
                     let off = instStride * group.start
                     enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
                     enc.setVertexBuffer(currentInstanceBuffer, offset: off, index: 2)
-                    enc.drawMesh(mesh, instanceCount: group.count)
+                    enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow)
                 }
                 enc.endEncoding()
             }

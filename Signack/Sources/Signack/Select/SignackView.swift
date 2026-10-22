@@ -16,6 +16,9 @@ public struct SignackView: Sendable, Equatable {
     public var threshold: Float
     /// Optional object-space frustum for culling (`SignackSelection.select(_:view:cull:)`).
     public var frustum: SignackFrustum?
+    /// Object units added to every cluster's bounding radius before the frustum test — what the
+    /// host's vertex stage can move a vertex beyond its rest position (vegetation wind).
+    public var cullPadding: Float = 0
 
     public init(position: SIMD3<Float>, pixelScale: Float, isOrthographic: Bool = false,
                 threshold: Float = 1, frustum: SignackFrustum? = nil) {

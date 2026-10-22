@@ -62,7 +62,7 @@ struct IlluminatoramaCullBounds: Equatable {
         let windStrength = treeWindStrength * inst.windScale
         if windStrength > 0 {
             guard let w = windMax() else { return nil }
-            radius += windStrength * (w.sway * (1.5 + 0.18) + w.flutter * (0.05 + 0.05 + 0.035))
+            radius += IlluminatoramaMesh.windReach(strength: windStrength, max: w)
         }
 
         // applySway: rotation about a pivot (box base for mode 1, model origin for modes 2/3) by any

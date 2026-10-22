@@ -22,10 +22,15 @@ public enum SignackSelection {
         out.reserveCapacity(h.clusters.count / 2)
         let frustum = cull ? view.frustum : nil
         for (i, c) in h.clusters.enumerated() where isInCut(c, view) {
-            if let f = frustum, !f.intersects(c.bounds) { continue }
+            if let f = frustum, !f.intersects(padded(c.bounds, view)) { continue }
             out.append(UInt32(i))
         }
         return out
+    }
+
+    /// A cluster's culling sphere grown by the view's `cullPadding` (the GPU pass does the same).
+    static func padded(_ s: SignackSphere, _ view: SignackView) -> SignackSphere {
+        SignackSphere(s.center, s.w + view.cullPadding)
     }
 
     /// The view-independent cut keeping every cluster whose error is ≤ `tolerance` object units —

@@ -48,6 +48,12 @@ public final class IlluminatoramaMesh {
     /// decides how many indices are drawn (view-culled, compacted geometry). Used by
     /// `GrassTileField`; `instanceCount` in the arguments must match the single instance.
     public var indirectDrawBuffer: MTLBuffer?
+    /// Byte offset of the camera (G-buffer) pass's record in `indirectDrawBuffer`.
+    public var indirectDrawOffset: Int = 0
+    /// Byte offset of a SEPARATE record the shadow passes draw with, or nil to use the camera's.
+    /// Signack (DH-1461) culls a cut to the camera frustum for the G-buffer but must keep every
+    /// off-screen caster for the sun/spot/point maps — see `IlluminatoramaMesh+IndirectDraw`.
+    public var shadowIndirectDrawOffset: Int?
 
     /// Cast shadows from BOTH faces (shadow passes use cull `.none` instead of the
     /// default `.front`). Opt-in, default false — an unset mesh keeps the renderer's
@@ -395,22 +401,3 @@ public final class IlluminatoramaMesh {
     }
 }
 
-
-extension MTLRenderCommandEncoder {
-    /// Draw `mesh` for `instanceCount` instances — or, when the mesh carries a GPU-written
-    /// indirect argument buffer, with those arguments. A `tracedOnly` mesh is never rasterised —
-    /// this is the one place every raster pass draws through, so the skip lives here.
-    @MainActor func drawMesh(_ mesh: IlluminatoramaMesh, instanceCount: Int) {
-        guard !mesh.tracedOnly else { return }
-        if let args = mesh.indirectDrawBuffer {
-            drawIndexedPrimitives(type: .triangle, indexType: mesh.indexType,
-                                  indexBuffer: mesh.indexBuffer, indexBufferOffset: 0,
-                                  indirectBuffer: args, indirectBufferOffset: 0)
-        } else {
-            drawIndexedPrimitives(type: .triangle, indexCount: mesh.indexCount,
-                                  indexType: mesh.indexType, indexBuffer: mesh.indexBuffer,
-                                  indexBufferOffset: 0, instanceCount: instanceCount,
-                                  baseVertex: 0, baseInstance: 0)
-        }
-    }
-}

@@ -20,6 +20,7 @@ let package = Package(
         .library(name: "VisualizerFlora", targets: ["VisualizerFlora"]),
         .library(name: "VisualizerHumans", targets: ["VisualizerHumans"]),
         .library(name: "Signack", targets: ["Signack"]),
+        .library(name: "SignackGPU", targets: ["SignackGPU"]),
     ],
     targets: [
         .target(
@@ -112,8 +113,15 @@ let package = Package(
         ),
         .testTarget(
             name: "SignackTests",
-            dependencies: ["Signack"],
+            dependencies: ["Signack", "SignackGPU"],
             path: "Signack/Tests/SignackTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "SignackGPU",
+            dependencies: ["Signack"],
+            path: "Signack/Sources/SignackGPU",
+            resources: [.process("Shaders")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .executableTarget(
