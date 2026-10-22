@@ -15,7 +15,10 @@ import PackageDescription
 //   S3 — visibility buffer: the cut also stamps each triangle's cluster id (SignackGPU); the id
 //        raster + resolve are host glue in the engine (IlluminatoramaRenderer+VisBuffer.swift,
 //        IlluminatoramaVisBuffer.metal) because the resolve IS the engine's material function
-//   (S4 Raster/ · S5 Foliage/ · S6 Scatter/ — not yet)
+//   S4 — software rasterizer for sub-pixel triangles (SignackGPU: SignackRaster + Shaders/SignackRaster.metal;
+//        the cut routes them per triangle, `SignackGPURouting`); the vertex stage and the merge into
+//        the S3 id attachment are host glue in the engine (IlluminatoramaRenderer+SoftRaster.swift)
+//   (S5 Foliage/ · S6 Scatter/ — not yet)
 //
 // WHY ITS OWN PACKAGE: Danny, 2026-10-21 — "None of this 12,000 line stuff. Make it proper."
 // Signack is not a corner of `IlluminatoramaRenderer.swift`; it is a module with a small public

@@ -1,7 +1,7 @@
 import Foundation
 import Metal
 
-/// The three compute pipelines of the S2 cut pass, built once per device.
+/// The compute pipelines of the S2 cut pass and the S4 software rasterizer, built once per device.
 ///
 /// **How the shader gets compiled.** Same mechanism as the engine (`SimPipelineCache`): the
 /// `.metal` file is a `.process` resource of this target, so in an Xcode build (the app, its test
@@ -15,6 +15,10 @@ public final class SignackGPUPipelines: @unchecked Sendable {
     let classify: MTLComputePipelineState
     let write: MTLComputePipelineState
     let finalize: MTLComputePipelineState
+    let rasterPrepare: MTLComputePipelineState
+    let rasterDepth: MTLComputePipelineState
+    let rasterIDs: MTLComputePipelineState
+    let rasterClear: MTLComputePipelineState
     /// "metallib" or "source" — which way the library was obtained (logged by hosts/tests).
     public let librarySource: String
 
@@ -38,20 +42,28 @@ public final class SignackGPUPipelines: @unchecked Sendable {
             return try? device.makeComputePipelineState(function: fn)
         }
         guard let c = pso("signack_cut_classify"), let w = pso("signack_cut_write"),
-              let f = pso("signack_cut_finalize") else { return nil }
+              let f = pso("signack_cut_finalize"), let rp = pso("signack_raster_prepare"),
+              let rd = pso("signack_raster_depth"), let ri = pso("signack_raster_ids"),
+              let rc = pso("signack_raster_clear") else { return nil }
         self.device = device
         classify = c; write = w; finalize = f
+        rasterPrepare = rp; rasterDepth = rd; rasterIDs = ri; rasterClear = rc
         librarySource = source
     }
 
     private static func library(_ device: MTLDevice) -> (MTLLibrary, String)? {
         if let lib = try? device.makeDefaultLibrary(bundle: .module),
-           lib.functionNames.contains("signack_cut_classify") {
+           lib.functionNames.contains("signack_cut_classify"), lib.functionNames.contains("signack_raster_depth") {
             return (lib, "metallib")
         }
-        let url = Bundle.module.url(forResource: "SignackCut", withExtension: "metal")
-            ?? Bundle.module.url(forResource: "SignackCut", withExtension: "metal", subdirectory: "Shaders")
-        guard let url, let src = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        // Each .metal is self-contained (no includes), so the sources concatenate into one library.
+        var src = ""
+        for name in ["SignackCut", "SignackRaster"] {
+            let url = Bundle.module.url(forResource: name, withExtension: "metal")
+                ?? Bundle.module.url(forResource: name, withExtension: "metal", subdirectory: "Shaders")
+            guard let url, let s = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+            src += s + "\n"
+        }
         let opts = MTLCompileOptions()
         if #available(macOS 15.0, iOS 18.0, tvOS 18.0, *) { opts.mathMode = .safe } else { opts.fastMathEnabled = false }
         guard let lib = try? device.makeLibrary(source: src, options: opts) else { return nil }

@@ -40,7 +40,9 @@ public struct SignackGPUCutUniforms: Sendable, Equatable {
     public var clusterCount: UInt32
     public var cull: UInt32
     public var capacity: UInt32
-    var pad0: UInt32 = 0
+    /// S4 — projected triangle area (px²) below which an on-screen triangle goes to the software
+    /// rasterizer (`SignackGPURouting.maxArea`); 0 = none.
+    public var softArea: Float
     var pad1: UInt32 = 0
 
     /// A plane every sphere is inside (used when the view carries no frustum).
@@ -61,15 +63,29 @@ public struct SignackGPUCutUniforms: Sendable, Equatable {
         self.clusterCount = UInt32(clusterCount)
         cull = view.frustum == nil ? 0 : 1
         self.capacity = UInt32(capacity)
+        softArea = 0
     }
 }
 
-/// Where the two indirect argument records sit in a cut's argument buffer.
+/// Where the indirect argument records sit in a cut's argument buffer.
+///
+/// The output index buffer (capacity C) is laid out `[off-screen | on-screen hardware | … | soft]`:
+/// shadow = `[0, S + P)`, primary = `[S, S + P)`, soft = `[C − Q, C)` (written from the top down,
+/// because a triangle's route is only known when its cluster is copied).
 public enum SignackGPUDrawArgs {
-    /// The on-screen part of the cut — the camera's G-buffer draw.
+    /// The on-screen triangles the HARDWARE rasterizer draws — the camera's G-buffer draw. With no
+    /// soft routing that is every on-screen cluster, exactly S2.
     public static let primaryOffset = 0
-    /// The whole cut, off-screen clusters included — every shadow pass (their casters reach past
-    /// the camera frustum).
+    /// The whole cut except the soft triangles — every shadow pass draws it AND the soft record
+    /// (casters reach past the camera frustum).
     public static let shadowOffset = 32
-    public static let bufferLength = 64
+    /// S4 — the on-screen triangles routed to the software rasterizer, as an indexed-indirect record
+    /// over the same buffer. Shadow passes always draw it; a camera pass that does not rasterise it
+    /// in software draws it with the hardware, so a routed triangle is never lost.
+    public static let softOffset = 64
+    /// S4 — `MTLDispatchThreadgroupsIndirectArguments` for ONE THREAD PER SOFT TRIANGLE at
+    /// `softThreadsPerGroup` threads per threadgroup (the host's vertex stage for the soft range).
+    public static let softDispatchOffset = 96
+    public static let softThreadsPerGroup = 64
+    public static let bufferLength = 128
 }

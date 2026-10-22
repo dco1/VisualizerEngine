@@ -116,6 +116,14 @@ public final class IlluminatoramaMesh {
     /// Optional per-triangle cluster id buffer parallel to `indexBuffer` (Signack's GPU cut writes
     /// it) — only the visibility buffer's cluster debug view reads it.
     public var visBufferClusterIDs: MTLBuffer?
+    /// Signack S4 (Daydream DH-1461): byte offsets, in `indirectDrawBuffer`, of a SECOND
+    /// indexed-indirect record over `indexBuffer` — triangles the host routed to the software
+    /// rasterizer (`IlluminatoramaSoftRasterizer`) — and of its `MTLDispatchThreadgroupsIndirect-
+    /// Arguments` (one thread per triangle, 64 per threadgroup). Shadow passes always draw it; a
+    /// camera pass that cannot rasterise it in software draws it with the hardware, so a routed
+    /// triangle is never lost. nil (the default): no second record.
+    public var softRasterDrawOffset: Int?
+    public var softRasterDispatchOffset: Int?
 
     /// Object-space AABB, computed once from the vertex buffer and cached.
     ///

@@ -1,4 +1,5 @@
 import Metal
+import simd
 import Signack
 
 /// One placed instance's GPU-selected cut: the compacted index list a raster draw reads, and the
@@ -14,17 +15,20 @@ public final class SignackGPUCut: @unchecked Sendable {
     /// The cluster each output triangle came from (`outputIndices[3t..<3t+3]` ↔ `outputClusterIDs[t]`)
     /// — S3: a visibility-buffer triangle id names its cluster with one load (debug view, S4/S5).
     public let outputClusterIDs: MTLBuffer
-    /// `SignackGPUDrawArgs` layout: primary record at 0, shadow record at 32.
+    /// `SignackGPUDrawArgs` layout: primary record at 0, shadow at 32, soft at 64, soft dispatch at 96.
     public let drawArgs: MTLBuffer
     let flags: MTLBuffer
     let counters: MTLBuffer
+    /// S4 — route this instance's sub-pixel on-screen triangles to the software rasterizer's range
+    /// (set by the host each frame before `encode`; nil = none, exactly S2).
+    public var routing: SignackGPURouting?
 
     public init?(hierarchy: SignackGPUHierarchy, device: MTLDevice, label: String = "Signack.cut") {
         guard let out = device.makeBuffer(length: max(4, hierarchy.maxCutIndices * 4), options: .storageModeShared),
               let clusterIDs = device.makeBuffer(length: max(4, hierarchy.maxCutIndices / 3 * 4), options: .storageModeShared),
               let args = device.makeBuffer(length: SignackGPUDrawArgs.bufferLength, options: .storageModeShared),
               let flags = device.makeBuffer(length: max(4, hierarchy.clusterCount), options: .storageModeShared),
-              let counters = device.makeBuffer(length: 16, options: .storageModeShared)
+              let counters = device.makeBuffer(length: 32, options: .storageModeShared)
         else { return nil }
         // Zeroed: an instance draws nothing until its first cut lands.
         memset(args.contents(), 0, args.length)
@@ -48,6 +52,17 @@ public final class SignackGPUCut: @unchecked Sendable {
     public func encode(view: SignackView, pipelines: SignackGPUPipelines, encoder enc: MTLComputeCommandEncoder) {
         var u = SignackGPUCutUniforms(view: view, clusterCount: hierarchy.clusterCount,
                                       capacity: hierarchy.maxCutIndices)
+        // Routing needs a threadgroup per cluster with a thread per triangle (≤ 128).
+        var route = SignackGPURouteUniforms(objectToClip: matrix_identity_float4x4, viewport: .zero, maxSpan: 0, vertexStride: 0)
+        if let r = routing, r.maxArea > 0, pipelines.write.maxTotalThreadsPerThreadgroup >= 128 {
+            u.softArea = r.maxArea
+            route = SignackGPURouteUniforms(objectToClip: r.objectToClip, viewport: r.viewport, maxSpan: r.maxSpan,
+                                            vertexStride: UInt32(r.vertexStride))
+            enc.setBuffer(r.vertices, offset: 0, index: 9)
+        } else {
+            enc.setBuffer(hierarchy.indexBuffer, offset: 0, index: 9)   // bound, never read
+        }
+        enc.setBytes(&route, length: MemoryLayout<SignackGPURouteUniforms>.stride, index: 8)
         let n = hierarchy.clusterCount
         enc.setBytes(&u, length: MemoryLayout<SignackGPUCutUniforms>.stride, index: 0)
         enc.setBuffer(hierarchy.clusterBuffer, offset: 0, index: 1)
@@ -76,6 +91,11 @@ public final class SignackGPUCut: @unchecked Sendable {
     /// without waiting, so it may lag the GPU by the frames in flight. For census, not for logic.
     public var lastPrimaryIndexCount: Int {
         Int(drawArgs.contents().load(fromByteOffset: SignackGPUDrawArgs.primaryOffset, as: UInt32.self))
+    }
+
+    /// Indices the last completed frame routed to the software rasterizer (S4).
+    public var lastSoftIndexCount: Int {
+        Int(drawArgs.contents().load(fromByteOffset: SignackGPUDrawArgs.softOffset, as: UInt32.self))
     }
 
     /// Indices the last completed frame drew in its shadow passes (the whole LOD cut).

@@ -6,7 +6,8 @@
 //
 //   1. illumi_vis_vs / illumi_vis_fs   rasterise the opted-in meshes with the G-buffer's own depth
 //      (test + write), writing ONLY a 64-bit id into a memoryless attachment (color 6):
-//        x = front-facing (bit 31) | draw slot + 1 (bits 16–30) | instance within the draw (0–15)
+//        x = front-facing (bit 31) | draw slot + 1 (bits 16–30) | software-rasterised (bit 15, S4)
+//            | instance within the draw (0–14)
 //        y = triangle index in the mesh's index buffer (indirect record's start + primitive id)
 //      Every other attachment is write-masked off, so what the conventional pass wrote stays put
 //      until step 2 decides who won. No material work at all: overdraw costs one id write.
@@ -42,7 +43,7 @@ struct VisBufferDraw {
 /// Mirror of `IlluminatoramaVisBufferResolveParams` (16 B).
 struct VisBufferResolveParams {
     float2 targetSize;   // the G-buffer's size in pixels
-    uint   debugMode;    // 0 shade · 1 cluster · 2 triangle · 3 draw — neon ids
+    uint   debugMode;    // 0 shade · 1 cluster · 2 triangle · 3 draw · 4 rasterizer — neon
     uint   _pad;
 };
 
@@ -84,7 +85,7 @@ fragment VisFragOut illumi_vis_fs(
     VisFragOut o;
     // `primitive_id` counts from the draw's first index; the record's indexStart says where that is.
     uint tri = args[2] / 3u + pid;
-    o.vis = uint2((ff ? 0x80000000u : 0u) | (((slot + 1u) & 0x7FFFu) << 16) | (in.iid & 0xFFFFu), tri);
+    o.vis = uint2((ff ? 0x80000000u : 0u) | (((slot + 1u) & 0x7FFFu) << 16) | (in.iid & 0x7FFFu), tri);
     return o;
 }
 
@@ -156,7 +157,7 @@ fragment GBufferOut illumi_vis_resolve_fs(
     if (vis.x == 0u) { discard_fragment(); GBufferOut none; return none; }
     if (kVisCount) { atomic_fetch_add_explicit(&counters[1], 1u, memory_order_relaxed); }
     const uint slot = ((vis.x >> 16) & 0x7FFFu) - 1u;
-    const uint iid  = vis.x & 0xFFFFu;
+    const uint iid  = vis.x & 0x7FFFu;
     const bool frontFacing = (vis.x >> 31) != 0u;
     const uint tri  = vis.y;
     const VisBufferDraw dr = draws[slot];
@@ -217,7 +218,11 @@ fragment GBufferOut illumi_vis_resolve_fs(
     GBufferOut o = illumiGBufferShade(in, frontFacing, duvdx, duvdy, worldPosFwidth, instances, frame,
                                       albedoUVScale, nonColorUVScale, albedoSliceMean, nonColorSliceMean,
                                       noInterior, albedoAtlas, nonColorAtlas);
-    if (rp.debugMode != 0u) {
+    if (rp.debugMode == 4u) {   // S4: which rasterizer wrote it — software magenta, hardware cyan
+        float3 c = (vis.x & 0x8000u) != 0u ? float3(1.0f, 0.0f, 0.85f) : float3(0.0f, 0.9f, 1.0f);
+        o.albedoMetallic = half4(half3(c), 0.0h);
+        o.emission = half4(half3(c * 0.6f), o.emission.w);
+    } else if (rp.debugMode != 0u) {
         uint id = rp.debugMode == 1u ? (dr.clusterIDs ? dr.clusterIDs[tri] : tri / 128u)
                 : rp.debugMode == 2u ? tri * 2654435761u
                 : slot;

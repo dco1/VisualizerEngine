@@ -25,11 +25,20 @@
 ///   the G-buffer pass and is shaded once per pixel by a resolve that writes the same G-buffer
 ///   targets. Signack's part is `SignackGPUCut.outputClusterIDs`: the cluster of every compacted
 ///   triangle, so a pixel's triangle id names its cluster with one load.
+/// - **S4 · Software rasterizer for sub-pixel triangles** (`SignackGPU`) — `SignackGPURouting` makes
+///   a cut send each on-screen triangle projecting under `maxArea` px² to a soft record (written from
+///   the top of the output); `SignackRaster` resolves window-space triangles (the host's vertex stage
+///   writes them) into a per-pixel nearest depth + id with the hardware's own coverage rule (1/256
+///   snap, top-left, `SignackRasterParityTests` checks it pixel for pixel against the real
+///   rasterizer). Two 32-bit passes — Apple7 has no 64-bit atomics. The engine's half
+///   (`IlluminatoramaRenderer+SoftRaster`) merges it through the G-buffer pass's depth test into the
+///   S3 id attachment. Built, parity-proven, lever OFF: at the 1 px cut its triangles cost the
+///   hardware nothing measurable (DH-1461 S4).
 /// - **Mesh utilities** — `SignackVertexWeld` (turn an unindexed soup into an indexed mesh).
 ///
 /// Everything here is pure, deterministic and seeded: the same input bakes the same output on
 /// every run, so host-side spec-keyed mesh caches stay valid.
 public enum Signack {
     /// The phase this module has reached. Bumped as phases land, so a host can log what it runs.
-    public static let phase = "S3"
+    public static let phase = "S4"
 }

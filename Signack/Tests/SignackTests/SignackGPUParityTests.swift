@@ -136,6 +136,85 @@ final class SignackGPUParityTests: XCTestCase {
                              SIMD4(0, 0, -(far * near) / zr, 0))
     }
 
+    /// S4 — per-triangle soft routing: an on-screen triangle projecting under `maxArea` px² (box
+    /// under `maxSpan`) lands in the soft range `[C − Q, C)`, every other on-screen triangle in the
+    /// primary range, and shadow + soft together are exactly the LOD cut.
+    func testSoftRoutingSplitsTheOnScreenCut() throws {
+        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
+              let pipelines = SignackGPUPipelines.shared(device: device) else { throw XCTSkip("no Metal") }
+        let (cm, atoms, cards) = SignackTestMeshes.cards(6000)
+        let h = SignackHierarchyBuilder().build(positions: cm.positions, indices: cm.indices, atoms: atoms,
+                                                simplifier: SignackCardSimplifier(cards: cards, seed: 7))
+        let src: [SIMD3<Float>] = cm.positions
+        let pos: [SIMD3<Float>] = src + h.derivedVertices.map { $0.position(source: src[Int($0.source)]) }
+        guard let gh = SignackGPUHierarchy(device: device, hierarchy: h),
+              let cut = SignackGPUCut(hierarchy: gh, device: device),
+              let vbuf = device.makeBuffer(bytes: pos, length: pos.count * MemoryLayout<SIMD3<Float>>.stride,
+                                           options: .storageModeShared) else { return XCTFail("buffers") }
+        let viewport = SIMD2<Float>(1920, 1200)
+        var split = 0
+        for d: Float in [1.5, 4, 10, 30, 90] {
+            for aim: Float in [0, 0.5] {
+                let c = h.bounds.center, r = h.bounds.w
+                let eye = c + SIMD3(d * r, 0.3 * d * r, 0.2 * r)
+                let toward = simd_normalize(c - eye), side = simd_normalize(simd_cross(toward, SIMD3(0, 1, 0)))
+                let m = Self.perspective(fovY: 0.8, aspect: 1.6, near: 0.01, far: 1000)
+                    * Self.lookAt(eye: eye, target: eye + simd_normalize(toward * cos(aim) + side * sin(aim)))
+                var view = SignackView.perspective(position: eye, fovY: 0.8, viewportHeight: viewport.y, threshold: 1)
+                view.frustum = SignackFrustum(clip: m)
+                cut.routing = SignackGPURouting(objectToClip: m, viewport: viewport, maxArea: 1, maxSpan: 4,
+                                                vertices: vbuf, vertexStride: MemoryLayout<SIMD3<Float>>.stride)
+                guard let cb = queue.makeCommandBuffer() else { return XCTFail("command buffer") }
+                SignackGPUCutPass.encode([(cut, view)], pipelines: pipelines, commandBuffer: cb)
+                cb.commit(); cb.waitUntilCompleted()
+                let sel = cut.readSelection()
+                // The CPU's routing of every on-screen triangle (ties within 1e-3 px² are skipped).
+                var wantSoft: [[UInt32]] = [], wantHW: [[UInt32]] = [], ties = Set<[UInt32]>()
+                for ci in sel.onScreen {
+                    let cl = h.clusters[Int(ci)]
+                    for k in stride(from: Int(cl.indexStart), to: Int(cl.indexStart) + 3 * Int(cl.triangleCount), by: 3) {
+                        let tri = Array(h.indices[k ..< k + 3])
+                        let (small, tie) = Self.routeSoft(tri.map { pos[Int($0)] }, m, viewport)
+                        if tie { ties.insert(tri.sorted()) }
+                        if small { wantSoft.append(tri.sorted()) } else { wantHW.append(tri.sorted()) }
+                    }
+                }
+                let out = cut.outputIndices.contents().bindMemory(to: UInt32.self, capacity: gh.maxCutIndices)
+                func tris(_ start: Int, _ count: Int) -> [[UInt32]] {
+                    stride(from: start, to: start + count, by: 3).map { Array(UnsafeBufferPointer(start: out + $0, count: 3)).sorted() }
+                }
+                let cap = gh.maxCutIndices
+                let gotSoft = tris(cap - cut.lastSoftIndexCount, cut.lastSoftIndexCount)
+                let gotHW = tris(cut.lastShadowIndexCount - cut.lastPrimaryIndexCount, cut.lastPrimaryIndexCount)
+                func key(_ v: [[UInt32]]) -> [[UInt32]] { v.filter { !ties.contains($0) }.sorted { $0.lexicographicallyPrecedes($1) } }
+                XCTAssertEqual(key(gotSoft), key(wantSoft), "d \(d) aim \(aim): the soft range")
+                XCTAssertEqual(key(gotHW), key(wantHW), "d \(d) aim \(aim): the primary range")
+                XCTAssertEqual(cut.lastShadowIndexCount + cut.lastSoftIndexCount, 3 * h.triangleCount(sel.lodCut))
+                let groups = Int(cut.drawArgs.contents().load(fromByteOffset: SignackGPUDrawArgs.softDispatchOffset, as: UInt32.self))
+                XCTAssertEqual(groups, (cut.lastSoftIndexCount / 3 + 63) / 64)
+                if !wantSoft.isEmpty && !wantHW.isEmpty { split += 1 }
+            }
+        }
+        cut.routing = nil
+        XCTAssertGreaterThanOrEqual(split, 3, "the views must split some cuts both ways")
+    }
+
+    /// The CPU reading of the routing test: projected area < 1 px² and box < 4 px; `tie` within 1e-3.
+    static func routeSoft(_ p: [SIMD3<Float>], _ m: simd_float4x4, _ viewport: SIMD2<Float>) -> (Bool, Bool) {
+        var px: [SIMD2<Float>] = []
+        for v in p {
+            let c: SIMD4<Float> = m * SIMD4<Float>(v, 1)
+            if c.w <= 1e-6 { return (false, false) }
+            px.append(SIMD2<Float>(c.x / c.w, c.y / c.w) * 0.5 * viewport)
+        }
+        let e1: SIMD2<Float> = px[1] - px[0], e2: SIMD2<Float> = px[2] - px[0]
+        let area: Float = 0.5 * abs(e1.x * e2.y - e1.y * e2.x)
+        let lo: SIMD2<Float> = simd_min(px[0], simd_min(px[1], px[2]))
+        let hi: SIMD2<Float> = simd_max(px[0], simd_max(px[1], px[2]))
+        let span: Float = max(hi.x - lo.x, hi.y - lo.y)
+        return (area < 1 && span < 4, abs(area - 1) < 1e-3 || abs(span - 4) < 1e-3)
+    }
+
     /// The Swift mirrors must match the shader's static_asserted sizes.
     func testGPUStructMirrorsMatchTheShader() {
         XCTAssertEqual(MemoryLayout<SignackGPUCluster>.stride, 64)
@@ -143,5 +222,7 @@ final class SignackGPUParityTests: XCTestCase {
         XCTAssertEqual(MemoryLayout<SignackGPUCluster>.offset(of: \.indexStart), 48)
         XCTAssertEqual(MemoryLayout<SignackGPUCutUniforms>.offset(of: \.camera), 96)
         XCTAssertEqual(MemoryLayout<SignackGPUCutUniforms>.offset(of: \.threshold), 112)
+        XCTAssertEqual(MemoryLayout<SignackGPUCutUniforms>.offset(of: \.softArea), 136)
+        XCTAssertEqual(MemoryLayout<SignackRasterTriangle>.stride, 48)
     }
 }

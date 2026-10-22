@@ -12,6 +12,8 @@ public enum IlluminatoramaVisBufferDebug: UInt32, Sendable {
     case triangles = 2
     /// Each opted-in draw (mesh) its own neon.
     case draws = 3
+    /// Which rasterizer wrote the pixel (Signack S4): magenta = software, cyan = hardware.
+    case rasterizer = 4
 }
 
 /// One opted-in draw as the resolve reads it — mirror of `VisBufferDraw` (IlluminatoramaVisBuffer.metal).
@@ -60,6 +62,8 @@ final class VisBufferState {
     var counters: MTLBuffer?
     /// Set when Metal refused a pipeline or the GPU cannot read its tile — the path stays off.
     var unavailable = false
+    /// Signack S4 — the software rasterizer's lever, pipelines and host hook.
+    let soft = SoftRasterState()
     /// The resolve reads its draw table with setFragmentBytes (≤ 4 KB).
     static let maxDraws = 4096 / MemoryLayout<IlluminatoramaVisBufferDraw>.stride
     static let log = Logger(subsystem: "Illuminatorama", category: "VisBuffer")
@@ -139,13 +143,14 @@ extension IlluminatoramaRenderer {
     /// G-buffer pass skips them, so a missing pipeline can never make a mesh vanish.
     func visBufferActive(extended: Bool) -> Bool {
         let env = Self.frameEnv("ILLUMINATORAMA_VISBUFFER")
-        guard env == "1" || (vbs.enabled && env != "0"), !vbs.unavailable, vbs.idTarget != nil else { return false }
+        guard env == "1" || (vbs.enabled && env != "0") || (softRasterRequested && !vbs.soft.dropForTest),
+              !vbs.unavailable, vbs.idTarget != nil else { return false }
         return ensureVisBufferResources(extended: extended)
     }
 
     /// The G-buffer pass's question: does this group draw through the visibility buffer instead?
     func defersToVisBuffer(_ mesh: IlluminatoramaMesh, kind: MeshKind, count: Int) -> Bool {
-        mesh.visBuffer && !mesh.tracedOnly && mesh.indexType == .uint32 && count <= 0xFFFF
+        mesh.visBuffer && !mesh.tracedOnly && mesh.indexType == .uint32 && count <= 0x7FFF
             && interiorMappedMeshKinds[kind] == nil
             && !fxs.gpuRepackTasks.contains { $0.kind == kind && !$0.direct }
     }
@@ -211,7 +216,7 @@ extension IlluminatoramaRenderer {
     /// The visibility-buffer draws, at the END of the G-buffer pass's encoder: id raster of `draws`
     /// against the pass's depth, then the fullscreen resolve into the G-buffer targets.
     func encodeVisBuffer(_ enc: MTLRenderCommandEncoder, _ draws: [VisBufferDeferredDraw], extended: Bool,
-                         cull passCull: MTLCullMode?) {
+                         cull passCull: MTLCullMode?, soft: SoftRasterFrame? = nil) {
         let key = (extended ? 1 : 0) | (vbs.countsOverdraw ? 2 : 0)
         guard !draws.isEmpty, let raster = vbs.raster[key], let resolve = vbs.resolve[key],
               let zero = vbs.zeroArgs else { return }
@@ -241,7 +246,14 @@ extension IlluminatoramaRenderer {
             } else {
                 enc.setFragmentBuffer(zero, offset: 0, index: 1)
             }
-            enc.drawMesh(d.mesh, instanceCount: d.group.count)
+            enc.drawMesh(d.mesh, instanceCount: d.group.count, withSoft: false)
+            // S4: a soft record the software rasterizer did not take this frame is drawn here.
+            if let rec = d.mesh.softRasterDrawOffset, let args = d.mesh.indirectDrawBuffer,
+               !(soft?.slots.contains(slot) ?? false) {
+                enc.setFragmentBuffer(args, offset: rec, index: 1)
+                enc.drawIndexedPrimitives(type: .triangle, indexType: d.mesh.indexType, indexBuffer: d.mesh.indexBuffer,
+                                          indexBufferOffset: 0, indirectBuffer: args, indirectBufferOffset: rec)
+            }
             table.append(IlluminatoramaVisBufferDraw(vertices: d.mesh.vertexBuffer.gpuAddress,
                                                      indices: d.mesh.indexBuffer.gpuAddress,
                                                      clusterIDs: d.mesh.visBufferClusterIDs?.gpuAddress ?? 0,
@@ -249,6 +261,12 @@ extension IlluminatoramaRenderer {
             enc.useResource(d.mesh.vertexBuffer, usage: .read, stages: .fragment)
             enc.useResource(d.mesh.indexBuffer, usage: .read, stages: .fragment)
             if let ids = d.mesh.visBufferClusterIDs { enc.useResource(ids, usage: .read, stages: .fragment) }
+        }
+
+        // (a′) S4 — the software rasterizer's nearest soft samples through the same depth test.
+        if let soft {
+            if cull != MTLCullMode.none { cull = MTLCullMode.none; enc.setCullMode(.none) }
+            encodeSoftRasterMerge(enc, soft, extended: extended)
         }
 
         // (b) resolve — one fullscreen triangle reading each pixel's id from tile memory, scissored
@@ -278,7 +296,7 @@ extension IlluminatoramaRenderer {
 
     /// The pixel rectangle covering every deferred draw's world bounds under this frame's camera
     /// (2 px of slack for the jitter); the whole target when any bound is open or crosses the eye.
-    private func visBufferScissor(_ draws: [VisBufferDeferredDraw]) -> MTLScissorRect {
+    func visBufferScissor(_ draws: [VisBufferDeferredDraw]) -> MTLScissorRect {
         let full = MTLScissorRect(x: 0, y: 0, width: width, height: height)
         let vp = gbs.gbufferCullVP
         var lo = SIMD2<Float>(repeating: .greatestFiniteMagnitude), hi = -lo

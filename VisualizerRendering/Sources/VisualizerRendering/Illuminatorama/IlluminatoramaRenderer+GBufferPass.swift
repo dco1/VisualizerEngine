@@ -66,6 +66,12 @@ extension IlluminatoramaRenderer {
         pass.depthAttachment.storeAction = .store
         pass.depthAttachment.clearDepth = 1.0
 
+        // Signack S3 — opted-in meshes are drawn by the visibility buffer at the end of the pass;
+        // S4 — their sub-pixel clusters are rasterised in software first, ahead of the pass.
+        let cullClip = cullVolume(gbs.gbufferCullVP)   // DH-0534
+        let (visDraws, deferred) = collectVisBufferDraws(extended: extended, cullClip: cullClip)
+        let soft = encodeSoftRaster(cb, visDraws, extended: extended)
+
         guard let enc = timedRenderEncoder(cb, pass, "gbuffer") else { return }
         enc.label = "Illuminatorama.gbuffer"
         enc.setRenderPipelineState(basePipe)
@@ -127,11 +133,8 @@ extension IlluminatoramaRenderer {
         var prevVertsBound = false
         var interiorBound = false
         var substrateBiased = false
-        let cullClip = cullVolume(gbs.gbufferCullVP)   // DH-0534
-        // Signack S3 — opted-in meshes are drawn by the visibility buffer right after this pass.
-        let visOn = visBufferActive(extended: extended)
-        var visDraws: [VisBufferDeferredDraw] = []
         for (gi, group) in gbs.meshGroups.enumerated() {
+            if deferred.contains(gi) { continue }   // the visibility buffer draws it (culled above)
             // Superquadric impostor box kinds are drawn by the impostor pipeline
             // below; RT-proxy kinds exist only in the TLAS; shadow-only kinds are
             // lighting occluders that draw solely into the shadow maps. All skipped here.
@@ -140,12 +143,6 @@ extension IlluminatoramaRenderer {
                shadowOnlyMeshKinds.contains(group.kind) { continue }
             guard let mesh = meshes[group.kind] else { continue }
             if shouldCull(gi, group, mesh, cullClip, drawn: \.gbufferDrawn, culled: \.gbufferCulled) { continue }
-            if visOn, visDraws.count < VisBufferState.maxDraws,
-               defersToVisBuffer(mesh, kind: group.kind, count: group.count) {
-                visDraws.append(VisBufferDeferredDraw(group: group, mesh: mesh,
-                    bounds: gi < gbs.meshGroupCullBounds.count ? gbs.meshGroupCullBounds[gi] : .unbounded))
-                continue
-            }
             // Two-sided meshes (open / dynamic MC fluid surfaces) render cull
             // `.none` so they don't go hollow when their back side faces the
             // camera; the fragment shader flips the normal for back faces.
@@ -194,7 +191,7 @@ extension IlluminatoramaRenderer {
             // Issue #65 — per-vertex previous positions for the deforming-mesh
             // motion vector. Only the kUsePrevVerts pipeline reads buffer(5).
             if let prevPos { enc.setVertexBuffer(prevPos, offset: 0, index: 5) }
-            enc.drawMesh(mesh, instanceCount: group.count)
+            enc.drawMesh(mesh, instanceCount: group.count, withSoft: !vbs.soft.dropForTest)
         }
 
         // ── Perfect analytic superquadric impostors ───────────────────────────
@@ -225,8 +222,27 @@ extension IlluminatoramaRenderer {
             }
         }
         // Signack S3 — the deferred meshes, last: ids against everything above, then the resolve.
-        encodeVisBuffer(enc, visDraws, extended: extended, cull: cull)
+        encodeVisBuffer(enc, visDraws, extended: extended, cull: cull, soft: soft)
         enc.endEncoding()
+    }
+
+    /// The groups the visibility buffer draws this frame (Signack S3), decided BEFORE the pass so the
+    /// software rasterizer (S4) can run ahead of it. Culling is decided here for them (and counted
+    /// once); `deferred` holds every group index this claimed, culled or not.
+    private func collectVisBufferDraws(extended: Bool, cullClip: IlluminatoramaClipVolume?)
+        -> ([VisBufferDeferredDraw], Set<Int>) {
+        guard visBufferActive(extended: extended) else { return ([], []) }
+        var draws: [VisBufferDeferredDraw] = [], claimed = Set<Int>()
+        for (gi, group) in gbs.meshGroups.enumerated() where draws.count < VisBufferState.maxDraws {
+            if gbs.impostorMeshKinds.contains(group.kind) || rts.rtProxyMeshKinds.contains(group.kind)
+                || shadowOnlyMeshKinds.contains(group.kind) { continue }
+            guard let mesh = meshes[group.kind], defersToVisBuffer(mesh, kind: group.kind, count: group.count) else { continue }
+            claimed.insert(gi)
+            if shouldCull(gi, group, mesh, cullClip, drawn: \.gbufferDrawn, culled: \.gbufferCulled) { continue }
+            draws.append(VisBufferDeferredDraw(group: group, mesh: mesh,
+                bounds: gi < gbs.meshGroupCullBounds.count ? gbs.meshGroupCullBounds[gi] : .unbounded))
+        }
+        return (draws, claimed)
     }
 
     func dispatch(_ enc: MTLComputeCommandEncoder,

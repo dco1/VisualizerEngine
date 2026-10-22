@@ -20,8 +20,12 @@ extension MTLRenderCommandEncoder {
     /// shadow passes draw the whole LOD cut. Signack compacts off-screen clusters first and
     /// on-screen ones after them, so both records index ONE buffer: shadow = [0, S + P), primary =
     /// [S, S + P). An indirect mesh draws as a single instance (the record's `instanceCount`).
+    ///
+    /// A mesh with a software-raster record (`softRasterDrawOffset`, S4) draws that record too — in
+    /// every shadow pass, and in a camera pass unless the caller rasterises it in software this frame
+    /// (`withSoft: false`).
     @MainActor func drawMesh(_ mesh: IlluminatoramaMesh, instanceCount: Int,
-                             pass: IlluminatoramaDrawPass = .primary) {
+                             pass: IlluminatoramaDrawPass = .primary, withSoft: Bool = true) {
         guard !mesh.tracedOnly else { return }
         if let args = mesh.indirectDrawBuffer {
             let offset = pass == .shadow ? (mesh.shadowIndirectDrawOffset ?? mesh.indirectDrawOffset)
@@ -29,6 +33,11 @@ extension MTLRenderCommandEncoder {
             drawIndexedPrimitives(type: .triangle, indexType: mesh.indexType,
                                   indexBuffer: mesh.indexBuffer, indexBufferOffset: 0,
                                   indirectBuffer: args, indirectBufferOffset: offset)
+            if withSoft, let soft = mesh.softRasterDrawOffset {
+                drawIndexedPrimitives(type: .triangle, indexType: mesh.indexType,
+                                      indexBuffer: mesh.indexBuffer, indexBufferOffset: 0,
+                                      indirectBuffer: args, indirectBufferOffset: soft)
+            }
         } else {
             drawIndexedPrimitives(type: .triangle, indexCount: mesh.indexCount,
                                   indexType: mesh.indexType, indexBuffer: mesh.indexBuffer,
@@ -46,7 +55,11 @@ extension IlluminatoramaMesh {
     public var drawnTriangleEstimate: Int {
         guard let args = indirectDrawBuffer, args.storageMode != .private,
               args.length >= indirectDrawOffset + 4 else { return indexCount / 3 }
-        return Int(args.contents().load(fromByteOffset: indirectDrawOffset, as: UInt32.self)) / 3
+        var n = Int(args.contents().load(fromByteOffset: indirectDrawOffset, as: UInt32.self))
+        if let soft = softRasterDrawOffset, args.length >= soft + 4 {   // S4: the soft-routed part
+            n += Int(args.contents().load(fromByteOffset: soft, as: UInt32.self))
+        }
+        return n / 3
     }
 
     /// How far (world units) `applyTreeWind` can move a vertex of a mesh whose packed wind weights
