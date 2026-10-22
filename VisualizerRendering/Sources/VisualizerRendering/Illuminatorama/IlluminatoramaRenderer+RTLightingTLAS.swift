@@ -335,4 +335,24 @@ extension IlluminatoramaRenderer {
         p.columns.2 = col(m.columns.2); p.columns.3 = col(m.columns.3)
         return p
     }
+
+    /// The TLAS transform of an instance whose descriptor `mask` is `mask`.
+    ///
+    /// **A mask-0 instance (raster-only, or a group with no BLAS) is COLLAPSED to a point.** No
+    /// ray ever intersects it, but its bounds still go into the instance BVH, and a ray pays for
+    /// every node it enters before the mask is tested at the leaf. Rebuild already left an
+    /// unslotted instance zeroed; the REFIT then wrote its real model matrix back over the zero
+    /// (paired with BLAS 0 — whatever mesh that is), so after one refit the BVH built around a
+    /// point held a box as big as that matrix. Daydream DH-1474: a yard planting's batched
+    /// buckets carry one raster-only placeholder per bucket whose matrix bounds the WHOLE
+    /// planting (the CPU group cull reads it); ~120 of them, refit to yard-sized boxes over the
+    /// house, cost the settled frame's RT glass pass +21 ms (21 → 42 ms) and RT lighting +2 ms.
+    /// The point sits 10 km below the scene rather than at the origin (usually inside the house),
+    /// so the collapsed instances share a node with nothing a ray is heading for.
+    func rtDescriptorTransform(_ m: simd_float4x4, mask: UInt32) -> MTLPackedFloat4x3 {
+        guard mask == 0 else { return packed4x3(m) }
+        var p = MTLPackedFloat4x3()
+        p.columns.3.y = -1.0e4
+        return p
+    }
 }

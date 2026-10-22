@@ -297,7 +297,13 @@ extension IlluminatoramaRenderer {
         let descPtr = descBuf.contents().bindMemory(to: MTLAccelerationStructureInstanceDescriptor.self, capacity: totalInstances)
         let dataPtr = dataBuf.contents().bindMemory(to: RTInstanceData.self, capacity: totalInstances)
         for group in gbs.meshGroups {
-            guard let mesh = meshes[group.kind], let s = slot[ObjectIdentifier(mesh)] else { continue }
+            guard let mesh = meshes[group.kind], let s = slot[ObjectIdentifier(mesh)] else {
+                // No BLAS (raster-only group): mask 0, parked where the refit will keep it (DH-1474).
+                for k in 0..<group.count where group.start + k < total {
+                    descPtr[group.start + k].transformationMatrix = rtDescriptorTransform(matrix_identity_float4x4, mask: 0)
+                }
+                continue
+            }
             for k in 0..<group.count {
                 let i = group.start + k
                 guard i < total else { break }
@@ -322,7 +328,7 @@ extension IlluminatoramaRenderer {
                 }
                 desc.options = .opaque
                 desc.intersectionFunctionTableOffset = 0
-                desc.transformationMatrix = packed4x3(inst.modelMatrix)
+                desc.transformationMatrix = rtDescriptorTransform(inst.modelMatrix, mask: desc.mask)
                 descPtr[i] = desc
                 dataPtr[i] = Self.rtInstanceRow(inst, normalBase: Float(s.normalBase))
             }
@@ -355,7 +361,10 @@ extension IlluminatoramaRenderer {
                 count: glassCount)
             for (gi, entry) in glassFlat.enumerated() {
                 let i = gls.rtGlassInstanceBase + gi
-                guard let mesh = meshes[entry.kind], let s = slot[ObjectIdentifier(mesh)] else { continue }
+                guard let mesh = meshes[entry.kind], let s = slot[ObjectIdentifier(mesh)] else {
+                    descPtr[i].transformationMatrix = rtDescriptorTransform(matrix_identity_float4x4, mask: 0)
+                    continue
+                }
                 let inst = entry.inst
                 var desc = MTLAccelerationStructureInstanceDescriptor()
                 desc.accelerationStructureIndex = UInt32(s.asIndex)
@@ -448,7 +457,9 @@ extension IlluminatoramaRenderer {
                 let i = group.start + k
                 guard i < total else { break }
                 let inst = instPtr[i]
-                descPtr[i].transformationMatrix = packed4x3(inst.modelMatrix)
+                // A mask-0 (raster-only / unslotted) instance stays collapsed — see
+                // `rtDescriptorTransform`; refit used to inflate it to its model matrix (DH-1474).
+                descPtr[i].transformationMatrix = rtDescriptorTransform(inst.modelMatrix, mask: descPtr[i].mask)
                 // Whole row through the ONE packer. Writing `nrm0`/`nrm1` straight
                 // from the normal matrix — as this did — wiped the albedo-atlas slice
                 // and the light-layer mask packed into their `.w` lanes, so from the
@@ -466,7 +477,7 @@ extension IlluminatoramaRenderer {
                 let i = gls.rtGlassInstanceBase + gi
                 guard i < cap else { break }
                 let inst = entry.inst
-                descPtr[i].transformationMatrix = packed4x3(inst.modelMatrix)
+                descPtr[i].transformationMatrix = rtDescriptorTransform(inst.modelMatrix, mask: descPtr[i].mask)
                 dataPtr[i] = Self.rtGlassInstanceRow(inst, normalBase: dataPtr[i].albedoTriBase.w,
                                                      cornerBase: dataPtr[i].emissionPad.w)
                 gPtr[gi] = IlluminatoramaRTGlassData(
