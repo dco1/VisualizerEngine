@@ -3559,6 +3559,8 @@ public final class IlluminatoramaRenderer {
         pfx.presentSync.markInFlight(writeIdx)
         cb.label = "Illuminatorama.frame"
         gbs.passTimer.beginFrame()   // reset per-pass GPU-timer sample assignment (env-gated)
+        // DH-1473 — no pass may trace a TLAS that `updateRTAccel` will rebuild later in this frame.
+        retireTLASIfTopologyMoved()
         // Opt-in host GPU work for THIS frame (see `onEncodeFrameCompute`); nil → nothing.
         onEncodeFrameCompute?(cb)
 
