@@ -840,10 +840,19 @@ public final class VolumetricCloudRenderer {
         // trap. `markDomeDirty()` is the escape hatch: opt-in, so hosts that never call it are
         // byte-identical, and it costs one extra bake per call.
         let now = CACurrentMediaTime()
+        // `skipUnchangedDome`: a throttle tick whose sky is bit-identical to the last bake's is
+        // not a bake — the dome would come out the same (see `domeKey`).
+        let key = skipUnchangedDome ? domeKey(uniforms) : nil
+        if domeDirtyIfChanged {
+            domeDirtyIfChanged = false
+            if key == nil || key != lastBakedDomeKey { domeDirty = true }
+        }
         if !domeDirty && now - lastDomeRenderTime < minRenderInterval { return }
+        if !domeDirty, let key, key == lastBakedDomeKey { return }
         guard domeSem.wait(timeout: .now()) == .success else { return }
         domeDirty = false
         lastDomeRenderTime = now
+        lastBakedDomeKey = key
         if !dispatchKernel(target: outputTexture,
                            resolution: resolution,
                            label: "volSkyRender.dome",
@@ -999,6 +1008,7 @@ public final class VolumetricCloudRenderer {
             cmd.waitUntilCompleted()  // gpu-ok: one-shot off-tick capture path; not per-frame
         }
         lastDomeRenderTime = CACurrentMediaTime()
+        lastBakedDomeKey = nil   // a capture bake: the next throttled tick compares afresh
     }
 
     // ── Reuse surface for an in-view (perspective) cloud pass ────────
@@ -1259,6 +1269,29 @@ public final class VolumetricCloudRenderer {
     private var lastDomeRenderTime: CFTimeInterval = 0
     private var domeDirty = false
 
+    /// **Skip a throttled dome bake that would reproduce the dome already baked** (opt-in, off =
+    /// every `minRenderInterval` tick re-bakes, as always). The dome is a pure function of the
+    /// uploaded uniforms (+ the baked noise volume and the burst lights, whose count/gain ride in
+    /// them), so a tick whose uniforms are bit-identical to the last bake's is skipped. The camera
+    /// position is quantised to `domeCameraQuantum` m first: the deck is a kilometre up, so an
+    /// orbit's few metres do not move it, and without the quantum every orbit frame would differ.
+    /// A static sky then bakes ONCE instead of 4×/s — measured in Daydream (DH-0957) on the
+    /// multiply-scattered dome, whose bake is ~22 ms at 2048×1024: orbit GPU p95 28 → 51 ms with
+    /// every tick baking. `markDomeDirty()` still forces a bake; a drifting deck (wind → `time`)
+    /// or a moving sun changes the uniforms and bakes at the throttle's cadence.
+    public var skipUnchangedDome = false
+    /// Camera-position quantum (m) for `skipUnchangedDome`'s comparison.
+    public var domeCameraQuantum: Float = 25
+    private var lastBakedDomeKey: [UInt8]?
+
+    /// The bytes `skipUnchangedDome` compares: the host-uploaded uniforms, camera quantised.
+    private func domeKey(_ uniforms: SkyUniforms) -> [UInt8] {
+        var u = uniforms
+        let q = max(domeCameraQuantum, 1e-3)
+        u.cameraPos = SIMD4<Float>((SIMD3<Float>(u.cameraPos.x, u.cameraPos.y, u.cameraPos.z) / q).rounded(.toNearestOrEven) * q, 0)
+        return withUnsafeBytes(of: &u) { Array($0.prefix(SkyUniforms.hostPrefixLength)) }
+    }
+
     // ── Sky radiance probes (opt-in; VolumetricCloudRenderer+RadianceProbe.swift) ──
     /// The planes whose sky radiance the next dome bakes measure (empty = never dispatched).
     public var radianceProbes: [RadianceProbe] = [] {
@@ -1279,6 +1312,13 @@ public final class VolumetricCloudRenderer {
     /// headless capture) can render an entirely stale dome. Purely additive: a host that never
     /// calls it behaves exactly as before.
     public func markDomeDirty() { domeDirty = true }
+
+    /// `markDomeDirty()` only if the next render's sky differs from the last baked dome's (with
+    /// `skipUnchangedDome` on; off, it is `markDomeDirty()`). For a host that re-asserts "the dome's
+    /// inputs may have changed" on every structural edit: an edit that did not change the sky —
+    /// a wall drag rebuilding every frame — then costs no bake.
+    public func markDomeDirtyIfChanged() { domeDirtyIfChanged = true }
+    private var domeDirtyIfChanged = false
 
     private static func makeTexture(device: MTLDevice,
                                     width: Int,
