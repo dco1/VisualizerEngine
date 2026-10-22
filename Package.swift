@@ -19,6 +19,7 @@ let package = Package(
         .library(name: "VisualizerVegetation", targets: ["VisualizerVegetation"]),
         .library(name: "VisualizerFlora", targets: ["VisualizerFlora"]),
         .library(name: "VisualizerHumans", targets: ["VisualizerHumans"]),
+        .library(name: "Signack", targets: ["Signack"]),
     ],
     targets: [
         .target(
@@ -100,6 +101,19 @@ let package = Package(
             name: "VisualizerHumansTests",
             dependencies: ["VisualizerHumans"],
             path: "VisualizerHumans/Tests/VisualizerHumansTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // Signack — the Nanite-class geometry system (Daydream DH-1461). Pure Swift + simd, no
+        // dependencies; see Signack/Package.swift for the phase map and why it is its own package.
+        .target(
+            name: "Signack",
+            path: "Signack/Sources/Signack",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "SignackTests",
+            dependencies: ["Signack"],
+            path: "Signack/Tests/SignackTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .executableTarget(
