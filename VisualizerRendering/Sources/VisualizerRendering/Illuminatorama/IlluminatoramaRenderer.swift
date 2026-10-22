@@ -217,7 +217,9 @@ public final class IlluminatoramaRenderer {
                                  rtActive: Bool, rtAutoDisabled: Bool, gpuRepackTasks: Int) {
         var tris = 0
         for g in gbs.meshGroups {
-            if let m = meshes[g.kind] { tris += g.count * (m.indexCount / 3) }
+            // A `tracedOnly` proxy is never rasterised — it is the RT side of an object whose
+            // raster side is counted under its own (raster-only) kind.
+            if let m = meshes[g.kind], !m.tracedOnly { tris += g.count * (m.indexCount / 3) }
         }
         return (instances.count, gbs.meshGroups.count, tris,
                 rts.rtTLASActive, rtAutoDisabled, fxs.gpuRepackTasks.count)

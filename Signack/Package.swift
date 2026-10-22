@@ -9,7 +9,8 @@ import PackageDescription
 //   Budget/  S0 — spend a triangle budget by visibility importance (this phase)
 //   LOD/     S0 — pick among pre-baked budgets by projected size (cheap, per frame, no rebake)
 //   Mesh/    S0 — small mesh utilities the later phases build on (vertex welding)
-//   (S1 Cluster/ · S2 Cull/ · S3 VisBuffer/ · S4 Raster/ · S5 Foliage/ · S6 Scatter/ — not yet)
+//   Cluster/ Simplify/ DAG/ Select/ Debug/  S1 — cluster LOD DAG, simplifiers, CPU reference selection
+//   (S2 Cull/ · S3 VisBuffer/ · S4 Raster/ · S5 Foliage/ · S6 Scatter/ — not yet)
 //
 // WHY ITS OWN PACKAGE: Danny, 2026-10-21 — "None of this 12,000 line stuff. Make it proper."
 // Signack is not a corner of `IlluminatoramaRenderer.swift`; it is a module with a small public

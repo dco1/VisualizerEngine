@@ -91,6 +91,16 @@ public final class IlluminatoramaMesh {
     /// Read when the cache bakes (a TLAS topology change); set it before `registerMesh`.
     public var surfaceCacheCards: Bool = true
 
+    /// A RAY-TRACING PROXY (Signack, Daydream DH-1461): the mesh lives in the TLAS — rays hit it,
+    /// it shadows/bounces/reflects/refracts — but NO raster pass draws it (G-buffer, sun cascades,
+    /// spot atlas, point cubes all skip it in `drawMesh`). Default false.
+    ///
+    /// It is the other half of a raster-only (`rtExcludeFully`) instance of the same object: the
+    /// raster side can then change its level of detail every few frames (a new index list, no new
+    /// mesh kind) while the traced side keeps one fixed cut — so a camera-distance LOD change never
+    /// touches TLAS topology (a 75–200 ms rebuild on a real house).
+    public var tracedOnly: Bool = false
+
     /// Object-space AABB, computed once from the vertex buffer and cached.
     ///
     /// Diagnostic-path only (the geometry auditors) — nothing per-frame reads
@@ -285,6 +295,25 @@ public final class IlluminatoramaMesh {
         self.cpuAuthoredVertices = false
     }
 
+    /// A second mesh over `source`'s vertex buffer with its OWN index buffer (Signack, DH-1461):
+    /// every level of detail of an object shares one set of vertices and differs only in which
+    /// triangles it indexes. The vertex buffer is not copied; provenance (and with it whether
+    /// visibility culling may trust the CPU-side bounds) is inherited from `source`, so a
+    /// CPU-authored object stays culled. `indexCount` may be less than the buffer holds (a
+    /// capacity buffer drawn through `indirectDrawBuffer`).
+    public init(sharingVerticesOf source: IlluminatoramaMesh, indexBuffer: MTLBuffer,
+                indexCount: Int, indexType: MTLIndexType = .uint32,
+                label: String = "Illuminatorama.sharedVertexMesh") {
+        precondition(indexCount > 0, "IlluminatoramaMesh sharing init given indexCount=0 (\(label))")
+        indexBuffer.label = "\(label).indices"
+        self.vertexBuffer = source.vertexBuffer
+        self.indexBuffer = indexBuffer
+        self.indexCount = indexCount
+        self.indexType = indexType
+        self.vertexCount = source.vertexCount
+        self.cpuAuthoredVertices = source.cpuAuthoredVertices
+    }
+
     // ── Procedural primitives ────────────────────────────────────────────────
 
     /// Unit cube centred at the origin, side length 1.
@@ -369,8 +398,10 @@ public final class IlluminatoramaMesh {
 
 extension MTLRenderCommandEncoder {
     /// Draw `mesh` for `instanceCount` instances — or, when the mesh carries a GPU-written
-    /// indirect argument buffer, with those arguments.
+    /// indirect argument buffer, with those arguments. A `tracedOnly` mesh is never rasterised —
+    /// this is the one place every raster pass draws through, so the skip lives here.
     @MainActor func drawMesh(_ mesh: IlluminatoramaMesh, instanceCount: Int) {
+        guard !mesh.tracedOnly else { return }
         if let args = mesh.indirectDrawBuffer {
             drawIndexedPrimitives(type: .triangle, indexType: mesh.indexType,
                                   indexBuffer: mesh.indexBuffer, indexBufferOffset: 0,
