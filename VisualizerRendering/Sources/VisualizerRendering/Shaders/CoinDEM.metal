@@ -6023,7 +6023,7 @@ static inline void cdJointSolveBias(PrepPtr P, thread CdJBodies& b)
 // table as coinJointPrepare read it. If they disagree (a slot re-bound to other bodies
 // while the frame was in flight), the pass falls back to the direct path, which takes the
 // bodies from the block, so a joint's impulse never lands on bodies it does not join.
-constant uint CD_JSOLVE_MAXJ = 40u;        // CoinDEMSolver.jointTGMaxJoints
+constant uint CD_JSOLVE_MAXJ = 20u;        // CoinDEMSolver.jointTGMaxJoints — kept small: the cached solve declares MAXJ × 496 B + MAXB × 64 B of threadgroup memory and Metal caps a threadgroup at 32 768 B (validation aborts above it; Apple TV hits it)
 constant uint CD_JSOLVE_MAXB = 80u;        // CoinDEMSolver.jointTGMaxBodies
 constant uint CD_JLIST_PAIRS = 1024u;      // list[1024 + k] = joint k's (local A | local B << 16)
 constant uint CD_JLIST_BODIES = 2048u;     // list[2048 + i] = cached body i's slot

@@ -53,6 +53,10 @@ final class ParticleState {
     /// `nil` when the shaders are absent from the library — streak draws are
     /// silently skipped in that case (logged once at init).
     var streakPipeline: MTLRenderPipelineState?
+    /// Near-camera crystal-flake sources (set each frame by the host) and their pipeline
+    /// (`illumi_crystal_vs/fs`). `nil` pipeline ⇒ the pass is silently skipped.
+    var crystalFlakeSources: [IlluminatoramaRenderer.CrystalFlakeSource] = []
+    var crystalPipeline: MTLRenderPipelineState?
 
     /// Wall-clock of the previous `render()` call, used to derive a real
     /// `dt` for particle integration even when the host's frame rate
@@ -564,6 +568,64 @@ extension IlluminatoramaRenderer {
         enc.endEncoding()
     }
 
+    // ── Crystal flakes (near-camera snow drawn as real ice-crystal shapes) ──────────────────────
+
+    /// Draw knobs for one crystal-flake source; mirrors `CrystalDrawParams` in IlluminatoramaCrystals.metal.
+    public struct CrystalFlakeDrawParams {
+        public var camPos: SIMD4<Float>
+        public var moonDir: SIMD4<Float>
+        public var glint: SIMD4<Float>
+        public var misc: SIMD4<Float>     // x intensity, y bokeh-full distance, z sharp distance, w bokeh strength
+        public init(camPos: SIMD3<Float>, moonToward: SIMD3<Float>, glintColor: SIMD3<Float>, glintStrength: Float,
+                    intensity: Float = 1, bokehFullDistance: Float = 0.9, sharpDistance: Float = 2.4,
+                    bokehStrength: Float = 0.30) {
+            self.camPos = SIMD4(camPos, 0); self.moonDir = SIMD4(simd_normalize(moonToward), 0)
+            self.glint = SIMD4(glintColor, glintStrength)
+            self.misc = SIMD4(intensity, bokehFullDistance, sharpDistance, bokehStrength)
+        }
+    }
+
+    /// One pool of crystal flakes: a buffer of 64-byte `CrystalFlake`s (see the shader), drawn as `count`
+    /// quads (6 vertices each, generated from `vertex_id`).
+    public struct CrystalFlakeSource {
+        public var buffer: MTLBuffer
+        public var count: Int
+        public var params: CrystalFlakeDrawParams
+        public init(buffer: MTLBuffer, count: Int, params: CrystalFlakeDrawParams) {
+            self.buffer = buffer; self.count = count; self.params = params
+        }
+    }
+
+    /// Replace this frame's crystal-flake sources (call from the host tick).
+    public func setCrystalFlakes(_ sources: [CrystalFlakeSource]) { fxs.crystalFlakeSources = sources }
+
+    /// Additive HDR draw of every crystal-flake source into `hdrTexture`, after the TAA resolve (so the
+    /// moving flakes never trail), depth-tested against the opaque scene.
+    func encodeCrystalFlakeDraw(_ cb: MTLCommandBuffer) {
+        guard !fxs.crystalFlakeSources.isEmpty, let pipeline = fxs.crystalPipeline else { return }
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = gbs.hdrTexture
+        pass.colorAttachments[0].loadAction = .load
+        pass.colorAttachments[0].storeAction = .store
+        pass.depthAttachment.texture = gbs.depthTexture
+        pass.depthAttachment.loadAction = .load
+        pass.depthAttachment.storeAction = .store
+        guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return }
+        enc.label = "Illuminatorama.crystals.draw"
+        enc.setRenderPipelineState(pipeline)
+        enc.setDepthStencilState(fxs.particleDepthState)
+        enc.setCullMode(.none)
+        enc.setVertexBuffer(frameUniformBuffer, offset: 0, index: 2)
+        for source in fxs.crystalFlakeSources where source.count > 0 {
+            enc.setVertexBuffer(source.buffer, offset: 0, index: 0)
+            var p = source.params
+            enc.setVertexBytes(&p, length: MemoryLayout<CrystalFlakeDrawParams>.stride, index: 3)
+            enc.setFragmentBytes(&p, length: MemoryLayout<CrystalFlakeDrawParams>.stride, index: 3)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: source.count * 6)
+        }
+        enc.endEncoding()
+    }
+
     /// Phase 4.11 — per-emitter integration step. One compute dispatch per
     /// emitter, covering its full capacity (dead particles early-return
     /// inside the kernel so the cost is bounded by capacity, not by
@@ -760,6 +822,30 @@ extension IlluminatoramaRenderer {
             }
         } else {
             Self.log.warning("Illuminatorama: particleStreakVS/FS not found in library — streak draws disabled")
+        }
+
+        // Crystal flakes — real six-fold snowflake shapes as camera-independent quads, shaded by an SDF in
+        // the fragment shader (`IlluminatoramaCrystals.metal`). Additive HDR, depth-tested, no depth write.
+        // Optional like the streak pipeline: absent shaders just disable the pass.
+        if let cvs = library.makeFunction(name: "illumi_crystal_vs"),
+           let cfs = library.makeFunction(name: "illumi_crystal_fs") {
+            let cd = MTLRenderPipelineDescriptor()
+            cd.label = "Illuminatorama.crystals"
+            cd.vertexFunction = cvs
+            cd.fragmentFunction = cfs
+            cd.colorAttachments[0].pixelFormat = .rgba16Float
+            cd.colorAttachments[0].isBlendingEnabled = true
+            cd.colorAttachments[0].rgbBlendOperation = .add
+            cd.colorAttachments[0].alphaBlendOperation = .add
+            cd.colorAttachments[0].sourceRGBBlendFactor = .one
+            cd.colorAttachments[0].destinationRGBBlendFactor = .one
+            cd.colorAttachments[0].sourceAlphaBlendFactor = .one
+            cd.colorAttachments[0].destinationAlphaBlendFactor = .one
+            cd.depthAttachmentPixelFormat = .depth32Float
+            s.crystalPipeline = try? device.makeRenderPipelineState(descriptor: cd)
+            if s.crystalPipeline == nil {
+                Self.log.error("Illuminatorama: crystalPipeline compilation failed — crystal flakes disabled")
+            }
         }
 
         // Depth state: less-equal compare, NO write. Lets each particle
