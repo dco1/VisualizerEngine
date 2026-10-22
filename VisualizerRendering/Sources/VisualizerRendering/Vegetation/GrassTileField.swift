@@ -49,6 +49,28 @@ public final class GrassTileField {
         public var foliageSSS: Bool = true
         /// How far the outer rings converge on `midColor` (0 = never, 1 = fully).
         public var farTint: Float = 0.85
+        /// Distance band (m) over which blades converge on `midColor` (scaled by `farTint`).
+        public var farRange: SIMD2<Float> = SIMD2(2, 40)
+        /// Brightness lift reached at the far end of `liftRange` (1 = none). A dense sward shades
+        /// darker than the open ground it stands on, so far blades are lifted to meet it.
+        public var farLift: Float = 1.9
+        public var liftRange: SIMD2<Float> = SIMD2(3, 30)
+        /// Blade HEIGHT growth per ring (×(1 + this·r)), so a widened far blade keeps a blade's
+        /// proportions. 0 = every ring as tall as ring 0 (a mown lawn stays mown in the distance).
+        public var heightPerRing: Float = 0.28
+        /// Root darkening toward the ground: the lowest third of every blade is multiplied down to
+        /// this (1 = none). Reeves & Blau root occlusion — the sward's base is in its own shadow.
+        public var rootOcclusion: Float = 1.0
+        /// How far a distant blade's shading normal is bent toward the ground's (0.2 near → this far),
+        /// over `normalUpRange` (m). Near 1 a far blade lights exactly like the turf it stands on, so a
+        /// low sun cannot pick it out as a bright fleck.
+        public var farNormalUp: Float = 0.60
+        public var normalUpRange: SIMD2<Float> = SIMD2(1.5, 45)
+        /// Steep-view thinning: blades whose cos(elevation from the camera) is below `steepCos.x` are
+        /// dropped, all kept above `steepCos.y`; it comes in over `steepRange` metres (horizontal) so
+        /// the blades underfoot always stay. `x ≥ y` (the default) disables it.
+        public var steepCos: SIMD2<Float> = SIMD2(1, 1)
+        public var steepRange: SIMD2<Float> = SIMD2(2, 6)
         /// Fraction of the slots the output buffers can hold. Only blades inside the view cone are
         /// written (compacted), so the buffers need room for the worst view, not for every slot;
         /// a blade past capacity is dropped (far rings first, as they claim space last).
@@ -183,11 +205,14 @@ public final class GrassTileField {
                 sizes: SIMD4(p.baseCellSize, p.baseHalfWidth, p.heightMin, p.heightRange),
                 maskRect: maskRect,
                 rootC: SIMD4(p.rootColor, 0), midC: SIMD4(p.midColor, 0), tipC: SIMD4(p.tipColor, 0),
-                misc: SIMD4(p.foliageSSS ? 0 : 1, p.farTint, 0, 0),
+                misc: SIMD4(p.foliageSSS ? 0 : 1, p.farTint, p.farLift, p.heightPerRing),
                 ringInfo: GrassTileUniforms.RingInfo(p.rings),
                 ringCount: UInt32(p.rings.count), segments: UInt32(p.segments),
                 capacity: UInt32(capacity), pad1: 0,
-                plane0: planes[0], plane1: planes[1], plane2: planes[2], plane3: planes[3])
+                plane0: planes[0], plane1: planes[1], plane2: planes[2], plane3: planes[3],
+                tune: SIMD4(p.farRange.x, p.farRange.y, p.liftRange.x, p.liftRange.y),
+                tune2: SIMD4(p.rootOcclusion, p.farNormalUp, p.normalUpRange.x, p.normalUpRange.y),
+                tune3: SIMD4(p.steepCos.x, p.steepCos.y, p.steepRange.x, p.steepRange.y))
         enc.setComputePipelineState(resetPipeline)
         enc.setBuffer(counterBuffer, offset: 0, index: 0)
         enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
@@ -304,6 +329,9 @@ struct GrassTileUniforms {
     var capacity: UInt32
     var pad1: UInt32
     var plane0: SIMD4<Float>, plane1: SIMD4<Float>, plane2: SIMD4<Float>, plane3: SIMD4<Float>
+    var tune: SIMD4<Float>
+    var tune2: SIMD4<Float>
+    var tune3: SIMD4<Float>
 
     /// Eight `uint4` (x = window, y = blades per cell) laid out as a Metal `uint4[8]`.
     struct RingInfo {

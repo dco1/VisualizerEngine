@@ -30,13 +30,18 @@ struct GrassTileUniforms {
     float4 rootC;
     float4 midC;
     float4 tipC;
-    float4 misc;       // x = vertex alpha (0 = foliage thin-sheet flag, 1 = opaque), y = far tint strength (0…1)
+    float4 misc;       // x = vertex alpha (0 = foliage thin-sheet flag, 1 = opaque), y = far tint strength (0…1),
+                       // z = far brightness lift, w = blade height growth per ring
     uint4  ringInfo[8];    // per ring: x = W (cells per side), y = K (blades per cell)
     uint   ringCount;
     uint   segments;       // S: rows = S + 1
     uint   capacity;       // blades the output buffers can hold (kept blades beyond it are dropped)
     uint   pad1;
     float4 planes[4];      // inward-facing view planes through the camera: xyz = unit normal, w = offset
+    float4 tune;           // x,y = far-tint distance band (m); z,w = brightness-lift distance band (m)
+    float4 tune2;          // x = root occlusion (1 = none); y = far normal-to-up blend; z,w = its distance band (m)
+    float4 tune3;          // steep-view thinning: x,y = cos(elevation) band (keep 0 → 1); z,w = horizontal distance band
+                           // over which the thinning comes in (m). x ≥ y disables it.
 };
 
 static inline uint gt_pcg(uint v) {
@@ -122,7 +127,16 @@ kernel void grassTileGenerate(
     float wOut = (r + 1u == u.ringCount) ? 1.0f - smoothstep(0.82f * rOut, rOut, distH)
                                          : 1.0f - smoothstep(rInNext, rOut, distH);
 
-    const bool keep = gt_h01(key ^ 0x5BD1E995u) < wIn * wOut * m;
+    // Steep-view thinning (DH-1083): seen from above, a distant blade is a dark stroke on the turf, not
+    // grass — the ground tile carries a lawn there (GPUOpen / Tsushima distance hand-off). Seen at a
+    // grazing angle the same blades are the lawn's fuzz, so they stay. cosE = horizontal / 3-D distance.
+    float steep = 1.0f;
+    if (u.tune3.x < u.tune3.y) {
+        const float cosE = length(xz - cam) / max(length(float3(xz.x, gy, xz.y) - u.camera.xyz), 1e-4f);
+        const float thin = 1.0f - smoothstep(u.tune3.x, u.tune3.y, cosE);
+        steep = 1.0f - thin * smoothstep(u.tune3.z, u.tune3.w, length(xz - cam));
+    }
+    const bool keep = gt_h01(key ^ 0x5BD1E995u) < wIn * wOut * m * steep;
 
     const uint rows = S + 1u;
 
@@ -133,7 +147,7 @@ kernel void grassTileGenerate(
     // Far blades grow in height as well as width so a widened blade keeps a blade's proportions (long and
     // narrow) instead of fattening into a cone: aspect stays ~1:6 and above at every ring.
     const float hgt    = (u.sizes.z + u.sizes.w * gt_h01(key ^ 0x68E31DA4u))
-                       * (0.75f + 0.5f * clump) * (1.0f + 0.28f * float(r));
+                       * (0.75f + 0.5f * clump) * (1.0f + u.misc.w * float(r));
     const float hw     = u.sizes.y * pow(u.shape.w, float(r)) * (0.65f + 0.60f * gt_h01(key ^ 0xB5297A4Du));
     const float az     = gt_h01(key ^ 0x1B873593u) * 6.2831853f;
     const float2 dir   = float2(cos(az), sin(az));
@@ -205,23 +219,25 @@ kernel void grassTileGenerate(
         // far more light than the horizontal ground it grows from and the field reads as glittering
         // confetti. Blending toward up makes blade and ground light alike; the blend grows with
         // the ring so the far field is almost purely ground-lit.
-        const float distT = smoothstep(1.5f, 45.0f, dist);   // continuous in DISTANCE, not ring index (no visible band)
-        const float toUp = mix(0.20f, 0.60f, distT);
+        const float distT = smoothstep(u.tune2.z, u.tune2.w, dist);   // continuous in DISTANCE, not ring index (no visible band)
+        const float toUp = mix(0.20f, u.tune2.y, distT);
         const float3 nL = normalize(mix(normalize(nrm - perp * fan), up, toUp));
         const float3 nR = normalize(mix(normalize(nrm + perp * fan), up, toUp));
 
         float3 col = (t < 0.5f) ? mix(u.rootC.xyz, u.midC.xyz, t * 2.0f)
                                 : mix(u.midC.xyz,  u.tipC.xyz, (t - 0.5f) * 2.0f);
         col *= tint;
+        // Root occlusion: the base of a dense sward stands in its neighbours' shadow.
+        col *= mix(u.tune2.x, 1.0f, smoothstep(0.0f, 0.45f, t));
         // Far rings converge on the palette's MID colour (≈ the ground tile's mean): in the distance
         // the blades are texture breakup on a ground of the same colour, not individually lit
         // flakes — Tsushima tints distant terrain toward the grass colour for the same reason.
-        const float far = smoothstep(2.0f, 40.0f, dist) * u.misc.y;
+        const float far = smoothstep(u.tune.x, u.tune.y, dist) * u.misc.y;
         col = mix(col, u.midC.xyz * tint, far);
         // A dense sward occludes itself: with ground-blended shading each blade still reads darker than
         // the open ground it stands on (AO from its neighbours). Lift the far blades to meet the ground
         // tile's brightness so the field reads as one surface instead of dark flecks on a lighter plane.
-        col *= mix(1.0f, 1.9f, smoothstep(3.0f, 30.0f, dist));
+        col *= mix(1.0f, u.misc.z, smoothstep(u.tune.z, u.tune.w, dist));
         // alpha 0 = the engine's foliage thin-sheet flag (same as the PBD ribbons).
         const float4 c4 = float4(col, u.misc.x);
         Vertex vl, vr;
