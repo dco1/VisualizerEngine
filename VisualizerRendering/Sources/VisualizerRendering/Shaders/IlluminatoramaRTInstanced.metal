@@ -12,6 +12,8 @@
 #include "IlluminatoramaBSDF.h"
 // Daydream DH-1304 — the per-term AOV set (slice indices + the capture's frame parameters).
 #include "IlluminatoramaAOV.h"
+// Signack S5 (DH-1461) — the thin-sheet transmittance a path vertex crosses (`kPathFlagThinTransmission`).
+#include "IlluminatoramaLeafOptics.h"
 using namespace metal;
 using namespace raytracing;
 
@@ -227,6 +229,8 @@ struct RTInstUniforms {
 /// stack too; its sun and lamp NEE keep only the diffuse share, so it is a valid cross-check only with those
 /// off (16 | 32). Never set by a host.
 #define kPathFlagDebugGlossyBrute 8192u
+/// Signack S5 (Daydream DH-1461 / DH-1361) — thin-sheet transmission at path vertices (see the vertex loop).
+#define kPathFlagThinTransmission 32768u
 
 // ── Curve primitives (#60 item 7) ────────────────────────────────────────────
 // `kRTCurvesEnabled` specializes the kernel for a TLAS that contains curve
@@ -1338,12 +1342,37 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 }
             }
         }
+        // Signack S5 (DH-1461 / DH-1361) — a THIN SHEET (a leaf, a sheer, a paper shade): the instance's
+        // transmission ratio rides `nrm2.w` (IlluminatoramaLeafOptics.h). One more lobe, picked ∝ its
+        // albedo against the reflecting stack: TRANSMIT ⇒ the path crosses to the far side (the next
+        // vertex's frame is −N, so its NEE sees the sun / sky / windows BEHIND the sheet and its
+        // continuation leaves from there), weight τ/pT; REFLECT ⇒ the stack above, weight 1/(1 − pT).
+        // τ is capped by 1 − A so a bright sheet never returns more than it receives. A sheet vertex
+        // neither reads nor writes the radiance cache (its cell would mix both faces' light).
+        bool thinV = false, thinT = false;
+        float3 thinW = float3(1.0);
+        if ((u.pathFlags & kPathFlagThinTransmission) != 0u) {
+            float ratio = thinSheetRatioFromLane(sec.insts[h.instanceID].nrm2.w);
+            if (ratio > 0.0) {
+                thinV = true;
+                float3 Ath = glossy ? Ahit : saturate(secondaryAlbedo(h, pFull, sec, albedoAtlas));
+                float3 tau = min(thinSheetTransmittance(Ath, ratio), max(1.0 - Ath, 0.0));
+                float pT = pathLuma(tau) / max(pathLuma(tau) + pathLuma(Ath), 1e-6);
+                float xi = illumiSobolOwen2DShuffled(sampleIndex, illumiPixelSeed(gid, 0x5448494Eu + v)).y;   // 'THIN'
+                if (pT > 0.0 && xi < pT) {
+                    thinT = true; thinW = tau / pT;
+                    specNext = false; bruteNext = false;
+                } else {
+                    thinW = float3(1.0 / max(1.0 - pT, 1e-4));
+                }
+            }
+        }
         // DH-1344 — the radiance cache at this vertex (vertex index v + 1), BEFORE its albedo and its Russian
         // roulette: the cached mean is the vertex's whole outgoing radiance, roulette included, so a read after
         // the roulette (with the throughput from before its 1/q) came out q× dark — 0.17 st, at any cell size.
         // DH-1308 — with glossy vertices a cell holds the LAMBERT radiance A·E/π of the diffuse picks only,
         // and a diffuse pick reads it × its own layer weight / pick probability (`lobeW`).
-        if (rcRead && !specNext && (v + 1u >= kRCMinVertex || res.distance > kRCFirstMinCells * rcCell)) {
+        if (rcRead && !specNext && !thinV && (v + 1u >= kRCMinVertex || res.distance > kRCFirstMinCells * rcCell)) {
             uint s = rcFind(rcKeys, rcKey(h.P, h.N, rcCell), false);
             if (s != 0xFFFFFFFFu) {
                 float cnt = atomic_load_explicit(&rcData[s * 4u + 3u], memory_order_relaxed);
@@ -1356,13 +1385,18 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 }
             }
         }
-        if (rcWrite && !specNext && rcN < kRCMaxVerts) {    // record it, to write its suffix at the end
+        if (rcWrite && !specNext && !thinV && rcN < kRCMaxVerts) {    // record it, to write its suffix at the end
             rcSlot[rcN] = rcFind(rcKeys, rcKey(h.P, h.N, rcCell), true);
             rcT[rcN] = glossy ? T * lobeW : T; rcL[rcN] = L;
             ++rcN;
         }
+        if (thinV && !thinT) T *= thinW;               // Signack S5 — the reflect branch's 1/(1 − pT)
         Tnee = T;                                       // DH-1363 inc. 2b — what arrived at this vertex
-        if (glossy) {
+        if (thinT) {
+            // Signack S5 — crossed the sheet: a Lambert vertex on its far face.
+            T *= thinW;
+            specV = false; bruteV = false; st.on = false; pick = float3(1.0, 0.0, 0.0);
+        } else if (glossy) {
             T *= (specNext || bruteNext) ? lobeW : lobeW * Ahit;
             specV = specNext; lobe = nextLobe;
             bruteV = bruteNext; lobeC = nextLobeC; bruteWdA = bruteWdANext;
@@ -1371,7 +1405,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         float3 A = saturate(secondaryAlbedo(h, pFull, sec, albedoAtlas));
         T *= A;
         }
-        P = h.P; N = h.N;
+        P = h.P; N = thinT ? -h.N : h.N;
         layerBits = secondaryLayerBits(h.instanceID, sec.insts);
         if (v >= 1u) {
             // DH-1308 — a glossy pick's T is still 1/p (its lobe weight lands with the continuation), so

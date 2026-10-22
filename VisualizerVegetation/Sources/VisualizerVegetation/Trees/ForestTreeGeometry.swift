@@ -120,6 +120,11 @@ public enum ForestTreeGeometry {
         public var cardMark:  Int32 = -1
         /// Next unused card ordinal. Bumped once per `emitLeafCard`.
         public var nextCardID: Int32 = 0
+        /// Signack S5 — per-branch wind (`ForestTreeGeometry+BranchWind.swift`). Opt-in: false keeps
+        /// every vertex's uv untouched (the Forest scene); true records each primary limb as it grows
+        /// and `bakeBranchWind()` writes the limb records the renderer's limb wind reads.
+        public var branchWind: Bool = false
+        public var limbs: [Limb] = []
         // ── Wood centerline skeleton for RT curve primitives (#60 item 7 2c) ─
         // When `captureCurves` is on (the real Forest build; off for AssetLab's
         // single-tree lab), `emitTrunkMesh` + `emitBranchMesh` append one strand

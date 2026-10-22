@@ -15,6 +15,7 @@
 // DH-1014 — the layered BSDF's energy bookkeeping (multiscatter, the diffuse base's share,
 // the sheen LUT) and the cloth-sheen lobe itself, shared with the DFG bake + the RT kernel.
 #include "IlluminatoramaBSDF.h"
+#include "IlluminatoramaLeafOptics.h"
 using namespace metal;
 
 static inline float distributionGGX(float NdotH, float roughness) {
@@ -1378,7 +1379,20 @@ kernel void illumi_lighting(
     // surface (back == 0 when the sun is on the viewer's side of the leaf, and
     // the whole branch is skipped for non-foliage).
     float3 transmission = float3(0.0);
-    if (nrH.a < 0.5h && frame.leafTransmission > 0.0) {   // foliage + scene opt-in
+    // The share of `transmission` that is ENVIRONMENT light (sky through the far face), so the AOV
+    // split can file it under `environment` instead of `direct` (the sum is unchanged).
+    float3 transmissionEnv = float3(0.0);
+    // Signack S5 (DH-1461 / DH-1361) — the PHYSICAL thin-leaf model (IlluminatoramaLeafOptics.h):
+    // τ from the leaf's own albedo + thickness (its class tag) + the scene's τ/ρ ratio
+    // (`leafTransmission`), Lambert + a mild normalised forward lobe. The sky behind the leaf is
+    // added in the IBL block below. Only foliage whose tag carries a thickness (a bake that opted in)
+    // and only when the host sets the ratio; grass and every legacy writer (tag 0) keep the #58
+    // backlight just below, unchanged.
+    float3 leafTau = float3(0.0);
+    if (nrH.a > half(kLeafPhysicalTagMin) && nrH.a < 0.5h && frame.leafTransmittanceRatio > 0.0) {
+        leafTau = leafTransmittance(albedo, leafThickness(float(nrH.a)), frame.leafTransmittanceRatio);
+        transmission = leafSunTransmission(N, V, Ld, frame.directionalLightColor, visibility, leafTau);
+    } else if (nrH.a < 0.5h && frame.leafTransmission > 0.0) {   // foliage + scene opt-in (legacy)
         float back    = saturate(dot(-N, Ld));           // sun on the FAR face
         float forward = pow(saturate(dot(V, -Ld)), 3.0); // viewing toward the sun
         // ROUND-6 POLISH #3: BACKLIT-ONLY GATE. The old `through = back·(0.40+0.60·
@@ -1765,11 +1779,13 @@ kernel void illumi_lighting(
         if (tt > 0.001) {
             float back = saturate(dot(-N, Ld));
             float3 incident = frame.directionalLightColor * back * visibility;
+            float3 skyBack = float3(0.0);
             if (kLightingIBLEnabled) {
                 constexpr sampler ttSampler(filter::linear, mip_filter::linear);
-                incident += float3(irradianceCube.sample(ttSampler, -N).rgb) * frame.iblIntensity * interiorIBLK;
+                skyBack = float3(irradianceCube.sample(ttSampler, -N).rgb) * frame.iblIntensity * interiorIBLK;
             }
-            transmission += albedo * incident * tt;
+            transmission += albedo * (incident + skyBack) * tt;
+            transmissionEnv += albedo * skyBack * tt;
         }
     }
     // The DIFFUSE lobe's interior factor. As the host's irradiance bands take over
@@ -1918,6 +1934,16 @@ kernel void illumi_lighting(
             irradianceSat = mix(irradianceSat, band, interiorBandW);
         }
         float3 diffuseIBL = kD * irradianceSat * albedo;
+        // Signack S5 — the SKY behind a leaf, through it: τ × the outdoor irradiance along −N, with
+        // the same AO / interior / intensity factors as the diffuse lobe (see the LIMITS note in
+        // IlluminatoramaLeafOptics.h). Not part of the traced lanes' hand-off: they trace the near
+        // hemisphere only, so this is the one estimate of the far one in every lane.
+        if (any(leafTau > 0.0)) {
+            float3 skyBehind = float3(irradianceCube.sample(cubeSampler, -N).rgb);
+            float3 leafSky = leafTau * skyBehind * (ao * interiorIBLKd * frame.iblIntensity);
+            transmission += leafSky;
+            transmissionEnv += leafSky;
+        }
 
         // Specular IBL: sample prefilteredCube along the world reflection
         // vector at the roughness-derived mip, then apply the split-sum DFG
@@ -2297,10 +2323,10 @@ kernel void illumi_lighting(
                         ? apertureSum : float3(0.0);
         float3 envShare  = aovEnvDiffuse * baseAttenForAOV;
         float3 handoff   = handed ? aovDiffSkyPre : float3(0.0);
-        float3 tDirect   = directSun + transmission + dirFillSum + pointSum + spotSum + (areaSum - apertureSum)
+        float3 tDirect   = directSun + (transmission - transmissionEnv) + dirFillSum + pointSum + spotSum + (areaSum - apertureSum)
                          + (clearcoat + hotdogCC - aovCoatEnv) + plushSheenTerm;
         float3 tSpecular = aovSpecPre + aovCoatEnv;
-        float3 tEnv      = envShare + apertureSum - (handed ? envShare + handedAp : float3(0.0));
+        float3 tEnv      = envShare + transmissionEnv + apertureSum - (handed ? envShare + handedAp : float3(0.0));
         float3 tIndirect = indirect - aovSpecPre - envShare
                          - (handed ? aovDiffSkyPre - envShare - handedAp : float3(0.0));
         float w = aovU.blend, t = aovAirT;

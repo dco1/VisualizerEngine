@@ -22,6 +22,10 @@ extension ForestTreeGeometry {
         let segWorld = parentWorld * rotY(yaw) * rotX(pitch) * rotY(roll)
         let basePos  = SIMD3<Float>(segWorld.columns.3.x, segWorld.columns.3.y, segWorld.columns.3.z)
         let tipDir   = SIMD3<Float>(segWorld.columns.1.x, segWorld.columns.1.y, segWorld.columns.1.z)
+        // Signack S5 — a PRIMARY limb's whole recursion is one limb record (per-branch wind,
+        // `ForestTreeGeometry+BranchWind.swift`); no-op unless the soup opted in.
+        let limb = depth == 1 ? s.openLimb(pivot: basePos, seed: site.seed) : -1
+        defer { s.closeLimb(limb) }
         let crownRXS = max(crownRX, 0.1)
         let crownRYS = max(crownRY, 0.1)
 

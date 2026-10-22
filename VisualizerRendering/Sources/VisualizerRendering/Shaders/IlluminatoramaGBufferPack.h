@@ -11,6 +11,7 @@
 #include "IlluminatoramaCommon.h"
 #include "IlluminatoramaMaterial.h"
 #include "IlluminatoramaGBufferDeform.h"
+#include "IlluminatoramaLeafOptics.h"
 using namespace metal;
 
 struct GBufferOut {
@@ -51,7 +52,10 @@ static inline __attribute__((always_inline)) GBufferOut illumiGBufferPack(
     // leaf vertices with colour ALPHA 0 (opaque geometry keeps alpha 1); the
     // deferred lighting pass reads w < 0.5 to add the back-light term. No-op
     // for every existing scene (they all ship vertex alpha 1 → w stays 1).
-    half foliageFlag = (in.vertexColor.a < 0.5) ? 0.0h : 1.0h;
+    // Signack S5 (DH-1461 / DH-1361) — a foliage vertex alpha in (0, 0.45] is the leaf's relative
+    // THICKNESS (IlluminatoramaLeafOptics.h `leafThickness`), carried in the tag itself: still < 0.5,
+    // so every foliage test is unchanged, and 0 (every legacy foliage writer) is the reference blade.
+    half foliageFlag = (in.vertexColor.a < 0.5) ? half(clamp(in.vertexColor.a, 0.0f, kLeafThicknessCodeMax)) : 1.0h;
     // Sausage casing (vertexColor.a = 0.75 from pbdTubeExpand) forwards its
     // flag into normalRoughness.w so the deferred lighting pass can add the
     // clearcoat glaze lobe. Every foliage test is `w < 0.5` and the matRough

@@ -318,6 +318,9 @@ extension IlluminatoramaRenderer {
         // the base's metalness + roughness in `emissionPad.w`, the clearcoat's strength + roughness in
         // `nrm2.w` (0 strength ⇒ no coat). Read only under `kPathFlagGlossyVertices`.
         c2.w = inst.clearcoat > 0 ? rtPackMaterialLane(inst.clearcoat, inst.clearcoatRoughness) : 0
+        // Signack S5 — a coat-free row carries its thin-sheet transmission ratio as 1 + t (≥ 1, so the
+        // coat decode still reads "none"); `thinSheetRatioFromLane` (IlluminatoramaLeafOptics.h).
+        if inst.clearcoat <= 0, inst.thinTransmission > 0 { c2.w = 1 + min(inst.thinTransmission, 1) }
         return RTInstanceData(nrm0: c0, nrm1: c1, nrm2: c2,
                               albedoTriBase: SIMD4(inst.albedo, normalBase),
                               emissionPad: SIMD4(inst.emission, rtPackMaterialLane(inst.metallic, inst.roughness)))

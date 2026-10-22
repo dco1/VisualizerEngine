@@ -184,7 +184,10 @@ struct FrameUniforms {
     uint     debandDitherEnabled;   // 1 = TPDF dither before 8-bit store
     // Former DDGI irradiance-cache pair (DH-1425) — kept as pad so the struct layout is unchanged.
     uint     _padDDGI0;
-    float    _padDDGI1;
+    // Signack S5 (Daydream DH-1461 / DH-1361) — τ/ρ of the PHYSICAL thin-leaf model
+    // (IlluminatoramaLeafOptics.h) for foliage whose tag carries a thickness (> 0). 0 = off. Was
+    // `_padDDGI1`: same 4 bytes, stride unchanged.
+    float    leafTransmittanceRatio;
     // Leaf thin-sheet transmission strength (issue #58). 0 = OFF (the default for
     // every scene) so the foliage-flag branch in illumi_lighting_fs is a no-op
     // unless a scene opts in. Foliage is flagged in normalRoughness.w. Lands in

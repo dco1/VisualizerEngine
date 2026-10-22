@@ -9,6 +9,7 @@
 
 #include <metal_stdlib>
 #include "IlluminatoramaCommon.h"
+#include "IlluminatoramaBranchWind.h"
 using namespace metal;
 
 // ── Animated UV DOMAIN WARP ───────────────────────────────────────────────────
@@ -55,7 +56,7 @@ static inline float2 warpUV(float2 uv, float4 w, float t) {
 // normal-mapped surface carries, so on ordinary geometry `windAttr.x` is a surface
 // direction, not a sway weight. Without the instance gate this function swings any
 // mesh whose tangents happen to point +X.
-static inline float3 applyTreeWind(float3 wp, float4 windAttr, float time,
+static inline float3 applyTreeWind(float3 wp, float4 windAttr, float2 uv, float time,
                                    float windStrength, float windHeading) {
     float sway = windAttr.x;
     if (sway < 0.0001 || windStrength <= 0.0) return wp;
@@ -78,7 +79,9 @@ static inline float3 applyTreeWind(float3 wp, float4 windAttr, float time,
         wp.z += flutter * windStrength * 0.05 * sin(time * 5.7 + phase * 3.0 + wp.x * 1.1);
         wp.y += flutter * windStrength * 0.035 * sin(time * 6.0 + phase * 3.5);
     }
-    return wp;
+    // Signack S5 — the limb layer on top (IlluminatoramaBranchWind.h): no-op unless the vertex's uv
+    // carries a limb record, which only a bake that opted in (Daydream's yard trees) writes.
+    return applyBranchWind(wp, uv, time, windStrength, windHeading, gust);
 }
 
 // Issue #65 — per-vertex motion vectors for animated GPU meshes (fluid /
@@ -290,11 +293,11 @@ static inline IllumiDeformed illumiDeform(Vertex v, float3 prevObjP, Instance in
     // Tree wind displacement — see the long note in `illumi_vs`.
     float windStrength = frame._padPhase2A * inst.windScale;
     float prevWindTime = frame.time - frame.windPrevDelta;
-    worldP.xyz = applyTreeWind(worldP.xyz, v.tangent, frame.time,
+    worldP.xyz = applyTreeWind(worldP.xyz, v.tangent, v.uv, frame.time,
                                windStrength, frame._padPhase2B);
     float3 worldN = (inst.normalMatrix * float4(v.normal, 0.0)).xyz;
     float4 prevWorldP = prevInst.modelMatrix * float4(prevObjP, 1.0);
-    prevWorldP.xyz = applyTreeWind(prevWorldP.xyz, v.tangent, prevWindTime,
+    prevWorldP.xyz = applyTreeWind(prevWorldP.xyz, v.tangent, v.uv, prevWindTime,
                                    windStrength, frame._padPhase2B);
     float3 worldT = (inst.modelMatrix * float4(v.tangent.xyz, 0.0)).xyz;
     worldP.xyz = applySway(worldP.xyz, inst.modelMatrix, inst.swayMode,

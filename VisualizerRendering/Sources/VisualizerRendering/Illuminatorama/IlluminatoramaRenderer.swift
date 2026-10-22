@@ -332,6 +332,14 @@ public final class IlluminatoramaRenderer {
     /// RT sun pass (`RTUniforms.leafTransmission`, which owns the sun under RT).
     /// Foliage fragments are flagged by tagging leaf vertices with colour alpha 0.
     public var leafTransmission: Float = 0
+    /// Signack S5 (Daydream DH-1461 / DH-1361) — τ/ρ (at the pigment peak; 0.6–1.0 for real
+    /// broadleaves) of the PHYSICAL thin-leaf model (`IlluminatoramaLeafOptics.h`), applied to every
+    /// foliage pixel whose vertex alpha carries a THICKNESS (0 < alpha ≤ 0.45): the transmitted
+    /// colour comes from the leaf's own albedo + thickness, the sun behind it transmits through a
+    /// Lambert + mild forward lobe, and the sky behind it transmits too. Foliage at alpha 0 (grass,
+    /// every legacy writer) keeps the #58 `leafTransmission` backlight. 0 (default) = off: every host
+    /// that never sets it is unchanged. Deferred kernel only (the RT soup sun pass is legacy).
+    public var leafTransmittanceRatio: Float = 0
     /// Plush material strengths (Teddy Bear Press). `plushSheen` = fur retro-
     /// reflective edge sheen; `plushTransmission` = backlit thin-fabric SSS. Both
     /// 0 = OFF (default) → exact no-op for every scene. Only the plush-flagged
@@ -796,6 +804,14 @@ public final class IlluminatoramaRenderer {
     /// (a textured roughness or metalness is not tapped at a path vertex — the albedo is).
     public var rtPathGlossyVertices: Bool = false {
         didSet { if rtPathGlossyVertices != oldValue { rts.rcNeedsClear = true } }   // the cache changes meaning
+    }
+    /// Signack S5 (Daydream DH-1461 / DH-1361) — a path vertex on an instance with `thinTransmission`
+    /// > 0 (and no clearcoat) is a THIN SHEET: with probability ∝ its transmittance the path crosses
+    /// it (cosine about −N, τ from `IlluminatoramaLeafOptics.h` `thinSheetTransmittance`) and the
+    /// vertex's NEE sees the light behind it. Light then passes through a canopy, a sheer or a paper
+    /// shade in an export. Default FALSE (every sheet is an opaque Lambert vertex, as before).
+    public var rtPathThinTransmission: Bool = false {
+        didSet { if rtPathThinTransmission != oldValue { rts.rcNeedsClear = true } }
     }
     /// DH-1308 — the roughness FLOOR of a glossy path vertex's lobes (perceptual; ≤ 0.045 ⇒ the
     /// material's own). Path regularisation: every glossy vertex here is reached through the primary's

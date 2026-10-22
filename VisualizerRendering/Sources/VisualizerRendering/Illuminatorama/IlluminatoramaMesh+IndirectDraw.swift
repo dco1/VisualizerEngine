@@ -69,6 +69,12 @@ extension IlluminatoramaMesh {
     /// and Signack's per-cluster culling both pad by it.
     nonisolated public static func windReach(strength: Float, max w: (sway: Float, flutter: Float)) -> Float {
         guard strength > 0 else { return 0 }
-        return strength * (w.sway * (1.5 + 0.18) + w.flutter * (0.05 + 0.05 + 0.035))
+        return strength * (w.sway * (1.5 + 0.18) + w.flutter * (0.05 + 0.05 + 0.035) + branchWindReach)
     }
+
+    /// Signack S5 — the limb layer's reach per unit strength (`applyBranchWind`,
+    /// IlluminatoramaBranchWind.h): `kBranchWindAmp` 0.55 × (1 along the wind + 0.45 across + 0.25 up),
+    /// limb weight ≤ 1. Added for every mesh (it cannot see which vertices carry a limb record): a
+    /// few centimetres of extra padding at a yard breeze, a valid bound always.
+    nonisolated public static let branchWindReach: Float = 0.55 * (1 + 0.45 + 0.25)
 }
