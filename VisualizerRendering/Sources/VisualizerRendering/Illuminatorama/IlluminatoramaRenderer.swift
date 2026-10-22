@@ -90,6 +90,8 @@ public final class IlluminatoramaRenderer {
     let fxs = ParticleState()
     /// G-buffer targets and pipelines, instance buffers, mesh draw groups, scene-stability counters, frame pacing.
     let gbs = GBufferState()
+    /// Signack S3 visibility buffer: pipelines, the memoryless id target, the A/B lever.
+    let vbs = VisBufferState()
     /// Per-term AOV capture.
     let aovs = AOVState()
 

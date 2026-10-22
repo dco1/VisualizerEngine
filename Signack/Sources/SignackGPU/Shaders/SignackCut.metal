@@ -8,7 +8,9 @@
 //                             off screen (shadow casters only), 2 = in the cut and on screen.
 //                             Off-screen indices are counted.
 //   2. signack_cut_write      one THREADGROUP per cluster: thread 0 claims an output range with one
-//                             atomic, every thread copies one triangle. Off-screen clusters fill
+//                             atomic, every thread copies one triangle — and (S3) stamps the
+//                             cluster id of each output triangle, so a visibility-buffer triangle id
+//                             names its cluster with one load. Off-screen clusters fill
 //                             [0, S), on-screen clusters [S, S + P) — so the SHADOW draw is the
 //                             whole LOD cut [0, S + P) and the PRIMARY draw is just [S, S + P).
 //   3. signack_cut_finalize   one thread: both indirect argument records, then zero the counters
@@ -107,6 +109,7 @@ kernel void signack_cut_write(
     device atomic_uint*             counters   [[buffer(3)]],
     device const uint*              dagIndices [[buffer(4)]],
     device uint*                    outIndices [[buffer(5)]],
+    device uint*                    outCluster [[buffer(7)]],   // S3: cluster id per output triangle
     uint cid                                   [[threadgroup_position_in_grid]],
     uint t                                     [[thread_position_in_threadgroup]],
     uint tgSize                                [[threads_per_threadgroup]])
@@ -127,7 +130,10 @@ kernel void signack_cut_write(
     uint b = base;
     for (uint k = t; k < n; k += tgSize) {
         uint dst = b + k;
-        if (dst < U.capacity) outIndices[dst] = dagIndices[start + k];
+        if (dst < U.capacity) {
+            outIndices[dst] = dagIndices[start + k];
+            if (k % 3u == 0u) outCluster[dst / 3u] = cid;   // ranges start on a triangle (b % 3 == 0)
+        }
     }
 }
 

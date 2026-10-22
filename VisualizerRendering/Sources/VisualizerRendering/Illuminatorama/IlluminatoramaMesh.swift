@@ -107,6 +107,16 @@ public final class IlluminatoramaMesh {
     /// touches TLAS topology (a 75–200 ms rebuild on a real house).
     public var tracedOnly: Bool = false
 
+    /// Draw this mesh's CAMERA pass through the visibility buffer (Signack S3, Daydream DH-1461):
+    /// it skips the conventional G-buffer draw, rasterises only a triangle id against the
+    /// G-buffer's depth, and is shaded once per covered pixel by the resolve, which writes the same
+    /// G-buffer targets (`IlluminatoramaRenderer+VisBuffer`). Shadow passes are unchanged. Needs
+    /// 32-bit indices; ignored (drawn conventionally) otherwise or when the host lever is off.
+    public var visBuffer: Bool = false
+    /// Optional per-triangle cluster id buffer parallel to `indexBuffer` (Signack's GPU cut writes
+    /// it) — only the visibility buffer's cluster debug view reads it.
+    public var visBufferClusterIDs: MTLBuffer?
+
     /// Object-space AABB, computed once from the vertex buffer and cached.
     ///
     /// Diagnostic-path only (the geometry auditors) — nothing per-frame reads

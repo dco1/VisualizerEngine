@@ -60,6 +60,7 @@ extension IlluminatoramaRenderer {
             pass.colorAttachments[5].storeAction = .store
             pass.colorAttachments[5].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
         }
+        attachVisBufferTarget(pass)   // Signack S3: the memoryless triangle-id attachment (color 6)
         pass.depthAttachment.texture = gbs.depthTexture
         pass.depthAttachment.loadAction = .clear
         pass.depthAttachment.storeAction = .store
@@ -127,6 +128,9 @@ extension IlluminatoramaRenderer {
         var interiorBound = false
         var substrateBiased = false
         let cullClip = cullVolume(gbs.gbufferCullVP)   // DH-0534
+        // Signack S3 — opted-in meshes are drawn by the visibility buffer right after this pass.
+        let visOn = visBufferActive(extended: extended)
+        var visDraws: [VisBufferDeferredDraw] = []
         for (gi, group) in gbs.meshGroups.enumerated() {
             // Superquadric impostor box kinds are drawn by the impostor pipeline
             // below; RT-proxy kinds exist only in the TLAS; shadow-only kinds are
@@ -136,6 +140,12 @@ extension IlluminatoramaRenderer {
                shadowOnlyMeshKinds.contains(group.kind) { continue }
             guard let mesh = meshes[group.kind] else { continue }
             if shouldCull(gi, group, mesh, cullClip, drawn: \.gbufferDrawn, culled: \.gbufferCulled) { continue }
+            if visOn, visDraws.count < VisBufferState.maxDraws,
+               defersToVisBuffer(mesh, kind: group.kind, count: group.count) {
+                visDraws.append(VisBufferDeferredDraw(group: group, mesh: mesh,
+                    bounds: gi < gbs.meshGroupCullBounds.count ? gbs.meshGroupCullBounds[gi] : .unbounded))
+                continue
+            }
             // Two-sided meshes (open / dynamic MC fluid surfaces) render cull
             // `.none` so they don't go hollow when their back side faces the
             // camera; the fragment shader flips the normal for back faces.
@@ -214,6 +224,8 @@ extension IlluminatoramaRenderer {
                 enc.drawMesh(mesh, instanceCount: group.count)
             }
         }
+        // Signack S3 — the deferred meshes, last: ids against everything above, then the resolve.
+        encodeVisBuffer(enc, visDraws, extended: extended, cull: cull)
         enc.endEncoding()
     }
 

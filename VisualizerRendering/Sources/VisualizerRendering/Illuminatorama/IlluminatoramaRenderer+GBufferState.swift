@@ -205,6 +205,7 @@ extension IlluminatoramaRenderer {
         // Light-layer attachment (R32Uint) — carries the per-fragment layer bitfield.
         pdesc.colorAttachments[4].pixelFormat = .r32Uint
         pdesc.depthAttachmentPixelFormat = .depth32Float
+        declareVisBufferAttachment(pdesc, device: device)
         // No vertex descriptor — the shader reads from a device-buffer of
         // Vertex via [[vertex_id]]. Simpler than wiring a vertex descriptor
         // and matches the Swift/Metal struct mirror more directly.
@@ -238,6 +239,7 @@ extension IlluminatoramaRenderer {
             sqdesc.colorAttachments[3].pixelFormat = .rg16Float
             sqdesc.colorAttachments[4].pixelFormat = .r32Uint
             sqdesc.depthAttachmentPixelFormat = .depth32Float
+            declareVisBufferAttachment(sqdesc, device: device)
             s.superquadricImpostorPipeline =
                 try? device.makeRenderPipelineState(descriptor: sqdesc)
         }

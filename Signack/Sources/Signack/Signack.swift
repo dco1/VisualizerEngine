@@ -20,11 +20,16 @@
 ///   indirect records (on-screen for the camera, whole cut for shadows); `SignackGPUCutPass` encodes
 ///   the per-cluster `isInCut` + padded frustum test + compaction for a batch of instances. The CPU
 ///   `SignackSelection` stays the reference it is gated against (`SignackGPUParityTests`).
+/// - **S3 · Visibility buffer** (host glue in the engine: `IlluminatoramaRenderer+VisBuffer`,
+///   `IlluminatoramaVisBuffer.metal`) — a mesh flagged `visBuffer` rasterises only a triangle id in
+///   the G-buffer pass and is shaded once per pixel by a resolve that writes the same G-buffer
+///   targets. Signack's part is `SignackGPUCut.outputClusterIDs`: the cluster of every compacted
+///   triangle, so a pixel's triangle id names its cluster with one load.
 /// - **Mesh utilities** — `SignackVertexWeld` (turn an unindexed soup into an indexed mesh).
 ///
 /// Everything here is pure, deterministic and seeded: the same input bakes the same output on
 /// every run, so host-side spec-keyed mesh caches stay valid.
 public enum Signack {
     /// The phase this module has reached. Bumped as phases land, so a host can log what it runs.
-    public static let phase = "S2"
+    public static let phase = "S3"
 }

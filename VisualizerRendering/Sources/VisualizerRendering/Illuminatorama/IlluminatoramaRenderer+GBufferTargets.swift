@@ -118,6 +118,7 @@ extension IlluminatoramaRenderer {
         d.colorAttachments[4].pixelFormat = .r32Uint
         if extended { d.colorAttachments[5].pixelFormat = .rgba16Float }
         d.depthAttachmentPixelFormat = .depth32Float
+        Self.declareVisBufferAttachment(d, device: device)
         let p = try? device.makeRenderPipelineState(descriptor: d)
         if extended { gbs.gbufferPipelineInteriorExt = p } else { gbs.gbufferPipelineInterior = p }
         return p
@@ -141,6 +142,7 @@ extension IlluminatoramaRenderer {
         d.colorAttachments[4].pixelFormat = .r32Uint
         d.colorAttachments[5].pixelFormat = .rgba16Float
         d.depthAttachmentPixelFormat = .depth32Float
+        declareVisBufferAttachment(d, device: device)
         return try device.makeRenderPipelineState(descriptor: d)
     }
 

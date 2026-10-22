@@ -58,6 +58,16 @@ final class SignackGPUParityTests: XCTestCase {
                 let onSet = Set(gpu.onScreen)
                 XCTAssertEqual(Array(drawn[offStart...]).sorted(), h.flatten(onSet.sorted()).sorted(),
                                "\(name) primary range holds exactly the on-screen clusters")
+                // S3: every output triangle carries the id of the cluster it was copied from — the
+                // per-cluster multiset of (cluster, index) pairs equals the DAG's.
+                let tris = cut.lastShadowIndexCount / 3
+                let ids = cut.outputClusterIDs.contents().bindMemory(to: UInt32.self, capacity: max(tris, 1))
+                var stamped: [UInt32: [UInt32]] = [:]
+                for t in 0..<tris { stamped[ids[t], default: []] += drawn[3 * t ..< 3 * t + 3] }
+                XCTAssertEqual(Set(stamped.keys), Set(gpu.lodCut), "\(name) cluster ids name the cut")
+                for (c, idx) in stamped where idx.sorted() != h.flatten([c]).sorted() {
+                    XCTFail("\(name): triangles stamped \(c) are not that cluster's"); break
+                }
                 compared += 1
             }
         }

@@ -11,6 +11,9 @@ public final class SignackGPUCut: @unchecked Sendable {
     public let hierarchy: SignackGPUHierarchy
     /// The index buffer the host's raster mesh draws (over the hierarchy's shared vertex buffer).
     public let outputIndices: MTLBuffer
+    /// The cluster each output triangle came from (`outputIndices[3t..<3t+3]` ↔ `outputClusterIDs[t]`)
+    /// — S3: a visibility-buffer triangle id names its cluster with one load (debug view, S4/S5).
+    public let outputClusterIDs: MTLBuffer
     /// `SignackGPUDrawArgs` layout: primary record at 0, shadow record at 32.
     public let drawArgs: MTLBuffer
     let flags: MTLBuffer
@@ -18,6 +21,7 @@ public final class SignackGPUCut: @unchecked Sendable {
 
     public init?(hierarchy: SignackGPUHierarchy, device: MTLDevice, label: String = "Signack.cut") {
         guard let out = device.makeBuffer(length: max(4, hierarchy.maxCutIndices * 4), options: .storageModeShared),
+              let clusterIDs = device.makeBuffer(length: max(4, hierarchy.maxCutIndices / 3 * 4), options: .storageModeShared),
               let args = device.makeBuffer(length: SignackGPUDrawArgs.bufferLength, options: .storageModeShared),
               let flags = device.makeBuffer(length: max(4, hierarchy.clusterCount), options: .storageModeShared),
               let counters = device.makeBuffer(length: 16, options: .storageModeShared)
@@ -30,13 +34,15 @@ public final class SignackGPUCut: @unchecked Sendable {
         flags.label = "\(label).flags"; counters.label = "\(label).counters"
         self.hierarchy = hierarchy
         outputIndices = out
+        clusterIDs.label = "\(label).clusterIDs"
+        outputClusterIDs = clusterIDs
         drawArgs = args
         self.flags = flags
         self.counters = counters
     }
 
     /// Bytes this instance holds on the GPU (its output + bookkeeping; the DAG is the type's).
-    public var instanceBytes: Int { outputIndices.length + drawArgs.length + flags.length + counters.length }
+    public var instanceBytes: Int { outputIndices.length + outputClusterIDs.length + drawArgs.length + flags.length + counters.length }
 
     /// Encode this instance's select → compact → finalize for `view` into `encoder` (serial).
     public func encode(view: SignackView, pipelines: SignackGPUPipelines, encoder enc: MTLComputeCommandEncoder) {
@@ -50,6 +56,7 @@ public final class SignackGPUCut: @unchecked Sendable {
         enc.setBuffer(hierarchy.indexBuffer, offset: 0, index: 4)
         enc.setBuffer(outputIndices, offset: 0, index: 5)
         enc.setBuffer(drawArgs, offset: 0, index: 6)
+        enc.setBuffer(outputClusterIDs, offset: 0, index: 7)
 
         enc.setComputePipelineState(pipelines.classify)
         let w = min(64, pipelines.classify.maxTotalThreadsPerThreadgroup)

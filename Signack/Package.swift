@@ -12,7 +12,10 @@ import PackageDescription
 //   Cluster/ Simplify/ DAG/ Select/ Debug/  S1 — cluster LOD DAG, simplifiers, CPU reference selection
 //   SignackGPU (target)  S2 — the GPU cut pass: per-cluster select + frustum cull + compaction
 //                         into indirect draws (Metal; `Sources/SignackGPU`, own Shaders/)
-//   (S3 VisBuffer/ · S4 Raster/ · S5 Foliage/ · S6 Scatter/ — not yet)
+//   S3 — visibility buffer: the cut also stamps each triangle's cluster id (SignackGPU); the id
+//        raster + resolve are host glue in the engine (IlluminatoramaRenderer+VisBuffer.swift,
+//        IlluminatoramaVisBuffer.metal) because the resolve IS the engine's material function
+//   (S4 Raster/ · S5 Foliage/ · S6 Scatter/ — not yet)
 //
 // WHY ITS OWN PACKAGE: Danny, 2026-10-21 — "None of this 12,000 line stuff. Make it proper."
 // Signack is not a corner of `IlluminatoramaRenderer.swift`; it is a module with a small public
