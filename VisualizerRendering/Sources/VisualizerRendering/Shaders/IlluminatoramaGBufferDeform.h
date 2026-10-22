@@ -56,11 +56,13 @@ static inline float2 warpUV(float2 uv, float4 w, float t) {
 // normal-mapped surface carries, so on ordinary geometry `windAttr.x` is a surface
 // direction, not a sway weight. Without the instance gate this function swings any
 // mesh whose tangents happen to point +X.
+// `phaseOffset` (Signack S6, `Instance.tagGlow.w`): radians added to the tree's baked phase and to
+// every limb's φ, so many instances of ONE baked plant do not sway in step. 0 = exact no-op.
 static inline float3 applyTreeWind(float3 wp, float4 windAttr, float2 uv, float time,
-                                   float windStrength, float windHeading) {
+                                   float windStrength, float windHeading, float phaseOffset = 0.0f) {
     float sway = windAttr.x;
     if (sway < 0.0001 || windStrength <= 0.0) return wp;
-    float phase   = windAttr.y;
+    float phase   = windAttr.y + phaseOffset;
     float flutter = windAttr.z;
     float2 wdir = float2(cos(windHeading), sin(windHeading));
     float gust  = 0.55 + 0.45 * sin(time * 0.43 + dot(wp.xz, wdir) * 0.07);
@@ -81,7 +83,7 @@ static inline float3 applyTreeWind(float3 wp, float4 windAttr, float2 uv, float 
     }
     // Signack S5 — the limb layer on top (IlluminatoramaBranchWind.h): no-op unless the vertex's uv
     // carries a limb record, which only a bake that opted in (Daydream's yard trees) writes.
-    return applyBranchWind(wp, uv, time, windStrength, windHeading, gust);
+    return applyBranchWind(wp, uv + float2(0.0f, phaseOffset), time, windStrength, windHeading, gust);
 }
 
 // Issue #65 — per-vertex motion vectors for animated GPU meshes (fluid /
@@ -294,11 +296,11 @@ static inline IllumiDeformed illumiDeform(Vertex v, float3 prevObjP, Instance in
     float windStrength = frame._padPhase2A * inst.windScale;
     float prevWindTime = frame.time - frame.windPrevDelta;
     worldP.xyz = applyTreeWind(worldP.xyz, v.tangent, v.uv, frame.time,
-                               windStrength, frame._padPhase2B);
+                               windStrength, frame._padPhase2B, inst.tagGlow.w);
     float3 worldN = (inst.normalMatrix * float4(v.normal, 0.0)).xyz;
     float4 prevWorldP = prevInst.modelMatrix * float4(prevObjP, 1.0);
     prevWorldP.xyz = applyTreeWind(prevWorldP.xyz, v.tangent, v.uv, prevWindTime,
-                                   windStrength, frame._padPhase2B);
+                                   windStrength, frame._padPhase2B, inst.tagGlow.w);
     float3 worldT = (inst.modelMatrix * float4(v.tangent.xyz, 0.0)).xyz;
     worldP.xyz = applySway(worldP.xyz, inst.modelMatrix, inst.swayMode,
                            inst.swayLean, inst.swayJostle, frame.time, frame._padPhase2A, frame._padPhase2B, worldN, worldT);

@@ -18,7 +18,15 @@ import PackageDescription
 //   S4 — software rasterizer for sub-pixel triangles (SignackGPU: SignackRaster + Shaders/SignackRaster.metal;
 //        the cut routes them per triangle, `SignackGPURouting`); the vertex stage and the merge into
 //        the S3 id attachment are host glue in the engine (IlluminatoramaRenderer+SoftRaster.swift)
-//   (S5 Foliage/ · S6 Scatter/ — not yet)
+//   S5 — foliage specifics (two-sided translucent leaves, per-branch wind) live in the ENGINE's
+//        shaders and the vegetation bake; Signack's part was keeping them intact under clustering
+//   SignackScatter (target)  S6 — rule-driven scatter (Unreal PCG's job): a planting RULESET →
+//                         deterministic seeded points (density, blue-noise spacing, exclusion masks,
+//                         slope/altitude, clumping, species mix + per-instance variation). Pure Swift,
+//                         depends on nothing — DaydreamCore (headless) consumes it.
+//   S6 — batched instances (SignackGPU: SignackGPUInstanceBatch + Shaders/SignackInstances.metal):
+//        one pass picks a rung (Signack `SignackRungs`) or the impostor per instance, culls, and
+//        compacts every instance of a baked type into a few shared indirect instanced draws
 //
 // WHY ITS OWN PACKAGE: Danny, 2026-10-21 — "None of this 12,000 line stuff. Make it proper."
 // Signack is not a corner of `IlluminatoramaRenderer.swift`; it is a module with a small public
@@ -36,6 +44,7 @@ let package = Package(
     products: [
         .library(name: "Signack", targets: ["Signack"]),
         .library(name: "SignackGPU", targets: ["SignackGPU"]),
+        .library(name: "SignackScatter", targets: ["SignackScatter"]),
     ],
     targets: [
         .target(
@@ -56,6 +65,20 @@ let package = Package(
             name: "SignackGPU",
             dependencies: ["Signack"],
             resources: [.process("Shaders")],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // S6 — the scatter RULE layer. Depends on nothing (not even `Signack`): a planting is
+        // points, and points need no geometry system. Same `-O` reason as the CPU target.
+        .target(
+            name: "SignackScatter",
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                .unsafeFlags(["-O"], .when(configuration: .debug)),
+            ]
+        ),
+        .testTarget(
+            name: "SignackScatterTests",
+            dependencies: ["SignackScatter"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .testTarget(

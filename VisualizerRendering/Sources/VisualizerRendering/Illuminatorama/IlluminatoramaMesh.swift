@@ -54,6 +54,14 @@ public final class IlluminatoramaMesh {
     /// Signack (DH-1461) culls a cut to the camera frustum for the G-buffer but must keep every
     /// off-screen caster for the sun/spot/point maps — see `IlluminatoramaMesh+IndirectDraw`.
     public var shadowIndirectDrawOffset: Int?
+    /// Signack S6 (DH-1461) — instance records a COMPUTE pass wrote this frame (a batched planting:
+    /// every instance of one baked type, LOD-bucketed, culled and compacted). When set, every raster
+    /// pass binds THIS buffer at offset 0 as both the current and previous instances (the records
+    /// are static plants, so last frame's transform is this frame's), the indirect record's
+    /// `instanceCount` / `baseInstance` say which records to draw. The group's one CPU instance is a
+    /// placeholder the GPU never reads — its matrix only has to bound every record, so the CPU group
+    /// cull (DH-0534) still drops the whole batch from a light that cannot see it.
+    public var gpuInstanceBuffer: MTLBuffer?
 
     /// Cast shadows from BOTH faces (shadow passes use cull `.none` instead of the
     /// default `.front`). Opt-in, default false — an unset mesh keeps the renderer's

@@ -367,6 +367,14 @@ public struct IlluminatoramaInstance {
     ///       placed with different matrices; 0 = hash the instance's origin) · w reserved
     public var tagGlow: SIMD4<Float> = .zero
 
+    /// Signack S6 (DH-1461) — radians added to a vegetation mesh's baked wind phase (trunk sway,
+    /// flutter and every limb's φ), so the many instances of ONE baked plant in a planting sway out
+    /// of step. Rides in `tagGlow.w` (unused until now); 0 — every existing instance — is a no-op.
+    public var windPhaseOffset: Float {
+        get { tagGlow.w }
+        set { tagGlow.w = newValue }
+    }
+
     public init(
         modelMatrix: simd_float4x4,
         albedo: SIMD3<Float> = SIMD3(0.8, 0.8, 0.8),

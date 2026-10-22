@@ -48,6 +48,12 @@ extension MTLRenderCommandEncoder {
 }
 
 extension IlluminatoramaMesh {
+    /// The instance buffer (and byte offset) a raster pass binds for this mesh's draw group: the
+    /// frame's grouped ring at the group's offset, or — Signack S6 — the GPU-compacted records at 0.
+    func instanceBinding(ring: MTLBuffer, groupOffset: Int) -> (buffer: MTLBuffer, offset: Int) {
+        gpuInstanceBuffer.map { ($0, 0) } ?? (ring, groupOffset)
+    }
+
     /// Triangles one instance of this mesh draws in the camera pass, for the draw census. For an
     /// indirect mesh it is the GPU's own count from the last completed frame (read from shared
     /// memory without waiting, so it may lag by the frames in flight) — `indexCount` there is only
@@ -56,6 +62,9 @@ extension IlluminatoramaMesh {
         guard let args = indirectDrawBuffer, args.storageMode != .private,
               args.length >= indirectDrawOffset + 4 else { return indexCount / 3 }
         var n = Int(args.contents().load(fromByteOffset: indirectDrawOffset, as: UInt32.self))
+        if gpuInstanceBuffer != nil {   // S6: a batched record draws many instances
+            n *= Int(args.contents().load(fromByteOffset: indirectDrawOffset + 4, as: UInt32.self))
+        }
         if let soft = softRasterDrawOffset, args.length >= soft + 4 {   // S4: the soft-routed part
             n += Int(args.contents().load(fromByteOffset: soft, as: UInt32.self))
         }

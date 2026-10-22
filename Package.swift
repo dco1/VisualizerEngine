@@ -21,6 +21,7 @@ let package = Package(
         .library(name: "VisualizerHumans", targets: ["VisualizerHumans"]),
         .library(name: "Signack", targets: ["Signack"]),
         .library(name: "SignackGPU", targets: ["SignackGPU"]),
+        .library(name: "SignackScatter", targets: ["SignackScatter"]),
     ],
     targets: [
         .target(
@@ -122,6 +123,18 @@ let package = Package(
             dependencies: ["Signack"],
             path: "Signack/Sources/SignackGPU",
             resources: [.process("Shaders")],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // S6 — rule-driven scatter (PCG-equivalent): rules → seeded plant points. Pure Swift + simd.
+        .target(
+            name: "SignackScatter",
+            path: "Signack/Sources/SignackScatter",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "SignackScatterTests",
+            dependencies: ["SignackScatter"],
+            path: "Signack/Tests/SignackScatterTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         .executableTarget(

@@ -180,14 +180,16 @@ extension IlluminatoramaRenderer {
             }
             enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
             enc.setVertexBuffer(frameUniformBuffer, offset: 0, index: 1)
-            enc.setVertexBuffer(currentInstanceBuffer, offset: off, index: 2)
-            enc.setFragmentBuffer(currentInstanceBuffer, offset: off, index: 2)
+            let inst = mesh.instanceBinding(ring: currentInstanceBuffer, groupOffset: off)
+            enc.setVertexBuffer(inst.buffer, offset: inst.offset, index: 2)
+            enc.setFragmentBuffer(inst.buffer, offset: inst.offset, index: 2)
             // Phase 2.7 — previous-frame instances at buffer(4) for the
             // motion-vector reconstruction. Same per-group offset as
             // current — the ping-pong buffers share the grouped layout
             // because the host's `instances` order is stable across
             // frames for a static scene topology.
-            enc.setVertexBuffer(previousInstanceBuffer, offset: off, index: 4)
+            let prev = mesh.instanceBinding(ring: previousInstanceBuffer, groupOffset: off)   // S6: same records
+            enc.setVertexBuffer(prev.buffer, offset: prev.offset, index: 4)
             // Issue #65 — per-vertex previous positions for the deforming-mesh
             // motion vector. Only the kUsePrevVerts pipeline reads buffer(5).
             if let prevPos { enc.setVertexBuffer(prevPos, offset: 0, index: 5) }

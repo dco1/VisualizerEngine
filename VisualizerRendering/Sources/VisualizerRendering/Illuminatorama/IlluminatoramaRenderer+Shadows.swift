@@ -74,7 +74,8 @@ extension IlluminatoramaRenderer {
                 if want != cull { cull = want; enc.setCullMode(cull) }
                 let off = instStride * group.start
                 enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
-                enc.setVertexBuffer(currentInstanceBuffer, offset: off, index: 2)
+                let inst = mesh.instanceBinding(ring: currentInstanceBuffer, groupOffset: off)
+                enc.setVertexBuffer(inst.buffer, offset: inst.offset, index: 2)
                 enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow)
             }
             enc.endEncoding()
@@ -481,7 +482,8 @@ extension IlluminatoramaRenderer {
                 if want != cull { cull = want; enc.setCullMode(cull) }
                 let off = instStride * group.start
                 enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
-                enc.setVertexBuffer(currentInstanceBuffer, offset: off, index: 2)
+                let inst = mesh.instanceBinding(ring: currentInstanceBuffer, groupOffset: off)
+                enc.setVertexBuffer(inst.buffer, offset: inst.offset, index: 2)
                 enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow)
             }
             enc.endEncoding()
@@ -631,7 +633,8 @@ extension IlluminatoramaRenderer {
                     if want != cull { cull = want; enc.setCullMode(cull) }
                     let off = instStride * group.start
                     enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
-                    enc.setVertexBuffer(currentInstanceBuffer, offset: off, index: 2)
+                    let inst = mesh.instanceBinding(ring: currentInstanceBuffer, groupOffset: off)
+                    enc.setVertexBuffer(inst.buffer, offset: inst.offset, index: 2)
                     enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow)
                 }
                 enc.endEncoding()
