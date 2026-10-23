@@ -54,6 +54,11 @@ public final class IlluminatoramaMesh {
     /// Signack (DH-1461) culls a cut to the camera frustum for the G-buffer but must keep every
     /// off-screen caster for the sun/spot/point maps — see `IlluminatoramaMesh+IndirectDraw`.
     public var shadowIndirectDrawOffset: Int?
+    /// Per-light shadow culling (Daydream DH-1465): a record per SHADOW VIEW — the part of the cut
+    /// that can land in that cascade slice / spot cone / point face. A shadow pass drawing a view
+    /// that is not in the map falls back to `shadowIndirectDrawOffset`. Set by the host each frame
+    /// (`IlluminatoramaRenderer.shadowViewsThisFrame()` names the views).
+    public var shadowViewDrawOffsets: [IlluminatoramaShadowView: Int] = [:]
     /// Signack S6 (DH-1461) — instance records a COMPUTE pass wrote this frame (a batched planting:
     /// every instance of one baked type, LOD-bucketed, culled and compacted). When set, every raster
     /// pass binds THIS buffer at offset 0 as both the current and previous instances (the records

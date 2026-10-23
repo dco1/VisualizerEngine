@@ -22,6 +22,15 @@
 //   3. signack_cut_finalize   one thread: the indirect argument records (primary, shadow, soft +
 //                             its one-thread-per-triangle dispatch), then zero the counters.
 //
+// DH-1465 — per-light shadow culling. With `V.count > 0` shadow views (sun cascade slices, spot
+// cones, point cube faces, as object-space frustums), classify also tests every cut cluster against
+// each view and sets bit v of `viewMask` (+ counts the view's indices); `signack_cut_views_prefix`
+// (one thread, between classify and write) gives each view a range of the POOL that follows the
+// main output ([C, C + pool)) — or none, when the view sees the whole cut (its record is then the
+// shadow record, no copy) or the pool is full (same fallback: never wrong, only not culled); write
+// copies each cluster once more per view it lands in; finalize writes one record per view slot at
+// 128 + 32·v (slots past V.count hold the shadow record). The main [off | on] layout is untouched.
+//
 // Self-contained on purpose (no engine header): Signack is its own package and its shaders build
 // into its own library (`SignackGPULibrary`). The structs below are byte-for-byte mirrors of
 // `SignackGPUCluster` / `SignackGPUCutUniforms` in Swift — the static_asserts pin the sizes.
@@ -86,8 +95,19 @@ struct SignackDispatchArgs {  // MTLDispatchThreadgroupsIndirectArguments
 
 constant uint SIGNACK_SOFT_THREADS = 64;   // SignackGPUDrawArgs.softThreadsPerGroup
 
+/// DH-1465 — the shadow views one cut is culled against (mirror of `SignackGPUShadowViewUniforms`).
+struct SignackGPUShadowViews {
+    float4 planes[48];      // view v's six object-space planes at [6v, 6v + 6)
+    uint   count;           // ≤ 8
+    uint   poolCapacity;    // indices in the pool after the main output
+    uint   _pad0, _pad1;
+};
+static_assert(sizeof(SignackGPUShadowViews) == 784, "mirror of Swift SignackGPUShadowViewUniforms");
+constant uint SIGNACK_VIEW_FULL = 0xFFFFFFFFu;   // a view base meaning "draw the shadow record"
+
 // counters[0] off-screen indices (classify), [1] off-screen cursor, [2] on-screen hardware cursor,
-// [3] soft cursor (counted down from the top of the buffer).
+// [3] soft cursor (counted down from the top of the buffer), [4] whole-cut indices (classify);
+// DH-1465: [8 + v] view v's indices (classify), [16 + v] its write cursor, [24 + v] its pool base.
 
 /// `SignackView.projectedError` — conservative pixels of `err` measured at sphere `s`.
 static float signack_projected(float4 s, float err, constant SignackGPUCutUniforms& U) {
@@ -104,10 +124,13 @@ kernel void signack_cut_classify(
     device const SignackGPUCluster* clusters   [[buffer(1)]],
     device uchar*                   flags      [[buffer(2)]],
     device atomic_uint*             counters   [[buffer(3)]],
+    constant SignackGPUShadowViews& V          [[buffer(10)]],  // DH-1465
+    device uchar*                   viewMask   [[buffer(11)]],
     uint i                                     [[thread_position_in_grid]])
 {
     if (i >= U.clusterCount) return;
     SignackGPUCluster c = clusters[i];
+    uchar mask = 0;
     bool inCut = signack_projected(c.lodSphere, c.lodError, U) <= U.threshold
               && signack_projected(c.parentSphere, c.parentError, U) > U.threshold;
     uchar f = 0;
@@ -121,8 +144,60 @@ kernel void signack_cut_classify(
             }
         }
         if (f == 1) atomic_fetch_add_explicit(&counters[0], c.triangleCount * 3, memory_order_relaxed);
+        if (V.count > 0) {
+            atomic_fetch_add_explicit(&counters[4], c.triangleCount * 3, memory_order_relaxed);
+            float r = c.bounds.w + U.boundsPad;
+            for (uint v = 0; v < V.count; ++v) {
+                bool in = true;
+                for (uint p = 0; p < 6; ++p) {
+                    float4 pl = V.planes[6 * v + p];
+                    if (dot(pl.xyz, c.bounds.xyz) + pl.w < -r) { in = false; break; }
+                }
+                if (in) {
+                    mask |= uchar(1u << v);
+                    atomic_fetch_add_explicit(&counters[8 + v], c.triangleCount * 3, memory_order_relaxed);
+                }
+            }
+        }
     }
     flags[i] = f;
+    viewMask[i] = mask;
+}
+
+/// DH-1465 — one thread: give every shadow view its pool range, in view order (cascades first).
+kernel void signack_cut_views_prefix(
+    constant SignackGPUShadowViews& V          [[buffer(10)]],
+    device atomic_uint*             counters   [[buffer(3)]],
+    uint i                                     [[thread_position_in_grid]])
+{
+    if (i != 0) return;
+    uint total = atomic_load_explicit(&counters[4], memory_order_relaxed);
+    uint cursor = 0;
+    for (uint v = 0; v < V.count; ++v) {
+        uint n = atomic_load_explicit(&counters[8 + v], memory_order_relaxed);
+        uint base = SIGNACK_VIEW_FULL;
+        if (n < total && cursor + n <= V.poolCapacity) { base = cursor; cursor += n; }
+        atomic_store_explicit(&counters[24 + v], base, memory_order_relaxed);
+    }
+}
+
+/// DH-1465 — copy one cluster's indices once more into each view's pool range it lands in.
+/// `mask` and the bases are uniform across the threadgroup, so the barriers are too.
+static void signack_copy_views(uchar mask, uint start, uint n, constant SignackGPUShadowViews& V,
+                               constant SignackGPUCutUniforms& U, device atomic_uint* counters,
+                               device const uint* dagIndices, device uint* outIndices,
+                               threadgroup uint& vbase, uint t, uint tgSize)
+{
+    for (uint v = 0; v < V.count; ++v) {
+        if ((mask & (1u << v)) == 0) continue;
+        uint pb = atomic_load_explicit(&counters[24 + v], memory_order_relaxed);
+        if (pb == SIGNACK_VIEW_FULL) continue;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (t == 0) vbase = U.capacity + pb + atomic_fetch_add_explicit(&counters[16 + v], n, memory_order_relaxed);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint b = vbase, end = U.capacity + V.poolCapacity;
+        for (uint k = t; k < n; k += tgSize) if (b + k < end) outIndices[b + k] = dagIndices[start + k];
+    }
 }
 
 kernel void signack_cut_write(
@@ -135,6 +210,8 @@ kernel void signack_cut_write(
     device uint*                    outCluster [[buffer(7)]],   // S3: cluster id per output triangle
     constant SignackGPURouteUniforms& R        [[buffer(8)]],   // S4 (read only when softArea > 0)
     device const uchar*             vertices   [[buffer(9)]],   // S4: the host's vertex buffer
+    constant SignackGPUShadowViews& V          [[buffer(10)]],  // DH-1465
+    device const uchar*             viewMask   [[buffer(11)]],
     uint cid                                   [[threadgroup_position_in_grid]],
     uint t                                     [[thread_position_in_threadgroup]],
     uint tgSize                                [[threads_per_threadgroup]])
@@ -145,6 +222,8 @@ kernel void signack_cut_write(
     uint start = clusters[cid].indexStart;
     uint n = clusters[cid].triangleCount * 3;
     threadgroup uint base;
+    threadgroup uint vbase;
+    signack_copy_views(viewMask[cid], start, n, V, U, counters, dagIndices, outIndices, vbase, t, tgSize);
     if (f == 2 && U.softArea > 0.0f) {           // S4: route each triangle (tgSize ≥ 128 ≥ triangles)
         threadgroup atomic_uint tally[2];
         threadgroup uint first[2];
@@ -206,7 +285,8 @@ kernel void signack_cut_write(
 kernel void signack_cut_finalize(
     constant SignackGPUCutUniforms& U          [[buffer(0)]],
     device atomic_uint*             counters   [[buffer(3)]],
-    device SignackDrawArgs*         args       [[buffer(6)]],   // primary @0, shadow @32, soft @64, soft dispatch @96
+    device SignackDrawArgs*         args       [[buffer(6)]],   // primary @0, shadow @32, soft @64, soft dispatch @96, views @128+32v
+    constant SignackGPUShadowViews& V          [[buffer(10)]],  // DH-1465
     uint i                                     [[thread_position_in_grid]])
 {
     if (i != 0) return;
@@ -228,5 +308,15 @@ kernel void signack_cut_finalize(
     *softArgs = a;
     softDispatch->x = (q / 3u + SIGNACK_SOFT_THREADS - 1u) / SIGNACK_SOFT_THREADS;
     softDispatch->y = 1u; softDispatch->z = 1u;
-    for (uint k = 0; k < 4; ++k) atomic_store_explicit(&counters[k], 0u, memory_order_relaxed);
+    for (uint v = 0; v < 8; ++v) {   // DH-1465: a view's own range, or the shadow record
+        device SignackDrawArgs* viewArgs = (device SignackDrawArgs*)((device uchar*)args + 128 + 32 * v);
+        uint pb = v < V.count ? atomic_load_explicit(&counters[24 + v], memory_order_relaxed) : SIGNACK_VIEW_FULL;
+        a.indexCount = hwEnd; a.indexStart = 0;
+        if (pb != SIGNACK_VIEW_FULL) {
+            a.indexCount = atomic_load_explicit(&counters[8 + v], memory_order_relaxed);
+            a.indexStart = U.capacity + pb;
+        }
+        *viewArgs = a;
+    }
+    for (uint k = 0; k < 32; ++k) atomic_store_explicit(&counters[k], 0u, memory_order_relaxed);
 }

@@ -19,17 +19,34 @@ public final class SignackGPUCut: @unchecked Sendable {
     public let drawArgs: MTLBuffer
     let flags: MTLBuffer
     let counters: MTLBuffer
+    /// DH-1465 — per cluster, bit v set when it can land in shadow view v.
+    let viewMask: MTLBuffer
+    /// DH-1465 — indices the per-view pool (after the main output, `[C, C + pool)`) holds.
+    public let shadowViewPool: Int
+    /// DH-1465 — this frame's shadow views (object-space frustums; at most
+    /// `SignackShadowViews.maxViews`): set by the host before `encode`, like `routing`. Empty = none
+    /// (every view slot holds the whole-cut shadow record, exactly S2).
+    public var shadowViews: [SignackFrustum] = []
     /// S4 — route this instance's sub-pixel on-screen triangles to the software rasterizer's range
     /// (set by the host each frame before `encode`; nil = none, exactly S2).
     public var routing: SignackGPURouting?
 
-    public init?(hierarchy: SignackGPUHierarchy, device: MTLDevice, label: String = "Signack.cut") {
-        guard let out = device.makeBuffer(length: max(4, hierarchy.maxCutIndices * 4), options: .storageModeShared),
+    /// `shadowViewPool` (indices, default one full cut) bounds what the per-view copies may use; a
+    /// view that does not fit draws the whole cut instead.
+    public init?(hierarchy: SignackGPUHierarchy, device: MTLDevice, label: String = "Signack.cut",
+                 shadowViewPool: Int? = nil) {
+        let pool = max(0, shadowViewPool ?? hierarchy.maxCutIndices)
+        guard let out = device.makeBuffer(length: max(4, (hierarchy.maxCutIndices + pool) * 4), options: .storageModeShared),
               let clusterIDs = device.makeBuffer(length: max(4, hierarchy.maxCutIndices / 3 * 4), options: .storageModeShared),
               let args = device.makeBuffer(length: SignackGPUDrawArgs.bufferLength, options: .storageModeShared),
               let flags = device.makeBuffer(length: max(4, hierarchy.clusterCount), options: .storageModeShared),
-              let counters = device.makeBuffer(length: 32, options: .storageModeShared)
+              let counters = device.makeBuffer(length: 128, options: .storageModeShared),
+              let mask = device.makeBuffer(length: max(4, hierarchy.clusterCount), options: .storageModeShared)
         else { return nil }
+        memset(mask.contents(), 0, mask.length)
+        mask.label = "\(label).viewMask"
+        viewMask = mask
+        self.shadowViewPool = pool
         // Zeroed: an instance draws nothing until its first cut lands.
         memset(args.contents(), 0, args.length)
         memset(counters.contents(), 0, counters.length)
@@ -46,7 +63,9 @@ public final class SignackGPUCut: @unchecked Sendable {
     }
 
     /// Bytes this instance holds on the GPU (its output + bookkeeping; the DAG is the type's).
-    public var instanceBytes: Int { outputIndices.length + outputClusterIDs.length + drawArgs.length + flags.length + counters.length }
+    public var instanceBytes: Int {
+        outputIndices.length + outputClusterIDs.length + drawArgs.length + flags.length + counters.length + viewMask.length
+    }
 
     /// Encode this instance's select → compact → finalize for `view` into `encoder` (serial).
     public func encode(view: SignackView, pipelines: SignackGPUPipelines, encoder enc: MTLComputeCommandEncoder) {
@@ -72,11 +91,18 @@ public final class SignackGPUCut: @unchecked Sendable {
         enc.setBuffer(outputIndices, offset: 0, index: 5)
         enc.setBuffer(drawArgs, offset: 0, index: 6)
         enc.setBuffer(outputClusterIDs, offset: 0, index: 7)
+        SignackGPUShadowViewUniforms(shadowViews, poolCapacity: shadowViewPool).bind(enc, index: 10)
+        enc.setBuffer(viewMask, offset: 0, index: 11)
 
         enc.setComputePipelineState(pipelines.classify)
         let w = min(64, pipelines.classify.maxTotalThreadsPerThreadgroup)
         enc.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+        if !shadowViews.isEmpty {   // DH-1465: each view's pool range, before any cluster is copied
+            enc.setComputePipelineState(pipelines.viewsPrefix)
+            enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        }
         enc.setComputePipelineState(pipelines.write)
         // ≤128 triangles per cluster: one thread per triangle (each copies its 3 indices' worth by stride).
         let tg = min(128, pipelines.write.maxTotalThreadsPerThreadgroup)

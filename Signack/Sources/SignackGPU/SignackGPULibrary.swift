@@ -16,6 +16,7 @@ public final class SignackGPUPipelines: @unchecked Sendable {
     let classify: MTLComputePipelineState
     let write: MTLComputePipelineState
     let finalize: MTLComputePipelineState
+    let viewsPrefix: MTLComputePipelineState   // DH-1465
     let rasterPrepare: MTLComputePipelineState
     let rasterDepth: MTLComputePipelineState
     let rasterIDs: MTLComputePipelineState
@@ -45,12 +46,12 @@ public final class SignackGPUPipelines: @unchecked Sendable {
             return try? device.makeComputePipelineState(function: fn)
         }
         guard let c = pso("signack_cut_classify"), let w = pso("signack_cut_write"),
-              let f = pso("signack_cut_finalize"), let rp = pso("signack_raster_prepare"),
+              let f = pso("signack_cut_finalize"), let vp = pso("signack_cut_views_prefix"), let rp = pso("signack_raster_prepare"),
               let rd = pso("signack_raster_depth"), let ri = pso("signack_raster_ids"),
               let rc = pso("signack_raster_clear"),
               let ic = pso("signack_instances_classify"), let inf = pso("signack_instances_finalize") else { return nil }
         self.device = device
-        classify = c; write = w; finalize = f
+        classify = c; write = w; finalize = f; viewsPrefix = vp
         rasterPrepare = rp; rasterDepth = rd; rasterIDs = ri; rasterClear = rc
         instancesClassify = ic; instancesFinalize = inf
         librarySource = source
@@ -59,7 +60,8 @@ public final class SignackGPUPipelines: @unchecked Sendable {
     private static func library(_ device: MTLDevice) -> (MTLLibrary, String)? {
         if let lib = try? device.makeDefaultLibrary(bundle: .module),
            lib.functionNames.contains("signack_cut_classify"), lib.functionNames.contains("signack_raster_depth"),
-           lib.functionNames.contains("signack_instances_classify") {
+           lib.functionNames.contains("signack_instances_classify"),
+           lib.functionNames.contains("signack_cut_views_prefix") {
             return (lib, "metallib")
         }
         // Each .metal is self-contained (no includes), so the sources concatenate into one library.

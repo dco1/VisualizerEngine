@@ -76,7 +76,7 @@ extension IlluminatoramaRenderer {
                 enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
                 let inst = mesh.instanceBinding(ring: currentInstanceBuffer, groupOffset: off)
                 enc.setVertexBuffer(inst.buffer, offset: inst.offset, index: 2)
-                enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow)
+                enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow, view: .cascade(cascade))
             }
             enc.endEncoding()
         }
@@ -484,7 +484,7 @@ extension IlluminatoramaRenderer {
                 enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
                 let inst = mesh.instanceBinding(ring: currentInstanceBuffer, groupOffset: off)
                 enc.setVertexBuffer(inst.buffer, offset: inst.offset, index: 2)
-                enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow)
+                enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow, view: .spot(slice))
             }
             enc.endEncoding()
         }
@@ -635,7 +635,7 @@ extension IlluminatoramaRenderer {
                     enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
                     let inst = mesh.instanceBinding(ring: currentInstanceBuffer, groupOffset: off)
                     enc.setVertexBuffer(inst.buffer, offset: inst.offset, index: 2)
-                    enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow)
+                    enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow, view: .point(slice))
                 }
                 enc.endEncoding()
             }
