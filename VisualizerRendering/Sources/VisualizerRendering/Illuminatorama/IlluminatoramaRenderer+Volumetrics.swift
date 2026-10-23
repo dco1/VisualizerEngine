@@ -162,6 +162,7 @@ extension IlluminatoramaRenderer {
         enc.setTexture(gbs.depthTexture, index: 0)
         enc.setTexture(pfx.hdrCompositeTexture, index: 1)
         enc.setBuffer(vols.volUniformBuffer, offset: 0, index: 0)
+        enc.setBuffer(cloudShadowBinding, offset: 0, index: 1)   // DH-1492 — cloud sun transmittance
         dispatch(enc, pipeline: pipeline, width: width, height: height)
         enc.endEncoding()
     }
@@ -209,6 +210,7 @@ extension IlluminatoramaRenderer {
             enc.setAccelerationStructure(tlas, bufferIndex: 0)
             enc.setBytes(&u, length: MemoryLayout<VolRTUniforms>.stride, index: 1)
             enc.setBuffer(counts, offset: 0, index: 2)
+            enc.setBuffer(cloudShadowBinding, offset: 0, index: 3)   // DH-1492
             for blas in rts.rtBLASList { enc.useResource(blas, usage: .read) }
             for blas in rts.rtCurveBLASList { enc.useResource(blas, usage: .read) }
             for buf in rts.rtResidentBuffers { enc.useResource(buf, usage: .read) }
@@ -227,6 +229,7 @@ extension IlluminatoramaRenderer {
         enc.setBytes(&u, length: MemoryLayout<VolRTUniforms>.stride, index: 1)
         enc.setBuffer(areaLightBuffer, offset: 0, index: 2)
         enc.setBuffer(counts, offset: 0, index: 3)
+        enc.setBuffer(cloudShadowBinding, offset: 0, index: 4)   // DH-1492 — cloud sun transmittance
         for blas in rts.rtBLASList { enc.useResource(blas, usage: .read) }
         for blas in rts.rtCurveBLASList { enc.useResource(blas, usage: .read) }
         for buf in rts.rtResidentBuffers { enc.useResource(buf, usage: .read) }

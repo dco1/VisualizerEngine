@@ -366,6 +366,7 @@ extension IlluminatoramaRenderer {
         enc.setBuffer(curvesOn ? rts.rtSoupCurvePoolPoints : triA, offset: 0, index: 11)
         enc.setBuffer(curvesOn ? rts.rtSoupCurveRadii : triA, offset: 0, index: 12)
         enc.setBuffer(curvesOn ? rts.rtSoupCurveSegments : triA, offset: 0, index: 13)
+        enc.setBuffer(cloudShadowBinding, offset: 0, index: 15)      // DH-1492 — cloud sun transmittance
         // Curve-only primitive AS (#60 item 7 incr. 2) — a SECOND acceleration
         // structure the kernel traces alongside the triangle soup. Bind the
         // triangle `accel` as a harmless dummy for the base (curve-free) variant.

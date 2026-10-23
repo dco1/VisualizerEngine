@@ -1,5 +1,6 @@
 #include <metal_stdlib>
 #include <metal_raytracing>
+#include "IlluminatoramaCloudShadow.h"   // DH-1492 — standalone (metal_stdlib only)
 using namespace metal;
 using namespace raytracing;
 
@@ -271,6 +272,7 @@ kernel void illumi_rt_lighting(
     // is traced alongside `accel` (any-hit occludes; nearest-hit compares
     // distance). Bound to `accel` as a harmless dummy for the base variant.
     primitive_acceleration_structure      curveAccel  [[buffer(14)]],
+    const device float*                   cloudShadow [[buffer(15)]],   // DH-1492 — cloud sun transmittance (dummy when off)
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -317,6 +319,8 @@ kernel void illumi_rt_lighting(
     float3 Ld = normalize(u.sunDir);
     float NdotL = saturate(dot(N, Ld));
     float3 direct = float3(0.0);
+    // DH-1492 — the cumulus deck's shadow, the same lookup every TLAS lane makes (exactly 1 when off).
+    float cloudT = illumiCloudSunTransmittance(cloudShadow, P, Ld);
     if (u.directSunEnabled != 0 && NdotL > 0.0 && u.shadowRays > 0) {
         isect.accept_any_intersection(true);   // occlusion-only
         uint hits = 0;
@@ -331,7 +335,7 @@ kernel void illumi_rt_lighting(
             if (!occ && kRTCurvesEnabled) occ = isect.intersect(r, curveAccel).type != intersection_type::none;
             if (occ) hits++;   // any occluder (triangle soup OR curve AS)
         }
-        float vis = 1.0 - float(hits) / float(u.shadowRays);
+        float vis = (1.0 - float(hits) / float(u.shadowRays)) * cloudT;
         // Lambert diffuse + a soft Blinn spec for the floor sheen.
         float3 V = normalize(u.cameraWorldPos - P);
         float3 H = normalize(Ld + V);
@@ -378,7 +382,7 @@ kernel void illumi_rt_lighting(
                 if (!occ && kRTCurvesEnabled) occ = isect.intersect(r, curveAccel).type != intersection_type::none;
                 if (occ) th++;   // any occluder (triangle soup OR curve AS)
             }
-            float tvis = 1.0 - float(th) / float(u.shadowRays);
+            float tvis = (1.0 - float(th) / float(u.shadowRays)) * cloudT;
             // ENERGY CLAMP: a leaf transmits a FRACTION of the light reaching it —
             // it cannot re-emit more than it receives. `leafTransmission` was a raw
             // (>1) gain with no ceiling, so under Forest's low warm BACKLIGHT the
@@ -422,7 +426,7 @@ kernel void illumi_rt_lighting(
                         sr.min_distance = 2e-3; sr.max_distance = 1e4;
                         bool occ = isect.intersect(sr, accel).type != intersection_type::none;
                         if (!occ) occ = isect.intersect(sr, curveAccel).type != intersection_type::none;
-                        hitRad += cs.albedoRoughness.xyz * (1.0 / M_PI_F) * u.sunColor * hN * (occ ? 0.0 : 1.0);
+                        hitRad += cs.albedoRoughness.xyz * (1.0 / M_PI_F) * u.sunColor * hN * (occ ? 0.0 : illumiCloudSunTransmittance(cloudShadow, hitP, Ld));
                         isect.accept_any_intersection(false);
                     }
                     indirect += hitRad;
@@ -447,7 +451,7 @@ kernel void illumi_rt_lighting(
                     sr.max_distance = 1e4;
                     bool occ = isect.intersect(sr, accel).type != intersection_type::none;
                     if (kRTCurvesEnabled && !occ) occ = isect.intersect(sr, curveAccel).type != intersection_type::none;
-                    float sv = occ ? 0.0 : 1.0;
+                    float sv = occ ? 0.0 : illumiCloudSunTransmittance(cloudShadow, hitP, Ld);
                     hitRad = hitA * (1.0 / M_PI_F) * u.sunColor * hN * sv;
                     isect.accept_any_intersection(false);
                 }
@@ -554,7 +558,7 @@ kernel void illumi_rt_lighting(
                         bool occ = isect.intersect(sr, accel).type != intersection_type::none;
                         if (!occ) occ = isect.intersect(sr, curveAccel).type != intersection_type::none;
                         isect.accept_any_intersection(false);
-                        hitRad += cA * (1.0 / M_PI_F) * u.sunColor * hN * (occ ? 0.0 : 1.0);
+                        hitRad += cA * (1.0 / M_PI_F) * u.sunColor * hN * (occ ? 0.0 : illumiCloudSunTransmittance(cloudShadow, hitP, Ld));
                     }
                     acc += hitRad;
                     continue;
@@ -592,7 +596,7 @@ kernel void illumi_rt_lighting(
                 sr.max_distance = 1e4;
                 bool occ = isect.intersect(sr, accel).type != intersection_type::none;
                 if (kRTCurvesEnabled && !occ) occ = isect.intersect(sr, curveAccel).type != intersection_type::none;
-                float sv = occ ? 0.0 : 1.0;   // curve or triangle occludes
+                float sv = occ ? 0.0 : illumiCloudSunTransmittance(cloudShadow, hitP, Ld);   // curve or triangle occludes
                 isect.accept_any_intersection(false);
                 hitRad += hitA * (1.0 / M_PI_F) * u.sunColor * hN * sv;
             }

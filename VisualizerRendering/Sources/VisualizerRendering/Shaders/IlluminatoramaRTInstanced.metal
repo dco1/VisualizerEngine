@@ -2197,6 +2197,7 @@ kernel void illumi_volumetric_rt_admittance(
     instance_acceleration_structure       accel       [[buffer(0)]],
     constant VolRTUniforms&               u           [[buffer(1)]],
     device atomic_uint*                   counts      [[buffer(2)]],
+    const device float*                   cloudShadow [[buffer(3)]],   // DH-1492 — cloud sun transmittance (dummy when off)
     uint2 gid [[thread_position_in_grid]])
 {
     uint gx = max(u.admittanceGrid, 1u);
@@ -2214,16 +2215,19 @@ kernel void illumi_volumetric_rt_admittance(
     bool sunOn = volRTSunOn(u);
     uint N = clamp(u.steps, 1u, 64u);
     float dt = tEnd / float(N);
+    // Counted in 1/64ths of a sample, so a sample under a cloud admits only the sun the deck lets
+    // through (DH-1492); with the deck off every sunlit sample counts 64 and the ratio is unchanged.
     uint roofed = 0u, sunlit = 0u;
     for (uint i = 0u; i < N; ++i) {
         float3 X = u.cameraWorldPos + rd * ((float(i) + 0.5) * dt);
         ray up; up.origin = X; up.direction = float3(0.0, 1.0, 0.0);
         up.min_distance = 0.0; up.max_distance = u.roofReach;
         if (isect.intersect(up, accel, u.transportMask).type == intersection_type::none) continue;
-        roofed++;
+        roofed += 64u;
         if (!sunOn) continue;
         ray sr; sr.origin = X; sr.direction = toSun; sr.min_distance = max(u.rayTMin, 1e-3); sr.max_distance = 1e4;
-        if (isect.intersect(sr, accel, u.transportMask).type == intersection_type::none) sunlit++;
+        if (isect.intersect(sr, accel, u.transportMask).type == intersection_type::none)
+            sunlit += uint(round(64.0 * illumiCloudSunTransmittance(cloudShadow, X, toSun)));
     }
     if (roofed > 0u) atomic_fetch_add_explicit(&counts[0], roofed, memory_order_relaxed);
     if (sunlit > 0u) atomic_fetch_add_explicit(&counts[1], sunlit, memory_order_relaxed);
@@ -2257,6 +2261,7 @@ kernel void illumi_volumetric_rt(
     constant VolRTUniforms&               u           [[buffer(1)]],
     const device RTAreaLight*             areaLights  [[buffer(2)]],
     const device uint*                    admittance  [[buffer(3)]],   // counts from the pre-pass
+    const device float*                   cloudShadow [[buffer(4)]],   // DH-1492 — cloud sun transmittance (dummy when off)
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height || u.density <= 0.0) return;
@@ -2316,7 +2321,7 @@ kernel void illumi_volumetric_rt(
         if (sunOn) {
             ray sr; sr.origin = X; sr.direction = toSun; sr.min_distance = tMin; sr.max_distance = 1e4;
             if (isect.intersect(sr, accel, u.transportMask).type == intersection_type::none) {
-                Lx += u.sunColor * (sunSigmaPhase * u.sunScatter);
+                Lx += u.sunColor * (sunSigmaPhase * u.sunScatter * illumiCloudSunTransmittance(cloudShadow, X, toSun));   // DH-1492
             }
         }
 
