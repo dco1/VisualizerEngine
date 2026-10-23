@@ -28,6 +28,8 @@ public final class SignackGPUInstanceBatch: @unchecked Sendable {
     public let drawArgs: MTLBuffer
     let counters: MTLBuffer
     public private(set) var instanceCount = 0
+    /// DH-1466 — this frame's Hi-Z occlusion source (world → the pyramid's clip), or nil = no test.
+    public var occlusion: SignackGPUOcclusion?
 
     public static let maxBuckets = 8
 
@@ -78,6 +80,7 @@ public final class SignackGPUInstanceBatch: @unchecked Sendable {
         enc.setBuffer(lists, offset: 0, index: 3)
         enc.setBuffer(counters, offset: 0, index: 4)
         enc.setBuffer(drawArgs, offset: 0, index: 5)
+        SignackGPUOcclusion.bind(occlusion, enc, buffer: 6, texture: 0, fallback: pipelines.blankHiZ)
         if instanceCount > 0 {
             enc.setComputePipelineState(pipelines.instancesClassify)
             let w = min(64, pipelines.instancesClassify.maxTotalThreadsPerThreadgroup)

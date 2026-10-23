@@ -58,6 +58,49 @@ struct SignackInstancedArgs {           // MTLDrawIndexedPrimitivesIndirectArgum
     uint baseInstance;
 };
 
+
+/// DH-1466 — Hi-Z occlusion: the pyramid's frame (mirror of Swift `SignackGPUOcclusion.Uniforms`).
+struct SignackInstOcclusionUniforms {
+    float4x4 toClip;      // the instance's space → the clip space the pyramid's depth was drawn in
+    float2   depthSize;   // px of that depth
+    uint     mipCount;
+    uint     enabled;
+    float    dilate;      // px each side (TAA jitter)
+    float    _pad0, _pad1, _pad2;
+};
+static_assert(sizeof(SignackInstOcclusionUniforms) == 96, "mirror of Swift SignackGPUOcclusion.Uniforms");
+
+/// Is the sphere (c, r) hidden behind everything over its footprint in the pyramid? Conservative:
+/// the footprint is the projected bounding CUBE (dilated), its depth the cube's nearest corner, the
+/// occluder depth the pyramid's MAX over every texel the footprint touches. Anything crossing the
+/// near plane is visible.
+static bool signack_inst_occluded(float3 c, float r, constant SignackInstOcclusionUniforms& O, texture2d<float, access::read> hzb) {
+    if (O.enabled == 0 || O.mipCount == 0) return false;
+    float2 lo = float2(1.0e30f), hi = float2(-1.0e30f);
+    float zmin = 1.0e30f;
+    for (uint k = 0; k < 8; ++k) {
+        float3 p = c + r * float3((k & 1u) ? 1.0f : -1.0f, (k & 2u) ? 1.0f : -1.0f, (k & 4u) ? 1.0f : -1.0f);
+        float4 q = O.toClip * float4(p, 1.0f);
+        if (q.w <= 1.0e-4f) return false;
+        float3 n = q.xyz / q.w;
+        lo = min(lo, n.xy); hi = max(hi, n.xy); zmin = min(zmin, n.z);
+    }
+    if (zmin <= 0.0f) return false;
+    float2 pmin = float2(lo.x * 0.5f + 0.5f, 0.5f - hi.y * 0.5f) * O.depthSize - O.dilate;
+    float2 pmax = float2(hi.x * 0.5f + 0.5f, 0.5f - lo.y * 0.5f) * O.depthSize + O.dilate;
+    pmin = clamp(pmin, float2(0.0f), O.depthSize - 1.0f);
+    pmax = clamp(pmax, float2(0.0f), O.depthSize - 1.0f);
+    float ext = max(pmax.x - pmin.x, pmax.y - pmin.y);
+    uint L = uint(clamp(ceil(log2(max(ext, 1.0f))) - 1.0f, 0.0f, float(O.mipCount - 1)));
+    float s = exp2(float(L + 1));              // source px per level-L texel
+    uint2 dim = uint2(hzb.get_width(L), hzb.get_height(L));
+    uint2 t1 = min(uint2(pmax / s), dim - 1u), t0 = min(uint2(pmin / s), t1);
+    float m = 0.0f;
+    for (uint y = t0.y; y <= t1.y; ++y)
+        for (uint x = t0.x; x <= t1.x; ++x) m = max(m, hzb.read(uint2(x, y), L).r);
+    return zmin > m;
+}
+
 static float signack_rung_error(constant SignackInstanceUniforms& U, uint k) {
     return U.rungError[k / 4][k % 4];
 }
@@ -68,6 +111,8 @@ kernel void signack_instances_classify(
     device const uint4*                source   [[buffer(2)]],   // instanceCount × stride
     device uint4*                      lists    [[buffer(3)]],   // 2 · buckets · instanceCount × stride
     device atomic_uint*                counters [[buffer(4)]],   // [list · buckets + bucket]
+    constant SignackInstOcclusionUniforms& O    [[buffer(6)]],   // DH-1466
+    texture2d<float, access::read>     hzb      [[texture(0)]],
     uint i                                      [[thread_position_in_grid]])
 {
     if (i >= U.instanceCount) return;
@@ -93,6 +138,8 @@ kernel void signack_instances_classify(
             if (dot(pl.xyz, c) + pl.w < -r) { onScreen = false; break; }
         }
     }
+    // DH-1466: a plant hidden behind last frame's depth is drawn by the shadow passes only.
+    if (onScreen && O.enabled != 0 && signack_inst_occluded(c, r, O, hzb)) onScreen = false;
     uint words = U.instanceStride / 16u;
     device const uint4* src = source + i * words;
     for (uint list = onScreen ? 0u : 1u; list < 2u; ++list) {

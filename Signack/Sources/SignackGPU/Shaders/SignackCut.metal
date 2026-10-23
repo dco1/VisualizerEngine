@@ -5,7 +5,8 @@
 //   1. signack_cut_classify   one THREAD per cluster: the crack-free cut test (`isInCut`, exactly
 //                             `SignackSelection.isInCut` on the CPU) then the frustum test on the
 //                             cluster's padded bounds. flag 0 = not in the cut, 1 = in the cut but
-//                             off screen (shadow casters only), 2 = in the cut and on screen.
+//                             off screen (shadow casters only), 2 = in the cut and on screen,
+//                             3 = on screen but OCCLUDED (DH-1466 Hi-Z; shadow casters only, like 1).
 //                             Off-screen indices are counted.
 //   2. signack_cut_write      one THREADGROUP per cluster: thread 0 claims an output range with one
 //                             atomic, every thread copies one triangle — and (S3) stamps the
@@ -105,8 +106,52 @@ struct SignackGPUShadowViews {
 static_assert(sizeof(SignackGPUShadowViews) == 784, "mirror of Swift SignackGPUShadowViewUniforms");
 constant uint SIGNACK_VIEW_FULL = 0xFFFFFFFFu;   // a view base meaning "draw the shadow record"
 
+
+/// DH-1466 — Hi-Z occlusion: the pyramid's frame (mirror of Swift `SignackGPUOcclusion.Uniforms`).
+struct SignackOcclusionUniforms {
+    float4x4 toClip;      // the instance's space → the clip space the pyramid's depth was drawn in
+    float2   depthSize;   // px of that depth
+    uint     mipCount;
+    uint     enabled;
+    float    dilate;      // px each side (TAA jitter)
+    float    _pad0, _pad1, _pad2;
+};
+static_assert(sizeof(SignackOcclusionUniforms) == 96, "mirror of Swift SignackGPUOcclusion.Uniforms");
+
+/// Is the sphere (c, r) hidden behind everything over its footprint in the pyramid? Conservative:
+/// the footprint is the projected bounding CUBE (dilated), its depth the cube's nearest corner, the
+/// occluder depth the pyramid's MAX over every texel the footprint touches. Anything crossing the
+/// near plane is visible.
+static bool signack_occluded(float3 c, float r, constant SignackOcclusionUniforms& O, texture2d<float, access::read> hzb) {
+    if (O.enabled == 0 || O.mipCount == 0) return false;
+    float2 lo = float2(1.0e30f), hi = float2(-1.0e30f);
+    float zmin = 1.0e30f;
+    for (uint k = 0; k < 8; ++k) {
+        float3 p = c + r * float3((k & 1u) ? 1.0f : -1.0f, (k & 2u) ? 1.0f : -1.0f, (k & 4u) ? 1.0f : -1.0f);
+        float4 q = O.toClip * float4(p, 1.0f);
+        if (q.w <= 1.0e-4f) return false;
+        float3 n = q.xyz / q.w;
+        lo = min(lo, n.xy); hi = max(hi, n.xy); zmin = min(zmin, n.z);
+    }
+    if (zmin <= 0.0f) return false;
+    float2 pmin = float2(lo.x * 0.5f + 0.5f, 0.5f - hi.y * 0.5f) * O.depthSize - O.dilate;
+    float2 pmax = float2(hi.x * 0.5f + 0.5f, 0.5f - lo.y * 0.5f) * O.depthSize + O.dilate;
+    pmin = clamp(pmin, float2(0.0f), O.depthSize - 1.0f);
+    pmax = clamp(pmax, float2(0.0f), O.depthSize - 1.0f);
+    float ext = max(pmax.x - pmin.x, pmax.y - pmin.y);
+    uint L = uint(clamp(ceil(log2(max(ext, 1.0f))) - 1.0f, 0.0f, float(O.mipCount - 1)));
+    float s = exp2(float(L + 1));              // source px per level-L texel
+    uint2 dim = uint2(hzb.get_width(L), hzb.get_height(L));
+    uint2 t1 = min(uint2(pmax / s), dim - 1u), t0 = min(uint2(pmin / s), t1);
+    float m = 0.0f;
+    for (uint y = t0.y; y <= t1.y; ++y)
+        for (uint x = t0.x; x <= t1.x; ++x) m = max(m, hzb.read(uint2(x, y), L).r);
+    return zmin > m;
+}
+
 // counters[0] off-screen indices (classify), [1] off-screen cursor, [2] on-screen hardware cursor,
-// [3] soft cursor (counted down from the top of the buffer), [4] whole-cut indices (classify);
+// [3] soft cursor (counted down from the top of the buffer), [4] whole-cut indices (classify),
+// [5] occluded clusters (DH-1466; finalize copies it to args + 384 for the census);
 // DH-1465: [8 + v] view v's indices (classify), [16 + v] its write cursor, [24 + v] its pool base.
 
 /// `SignackView.projectedError` — conservative pixels of `err` measured at sphere `s`.
@@ -126,6 +171,8 @@ kernel void signack_cut_classify(
     device atomic_uint*             counters   [[buffer(3)]],
     constant SignackGPUShadowViews& V          [[buffer(10)]],  // DH-1465
     device uchar*                   viewMask   [[buffer(11)]],
+    constant SignackOcclusionUniforms& O       [[buffer(12)]],  // DH-1466
+    texture2d<float, access::read>  hzb        [[texture(0)]],
     uint i                                     [[thread_position_in_grid]])
 {
     if (i >= U.clusterCount) return;
@@ -143,7 +190,12 @@ kernel void signack_cut_classify(
                 if (dot(pl.xyz, c.bounds.xyz) + pl.w < -r) { f = 1; break; }
             }
         }
-        if (f == 1) atomic_fetch_add_explicit(&counters[0], c.triangleCount * 3, memory_order_relaxed);
+        // DH-1466: on screen but hidden behind last frame's depth → flag 3, drawn by the shadow passes only.
+        if (f == 2 && O.enabled != 0 && signack_occluded(c.bounds.xyz, c.bounds.w + U.boundsPad, O, hzb)) {
+            f = 3;
+            atomic_fetch_add_explicit(&counters[5], 1u, memory_order_relaxed);
+        }
+        if (f != 2) atomic_fetch_add_explicit(&counters[0], c.triangleCount * 3, memory_order_relaxed);
         if (V.count > 0) {
             atomic_fetch_add_explicit(&counters[4], c.triangleCount * 3, memory_order_relaxed);
             float r = c.bounds.w + U.boundsPad;
@@ -267,7 +319,7 @@ kernel void signack_cut_write(
         return;
     }
     if (t == 0) {
-        base = (f == 1) ? atomic_fetch_add_explicit(&counters[1], n, memory_order_relaxed)
+        base = (f != 2) ? atomic_fetch_add_explicit(&counters[1], n, memory_order_relaxed)
              : atomic_load_explicit(&counters[0], memory_order_relaxed)
                + atomic_fetch_add_explicit(&counters[2], n, memory_order_relaxed);
     }
@@ -318,5 +370,7 @@ kernel void signack_cut_finalize(
         }
         *viewArgs = a;
     }
+    device uint* occludedOut = (device uint*)((device uchar*)args + 384);   // DH-1466 census
+    *occludedOut = atomic_load_explicit(&counters[5], memory_order_relaxed);
     for (uint k = 0; k < 32; ++k) atomic_store_explicit(&counters[k], 0u, memory_order_relaxed);
 }

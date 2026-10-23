@@ -310,6 +310,14 @@ public final class IlluminatoramaRenderer {
     /// the frames in flight, and holds command-buffer slots on the renderer's queue (Digital Clock,
     /// VZ-0233). Same ordering on the GPU as a side buffer committed just before the frame.
     public var onEncodeFrameCompute: ((_ cb: MTLCommandBuffer) -> Void)?
+    /// Opt-in AFTER-G-BUFFER hook (Daydream DH-1466; nil elsewhere): called with the frame's command
+    /// buffer right after the G-buffer pass, before glass/particles touch `gbufferDepthTexture` — a
+    /// host reads this frame's opaque depth here (Signack's Hi-Z pyramid).
+    public var onEncodeAfterGBuffer: ((_ cb: MTLCommandBuffer) -> Void)?
+    /// True when every CPU instance kept its mesh, matrix and sway this frame and nothing sways
+    /// (DH-1466: last frame's depth still stands for this frame's occluders). Valid from
+    /// `onEncodeFrameCompute` on.
+    public var sceneShapeHeld: Bool { gbs.instanceShapeStableFrames >= 1 && !gbs.contentHasSway }
 
     public var pointLights: [IlluminatoramaPointLight] = []
     public var spotLights: [IlluminatoramaSpotLight] = []
@@ -3627,6 +3635,7 @@ public final class IlluminatoramaRenderer {
         encodeSpotShadowPasses(cb)
         encodePointShadowPasses(cb)
         encodeGBufferPass(cb)
+        onEncodeAfterGBuffer?(cb)   // DH-1466 — nil for every host that does not opt in
         // Issue #65 — now that the G-buffer draw has read THIS frame's prev
         // positions, copy the current positions forward to be next frame's prev.
         encodeGPUMeshPrevCapture(cb, prime: false)

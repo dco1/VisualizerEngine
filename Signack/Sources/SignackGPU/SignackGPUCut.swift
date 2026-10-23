@@ -27,6 +27,8 @@ public final class SignackGPUCut: @unchecked Sendable {
     /// `SignackShadowViews.maxViews`): set by the host before `encode`, like `routing`. Empty = none
     /// (every view slot holds the whole-cut shadow record, exactly S2).
     public var shadowViews: [SignackFrustum] = []
+    /// DH-1466 — this frame's Hi-Z occlusion source (object → the pyramid's clip), or nil = no test.
+    public var occlusion: SignackGPUOcclusion?
     /// S4 — route this instance's sub-pixel on-screen triangles to the software rasterizer's range
     /// (set by the host each frame before `encode`; nil = none, exactly S2).
     public var routing: SignackGPURouting?
@@ -93,6 +95,7 @@ public final class SignackGPUCut: @unchecked Sendable {
         enc.setBuffer(outputClusterIDs, offset: 0, index: 7)
         SignackGPUShadowViewUniforms(shadowViews, poolCapacity: shadowViewPool).bind(enc, index: 10)
         enc.setBuffer(viewMask, offset: 0, index: 11)
+        SignackGPUOcclusion.bind(occlusion, enc, buffer: 12, texture: 0, fallback: pipelines.blankHiZ)
 
         enc.setComputePipelineState(pipelines.classify)
         let w = min(64, pipelines.classify.maxTotalThreadsPerThreadgroup)
@@ -133,13 +136,24 @@ public final class SignackGPUCut: @unchecked Sendable {
     /// and `onScreen` (flag 2, what the camera draws), as ascending cluster ids. Read it only after
     /// the command buffer that encoded it has completed (tests, diagnostics).
     public func readSelection() -> (lodCut: [UInt32], onScreen: [UInt32]) {
+        let s = readSelectionWithOcclusion()
+        return (s.lodCut, s.onScreen)
+    }
+
+    /// `readSelection` plus DH-1466's `occluded` (flag 3: in the camera frustum, hidden by the Hi-Z test).
+    public func readSelectionWithOcclusion() -> (lodCut: [UInt32], onScreen: [UInt32], occluded: [UInt32]) {
         let f = flags.contents().bindMemory(to: UInt8.self, capacity: hierarchy.clusterCount)
-        var cut: [UInt32] = [], on: [UInt32] = []
+        var cut: [UInt32] = [], on: [UInt32] = [], occ: [UInt32] = []
         for i in 0..<hierarchy.clusterCount where f[i] != 0 {
             cut.append(UInt32(i))
-            if f[i] == 2 { on.append(UInt32(i)) }
+            if f[i] == 2 { on.append(UInt32(i)) } else if f[i] == 3 { occ.append(UInt32(i)) }
         }
-        return (cut, on)
+        return (cut, on, occ)
+    }
+
+    /// Clusters the last completed frame's Hi-Z test hid (async, may lag) — census.
+    public var lastOccludedClusterCount: Int {
+        Int(drawArgs.contents().load(fromByteOffset: SignackGPUDrawArgs.occludedCountOffset, as: UInt32.self))
     }
 }
 

@@ -17,6 +17,10 @@ public final class SignackGPUPipelines: @unchecked Sendable {
     let write: MTLComputePipelineState
     let finalize: MTLComputePipelineState
     let viewsPrefix: MTLComputePipelineState   // DH-1465
+    let hizSeed: MTLComputePipelineState       // DH-1466
+    let hizReduce: MTLComputePipelineState
+    /// DH-1466 — bound in place of a pyramid when a pass has no occlusion source (never read).
+    let blankHiZ: MTLTexture
     let rasterPrepare: MTLComputePipelineState
     let rasterDepth: MTLComputePipelineState
     let rasterIDs: MTLComputePipelineState
@@ -46,10 +50,16 @@ public final class SignackGPUPipelines: @unchecked Sendable {
             return try? device.makeComputePipelineState(function: fn)
         }
         guard let c = pso("signack_cut_classify"), let w = pso("signack_cut_write"),
-              let f = pso("signack_cut_finalize"), let vp = pso("signack_cut_views_prefix"), let rp = pso("signack_raster_prepare"),
+              let f = pso("signack_cut_finalize"), let vp = pso("signack_cut_views_prefix"),
+              let hs = pso("signack_hiz_seed"), let hr = pso("signack_hiz_reduce"), let rp = pso("signack_raster_prepare"),
               let rd = pso("signack_raster_depth"), let ri = pso("signack_raster_ids"),
               let rc = pso("signack_raster_clear"),
               let ic = pso("signack_instances_classify"), let inf = pso("signack_instances_finalize") else { return nil }
+        let bd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: 1, height: 1, mipmapped: false)
+        bd.usage = .shaderRead
+        guard let blank = device.makeTexture(descriptor: bd) else { return nil }
+        blankHiZ = blank
+        hizSeed = hs; hizReduce = hr
         self.device = device
         classify = c; write = w; finalize = f; viewsPrefix = vp
         rasterPrepare = rp; rasterDepth = rd; rasterIDs = ri; rasterClear = rc
@@ -61,12 +71,12 @@ public final class SignackGPUPipelines: @unchecked Sendable {
         if let lib = try? device.makeDefaultLibrary(bundle: .module),
            lib.functionNames.contains("signack_cut_classify"), lib.functionNames.contains("signack_raster_depth"),
            lib.functionNames.contains("signack_instances_classify"),
-           lib.functionNames.contains("signack_cut_views_prefix") {
+           lib.functionNames.contains("signack_cut_views_prefix"), lib.functionNames.contains("signack_hiz_seed") {
             return (lib, "metallib")
         }
         // Each .metal is self-contained (no includes), so the sources concatenate into one library.
         var src = ""
-        for name in ["SignackCut", "SignackRaster", "SignackInstances"] {
+        for name in ["SignackCut", "SignackRaster", "SignackInstances", "SignackHiZ"] {
             let url = Bundle.module.url(forResource: name, withExtension: "metal")
                 ?? Bundle.module.url(forResource: name, withExtension: "metal", subdirectory: "Shaders")
             guard let url, let s = try? String(contentsOf: url, encoding: .utf8) else { return nil }
