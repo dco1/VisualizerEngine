@@ -152,6 +152,7 @@ extension IlluminatoramaRenderer {
     func defersToVisBuffer(_ mesh: IlluminatoramaMesh, kind: MeshKind, count: Int) -> Bool {
         mesh.visBuffer && !mesh.tracedOnly && mesh.indexType == .uint32 && count <= 0x7FFF
             && interiorMappedMeshKinds[kind] == nil
+            && !(mesh.leafCutout && leafCutoutEnabled)   // DH-1487 — the cutout lives in the conventional pass
             && !fxs.gpuRepackTasks.contains { $0.kind == kind && !$0.direct }
     }
 

@@ -206,6 +206,7 @@ fragment GBufferOut illumi_vis_resolve_fs(
     in.worldTangent = visLerp(b, float4(d[0].worldT, v[0].tangent.w), float4(d[1].worldT, v[1].tangent.w),
                               float4(d[2].worldT, v[2].tangent.w));
     in.vertexColor  = visLerp(b, v[0].color, v[1].color, v[2].color);
+    in.cardUV       = float2(0.0f);   // a cutout mesh never defers to the visibility buffer
 
     float2 uvX = visLerp(bx, v[0].uv, v[1].uv, v[2].uv), uvY = visLerp(by, v[0].uv, v[1].uv, v[2].uv);
     float2 duvdx = oddX ? in.uv - uvX : uvX - in.uv;

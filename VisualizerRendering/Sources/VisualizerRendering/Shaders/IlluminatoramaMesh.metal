@@ -63,7 +63,7 @@ kernel void illumi_repack_pos_norm(
     v.normal   = n;
     v._padNrm  = 0.0;
     v.uv       = uv;
-    v._padUv   = float2(0.0);
+    v.cardUV   = float2(0.0);
     v.tangent  = float4(t, 1.0);
     // Per-vertex color → albedo (white identity when the mesh ships no color).
     v.color    = (hasColor != 0u) ? inColor[gid] : float4(1.0);

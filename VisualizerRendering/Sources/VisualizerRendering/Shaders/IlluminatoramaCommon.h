@@ -995,7 +995,9 @@ struct Vertex {
     float3 normal;
     float  _padNrm;
     float2 uv;
-    float2 _padUv;
+    // DH-1487 — leaf-cutout card coordinates (IlluminatoramaLeafCutout.h); (0, 0) = no cutout.
+    // Was `_padUv`, the padding that kept the stride at 48: every writer already zeroed it.
+    float2 cardUV;
     // Phase 4.5 — tangent (xyz) + handedness (w). Bitangent =
     // cross(normal, tangent.xyz) * tangent.w. Zero tangent means "no
     // normal-map data for this vertex" and the fragment shader falls
@@ -1036,6 +1038,8 @@ struct VSOut {
     // SCNGeometry (HotAirBalloon's chevron stripes; GiantGummyBears'
     // candy gradients; anything procedural-coloured per-vertex).
     float4 vertexColor;
+    // DH-1487 — the vertex's leaf-cutout coordinates, interpolated (read only by the cutout variant).
+    float2 cardUV;
 };
 
 // Octahedral encoding — packs a normalized vec3 into 2 channels. Standard

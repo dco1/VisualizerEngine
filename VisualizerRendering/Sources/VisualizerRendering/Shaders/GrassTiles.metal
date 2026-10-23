@@ -242,7 +242,7 @@ kernel void grassTileGenerate(
         const float4 c4 = float4(col, u.misc.x);
         Vertex vl, vr;
         vl.position = pL; vl._padPos = 0.0f; vl.normal = nL; vl._padNrm = 0.0f;
-        vl.uv = float2(0.0f); vl._padUv = float2(0.0f);
+        vl.uv = float2(0.0f); vl.cardUV = float2(0.0f);
         vr = vl; vr.position = pR; vr.normal = nR;
         // Arbitrary stable tangent, as the engine's repack kernel writes (grass samples no normal map).
         float3 axL = abs(nL.y) < 0.99f ? float3(0, 1, 0) : float3(1, 0, 0);

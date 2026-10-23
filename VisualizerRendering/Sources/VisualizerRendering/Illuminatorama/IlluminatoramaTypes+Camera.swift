@@ -13,7 +13,13 @@ public struct IlluminatoramaVertex {
     public var normal: SIMD3<Float>
     public var _padNrm: Float = 0
     public var uv: SIMD2<Float>
-    public var _padUv: SIMD2<Float> = .zero  // pad to 16 so stride was 48
+    public var _padUv: SIMD2<Float> = .zero  // pad to 16 so stride was 48 — the shader's `cardUV` (DH-1487)
+    /// Leaf-cutout card coordinates (IlluminatoramaLeafCutout.h, Daydream DH-1487): (0, 0) = no cutout;
+    /// read only when the mesh is flagged `leafCutout`. Stored in the old padding — the stride is unchanged.
+    public var cardUV: SIMD2<Float> {
+        get { _padUv }
+        set { _padUv = newValue }
+    }
     /// Tangent in object space (xyz) + handedness in `w`. The fragment
     /// shader builds the bitangent as `cross(normal, tangent) * w` so a
     /// mirrored mesh's TBN frame stays consistent. Zero tangent = "no

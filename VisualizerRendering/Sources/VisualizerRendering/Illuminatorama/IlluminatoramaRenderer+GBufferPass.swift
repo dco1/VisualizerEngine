@@ -132,6 +132,7 @@ extension IlluminatoramaRenderer {
         // groups are all ordinary meshes (the common case).
         var prevVertsBound = false
         var interiorBound = false
+        var cutoutBound = false   // DH-1487
         var substrateBiased = false
         for (gi, group) in gbs.meshGroups.enumerated() {
             if deferred.contains(gi) { continue }   // the visibility buffer draws it (culled above)
@@ -167,16 +168,24 @@ extension IlluminatoramaRenderer {
                 if !interiorBound { enc.setRenderPipelineState(ip) }
                 interiorBound = true
                 prevVertsBound = false
+                cutoutBound = false
                 var gpu = imap.gpu
                 enc.setFragmentBytes(&gpu, length: MemoryLayout<IlluminatoramaInteriorMapping.GPU>.stride, index: 9)
             } else if prevPos != nil {
-                if !prevVertsBound || interiorBound { enc.setRenderPipelineState(prevPipe) }
+                if !prevVertsBound || interiorBound || cutoutBound { enc.setRenderPipelineState(prevPipe) }
                 prevVertsBound = true
                 interiorBound = false
-            } else if prevVertsBound || interiorBound {
+                cutoutBound = false
+            } else if mesh.leafCutout, leafCutoutEnabled, let cp = leafCutoutGBufferPipeline(extended: extended) {
+                if !cutoutBound { enc.setRenderPipelineState(cp) }   // DH-1487
+                cutoutBound = true
+                prevVertsBound = false
+                interiorBound = false
+            } else if prevVertsBound || interiorBound || cutoutBound {
                 enc.setRenderPipelineState(basePipe)
                 prevVertsBound = false
                 interiorBound = false
+                cutoutBound = false
             }
             enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
             enc.setVertexBuffer(frameUniformBuffer, offset: 0, index: 1)

@@ -76,6 +76,10 @@ final class GBufferState {
     /// Interior-mapping variants (kInteriorMap = true), built on first use (live / extended lane).
     var gbufferPipelineInterior: MTLRenderPipelineState?
     var gbufferPipelineInteriorExt: MTLRenderPipelineState?
+    var gbufferPipelineCutout: MTLRenderPipelineState?      // DH-1487
+    var leafCutoutEnabled = true
+    var leafCutoutShadowCascades = 1
+    var gbufferPipelineCutoutExt: MTLRenderPipelineState?
 
     var depthState: MTLDepthStencilState!
     var lightingPipeline: MTLComputePipelineState!

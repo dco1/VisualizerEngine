@@ -126,6 +126,12 @@ public final class IlluminatoramaMesh {
     /// G-buffer targets (`IlluminatoramaRenderer+VisBuffer`). Shadow passes are unchanged. Needs
     /// 32-bit indices; ignored (drawn conventionally) otherwise or when the host lever is off.
     public var visBuffer: Bool = false
+    /// Cut each card's species leaf out per pixel (Daydream DH-1487): the G-buffer and the shadow maps
+    /// draw this mesh with the leaf-cutout variants, which discard what lies outside the leaf its
+    /// vertices' `cardUV` names (IlluminatoramaLeafCutout.h). A cutout mesh never defers to the
+    /// visibility buffer. The ray tracer still sees the whole card. Ignored when the renderer's
+    /// `leafCutoutEnabled` is off.
+    public var leafCutout: Bool = false
     /// Optional per-triangle cluster id buffer parallel to `indexBuffer` (Signack's GPU cut writes
     /// it) — only the visibility buffer's cluster debug view reads it.
     public var visBufferClusterIDs: MTLBuffer?

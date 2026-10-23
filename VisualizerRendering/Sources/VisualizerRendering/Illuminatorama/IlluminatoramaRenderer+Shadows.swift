@@ -40,6 +40,7 @@ extension IlluminatoramaRenderer {
             // Disabled → the clear above already made this a fully-lit slice; no draws.
             guard shadowsEnabled else { enc.endEncoding(); continue }
             enc.setRenderPipelineState(shd.shadowPipeline)
+            var cutoutBound = false   // DH-1487 — the fragment-less pipeline is bound
             enc.setDepthStencilState(gbs.depthState)
             // Front-face cull keeps the shadow projection biased on the
             // back faces of geometry, which combats acne on lit surfaces
@@ -76,6 +77,8 @@ extension IlluminatoramaRenderer {
                 enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
                 let inst = mesh.instanceBinding(ring: currentInstanceBuffer, groupOffset: off)
                 enc.setVertexBuffer(inst.buffer, offset: inst.offset, index: 2)
+                bindShadowPipeline(for: mesh, enc, cutout: &cutoutBound,   // DH-1487 — near cascades only
+                                   allowed: cascade < leafCutoutShadowCascades)
                 enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow, view: .cascade(cascade))
             }
             enc.endEncoding()
@@ -452,6 +455,7 @@ extension IlluminatoramaRenderer {
             guard let enc = timedRenderEncoder(cb, shd.spotShadowPassDescs[slice], "shadow.spot") else { continue }
             enc.label = shd.spotShadowPassLabels[slice]
             enc.setRenderPipelineState(shd.shadowPipeline)
+            var cutoutBound = false   // DH-1487 — the fragment-less pipeline is bound
             enc.setDepthStencilState(gbs.depthState)
             // Same back-face-cast trick as the cascaded path, and the same per-group
             // opt-out for open shells (`shadowCullMode`).
@@ -484,6 +488,7 @@ extension IlluminatoramaRenderer {
                 enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
                 let inst = mesh.instanceBinding(ring: currentInstanceBuffer, groupOffset: off)
                 enc.setVertexBuffer(inst.buffer, offset: inst.offset, index: 2)
+                bindShadowPipeline(for: mesh, enc, cutout: &cutoutBound, allowed: true)   // DH-1487
                 enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow, view: .spot(slice))
             }
             enc.endEncoding()
@@ -612,6 +617,7 @@ extension IlluminatoramaRenderer {
                 guard let enc = timedRenderEncoder(cb, shd.pointShadowPassDescs[slice], "shadow.point") else { continue }
                 enc.label = shd.pointShadowPassLabels[slice]
                 enc.setRenderPipelineState(shd.shadowPipeline)
+                var cutoutBound = false   // DH-1487 — the fragment-less pipeline is bound
                 enc.setDepthStencilState(gbs.depthState)
                 // Back-face cast, same acne mitigation as the sun / spot maps, and the
                 // same per-group opt-out for open shells (`shadowCullMode`).
@@ -635,6 +641,7 @@ extension IlluminatoramaRenderer {
                     enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
                     let inst = mesh.instanceBinding(ring: currentInstanceBuffer, groupOffset: off)
                     enc.setVertexBuffer(inst.buffer, offset: inst.offset, index: 2)
+                    bindShadowPipeline(for: mesh, enc, cutout: &cutoutBound, allowed: false)   // DH-1487 — whole cards
                     enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow, view: .point(slice))
                 }
                 enc.endEncoding()
@@ -745,6 +752,8 @@ final class ShadowState {
     let pointShadowMapResolution: Int = 512
 
     var shadowPipeline: MTLRenderPipelineState!
+    /// DH-1487 — the leaf-cutout depth stage (a fragment that discards outside the card's leaf).
+    var shadowPipelineCutout: MTLRenderPipelineState?
 
     // ── Per-frame input buffers — ring-buffered (maxFramesInFlight) ─────────────
     // These hold the frame's uniforms + lights + impostor params. They are
@@ -1037,6 +1046,32 @@ extension IlluminatoramaRenderer {
         sdesc.fragmentFunction = nil
         sdesc.depthAttachmentPixelFormat = .depth32Float
         s.shadowPipeline = try device.makeRenderPipelineState(descriptor: sdesc)
+        // DH-1487 — the same depth for leaf-cutout meshes, with the discarding fragment. Optional: a
+        // failed compile leaves those meshes casting whole cards.
+        let cdesc = MTLRenderPipelineDescriptor()
+        cdesc.label = "Illuminatorama.shadow.leafCutout"
+        cdesc.vertexFunction = library.makeFunction(name: "illumi_shadow_cutout_vs")
+        cdesc.fragmentFunction = library.makeFunction(name: "illumi_shadow_cutout_fs")
+        cdesc.depthAttachmentPixelFormat = .depth32Float
+        if cdesc.vertexFunction != nil, cdesc.fragmentFunction != nil {
+            s.shadowPipelineCutout = try? device.makeRenderPipelineState(descriptor: cdesc)
+        }
+    }
+
+    /// DH-1487 — bind the shadow pipeline `mesh` needs (the cutout stage for a leaf-cutout mesh, where
+    /// the pass is `allowed` one), switching only when it changes; `cutout` tracks what is bound.
+    ///
+    /// The cutout stage has a fragment, so a depth-only pass loses its fast path for every leaf draw —
+    /// measured +1.3 ms of sun cascades on a close five-tree shot with all three cascades cut. Only the
+    /// passes where a leaf's outline can resolve pay it: the near sun cascades
+    /// (`leafCutoutShadowCascades`) and spot slices. The far cascades and point-light faces draw whole
+    /// cards — there a leaf is a texel or two, its outline invisible.
+    func bindShadowPipeline(for mesh: IlluminatoramaMesh, _ enc: MTLRenderCommandEncoder, cutout: inout Bool,
+                            allowed: Bool) {
+        let want = allowed && mesh.leafCutout && leafCutoutEnabled && shd.shadowPipelineCutout != nil
+        guard want != cutout else { return }
+        cutout = want
+        enc.setRenderPipelineState(want ? shd.shadowPipelineCutout! : shd.shadowPipeline)
     }
 
     /// Sun cascade shadow map array + spot shadow atlas.
