@@ -584,28 +584,15 @@ public extension MaterialGenerator {
         let bakedToneVariation = split.bakedToneVariation
         ch.patternJitter = split.patternJitter
 
-        // Joint half-widths per axis. `jointFraction` is a fraction of the LONG edge; the v
-        // axis is measured in short-edge units, so its half-width scales by the aspect — that
-        // is what makes the joint physically SQUARE on a rectangular tile instead of a
-        // letterboxed grid (the bug `wallTile` papered over with two hand-picked constants).
-        //
-        // FLOORED AT `TileLayout.minJointTexels` on each axis. On a fine grid a proportional joint
-        // falls below one texel, the line aliases into a dotted mess and the wrap stops matching.
-        // A joint that cannot be drawn is not a joint, so it widens to the thinnest line the bake
-        // can hold — which is also what fine mosaic genuinely looks like.
-        //
-        // The floor is taken from `layout`, NOT re-derived here: the width CONTROL has to offer
-        // exactly the range this baker will honour, and two copies of that arithmetic is how the
-        // slider ended up with a dead bottom quarter nobody could see.
-        let aspect = Double(p.shape.aspect)
-        let texelsU = Double(size) / Double(Swift.max(1, cols))
-        let texelsV = Double(size) / Double(Swift.max(1, rows))
-        let jf = layout.effectiveJointFraction(p.jointFraction)
-        let halfU = jf / 2
-        let halfV = jf * aspect / 2
-        // Antialias band, in tile units, ≈1 texel wide on each axis.
-        let softU = Swift.max(1.0 / Swift.max(texelsU, 1), 0.004)
-        let softV = Swift.max(1.0 / Swift.max(texelsV, 1), 0.004)
+        // Joint half-widths per axis, the antialias band, the course offset and the per-unit
+        // identity all come from `UnitLattice` — the ONE place laid-unit grid arithmetic lives
+        // (brick samples through it too). `jointFraction` is a fraction of the LONG edge and the v
+        // half-width scales by the aspect, so the joint is physically SQUARE on a rectangular
+        // tile; it is FLOORED at `TileLayout.minJointTexels`, so a joint too thin to draw widens to
+        // the thinnest line the bake can hold — and that floor is taken from `layout`, the same
+        // number the width control offers.
+        let lattice = UnitLattice(pattern: p, layout: layout, size: size)
+        let real = TileRealism(params: params, lattice: lattice, size: size)
 
         let bevel = params.edge.bevelFraction
         let handmade = params.edge == .handmade
@@ -616,33 +603,13 @@ public extension MaterialGenerator {
 
         for y in 0..<size {
             for x in 0..<size {
-                // A VERTICAL run is an exact quarter turn of the lattice: swap the sampling axes
-                // and the grid counts. On a square bake that maps the pattern onto itself, so the
-                // vertical layout is seamless by construction rather than by luck.
-                let su = (Double(x) + 0.5) / Double(size)
-                let sv = (Double(y) + 0.5) / Double(size)
-                let u = p.run == .vertical ? sv : su
-                let v = p.run == .vertical ? su : sv
-
-                let tv = v * Double(rows)
-                let tj = Int(floor(tv))
-                let tu = u * Double(cols) + p.bond.offset(row: tj)
-                let ti = Int(floor(tu))
-                let fx = tu - floor(tu), fy = tv - floor(tv)
-
-                // Wrapped unit indices: the per-unit tone must be identical either side of the
-                // u/v seam, so it is hashed on the WRAPPED index, not the raw one.
-                let tiW = ((ti % cols) + cols) % cols
-                let tjW = ((tj % rows) + rows) % rows
-
-                // Distance to the nearest joint on each axis, in that axis's tile units.
-                let dU = Swift.min(fx, 1 - fx), dV = Swift.min(fy, 1 - fy)
-                let gU = 1 - smoothstep(halfU, halfU + softU, dU)
-                let gV = 1 - smoothstep(halfV, halfV + softV, dV)
-                let joint = Swift.max(gU, gV)
+                let (u, v) = lattice.uv(x: x, y: y)
+                let c = lattice.cell(u: u, v: v)
+                let fx = c.fx, fy = c.fy
+                let joint = c.joint
 
                 // Per-unit discrete tone — the thing that stops a grid reading as clones.
-                let th = Noise.hash2(tiW, tjW, p.seed)
+                let th = Noise.hash2(c.keyI, c.keyJ, p.seed)
                 let tone = 1 + (Noise.unit(th) - 0.5) * bakedToneVariation
                 let warp = Noise.fbmTiled(u, v, baseCells: Swift.max(cols, 2) * 3, octaves: 3,
                                           seed: p.seed ^ 0x11)
@@ -652,8 +619,7 @@ public extension MaterialGenerator {
                 // Glaze pooling: fired glaze runs thicker (darker, glossier) toward the unit
                 // edge and thins at the centre. Measured from the normalised edge distance so
                 // it is symmetric per unit and stays seamless on both axes.
-                let edgeN = Swift.min(dU / Swift.max(halfU, 1e-6), dV / Swift.max(halfV, 1e-6))
-                let pool = 1 - smoothstep(1.0, 3.0, edgeN)
+                let pool = 1 - smoothstep(1.0, 3.0, c.edgeN)
 
                 // THE UNIT FACE. Procedural: the body colour, per-unit tone and glaze pooling.
                 // Imported: the photo, sampled by the WITHIN-UNIT coordinate so one copy lands on
@@ -668,21 +634,29 @@ public extension MaterialGenerator {
                     bodyCol = face.albedo[face.idx(sx, sy)] * tone
                 } else {
                     bodyCol = p.bodyColor * tone * (0.96 + 0.08 * warp) * (1 - 0.09 * pool)
+                        * real.hue(unitHash: th)
                 }
-                ch.albedo[ch.idx(x, y)] = clampBand(mix(bodyCol, p.jointColor, joint) * macro)
+                let grout = real.grout(c, u: u, v: v, x: x, y: y)
+                let flaw = face == nil ? real.defects(c, unitHash: th, u: u, v: v, x: x, y: y)
+                                       : TileRealism.Defect(albedoMul: 1, albedoToBisque: 0, roughAdd: 0, heightAdd: 0)
+                let faceCol = mix(bodyCol * flaw.albedoMul, TileRealism.bisque * tone, flaw.albedoToBisque)
+                ch.albedo[ch.idx(x, y)] = clampBand(mix(faceCol, p.jointColor * grout.albedoMul, joint) * macro)
 
                 let micro = (Noise.fbmTiled(u, v, baseCells: 30, octaves: 2,
                                             seed: p.seed ^ 0x33) - 0.5) * 0.04
                 ch.roughness[ch.idx(x, y)] =
-                    clamp01(mix(bodyRough, 0.85, joint) + micro - 0.05 * pool)
+                    clamp01(mix(bodyRough, 0.85, joint) + micro - 0.05 * pool
+                            + mix(flaw.roughAdd, grout.roughAdd, joint))
 
                 // Height: the joint is recessed. A BEVELLED edge additionally chamfers the
                 // unit's own rim — a ramp over the band just inside the joint — which is free
                 // here because the normal is derived from this field anyway.
-                let chamfer = bevel > 0 ? (1 - smoothstep(0, bevel, Swift.min(dU, dV * aspect))) : 0
-                let relief = params.edge.handmadeRelief(rim: Swift.min(dU, dV * aspect), fx: fx, fy: fy, unitHash: th,
+                let chamfer = bevel > 0 ? (1 - smoothstep(0, bevel, c.rim)) : 0
+                let relief = params.edge.handmadeRelief(rim: c.rim, fx: fx, fy: fy, unitHash: th,
                                                         wobble: handmade ? Noise.fbmTiled(u, v, baseCells: Swift.max(cols, 2) * 2, octaves: 3, seed: p.seed ^ 0x44) : 0.5)
-                ch.height[ch.idx(x, y)] = clamp01((handmade ? 0.88 + relief : 1) - joint * 0.7 - chamfer * bevel * 6)   // machine edges bake exactly as before
+                ch.height[ch.idx(x, y)] = clamp01((handmade ? 0.88 + relief : 1) - joint * 0.7 - chamfer * bevel * 6
+                                                  - real.rimEase(c, edge: params.edge)
+                                                  + grout.heightAdd * joint + flaw.heightAdd * (1 - joint))
             }
         }
 
@@ -724,65 +698,23 @@ public extension MaterialGenerator {
         ch.patternCells = .zero
         ch.patternJitter = 0
 
-        let herring = p.bond == .herringbone
-        let L = TileLayout.herringboneBrickLength
         let bevel = params.edge.bevelFraction
         let handmade = params.edge == .handmade
         let bodyRough = params.finish.bodyRoughness
         let face = params.face.imageDocumentID == nil ? nil : faceImage
 
-        // Joint half-width and antialias band, in the lattice's own cell units, floored to the
-        // thinnest line the bake can hold (below `minJointTexels` the grout aliases and the wrap
-        // stops matching — the same floor `tile` takes from `TileLayout`).
-        let texelsPerCell = Double(size) / Double(cells)
-        let soft = Swift.max((herring ? 1.0 : 1.4142) / Swift.max(texelsPerCell, 1), 0.004)
-        let jf = p.jointFraction
-        // Herringbone: joint is `jf` of the LONG (L-cell) edge, measured in cells. Diagonal: `jf` of
-        // the diamond edge, in `a`/`b` units, where one cell of `a` spans edge/√2 → ×√2.
-        let jointHalf = herring ? jf * Double(L) / 2 : jf * 1.4142 / 2
-        let jointHalfFloored = Swift.max(jointHalf, TileLayout.minJointTexels / (2 * Swift.max(texelsPerCell, 1)))
+        // The lattice classification (which brick, where in it, how far from the joint) and the
+        // joint geometry — floored to the thinnest line the bake can hold, in the lattice's own
+        // cell units — come from `UnitLattice`, shared with every laid-unit bake.
+        let lattice = UnitLattice(pattern: p, layout: layout, size: size)
+        let real = TileRealism(params: params, lattice: lattice, size: size)
 
         for y in 0..<size {
             for x in 0..<size {
-                // A vertical run is a quarter turn of the lattice — swap the sampling axes, exactly
-                // as `tile` does, so a vertical herringbone is seamless the same way.
-                let su = (Double(x) + 0.5) / Double(size)
-                let sv = (Double(y) + 0.5) / Double(size)
-                let u = p.run == .vertical ? sv : su
-                let v = p.run == .vertical ? su : sv
-
-                // Per-texel lattice classification → the SAME shading inputs both bakes share:
-                //   dMin  = distance to the nearest joint, in cell units
-                //   keyI/keyJ = wrapped per-unit id for the tone hash (identical across the seam)
-                //   faceU/faceV = within-unit coordinate for an imported face image
-                var dMin = 0.0, faceU = 0.0, faceV = 0.0, keyI = 0, keyJ = 0
-                if herring {
-                    let gx = u * Double(cells), gy = v * Double(cells)
-                    let i = Int(floor(gx)), j = Int(floor(gy))
-                    let s = (((i + j) % (2 * L)) + 2 * L) % (2 * L)
-                    let ax: Int, ay: Int, lu: Int, lv: Int
-                    if s < L { ax = i - s; ay = j; lu = L; lv = 1 }      // horizontal brick
-                    else     { ax = i;     ay = j - (s - L); lu = 1; lv = L }  // vertical brick
-                    let lx = gx - Double(ax), ly = gy - Double(ay)
-                    let dU = Swift.min(lx, Double(lu) - lx)
-                    let dV = Swift.min(ly, Double(lv) - ly)
-                    dMin = Swift.min(dU, dV)
-                    faceU = lx / Double(lu); faceV = ly / Double(lv)
-                    keyI = ((ax % cells) + cells) % cells
-                    // Fold orientation in so an H brick and a V brick sharing an anchor coordinate
-                    // still draw as two different cuts.
-                    keyJ = (((ay % cells) + cells) % cells) + (s < L ? 0 : cells)
-                } else {
-                    let a = (u + v) * Double(cells)
-                    let b = (u - v) * Double(cells)
-                    let fa = a - floor(a), fb = b - floor(b)
-                    dMin = Swift.min(Swift.min(fa, 1 - fa), Swift.min(fb, 1 - fb))
-                    faceU = fa; faceV = fb
-                    keyI = ((Int(floor(a)) % cells) + cells) % cells
-                    keyJ = ((Int(floor(b)) % cells) + cells) % cells
-                }
-
-                let joint = 1 - smoothstep(jointHalfFloored, jointHalfFloored + soft, dMin)
+                let (u, v) = lattice.uv(x: x, y: y)
+                let c = lattice.cell(u: u, v: v)
+                let dMin = c.rim, faceU = c.fx, faceV = c.fy, keyI = c.keyI, keyJ = c.keyJ
+                let joint = c.joint
 
                 // Per-unit discrete tone — the thing that stops a lattice reading as clones.
                 let th = Noise.hash2(keyI, keyJ, p.seed)
@@ -794,8 +726,7 @@ public extension MaterialGenerator {
 
                 // Glaze pooling: thicker (darker, glossier) toward the unit edge, from the
                 // normalised edge distance so it stays symmetric per unit and seamless.
-                let edgeN = dMin / Swift.max(jointHalfFloored, 1e-6)
-                let pool = 1 - smoothstep(1.0, 3.0, edgeN)
+                let pool = 1 - smoothstep(1.0, 3.0, c.edgeN)
 
                 var bodyCol: Vec3
                 if let face {
@@ -805,18 +736,26 @@ public extension MaterialGenerator {
                     bodyCol = face.albedo[face.idx(sx, sy)] * tone
                 } else {
                     bodyCol = p.bodyColor * tone * (0.96 + 0.08 * warp) * (1 - 0.09 * pool)
+                        * real.hue(unitHash: th)
                 }
-                ch.albedo[ch.idx(x, y)] = clampBand(mix(bodyCol, p.jointColor, joint) * macro)
+                let grout = real.grout(c, u: u, v: v, x: x, y: y)
+                let flaw = face == nil ? real.defects(c, unitHash: th, u: u, v: v, x: x, y: y)
+                                       : TileRealism.Defect(albedoMul: 1, albedoToBisque: 0, roughAdd: 0, heightAdd: 0)
+                let faceCol = mix(bodyCol * flaw.albedoMul, TileRealism.bisque * tone, flaw.albedoToBisque)
+                ch.albedo[ch.idx(x, y)] = clampBand(mix(faceCol, p.jointColor * grout.albedoMul, joint) * macro)
 
                 let micro = (Noise.fbmTiled(u, v, baseCells: 30, octaves: 2,
                                             seed: p.seed ^ 0x33) - 0.5) * 0.04
                 ch.roughness[ch.idx(x, y)] =
-                    clamp01(mix(bodyRough, 0.85, joint) + micro - 0.05 * pool)
+                    clamp01(mix(bodyRough, 0.85, joint) + micro - 0.05 * pool
+                            + mix(flaw.roughAdd, grout.roughAdd, joint))
 
                 let chamfer = bevel > 0 ? (1 - smoothstep(0, bevel, dMin)) : 0
                 let relief = params.edge.handmadeRelief(rim: dMin, fx: faceU, fy: faceV, unitHash: th,
                                                         wobble: handmade ? Noise.fbmTiled(u, v, baseCells: Swift.max(cells, 2) * 2, octaves: 3, seed: p.seed ^ 0x44) : 0.5)
-                ch.height[ch.idx(x, y)] = clamp01((handmade ? 0.88 + relief : 1) - joint * 0.7 - chamfer * bevel * 6)   // machine edges bake exactly as before
+                ch.height[ch.idx(x, y)] = clamp01((handmade ? 0.88 + relief : 1) - joint * 0.7 - chamfer * bevel * 6
+                                                  - real.rimEase(c, edge: params.edge)
+                                                  + grout.heightAdd * joint + flaw.heightAdd * (1 - joint))
             }
         }
 
