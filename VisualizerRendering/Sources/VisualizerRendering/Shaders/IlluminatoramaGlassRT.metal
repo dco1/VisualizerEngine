@@ -310,6 +310,7 @@ static inline SecondaryShadeParams glassSecondaryParams(constant GlassRTUniforms
     p.interiorAmbient = u.interiorAmbient;
     p.interiorRoomGains = &u.interiorRoomGain[0];
     p.interiorRoomGainEnabled = u.interiorRoomGainMeta.x;
+    p.diffuseRoughnessOn = u.interiorRoomGainMeta.w;   // DH-1301 — the meta's spare lane (Glass.swift)
     p.interiorIrrUp = u.interiorIrrUp.xyz;     p.interiorIrrW = u.interiorIrrUp.w;
     p.interiorIrrSide = u.interiorIrrSide.xyz;
     p.interiorIrrDown = u.interiorIrrDown.xyz;
@@ -504,6 +505,7 @@ static float3 shadeOpaqueHit(thread intersector<triangle_data, instancing>& isec
     SecondaryHit h;
     h.P = hitP; h.N = hitN; h.bary = bary;
     h.instanceID = iid; h.primitiveID = prim;
+    h.muO = saturate(-dot(hitN, rd));                  // DH-1301
     // DH-0622 — a surface-cache card supplies only the hit's multi-bounce indirect term; the
     // hit is shaded by the one secondary shader either way. A non-resident card (budget
     // streaming zeroed its rect) takes the fill estimate of the same light instead.

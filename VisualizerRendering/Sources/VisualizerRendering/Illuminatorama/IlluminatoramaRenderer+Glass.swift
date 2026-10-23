@@ -382,6 +382,7 @@ extension IlluminatoramaRenderer {
         // DH-0718 — area lights at through-glass hits too (same body, same lanes).
         u.interiorRoomGainMeta.y = rtShade ? Float(secondaryAreaLightCount) : 0
         u.interiorRoomGainMeta.z = Float(max(0, min(secondaryAreaShadowRays, 8)))
+        u.interiorRoomGainMeta.w = diffuseRoughnessEnabled ? 1 : 0   // DH-1301 — `SecondaryShadeParams.diffuseRoughnessOn`
         u.interiorIrrSide = SIMD4(simd_max(interiorIrradianceSide, .zero), 0)
         u.interiorIrrDown = SIMD4(simd_max(interiorIrradianceDown, .zero), 0)
         // ── The night sky, THROUGH the glass ─────────────────────────────────

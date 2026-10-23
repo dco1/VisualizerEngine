@@ -294,7 +294,9 @@ kernel void illumi_rt_lighting(
     // and read `secondaryConeVisible` in IlluminatoramaSecondary.h first.
     float roughness = max(0.045, float(nrH.b));
     float3 albedo = float3(amH.rgb);
-    float metalness = float(amH.a);
+    // DH-1301 — a negative alpha is a pure dielectric's diffuse roughness (IlluminatoramaDiffuseRoughness.h):
+    // metalness 0. Written inline: this file deliberately includes only metal_stdlib.
+    float metalness = max(float(amH.a), 0.0);
 
     float3 Pofs = P + N * max(u.rayTMin, 1e-3);
 

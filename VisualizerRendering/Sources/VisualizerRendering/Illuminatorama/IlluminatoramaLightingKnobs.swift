@@ -178,13 +178,15 @@ final class LightingKnobs {
     /// `false` (the default) is every lobe's historical expression, byte for byte — a look
     /// change is the host's call (Daydream Home opts in).
     var layeredMultiscatter: Bool = false
-    /// **DH-1301 — diffuse roughness (Oren-Nayar).** `true`: the DIRECT diffuse lobe of rough
-    /// surfaces (sun, points, spots, fill directionals, the traced primary sun) is Fujii's
-    /// qualitative Oren-Nayar instead of Lambert, so plaster / carpet / matte paint backscatter
-    /// toward grazing instead of reading flat. sigma = saturate((roughness − 0.4)/0.6)·0.6 rad
-    /// (roughness ≤ 0.4 is exactly Lambert). LTC area lights and the IBL diffuse stay Lambert.
-    /// `false` (the default) is byte-identical to before — a look change is the host's call.
-    var diffuseRoughnessEnabled: Bool = false
+    /// **DH-1301 — diffuse roughness (OpenPBR `base_diffuse_roughness`, the EON lobe).** The master
+    /// switch for every lane: with it set, an instance's `diffuseRoughness` (> 0, pure dielectric)
+    /// shades with the energy-preserving Oren-Nayar lobe (IlluminatoramaDiffuseRoughness.h) — the full
+    /// lobe under every light with a direction (sun, points, spots, fills, the traced primary sun), its
+    /// directional albedo under every integrated source (area / portal lights, the diffuse IBL and
+    /// ambient, the traced GI, every secondary and path vertex). `true` (the default) costs nothing and
+    /// changes nothing for a material that never sets one — the per-material value defaults to 0, which
+    /// is Lambert bit for bit. `false` makes every lane Lambert whatever the materials carry (the A/B lever).
+    var diffuseRoughnessEnabled: Bool = true
     /// **DH-1014 / DH-0597 — cloth sheen as a layer.** `true`: the sheen's environment arms read
     /// the fitted Charlie albedo from the DFG LUT (`.a`) instead of the hand-fitted curve, and
     /// the base under the sheen loses what the sheen reflected (albedo scaling), in the deferred

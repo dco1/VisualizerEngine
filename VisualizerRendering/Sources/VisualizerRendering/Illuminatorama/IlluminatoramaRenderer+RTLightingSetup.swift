@@ -323,7 +323,18 @@ extension IlluminatoramaRenderer {
         if inst.clearcoat <= 0, inst.thinTransmission > 0 { c2.w = 1 + min(inst.thinTransmission, 1) }
         return RTInstanceData(nrm0: c0, nrm1: c1, nrm2: c2,
                               albedoTriBase: SIMD4(inst.albedo, normalBase),
-                              emissionPad: SIMD4(inst.emission, rtPackMaterialLane(inst.metallic, inst.roughness)))
+                              emissionPad: SIMD4(inst.emission, rtPackBaseLane(inst)))
+    }
+
+    /// DH-1301 — the base layer's lane: metalness + roughness (`rtPackMaterialLane`), or, for a PURE
+    /// dielectric with a diffuse roughness, an integer part 1001…2001 = 1001 + round(r·1000) — decoded
+    /// as metalness 0 by `secondaryMaterial` and as the roughness by `secondaryDiffuseRoughness`.
+    /// Same rule as the G-buffer's (`illumiPackMetallicDiffuseRoughness`): only `metallic == 0` carries it.
+    nonisolated static func rtPackBaseLane(_ inst: IlluminatoramaInstance) -> Float {
+        let dr = inst.diffuseRoughness
+        guard dr > 0, inst.metallic <= 0 else { return rtPackMaterialLane(inst.metallic, inst.roughness) }
+        let aq = 1001 + (min(dr, 1) * 1000).rounded()
+        return -(1 + 2 * aq + min(max(inst.roughness, 0), 0.999))
     }
 
     /// DH-1308 — two [0, 1] material scalars in ONE float lane, `−(1 + 2·round(a·1000) + min(b, 0.999))`:

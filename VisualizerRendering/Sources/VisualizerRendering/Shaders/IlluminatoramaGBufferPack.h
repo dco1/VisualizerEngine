@@ -45,7 +45,9 @@ static inline __attribute__((always_inline)) GBufferOut illumiGBufferPack(
     texture2d_array<float, access::sample> nonColorAtlas, sampler texSampler
 ) {
     GBufferOut o;
-    o.albedoMetallic  = half4(half3(albedo), half(metallic));
+    // DH-1301 — a pure dielectric's diffuse roughness rides the sign of the metalness channel
+    // (IlluminatoramaDiffuseRoughness.h); 0 (every material that never sets one) packs `metallic`.
+    o.albedoMetallic  = half4(half3(albedo), illumiPackMetallicDiffuseRoughness(metallic, inst.materialExt.x));
     float2 oct = octEncode(n);
     // normalRoughness.w is otherwise unused (always 1) — repurpose it as a
     // foliage flag. Scenes that want leaf thin-sheet transmission tag their

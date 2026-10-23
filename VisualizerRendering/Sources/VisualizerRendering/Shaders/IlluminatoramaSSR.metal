@@ -48,7 +48,7 @@ kernel void illumi_ssr_gather(
 
     half4 amH = gAlbedoMet.read(gid);
     half4 nrH = gNormalRgh.read(gid);
-    float metallic  = float(amH.a);
+    float metallic  = illumiUnpackMetallic(amH.a);   // DH-1301 — negative = diffuse roughness
     float roughness = max(0.045, float(nrH.b));
     if (roughness > 0.7) {
         outSSRRaw.write(half4(0.0h), gid);

@@ -675,6 +675,7 @@ extension MaterialGenerator {
             }
         }
         ch.clearcoat = 0.0
+        ch.diffuseRoughness = 1.0   // DH-1301 — fired brick / cast paver + mortar: OpenPBR's brick example, 1.0
         ch.deriveNormals(strength: 2.5)
         // Fine masonry tooth on the brick/mortar faces — real pavers are gritty, not
         // molded plastic. Isotropic micro over both body and joint.

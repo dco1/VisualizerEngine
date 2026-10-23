@@ -153,6 +153,7 @@ extension MaterialGenerator {
         }
 
         ch.sheen = gloss
+        ch.diffuseRoughness = 1.0                    // DH-1301 — a tufted pile is a forest of fibres, maximally rough
         ch.sheenRoughness = 0.60                     // upright pile → a broad, soft grazing sheen
                                                      // (DH-0081; broader than a flat weave)
         // Strong relief from the pile field — the tufts stand up; the normal should read them.

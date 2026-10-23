@@ -39,6 +39,14 @@ public struct MaterialChannels: Equatable, Sendable {
     /// `clothSheenRoughnessForBand` in IlluminatoramaCommon.h) — inert (band 0) unless a material
     /// picks a non-default nap. Only meaningful where `sheen > 0`.
     public var sheenRoughness: Double = 0.30
+    /// **Diffuse roughness** (Daydream DH-1301) — OpenPBR `base_diffuse_roughness`, [0, 1]: how far the
+    /// diffuse base departs from Lambert. 0 (the default) is Lambert; a rough matte surface (plaster,
+    /// brick, carpet pile, velvet, unglazed clay) backscatters toward the light, reads darker head-on
+    /// under a raking light, and its colour deepens through multiple scattering between its facets.
+    /// The renderer evaluates the energy-preserving Oren-Nayar lobe EON (VisualizerRendering's
+    /// `IlluminatoramaDiffuseRoughness.h`). Uniform per material, set by the generator per family —
+    /// OpenPBR's example library uses 1.0 for brick, sand and velvet. Only a dielectric uses it.
+    public var diffuseRoughness: Double = 0
     /// High-frequency (close-range) detail normal map — pores, weave, grain.
     /// Sampled at `detailNormalUVScale × uv` (shader-side) and blended over the
     /// macro normal via partial-derivative add. `nil` = no detail layer.

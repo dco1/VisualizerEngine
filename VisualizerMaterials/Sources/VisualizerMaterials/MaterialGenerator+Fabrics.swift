@@ -24,6 +24,7 @@ extension MaterialGenerator {
             }
         }
         ch.sheen = 0.85                            // velvet is sheen-dominated
+        ch.diffuseRoughness = 1.0                  // DH-1301 — OpenPBR's velvet example: 1.0
         ch.sheenRoughness = 0.45                    // dense cut pile → a BROAD, soft grazing glow
                                                     // (DH-0081; was the 0.30 library default)
         ch.deriveNormals(strength: 0.7)      // was 2 on the crossed-band weave; on the isotropic nap that read as crushed suede
@@ -67,6 +68,7 @@ extension MaterialGenerator {
         // what "medium" means here. `MaterialTextureTests.testEveryUncoatedFabricCarriesSheen`
         // now iterates the registry, so no future fabric can lose it silently.
         ch.sheen = 0.45
+        ch.diffuseRoughness = 0.80                  // DH-1301 — a looped bouclé: rough, a shade short of cut pile
         ch.sheenRoughness = 0.60                    // chunky looped bouclé → the broadest, fuzziest
                                                     // nap of the fabric set (DH-0081)
         ch.deriveNormals(strength: 4)
@@ -301,6 +303,7 @@ extension MaterialGenerator {
         // velvet grade so it reads as matte upholstery, not satin: the fabric character is carried
         // mostly by the albedo weave + roughness variation, with sheen as the finishing soft glow.
         ch.sheen = 0.30
+        ch.diffuseRoughness = 0.50                  // DH-1301 — a flat plain weave: matte, the yarns' crowns smooth
         // Nap width kept at the library DEFAULT (0.30) on purpose: a flat plain weave has a
         // medium, unremarkable sheen breadth, and this is the fabric the cloth-sheen render gate
         // measures — leaving it default keeps that frame byte-identical (DH-0081).

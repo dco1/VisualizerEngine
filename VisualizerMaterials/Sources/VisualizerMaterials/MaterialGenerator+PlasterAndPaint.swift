@@ -94,6 +94,7 @@ extension MaterialGenerator {
         }
         // The polish lobe over the pigment — 0 for flat/matte, real for the sheens.
         ch.clearcoat = finish.clearcoat
+        ch.diffuseRoughness = finish.diffuseRoughness          // DH-1301 — same single source
         // Roller lap at 3.75 cm (see the tile table above). Scaled by the finish, because a
         // gloss enamel flows level and a flat paint keeps the stipple it was rolled with.
         ch.deriveNormals(strength: 0.8 * relief)
@@ -225,6 +226,7 @@ extension MaterialGenerator {
             }
         }
         ch.clearcoat = 0
+        ch.diffuseRoughness = 0.80   // DH-1301 — a sand-float cement render: one of the roughest diffusers on a house
         ch.deriveNormals(strength: 2.8)
         addMicroDetail(&ch, seed: seed ^ 0xD4, baseCells: 120, strength: 0.7)
         return ch

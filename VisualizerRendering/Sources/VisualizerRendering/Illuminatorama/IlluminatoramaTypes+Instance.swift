@@ -375,6 +375,23 @@ public struct IlluminatoramaInstance {
         set { tagGlow.w = newValue }
     }
 
+    /// **OpenPBR material extension** (Daydream DH-1301; offsets 384–399, stride 384 → 400) — the
+    /// per-instance home for OpenPBR parameters the G-buffer has no channel of its own for.
+    ///   x = `base_diffuse_roughness` (see `diffuseRoughness`) · y, z, w reserved (0)
+    /// `.zero` — the default, and every existing instance — is an exact shader no-op.
+    /// Mirrors `Instance.materialExt` in `IlluminatoramaCommon.h`.
+    public var materialExt: SIMD4<Float> = .zero
+
+    /// **Diffuse roughness** — OpenPBR `base_diffuse_roughness`, [0, 1]: 0 is Lambert, 1 the roughest
+    /// matte (brick, sand, velvet). Evaluated as the energy-preserving Oren-Nayar lobe EON
+    /// (`IlluminatoramaDiffuseRoughness.h`) on every lane, under `IlluminatoramaRenderer.diffuseRoughnessEnabled`.
+    /// Carried only by a PURE dielectric (`metallic == 0`) — it rides the sign of the G-buffer's
+    /// metalness channel; a partly metallic instance is Lambert. Rides `materialExt.x`.
+    public var diffuseRoughness: Float {
+        get { materialExt.x }
+        set { materialExt.x = newValue }
+    }
+
     public init(
         modelMatrix: simd_float4x4,
         albedo: SIMD3<Float> = SIMD3(0.8, 0.8, 0.8),
@@ -407,10 +424,10 @@ public struct IlluminatoramaInstance {
         self.normalMatrix = Self.normalMatrix(from: m)
     }
 
-    /// Compile-time guard: Swift and Metal structs must agree on 384 bytes.
+    /// Compile-time guard: Swift and Metal structs must agree on 400 bytes.
     /// If this fires, either a Swift field was added without the matching Metal
     /// field (or vice versa), or alignment changed unexpectedly.
-    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 384, "IlluminatoramaInstance stride must be 384") }()
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 400, "IlluminatoramaInstance stride must be 400") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //

@@ -497,8 +497,9 @@ static inline float3 brdf(
         spec *= le.specDirectMS;
         kd = le.diffuseDirect;
     }
-    // DH-1301 — Oren-Nayar diffuse roughness (le.onSigma 0 ⇒ exactly × 1.0, i.e. Lambert).
-    float3 diff = kd * albedo / M_PI_F * orenNayarDiffuseScale(N, V, L, le.onSigma);
+    // DH-1301 — diffuse roughness: the EON lobe as a factor on Lambert (IlluminatoramaDiffuseRoughness.h);
+    // `le.diffuseRoughness` 0 ⇒ the literal 1.0, i.e. exactly the Lambert term.
+    float3 diff = kd * albedo / M_PI_F * illumiEONLambertRatio(albedo, le.diffuseRoughness, NdotL, NdotV, dot(L, V));
     // THE EXACT EARLY-OUT. Everything above this line is untouched, and this is the expression
     // `brdf` has always returned; a surface with no cloth sheen therefore cannot move by a bit.
     if (!(sheenStrength > 0.0)) return (diff + spec) * lightColor * NdotL;
@@ -532,7 +533,8 @@ static inline float3 brdfDiffuse(
     // DH-1014 — must stay `brdf`'s diffuse exactly (the SSS composite subtracts it).
     if (le.multiscatter) kd = le.diffuseDirect;
     kd *= le.baseUnderSheen;
-    return kd * albedo / M_PI_F * orenNayarDiffuseScale(N, V, L, le.onSigma) * lightColor * NdotL;
+    return kd * albedo / M_PI_F * illumiEONLambertRatio(albedo, le.diffuseRoughness, NdotL, saturate(dot(N, V)), dot(L, V))
+         * lightColor * NdotL;
 }
 
 // ── Rectangular area light (#60 task 5) ─────────────────────────────────────
@@ -794,6 +796,9 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
         spec *= le.specDirectMS;
         diffuse = le.diffuseDirect * albedo * ff;
     }
+    // DH-1301 — an area light is an INTEGRATED source: the rough diffuse lobe's directional albedo
+    // (exactly 1 at diffuse roughness 0). See IlluminatoramaDiffuseRoughness.h for why not the lobe.
+    diffuse *= le.eonAlbedoRatio;
 
     return (diffuse + spec) * al.color * window;
 }
@@ -1211,7 +1216,8 @@ kernel void illumi_lighting(
     half4 nrH = gNormalRgh.read(gid);
 
     float3 albedo    = float3(amH.rgb);
-    float  metallic  = float(amH.a);
+    // DH-1301 — `albedoMetallic.a` carries metalness, or (negative) a pure dielectric's diffuse roughness.
+    float  metallic  = illumiUnpackMetallic(amH.a);
     float3 N         = octDecode(float2(nrH.rg));
     float  roughness = max(0.045, float(nrH.b));
     float3 emission  = float3(emH.rgb);
@@ -1275,9 +1281,11 @@ kernel void illumi_lighting(
                         ? float(dfgLUT.sample(leSampler, float2(leNdotV, sheenRoughness)).a) : 0.0;
         le = layeredEnergy(albedo, metallic, leLUT, leSheenA, sheenStrength, layeredMS, layeredSheen);
     }
-    // DH-1301 — diffuse roughness: the DIRECT lobes below (sun, points, spots, fill directionals,
-    // and the SSS diffuse peel) take Oren-Nayar; LTC area lights and the IBL diffuse stay Lambert.
-    if ((frame.frameFlags & kFrameFlagDiffuseRoughness) != 0u) le.onSigma = diffuseRoughnessSigma(roughness);
+    // DH-1301 — diffuse roughness (EON): the lights with a direction below (sun, points, spots, fill
+    // directionals, the SSS diffuse peel) evaluate the full lobe; the integrated sources (LTC area /
+    // portal lights, the diffuse IBL + bands, the ambient supplement) its directional albedo.
+    if ((frame.frameFlags & kFrameFlagDiffuseRoughness) != 0u)
+        le = layeredWithDiffuseRoughness(le, albedo, illumiUnpackDiffuseRoughness(amH.a), saturate(dot(N, V)));
 
     // Issue #65 — screen-space SSS. SSS-flagged pixels carry ≈0.95h in
     // normalRoughness.w (vertex-colour alpha ∈ [0.90,0.98]; above the foliage 0.0
@@ -1836,6 +1844,9 @@ kernel void illumi_lighting(
         // …and the sheen layer over the base reflects its own albedo first (albedo scaling,
         // Estevez & Kulla 2017 §4) — 1.0 exactly for every non-cloth pixel.
         if (layeredSheen) kD *= le.baseUnderSheen;
+        // DH-1301 — the rough diffuse lobe's directional albedo (1.0 exactly at diffuse roughness 0).
+        // On `kD`, so the traced lanes' hand-off (`diffSkyInComposite`) carries it too.
+        kD *= le.eonAlbedoRatio;
 
         // Diffuse: the sky-probe irradiance cube.
         float3 irradianceSrc = float3(irradianceCube.sample(cubeSampler, N).rgb);
@@ -2078,7 +2089,7 @@ kernel void illumi_lighting(
         // zenith), × albedo, AO-gated. `ambientColor == 0` is the default no-op.
         float upness = saturate(N.y * 0.5 + 0.5);
         float3 ambCol = desaturateFill(frame.ambientColor, frame.iblDiffuseDesaturation);
-        float3 ambSupp = mix(ambCol * 0.4, ambCol, upness) * albedo;
+        float3 ambSupp = mix(ambCol * 0.4, ambCol, upness) * albedo * le.eonAlbedoRatio;   // DH-1301
         if (layeredSheen) ambSupp *= le.baseUnderSheen;   // DH-1014 — 1.0 off cloth
         indirect += ambSupp * ao * interiorAmbK;
         dbgAmbient = ambSupp * ao * interiorAmbK;
@@ -2109,7 +2120,7 @@ kernel void illumi_lighting(
         // Legacy hemispheric ambient — only the diffuse term, no spec.
         float upness = saturate(N.y * 0.5 + 0.5);
         float3 ambCol = desaturateFill(frame.ambientColor, frame.iblDiffuseDesaturation);
-        float3 amb = mix(ambCol * 0.4, ambCol, upness) * albedo;
+        float3 amb = mix(ambCol * 0.4, ambCol, upness) * albedo * le.eonAlbedoRatio;   // DH-1301
         indirect = amb * ao * interiorAmbK;
         dbgAmbient = amb * ao * interiorAmbK;
         if ((frame.frameFlags & (kFrameFlagPathOwnsIndirect | kFrameFlagGIOwnsAmbient)) != 0u) diffSkyInComposite = dbgAmbient;

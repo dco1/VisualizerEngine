@@ -214,7 +214,7 @@ fragment SQImpostorFSOut illumi_superquadric_impostor_fs(
     float2 velUV   = (curNDC - prevNDC) * float2(0.5, -0.5);
 
     SQImpostorFSOut o;
-    o.albedoMetallic  = half4(half3(inst.albedo), half(inst.metallic));
+    o.albedoMetallic  = half4(half3(inst.albedo), illumiPackMetallicDiffuseRoughness(inst.metallic, inst.materialExt.x));   // DH-1301
     float2 oct = octEncode(wN);
     // .w tag: 1.0 = opaque (default); 1.0 + anisotropy (>1) carries the grain-highlight stretch
     // for the deferred pass (all existing tag tests are < 1.0, so this reads as opaque to them).

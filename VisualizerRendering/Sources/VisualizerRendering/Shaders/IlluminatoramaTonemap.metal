@@ -833,7 +833,7 @@ fragment float4 illumi_tonemap_fs(
                 return float4(r, r, r, 1.0);
             }
             case 13u: { // Metalness (greyscale).
-                float m = float(gAlbedoMet.read(gp).a);
+                float m = illumiUnpackMetallic(gAlbedoMet.read(gp).a);   // DH-1301
                 return float4(m, m, m, 1.0);
             }
             case 14u: { // Depth — non-linear NDC z, ramped so the foreground is legible.

@@ -262,6 +262,7 @@ extension MaterialGenerator {
             }
         }
         ch.clearcoat = 0.0                          // unglazed — no gloss
+        ch.diffuseRoughness = 0.80                  // DH-1301 — unglazed low-fire clay: chalky, strongly matte
         ch.deriveNormals(strength: 2.5)
         addMicroDetail(&ch, seed: seed ^ 0xE7, baseCells: 88, octaves: 2, strength: 0.80)   // clay grain tooth
         return ch

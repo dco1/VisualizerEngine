@@ -51,53 +51,17 @@ using namespace metal;
 /// FrameUniforms.frameFlags bit 3 — cloth sheen read from the LUT's fitted albedo (both
 /// environment arms) and energy-conserving against the base (albedo scaling).
 #define kFrameFlagLayeredSheen        8u
-/// FrameUniforms.frameFlags bit 7 (128) — DIFFUSE ROUGHNESS (Daydream DH-1301): the DIRECT diffuse
-/// lobe of rough surfaces is the qualitative Oren-Nayar term instead of Lambert (see
-/// `orenNayarDiffuseScale`). Mirrored for the ray-traced lighting kernel as
-/// RTInstUniforms.pathFlags kPathFlagDiffuseRoughness. Clear (the default) ⇒ every caller keeps
-/// its Lambert expression, so a host that never opts in is byte-identical.
+/// FrameUniforms.frameFlags bit 7 (128) — DIFFUSE ROUGHNESS (Daydream DH-1301): the master switch for
+/// the EON lobe (IlluminatoramaDiffuseRoughness.h). The per-pixel value rides the sign of
+/// `albedoMetallic.a`, so with the flag set a pixel whose material never set one is still Lambert,
+/// bit for bit. Mirrored for the ray-traced lighting kernel as RTInstUniforms.pathFlags
+/// kPathFlagDiffuseRoughness (the traced primary's sun, its GI weight, every secondary / path
+/// vertex). Clear ⇒ every lane is Lambert whatever the materials carry.
 #define kFrameFlagDiffuseRoughness    128u
-/// RTInstUniforms.pathFlags bit 14 (16384) — the same switch for the ray-traced primary sun.
+/// RTInstUniforms.pathFlags bit 14 (16384) — the same switch for the ray-traced lighting kernel.
 #define kPathFlagDiffuseRoughness     16384u
 
-// ── Diffuse roughness: qualitative Oren-Nayar (Daydream DH-1301) ───────────────────────────────
-//
-// A Lambert surface looks flat and plastic from a low angle: real rough diffuse (plaster, carpet,
-// matte paint, unglazed ceramic) BACKSCATTERS — it is brighter when the light comes from the
-// viewer's side, and stays bright toward grazing instead of falling off like cos(theta).
-//
-// Fujii's improved qualitative Oren-Nayar ("A tiny improvement of Oren-Nayar reflectance model",
-// 2012), per Oren & Nayar 1994 with the interreflection term folded into the constants:
-//     A = 1 / (pi + (pi/2 - 2/3) sigma),    B = sigma * A
-//     s = L.V - (N.L)(N.V),                 t = s > 0 ? max(N.L, N.V) : 1
-//     f = albedo * (A + B * s / t)                  [times N.L, applied by the caller]
-// Relative to Lambert (albedo/pi) that is the dimensionless scale
-//     scale = pi * A * (1 + sigma * s / t)
-// which this function returns, so every caller just multiplies the Lambert diffuse it already
-// has. Needs only N.L, N.V and L.V. sigma = 0 gives A = 1/pi, B = 0 => scale == 1.0 EXACTLY
-// (and the function returns the literal 1.0 for sigma <= 0 so it is bit-exact). Backscatter
-// (s > 0, light and eye on the same side) lifts the scale above 1 toward grazing; forward
-// scatter (s < 0, t = 1) dims it a little. For sigma <= 0.6 the result stays within ~[0.4, 1.6].
-//
-// sigma (radians) comes from the material roughness already in the G-buffer, no new field:
-//     sigma = saturate((roughness - 0.40) / 0.60) * 0.60
-// so anything at roughness <= 0.40 (glossy, glazed, polished) is exactly Lambert, and a fully
-// rough surface (roughness 1) is sigma 0.60 (~34 degrees facet slope).
-//
-// NOT applied: LTC / area-light diffuse and every IBL / irradiance diffuse (their cosine
-// integral over a whole patch of sky or emitter has no L to evaluate at) stay Lambert.
-static inline float diffuseRoughnessSigma(float roughness) {
-    return saturate((roughness - 0.40) / 0.60) * 0.60;
-}
-static inline float orenNayarDiffuseScale(float3 N, float3 V, float3 L, float sigma) {
-    if (!(sigma > 0.0)) return 1.0;
-    float NdotL = saturate(dot(N, L));
-    float NdotV = saturate(dot(N, V));
-    float s = dot(L, V) - NdotL * NdotV;
-    float t = s > 0.0 ? max(max(NdotL, NdotV), 1e-4) : 1.0;
-    float A = 1.0 / (M_PI_F + (0.5 * M_PI_F - 2.0 / 3.0) * sigma);
-    return M_PI_F * A * (1.0 + sigma * s / t);
-}
+#include "IlluminatoramaDiffuseRoughness.h"
 
 // ── Cloth sheen lobe (moved here from IlluminatoramaLighting.metal so the LUT bake integrates
 //    the IDENTICAL functions the direct lobe evaluates — the two arms cannot drift) ──────────
@@ -174,8 +138,11 @@ struct LayeredEnergy {
     float  baseUnderSheen;
     /// Directional albedo of the sheen lobe at μo — the environment arm's magnitude.
     float  sheenAlbedo;
-    /// Daydream DH-1301 — Oren-Nayar sigma (radians) for the DIRECT diffuse lobe; 0 ⇒ Lambert.
-    float  onSigma;
+    /// Daydream DH-1301 — the pixel's diffuse roughness (OpenPBR `base_diffuse_roughness`, EON);
+    /// 0 ⇒ Lambert. Read by `brdf` / `brdfDiffuse` (the full lobe, per light direction).
+    float  diffuseRoughness;
+    /// E_EON(μo)/ρ — what every INTEGRATED source (area lights, IBL, ambient) multiplies ρ by; 1 ⇒ Lambert.
+    float3 eonAlbedoRatio;
     /// Whether the multiscatter / diffuse-weight half is live (else callers keep the legacy terms).
     bool   multiscatter;
 };
@@ -212,7 +179,8 @@ static inline LayeredEnergy layeredOff() {
     e.baseUnderSheen = 1.0;
     e.sheenAlbedo = 0.0;
     e.multiscatter = false;
-    e.onSigma = 0.0;
+    e.diffuseRoughness = 0.0;
+    e.eonAlbedoRatio = float3(1.0);
     return e;
 }
 
@@ -229,7 +197,8 @@ static inline LayeredEnergy layeredEnergy(float3 albedo, float metallic,
     LayeredEnergy e;
     float3 F0 = mix(float3(0.04), albedo, metallic);
     e.multiscatter = multiscatter;
-    e.onSigma = 0.0;   // set by the lighting kernel under kFrameFlagDiffuseRoughness
+    e.diffuseRoughness = 0.0;          // set by `layeredWithDiffuseRoughness`
+    e.eonAlbedoRatio = float3(1.0);
     e.envSpec = layeredEnvSpecular(F0, lut.xy);
     if (multiscatter) {
         float Ed = clamp(lut.z, 1e-3, 1.0);
@@ -256,6 +225,17 @@ static inline LayeredEnergy layeredEnergy(float3 albedo, float metallic,
         float3 c = clothSheenColor(albedo);
         e.baseUnderSheen = saturate(1.0 - sheenStrength * max(c.r, max(c.g, c.b)) * e.sheenAlbedo);
     }
+    return e;
+}
+
+/// Daydream DH-1301 — stamp a pixel's diffuse roughness onto its energy terms: the EON lobe for
+/// every light with a direction (`brdf`, `brdfDiffuse`) and the lobe's directional albedo for
+/// every integrated source (`eonAlbedoRatio`). r ≤ 0 leaves `e` exactly as it was.
+static inline LayeredEnergy layeredWithDiffuseRoughness(LayeredEnergy e, float3 albedo,
+                                                        float diffuseRoughness, float NdotV) {
+    if (!(diffuseRoughness > 0.0)) return e;
+    e.diffuseRoughness = diffuseRoughness;
+    e.eonAlbedoRatio = illumiEONAlbedoRatio(albedo, diffuseRoughness, NdotV);
     return e;
 }
 
@@ -287,9 +267,12 @@ struct LayeredRTWeights {
 static inline LayeredRTWeights layeredRTWeights(uint pathFlags, float3 albedo, float metallic,
                                                 float roughness, float NdotV, half emissionAlpha,
                                                 texture2d<half, access::sample> dfgLUT,
-                                                float3 fresLegacy) {
+                                                float3 fresLegacy, float diffuseRoughness = 0.0) {
     LayeredRTWeights w;
-    w.diffuse = float3(1.0);
+    // DH-1301 — the traced GI replaces the deferred diffuse ENVIRONMENT, which a rough diffuse
+    // surface weights by its EON directional albedo; the replacement takes the same factor
+    // (exactly 1 at diffuse roughness 0, with or without the layered switches).
+    w.diffuse = illumiEONAlbedoRatio(albedo, diffuseRoughness, NdotV);
     w.reflection = fresLegacy;
     bool ms = (pathFlags & kPathFlagLayeredMultiscatter) != 0u;
     bool sh = (pathFlags & kPathFlagLayeredSheen) != 0u;
@@ -306,7 +289,7 @@ static inline LayeredRTWeights layeredRTWeights(uint pathFlags, float3 albedo, f
     float4 lut = float4(dfgLUT.sample(s, float2(NdotV, roughness)));
     float sheenA = (sh && sheenStrength > 0.0) ? float(dfgLUT.sample(s, float2(NdotV, sheenRoughness)).a) : 0.0;
     LayeredEnergy e = layeredEnergy(albedo, metallic, lut, sheenA, sheenStrength, ms, sh);
-    if (ms) { w.diffuse = e.diffuseEnv; w.reflection = e.envSpec; }
+    if (ms) { w.diffuse *= e.diffuseEnv; w.reflection = e.envSpec; }
     w.diffuse *= e.baseUnderSheen;
     w.reflection *= e.baseUnderSheen;
     return w;

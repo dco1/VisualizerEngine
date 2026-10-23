@@ -59,6 +59,22 @@ public enum PaintFinish: String, CaseIterable, Equatable, Hashable, Sendable, Co
         }
     }
 
+    /// **Diffuse roughness** (OpenPBR `base_diffuse_roughness`, DH-1301) — the same binder story once
+    /// more: a high-PVC flat paint dries to a field of exposed pigment and extender particles, a
+    /// genuinely rough diffuser (the chalky look of a flat ceiling at a low angle); the more binder,
+    /// the more the film closes over them and the closer the base is to Lambert. Satin and up are
+    /// smooth enough that the lobe is indistinguishable from Lambert, so they ship 0.
+    public var diffuseRoughness: Double {
+        switch self {
+        case .flat:      return 0.50
+        case .matte:     return 0.40
+        case .eggshell:  return 0.25
+        case .satin:     return 0.10
+        case .semiGloss: return 0.00
+        case .gloss:     return 0.00
+        }
+    }
+
     /// How much of the roller's tooth survives the film levelling — scales the surface-relief
     /// normal amplitude and the detail-band micro-occlusion. See the type note: this tracks
     /// sheen because both are consequences of the same binder content.

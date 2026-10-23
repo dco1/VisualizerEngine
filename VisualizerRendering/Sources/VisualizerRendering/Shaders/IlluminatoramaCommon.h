@@ -932,12 +932,20 @@ struct Instance {
     //   z = field-sink stagger key (> 0: fract(z) is the delay, shared by an object's parts;
     //       0 = hash of the instance origin) · w reserved
     float4   tagGlow;
+
+    // ── OpenPBR material extension (Daydream DH-1301) ──
+    // NEW 16-byte cluster (offsets 384-399): stride 384 -> 400. The per-instance home for the
+    // OpenPBR parameters the G-buffer has no channel of its own for (DH-1014's parameter model).
+    //   x = base_diffuse_roughness [0, 1] — the EON lobe (IlluminatoramaDiffuseRoughness.h); 0 = Lambert
+    //   y, z, w = reserved (0)
+    // Mirrors `IlluminatoramaInstance.materialExt`.
+    float4   materialExt;
 };
 
 // The Swift mirror (`IlluminatoramaInstance._assertStride240`) has always asserted this
 // side of the contract; this is the other side, and it costs a compile. A Swift field
 // added without its Metal twin used to be caught only by a wrong-looking render.
-static_assert(sizeof(Instance) == 384, "Instance must match IlluminatoramaInstance (384 bytes)");
+static_assert(sizeof(Instance) == 400, "Instance must match IlluminatoramaInstance (400 bytes)");
 
 // Every field at the Swift mirror's default (`IlluminatoramaInstance`'s property initialisers).
 // A GPU kernel that WRITES instances must start from this, not from `Instance inst;` — a local
@@ -962,6 +970,7 @@ inline Instance illumiDefaultInstance() {
     d.grainTangentTextureSlice = -1; d.thinTransmission = 0.0f;
     d.leafVenation = 0;              d.surfaceWear = 0.0f;
     d.uvWarp = float4(0.0f);         d.hueCycle = float4(0.0f);      d.tagGlow = float4(0.0f);
+    d.materialExt = float4(0.0f);
     return d;
 }
 
