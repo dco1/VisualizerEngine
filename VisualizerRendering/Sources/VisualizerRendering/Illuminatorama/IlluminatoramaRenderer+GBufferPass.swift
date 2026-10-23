@@ -60,6 +60,12 @@ extension IlluminatoramaRenderer {
             pass.colorAttachments[5].storeAction = .store
             pass.colorAttachments[5].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
         }
+        // DH-1300 — the material-layer slot. Cleared to kMaterialLayerNone (0xFFFFFFFF): sky, and every
+        // instance without layer parameters, reads "none" and keeps the legacy material model.
+        pass.colorAttachments[7].texture = gbs.gbufferMaterialLayer
+        pass.colorAttachments[7].loadAction = .clear
+        pass.colorAttachments[7].storeAction = .store
+        pass.colorAttachments[7].clearColor = MTLClearColor(red: Double(UInt32.max), green: 0, blue: 0, alpha: 0)
         attachVisBufferTarget(pass)   // Signack S3: the memoryless triangle-id attachment (color 6)
         pass.depthAttachment.texture = gbs.depthTexture
         pass.depthAttachment.loadAction = .clear

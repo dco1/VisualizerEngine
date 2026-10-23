@@ -67,12 +67,14 @@ extension IlluminatoramaRenderer {
         u.pathFlags |= (dfgLUTEnabled && layeredMultiscatter ? 256 : 0)
             | (dfgLUTEnabled && layeredClothSheen ? 512 : 0)
             | (diffuseRoughnessEnabled ? 16384 : 0)           // DH-1301 — `kPathFlagDiffuseRoughness`
+            | (layeredSpecularEnabled ? 65536 : 0)            // DH-1300 — `kPathFlagLayeredSpecular`
             | (!pathOn && rtGIHitFill ? 1024 : 0)            // DH-1320 — `kPathFlagOneBounceHitFill`
             // DH-1308 — `kPathFlagGlossyVertices`: only with light sampling + the DFG LUT (the lobe's albedo).
             | (pathOn && rtPathGlossyVertices && rtPathLightSampling && dfgLUTEnabled ? 2048 : 0)
             | (pathOn && rtPathThinTransmission ? 32768 : 0)   // Signack S5 — `kPathFlagThinTransmission`
         u.pathGlossyMinRoughness = pathOn ? max(0, rtPathGlossyMinRoughness) : 0
         u.pathGlossyLampSize = pathOn ? max(0, rtPathGlossyLampSize) : 1   // DH-1395
+        u.layerInstanceCount = UInt32(instances.count)                       // DH-1300
         u.pathGlossyLampMinRoughness = pathOn ? max(0, rtPathGlossyLampMinRoughness) : 0
         // DH-1293 — the lamps' near-field levers (0 ⇒ the shipped point-source law).
         u.pathLampMinDist = pathOn ? rtPathLampMinDistance : 0
@@ -263,6 +265,10 @@ extension IlluminatoramaRenderer {
         enc.setTexture(diffSkyOn ? ibls.diffSkyTexture : diffSkyDummyTexture, index: 10)
         enc.setTexture(ibls.dfgLUT, index: 11)              // DH-1014 — `layeredRTWeights`
         enc.setTexture(gbs.gbufferEmission, index: 12)     // DH-1014 — the cloth-sheen decode
+        // DH-1300 — the material-layer slot target + the raster instance buffer it (and every TLAS id
+        // below `layerInstanceCount`) indexes — IlluminatoramaMaterialLayers.h.
+        enc.setTexture(gbs.gbufferMaterialLayer, index: 14)
+        enc.setBuffer(currentInstanceBuffer, offset: 0, index: 26)
         // DH-0653 hit/miss counters (buffer 19). Dummy = instData, never added to while
         // `surfStatsEnabled` is 0.
         enc.setBuffer(hitStats ?? instData, offset: 0, index: 19)

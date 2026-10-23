@@ -170,6 +170,10 @@ extension IlluminatoramaRenderer {
         // masks each light against. When no scene sets layers this reads all-bits
         // everywhere, so every light passes the mask (no behaviour change).
         enc.setTexture(gbs.gbufferLayer, index: 18)
+        // DH-1300 — the material-layer slot target + the instance buffer it indexes (the kernel reads
+        // the instance's layer parameters by slot; IlluminatoramaMaterialLayers.h).
+        enc.setTexture(gbs.gbufferMaterialLayer, index: 26)
+        enc.setBuffer(currentInstanceBuffer, offset: 0, index: 2)
         // Issue #65 — SSS diffuse side buffer. Always bound (the kernel only writes
         // it when frame.sssStrength > 0, so non-SSS scenes leave it idle).
         // (index 20: 18/19 went to gLayer/pointShadowAtlas in the merge.)

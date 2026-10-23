@@ -33,6 +33,9 @@ kernel void illumi_ssr_gather(
     texture2d<half,  access::read>     gNormalRgh      [[texture(2)]],
     depth2d<float,   access::read>     gDepth          [[texture(3)]],
     texture2d<half,  access::write>    outSSRRaw       [[texture(4)]],
+    // Daydream DH-1300 — the material-layer slot + the instances it indexes (the reflection's F0).
+    texture2d<uint,  access::read>     gMaterialLayer  [[texture(5)]],
+    const device float4*               layerInstances  [[buffer(1)]],
     constant FrameUniforms&            frame           [[buffer(0)]],
     uint2                              gid             [[thread_position_in_grid]]
 ) {
@@ -113,7 +116,11 @@ kernel void illumi_ssr_gather(
         uint2 hPx = uint2(clamp(hitUV * float2(W, H),
                                 float2(0.0), float2(W - 1, H - 1)));
         float3 refl = float3(inHDR.read(hPx).rgb);
-        float3 F0 = mix(float3(0.04), albedo, metallic);
+        // DH-1300 — the material's own dielectric F0 (the literal 0.04 for one without layer parameters).
+        MaterialLayers ml = ((frame.frameFlags & kFrameFlagLayeredSpecular) != 0u)
+            ? illumiMaterialLayersAt(layerInstances, gMaterialLayer.read(gid).r, 0xFFFFFFFFu)
+            : illumiMaterialLayersNone();
+        float3 F0 = mix(illumiDielectricF0(ml), albedo, metallic);
         float NdotV = saturate(dot(Nview, Vview));
         float3 F = F0 + (1.0 - F0) * pow(saturate(1.0 - NdotV), 5.0);
         float2 fade2 = smoothstep(float2(0.0), float2(0.15),

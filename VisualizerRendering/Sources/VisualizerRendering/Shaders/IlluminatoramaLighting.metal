@@ -469,7 +469,7 @@ static inline float3 brdf(
     float NdotH = saturate(dot(N, H));
     float HdotV = saturate(dot(H, V));
 
-    float3 F0 = mix(float3(0.04), albedo, metallic);
+    float3 F0 = mix(le.dielectricF0, albedo, metallic);   // DH-1300
     float3 F  = fresnelSchlick(HdotV, F0);
     float  G  = geometrySmith(NdotV, NdotL, roughness);
     float  D;
@@ -527,7 +527,7 @@ static inline float3 brdfDiffuse(
     if (NdotL <= 0.0) return float3(0);
     float3 H = normalize(V + L);
     float  HdotV = saturate(dot(H, V));
-    float3 F0 = mix(float3(0.04), albedo, metallic);
+    float3 F0 = mix(le.dielectricF0, albedo, metallic);   // DH-1300
     float3 F  = fresnelSchlick(HdotV, F0);
     float3 kd = (1.0 - F) * (1.0 - metallic);
     // DH-1014 — must stay `brdf`'s diffuse exactly (the SSS composite subtracts it).
@@ -671,7 +671,7 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
     float3 diffuse = (1.0 - metallic) * albedo * ff;
 
     float3 spec = float3(0.0);
-    float3 F0 = mix(float3(0.04), albedo, metallic);
+    float3 F0 = mix(le.dielectricF0, albedo, metallic);   // DH-1300
     if (ltcEnabled) {
         // LTC specular — transform the light polygon by the per-(roughness, NdotV)
         // inverse matrix, then run the SAME clamped-cosine polygon integral. The
@@ -1129,6 +1129,11 @@ kernel void illumi_lighting(
     // (its misses ARE the sky), so where it runs it REPLACES this share instead of adding a
     // second sky on top of it. Written only when the host binds a full-size target.
     texture2d<half,  access::write>         diffSkyOut      [[texture(23)]],
+    // Daydream DH-1300 — the material-layer target (`GBufferOut.materialLayer`: the instance slot,
+    // or kMaterialLayerNone) and the frame's instance buffer it indexes, viewed as float4s
+    // (IlluminatoramaMaterialLayers.h). Read only under kFrameFlagLayeredSpecular.
+    texture2d<uint,  access::read>          gMaterialLayer  [[texture(26)]],
+    const device float4*                    layerInstances  [[buffer(2)]],
     constant FrameUniforms&                 frame           [[buffer(0)]],
     const device PointLight*                pointLights     [[buffer(1)]],
     const device SpotLight*                 spotLights      [[buffer(3)]],
@@ -1272,14 +1277,22 @@ kernel void illumi_lighting(
     // the historical expression, so an opted-out host is byte-identical.
     bool layeredMS    = kLightingDFGLUTEnabled && (frame.frameFlags & kFrameFlagLayeredMultiscatter) != 0u;
     bool layeredSheen = kLightingDFGLUTEnabled && (frame.frameFlags & kFrameFlagLayeredSheen) != 0u;
+    // DH-1300 — the instance's layer parameters (IlluminatoramaMaterialLayers.h): the per-material
+    // specular F0 every lobe below mixes from. A pixel whose instance carries none reads the
+    // legacy literal 0.04, so the flag costs one texel read and changes nothing else.
+    MaterialLayers ml = illumiMaterialLayersNone();
+    if ((frame.frameFlags & kFrameFlagLayeredSpecular) != 0u)
+        ml = illumiMaterialLayersAt(layerInstances, gMaterialLayer.read(gid).r, 0xFFFFFFFFu);
+    float3 dielF0 = illumiDielectricF0(ml);
     LayeredEnergy le = layeredOff();
+    le.dielectricF0 = dielF0;
     if (layeredMS || layeredSheen) {
         constexpr sampler leSampler(filter::linear, address::clamp_to_edge);
         float leNdotV = saturate(dot(N, V));
         float4 leLUT = float4(dfgLUT.sample(leSampler, float2(leNdotV, roughness)));
         float  leSheenA = (layeredSheen && sheenStrength > 0.0)
                         ? float(dfgLUT.sample(leSampler, float2(leNdotV, sheenRoughness)).a) : 0.0;
-        le = layeredEnergy(albedo, metallic, leLUT, leSheenA, sheenStrength, layeredMS, layeredSheen);
+        le = layeredEnergy(albedo, metallic, leLUT, leSheenA, sheenStrength, layeredMS, layeredSheen, dielF0);
     }
     // DH-1301 — diffuse roughness (EON): the lights with a direction below (sun, points, spots, fill
     // directionals, the SSS diffuse peel) evaluate the full lobe; the integrated sources (LTC area /
@@ -1832,7 +1845,7 @@ kernel void illumi_lighting(
     if (kLightingIBLEnabled) {  // function_constant(0)
         constexpr sampler cubeSampler(filter::linear, mip_filter::linear);
 
-        float3 F0 = mix(float3(0.04), albedo, metallic);
+        float3 F0 = mix(le.dielectricF0, albedo, metallic);   // DH-1300
         float NdotV = saturate(dot(N, V));
         float3 F  = fresnelSchlickRoughness(NdotV, F0, roughness);
         float3 kD = (1.0 - F) * (1.0 - metallic);

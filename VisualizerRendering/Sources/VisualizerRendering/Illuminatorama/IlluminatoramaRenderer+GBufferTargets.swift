@@ -24,6 +24,9 @@ extension IlluminatoramaRenderer {
         // to 0xFFFFFFFF (sky/no-geometry) — the all-bits default means no scene that
         // leaves layers/masks untouched sees any change.
         var layer: MTLTexture
+        /// Daydream DH-1300 — the material-layer target (R32Uint): each fragment's instance slot, or
+        /// 0xFFFFFFFF when its instance carries no layer parameters (IlluminatoramaMaterialLayers.h).
+        var materialLayer: MTLTexture
         var historyA: MTLTexture
         var historyB: MTLTexture
         /// The TAA resolve's DOWNSTREAM output — the sharpened frame bloom and
@@ -119,6 +122,7 @@ extension IlluminatoramaRenderer {
         d.colorAttachments[2].pixelFormat = .rgba16Float
         d.colorAttachments[3].pixelFormat = .rg16Float
         d.colorAttachments[4].pixelFormat = .r32Uint
+        d.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot
         if extended { d.colorAttachments[5].pixelFormat = .rgba16Float }
         d.depthAttachmentPixelFormat = .depth32Float
         Self.declareVisBufferAttachment(d, device: device)
@@ -163,6 +167,7 @@ extension IlluminatoramaRenderer {
         d.colorAttachments[2].pixelFormat = .rgba16Float
         d.colorAttachments[3].pixelFormat = .rg16Float
         d.colorAttachments[4].pixelFormat = .r32Uint
+        d.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot
         if extended { d.colorAttachments[5].pixelFormat = .rgba16Float }
         d.depthAttachmentPixelFormat = .depth32Float
         Self.declareVisBufferAttachment(d, device: device)
@@ -187,6 +192,7 @@ extension IlluminatoramaRenderer {
         d.colorAttachments[2].pixelFormat = .rgba16Float
         d.colorAttachments[3].pixelFormat = .rg16Float
         d.colorAttachments[4].pixelFormat = .r32Uint
+        d.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot
         d.colorAttachments[5].pixelFormat = .rgba16Float
         d.depthAttachmentPixelFormat = .depth32Float
         declareVisBufferAttachment(d, device: device)
@@ -288,6 +294,9 @@ extension IlluminatoramaRenderer {
         let layer = try make(label: "Illuminatorama.gbuffer.layer",
                              format: .r32Uint, w: internalW, h: internalH,
                              usage: [.renderTarget, .shaderRead])
+        let materialLayer = try make(label: "Illuminatorama.gbuffer.materialLayer",
+                                     format: .r32Uint, w: internalW, h: internalH,
+                                     usage: [.renderTarget, .shaderRead])
         let historyA = try make(label: "Illuminatorama.historyA",
                                 format: .rgba16Float, w: internalW, h: internalH,
                                 usage: [.shaderRead, .shaderWrite])
@@ -415,7 +424,7 @@ extension IlluminatoramaRenderer {
         return Targets(
             albedoMet: am, normalRgh: nr, emission: em, depth: depth,
             hdr: hdr, ao: ao, hdrComposite: hdrComposite, rtDiffuse: rtDiffuse,
-            velocity: velocity, layer: layer, historyA: historyA, historyB: historyB,
+            velocity: velocity, layer: layer, materialLayer: materialLayer, historyA: historyA, historyB: historyB,
             taaResolved: taaResolved,
             bloomDown: bloomDown, bloomUp: bloomUp,
             halationBright: hb, halationBlurH: hbh, halationBlurV: hbv,

@@ -276,7 +276,9 @@ extension IlluminatoramaRenderer {
         /// DH-1308 — the glossy vertices' roughness floor (Metal twin appended last; three pads keep the
         /// 16-byte tail).
         var pathGlossyMinRoughness: Float = 0
-        var pathGlossyLampSize: Float = 1, pathGlossyLampMinRoughness: Float = 0, padGlossy2: Float = 0
+        var pathGlossyLampSize: Float = 1, pathGlossyLampMinRoughness: Float = 0
+        /// DH-1300 — the raster instances bound as `layerInstances` (was `padGlossy2`, same 4 bytes).
+        var layerInstanceCount: UInt32 = 0
 
         mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
             let p = InteriorRoomGains.pack(gains, enabled: enabled)

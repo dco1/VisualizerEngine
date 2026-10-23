@@ -759,6 +759,7 @@ fragment float4 illumi_glass_rt_fs(
 
     GlassRTState st;
     st.sec.insts = insts;        st.sec.objNormal = objNormal;
+    st.sec.layerInsts = nullptr; st.sec.layerCount = 0u;   // DH-1300 — no layer parameters at glass-pass hits
     st.sec.objUV = objUV;        st.sec.uvScale = albedoUVScale;
     st.sec.pointLights = pointLights; st.sec.spotLights = spotLights;
     st.sec.areaLights = areaLights;

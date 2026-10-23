@@ -210,6 +210,8 @@ extension IlluminatoramaRenderer {
         }
         d.colorAttachments[6].pixelFormat = .rg32Uint
         d.colorAttachments[6].writeMask = resolve ? [] : .all
+        d.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot (the resolve writes it)
+        d.colorAttachments[7].writeMask = resolve ? .all : []
         d.depthAttachmentPixelFormat = .depth32Float
         return try device.makeRenderPipelineState(descriptor: d)
     }

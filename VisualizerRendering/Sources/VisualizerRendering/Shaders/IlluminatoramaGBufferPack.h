@@ -33,6 +33,13 @@ struct GBufferOut {
     // A pipeline that does not write this target (impostors, any legacy PSO) leaves the clear
     // value, and every reader treats 0 as "fall back to the live-lane behaviour".
     half4 material         [[color(5), function_constant(kExtendedGBuffer)]];
+    // (color 6 is the visibility buffer's memoryless id target — IlluminatoramaVisBuffer.metal.)
+    // Daydream DH-1300 — the material-layer target (R32Uint): this fragment's INSTANCE SLOT when
+    // the instance carries per-material layer parameters (specular IOR / weight / colour …), else
+    // kMaterialLayerNone — the clear value, and what every instance of a host that never sets one
+    // writes. The lighting and RT kernels read the parameters out of the instance buffer by it
+    // (IlluminatoramaMaterialLayers.h). Every lane, live and photo.
+    uint  materialLayer    [[color(7)]];
 };
 
 static inline __attribute__((always_inline)) GBufferOut illumiGBufferPack(
@@ -216,6 +223,9 @@ static inline __attribute__((always_inline)) GBufferOut illumiGBufferPack(
     float2 velocityUV = ((currNDC - prevNDC) - frame.taaJitterDelta.xy) * float2(0.5, -0.5);
     o.velocity        = half2(velocityUV);
     o.layer           = in.layer;   // light-layer bitfield (default 0xFFFFFFFF)
+    // DH-1300 — the slot of an instance with layer parameters (IlluminatoramaMaterialLayers.h).
+    o.materialLayer   = illumiHasMaterialLayers(inst.materialExt, inst.specularTint)
+                      ? in.instanceID : kMaterialLayerNone;
     return o;
     return o;
 }

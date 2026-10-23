@@ -62,6 +62,9 @@ final class GBufferState {
 
     /// Light-layer G-buffer target (R32Uint) — see `Targets.layer`.
     var gbufferLayer: MTLTexture!
+    /// Daydream DH-1300 — the material-layer target (R32Uint, color 7): the instance slot of every
+    /// fragment whose instance carries layer parameters, else 0xFFFFFFFF — see `Targets.materialLayer`.
+    var gbufferMaterialLayer: MTLTexture!
 
     var gbufferPipeline: MTLRenderPipelineState!
     /// Issue #65 — G-buffer pipeline specialized with `kUsePrevVerts = true`. Used
@@ -208,6 +211,7 @@ extension IlluminatoramaRenderer {
         pdesc.colorAttachments[3].pixelFormat = .rg16Float
         // Light-layer attachment (R32Uint) — carries the per-fragment layer bitfield.
         pdesc.colorAttachments[4].pixelFormat = .r32Uint
+        pdesc.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot
         pdesc.depthAttachmentPixelFormat = .depth32Float
         declareVisBufferAttachment(pdesc, device: device)
         // No vertex descriptor — the shader reads from a device-buffer of
@@ -242,6 +246,7 @@ extension IlluminatoramaRenderer {
             sqdesc.colorAttachments[2].pixelFormat = .rgba16Float
             sqdesc.colorAttachments[3].pixelFormat = .rg16Float
             sqdesc.colorAttachments[4].pixelFormat = .r32Uint
+            sqdesc.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot
             sqdesc.depthAttachmentPixelFormat = .depth32Float
             declareVisBufferAttachment(sqdesc, device: device)
             s.superquadricImpostorPipeline =

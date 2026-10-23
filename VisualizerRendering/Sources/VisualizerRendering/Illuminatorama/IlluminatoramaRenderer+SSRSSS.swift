@@ -20,6 +20,8 @@ extension IlluminatoramaRenderer {
         enc.setTexture(gbs.gbufferNormalRgh, index: 2)
         enc.setTexture(gbs.depthTexture,     index: 3)
         enc.setTexture(ssrs.ssrRawTexture,    index: 4)  // output: SSR delta
+        enc.setTexture(gbs.gbufferMaterialLayer, index: 5)          // DH-1300 — the material-layer slot
+        enc.setBuffer(currentInstanceBuffer, offset: 0, index: 1)   // …and the instances it indexes
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
         dispatch(enc, pipeline: ssrs.ssrGatherPipeline, width: width, height: height)
         enc.endEncoding()

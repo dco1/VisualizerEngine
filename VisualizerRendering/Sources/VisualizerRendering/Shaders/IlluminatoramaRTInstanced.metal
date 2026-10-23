@@ -184,7 +184,8 @@ struct RTInstUniforms {
     // Daydream DH-1395 — a roughness floor (perceptual; α = r²) applied ONLY when a glossy lobe is evaluated toward a
     // LAMP (not to lobe sampling, not to the sun or the windows, which MIS already bounds): path regularisation of the
     // caustic camera → diffuse → glossy → lamp. 0 ⇒ the material's own. Was `_padGlossy1`.
-    float pathGlossyLampMinRoughness; float _padGlossy2;
+    float pathGlossyLampMinRoughness;
+    uint  layerInstanceCount;   // DH-1300 — raster instances in `layerInstances` (TLAS ids below it are raster slots); was _padGlossy2
 };
 
 /// DH-1011 — `RTInstUniforms.pathFlags` bits.
@@ -1306,7 +1307,9 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 float NdotVh = saturate(dot(h.N, wo));
                 float m = mr.x, rB = max(glossyMinR, mr.y);
                 float4 lutB = float4(dfgLUT.sample(lutSmp, float2(NdotVh, rB)));
-                float3 F0 = mix(float3(0.04), Ahit, m);
+                // DH-1300 — the hit's own dielectric F0 (its layer record, by TLAS id = raster slot).
+                float3 F0 = mix(illumiDielectricF0(illumiMaterialLayersAt(sec.layerInsts, h.instanceID, sec.layerCount)),
+                                Ahit, m);
                 float3 Es = saturate(layeredEnvSpecular(F0, lutB.xy));
                 float2 cc = secondaryCoat(h.instanceID, sec.insts);
                 float ccS = max(cc.x, 0.0), rC = max(glossyMinR, cc.y), Ec = 0.0;
@@ -1516,6 +1519,10 @@ kernel void illumi_rt_lighting_tlas(
     device atomic_float*                  rcData      [[buffer(22)]],
     const device float*                   spotProfiles [[buffer(23)]],  // DH-0540 — the spot-profile rows
     const device float*                   cloudShadow [[buffer(25)]],   // DH-1462 — cloud sun transmittance (dummy when off)
+    // Daydream DH-1300 — the material-layer slot target and the raster instance buffer it (and every
+    // TLAS id below `u.layerInstanceCount`) indexes; read only under kPathFlagLayeredSpecular.
+    texture2d<uint, access::read>         gMaterialLayer [[texture(14)]],
+    const device float4*                  layerInstances [[buffer(26)]],
     // Daydream DH-1304 — the per-term AOV capture (running means the deferred pass started this
     // frame) and its frame parameters. Exist only in the `kRTAOVEnabled` variants.
     texture2d_array<float, access::read_write> aovOut   [[texture(13), function_constant(kRTAOVEnabled)]],
@@ -1551,12 +1558,17 @@ kernel void illumi_rt_lighting_tlas(
     // DH-1014 — the layered weights (diffuse: × albedo × incoming; reflection: × radiance).
     float3 Vrt = normalize(u.cameraWorldPos - P);
     float  NdotVrt = saturate(dot(N, Vrt));
-    float3 F0rt = mix(float3(0.04), albedo, metallicRT);
+    // DH-1300 — the primary's layer parameters, by the same G-buffer slot the deferred pass reads.
+    bool layeredSpecRT = (u.pathFlags & kPathFlagLayeredSpecular) != 0u;
+    MaterialLayers mlRT = layeredSpecRT ? illumiMaterialLayersAt(layerInstances, gMaterialLayer.read(gid).r, 0xFFFFFFFFu)
+                                        : illumiMaterialLayersNone();
+    float3 dielF0RT = illumiDielectricF0(mlRT);
+    float3 F0rt = mix(dielF0RT, albedo, metallicRT);
     LayeredRTWeights lw = layeredRTWeights(u.pathFlags, albedo, metallicRT, roughness, NdotVrt,
                                            (u.pathFlags & (kPathFlagLayeredMultiscatter | kPathFlagLayeredSheen)) != 0u
                                                ? gEmission.read(gid).a : 0.0h,
                                            dfgLUT, F0rt + (float3(1.0) - F0rt) * pow(1.0 - NdotVrt, 5.0),
-                                           diffRoughRT);
+                                           diffRoughRT, dielF0RT);
 
     constexpr sampler skySamp(filter::linear, address::repeat);
     // The curve_data tag is compile-time; the base variant keeps the original
@@ -1582,6 +1594,8 @@ kernel void illumi_rt_lighting_tlas(
     sec.areaLights = areaLights;
     sec.spotProfiles = spotProfiles;   // DH-0540
     sec.cloudShadow = cloudShadow;     // DH-1462
+    sec.layerInsts = layerInstances;   // DH-1300 — a hit's layer parameters by TLAS id
+    sec.layerCount = layeredSpecRT ? u.layerInstanceCount : 0u;
     SecondaryShadeParams secFull   = fullRadianceParams(u);   // reflections + cache fallbacks
     SecondaryShadeParams secBounce = giBounceParams(u);       // GI bounces (no sky double-count)
 
@@ -1840,7 +1854,7 @@ kernel void illumi_rt_lighting_tlas(
         // tinted by its own colour. This is what turns the metal spheres into
         // mirrors instead of a 4 % gloss over the deferred specular-IBL base.
         float metalness = metallicRT;
-        float3 F0 = mix(float3(0.04), albedo, metalness);
+        float3 F0 = mix(dielF0RT, albedo, metalness);   // DH-1300 — the material's own dielectric F0
         // Plain Schlick at the macro NdotV — identical to the sibling RT path
         // (IlluminatoramaRT.metal). The roughness spread is already captured by
         // the cone sampling below, so a roughness-aware grazing floor here would

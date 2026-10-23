@@ -484,6 +484,11 @@ struct SecondaryScene {
     const device RTAreaLight*    areaLights;   // DH-0718; read only when `areaLightCount` > 0
     const device float*          spotProfiles; // DH-0540 — the host's spot-profile rows (a 1-float dummy when none)
     const device float*          cloudShadow;  // DH-1462 — the cloud deck's sun transmittance (8-float dummy when off)
+    // Daydream DH-1300 — the raster instance buffer as float4s, indexed by TLAS id (the grouped order
+    // `rebuildRTAccel` lays the TLAS out in), for a hit's material-layer parameters
+    // (IlluminatoramaMaterialLayers.h). `layerCount` 0 (the glass pass; the flag off) ⇒ every hit none.
+    const device float4*         layerInsts;
+    uint                         layerCount;
 };
 
 /// One opaque triangle hit, however the ray that found it was fired.

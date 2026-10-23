@@ -62,6 +62,7 @@ using namespace metal;
 #define kPathFlagDiffuseRoughness     16384u
 
 #include "IlluminatoramaDiffuseRoughness.h"
+#include "IlluminatoramaMaterialLayers.h"   // DH-1300 — the per-material specular F0
 
 // ── Cloth sheen lobe (moved here from IlluminatoramaLighting.metal so the LUT bake integrates
 //    the IDENTICAL functions the direct lobe evaluates — the two arms cannot drift) ──────────
@@ -145,6 +146,10 @@ struct LayeredEnergy {
     float3 eonAlbedoRatio;
     /// Whether the multiscatter / diffuse-weight half is live (else callers keep the legacy terms).
     bool   multiscatter;
+    /// Daydream DH-1300 — the dielectric base's F0 (OpenPBR `specular_weight · F0(specular_ior)`,
+    /// tinted by `specular_color`; IlluminatoramaMaterialLayers.h). What every lobe's
+    /// `mix(F0, albedo, metallic)` mixes from; the literal 0.04 unless the material set one.
+    float3 dielectricF0;
 };
 
 /// Fdez-Agüera 2019 ("A Multiple-Scattering Microfacet Model for Real-Time Image-Based
@@ -181,6 +186,7 @@ static inline LayeredEnergy layeredOff() {
     e.multiscatter = false;
     e.diffuseRoughness = 0.0;
     e.eonAlbedoRatio = float3(1.0);
+    e.dielectricF0 = float3(0.04);
     return e;
 }
 
@@ -193,9 +199,11 @@ static inline LayeredEnergy layeredOff() {
 static inline LayeredEnergy layeredEnergy(float3 albedo, float metallic,
                                           float4 lut, float sheenLutA,
                                           float sheenStrength,
-                                          bool multiscatter, bool sheen) {
+                                          bool multiscatter, bool sheen,
+                                          float3 dielectricF0 = float3(0.04)) {
     LayeredEnergy e;
-    float3 F0 = mix(float3(0.04), albedo, metallic);
+    e.dielectricF0 = dielectricF0;     // DH-1300
+    float3 F0 = mix(dielectricF0, albedo, metallic);
     e.multiscatter = multiscatter;
     e.diffuseRoughness = 0.0;          // set by `layeredWithDiffuseRoughness`
     e.eonAlbedoRatio = float3(1.0);
@@ -267,7 +275,8 @@ struct LayeredRTWeights {
 static inline LayeredRTWeights layeredRTWeights(uint pathFlags, float3 albedo, float metallic,
                                                 float roughness, float NdotV, half emissionAlpha,
                                                 texture2d<half, access::sample> dfgLUT,
-                                                float3 fresLegacy, float diffuseRoughness = 0.0) {
+                                                float3 fresLegacy, float diffuseRoughness = 0.0,
+                                                float3 dielectricF0 = float3(0.04)) {
     LayeredRTWeights w;
     // DH-1301 — the traced GI replaces the deferred diffuse ENVIRONMENT, which a rough diffuse
     // surface weights by its EON directional albedo; the replacement takes the same factor
@@ -288,7 +297,7 @@ static inline LayeredRTWeights layeredRTWeights(uint pathFlags, float3 albedo, f
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     float4 lut = float4(dfgLUT.sample(s, float2(NdotV, roughness)));
     float sheenA = (sh && sheenStrength > 0.0) ? float(dfgLUT.sample(s, float2(NdotV, sheenRoughness)).a) : 0.0;
-    LayeredEnergy e = layeredEnergy(albedo, metallic, lut, sheenA, sheenStrength, ms, sh);
+    LayeredEnergy e = layeredEnergy(albedo, metallic, lut, sheenA, sheenStrength, ms, sh, dielectricF0);
     if (ms) { w.diffuse *= e.diffuseEnv; w.reflection = e.envSpec; }
     w.diffuse *= e.baseUnderSheen;
     w.reflection *= e.baseUnderSheen;

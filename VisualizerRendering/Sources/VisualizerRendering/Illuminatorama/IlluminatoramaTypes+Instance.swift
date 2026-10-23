@@ -377,7 +377,8 @@ public struct IlluminatoramaInstance {
 
     /// **OpenPBR material extension** (Daydream DH-1301; offsets 384–399, stride 384 → 400) — the
     /// per-instance home for OpenPBR parameters the G-buffer has no channel of its own for.
-    ///   x = `base_diffuse_roughness` (see `diffuseRoughness`) · y, z, w reserved (0)
+    ///   x = `base_diffuse_roughness` (see `diffuseRoughness`) · y = `specular_ior` (DH-1300, see
+    ///   `specularIOR`; 0 ⇒ 1.5) · z, w reserved (0)
     /// `.zero` — the default, and every existing instance — is an exact shader no-op.
     /// Mirrors `Instance.materialExt` in `IlluminatoramaCommon.h`.
     public var materialExt: SIMD4<Float> = .zero
@@ -390,6 +391,42 @@ public struct IlluminatoramaInstance {
     public var diffuseRoughness: Float {
         get { materialExt.x }
         set { materialExt.x = newValue }
+    }
+
+    /// **OpenPBR specular colour + weight** (Daydream DH-1300; offsets 400–415, stride 400 → 416):
+    /// rgb = `specular_color`, w = `specular_weight`. `.zero` (the default) means (1, 1, 1, 1) —
+    /// untinted, full strength — and is an exact shader no-op. Set it through `specularColor` /
+    /// `specularWeight`. Mirrors `Instance.specularTint` in `IlluminatoramaCommon.h`.
+    public var specularTint: SIMD4<Float> = .zero
+
+    /// **Specular IOR** (Daydream DH-1300) — OpenPBR `specular_ior` of a dielectric's specular layer:
+    /// F0 = ((n − 1)/(n + 1))², so 1.5 (the default) is the engine's historical F0 0.04, water is
+    /// 1.33 (F0 0.020), a glaze ~1.54, calcite ~1.57, melamine ~1.65 (F0 0.060). Read under
+    /// `IlluminatoramaRenderer.layeredSpecularEnabled` on every lane (the deferred lights and
+    /// environment, the traced reflection's Fresnel, the GI weight, every path vertex). Metals keep
+    /// F0 = albedo. Rides `materialExt.y`; 1.5 is stored as 0 so the default stays the legacy literal.
+    public var specularIOR: Float {
+        get { materialExt.y > 0 ? materialExt.y : 1.5 }
+        set { materialExt.y = newValue == 1.5 ? 0 : max(newValue, 1) }
+    }
+
+    /// **Specular colour** (DH-1300) — OpenPBR `specular_color`, a tint on the dielectric F0. (1, 1, 1)
+    /// is the default. The base below takes the per-channel complement, so a white furnace still
+    /// returns 1.
+    public var specularColor: SIMD3<Float> {
+        get { specularTint == .zero ? SIMD3(1, 1, 1) : SIMD3(specularTint.x, specularTint.y, specularTint.z) }
+        set { setSpecularTint(color: newValue, weight: specularWeight) }
+    }
+
+    /// **Specular weight** (DH-1300) — OpenPBR `specular_weight`, a scale on the dielectric F0 (1 = the default).
+    public var specularWeight: Float {
+        get { specularTint == .zero ? 1 : specularTint.w }
+        set { setSpecularTint(color: specularColor, weight: newValue) }
+    }
+
+    private mutating func setSpecularTint(color: SIMD3<Float>, weight: Float) {
+        let c = simd_max(color, .zero), w = max(weight, 0)
+        specularTint = (c == SIMD3(1, 1, 1) && w == 1) ? .zero : SIMD4(c, w)
     }
 
     public init(
@@ -424,10 +461,10 @@ public struct IlluminatoramaInstance {
         self.normalMatrix = Self.normalMatrix(from: m)
     }
 
-    /// Compile-time guard: Swift and Metal structs must agree on 400 bytes.
+    /// Compile-time guard: Swift and Metal structs must agree on 416 bytes.
     /// If this fires, either a Swift field was added without the matching Metal
     /// field (or vice versa), or alignment changed unexpectedly.
-    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 400, "IlluminatoramaInstance stride must be 400") }()
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 416, "IlluminatoramaInstance stride must be 416") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //

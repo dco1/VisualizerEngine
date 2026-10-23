@@ -139,6 +139,7 @@ extension IlluminatoramaRenderer {
             self.rts.rtDiffuseTexture    = t.rtDiffuse
             self.pfx.velocityTexture     = t.velocity
             self.gbs.gbufferLayer        = t.layer
+            self.gbs.gbufferMaterialLayer = t.materialLayer   // DH-1300
             self.gbs.gbufferMaterial     = nil          // DH-0140 — re-made at the new size on first use
             self.pfx.historyA            = t.historyA
             self.pfx.historyB            = t.historyB

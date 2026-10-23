@@ -169,6 +169,7 @@ struct SQImpostorFSOut {
     half4 emission         [[color(2)]];
     half2 velocity         [[color(3)]];
     uint  layer            [[color(4)]];   // light-layer bitfield (default 0xFFFFFFFF)
+    uint  materialLayer    [[color(7)]];   // DH-1300 — the material-layer slot (GBufferOut.materialLayer)
     float depth            [[depth(less)]];
 };
 
@@ -233,6 +234,7 @@ fragment SQImpostorFSOut illumi_superquadric_impostor_fs(
     o.emission        = half4(half3(inst.emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -sqSheenAlpha));
     o.velocity        = half2(velUV);
     o.layer           = inst.layer;   // light-layer bitfield (default 0xFFFFFFFF)
+    o.materialLayer   = illumiHasMaterialLayers(inst.materialExt, inst.specularTint) ? in.iid : kMaterialLayerNone;
     o.depth           = curClip.z / curClip.w;   // Metal NDC z ∈ [0,1]
     return o;
 }

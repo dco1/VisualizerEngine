@@ -187,6 +187,14 @@ final class LightingKnobs {
     /// changes nothing for a material that never sets one — the per-material value defaults to 0, which
     /// is Lambert bit for bit. `false` makes every lane Lambert whatever the materials carry (the A/B lever).
     var diffuseRoughnessEnabled: Bool = true
+    /// **DH-1300 — the per-material specular layer (OpenPBR `specular_ior` / `specular_weight` /
+    /// `specular_color`).** The master switch for every lane: with it set, an instance's
+    /// `specularIOR` / `specularWeight` / `specularColor` set its dielectric F0 under every light, in
+    /// the environment, in the traced reflection's Fresnel and the traced GI's weight, and at every path
+    /// vertex. `true` (the default) changes nothing for a material that never sets them — the instance
+    /// then carries no layer parameters and every lane keeps the literal F0 0.04 — so it costs one
+    /// G-buffer texel read per pixel. `false` makes every dielectric F0 0.04 whatever the materials carry.
+    var layeredSpecularEnabled: Bool = true
     /// **DH-1014 / DH-0597 — cloth sheen as a layer.** `true`: the sheen's environment arms read
     /// the fitted Charlie albedo from the DFG LUT (`.a`) instead of the hand-fitted curve, and
     /// the base under the sheen loses what the sheen reflected (albedo scaling), in the deferred
