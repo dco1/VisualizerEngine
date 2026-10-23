@@ -3926,3 +3926,92 @@ kernel void illumi_cumulus_inview_resolve(
     float4 c = hdr.read(gid);
     hdr.write(float4(max(c.rgb + acc / wsum, float3(0.0f)), c.a), gid);
 }
+
+// ── Cumulus in-view: the REPROJECTING resolve (`cumulusInViewReprojection`, DH-0578) ─────────────
+//
+// The last converged accumulator (the HISTORY) was built from another camera. A pixel's cloud is
+// found in it by projecting the point where the pixel's ray meets the middle of the slab through the
+// history's (unjittered) view-projection: a pure rotation is exact (that point is as good as any on
+// the ray), and a translation is corrected by the deck's own parallax. The history fades out at its
+// frame's edges (rotation reveals sky it never marched — that shows the dome) and with distance from
+// where it was built. The new accumulator blends in by α once it has a full cycle.
+
+struct CumulusReprojectUniforms {
+    float4x4 invViewProjection;  // this frame's clip → world
+    float4x4 historyViewProj;    // the history's world → clip (unjittered)
+    float4   cameraWorldPos;     // xyz = eye; w = α (0 = history only, 1 = the new accumulator)
+    float4   historyCam;         // xyz = the history's eye; w = edge fade width (history uv)
+    float4   parallax;           // x = mid-slab Y, y/z = translation fade start/end (m), w = far t
+    uint4    cfg;                // x = accumulator scale s, y = history valid, zw = canvas size
+};
+
+// Mean delta over the 2×2 accumulator texels around `p` (texel coords), skipping unsampled texels.
+inline float3 cumulusAccumMean(texture2d<float, access::read> a, float2 p, thread float &wsum) {
+    int2 amax = int2(a.get_width() - 1, a.get_height() - 1);
+    int2 p0 = int2(floor(p));
+    float2 f = p - float2(p0);
+    float3 acc = float3(0.0f);
+    wsum = 0.0f;
+    for (int jy = 0; jy < 2; ++jy) {
+        for (int jx = 0; jx < 2; ++jx) {
+            int2 q = p0 + int2(jx, jy);
+            if (any(q < int2(0)) || any(q > amax)) continue;
+            float4 s = a.read(uint2(q));
+            if (s.w < 0.5f) continue;
+            float w = (jx == 0 ? 1.0f - f.x : f.x) * (jy == 0 ? 1.0f - f.y : f.y);
+            acc += (s.rgb / s.w) * w;
+            wsum += w;
+        }
+    }
+    return wsum > 1e-5f ? acc / wsum : float3(0.0f);
+}
+
+kernel void illumi_cumulus_inview_resolve_reproject(
+    texture2d<float, access::read_write> hdr     [[texture(0)]],
+    texture2d<float, access::read>       accum   [[texture(1)]],
+    depth2d<float,   access::read>       gDepth  [[texture(2)]],
+    texture2d<float, access::read>       history [[texture(3)]],
+    constant CumulusReprojectUniforms &r         [[buffer(0)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    if (gid.x >= hdr.get_width() || gid.y >= hdr.get_height()) return;
+    if (gDepth.read(gid) < 0.99999f) return;
+    float sc = float(max(1u, r.cfg.x));
+    float alpha = saturate(r.cameraWorldPos.w);
+    float2 canvas = float2(r.cfg.zw);
+
+    float wA = 0.0f;
+    float3 dA = alpha > 0.0f ? cumulusAccumMean(accum, (float2(gid) + 0.5f) / sc - 0.5f, wA) : float3(0.0f);
+
+    float3 dB = float3(0.0f);
+    float wB = 0.0f;
+    if (r.cfg.y != 0u && alpha < 1.0f) {
+        float2 uv = (float2(gid) + 0.5f) / canvas;
+        float4 wp = r.invViewProjection * float4(uv.x * 2.0f - 1.0f, 1.0f - uv.y * 2.0f, 1.0f, 1.0f);
+        float3 ro = r.cameraWorldPos.xyz;
+        float3 d = normalize(wp.xyz / wp.w - ro);
+        float t = r.parallax.w;
+        if (d.y > 1e-3f) t = min(t, max(r.parallax.x - ro.y, 1.0f) / d.y);
+        float4 c = r.historyViewProj * float4(ro + d * t, 1.0f);
+        if (c.w > 1e-4f) {
+            float2 ndc = c.xy / c.w;
+            float2 huv = float2(ndc.x * 0.5f + 0.5f, 0.5f - ndc.y * 0.5f);
+            float e = min(min(huv.x, 1.0f - huv.x), min(huv.y, 1.0f - huv.y));
+            // The fade band grows with how far the history has slid: at a near-identity reprojection
+            // (the first moving frame) it is ~0 wide, so the frame border does not step back toward
+            // the dome; after a real turn the revealed edge is a soft ramp, not a seam.
+            float band = clamp(2.0f * length(huv - uv), 1e-4f, max(r.historyCam.w, 1e-4f));
+            float wEdge = smoothstep(0.0f, band, e);
+            float wT = 1.0f - smoothstep(r.parallax.y, r.parallax.z, length(ro - r.historyCam.xyz));
+            if (wEdge * wT > 0.0f) {
+                float ws = 0.0f;
+                float3 v = cumulusAccumMean(history, huv * canvas / sc - 0.5f, ws);
+                if (ws > 1e-5f) { dB = v; wB = wEdge * wT; }
+            }
+        }
+    }
+    if (wA <= 0.0f && wB <= 0.0f) return;
+    float3 add = mix(dB * wB, dA, alpha);
+    float4 c = hdr.read(gid);
+    hdr.write(float4(max(c.rgb + add, float3(0.0f)), c.a), gid);
+}

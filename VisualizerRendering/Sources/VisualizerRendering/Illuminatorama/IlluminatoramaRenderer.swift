@@ -3170,6 +3170,15 @@ public final class IlluminatoramaRenderer {
     public var cumulusInViewLightSteps = 7
     /// High-frequency detail erosion (0 = the dome's field, 1 = the ~4 m octave, 2 = + ~1.5 m).
     public var cumulusInViewDetail: Float = 2
+    /// Keep the last converged accumulator across CAMERA moves and reproject it into each frame
+    /// (DH-0578 follow-up): a moving camera keeps the sharp clouds instead of popping back to the
+    /// dome, and the new accumulator crossfades in after it stops. OFF → byte-identical (reset on
+    /// any camera change, as before).
+    public var cumulusInViewReprojection = false
+    /// Frames over which a freshly converged accumulator crossfades in over the reprojected history
+    /// (and, with no history, over the dome). 0 = switch at once (the photo lane: an accumulating
+    /// still must not average a ramp in).
+    public var cumulusInViewFadeFrames = 0
     let cumulusInView = CumulusInViewState()
     /// The clock the in-view sky animates by (the lava lamp's wax, the cirrus threads' flow) —
     /// `nil` (the default) = `time`, byte-identical. A host that lets those speeds change live
