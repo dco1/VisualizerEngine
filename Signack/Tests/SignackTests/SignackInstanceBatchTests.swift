@@ -93,6 +93,93 @@ final class SignackInstanceBatchTests: XCTestCase {
         XCTAssertTrue(used.contains(buckets - 1), "far plants go to the impostor")
     }
 
+    /// DH-1493 — per-light shadow views: every (view, bucket) record holds exactly the instances the CPU
+    /// reference puts there (in that bucket, sphere touching the view), each once, records intact; the
+    /// primary and shadow lists are unchanged by the views; views straddle, contain and miss instances.
+    func testShadowViewRecordsMatchTheCPUReference() throws {
+        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
+              let pipelines = SignackGPUPipelines.shared(device: device) else { throw XCTSkip("no Metal") }
+        let rungs = Self.rungs()
+        let n = 800, stride = 16
+        guard let batch = SignackGPUInstanceBatch(device: device, rungs: rungs, impostorIndexCount: 24,
+                                                  capacity: n, instanceStride: stride) else { return XCTFail("batch") }
+        var bounds: [SignackGPUInstanceBounds] = []
+        var s: UInt64 = 1493
+        func r() -> Float { s = s &* 6364136223846793005 &+ 1442695040888963407; return Float(s >> 40) / Float(1 << 24) }
+        for _ in 0..<n {
+            let scale = 0.4 + r()
+            bounds.append(SignackGPUInstanceBounds(center: SIMD3((r() - 0.5) * 300, 0.5, (r() - 0.5) * 300),
+                                                   radius: 3 * scale, scale: scale))
+        }
+        batch.setInstances(count: n) { raw, b in
+            for i in 0..<n {
+                raw.storeBytes(of: SIMD4<UInt32>(UInt32(i), 7, 7, 7), toByteOffset: i * stride, as: SIMD4<UInt32>.self)
+                b[i] = bounds[i]
+            }
+        }
+        // Three nested sun-cascade boxes (a low sun from the south-west) and one spot cone.
+        let sunView = simd_float4x4(lookAt: SIMD3(-60, 80, 60), target: SIMD3(0, 0, -10))
+        var views: [SignackFrustum] = [20, 60, 160].map {
+            SignackFrustum(clip: simd_float4x4(orthoHalf: $0, depth: 400) * sunView)
+        }
+        views.append(SignackFrustum(clip: simd_float4x4(perspectiveFov: 0.8, aspect: 1, near: 0.1, far: 120)
+                                         * simd_float4x4(lookAt: SIMD3(10, 30, -20), target: SIMD3(15, 0, -40))))
+        batch.shadowViews = views
+        let view = Self.view()
+        guard let cb = queue.makeCommandBuffer() else { return XCTFail("cb") }
+        SignackGPUInstancePass.encode([(batch, view)], pipelines: pipelines, commandBuffer: cb)
+        cb.commit(); cb.waitUntilCompleted()
+
+        let buckets = batch.bucketCount
+        var line = "DH-1493 per-view instances (of \(n)):"
+        for (v, f) in views.enumerated() {
+            var total = 0
+            for b in 0..<buckets {
+                let off = SignackGPUInstanceBatch.shadowViewOffset(view: v, bucket: b)
+                let a = batch.drawArgs.contents().advanced(by: off).bindMemory(to: UInt32.self, capacity: 5)
+                if b < rungs.rungs.count {
+                    let rr = min(b + 2, rungs.rungs.count - 1)
+                    XCTAssertEqual(Int(a[0]), rungs.rungs[rr].indexCount, "view \(v) bucket \(b): the shadow rung")
+                    XCTAssertEqual(Int(a[2]), rungs.rungs[rr].indexStart)
+                } else { XCTAssertEqual(Int(a[0]), 24) }
+                var expect = Set<UInt32>()
+                for i in 0..<n {
+                    guard let (bb, _) = Self.reference(bounds[i], view, rungs: rungs.rungs, impostor: true), bb == b,
+                          SignackGPUInstanceBatch.referenceInView(bounds[i], f) else { continue }
+                    expect.insert(UInt32(i))
+                }
+                var got: [UInt32] = []
+                for rec in batch.shadowViewRecords(view: v, bucket: b) {
+                    let w = rec.withUnsafeBytes { $0.load(as: SIMD4<UInt32>.self) }
+                    XCTAssertEqual(w.y, 7, "record copied intact")
+                    got.append(w.x)
+                }
+                XCTAssertEqual(got.count, Set(got).count, "view \(v) bucket \(b): each instance once")
+                XCTAssertEqual(Set(got), expect, "view \(v) bucket \(b)")
+                total += got.count
+            }
+            line += " v\(v) \(total)"
+            XCTAssertGreaterThan(total, 0, "view \(v) must hold plants")
+            XCTAssertLessThan(total, n, "view \(v) must cull plants")
+        }
+        print(line)
+        // The two lists are untouched by the views.
+        for b in 0..<buckets {
+            let a = batch.drawArgs.contents().advanced(by: SignackGPUInstanceBatch.shadowOffset(bucket: b))
+                .bindMemory(to: UInt32.self, capacity: 5)
+            var expect = 0
+            for i in 0..<n where Self.reference(bounds[i], view, rungs: rungs.rungs, impostor: true)?.0 == b { expect += 1 }
+            XCTAssertEqual(Int(a[1]), expect, "shadow list bucket \(b)")
+        }
+        // A second frame with the views gone writes no view records again (the book is reset each frame).
+        batch.shadowViews = []
+        guard let cb2 = queue.makeCommandBuffer() else { return XCTFail("cb") }
+        SignackGPUInstancePass.encode([(batch, view)], pipelines: pipelines, commandBuffer: cb2)
+        cb2.commit(); cb2.waitUntilCompleted()
+        let book = batch.viewBook.contents().bindMemory(to: UInt32.self, capacity: 192)
+        XCTAssertEqual((0..<64).map { book[$0] }.reduce(0, +), 0, "per-view counts reset after finalize")
+    }
+
     /// The pass's GPU cost (start→end of a command buffer holding only it), 6 species × N each.
     func testBatchedPassCost() throws {
         guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
@@ -132,6 +219,10 @@ private extension simd_float4x4 {
         let f = simd_normalize(target - eye), s = simd_normalize(simd_cross(f, SIMD3(0, 1, 0))), u = simd_cross(s, f)
         self.init(SIMD4(s.x, u.x, -f.x, 0), SIMD4(s.y, u.y, -f.y, 0), SIMD4(s.z, u.z, -f.z, 0),
                   SIMD4(-simd_dot(s, eye), -simd_dot(u, eye), simd_dot(f, eye), 1))
+    }
+    /// Metal-style orthographic box, ±half in x/y, depth 0…depth in front of the eye.
+    init(orthoHalf h: Float, depth: Float) {
+        self.init(SIMD4(1 / h, 0, 0, 0), SIMD4(0, 1 / h, 0, 0), SIMD4(0, 0, -1 / depth, 0), SIMD4(0, 0, 0, 1))
     }
     init(perspectiveFov fov: Float, aspect: Float, near: Float, far: Float) {
         let y = 1 / tan(fov / 2), x = y / aspect, z = far / (near - far)

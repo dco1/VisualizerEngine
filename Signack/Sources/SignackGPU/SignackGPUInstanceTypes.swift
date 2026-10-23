@@ -1,3 +1,4 @@
+import Metal
 import simd
 import Signack
 
@@ -53,7 +54,8 @@ struct SignackGPUInstanceUniforms {
     var isOrthographic: UInt32
     var cull: UInt32
     var maxDistance: Float
-    var pad0: UInt32 = 0, pad1: UInt32 = 0, pad2: UInt32 = 0
+    var viewCount: UInt32 = 0          // DH-1493
+    var pad1: UInt32 = 0, pad2: UInt32 = 0
 
     init(view: SignackInstanceView, batch: SignackGPUInstanceBatch) {
         let p = view.frustum?.planes ?? []
@@ -79,7 +81,32 @@ struct SignackGPUInstanceUniforms {
     }
 }
 
+/// DH-1493 — the shadow views a planting batch is culled against: mirror of `SignackInstanceShadowViews`
+/// (768 B, view v's six world-space planes at [6v, 6v+6)). Unused slots pass everything.
+struct SignackGPUInstanceShadowViews {
+    static let byteLength = 6 * SignackShadowViews.maxViews * 16
+    var words: [SIMD4<Float>]
+
+    init(_ views: [SignackFrustum]) {
+        words = Array(repeating: SIMD4<Float>(0, 0, 0, 1e30), count: 6 * SignackShadowViews.maxViews)
+        for (v, f) in views.prefix(SignackShadowViews.maxViews).enumerated() {
+            for (p, plane) in f.planes.prefix(6).enumerated() { words[6 * v + p] = plane }
+        }
+    }
+
+    func bind(_ enc: MTLComputeCommandEncoder, index: Int) {
+        words.withUnsafeBytes { enc.setBytes($0.baseAddress!, length: Self.byteLength, index: index) }
+    }
+}
+
 extension SignackGPUInstanceBatch {
+    /// DH-1493 — the CPU REFERENCE of the per-view membership: may this instance land in `view`?
+    /// (The same sphere-vs-planes test the kernel makes; the parity test holds it to it.)
+    public static func referenceInView(_ b: SignackGPUInstanceBounds, _ view: SignackFrustum) -> Bool {
+        let c = SIMD3(b.sphere.x, b.sphere.y, b.sphere.z)
+        return view.planes.allSatisfy { simd_dot(SIMD3($0.x, $0.y, $0.z), c) + $0.w >= -b.sphere.w }
+    }
+
     /// The CPU REFERENCE of `signack_instances_classify` — the bucket an instance lands in and
     /// whether it is on screen, or nil beyond `maxDistance`. The parity test holds the kernel to it;
     /// a host's debug view colours by it (the same answer the GPU drew).

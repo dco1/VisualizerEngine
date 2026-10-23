@@ -27,6 +27,8 @@ public final class SignackGPUPipelines: @unchecked Sendable {
     let rasterClear: MTLComputePipelineState
     let instancesClassify: MTLComputePipelineState
     let instancesFinalize: MTLComputePipelineState
+    let instancesViewsPrefix: MTLComputePipelineState   // DH-1493
+    let instancesViewsWrite: MTLComputePipelineState
     /// "metallib" or "source" — which way the library was obtained (logged by hosts/tests).
     public let librarySource: String
 
@@ -54,7 +56,8 @@ public final class SignackGPUPipelines: @unchecked Sendable {
               let hs = pso("signack_hiz_seed"), let hr = pso("signack_hiz_reduce"), let rp = pso("signack_raster_prepare"),
               let rd = pso("signack_raster_depth"), let ri = pso("signack_raster_ids"),
               let rc = pso("signack_raster_clear"),
-              let ic = pso("signack_instances_classify"), let inf = pso("signack_instances_finalize") else { return nil }
+              let ic = pso("signack_instances_classify"), let inf = pso("signack_instances_finalize"),
+              let ivp = pso("signack_instances_views_prefix"), let ivw = pso("signack_instances_views_write") else { return nil }
         let bd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .r32Float, width: 1, height: 1, mipmapped: false)
         bd.usage = .shaderRead
         guard let blank = device.makeTexture(descriptor: bd) else { return nil }
@@ -64,6 +67,7 @@ public final class SignackGPUPipelines: @unchecked Sendable {
         classify = c; write = w; finalize = f; viewsPrefix = vp
         rasterPrepare = rp; rasterDepth = rd; rasterIDs = ri; rasterClear = rc
         instancesClassify = ic; instancesFinalize = inf
+        instancesViewsPrefix = ivp; instancesViewsWrite = ivw
         librarySource = source
     }
 
@@ -71,7 +75,8 @@ public final class SignackGPUPipelines: @unchecked Sendable {
         if let lib = try? device.makeDefaultLibrary(bundle: .module),
            lib.functionNames.contains("signack_cut_classify"), lib.functionNames.contains("signack_raster_depth"),
            lib.functionNames.contains("signack_instances_classify"),
-           lib.functionNames.contains("signack_cut_views_prefix"), lib.functionNames.contains("signack_hiz_seed") {
+           lib.functionNames.contains("signack_cut_views_prefix"), lib.functionNames.contains("signack_hiz_seed"),
+           lib.functionNames.contains("signack_instances_views_write") {
             return (lib, "metallib")
         }
         // Each .metal is self-contained (no includes), so the sources concatenate into one library.
