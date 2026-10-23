@@ -196,6 +196,7 @@ extension IlluminatoramaRenderer {
         enc.setBuffer(areaLightBuffer, offset: 0, index: 4)
         enc.setBuffer(extraDirectionalBuffer, offset: 0, index: 5)
         enc.setBuffer(shd.spotProfileBuffer, offset: 0, index: 9)   // DH-0540 — the spot-profile rows
+        enc.setBuffer(cloudShadowBinding, offset: 0, index: 11)     // DH-1462 — cloud sun transmittance
         // Point-light cube-face view-projection matrices (6 per shadowed light).
         // Placeholder-bound to `pointLightBuffer` when the feature is off / not yet
         // allocated — never read, because the kernel only indexes it for lights with

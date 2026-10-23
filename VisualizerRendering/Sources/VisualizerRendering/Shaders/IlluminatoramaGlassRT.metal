@@ -719,6 +719,7 @@ fragment float4 illumi_glass_rt_fs(
     const device float4*             cornerN     [[buffer(16)]],
     const device RTAreaLight*        areaLights  [[buffer(17)]],   // DH-0718; gated by meta.y
     const device float*              spotProfiles [[buffer(18)]],  // DH-0540 — the spot-profile rows
+    const device float*              cloudShadow [[buffer(19)]],   // DH-1462 — cloud sun transmittance (dummy when off)
     texture2d<float, access::sample> sky         [[texture(0)]],
     texture2d<float, access::sample> surfAtlas   [[texture(1)]],
     texture2d<float, access::sample> backdrop    [[texture(2)]],
@@ -760,6 +761,7 @@ fragment float4 illumi_glass_rt_fs(
     st.sec.pointLights = pointLights; st.sec.spotLights = spotLights;
     st.sec.areaLights = areaLights;
     st.sec.spotProfiles = spotProfiles;   // DH-0540
+    st.sec.cloudShadow = cloudShadow;     // DH-1462
     st.glassData = glassData;
     st.triCard = triCard; st.triUVa = triUVa; st.triUVc = triUVc;
     st.soupTriBase = soupTriBase; st.surfCardRect = surfCardRect; st.surfCards = surfCards;

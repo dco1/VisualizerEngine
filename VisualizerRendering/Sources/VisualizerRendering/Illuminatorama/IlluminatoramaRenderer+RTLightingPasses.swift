@@ -249,6 +249,7 @@ extension IlluminatoramaRenderer {
         enc.setBuffer(pointLightBuffer, offset: 0, index: 17)
         enc.setBuffer(spotLightBuffer, offset: 0, index: 18)
         enc.setBuffer(shd.spotProfileBuffer, offset: 0, index: 23)   // DH-0540 — the spot-profile rows
+        enc.setBuffer(cloudShadowBinding, offset: 0, index: 25)      // DH-1462 — cloud sun transmittance
         // DH-0718 — area lights (buffer 20); a dummy when none are read.
         enc.setBuffer(secondaryAreaLightCount > 0 ? areaLightBuffer : instData, offset: 0, index: 20)
         enc.setTexture(ibls.irradianceCube, index: 6)

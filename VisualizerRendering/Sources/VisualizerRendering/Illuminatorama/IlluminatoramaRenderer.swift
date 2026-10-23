@@ -3179,6 +3179,23 @@ public final class IlluminatoramaRenderer {
     /// (and, with no history, over the dome). 0 = switch at once (the photo lane: an accumulating
     /// still must not average a ramp in).
     public var cumulusInViewFadeFrames = 0
+    /// Daydream DH-1462 — the cumulus deck shadows the scene: a low-res transmittance map toward the
+    /// sun, baked from the SAME density the sky marches (`volSkyCloudShadowMap`) whenever the sky, sun
+    /// or the map's camera-following centre changes, and read by every sun-lit lane (deferred, RT
+    /// direct sun, path vertices, secondary hits, glass). Needs `cloudNoiseTexture` +
+    /// `cloudSkyUniforms` and a `.cumulus` deck. OFF by default → byte-identical.
+    public var cloudShadowEnabled = false
+    /// Map texels per side, the world square it covers (m, centred on the camera) and sun-ray steps.
+    public var cloudShadowResolution = 256
+    public var cloudShadowExtent: Float = 4000
+    public var cloudShadowSteps = 32
+    /// The plane the map is baked on (a point above it slides down the sun ray to it).
+    public var cloudShadowGroundY: Float = 0
+    /// 0…1 — how much of the deck's transmittance reaches the sun term (1 = physical).
+    public var cloudShadowStrength: Float = 1
+    /// Shade only points within this height of `cloudShadowGroundY` (0 = everything — the house too).
+    public var cloudShadowHeightLimit: Float = 0
+    let cloudShadow = CloudShadowState()
     let cumulusInView = CumulusInViewState()
     /// The clock the in-view sky animates by (the lava lamp's wax, the cirrus threads' flow) —
     /// `nil` (the default) = `time`, byte-identical. A host that lets those speeds change live
@@ -3619,6 +3636,7 @@ public final class IlluminatoramaRenderer {
         encodeSSAOSpatialFilter(cb)
         encodeSSAOTemporalPass(cb)
         prepareAOVFrame()   // DH-1304 — this frame's capture (no-op unless `aovCaptureEnabled`)
+        encodeCloudShadowPass(cb)   // DH-1462 — no-op unless `cloudShadowEnabled` (and the sky changed)
         encodeLightingPass(cb)
         // Issue #65 — screen-space SSS: diffuse the lit irradiance of SSS-flagged
         // pixels and blend it back into hdrTexture BEFORE SSR/RT/TAA/bloom read it,

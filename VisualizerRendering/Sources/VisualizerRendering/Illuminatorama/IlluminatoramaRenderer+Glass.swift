@@ -532,6 +532,7 @@ extension IlluminatoramaRenderer {
                 enc.setFragmentBuffer(pointLightBuffer, offset: 0, index: 14)
                 enc.setFragmentBuffer(spotLightBuffer, offset: 0, index: 15)
                 enc.setFragmentBuffer(shd.spotProfileBuffer, offset: 0, index: 18)   // DH-0540 — the spot-profile rows
+                enc.setFragmentBuffer(cloudShadowBinding, offset: 0, index: 19)      // DH-1462 — cloud sun transmittance
                 // Smooth refraction: glass hits interpolate these corner normals (a dummy with
                 // every row's base 0 means "face normal" — see `rtGlassCornerNormalBuffer`).
                 enc.setFragmentBuffer(gls.rtGlassCornerNormalBuffer ?? instData, offset: 0, index: 16)

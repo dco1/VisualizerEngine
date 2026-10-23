@@ -50,6 +50,7 @@
 #include <metal_raytracing>
 #include "IlluminatoramaNightSky.h"
 #include "IlluminatoramaSampling.h"
+#include "IlluminatoramaCloudShadow.h"
 
 using namespace metal;
 using namespace raytracing;
@@ -462,6 +463,7 @@ struct SecondaryScene {
     const device RTSpotLight*    spotLights;
     const device RTAreaLight*    areaLights;   // DH-0718; read only when `areaLightCount` > 0
     const device float*          spotProfiles; // DH-0540 — the host's spot-profile rows (a 1-float dummy when none)
+    const device float*          cloudShadow;  // DH-1462 — the cloud deck's sun transmittance (8-float dummy when off)
 };
 
 /// One opaque triangle hit, however the ray that found it was fired.
@@ -829,7 +831,8 @@ static inline float3 shadeSecondarySurface(thread Isect& isect,
     // through-glass world fell from 1.197× the open aperture to 1.049×, i.e. the sun it should
     // have been given was 15 points of ratio, silently absent.
     if (nl > 0.0) {
-        float vis = secondarySunVisibility(isect, accel, h.P, h.N, Ld, p, seed);
+        float vis = secondarySunVisibility(isect, accel, h.P, h.N, Ld, p, seed)
+                  * illumiCloudSunTransmittance(sc.cloudShadow, h.P, Ld);
         rad += A * (1.0 / M_PI_F) * p.sunColor * nl * vis;
     }
     return rad;

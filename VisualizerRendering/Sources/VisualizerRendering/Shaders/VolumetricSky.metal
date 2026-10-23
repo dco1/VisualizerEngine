@@ -4015,3 +4015,44 @@ kernel void illumi_cumulus_inview_resolve_reproject(
     float4 c = hdr.read(gid);
     hdr.write(float4(max(c.rgb + add, float3(0.0f)), c.a), gid);
 }
+
+// ── Cloud shadow map (Daydream DH-1462) — the deck's transmittance toward the sun over world XZ ────
+//
+// One texel per thread: march the sun ray from the shadow plane (`groundY`) through the slab with the
+// SAME density (`cumulusDensityHD` at the dome's detail, the cloud-field fade) and the SAME extinction
+// the sky's own march uses (exp(−ρ·dt·absK·0.4)), so a cloud's shadow is that cloud. No jitter: the
+// fixed sample positions slide continuously with the texel, so the result is smooth (low variance)
+// and the bilinear reader softens it further. Header (centre, extent, resolution, groundY) is the
+// host's; see IlluminatoramaCloudShadow.h for the layout.
+kernel void volSkyCloudShadowMap(device float* cs                       [[buffer(0)]],
+                                 constant SkyUniforms &u                [[buffer(1)]],
+                                 constant uint4 &cfg                    [[buffer(2)]],   // x = march steps
+                                 texture3d<float, access::sample> noiseVol [[texture(0)]],
+                                 uint2 gid                              [[thread_position_in_grid]]) {
+    uint res = uint(cs[4]);
+    if (gid.x >= res || gid.y >= res) return;
+    uint idx = 8u + gid.y * res + gid.x;
+    float3 L = normalize(-u.sunDir.xyz);
+    if (L.y <= 0.02f) { cs[idx] = 1.0f; return; }
+    float ext = cs[2], gy = cs[5];
+    float2 g = float2(cs[0], cs[1]) + ((float2(gid) + 0.5f) / float(res) - 0.5f) * ext;
+    float baseY = u.cloudSlab.x, topY = u.cloudSlab.y;
+    float thickness = max(topY - baseY, 1.0f);
+    float t0 = max(baseY - gy, 0.0f) / L.y;
+    float t1 = max(topY - gy, 0.0f) / L.y;
+    t1 = min(t1, t0 + thickness * 6.0f);          // a grazing sun: the first six thicknesses decide it
+    int steps = max(8, int(cfg.x));
+    float dt = (t1 - t0) / float(steps);
+    float densityScale = u.cloudShape.y;
+    float absK = max(0.05f, u.lighting.z);
+    float3 o = float3(g.x, gy, g.y);
+    float od = 0.0f;
+    for (int i = 0; i < steps; ++i) {
+        float3 pos = o + L * (t0 + (float(i) + 0.5f) * dt);
+        float d = cumulusDensityHD(pos, u, noiseVol, 0.0f) * densityScale;
+        if (u.cloudField.w > 0.0f)
+            d *= 1.0f - smoothstep(u.cloudField.z, u.cloudField.w, length(pos.xz - u.cloudField.xy));
+        od += d * dt;
+    }
+    cs[idx] = exp(-od * absK * 0.4f);
+}

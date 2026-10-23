@@ -6,6 +6,7 @@
 #include <metal_stdlib>
 #include "IlluminatoramaSpotProfile.h"
 #include "IlluminatoramaCommon.h"
+#include "IlluminatoramaCloudShadow.h"
 #include "IlluminatoramaAOV.h"
 // S4.1 — ray-traced soft sun shadows in this kernel's `kLightingRTSunShadow`
 // variant. The header carries the shared RNG (`pcgHash`/`rnd`) and disc sampling
@@ -1140,6 +1141,9 @@ kernel void illumi_lighting(
     instance_acceleration_structure         rtSunAccel      [[buffer(8), function_constant(kLightingRTSunShadow)]],
     // Daydream DH-0540 — the host's spot-profile rows (`illumiSpotProfile`); a 1-float dummy when no spot names one.
     const device float*                     spotProfiles    [[buffer(9)]],
+    // Daydream DH-1462 — the cloud deck's sun transmittance (IlluminatoramaCloudShadow.h); the
+    // disabled 8-float dummy when off, so every lookup is 1.
+    const device float*                     cloudShadow     [[buffer(11)]],
     // The defocus shading-rate tile map (least |CoC| of each 16×16 tile's geometry) — exists only in
     // the coarse / skip variants (`kLightingShadingRate`), which the host binds it for.
     texture2d<float, access::read>          rateTiles       [[texture(24), function_constant(kLightingShadingRate)]],
@@ -1324,6 +1328,9 @@ kernel void illumi_lighting(
                                          NdotL_sun);
         visibility *= saturate(1.0 - frame.contactShadowStrength * occ);
     }
+    // The cumulus deck between this point and the sun (DH-1462) — folded into the SAME visibility, so
+    // every sun-driven term below dims together under a cloud.
+    visibility *= illumiCloudSunTransmittance(cloudShadow, worldPos, Ld);
     // Terms kept separate so the per-term split-render (frame.debugTerm) can
     // isolate any one of them; the normal path just sums them at the end.
     // Phase 7c — grain anisotropy, now with an AUTHORABLE grain axis. normalRoughness.w packs the

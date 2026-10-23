@@ -1081,8 +1081,9 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 bool blocked = isect.intersect(sr, accel, u.transportRayMask).type != intersection_type::none;
                 isect.accept_any_intersection(false);
                 if (!blocked) {
+                    float cT = illumiCloudSunTransmittance(sec.cloudShadow, P, Ld);   // DH-1462
                     if (!st.on) {
-                        Lv += u.sunColor * nl * (1.0 / M_PI_F);
+                        Lv += u.sunColor * cT * nl * (1.0 / M_PI_F);
                     } else {
                         // DH-1363 inc. 2b — the whole stack's sun: the diffuse share at full weight (its
                         // continuation never credits a sun hit), the glossy lobes toward the sun's DISC with
@@ -1093,7 +1094,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                                   + pathGlossyEvalSource(st.lobeC, sr.direction, 0.5 * u.sunSoftnessRad, lampMinAlpha, pc);
                         float rB = (pick.y * ps + pick.z * pc) * sunOmega;    // p_B / p_L
                         float nlS = saturate(dot(N, sr.direction));
-                        Lv += u.sunColor * nlS * (st.WdA * (1.0 / M_PI_F) + fS / (1.0 + rB * rB));
+                        Lv += u.sunColor * cT * nlS * (st.WdA * (1.0 / M_PI_F) + fS / (1.0 + rB * rB));
                     }
                 }
             }
@@ -1497,6 +1498,7 @@ kernel void illumi_rt_lighting_tlas(
     device atomic_uint*                   rcKeys      [[buffer(21)]],
     device atomic_float*                  rcData      [[buffer(22)]],
     const device float*                   spotProfiles [[buffer(23)]],  // DH-0540 — the spot-profile rows
+    const device float*                   cloudShadow [[buffer(25)]],   // DH-1462 — cloud sun transmittance (dummy when off)
     // Daydream DH-1304 — the per-term AOV capture (running means the deferred pass started this
     // frame) and its frame parameters. Exist only in the `kRTAOVEnabled` variants.
     texture2d_array<float, access::read_write> aovOut   [[texture(13), function_constant(kRTAOVEnabled)]],
@@ -1558,6 +1560,7 @@ kernel void illumi_rt_lighting_tlas(
     sec.pointLights = pointLights; sec.spotLights = spotLights;
     sec.areaLights = areaLights;
     sec.spotProfiles = spotProfiles;   // DH-0540
+    sec.cloudShadow = cloudShadow;     // DH-1462
     SecondaryShadeParams secFull   = fullRadianceParams(u);   // reflections + cache fallbacks
     SecondaryShadeParams secBounce = giBounceParams(u);       // GI bounces (no sky double-count)
 
@@ -1612,7 +1615,7 @@ kernel void illumi_rt_lighting_tlas(
             // clear pane doesn't cast a solid shadow.
             if (isect.intersect(r, accel, u.transportRayMask).type != intersection_type::none) hits++;
         }
-        float vis = 1.0 - float(hits) / float(u.shadowRays);
+        float vis = (1.0 - float(hits) / float(u.shadowRays)) * illumiCloudSunTransmittance(sec.cloudShadow, P, Ld);
         float3 V = normalize(u.cameraWorldPos - P);
         float3 H = normalize(Ld + V);
         float spec = pow(saturate(dot(N, H)), mix(8.0, 90.0, 1.0 - roughness)) * (1.0 - roughness) * u.specStrength;
