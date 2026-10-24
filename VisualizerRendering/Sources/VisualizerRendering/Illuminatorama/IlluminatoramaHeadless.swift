@@ -15,6 +15,10 @@ public struct IlluminatoramaFrame: Sendable {
     /// Tightly packed 8-bit, 4 bytes per pixel, in `pixelFormat`'s channel order.
     public let bytes: [UInt8]
 
+    public init(width: Int, height: Int, pixelFormat: MTLPixelFormat, bytes: [UInt8]) {
+        self.width = width; self.height = height; self.pixelFormat = pixelFormat; self.bytes = bytes
+    }
+
     /// True when `bytes` are B,G,R,A (so luma weights land on the right channels).
     public var isBGRA: Bool { pixelFormat == .bgra8Unorm || pixelFormat == .bgra8Unorm_srgb }
 

@@ -1,6 +1,7 @@
 import Foundation
 import Metal
 import VisualizerCore
+import VisualizerStill
 
 // One call to take a STILL: settle the scene to a converged picture and hand back the pixels.
 //
@@ -75,6 +76,23 @@ public struct IlluminatoramaStillReport {
     public let accumulatedFrames: Int
     public let internalScale: Float
     public let milliseconds: Double
+}
+
+public extension IlluminatoramaStillOptions {
+    /// Daydream's measured photo lane (`PhotoQuality`) as options, for any host: 2× supersample capped by the
+    /// megapixel budget, 32 jittered frames averaged 1/k, and the 4K long-edge output (`outputSize` nil ⇒
+    /// the renderer's current size is used as the canvas). Pass `outputSize` to pin it exactly.
+    static func photoQuality(canvas: (width: Int, height: Int),
+                             outputSize: (width: Int, height: Int)? = nil) -> IlluminatoramaStillOptions {
+        let size = outputSize ?? PhotoQuality.outputSize(canvasWidth: canvas.width, canvasHeight: canvas.height)
+        var o = IlluminatoramaStillOptions(
+            frames: PhotoQuality.settleFrames, jitterPixels: PhotoQuality.jitterPixels,
+            accumulationFloor: PhotoQuality.accumulationFloor,
+            outputSize: size,
+            internalScale: PhotoQuality.scale(outputPixels: Double(size.width * size.height)))
+        o.svgfLevels = 2
+        return o
+    }
 }
 
 public struct IlluminatoramaStillResult {
@@ -172,10 +190,18 @@ public final class IlluminatoramaStillSession {
                 r.ssaoTemporalBlend = max(savedAO, 1 - o.accumulationFloor)   // 1/N governs, not the dial's EMA
             }
             r.taaJitterPixels = o.jitterPixels
-            r.taaHistoryBlend = max(1 / Float(k), o.accumulationFloor)
+            r.taaHistoryBlend = StillAccumulation.blend(frame: k, floor: o.accumulationFloor)
         }
         index += 1
         return kind
+    }
+
+    /// Begin another accumulation run on the SAME scope — a new shot after the host moved the camera. The
+    /// next `next()` is accumulate-frame 1 (blend 1, so the new view replaces the history rather than
+    /// averaging with the last shot's); warm-up and cache build are not repeated.
+    public func restartAccumulation() {
+        index = kinds.count - accumulatedFrames
+        // The previous frame is now an accumulate frame, so frame 1 takes no build→accumulate transition.
     }
 
     /// Restore everything the still changed. Safe to call twice.
@@ -263,5 +289,44 @@ public extension IlluminatoramaRenderer {
             frame: frame, warmupFrames: report.warmupFrames, cacheBuildFrames: report.cacheBuildFrames,
             accumulatedFrames: report.accumulatedFrames, internalScale: report.internalScale,
             milliseconds: report.milliseconds)
+    }
+
+    /// A sweep: several stills of one scene from different poses, with the still scope entered ONCE
+    /// (not per shot — the output/scale resize is what costs, and destroys the temporal histories).
+    /// `pose(i)` moves the camera for shot `i`; `leadInFrames` accumulate frames run first at the
+    /// current pose to warm the pools. `autoExposureHalfLife` (seconds) is held for the sweep: a batch
+    /// nobody watches has no use for the live meter's smoothing, and snapping it makes every shot land
+    /// on the exposure its OWN view meters to — which also makes the sheet independent of shot order.
+    @MainActor
+    func renderStillSweep(shots: Int, _ o: IlluminatoramaStillOptions,
+                          leadInFrames: Int = 0, autoExposureHalfLife: Float? = nil,
+                          step: ((IlluminatoramaStillFrame) -> Bool)? = nil,
+                          pose: (Int) -> Void) -> [IlluminatoramaFrame] {
+        let step = step ?? { [unowned self] _ in self.render(blocking: true) }
+        let savedHalfLife = self.autoExposureHalfLife
+        if let h = autoExposureHalfLife { self.autoExposureHalfLife = h }
+        let s = IlluminatoramaStillSession(self, o)
+        defer { s.finish(); self.autoExposureHalfLife = savedHalfLife }
+
+        // Warm-up/cache-build frames are consumed once, then every shot accumulates from 1.
+        var kind = s.next()
+        while let k = kind, !k.accumulates { _ = step(k); kind = s.next() }
+        var pending = kind          // the first accumulate frame, already prepared
+        for _ in 0..<max(leadInFrames, 0) {
+            if let k = pending ?? s.next() { _ = step(k) }
+            pending = nil
+            if s.framesDone >= s.totalFrames { s.restartAccumulation() }
+        }
+        s.restartAccumulation()
+        pending = nil
+
+        var out: [IlluminatoramaFrame] = []
+        for i in 0..<max(shots, 0) {
+            pose(i)
+            s.restartAccumulation()
+            while let k = s.next() { _ = step(k) }
+            if let f = readFrame() { out.append(f) }
+        }
+        return out
     }
 }

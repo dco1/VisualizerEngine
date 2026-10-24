@@ -15,6 +15,7 @@ let package = Package(
     products: [
         .library(name: "VisualizerCore", targets: ["VisualizerCore"]),
         .library(name: "VisualizerMaterials", targets: ["VisualizerMaterials"]),
+        .library(name: "VisualizerStill", targets: ["VisualizerStill"]),
         .library(name: "VisualizerRendering", targets: ["VisualizerRendering"]),
         .library(name: "VisualizerVegetation", targets: ["VisualizerVegetation"]),
         .library(name: "VisualizerFlora", targets: ["VisualizerFlora"]),
@@ -44,6 +45,12 @@ let package = Package(
             path: "VisualizerMaterials/Sources/VisualizerMaterials",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        // The still/converge quality policy — pure, zero dependencies; see VisualizerStill/Package.swift.
+        .target(
+            name: "VisualizerStill",
+            path: "VisualizerStill/Sources/VisualizerStill",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
         .testTarget(
             name: "VisualizerMaterialsTests",
             dependencies: ["VisualizerMaterials"],
@@ -69,7 +76,7 @@ let package = Package(
         ),
         .target(
             name: "VisualizerRendering",
-            dependencies: ["VisualizerCore"],
+            dependencies: ["VisualizerCore", "VisualizerStill"],
             path: "VisualizerRendering/Sources/VisualizerRendering",
             resources: [.process("Shaders")],
             swiftSettings: [.swiftLanguageMode(.v6)]

@@ -1,6 +1,7 @@
 import XCTest
 import simd
 import Metal
+import VisualizerStill
 import AVFoundation
 @testable import VisualizerRendering
 
@@ -115,5 +116,42 @@ final class IlluminatoramaStillStreamingTests: XCTestCase {
         XCTAssertEqual(seen.last ?? 0, 1, accuracy: 1e-9)
         XCTAssertEqual(seen, seen.sorted())
         XCTAssertEqual(r.outputWidth, 128, "restored")
+    }
+}
+
+@MainActor
+final class IlluminatoramaSweepTests: XCTestCase {
+
+    func testSweepPosesEachShotAndRestoresTheRenderer() throws {
+        let cam = IlluminatoramaCamera(position: SIMD3(0, 1, 4), target: .zero, up: SIMD3(0, 1, 0),
+                                       fovYRadians: .pi / 3, aspect: 4.0 / 3.0, zNear: 0.05, zFar: 100)
+        let r = try IlluminatoramaRenderer(engine: SimEngine.shared, width: 128, height: 96, camera: cam)
+        stageScene(r)
+        let halfLife = r.autoExposureHalfLife
+        var posed: [Int] = []
+        var accumulate: [Int] = []
+        let shots = r.renderStillSweep(shots: 3, .init(frames: 2, outputSize: (160, 120)), leadInFrames: 2,
+                                       autoExposureHalfLife: 0.02,
+                                       step: { kind in if case .accumulate(let k) = kind { accumulate.append(k) }
+                                                       return r.render(blocking: true) },
+                                       pose: { posed.append($0) })
+        XCTAssertEqual(posed, [0, 1, 2])
+        XCTAssertEqual(shots.count, 3)
+        XCTAssertTrue(shots.allSatisfy { $0.width == 160 && $0.height == 120 })
+        // lead-in (2 frames) then 3 shots × accumulate 1,2 — each shot restarts at 1
+        XCTAssertEqual(Array(accumulate.suffix(6)), [1, 2, 1, 2, 1, 2])
+        XCTAssertEqual(r.autoExposureHalfLife, halfLife)
+        XCTAssertEqual(r.outputWidth, 128)
+    }
+}
+
+final class IlluminatoramaPhotoQualityOptionsTests: XCTestCase {
+    func testPhotoQualityOptionsAreTheMeasuredTable() {
+        let o = IlluminatoramaStillOptions.photoQuality(canvas: (1280, 720))
+        XCTAssertEqual(o.frames, PhotoQuality.settleFrames)
+        XCTAssertEqual(o.outputSize?.width, PhotoQuality.targetLongEdge)
+        XCTAssertEqual(o.internalScale, PhotoQuality.scale(outputPixels: 3840 * 2160), "scale follows the OUTPUT size")
+        XCTAssertEqual(StillAccumulation.blend(frame: 4, floor: 0.01), 0.25)
+        XCTAssertEqual(StillAccumulation.blend(frame: 1000, floor: 0.01), 0.01)
     }
 }
