@@ -97,3 +97,23 @@ final class IlluminatoramaVideoTests: XCTestCase {
         XCTAssertEqual(r.outputWidth, 128, "the renderer is restored to its own size")
     }
 }
+
+@MainActor
+final class IlluminatoramaStillStreamingTests: XCTestCase {
+
+    func testStreamingStillReportsProgressAndMatchesTheBlockingSequence() async throws {
+        let cam = IlluminatoramaCamera(position: SIMD3(0, 1, 4), target: .zero, up: SIMD3(0, 1, 0),
+                                       fovYRadians: .pi / 3, aspect: 4.0 / 3.0, zNear: 0.05, zFar: 100)
+        let r = try IlluminatoramaRenderer(engine: SimEngine.shared, width: 128, height: 96, camera: cam)
+        stageScene(r)
+        var seen: [Double] = []
+        let result = await r.renderStillStreaming(.init(frames: 3, jitterPixels: 1, outputSize: (160, 120)),
+                                                  progress: { seen.append($0) })
+        let still = try XCTUnwrap(result)
+        XCTAssertEqual(still.frame.width, 160)
+        XCTAssertEqual(seen.count, 3)
+        XCTAssertEqual(seen.last ?? 0, 1, accuracy: 1e-9)
+        XCTAssertEqual(seen, seen.sorted())
+        XCTAssertEqual(r.outputWidth, 128, "restored")
+    }
+}
