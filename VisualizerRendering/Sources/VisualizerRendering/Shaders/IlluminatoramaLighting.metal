@@ -460,7 +460,8 @@ static inline float3 brdf(
     float anisotropy = 0.0, float3 grainT = float3(0.0),
     float sheenStrength = 0.0, thread float3 *sheenOut = nullptr,
     float sheenRoughness = kClothSheenRoughness,
-    LayeredEnergy le = layeredOff()
+    LayeredEnergy le = layeredOff(),
+    float sourceTan = 0.0
 ) {
     float3 H = normalize(V + L);
     float NdotL = saturate(dot(N, L));
@@ -500,6 +501,19 @@ static inline float3 brdf(
     // DH-1301 — diffuse roughness: the EON lobe as a factor on Lambert (IlluminatoramaDiffuseRoughness.h);
     // `le.diffuseRoughness` 0 ⇒ the literal 1.0, i.e. exactly the Lambert term.
     float3 diff = kd * albedo / M_PI_F * illumiEONLambertRatio(albedo, le.diffuseRoughness, NdotL, NdotV, dot(L, V));
+    // DH-1309 — the COAT layer over the base (IlluminatoramaBSDF.h `layeredWithCoat`): the base takes
+    // what the coat's own lobe did not reflect (× the coat tint, its diffuse × the darkening), and
+    // the coat lobe answers this light too — a lamp shows in a lacquered floor.
+    if (le.coatOn) {
+        float3 coated = (diff * le.coatDarken + spec) * le.underCoatDirect
+                      + float3(layeredCoatDirect(N, V, L, le, sourceTan));
+        if (!(sheenStrength > 0.0)) return coated * lightColor * NdotL;
+        float3 sheenC = clothSheenColor(albedo) * (sheenStrength * clothSheenD(sheenRoughness, NdotH)
+                                                   * clothSheenV(NdotV, NdotL));
+        if (sheenOut != nullptr) *sheenOut += sheenC * lightColor * NdotL;
+        // DH-1299 — fuzz over coat over base: the sheen sits on top of the coated stack.
+        return (coated * le.baseUnderSheen + sheenC) * lightColor * NdotL;
+    }
     // THE EXACT EARLY-OUT. Everything above this line is untouched, and this is the expression
     // `brdf` has always returned; a surface with no cloth sheen therefore cannot move by a bit.
     if (!(sheenStrength > 0.0)) return (diff + spec) * lightColor * NdotL;
@@ -532,6 +546,7 @@ static inline float3 brdfDiffuse(
     float3 kd = (1.0 - F) * (1.0 - metallic);
     // DH-1014 — must stay `brdf`'s diffuse exactly (the SSS composite subtracts it).
     if (le.multiscatter) kd = le.diffuseDirect;
+    if (le.coatOn) kd *= le.underCoatDirect * le.coatDarken;   // DH-1309 — under the coat
     kd *= le.baseUnderSheen;
     return kd * albedo / M_PI_F * illumiEONLambertRatio(albedo, le.diffuseRoughness, NdotL, saturate(dot(N, V)), dot(L, V))
          * lightColor * NdotL;
@@ -624,54 +639,14 @@ static inline int ltcClipQuadToHorizon(thread float3* L) {
     return n;
 }
 
-// Full rectangular area-light contribution at a shaded point.
-//
-// `le` (DH-1014): with multiscatter on, the specular takes the direct lobe's multiple-scattering
-// factor and the diffuse the share the specular layer passed down — the same bookkeeping as
-// `brdf`. (Area lights carry no sheen lobe — DH-0597 #2 — so no sheen albedo scaling either.)
-static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, float3 V,
-                                   float3 albedo, float metallic, float roughness,
-                                   texture2d<float> ltcMat, texture2d<float> ltcMag,
-                                   bool ltcEnabled,
-                                   LayeredEnergy le = layeredOff()) {
-    float3 nL = cross(al.ex, al.ey);
-    float  nLlen = length(nL);
-    if (nLlen < 1e-8) return float3(0.0);
-    nL /= nLlen;
-    bool twoSided = al.twoSided > 0.5;
-
-    // One-sided: the receiver must be on the emitting (+nL) face.
-    float facing = dot(nL, worldPos - al.center);
-    if (!twoSided && facing <= 0.0) return float3(0.0);
-
-    // Distance falloff (centre distance) with a smooth radius window — keeps the
-    // light local like the point/spot path rather than lighting the whole scene.
-    float dist = length(al.center - worldPos);
-    if (dist > al.radius) return float3(0.0);
-    float window = saturate(1.0 - pow(dist / al.radius, 4.0));
-    window *= window;
-    if (window <= 0.0) return float3(0.0);
-
-    // Quad corners relative to the shaded point — wound CLOCKWISE as seen from +nL,
-    // which is COUNTER-clockwise as seen from a receiver ON the +nL side, the
-    // orientation the edge integral's sign convention wants. The previous (CCW-from-
-    // +nL) order made `z` NEGATIVE at every legitimately-lit receiver: two-sided
-    // lights take |z| and never noticed (every Visualizer softbox is two-sided), but
-    // the first ONE-sided light — a window portal — rendered `max(0, z)` = zero
-    // diffuse everywhere, with normal-map jitter flickering individual pixels across
-    // the clamp as salt-and-pepper speckle. Measured: a ×6 intensity change moved the
-    // near-window floor probe 0.3 luma before this flip.
-    float3 p0 = al.center - al.ex - al.ey - worldPos;
-    float3 p1 = al.center - al.ex + al.ey - worldPos;
-    float3 p2 = al.center + al.ex + al.ey - worldPos;
-    float3 p3 = al.center + al.ex - al.ey - worldPos;
-
-    // Diffuse — exact polygon clamped-cosine (LTC, M = identity).
-    float  ff = ltcPolygonForm(N, p0, p1, p2, p3, twoSided);
-    float3 diffuse = (1.0 - metallic) * albedo * ff;
-
+// DH-1309 — the specular half of `evalAreaLight` for one GGX lobe (F0, roughness): the LTC polygon
+// integral, or the most-representative-point fallback. The base calls it with its own lobe and the
+// coat with its own, so a window portal reflects in a lacquered top through the same code.
+static inline float3 areaLightSpecular(AreaLight al, float3 worldPos, float3 N, float3 V,
+                                       float3 F0, float roughness,
+                                       texture2d<float> ltcMat, texture2d<float> ltcMag, bool ltcEnabled,
+                                       float3 nL, float3 p0, float3 p1, float3 p2, float3 p3, float ff) {
     float3 spec = float3(0.0);
-    float3 F0 = mix(le.dielectricF0, albedo, metallic);   // DH-1300
     if (ltcEnabled) {
         // LTC specular — transform the light polygon by the per-(roughness, NdotV)
         // inverse matrix, then run the SAME clamped-cosine polygon integral. The
@@ -792,6 +767,58 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
             spec = (D * G * F) / (4.0 * NdotV * NdotLs + 1e-7) * projSA;
         }
     }
+    return spec;
+}
+
+// Full rectangular area-light contribution at a shaded point.
+//
+// `le` (DH-1014): with multiscatter on, the specular takes the direct lobe's multiple-scattering
+// factor and the diffuse the share the specular layer passed down — the same bookkeeping as
+// `brdf`. (Area lights carry no sheen lobe — DH-0597 #2 — so no sheen albedo scaling either.)
+static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, float3 V,
+                                   float3 albedo, float metallic, float roughness,
+                                   texture2d<float> ltcMat, texture2d<float> ltcMag,
+                                   bool ltcEnabled,
+                                   LayeredEnergy le = layeredOff()) {
+    float3 nL = cross(al.ex, al.ey);
+    float  nLlen = length(nL);
+    if (nLlen < 1e-8) return float3(0.0);
+    nL /= nLlen;
+    bool twoSided = al.twoSided > 0.5;
+
+    // One-sided: the receiver must be on the emitting (+nL) face.
+    float facing = dot(nL, worldPos - al.center);
+    if (!twoSided && facing <= 0.0) return float3(0.0);
+
+    // Distance falloff (centre distance) with a smooth radius window — keeps the
+    // light local like the point/spot path rather than lighting the whole scene.
+    float dist = length(al.center - worldPos);
+    if (dist > al.radius) return float3(0.0);
+    float window = saturate(1.0 - pow(dist / al.radius, 4.0));
+    window *= window;
+    if (window <= 0.0) return float3(0.0);
+
+    // Quad corners relative to the shaded point — wound CLOCKWISE as seen from +nL,
+    // which is COUNTER-clockwise as seen from a receiver ON the +nL side, the
+    // orientation the edge integral's sign convention wants. The previous (CCW-from-
+    // +nL) order made `z` NEGATIVE at every legitimately-lit receiver: two-sided
+    // lights take |z| and never noticed (every Visualizer softbox is two-sided), but
+    // the first ONE-sided light — a window portal — rendered `max(0, z)` = zero
+    // diffuse everywhere, with normal-map jitter flickering individual pixels across
+    // the clamp as salt-and-pepper speckle. Measured: a ×6 intensity change moved the
+    // near-window floor probe 0.3 luma before this flip.
+    float3 p0 = al.center - al.ex - al.ey - worldPos;
+    float3 p1 = al.center - al.ex + al.ey - worldPos;
+    float3 p2 = al.center + al.ex + al.ey - worldPos;
+    float3 p3 = al.center + al.ex - al.ey - worldPos;
+
+    // Diffuse — exact polygon clamped-cosine (LTC, M = identity).
+    float  ff = ltcPolygonForm(N, p0, p1, p2, p3, twoSided);
+    float3 diffuse = (1.0 - metallic) * albedo * ff;
+
+    float3 F0 = mix(le.dielectricF0, albedo, metallic);
+    float3 spec = areaLightSpecular(al, worldPos, N, V, F0, roughness, ltcMat, ltcMag, ltcEnabled,
+                                    nL, p0, p1, p2, p3, ff);
     if (le.multiscatter) {
         spec *= le.specDirectMS;
         diffuse = le.diffuseDirect * albedo * ff;
@@ -799,6 +826,13 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
     // DH-1301 — an area light is an INTEGRATED source: the rough diffuse lobe's directional albedo
     // (exactly 1 at diffuse roughness 0). See IlluminatoramaDiffuseRoughness.h for why not the lobe.
     diffuse *= le.eonAlbedoRatio;
+    if (le.coatOn) {   // DH-1309 — the base under the coat, and the coat's own lobe of this light
+        diffuse *= le.underCoatDirect * le.coatDarken;
+        spec = spec * le.underCoatDirect
+             + (le.coatWeight * le.coatSpecMS)
+               * areaLightSpecular(al, worldPos, N, V, float3(le.coatF0), le.coatRoughness,
+                                   ltcMat, ltcMag, ltcEnabled, nL, p0, p1, p2, p3, ff);
+    }
 
     return (diffuse + spec) * al.color * window;
 }
@@ -1281,8 +1315,10 @@ kernel void illumi_lighting(
     // specular F0 every lobe below mixes from. A pixel whose instance carries none reads the
     // legacy literal 0.04, so the flag costs one texel read and changes nothing else.
     MaterialLayers ml = illumiMaterialLayersNone();
-    if ((frame.frameFlags & kFrameFlagLayeredSpecular) != 0u)
+    bool layeredCoat = kLightingDFGLUTEnabled && (frame.frameFlags & kFrameFlagLayeredCoat) != 0u;
+    if ((frame.frameFlags & kFrameFlagLayeredSpecular) != 0u || layeredCoat)
         ml = illumiMaterialLayersAt(layerInstances, gMaterialLayer.read(gid).r, 0xFFFFFFFFu);
+    if ((frame.frameFlags & kFrameFlagLayeredSpecular) == 0u) ml.spec = false;
     float3 dielF0 = illumiDielectricF0(ml);
     LayeredEnergy le = layeredOff();
     le.dielectricF0 = dielF0;
@@ -1299,6 +1335,20 @@ kernel void illumi_lighting(
     // portal lights, the diffuse IBL + bands, the ambient supplement) its directional albedo.
     if ((frame.frameFlags & kFrameFlagDiffuseRoughness) != 0u)
         le = layeredWithDiffuseRoughness(le, albedo, illumiUnpackDiffuseRoughness(amH.a), saturate(dot(N, V)));
+    // DH-1309 — the COAT as a layer (IlluminatoramaBSDF.h). Its strength is the G-buffer's emission.a
+    // when that carries a coat (> 0), else the instance's own (a coat sharing the pixel with a sheen,
+    // DH-1299); its roughness the instance's own on every lane (the Phase-7 kernel used 0.08 live).
+    if (layeredCoat) {
+        float ccW = (emH.a > 0.001h) ? float(emH.a) : ml.coat;
+        float ccR = ml.any ? ml.coatRoughness : 0.08;
+        if (!ml.any && frame.extendedGBuffer != 0.0) { float r = float(gMaterial.read(gid).a); if (r > 0.0) ccR = r; }
+        ccR = max(ccR, 0.02);
+        if (ccW > 0.001) {
+            constexpr sampler ccLutSampler(filter::linear, address::clamp_to_edge);
+            float4 lutC = float4(dfgLUT.sample(ccLutSampler, float2(saturate(dot(N, V)), ccR)));
+            le = layeredWithCoat(le, ccW, ccR, 0.04, lutC, float3(1.0), float3(1.0));
+        }
+    }
 
     // Issue #65 — screen-space SSS. SSS-flagged pixels carry ≈0.95h in
     // normalRoughness.w (vertex-colour alpha ∈ [0.90,0.98]; above the foliage 0.0
@@ -1561,7 +1611,8 @@ kernel void illumi_lighting(
         }
         if (visibility <= 0.0) continue;
         pointSum += brdf(N, V, L, albedo, metallic, roughness, pl.color * atten * visibility,
-                         0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness, le);
+                         0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness, le,
+                         max(pl.openingRadius, max(pl.bulbRadius, pl.softRadius)) / max(dist, 1e-3));   // DH-1309 — the coat sees the source's luminous size
         if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic,
                                              pl.color * atten * visibility, le);
     }
@@ -1639,7 +1690,8 @@ kernel void illumi_lighting(
         if (visibility <= 0.0) continue;
         spotSum += brdf(N, V, L, albedo, metallic, roughness,
                         sl.color * atten * visibility,
-                        0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness, le);
+                        0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness, le,
+                        max(sl.openingRadius, max(sl.bulbRadius, sl.softRadius)) / max(dist, 1e-3));   // DH-1309
         if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic,
                                              sl.color * atten * visibility, le);
     }
@@ -1860,6 +1912,9 @@ kernel void illumi_lighting(
         // DH-1301 — the rough diffuse lobe's directional albedo (1.0 exactly at diffuse roughness 0).
         // On `kD`, so the traced lanes' hand-off (`diffSkyInComposite`) carries it too.
         kD *= le.eonAlbedoRatio;
+        // DH-1309 — under the coat: what the coat's environment lobe did not reflect (× tint, and the
+        // diffuse darkening). On `kD`, so the traced lanes' hand-off carries it too. 1 off the coat.
+        if (le.coatOn) kD *= le.underCoatEnv * le.coatDarken;
 
         // Diffuse: the sky-probe irradiance cube.
         float3 irradianceSrc = float3(irradianceCube.sample(cubeSampler, N).rgb);
@@ -2029,6 +2084,7 @@ kernel void illumi_lighting(
             specularIBL = specEnv * F;
         }
         if (layeredSheen) specularIBL *= le.baseUnderSheen;   // DH-1014 — under the sheen layer
+        if (le.coatOn) specularIBL *= le.underCoatEnv;         // DH-1309 — under the coat
 
         // ── Foliage: no broad sky reflection ─────────────────────────────────
         // Foliage is flagged in normalRoughness.w < 0.5 (the same flag the thin-sheet
@@ -2103,6 +2159,7 @@ kernel void illumi_lighting(
         float upness = saturate(N.y * 0.5 + 0.5);
         float3 ambCol = desaturateFill(frame.ambientColor, frame.iblDiffuseDesaturation);
         float3 ambSupp = mix(ambCol * 0.4, ambCol, upness) * albedo * le.eonAlbedoRatio;   // DH-1301
+        if (le.coatOn) ambSupp *= le.underCoatEnv * le.coatDarken;                            // DH-1309
         if (layeredSheen) ambSupp *= le.baseUnderSheen;   // DH-1014 — 1.0 off cloth
         indirect += ambSupp * ao * interiorAmbK;
         dbgAmbient = ambSupp * ao * interiorAmbK;
@@ -2134,6 +2191,7 @@ kernel void illumi_lighting(
         float upness = saturate(N.y * 0.5 + 0.5);
         float3 ambCol = desaturateFill(frame.ambientColor, frame.iblDiffuseDesaturation);
         float3 amb = mix(ambCol * 0.4, ambCol, upness) * albedo * le.eonAlbedoRatio;   // DH-1301
+        if (le.coatOn) amb *= le.underCoatEnv * le.coatDarken;                            // DH-1309
         indirect = amb * ao * interiorAmbK;
         dbgAmbient = amb * ao * interiorAmbK;
         if ((frame.frameFlags & (kFrameFlagPathOwnsIndirect | kFrameFlagGIOwnsAmbient)) != 0u) diffSkyInComposite = dbgAmbient;
@@ -2151,7 +2209,25 @@ kernel void illumi_lighting(
     // polished surfaces. Strength 0 → no cost (branch exits immediately).
     float3 clearcoat = float3(0.0);
     float houseCC = float(emH.a);
-    if (houseCC > 0.001f) {
+    if (le.coatOn) {
+        // DH-1309 — the coat's ENVIRONMENT lobe: the prefiltered radiance at its own roughness × its
+        // split-sum albedo `E_env(F0c, μo)` (the base below already took `1 − w·E_env`). Raw `ao` and
+        // the outdoor cube's interior factor, as the Phase-7 coat had (its sharp lobe sits outside
+        // the interior band's roughness ramp). Under a sheen it is under the fuzz (DH-1299).
+        if (kLightingIBLEnabled) {
+            constexpr sampler ccSampler(filter::linear, mip_filter::linear);
+            float  mips = float(max(frame.iblPrefilteredMipCount, 1u));
+            float3 env  = float3(prefilteredCube.sample(ccSampler, reflect(-V, N),
+                                                        level(le.coatRoughness * (mips - 1.0))).rgb);
+            clearcoat = env * (le.coatWeight * le.coatEnvAlbedo) * frame.iblIntensity * ao * interiorIBLK;
+            if (layeredSheen) clearcoat *= le.baseUnderSheen;
+            if (kLightingAOVEnabled) aovCoatEnv += clearcoat;   // DH-1304
+            // DH-0896 — the traced reflection still replaces the BASE's specular share (traced at the
+            // base's roughness, weighted by the same `1 − w·E_coat` — `layeredRTWeights`): a lacquered
+            // door keeps the lamp it reflects through its finish. The coat's own sharp share stays the
+            // prefiltered environment, as the Phase-7 coat's did (one ray cannot be both lobes).
+        }
+    } else if (houseCC > 0.001f) {
         float ccRough = 0.08;          // tight polish (terrazzo/marble) — the live lane's constant
         if (frame.extendedGBuffer != 0.0) {
             // DH-0140 slice 1 — the still reads the material's OWN clearcoat roughness from the

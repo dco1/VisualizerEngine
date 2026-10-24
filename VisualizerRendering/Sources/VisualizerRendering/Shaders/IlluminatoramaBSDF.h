@@ -150,6 +150,21 @@ struct LayeredEnergy {
     /// tinted by `specular_color`; IlluminatoramaMaterialLayers.h). What every lobe's
     /// `mix(F0, albedo, metallic)` mixes from; the literal 0.04 unless the material set one.
     float3 dielectricF0;
+    /// Daydream DH-1309 — the COAT as a layer (`layeredWithCoat`). `coatOn` false ⇒ every caller keeps
+    /// its pre-DH-1309 expression and the fields below are unread.
+    bool   coatOn;
+    float  coatWeight;        // OpenPBR coat_weight (the instance's clearcoat strength)
+    float  coatRoughness;     // perceptual; the LUT's axis
+    float  coatF0;            // F0 of the coat interface (0.04 = IOR 1.5)
+    float  coatSpecMS;        // Turquin multiple-scattering factor of the coat's direct lobe
+    float  coatEnvAlbedo;     // E_env(F0c, μo): the coat's environment lobe albedo (× prefiltered radiance)
+    /// What reaches the base and comes back out under a punctual / area light: `1 − w·E_coat,direct(μo)`
+    /// (the coat lobe's OWN directional albedo, from the DFG LUT) — × the coat tint (DH-1298).
+    float3 underCoatDirect;
+    /// …and under the environment: `1 − w·E_coat,env(μo)`, × the tint.
+    float3 underCoatEnv;
+    /// DH-1298 — the base's DIFFUSE darkening under the coat (internal reflection; 1 = none).
+    float3 coatDarken;
 };
 
 /// Fdez-Agüera 2019 ("A Multiple-Scattering Microfacet Model for Real-Time Image-Based
@@ -187,6 +202,9 @@ static inline LayeredEnergy layeredOff() {
     e.diffuseRoughness = 0.0;
     e.eonAlbedoRatio = float3(1.0);
     e.dielectricF0 = float3(0.04);
+    e.coatOn = false; e.coatWeight = 0.0; e.coatRoughness = 0.08; e.coatF0 = 0.04;
+    e.coatSpecMS = 1.0; e.coatEnvAlbedo = 0.0;
+    e.underCoatDirect = float3(1.0); e.underCoatEnv = float3(1.0); e.coatDarken = float3(1.0);
     return e;
 }
 
@@ -201,7 +219,7 @@ static inline LayeredEnergy layeredEnergy(float3 albedo, float metallic,
                                           float sheenStrength,
                                           bool multiscatter, bool sheen,
                                           float3 dielectricF0 = float3(0.04)) {
-    LayeredEnergy e;
+    LayeredEnergy e = layeredOff();
     e.dielectricF0 = dielectricF0;     // DH-1300
     float3 F0 = mix(dielectricF0, albedo, metallic);
     e.multiscatter = multiscatter;
@@ -247,6 +265,48 @@ static inline LayeredEnergy layeredWithDiffuseRoughness(LayeredEnergy e, float3 
     return e;
 }
 
+// ── The COAT layer (Daydream DH-1309) ───────────────────────────────────────────────────────
+//
+// OpenPBR's coat is a dielectric layer over everything below it: its own GGX lobe (the coat's IOR,
+// its own roughness), and whatever that lobe reflects is gone from the layers beneath ("albedo
+// scaling", the rule the sheen layer already follows). The Phase-7 clearcoat was a special case:
+// a fixed-F0 lobe for the SUN and the IBL only — no lamp, spot, fill or window portal ever lit it,
+// so a lacquered floor under a room of cans showed none of them — and the base under it was
+// attenuated by `1 − cc·Schlick(N·V)`, a number unrelated to what the coat lobe actually reflects.
+//
+// Here the coat is a second lobe evaluated by the SAME light loops as the base, the base below it
+// takes `1 − w·E_coat(μo)` — the coat lobe's own directional albedo, from the DFG LUT texel at
+// (μo, coat roughness): the DIRECT lobe's for the lights, the ENVIRONMENT lobe's for the IBL — and
+// a white base under any coat returns exactly 1 under a uniform light (the furnace's coated row).
+// The coat's direct lobe is the LUT's `.b` lobe (analytic-k Schlick-GGX G, Schlick F) with a
+// RELATIVE-guarded D (`pathGGXD`): the deferred `distributionGGX`'s `+1e-7` clips the peak below
+// roughness ~0.2 (DH-1306) — a polish (0.08) would keep ~5 % of its highlight and its energy would
+// no longer match the albedo the base was charged. A punctual light with a physical size widens the
+// coat lobe by its angular radius (`sourceTan`; the convolution of two GGX-like lobes keeps unit
+// energy), so a lamp in a lacquered floor is a soft-edged reflection of the lamp, not a 1-px spark.
+
+/// The coat's terms for a pixel: weight `w`, roughness `r`, interface F0 `f0`, the LUT texel at
+/// (μo, r), the coat tint (DH-1298, 1 = clear) and the base's diffuse darkening (1 = none).
+/// `w ≤ 0` returns `e` unchanged.
+static inline LayeredEnergy layeredWithCoat(LayeredEnergy e, float w, float r, float f0, float4 lutC,
+                                            float3 tint, float3 darken) {
+    if (!(w > 0.0)) return e;
+    e.coatOn = true;
+    e.coatWeight = saturate(w);
+    e.coatRoughness = r;
+    e.coatF0 = f0;
+    float Ed = clamp(lutC.z, 1e-3, 1.0);
+    float AB = max(lutC.x + lutC.y, 1e-4);
+    e.coatSpecMS = 1.0 + f0 * ((1.0 - Ed) / Ed);
+    float EcD = saturate(Ed * (f0 * lutC.x + lutC.y) / AB * e.coatSpecMS);
+    e.coatEnvAlbedo = saturate(layeredEnvSpecular(float3(f0), lutC.xy).x);
+    float3 t = mix(float3(1.0), tint, e.coatWeight);
+    e.underCoatDirect = (1.0 - e.coatWeight * EcD) * t;
+    e.underCoatEnv    = (1.0 - e.coatWeight * e.coatEnvAlbedo) * t;
+    e.coatDarken = darken;
+    return e;
+}
+
 // ── The ray-traced lighting kernel's half (IlluminatoramaRTInstanced.metal) ─────────────────
 //
 // The traced GI (one-bounce or the path-traced Maximum lane) REPLACES the deferred pass's
@@ -268,6 +328,8 @@ static inline LayeredEnergy layeredWithDiffuseRoughness(LayeredEnergy e, float3 
 struct LayeredRTWeights {
     float3 diffuse;      // × albedo × incoming irradiance
     float3 reflection;   // × traced reflected radiance
+    /// The roughness the reflection is traced at (the surface's own — the base's, under a coat too).
+    float  reflRoughness;
 };
 
 /// `fresLegacy` is the kernel's historical reflection Fresnel, returned unchanged when the
@@ -276,8 +338,11 @@ static inline LayeredRTWeights layeredRTWeights(uint pathFlags, float3 albedo, f
                                                 float roughness, float NdotV, half emissionAlpha,
                                                 texture2d<half, access::sample> dfgLUT,
                                                 float3 fresLegacy, float diffuseRoughness = 0.0,
-                                                float3 dielectricF0 = float3(0.04)) {
+                                                float3 dielectricF0 = float3(0.04),
+                                                float coatW = 0.0, float coatR = 0.08, float coatF0 = 0.04,
+                                                float3 coatTint = float3(1.0), float3 coatDarken = float3(1.0)) {
     LayeredRTWeights w;
+    w.reflRoughness = roughness;
     // DH-1301 — the traced GI replaces the deferred diffuse ENVIRONMENT, which a rough diffuse
     // surface weights by its EON directional albedo; the replacement takes the same factor
     // (exactly 1 at diffuse roughness 0, with or without the layered switches).
@@ -285,6 +350,18 @@ static inline LayeredRTWeights layeredRTWeights(uint pathFlags, float3 albedo, f
     w.reflection = fresLegacy;
     bool ms = (pathFlags & kPathFlagLayeredMultiscatter) != 0u;
     bool sh = (pathFlags & kPathFlagLayeredSheen) != 0u;
+    // DH-1309 — the coat layer (the deferred pass's `layeredWithCoat`, from the same LUT). The traced
+    // diffuse and the traced reflection replace the deferred diffuse environment and the BASE's
+    // specular IBL, both of which sit under the coat: each takes the coat's `1 − w·E_env` (× tint;
+    // the diffuse also the darkening). `coatW` 0 (the coat layer off, or no coat) ⇒ untouched.
+    constexpr sampler cs(filter::linear, address::clamp_to_edge);
+    LayeredEnergy coat = layeredOff();
+    if (coatW > 0.0) {
+        coat = layeredWithCoat(coat, coatW, coatR, coatF0, float4(dfgLUT.sample(cs, float2(NdotV, coatR))),
+                               coatTint, coatDarken);
+        w.diffuse *= coat.underCoatEnv * coat.coatDarken;
+        w.reflection *= coat.underCoatEnv;
+    }
     if (!ms && !sh) return w;
     // The sheen decode is the deferred kernel's (`emission.alpha = -(band + strength)`).
     float sheenStrength = 0.0, sheenRoughness = clothSheenRoughnessForBand(0);
@@ -298,7 +375,7 @@ static inline LayeredRTWeights layeredRTWeights(uint pathFlags, float3 albedo, f
     float4 lut = float4(dfgLUT.sample(s, float2(NdotV, roughness)));
     float sheenA = (sh && sheenStrength > 0.0) ? float(dfgLUT.sample(s, float2(NdotV, sheenRoughness)).a) : 0.0;
     LayeredEnergy e = layeredEnergy(albedo, metallic, lut, sheenA, sheenStrength, ms, sh, dielectricF0);
-    if (ms) { w.diffuse *= e.diffuseEnv; w.reflection = e.envSpec; }
+    if (ms) { w.diffuse *= e.diffuseEnv; w.reflection = e.envSpec * coat.underCoatEnv; }
     w.diffuse *= e.baseUnderSheen;
     w.reflection *= e.baseUnderSheen;
     return w;
@@ -463,4 +540,22 @@ static inline float3 pathGlossySample(PathGlossyLobe b, float2 u, thread float3&
     pdf = pathGGXD(b.alpha, saturate(Hl.z)) * b.G1v / (4.0 * b.NdotV);
     float3 F = b.F0 + (1.0 - b.F0) * pow(1.0 - VdotH, 5.0);
     return F * b.scale * (layeredSmithG_IBL(b.NdotV, NdotL, b.roughness) / b.G1v);
+}
+
+/// The coat's direct lobe toward `L` (BRDF × w × multiscatter, NOT × cos): see the section comment.
+/// `sourceTan` — the light's angular radius (its size over its distance); 0 = a point.
+static inline float layeredCoatDirect(float3 N, float3 V, float3 L, LayeredEnergy e, float sourceTan) {
+    float NdotL = dot(N, L);
+    float NdotV = max(dot(N, V), 1e-4);
+    if (!e.coatOn || NdotL <= 0.0) return 0.0;
+    float3 H = normalize(V + L);
+    float NdotH = saturate(dot(N, H));
+    float VdotH = saturate(dot(V, H));
+    float a = max(e.coatRoughness * e.coatRoughness, 1e-4);
+    float aEff = min(1.0, sqrt(a * a + 0.25 * sourceTan * sourceTan));
+    float D = pathGGXD(aEff, NdotH);
+    float rk = e.coatRoughness + 1.0, k = rk * rk / 8.0;
+    float G = (NdotV / (NdotV * (1.0 - k) + k)) * (NdotL / (NdotL * (1.0 - k) + k));
+    float F = e.coatF0 + (1.0 - e.coatF0) * pow(1.0 - VdotH, 5.0);
+    return e.coatWeight * e.coatSpecMS * (D * G * F) / (4.0 * NdotV * NdotL);
 }

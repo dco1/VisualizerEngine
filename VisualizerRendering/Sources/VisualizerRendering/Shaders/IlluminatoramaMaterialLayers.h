@@ -36,6 +36,13 @@ using namespace metal;
 /// RTInstUniforms.pathFlags kPathFlagLayeredSpecular. Clear ⇒ every dielectric is F0 0.04.
 #define kFrameFlagLayeredSpecular  256u
 #define kPathFlagLayeredSpecular   65536u
+/// FrameUniforms.frameFlags bit 9 (512) — DH-1309: the COAT as a real layer (IlluminatoramaBSDF.h
+/// `layeredWithCoat`): its lobe under every light (sun, points, spots, fills, area / portal lights)
+/// and the environment, the base below attenuated by the coat lobe's own directional albedo, the
+/// traced reflection taking the coat's share. Mirrored as RTInstUniforms.pathFlags
+/// kPathFlagLayeredCoat. Clear ⇒ the Phase-7 clearcoat (sun + IBL, base × 1 − cc·Schlick(N·V)).
+#define kFrameFlagLayeredCoat      512u
+#define kPathFlagLayeredCoat       131072u
 
 /// `GBufferOut.materialLayer`'s clear value and the "no layer parameters" slot.
 #define kMaterialLayerNone 0xFFFFFFFFu
@@ -50,6 +57,11 @@ using namespace metal;
 /// the caller keeps its historical expression.
 struct MaterialLayers {
     bool   any;
+    /// The specular parameters are set (else the dielectric F0 is the legacy literal 0.04).
+    bool   spec;
+    /// DH-1309 — the instance's coat (`clearcoat`, `clearcoatRoughness`); 0 ⇒ none.
+    float  coat;
+    float  coatRoughness;
     /// OpenPBR `specular_color × specular_weight` (1 ⇒ untinted, full strength).
     float3 specularTint;
     /// OpenPBR `specular_ior` (1.5 ⇒ F0 0.04).
@@ -59,21 +71,30 @@ struct MaterialLayers {
 static inline MaterialLayers illumiMaterialLayersNone() {
     MaterialLayers m;
     m.any = false;
+    m.spec = false;
+    m.coat = 0.0;
+    m.coatRoughness = 0.08;
     m.specularTint = float3(1.0);
     m.specularIOR = 1.5;
     return m;
 }
 
 /// Whether an instance carries anything the layer target must point at. Zero in every new field
-/// (the Swift defaults, `illumiDefaultInstance`, a memset row) ⇒ false ⇒ the G-buffer writes none.
-static inline bool illumiHasMaterialLayers(float4 materialExt, float4 specularTint) {
-    return materialExt.y != 0.0 || any(specularTint != float4(0.0));
+/// (the Swift defaults, `illumiDefaultInstance`, a memset row) and no coat ⇒ false ⇒ the G-buffer
+/// writes none. `coatRec` is the record's `kInstanceF4Coat` float4 (metallic, clearcoat,
+/// clearcoatRoughness, sheen): a coated instance points at its record so the coat layer (DH-1309)
+/// reads its own roughness on every lane, and a coat can coexist with a sheen (DH-1299).
+static inline bool illumiHasMaterialLayers(float4 coatRec, float4 materialExt, float4 specularTint) {
+    return coatRec.y > 0.0 || materialExt.y != 0.0 || any(specularTint != float4(0.0));
 }
 
-static inline MaterialLayers illumiDecodeMaterialLayers(float4 materialExt, float4 specularTint) {
+static inline MaterialLayers illumiDecodeMaterialLayers(float4 coatRec, float4 materialExt, float4 specularTint) {
     MaterialLayers m = illumiMaterialLayersNone();
-    if (!illumiHasMaterialLayers(materialExt, specularTint)) return m;
+    if (!illumiHasMaterialLayers(coatRec, materialExt, specularTint)) return m;
     m.any = true;
+    m.spec = materialExt.y != 0.0 || any(specularTint != float4(0.0));
+    m.coat = max(coatRec.y, 0.0);
+    m.coatRoughness = coatRec.z > 0.0 ? coatRec.z : 0.08;
     if (materialExt.y > 0.0) m.specularIOR = materialExt.y;
     if (any(specularTint != float4(0.0))) m.specularTint = max(specularTint.rgb, 0.0) * max(specularTint.w, 0.0);
     return m;
@@ -84,7 +105,7 @@ static inline MaterialLayers illumiDecodeMaterialLayers(float4 materialExt, floa
 static inline MaterialLayers illumiMaterialLayersAt(const device float4* inst, uint slot, uint count) {
     if (slot == kMaterialLayerNone || slot >= count || inst == nullptr) return illumiMaterialLayersNone();
     const device float4* r = inst + slot * kInstanceF4Stride;
-    return illumiDecodeMaterialLayers(r[kInstanceF4MaterialExt], r[kInstanceF4SpecularTint]);
+    return illumiDecodeMaterialLayers(r[kInstanceF4Coat], r[kInstanceF4MaterialExt], r[kInstanceF4SpecularTint]);
 }
 
 /// Normal-incidence Fresnel reflectance of a dielectric interface of relative index `n`.
@@ -103,6 +124,6 @@ static inline float illumiF0FromIOR(float n) {
 /// leaves the transmitted share untinted, which loses energy for a tinted specular; this engine
 /// keeps the furnace exact instead.)
 static inline float3 illumiDielectricF0(MaterialLayers m) {
-    if (!m.any) return float3(0.04);
+    if (!m.spec) return float3(0.04);
     return saturate(m.specularTint * illumiF0FromIOR(max(m.specularIOR, 1.0)));
 }

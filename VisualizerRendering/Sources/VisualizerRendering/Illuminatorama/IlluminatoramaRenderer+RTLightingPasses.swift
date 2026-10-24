@@ -68,6 +68,7 @@ extension IlluminatoramaRenderer {
             | (dfgLUTEnabled && layeredClothSheen ? 512 : 0)
             | (diffuseRoughnessEnabled ? 16384 : 0)           // DH-1301 — `kPathFlagDiffuseRoughness`
             | (layeredSpecularEnabled ? 65536 : 0)            // DH-1300 — `kPathFlagLayeredSpecular`
+            | (dfgLUTEnabled && layeredCoatEnabled ? 131072 : 0)   // DH-1309 — `kPathFlagLayeredCoat`
             | (!pathOn && rtGIHitFill ? 1024 : 0)            // DH-1320 — `kPathFlagOneBounceHitFill`
             // DH-1308 — `kPathFlagGlossyVertices`: only with light sampling + the DFG LUT (the lobe's albedo).
             | (pathOn && rtPathGlossyVertices && rtPathLightSampling && dfgLUTEnabled ? 2048 : 0)

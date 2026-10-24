@@ -224,8 +224,7 @@ static inline __attribute__((always_inline)) GBufferOut illumiGBufferPack(
     o.velocity        = half2(velocityUV);
     o.layer           = in.layer;   // light-layer bitfield (default 0xFFFFFFFF)
     // DH-1300 — the slot of an instance with layer parameters (IlluminatoramaMaterialLayers.h).
-    o.materialLayer   = illumiHasMaterialLayers(inst.materialExt, inst.specularTint)
-                      ? in.instanceID : kMaterialLayerNone;
+    o.materialLayer   = illumiInstanceHasMaterialLayers(inst) ? in.instanceID : kMaterialLayerNone;
     return o;
     return o;
 }

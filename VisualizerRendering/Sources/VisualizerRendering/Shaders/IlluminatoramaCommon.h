@@ -962,6 +962,12 @@ static_assert(__builtin_offsetof(Instance, metallic) == kInstanceF4Coat * 16, "k
 static_assert(__builtin_offsetof(Instance, materialExt) == kInstanceF4MaterialExt * 16, "kInstanceF4MaterialExt");
 static_assert(__builtin_offsetof(Instance, specularTint) == kInstanceF4SpecularTint * 16, "kInstanceF4SpecularTint");
 
+/// DH-1300/1309 — whether the G-buffer writes this instance's slot to the material-layer target.
+static inline bool illumiInstanceHasMaterialLayers(Instance i) {
+    return illumiHasMaterialLayers(float4(i.metallic, i.clearcoat, i.clearcoatRoughness, i.sheen),
+                                   i.materialExt, i.specularTint);
+}
+
 // Every field at the Swift mirror's default (`IlluminatoramaInstance`'s property initialisers).
 // A GPU kernel that WRITES instances must start from this, not from `Instance inst;` — a local
 // struct is uninitialised in MSL, so any field the kernel does not name (every one added after

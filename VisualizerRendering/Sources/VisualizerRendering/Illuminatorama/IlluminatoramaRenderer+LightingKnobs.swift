@@ -44,6 +44,7 @@ extension IlluminatoramaRenderer {
     public var iblRebakeInterval: Float { get { kLighting.iblRebakeInterval } set { kLighting.iblRebakeInterval = newValue } _modify { yield &kLighting.iblRebakeInterval } }
     public var dfgLUTEnabled: Bool { get { kLighting.dfgLUTEnabled } set { kLighting.dfgLUTEnabled = newValue } _modify { yield &kLighting.dfgLUTEnabled } }
     public var layeredMultiscatter: Bool { get { kLighting.layeredMultiscatter } set { kLighting.layeredMultiscatter = newValue } _modify { yield &kLighting.layeredMultiscatter } }
+    public var layeredCoatEnabled: Bool { get { kLighting.layeredCoatEnabled } set { kLighting.layeredCoatEnabled = newValue } _modify { yield &kLighting.layeredCoatEnabled } }
     public var layeredSpecularEnabled: Bool { get { kLighting.layeredSpecularEnabled } set { kLighting.layeredSpecularEnabled = newValue } _modify { yield &kLighting.layeredSpecularEnabled } }
     public var diffuseRoughnessEnabled: Bool { get { kLighting.diffuseRoughnessEnabled } set { kLighting.diffuseRoughnessEnabled = newValue } _modify { yield &kLighting.diffuseRoughnessEnabled } }
     public var layeredClothSheen: Bool { get { kLighting.layeredClothSheen } set { kLighting.layeredClothSheen = newValue } _modify { yield &kLighting.layeredClothSheen } }

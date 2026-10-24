@@ -195,6 +195,14 @@ final class LightingKnobs {
     /// then carries no layer parameters and every lane keeps the literal F0 0.04 — so it costs one
     /// G-buffer texel read per pixel. `false` makes every dielectric F0 0.04 whatever the materials carry.
     var layeredSpecularEnabled: Bool = true
+    /// **DH-1309 — the coat as a real layer.** `true`: a clearcoated instance's coat is a second GGX lobe
+    /// under EVERY light (sun, points, spots, fills, area / portal lights) and the environment, at its
+    /// own roughness on every lane, the base below attenuated by the coat lobe's own directional albedo
+    /// (DFG LUT) instead of `1 − cc·Schlick(N·V)`, and the traced reflection takes the coat's share. A
+    /// coat can then share a pixel with a cloth sheen (DH-1299) and carries its IOR / tint / darkening
+    /// (DH-1298). `false` (the default) is the Phase-7 clearcoat, byte-identical — it changes every
+    /// coated material, so a host opts in.
+    var layeredCoatEnabled: Bool = false
     /// **DH-1014 / DH-0597 — cloth sheen as a layer.** `true`: the sheen's environment arms read
     /// the fitted Charlie albedo from the DFG LUT (`.a`) instead of the hand-fitted curve, and
     /// the base under the sheen loses what the sheen reflected (albedo scaling), in the deferred

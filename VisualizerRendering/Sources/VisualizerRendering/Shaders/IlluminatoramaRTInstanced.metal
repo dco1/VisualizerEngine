@@ -1560,15 +1560,19 @@ kernel void illumi_rt_lighting_tlas(
     float  NdotVrt = saturate(dot(N, Vrt));
     // DH-1300 — the primary's layer parameters, by the same G-buffer slot the deferred pass reads.
     bool layeredSpecRT = (u.pathFlags & kPathFlagLayeredSpecular) != 0u;
-    MaterialLayers mlRT = layeredSpecRT ? illumiMaterialLayersAt(layerInstances, gMaterialLayer.read(gid).r, 0xFFFFFFFFu)
-                                        : illumiMaterialLayersNone();
+    bool layeredCoatRT = (u.pathFlags & kPathFlagLayeredCoat) != 0u;   // DH-1309
+    MaterialLayers mlRT = (layeredSpecRT || layeredCoatRT)
+                        ? illumiMaterialLayersAt(layerInstances, gMaterialLayer.read(gid).r, 0xFFFFFFFFu)
+                        : illumiMaterialLayersNone();
+    if (!layeredSpecRT) mlRT.spec = false;
+    float coatWRT = layeredCoatRT ? mlRT.coat : 0.0, coatRRT = max(mlRT.coatRoughness, 0.02);
     float3 dielF0RT = illumiDielectricF0(mlRT);
     float3 F0rt = mix(dielF0RT, albedo, metallicRT);
     LayeredRTWeights lw = layeredRTWeights(u.pathFlags, albedo, metallicRT, roughness, NdotVrt,
                                            (u.pathFlags & (kPathFlagLayeredMultiscatter | kPathFlagLayeredSheen)) != 0u
                                                ? gEmission.read(gid).a : 0.0h,
                                            dfgLUT, F0rt + (float3(1.0) - F0rt) * pow(1.0 - NdotVrt, 5.0),
-                                           diffRoughRT, dielF0RT);
+                                           diffRoughRT, dielF0RT, coatWRT, coatRRT);
 
     constexpr sampler skySamp(filter::linear, address::repeat);
     // The curve_data tag is compile-time; the base variant keeps the original
@@ -1844,7 +1848,8 @@ kernel void illumi_rt_lighting_tlas(
     // (as this pass did) left a mirror showing the sunset horizon with the room ghosted
     // faintly through it — the whole of the Primary Bathroom report.
     float reflHitFraction = 0.0;
-    if (u.reflEnabled != 0 && u.reflStrength > 0.0 && roughness <= u.reflRoughnessCutoff) {
+    float reflRough = lw.reflRoughness;
+    if (u.reflEnabled != 0 && u.reflStrength > 0.0 && reflRough <= u.reflRoughnessCutoff) {
         float3 V = normalize(u.cameraWorldPos - P);
         float3 R = reflect(-V, N);
         float NdotV = saturate(dot(N, V));
@@ -1864,7 +1869,7 @@ kernel void illumi_rt_lighting_tlas(
         float3 fres = F0 + (float3(1.0) - F0) * pow(1.0 - NdotV, 5.0);
         // DH-1014 — with the layered model on, the split-sum env BRDF the specular IBL this
         // reflection replaces is weighted by (`lw.reflection`); `fres` itself otherwise.
-        if ((u.pathFlags & (kPathFlagLayeredMultiscatter | kPathFlagLayeredSheen)) != 0u) fres = lw.reflection;
+        if ((u.pathFlags & (kPathFlagLayeredMultiscatter | kPathFlagLayeredSheen)) != 0u || coatWRT > 0.0) fres = lw.reflection;
         // Glossy cone widens with roughness² (GGX α scales as roughness²); mirror
         // surfaces stay tight. Harmonised with the soup-path kernel in
         // IlluminatoramaRT.metal (#60 task 5) — was the linear `roughness * 0.5`,
@@ -1901,8 +1906,8 @@ kernel void illumi_rt_lighting_tlas(
         uint hits = 0u;
         isect.accept_any_intersection(false);
         for (uint i = 0; i < rrays; ++i) {
-            float3 dir = secondaryConeVisible(roughness, kReflConeK)
-                ? coneSample(R, secondaryConeRad(roughness, kReflConeK), rnd(seed), rnd(seed)) : R;
+            float3 dir = secondaryConeVisible(reflRough, kReflConeK)
+                ? coneSample(R, secondaryConeRad(reflRough, kReflConeK), rnd(seed), rnd(seed)) : R;
             if (dot(dir, N) <= 0.0) continue;
             ray r; r.origin = Pofs; r.direction = dir;
             r.min_distance = max(u.rayTMin, 1e-3); r.max_distance = u.reflMaxDist;

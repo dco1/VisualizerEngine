@@ -42,7 +42,7 @@ final class IlluminatoramaMaterialLayersFurnaceTests: XCTestCase {
         float4 a = inp[gid * 4];
         float r = a.x, mu = a.y; uint flags = uint(a.z + 0.5);
         float3 albedo = inp[gid * 4 + 1].xyz;
-        MaterialLayers ml = illumiDecodeMaterialLayers(inp[gid * 4 + 2], inp[gid * 4 + 3]);
+        MaterialLayers ml = illumiDecodeMaterialLayers(float4(0.0), inp[gid * 4 + 2], inp[gid * 4 + 3]);
         float3 dielF0 = illumiDielectricF0(ml);
         float3 N = float3(0, 0, 1);
         float3 V = float3(sqrt(max(0.0, 1.0 - mu * mu)), 0.0, mu);
