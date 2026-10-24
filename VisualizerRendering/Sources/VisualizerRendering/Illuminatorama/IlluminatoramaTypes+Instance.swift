@@ -378,7 +378,8 @@ public struct IlluminatoramaInstance {
     /// **OpenPBR material extension** (Daydream DH-1301; offsets 384–399, stride 384 → 400) — the
     /// per-instance home for OpenPBR parameters the G-buffer has no channel of its own for.
     ///   x = `base_diffuse_roughness` (see `diffuseRoughness`) · y = `specular_ior` (DH-1300, see
-    ///   `specularIOR`; 0 ⇒ 1.5) · z, w reserved (0)
+    ///   `specularIOR`; 0 ⇒ 1.5) · z = `coat_ior` (DH-1298, `coatIOR`; 0 ⇒ 1.5) · w = `coat_darkening`
+    ///   (DH-1298, `coatDarkening`; 0 ⇒ none)
     /// `.zero` — the default, and every existing instance — is an exact shader no-op.
     /// Mirrors `Instance.materialExt` in `IlluminatoramaCommon.h`.
     public var materialExt: SIMD4<Float> = .zero
@@ -424,6 +425,39 @@ public struct IlluminatoramaInstance {
         set { setSpecularTint(color: specularColor, weight: newValue) }
     }
 
+    /// **OpenPBR coat colour** (Daydream DH-1298; offsets 416–431, stride 416 → 432): rgb = `coat_color`;
+    /// `.zero` (the default) means white — a clear coat — and is an exact shader no-op. Set it through
+    /// `coatColor`. Mirrors `Instance.coatTint` in `IlluminatoramaCommon.h`.
+    public var coatTint: SIMD4<Float> = .zero
+
+    /// **Coat IOR** (Daydream DH-1298) — OpenPBR `coat_ior`: the coat interface's F0, and the base below
+    /// then sees the RELATIVE index (its own over the coat's, blended by the coat weight). 1.5 (the
+    /// default) is the coat's historical F0 0.04; water 1.33, a glaze ~1.54, lacquer / polyurethane ~1.5.
+    /// Read only by the coat layer (`IlluminatoramaRenderer.layeredCoatEnabled`). Rides `materialExt.z`;
+    /// 1.5 is stored as 0 so the default stays the legacy literal.
+    public var coatIOR: Float {
+        get { materialExt.z > 0 ? materialExt.z : 1.5 }
+        set { materialExt.z = newValue == 1.5 ? 0 : max(newValue, 1) }
+    }
+
+    /// **Coat darkening** (Daydream DH-1298) — OpenPBR `coat_darkening` [0, 1]: how far the base's diffuse
+    /// darkens and saturates under the coat (light trapped by internal reflection returns to the base).
+    /// 0 is the DEFAULT here — the pre-DH-1298 coat, so an untouched coat renders as it did — where
+    /// OpenPBR's default is 1; a host adopting the parameter model sets it. Rides `materialExt.w`.
+    public var coatDarkening: Float {
+        get { materialExt.w }
+        set { materialExt.w = min(max(newValue, 0), 1) }
+    }
+
+    /// **Coat colour** (Daydream DH-1298) — OpenPBR `coat_color`, a tint on everything beneath the coat.
+    public var coatColor: SIMD3<Float> {
+        get { coatTint == .zero ? SIMD3(1, 1, 1) : SIMD3(coatTint.x, coatTint.y, coatTint.z) }
+        set {
+            let c = simd_clamp(newValue, SIMD3<Float>(repeating: 0), SIMD3<Float>(repeating: 1))
+            coatTint = c == SIMD3(1, 1, 1) ? .zero : SIMD4(c, 0)
+        }
+    }
+
     private mutating func setSpecularTint(color: SIMD3<Float>, weight: Float) {
         let c = simd_max(color, .zero), w = max(weight, 0)
         specularTint = (c == SIMD3(1, 1, 1) && w == 1) ? .zero : SIMD4(c, w)
@@ -461,10 +495,10 @@ public struct IlluminatoramaInstance {
         self.normalMatrix = Self.normalMatrix(from: m)
     }
 
-    /// Compile-time guard: Swift and Metal structs must agree on 416 bytes.
+    /// Compile-time guard: Swift and Metal structs must agree on 432 bytes.
     /// If this fires, either a Swift field was added without the matching Metal
     /// field (or vice versa), or alignment changed unexpectedly.
-    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 416, "IlluminatoramaInstance stride must be 416") }()
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 432, "IlluminatoramaInstance stride must be 432") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //

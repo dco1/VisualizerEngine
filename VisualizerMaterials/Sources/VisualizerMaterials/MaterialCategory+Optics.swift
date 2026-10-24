@@ -35,4 +35,28 @@ public extension MaterialCategory {
         default:                return 1.5
         }
     }
+
+    /// **DH-1298 — OpenPBR `coat_ior` of the family's coat**, where its `clearcoat` lobe is one: a fired
+    /// glaze (`.tile`, `.ceramic`) 1.54; a lacquer / polyurethane / acrylic finish (`.wood`, `.laminate`,
+    /// `.leather`, `.paint`) 1.50; a polished mineral face (`.stone`, `.terrazzo`, `.concrete`) is not a
+    /// film — its "coat" is its own polish — so it takes the mineral's index, 1.56.
+    var coatIOR: Double {
+        switch self {
+        case .tile, .ceramic:              return 1.54
+        case .stone, .terrazzo, .concrete: return 1.56
+        default:                           return 1.5
+        }
+    }
+
+    /// **DH-1298 — OpenPBR `coat_darkening`** [0, 1]: 1 where the coat is a real FILM over a separate
+    /// base (a glaze over its clay body, a finish over wood / laminate / leather / paint) — light the
+    /// base scatters back is partly trapped under the film and returns to be absorbed again, which is
+    /// why wet stone and oiled wood read darker and richer. 0 where the "coat" is the material's own
+    /// polished face (stone, terrazzo, concrete): there is no film to trap anything.
+    var coatDarkening: Double {
+        switch self {
+        case .tile, .ceramic, .wood, .laminate, .leather, .paint: return 1
+        default:                                                  return 0
+        }
+    }
 }

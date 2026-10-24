@@ -1307,8 +1307,11 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 float NdotVh = saturate(dot(h.N, wo));
                 float m = mr.x, rB = max(glossyMinR, mr.y);
                 float4 lutB = float4(dfgLUT.sample(lutSmp, float2(NdotVh, rB)));
-                // DH-1300 — the hit's own dielectric F0 (its layer record, by TLAS id = raster slot).
-                float3 F0 = mix(illumiDielectricF0(illumiMaterialLayersAt(sec.layerInsts, h.instanceID, sec.layerCount)),
+                // DH-1300 — the hit's own dielectric F0 (its layer record, by TLAS id = raster slot); DH-1298 —
+                // under its coat, the relative IOR, and the coat's own F0, colour and darkening below.
+                MaterialLayers mlHit = illumiMaterialLayersAt(sec.layerInsts, h.instanceID, sec.layerCount);
+                float2 ccHit = secondaryCoat(h.instanceID, sec.insts);
+                float3 F0 = mix(ccHit.x > 0.0 ? illumiDielectricF0UnderCoat(mlHit, ccHit.x) : illumiDielectricF0(mlHit),
                                 Ahit, m);
                 float3 Es = saturate(layeredEnvSpecular(F0, lutB.xy));
                 float2 cc = secondaryCoat(h.instanceID, sec.insts);
@@ -1316,10 +1319,11 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 float4 lutC = lutB;
                 if (ccS > 0.0) {
                     lutC = float4(dfgLUT.sample(lutSmp, float2(NdotVh, rC)));
-                    Ec = saturate(ccS * layeredEnvSpecular(float3(0.04), lutC.xy).x);
+                    Ec = saturate(ccS * layeredEnvSpecular(float3(illumiCoatF0(mlHit)), lutC.xy).x);
                 }
-                float under = 1.0 - Ec;
-                float3 Wd = under * (1.0 - m) * (1.0 - Es);
+                // DH-1298 — everything under the coat takes its colour; the diffuse its darkening.
+                float3 under = (1.0 - Ec) * (ccS > 0.0 ? mix(float3(1.0), illumiCoatColor(mlHit), saturate(ccS)) : float3(1.0));
+                float3 Wd = under * (1.0 - m) * (1.0 - Es) * illumiCoatDarkening(mlHit, Ahit, ccS);
                 // DH-1301 — the diffuse share's EON factor, folded into its layer weight so the pick, the
                 // stack's NEE (`WdA`), the lobe weight and the radiance cache (which keeps Lambert A·E/π)
                 // all see it. Exactly 1 for a row without a diffuse roughness.
@@ -1334,13 +1338,13 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 stNext.on = (u.pathFlags & kPathFlagDebugGlossyBrute) == 0u;
                 stNext.WdA = Wd * Ahit;
                 stNext.lobe = pathGlossyLobe(h.N, wo, F0, rB, float3(under), lutB);
-                stNext.lobeC = pathGlossyLobe(h.N, wo, float3(0.04), rC, float3(ccS), lutC);
+                stNext.lobeC = pathGlossyLobe(h.N, wo, float3(illumiCoatF0(mlHit)), rC, float3(ccS), lutC);
                 pickNext = float3(wD, wS, wC) / wT;
                 float xi = illumiSobolOwen2DShuffled(sampleIndex, illumiPixelSeed(gid, 0x474C4F53u + v)).x * wT;   // 'GLOS'
                 if ((u.pathFlags & kPathFlagDebugGlossyBrute) != 0u) {
                     bruteNext = true;
                     nextLobe = pathGlossyLobe(h.N, wo, F0, rB, float3(under), lutB);
-                    nextLobeC = pathGlossyLobe(h.N, wo, float3(0.04), rC, float3(ccS), lutC);
+                    nextLobeC = pathGlossyLobe(h.N, wo, float3(illumiCoatF0(mlHit)), rC, float3(ccS), lutC);
                     bruteWdANext = Wd * Ahit;
                     lobeW = float3(1.0); rrAlb = Wd * Ahit + under * Es + Ec;
                 } else if (xi < wS && wS > 0.0) {
@@ -1349,7 +1353,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                     lobeW = float3(wT / wS); rrAlb = under * Es;
                 } else if (xi < wS + wC && wC > 0.0) {
                     specNext = true;
-                    nextLobe = pathGlossyLobe(h.N, wo, float3(0.04), rC, float3(ccS), lutC);
+                    nextLobe = pathGlossyLobe(h.N, wo, float3(illumiCoatF0(mlHit)), rC, float3(ccS), lutC);
                     lobeW = float3(wT / wC); rrAlb = float3(Ec);
                 } else {
                     if (wD <= 0.0) break;
@@ -1566,13 +1570,14 @@ kernel void illumi_rt_lighting_tlas(
                         : illumiMaterialLayersNone();
     if (!layeredSpecRT) mlRT.spec = false;
     float coatWRT = layeredCoatRT ? mlRT.coat : 0.0, coatRRT = max(mlRT.coatRoughness, 0.02);
-    float3 dielF0RT = illumiDielectricF0(mlRT);
+    float3 dielF0RT = coatWRT > 0.0 ? illumiDielectricF0UnderCoat(mlRT, coatWRT) : illumiDielectricF0(mlRT);
     float3 F0rt = mix(dielF0RT, albedo, metallicRT);
     LayeredRTWeights lw = layeredRTWeights(u.pathFlags, albedo, metallicRT, roughness, NdotVrt,
                                            (u.pathFlags & (kPathFlagLayeredMultiscatter | kPathFlagLayeredSheen)) != 0u
                                                ? gEmission.read(gid).a : 0.0h,
                                            dfgLUT, F0rt + (float3(1.0) - F0rt) * pow(1.0 - NdotVrt, 5.0),
-                                           diffRoughRT, dielF0RT, coatWRT, coatRRT);
+                                           diffRoughRT, dielF0RT, coatWRT, coatRRT, illumiCoatF0(mlRT),
+                                           illumiCoatColor(mlRT), illumiCoatDarkening(mlRT, albedo, coatWRT));   // DH-1298
 
     constexpr sampler skySamp(filter::linear, address::repeat);
     // The curve_data tag is compile-time; the base variant keeps the original

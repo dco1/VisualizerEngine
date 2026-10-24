@@ -252,7 +252,7 @@ final class IlluminatoramaMaterialLayersFurnaceTests: XCTestCase {
         XCTAssertEqual(inst.specularTint, SIMD4(1, 1, 1, 0.5))
         inst.specularColor = SIMD3(0.2, 0.4, 0.6)
         XCTAssertEqual(inst.specularTint, SIMD4(0.2, 0.4, 0.6, 0.5))
-        XCTAssertEqual(MemoryLayout<IlluminatoramaInstance>.stride, 416)
+        XCTAssertEqual(MemoryLayout<IlluminatoramaInstance>.stride, 432)
         XCTAssertEqual(MemoryLayout<IlluminatoramaInstance>.offset(of: \.metallic), 9 * 16)
         XCTAssertEqual(MemoryLayout<IlluminatoramaInstance>.offset(of: \.materialExt), 24 * 16)
         XCTAssertEqual(MemoryLayout<IlluminatoramaInstance>.offset(of: \.specularTint), 25 * 16)

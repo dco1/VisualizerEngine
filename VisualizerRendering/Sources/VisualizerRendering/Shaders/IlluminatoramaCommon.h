@@ -939,7 +939,7 @@ struct Instance {
     // OpenPBR parameters the G-buffer has no channel of its own for (DH-1014's parameter model).
     //   x = base_diffuse_roughness [0, 1] — the EON lobe (IlluminatoramaDiffuseRoughness.h); 0 = Lambert
     //   y = specular_ior (DH-1300; 0 = the legacy 1.5 / F0 0.04)
-    //   z, w = reserved (0)
+    //   z = coat_ior (DH-1298; 0 = 1.5) · w = coat_darkening [0, 1] (DH-1298; 0 = none)
     // Mirrors `IlluminatoramaInstance.materialExt`.
     float4   materialExt;
 
@@ -949,23 +949,30 @@ struct Instance {
     // through the material-layer target (IlluminatoramaMaterialLayers.h). Mirrors
     // `IlluminatoramaInstance.specularTint`.
     float4   specularTint;
+
+    // ── OpenPBR coat colour (Daydream DH-1298) ──
+    // NEW 16-byte cluster (offsets 416-431): stride 416 -> 432. rgb = coat_color; ALL ZERO (the
+    // default) = white (1, 1, 1), a clear coat; w reserved. Read only through the material-layer
+    // target. Mirrors `IlluminatoramaInstance.coatTint`.
+    float4   coatTint;
 };
 
 // The Swift mirror (`IlluminatoramaInstance._assertStride240`) has always asserted this
 // side of the contract; this is the other side, and it costs a compile. A Swift field
 // added without its Metal twin used to be caught only by a wrong-looking render.
-static_assert(sizeof(Instance) == 416, "Instance must match IlluminatoramaInstance (416 bytes)");
+static_assert(sizeof(Instance) == 432, "Instance must match IlluminatoramaInstance (432 bytes)");
 // DH-1300 — the material-layer record is read as raw float4s by kernels that do not see `Instance`
 // (IlluminatoramaMaterialLayers.h); hold its offsets to the struct.
 static_assert(sizeof(Instance) == kInstanceF4Stride * 16, "kInstanceF4Stride must be sizeof(Instance)/16");
 static_assert(__builtin_offsetof(Instance, metallic) == kInstanceF4Coat * 16, "kInstanceF4Coat");
 static_assert(__builtin_offsetof(Instance, materialExt) == kInstanceF4MaterialExt * 16, "kInstanceF4MaterialExt");
 static_assert(__builtin_offsetof(Instance, specularTint) == kInstanceF4SpecularTint * 16, "kInstanceF4SpecularTint");
+static_assert(__builtin_offsetof(Instance, coatTint) == kInstanceF4CoatTint * 16, "kInstanceF4CoatTint");
 
 /// DH-1300/1309 — whether the G-buffer writes this instance's slot to the material-layer target.
 static inline bool illumiInstanceHasMaterialLayers(Instance i) {
     return illumiHasMaterialLayers(float4(i.metallic, i.clearcoat, i.clearcoatRoughness, i.sheen),
-                                   i.materialExt, i.specularTint);
+                                   i.materialExt, i.specularTint, i.coatTint);
 }
 
 // Every field at the Swift mirror's default (`IlluminatoramaInstance`'s property initialisers).
@@ -991,7 +998,7 @@ inline Instance illumiDefaultInstance() {
     d.grainTangentTextureSlice = -1; d.thinTransmission = 0.0f;
     d.leafVenation = 0;              d.surfaceWear = 0.0f;
     d.uvWarp = float4(0.0f);         d.hueCycle = float4(0.0f);      d.tagGlow = float4(0.0f);
-    d.materialExt = float4(0.0f);    d.specularTint = float4(0.0f);
+    d.materialExt = float4(0.0f);    d.specularTint = float4(0.0f);   d.coatTint = float4(0.0f);
     return d;
 }
 

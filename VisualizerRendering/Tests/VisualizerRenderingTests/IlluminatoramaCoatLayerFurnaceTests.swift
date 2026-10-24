@@ -104,6 +104,17 @@ final class IlluminatoramaCoatLayerFurnaceTests: XCTestCase {
         outp[gid * 4 + 2] = float4(maximum, 0.0);
         outp[gid * 4 + 3] = float4(le.underCoatDirect.g, le.underCoatEnv.g, le.coatEnvAlbedo, rw.reflRoughness);
     }
+
+    // DH-1298 — the coat-optics helpers on the shipped header. in: [albedo.rgb, coatW] [specIOR, coatIOR, darkening, 0]
+    // out: [darken.rgb, coatF0] [baseF0UnderCoat.rgb, 0]
+    kernel void dh1298Optics(device const float4* inp [[buffer(0)]], device float4* outp [[buffer(1)]],
+                             uint gid [[thread_position_in_grid]]) {
+        float4 a = inp[gid * 2], b = inp[gid * 2 + 1];
+        MaterialLayers m = illumiDecodeMaterialLayers(float4(0.0, a.w, 0.08, 0.0), float4(0.0, b.x, b.y, b.z),
+                                                     float4(0.0), float4(0.0));
+        outp[gid * 2]     = float4(illumiCoatDarkening(m, a.xyz, a.w), illumiCoatF0(m));
+        outp[gid * 2 + 1] = float4(illumiDielectricF0UnderCoat(m, a.w), 0.0);
+    }
     """
 
     struct Row {
@@ -206,6 +217,64 @@ final class IlluminatoramaCoatLayerFurnaceTests: XCTestCase {
                 XCTAssertLessThan(o[3].underDirect, o[0].underDirect, "the coat reflects more at grazing")
             }
         }
+    }
+
+    /// DH-1298 — a coat of any IOR keeps the white furnace (water 1.33, glaze 1.54, a dense 1.8 lacquer),
+    /// with or without the darkening (white is never darkened).
+    func testWhiteFurnaceUnderCoatsOfEveryIOR() throws {
+        let iors: [Float] = [1.33, 1.54, 1.8]
+        var rows: [Row] = []
+        for n in iors { for mu in Self.views {
+            let f0 = pow((n - 1) / (n + 1), 2)
+            rows.append(Row(r: 0.5, mu: mu, coatW: 1, coatR: 0.08, coatF0: f0))
+        } }
+        let out = try run(rows)
+        say("── DH-1298 white furnace — coat w 1 r .08 at coat IOR 1.33 / 1.54 / 1.8 (base r .5); per N·V ──")
+        for (k, n) in iors.enumerated() {
+            let o = Array(out[(k * Self.views.count)..<((k + 1) * Self.views.count)])
+            say(String(format: "  ior %.2f | direct ", n) + o.map { f($0.direct.y) }.joined(separator: "/")
+                + " | env " + o.map { f($0.env.y) }.joined(separator: "/") + " | maximum " + o.map { f($0.maximum.y) }.joined(separator: "/"))
+            for row in o {
+                XCTAssertEqual(row.direct.y, 1, accuracy: 0.02); XCTAssertEqual(row.env.y, 1, accuracy: 0.01)
+                XCTAssertEqual(row.maximum.y, 1, accuracy: 0.01)
+            }
+        }
+    }
+
+    /// DH-1298 — the coat-optics helpers against a CPU mirror of OpenPBR's forms: the base's diffuse
+    /// darkening ρ(1 − K)/(1 − ρK), K = 1 − (1 − Ē_c)/n², blended by w × coat_darkening; the coat F0;
+    /// the base's F0 at the RELATIVE index. White is never darkened; a darker albedo darkens more.
+    func testCoatOpticsHelpers() throws {
+        let rig = try rig()
+        guard let fn = (try? rig.device.makeLibrary(source: MetalSourceLoader.source(contentsOf: Self.shaderURL("IlluminatoramaLighting.metal")) + Self.probeKernel, options: nil))?.makeFunction(name: "dh1298Optics"),
+              let pso = try? rig.device.makeComputePipelineState(function: fn) else { throw XCTSkip("no optics probe") }  // gpu-ok: test harness
+        let cases: [(albedo: Float, w: Float, nb: Float, nc: Float, dk: Float)] = [
+            (1.0, 1, 1.5, 1.5, 1), (0.5, 1, 1.5, 1.5, 1), (0.2, 1, 1.5, 1.5, 1), (0.5, 0.3, 1.56, 1.56, 1),
+            (0.5, 1, 1.5, 1.5, 0), (0.5, 1, 1.56, 1.33, 0.5), (0.2, 1, 1.56, 1.33, 1)]
+        var packed: [SIMD4<Float>] = []
+        for c in cases { packed.append(SIMD4(c.albedo, c.albedo, c.albedo, c.w)); packed.append(SIMD4(c.nb, c.nc, c.dk, 0)) }
+        guard let ib = rig.device.makeBuffer(bytes: packed, length: packed.count * 16, options: .storageModeShared),
+              let ob = rig.device.makeBuffer(length: packed.count * 16, options: .storageModeShared),
+              let cb = rig.queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { throw XCTSkip("no buffers") }
+        enc.setComputePipelineState(pso); enc.setBuffer(ib, offset: 0, index: 0); enc.setBuffer(ob, offset: 0, index: 1)
+        enc.dispatchThreads(MTLSize(width: cases.count, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: cases.count, height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()  // gpu-ok: test harness
+        let o = ob.contents().bindMemory(to: SIMD4<Float>.self, capacity: packed.count)
+        say("── DH-1298 coat optics — albedo, w, n_base, n_coat, darkening → diffuse factor, coat F0, base F0 ──")
+        for (i, c) in cases.enumerated() {
+            func f0(_ n: Float) -> Float { pow((n - 1) / (n + 1), 2) }
+            let fc = f0(c.nc), eavg = fc + (1 - fc) / 21, K = max(0, 1 - (1 - eavg) / (c.nc * c.nc))
+            let d = (1 - K) / (1 - c.albedo * K), dk = 1 + (d - 1) * min(1, c.w * c.dk)
+            let nEff = c.nb + (c.nb / c.nc - c.nb) * c.w
+            say(String(format: "  ρ %.1f w %.1f n %.2f/%.2f dk %.1f → darken %.3f (cpu %.3f)  F0c %.4f  F0base %.4f (cpu %.4f)",
+                       c.albedo, c.w, c.nb, c.nc, c.dk, o[i * 2].x, dk, o[i * 2].w, o[i * 2 + 1].x, f0(nEff)))
+            XCTAssertEqual(o[i * 2].x, dk, accuracy: 1e-4)
+            XCTAssertEqual(o[i * 2].w, fc, accuracy: 1e-6)
+            XCTAssertEqual(o[i * 2 + 1].x, f0(nEff), accuracy: 1e-5)
+        }
+        XCTAssertEqual(o[0].x, 1, accuracy: 1e-6, "white is never darkened")
+        XCTAssertLessThan(o[2 * 2].x, o[1 * 2].x, "a darker albedo darkens more under the coat")
+        XCTAssertEqual(o[4 * 2].x, 1, accuracy: 1e-6, "coat_darkening 0 ⇒ none")
     }
 
     /// No coat ⇒ the layered rows are exactly the uncoated ones (the coat terms are 1 / 0).

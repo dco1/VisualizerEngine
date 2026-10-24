@@ -1319,7 +1319,16 @@ kernel void illumi_lighting(
     if ((frame.frameFlags & kFrameFlagLayeredSpecular) != 0u || layeredCoat)
         ml = illumiMaterialLayersAt(layerInstances, gMaterialLayer.read(gid).r, 0xFFFFFFFFu);
     if ((frame.frameFlags & kFrameFlagLayeredSpecular) == 0u) ml.spec = false;
-    float3 dielF0 = illumiDielectricF0(ml);
+    // DH-1309 / DH-1298 — the coat's weight and roughness first: the base's F0 depends on what it is
+    // under (OpenPBR's relative IOR), and the coat terms are built from them below.
+    float ccW = 0.0, ccR = 0.08;
+    if (layeredCoat) {
+        ccW = (emH.a > 0.001h) ? float(emH.a) : ml.coat;
+        ccR = ml.any ? ml.coatRoughness : 0.08;
+        if (!ml.any && frame.extendedGBuffer != 0.0) { float r = float(gMaterial.read(gid).a); if (r > 0.0) ccR = r; }
+        ccR = max(ccR, 0.02);
+    }
+    float3 dielF0 = (ccW > 0.001) ? illumiDielectricF0UnderCoat(ml, ccW) : illumiDielectricF0(ml);
     LayeredEnergy le = layeredOff();
     le.dielectricF0 = dielF0;
     if (layeredMS || layeredSheen) {
@@ -1338,16 +1347,12 @@ kernel void illumi_lighting(
     // DH-1309 — the COAT as a layer (IlluminatoramaBSDF.h). Its strength is the G-buffer's emission.a
     // when that carries a coat (> 0), else the instance's own (a coat sharing the pixel with a sheen,
     // DH-1299); its roughness the instance's own on every lane (the Phase-7 kernel used 0.08 live).
-    if (layeredCoat) {
-        float ccW = (emH.a > 0.001h) ? float(emH.a) : ml.coat;
-        float ccR = ml.any ? ml.coatRoughness : 0.08;
-        if (!ml.any && frame.extendedGBuffer != 0.0) { float r = float(gMaterial.read(gid).a); if (r > 0.0) ccR = r; }
-        ccR = max(ccR, 0.02);
-        if (ccW > 0.001) {
-            constexpr sampler ccLutSampler(filter::linear, address::clamp_to_edge);
-            float4 lutC = float4(dfgLUT.sample(ccLutSampler, float2(saturate(dot(N, V)), ccR)));
-            le = layeredWithCoat(le, ccW, ccR, 0.04, lutC, float3(1.0), float3(1.0));
-        }
+    if (layeredCoat && ccW > 0.001) {
+        constexpr sampler ccLutSampler(filter::linear, address::clamp_to_edge);
+        float4 lutC = float4(dfgLUT.sample(ccLutSampler, float2(saturate(dot(N, V)), ccR)));
+        // DH-1298 — the coat's own IOR, its colour, and the base's darkening under it.
+        le = layeredWithCoat(le, ccW, ccR, illumiCoatF0(ml), lutC, illumiCoatColor(ml),
+                             illumiCoatDarkening(ml, albedo, ccW));
     }
 
     // Issue #65 — screen-space SSS. SSS-flagged pixels carry ≈0.95h in
