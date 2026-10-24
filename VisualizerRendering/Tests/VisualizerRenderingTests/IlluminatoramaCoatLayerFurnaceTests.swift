@@ -105,6 +105,46 @@ final class IlluminatoramaCoatLayerFurnaceTests: XCTestCase {
         outp[gid * 4 + 3] = float4(le.underCoatDirect.g, le.underCoatEnv.g, le.coatEnvAlbedo, rw.reflRoughness);
     }
 
+    // DH-1299 — fuzz over coat over base: a WHITE cloth (sheen s, nap α) under the sheen, with a coat
+    // between. in: [r, NdotV, coatW, coatR] [sheenStrength, sheenRoughness, 0, 0]; out: [direct, env, 0, 0]
+    kernel void dh1299Furnace(device const float4* inp [[buffer(0)]], device float4* outp [[buffer(1)]],
+                              texture2d<half, access::sample> dfg [[texture(0)]],
+                              uint gid [[thread_position_in_grid]]) {
+        float4 a = inp[gid * 2], b = inp[gid * 2 + 1];
+        float r = a.x, mu = a.y, cw = a.z, cr = a.w, ss = b.x, sr = b.y;
+        float3 albedo = float3(1.0);
+        float3 N = float3(0, 0, 1);
+        float3 V = float3(sqrt(max(0.0, 1.0 - mu * mu)), 0.0, mu);
+        constexpr sampler ls(filter::linear, address::clamp_to_edge);
+        float4 lut = float4(dfg.sample(ls, float2(mu, r)));
+        float4 lutC = float4(dfg.sample(ls, float2(mu, cr)));
+        float sheenA = float(dfg.sample(ls, float2(mu, sr)).a);
+        LayeredEnergy le = layeredEnergy(albedo, 0.0, lut, sheenA, ss, true, true);
+        le = layeredWithCoat(le, cw, cr, 0.04, lutC, float3(1.0), float3(1.0));
+        const uint NS = 4096u;
+        float direct = 0.0;
+        float a2 = r * r * r * r, ac2 = pow(max(cr * cr, 1e-4), 2.0);
+        for (uint s = 0u; s < 3u * NS; ++s) {
+            uint i = s % NS;
+            float u1 = (float(i) + 0.5) / float(NS), u2 = dh1309RadInv(i);
+            float3 L;
+            if (s < NS) { float rr = sqrt(u1), ph = 2.0 * M_PI_F * u2; L = float3(rr * cos(ph), rr * sin(ph), sqrt(max(0.0, 1.0 - u1))); }
+            else if (s < 2u * NS) { L = dh1309SampleGGX(a2, V, u1, u2); }
+            else { L = dh1309SampleGGX(ac2, V, u1, u2); }
+            if (L.z <= 0.0) continue;
+            L = normalize(L);
+            float3 H = normalize(V + L);
+            float w = 1.0 / (float(NS) * (L.z / M_PI_F + dh1309PdfGGX(a2, V, H) + dh1309PdfGGX(ac2, V, H)));
+            direct += brdf(N, V, L, albedo, 0.0, r, float3(1.0), 0.0, float3(0.0), ss, nullptr, sr, le).g * w;
+        }
+        float3 F0 = float3(0.04);
+        float3 under = le.underCoatEnv * le.baseUnderSheen;
+        float env = (le.diffuseEnv * le.coatDarken * albedo * under + layeredEnvSpecular(F0, lut.xy) * under
+                     + le.coatWeight * le.coatEnvAlbedo * le.baseUnderSheen
+                     + clothSheenColor(albedo) * ss * le.sheenAlbedo).g;
+        outp[gid] = float4(direct, env, 0.0, 0.0);
+    }
+
     // DH-1298 — the coat-optics helpers on the shipped header. in: [albedo.rgb, coatW] [specIOR, coatIOR, darkening, 0]
     // out: [darken.rgb, coatF0] [baseF0UnderCoat.rgb, 0]
     kernel void dh1298Optics(device const float4* inp [[buffer(0)]], device float4* outp [[buffer(1)]],
@@ -275,6 +315,37 @@ final class IlluminatoramaCoatLayerFurnaceTests: XCTestCase {
         XCTAssertEqual(o[0].x, 1, accuracy: 1e-6, "white is never darkened")
         XCTAssertLessThan(o[2 * 2].x, o[1 * 2].x, "a darker albedo darkens more under the coat")
         XCTAssertEqual(o[4 * 2].x, 1, accuracy: 1e-6, "coat_darkening 0 ⇒ none")
+    }
+
+    /// DH-1299 — fuzz over coat over base: a white cloth with a coat between (glazed chintz, a satin
+    /// over a lacquer) returns 1 on the direct and environment arms — the sheen layer charges everything
+    /// below it (coat included) its albedo, the coat everything below it.
+    func testWhiteFurnaceFuzzOverCoat() throws {
+        let rig = try rig()
+        guard let fn = (try? rig.device.makeLibrary(source: MetalSourceLoader.source(contentsOf: Self.shaderURL("IlluminatoramaLighting.metal")) + Self.probeKernel, options: nil))?.makeFunction(name: "dh1299Furnace"),
+              let pso = try? rig.device.makeComputePipelineState(function: fn) else { throw XCTSkip("no fuzz probe") }  // gpu-ok: test harness
+        let cases: [(s: Float, a: Float, w: Float, r: Float)] = [(0.30, 0.30, 0.35, 0.12), (0.85, 0.45, 0.35, 0.12), (0.30, 0.18, 1.0, 0.08)]
+        var packed: [SIMD4<Float>] = []
+        for c in cases { for mu in Self.views { packed.append(SIMD4(0.6, mu, c.w, c.r)); packed.append(SIMD4(c.s, c.a, 0, 0)) } }
+        let n = packed.count / 2
+        guard let ib = rig.device.makeBuffer(bytes: packed, length: packed.count * 16, options: .storageModeShared),
+              let ob = rig.device.makeBuffer(length: n * 16, options: .storageModeShared),
+              let cb = rig.queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else { throw XCTSkip("no buffers") }
+        enc.setComputePipelineState(pso); enc.setBuffer(ib, offset: 0, index: 0); enc.setBuffer(ob, offset: 0, index: 1)
+        enc.setTexture(rig.lut, index: 0)
+        enc.dispatchThreads(MTLSize(width: n, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: min(32, n), height: 1, depth: 1))
+        enc.endEncoding(); cb.commit(); cb.waitUntilCompleted()  // gpu-ok: test harness
+        let o = ob.contents().bindMemory(to: SIMD4<Float>.self, capacity: n)
+        say("── DH-1299 white furnace — fuzz over coat over base (base r .6); per N·V 1/.7/.4/.15 ──")
+        for (k, c) in cases.enumerated() {
+            let rows = (0..<Self.views.count).map { o[k * Self.views.count + $0] }
+            say(String(format: "  sheen %.2f nap %.2f | coat %.2f r %.2f | direct ", c.s, c.a, c.w, c.r)
+                + rows.map { f($0.x) }.joined(separator: "/") + " | env " + rows.map { f($0.y) }.joined(separator: "/"))
+            for row in rows {
+                XCTAssertEqual(row.x, 1, accuracy: 0.02, "direct, fuzz over coat \(c)")
+                XCTAssertEqual(row.y, 1, accuracy: 0.01, "env, fuzz over coat \(c)")
+            }
+        }
     }
 
     /// No coat ⇒ the layered rows are exactly the uncoated ones (the coat terms are 1 / 0).

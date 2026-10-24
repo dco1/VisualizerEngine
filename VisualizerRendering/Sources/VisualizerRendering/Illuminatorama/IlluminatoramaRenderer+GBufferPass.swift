@@ -198,6 +198,10 @@ extension IlluminatoramaRenderer {
             let inst = mesh.instanceBinding(ring: currentInstanceBuffer, groupOffset: off)
             enc.setVertexBuffer(inst.buffer, offset: inst.offset, index: 2)
             enc.setFragmentBuffer(inst.buffer, offset: inst.offset, index: 2)
+            // DH-1300 — the group's first record in the ring, so the material-layer slot is global (the
+            // lighting / RT kernels read the ring from 0); a GPU-compacted batch is not in the ring.
+            var layerSlotBase: UInt32 = inst.buffer === currentInstanceBuffer ? UInt32(inst.offset / instStride) : UInt32.max
+            enc.setFragmentBytes(&layerSlotBase, length: 4, index: 10)
             // Phase 2.7 — previous-frame instances at buffer(4) for the
             // motion-vector reconstruction. Same per-group offset as
             // current — the ping-pong buffers share the grouped layout
@@ -235,6 +239,8 @@ extension IlluminatoramaRenderer {
                 enc.setFragmentBuffer(currentInstanceBuffer, offset: off, index: 2)
                 enc.setFragmentBuffer(previousInstanceBuffer, offset: off, index: 4)
                 enc.setFragmentBuffer(superquadricParamBuffer, offset: poff, index: 6)
+                var layerSlotBase = UInt32(group.start)   // DH-1300 — the group's first ring record
+                enc.setFragmentBytes(&layerSlotBase, length: 4, index: 10)
                 enc.drawMesh(mesh, instanceCount: group.count)
             }
         }

@@ -177,7 +177,13 @@ static inline __attribute__((always_inline)) GBufferOut illumiGBufferPack(
     float sheenAlpha = (inst.sheen > 0.0f)
         ? float(clothSheenBandForRoughness(inst.sheenRoughness)) + min(sheenStrength, 0.98f)
         : 0.0f;
-    o.emission        = half4(half3(emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -sheenAlpha));
+    // Daydream DH-1299 — with the coat a LAYER (kFrameFlagLayeredCoat), a material may be both: the
+    // channel keeps the SHEEN (it varies per texel — the carpet lay above) and the coat rides the
+    // instance's material-layer record (IlluminatoramaMaterialLayers.h), which the lighting and RT
+    // kernels read whenever emission.a carries no coat. Fuzz over coat over base. Without the flag a
+    // coated cloth packs its coat, as it always did.
+    bool coatAndSheen = (frame.frameFlags & kFrameFlagLayeredCoat) != 0u && inst.clearcoat > 0.0 && inst.sheen > 0.0;
+    o.emission        = half4(half3(emission), half((inst.clearcoat > 0.0 && !coatAndSheen) ? inst.clearcoat : -sheenAlpha));
     if (kExtendedGBuffer) {
         // DH-0478 — per-texel grain DIRECTION for the anisotropy lobe. The material's map holds
         // (cos 2θ, sin 2θ), θ from its U axis in tangent space; here it becomes a world-space angle

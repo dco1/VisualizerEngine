@@ -161,6 +161,10 @@ fragment GBufferOut illumi_fs(
     const device float4*                        nonColorSliceMean [[buffer(8)]],
     // Interior mapping (only the kInteriorMap pipeline declares it).
     constant InteriorMapParams&                 imap            [[buffer(9), function_constant(kInteriorMap)]],
+    // DH-1300 — the draw group's first record in the frame's instance ring (the ring is bound at the
+    // group's offset, so `instance_id` is group-LOCAL), or 0xFFFFFFFF when the group's records are not
+    // in the ring (a GPU-compacted batch, Signack S6): the material-layer slot is base + instance_id.
+    constant uint&                              layerSlotBase   [[buffer(10)]],
     // Phase 4.0 — atlas of diffuse-albedo textures. Each slice is the
     // 512×512 BGRA8-sRGB upload from `IlluminatoramaTextureAtlas`; the
     // texture-format's sRGB→linear decode happens automatically inside
@@ -189,7 +193,11 @@ fragment GBufferOut illumi_fs(
     }
     InteriorMapParams ip = {};
     if (kInteriorMap) { ip = imap; }
-    return illumiGBufferShade(in, frontFacing, duvdx, duvdy, worldPosFwidth, instances, frame,
+    GBufferOut o = illumiGBufferShade(in, frontFacing, duvdx, duvdy, worldPosFwidth, instances, frame,
                               albedoUVScale, nonColorUVScale, albedoSliceMean, nonColorSliceMean,
                               ip, albedoAtlas, nonColorAtlas);
+    // DH-1300 — make the material-layer slot global (see `layerSlotBase`).
+    if (o.materialLayer != kMaterialLayerNone)
+        o.materialLayer = (layerSlotBase == kMaterialLayerNone) ? kMaterialLayerNone : layerSlotBase + o.materialLayer;
+    return o;
 }

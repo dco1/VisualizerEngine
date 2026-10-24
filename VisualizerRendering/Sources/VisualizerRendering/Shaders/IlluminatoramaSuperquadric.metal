@@ -178,7 +178,8 @@ fragment SQImpostorFSOut illumi_superquadric_impostor_fs(
     constant FrameUniforms&    frame         [[buffer(1)]],
     const device Instance*     instances     [[buffer(2)]],
     const device Instance*     prevInstances [[buffer(4)]],
-    const device SQParam*      params        [[buffer(6)]]
+    const device SQParam*      params        [[buffer(6)]],
+    constant uint&             layerSlotBase [[buffer(10)]]   // DH-1300 — the group's first ring record
 ) {
     Instance inst = instances[in.iid];
     SQParam  p    = params[in.iid];
@@ -234,7 +235,7 @@ fragment SQImpostorFSOut illumi_superquadric_impostor_fs(
     o.emission        = half4(half3(inst.emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -sqSheenAlpha));
     o.velocity        = half2(velUV);
     o.layer           = inst.layer;   // light-layer bitfield (default 0xFFFFFFFF)
-    o.materialLayer   = illumiInstanceHasMaterialLayers(inst) ? in.iid : kMaterialLayerNone;
+    o.materialLayer   = illumiInstanceHasMaterialLayers(inst) ? layerSlotBase + in.iid : kMaterialLayerNone;
     o.depth           = curClip.z / curClip.w;   // Metal NDC z ∈ [0,1]
     return o;
 }
