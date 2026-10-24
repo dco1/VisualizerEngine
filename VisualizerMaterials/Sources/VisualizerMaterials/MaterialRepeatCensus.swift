@@ -80,7 +80,7 @@ public struct MaterialRepeatCensus: Equatable, Sendable {
         let repeats = surfaceWidthMeters / run
         let isCoherent = coherentCategories.contains(ch.category)
         // The tone de-repeat only breaks the horizontal (U) tiling if the U axis carries cells.
-        let breaksU = ch.patternCells.x >= 1 && ch.patternJitter > 0
+        let breaksU = Swift.abs(ch.patternCells.x) >= 1 && ch.patternJitter > 0
         let perRepeat = breaksU ? ch.patternJitter : 0
 
         // Faithful residual: model K side-by-side copies, each toned by the shader's own hash, and
@@ -138,11 +138,14 @@ public struct MaterialRepeatCensus: Equatable, Sendable {
         guard mean > 1e-9 else { return 0 }
         for k in tone.indices { tone[k] /= mean }
         let w = cols * Swift.max(2, periods), h = rows * 2
-        let hashed = bake.patternJitter > 0 && bake.patternCells.x >= 1
+        let hashed = bake.patternJitter > 0 && Swift.abs(bake.patternCells.x) >= 1
         func surface(_ i: Int, _ j: Int) -> Double {
+            // The cell the shader hashes at this unit's centre (`MaterialChannels.patternCellIndex`).
+            let cell = MaterialChannels.patternCellIndex(u: (Double(i) + 0.5) / Double(cols),
+                                                         v: (Double(j) + 0.5) / Double(rows),
+                                                         cells: bake.patternCells)
             let m = hashed
-                ? 1 + bake.patternJitter * patternCellHash(Double(i) / Double(cols) * bake.patternCells.x,
-                                                           Double(j) / Double(rows) * bake.patternCells.y)
+                ? 1 + bake.patternJitter * patternCellHash(cell.x, cell.y)
                 : 1
             return tone[(j % rows) * cols + i % cols] * m
         }
@@ -182,7 +185,9 @@ public struct MaterialRepeatCensus: Equatable, Sendable {
     /// The tone multiplier the shader applies to the U-cell that starts copy `copy`.
     /// `m = 1 + jitter · patternCellHash(floor(copy · cells.x), 0)`.
     static func toneMultiplier(copy: Int, cells: Vec2, jitter: Double) -> Double {
-        let cellX = Double(copy) * cells.x
+        // Course 0 carries no running-bond offset, so a negative (running-bond) count indexes the
+        // same first cell its magnitude would.
+        let cellX = Double(copy) * Swift.abs(cells.x)
         return 1.0 + jitter * patternCellHash(cellX, 0)
     }
 

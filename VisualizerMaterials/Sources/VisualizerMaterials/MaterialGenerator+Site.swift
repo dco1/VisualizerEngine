@@ -626,6 +626,13 @@ extension MaterialGenerator {
         // `testEveryIntegerTileCountIsSeamless`.)
         let layout = params.layout
         let cellsU = layout.cols, cellsV = layout.rows
+        // DH-1496 — declare the grid this bake draws (a stack of `cellsU × cellsV` units). It is the
+        // per-PHYSICAL-paver tone de-repeat a coherent unit grid gets in place of the hex blend, and
+        // declaring a grid is what classifies the bake as COHERENT for anti-tiling
+        // (`MaterialChannels.laysUnitGrid`): pavers are `.ground`, a stochastic category, so until
+        // this the hex de-repeat blended offset copies of the bond and printed a ghost second grid.
+        ch.patternCells = Vec2(Double(cellsU), Double(cellsV))
+        ch.patternJitter = 0.05
         // Floored at the thinnest drawable line, the same way tile is — this generator shares
         // `UnitPatternParams` AND the width control with tile, so it has to honour the same range
         // the control offers. It also has a hard-edged joint (no antialias band), which is exactly

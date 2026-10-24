@@ -224,7 +224,7 @@ static inline __attribute__((always_inline)) void illumiSurfaceBase(
         // `patternJitter == 0` — the default, and every scene that never opts in — is an
         // exact no-op, so Visualizer is byte-identical.
         if (inst.patternJitter != 0.0f) {
-            albedo *= 1.0f + inst.patternJitter * patternCellHash(floor(in.uv * inst.patternCells));
+            albedo *= 1.0f + inst.patternJitter * patternCellHash(patternCellIndex(in.uv, inst.patternCells));
         }
     }
     // Phase 4.17 — modulate albedo by per-vertex color (default white,

@@ -117,6 +117,12 @@ public struct MaterialChannels: Equatable, Sendable {
     /// units, because that is the only layer that knows the surface's period.
     public var carpetMacro: CarpetMacroField? = nil
 
+    ///
+    /// **A NEGATIVE x declares a horizontal RUNNING BOND** (DH-1497): `|x|` units per tile with odd
+    /// courses offset half a unit, so the engine indexes every physical brick — the offset course
+    /// no longer has to vary as a whole. Only for a bond whose courses are the tile's rows and
+    /// whose row count is even (`MaterialGenerator.brick` declares it). `patternCellIndex` is the
+    /// Swift mirror of the cell the shader hashes.
     public var patternCells: Vec2 = .zero
     /// Half-amplitude of the per-cell tone jitter (0.04 ⇒ ±4 %). 0 = exact shader no-op.
     /// Real tile/plank batch variation lives around 3–6 %; the generator owns the number.
@@ -129,6 +135,26 @@ public struct MaterialChannels: Equatable, Sendable {
     /// a grain discontinuity at each panel edge, which is what a real panel joint looks like.
     /// Needs `patternCells.x ≥ 1` and `patternJitter > 0`; the bonded v axis stays `patternCells.y = 0`.
     public var panelFigurePhase: Bool = false
+
+    /// **Whether this bake lays a regular unit grid** — tiles, bricks, pavers, planks, glass block:
+    /// any bake that declared its lattice for the per-cell de-repeat. Such a bake is COHERENT for
+    /// anti-tiling whatever its category: the hex-stochastic blend overlays offset copies of a grid
+    /// and double-prints its joints (DH-1496: unit pavers are `.ground`, a stochastic family, and
+    /// ghosted a second bond). The category table stays the default for bakes that declare
+    /// nothing; this is the per-material answer for the ones that do.
+    public var laysUnitGrid: Bool { patternCells != .zero }
+
+    /// **The physical-unit index the engine's per-pattern-cell jitter hashes at surface `uv`** — the
+    /// Swift mirror of `patternCellIndex` in IlluminatoramaMaterial.h, including the running-bond
+    /// encoding (negative `cells.x`).
+    public static func patternCellIndex(u: Double, v: Double, cells: Vec2) -> (x: Double, y: Double) {
+        if cells.x < 0 {
+            let cy = (v * cells.y).rounded(.down)
+            let odd = cy - 2 * (cy * 0.5).rounded(.down)
+            return ((u * -cells.x + 0.5 * odd).rounded(.down), cy)
+        }
+        return ((u * cells.x).rounded(.down), (v * cells.y).rounded(.down))
+    }
 
     public init(size: Int, category: MaterialCategory) {
         self.size = max(1, size)
