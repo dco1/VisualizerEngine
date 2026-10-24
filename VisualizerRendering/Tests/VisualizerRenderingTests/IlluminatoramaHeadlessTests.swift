@@ -155,3 +155,19 @@ final class IlluminatoramaPhotoQualityOptionsTests: XCTestCase {
         XCTAssertEqual(StillAccumulation.blend(frame: 1000, floor: 0.01), 0.01)
     }
 }
+
+@MainActor
+final class IlluminatoramaAccumulationStepTests: XCTestCase {
+    func testStepsWriteTheTemporalKnobs() throws {
+        let cam = IlluminatoramaCamera(position: SIMD3(0, 1, 4), target: .zero, up: SIMD3(0, 1, 0),
+                                       fovYRadians: .pi / 3, aspect: 4.0 / 3.0, zNear: 0.05, zFar: 100)
+        let r = try IlluminatoramaRenderer(engine: SimEngine.shared, width: 64, height: 48, camera: cam)
+        r.applyAccumulation(.average(jitter: 1, frame: 4, floor: 0.01, aoDial: 0.5))
+        XCTAssertEqual(r.taaJitterPixels, 1); XCTAssertEqual(r.taaHistoryBlend, 0.25)
+        XCTAssertEqual(r.ssaoTemporalBlend, 0.99, accuracy: 1e-6, "AO opens to 1 - floor")
+        r.applyAccumulation(.hold(jitter: 1)); XCTAssertEqual(r.taaHistoryBlend, 0)
+        r.applyAccumulation(.heldOut); XCTAssertEqual(r.taaJitterPixels, 0); XCTAssertEqual(r.taaHistoryBlend, 1)
+        r.applyAccumulation(.fixed(jitter: 0.5, blend: 1.0 / 32)); XCTAssertEqual(r.taaHistoryBlend, 1.0 / 32)
+        r.applyAccumulation(.off); XCTAssertEqual(r.taaJitterPixels, 0)
+    }
+}

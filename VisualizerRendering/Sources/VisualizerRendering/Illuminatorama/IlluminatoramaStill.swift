@@ -182,15 +182,14 @@ public final class IlluminatoramaStillSession {
                 if previous == .warmup { r.resetRTGIAccumulation() }   // out of the GI running mean
                 r.resetRTGIAccumulation()                              // a FRESH cache: never the last still's
             }
-            r.taaJitterPixels = 0; r.taaHistoryBlend = 1
+            r.applyAccumulation(.heldOut)
         case .accumulate(let k):
             if k == 1 {
                 if previous == .cacheBuild { r.resetRTGIAccumulation(keepingRadianceCache: true) }
                 else if previous == .warmup { r.resetRTGIAccumulation() }
-                r.ssaoTemporalBlend = max(savedAO, 1 - o.accumulationFloor)   // 1/N governs, not the dial's EMA
             }
-            r.taaJitterPixels = o.jitterPixels
-            r.taaHistoryBlend = StillAccumulation.blend(frame: k, floor: o.accumulationFloor)
+            // 1/N governs, not the dial's EMA: the AO accumulator opens to the same floor.
+            r.applyAccumulation(.average(jitter: o.jitterPixels, frame: k, floor: o.accumulationFloor, aoDial: savedAO))
         }
         index += 1
         return kind
@@ -227,6 +226,26 @@ public final class IlluminatoramaStillSession {
 }
 
 public extension IlluminatoramaRenderer {
+
+    /// Write the renderer's temporal knobs for one frame (`StillAccumulation.Step`). The one place jitter,
+    /// the TAA blend and the AO accumulator floor are set for accumulation, so a still, a settled canvas
+    /// and an export cannot disagree about what "frame k" means.
+    func applyAccumulation(_ step: StillAccumulation.Step) {
+        switch step {
+        case .off:
+            taaJitterPixels = 0
+        case .fixed(let jitter, let blend):
+            taaJitterPixels = jitter; taaHistoryBlend = blend
+        case .average(let jitter, let frame, let floor, let aoDial):
+            taaJitterPixels = jitter
+            taaHistoryBlend = StillAccumulation.blend(frame: frame, floor: floor)
+            if let dial = aoDial { ssaoTemporalBlend = max(dial, 1 - floor) }
+        case .hold(let jitter):
+            taaJitterPixels = jitter; taaHistoryBlend = 0
+        case .heldOut:
+            taaJitterPixels = 0; taaHistoryBlend = 1
+        }
+    }
 
     /// Take a still. `step` renders ONE frame and returns whether it was committed; the default
     /// drives the renderer directly (`render(blocking: true)`), a host with per-frame scene
