@@ -50,6 +50,8 @@
 #include <metal_raytracing>
 #include "IlluminatoramaNightSky.h"
 #include "IlluminatoramaSampling.h"
+#include "IlluminatoramaCloudShadow.h"
+#include "IlluminatoramaDiffuseRoughness.h"   // DH-1301 — the EON directional albedo at a hit
 
 using namespace metal;
 using namespace raytracing;
@@ -359,8 +361,24 @@ static inline float2 secondaryUnpackMaterialLane(float w) {
 }
 /// The base layer at a hit: (metallic, roughness) from `emissionPad.w`, or (−1, −1) when the row
 /// carries none (glass, a curve set, a host that never packs) — the path lane then keeps Lambert.
+///
+/// DH-1301 — the lane's integer part 0…1000 is metalness; 1001…2001 is a PURE dielectric carrying a
+/// diffuse roughness (`secondaryDiffuseRoughness`), whose metalness is therefore 0.
 static inline float2 secondaryMaterial(uint iid, const device RTInstanceData* insts) {
-    return secondaryUnpackMaterialLane(insts[iid].emissionPad.w);
+    float2 mr = secondaryUnpackMaterialLane(insts[iid].emissionPad.w);
+    if (mr.x > 1.0005) mr.x = 0.0;
+    return mr;
+}
+/// DH-1301 — the row's diffuse roughness (OpenPBR `base_diffuse_roughness`), 0 when it carries none.
+static inline float secondaryDiffuseRoughness(uint iid, const device RTInstanceData* insts) {
+    float2 mr = secondaryUnpackMaterialLane(insts[iid].emissionPad.w);
+    return mr.x > 1.0005 ? saturate(mr.x - 1.001) : 0.0;
+}
+/// DH-1301 — the factor a hit's albedo takes for its diffuse roughness: the EON lobe's directional
+/// albedo toward where the ray came from (a secondary / path vertex is an INTEGRATED reflector —
+/// IlluminatoramaDiffuseRoughness.h). Exactly 1 for a row without one.
+static inline float3 secondaryEONRatio(float3 A, uint iid, float muO, const device RTInstanceData* insts) {
+    return illumiEONAlbedoRatio(A, secondaryDiffuseRoughness(iid, insts), muO);
 }
 /// The clearcoat at a hit: (strength, roughness) from `nrm2.w`, or (−1, −1) for none.
 static inline float2 secondaryCoat(uint iid, const device RTInstanceData* insts) {
@@ -428,7 +446,10 @@ struct SecondaryShadeParams {
     // block, not a copy: 32 gains is 128 bytes, and a secondary ray must not pay
     // that per hit. `nullptr` / 0 ⇒ every room reads 1.0, the pre-Stage-E behaviour.
     constant float4 *interiorRoomGains;
-    float  interiorRoomGainEnabled;  float _padRoomGain0, _padRoomGain1, _padRoomGain2;
+    float  interiorRoomGainEnabled;
+    // DH-1301 — 1 ⇒ a hit whose row carries a diffuse roughness reflects with the EON lobe's
+    // directional albedo (`secondaryEONRatio`); 0 ⇒ Lambert. Was `_padRoomGain0`.
+    float  diffuseRoughnessOn;  float _padRoomGain1, _padRoomGain2;
     // Albedo atlas: 0 ⇒ fall back to the instance's mean albedo.
     uint   albedoAtlasEnabled;
     uint   objUVCount;      // bound of objUV in float2 entries
@@ -462,6 +483,12 @@ struct SecondaryScene {
     const device RTSpotLight*    spotLights;
     const device RTAreaLight*    areaLights;   // DH-0718; read only when `areaLightCount` > 0
     const device float*          spotProfiles; // DH-0540 — the host's spot-profile rows (a 1-float dummy when none)
+    const device float*          cloudShadow;  // DH-1462 — the cloud deck's sun transmittance (8-float dummy when off)
+    // Daydream DH-1300 — the raster instance buffer as float4s, indexed by TLAS id (the grouped order
+    // `rebuildRTAccel` lays the TLAS out in), for a hit's material-layer parameters
+    // (IlluminatoramaMaterialLayers.h). `layerCount` 0 (the glass pass; the flag off) ⇒ every hit none.
+    const device float4*         layerInsts;
+    uint                         layerCount;
 };
 
 /// One opaque triangle hit, however the ray that found it was fired.
@@ -471,6 +498,7 @@ struct SecondaryHit {
     float2 bary;          // triangle barycentrics (→ mesh UV → atlas tap)
     uint   instanceID;    // TLAS instance id
     uint   primitiveID;   // triangle within the instance's mesh
+    float  muO;           // DH-1301 — cos of the angle to where the ray CAME from (N·ωo, ≥ 0); set at every hit site
 };
 
 // ── Albedo ───────────────────────────────────────────────────────────────────
@@ -811,6 +839,7 @@ static inline float3 shadeSecondarySurface(thread Isect& isect,
 {
     uint layerBits = secondaryLayerBits(h.instanceID, sc.insts);
     float3 A = secondaryAlbedo(h, p, sc, albedoAtlas);
+    if (p.diffuseRoughnessOn > 0.5) A *= secondaryEONRatio(A, h.instanceID, h.muO, sc.insts);   // DH-1301
     float3 rad = secondaryEmission(h.instanceID, sc.insts);
     cacheTerm = cached ? A * cacheIndirect : float3(0.0);
     rad += cached ? cacheTerm : A * secondaryIndirectFill(h.N, layerBits, p, irrCube);
@@ -829,7 +858,8 @@ static inline float3 shadeSecondarySurface(thread Isect& isect,
     // through-glass world fell from 1.197× the open aperture to 1.049×, i.e. the sun it should
     // have been given was 15 points of ratio, silently absent.
     if (nl > 0.0) {
-        float vis = secondarySunVisibility(isect, accel, h.P, h.N, Ld, p, seed);
+        float vis = secondarySunVisibility(isect, accel, h.P, h.N, Ld, p, seed)
+                  * illumiCloudSunTransmittance(sc.cloudShadow, h.P, Ld);
         rad += A * (1.0 / M_PI_F) * p.sunColor * nl * vis;
     }
     return rad;

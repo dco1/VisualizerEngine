@@ -10,6 +10,10 @@
 //                                   host's own instance struct) into that bucket's PRIMARY list when
 //                                   it is on screen, and always into its SHADOW list (a plant behind
 //                                   the camera still shades the lawn in front of it).
+//   1b. (DH-1493, only when the host gave SHADOW VIEWS) signack_instances_views_prefix gives each
+//       (view, bucket) a range of the view region of `lists`, and signack_instances_views_write
+//       copies each instance once more into every view its sphere can reach — so a sun cascade slice,
+//       a spot cone or a point face draws only the plants that can land in it.
 //   2. signack_instances_finalize   one thread per bucket: the two indexed-INSTANCED indirect records
 //                                   (primary @ b·64, shadow @ b·64+32 — the shadow record two rungs
 //                                   coarser): the rung's index range, the
@@ -24,6 +28,7 @@
 using namespace metal;
 
 constant uint SIGNACK_MAX_BUCKETS = 8;
+constant uint SIGNACK_INST_MAX_VIEWS = 8;
 
 struct SignackInstanceUniforms {        // mirror of Swift SignackGPUInstanceUniforms (256 B)
     float4 planes[6];                   // world-space frustum, inside where dot(xyz, p) + w ≥ 0
@@ -40,7 +45,8 @@ struct SignackInstanceUniforms {        // mirror of Swift SignackGPUInstanceUni
     uint   isOrthographic;
     uint   cull;                        // 0 = no frustum test (everything on screen)
     float  maxDistance;                 // beyond this a plant is not drawn at all (0 = no limit)
-    uint   _pad0, _pad1, _pad2;
+    uint   viewCount;                   // DH-1493 — shadow views (0 = none: exactly the two lists)
+    uint   _pad1, _pad2;
 };
 static_assert(sizeof(SignackInstanceUniforms) == 256, "mirror of Swift SignackGPUInstanceUniforms");
 
@@ -50,6 +56,16 @@ struct SignackInstanceBounds {          // per instance, world space (32 B)
     float  _pad0, _pad1, _pad2;
 };
 
+/// DH-1493 — the shadow views, world space (mirror of Swift `SignackGPUInstanceShadowViews`, 768 B):
+/// view v's planes at [6v, 6v+6), inside where dot(xyz, p) + w ≥ 0.
+struct SignackInstanceShadowViews {
+    float4 planes[6 * SIGNACK_INST_MAX_VIEWS];
+};
+
+/// The view region's bookkeeping (Swift allocates 3 · 64 uints): per (view, bucket) the instance
+/// count, the range base inside the view's region, and the write cursor.
+constant uint SIGNACK_VIEW_COUNT = 0u, SIGNACK_VIEW_BASE = 64u, SIGNACK_VIEW_CURSOR = 128u;
+
 struct SignackInstancedArgs {           // MTLDrawIndexedPrimitivesIndirectArguments
     uint indexCount;
     uint instanceCount;
@@ -57,6 +73,49 @@ struct SignackInstancedArgs {           // MTLDrawIndexedPrimitivesIndirectArgum
     int  baseVertex;
     uint baseInstance;
 };
+
+
+/// DH-1466 — Hi-Z occlusion: the pyramid's frame (mirror of Swift `SignackGPUOcclusion.Uniforms`).
+struct SignackInstOcclusionUniforms {
+    float4x4 toClip;      // the instance's space → the clip space the pyramid's depth was drawn in
+    float2   depthSize;   // px of that depth
+    uint     mipCount;
+    uint     enabled;
+    float    dilate;      // px each side (TAA jitter)
+    float    _pad0, _pad1, _pad2;
+};
+static_assert(sizeof(SignackInstOcclusionUniforms) == 96, "mirror of Swift SignackGPUOcclusion.Uniforms");
+
+/// Is the sphere (c, r) hidden behind everything over its footprint in the pyramid? Conservative:
+/// the footprint is the projected bounding CUBE (dilated), its depth the cube's nearest corner, the
+/// occluder depth the pyramid's MAX over every texel the footprint touches. Anything crossing the
+/// near plane is visible.
+static bool signack_inst_occluded(float3 c, float r, constant SignackInstOcclusionUniforms& O, texture2d<float, access::read> hzb) {
+    if (O.enabled == 0 || O.mipCount == 0) return false;
+    float2 lo = float2(1.0e30f), hi = float2(-1.0e30f);
+    float zmin = 1.0e30f;
+    for (uint k = 0; k < 8; ++k) {
+        float3 p = c + r * float3((k & 1u) ? 1.0f : -1.0f, (k & 2u) ? 1.0f : -1.0f, (k & 4u) ? 1.0f : -1.0f);
+        float4 q = O.toClip * float4(p, 1.0f);
+        if (q.w <= 1.0e-4f) return false;
+        float3 n = q.xyz / q.w;
+        lo = min(lo, n.xy); hi = max(hi, n.xy); zmin = min(zmin, n.z);
+    }
+    if (zmin <= 0.0f) return false;
+    float2 pmin = float2(lo.x * 0.5f + 0.5f, 0.5f - hi.y * 0.5f) * O.depthSize - O.dilate;
+    float2 pmax = float2(hi.x * 0.5f + 0.5f, 0.5f - lo.y * 0.5f) * O.depthSize + O.dilate;
+    pmin = clamp(pmin, float2(0.0f), O.depthSize - 1.0f);
+    pmax = clamp(pmax, float2(0.0f), O.depthSize - 1.0f);
+    float ext = max(pmax.x - pmin.x, pmax.y - pmin.y);
+    uint L = uint(clamp(ceil(log2(max(ext, 1.0f))) - 1.0f, 0.0f, float(O.mipCount - 1)));
+    float s = exp2(float(L + 1));              // source px per level-L texel
+    uint2 dim = uint2(hzb.get_width(L), hzb.get_height(L));
+    uint2 t1 = min(uint2(pmax / s), dim - 1u), t0 = min(uint2(pmin / s), t1);
+    float m = 0.0f;
+    for (uint y = t0.y; y <= t1.y; ++y)
+        for (uint x = t0.x; x <= t1.x; ++x) m = max(m, hzb.read(uint2(x, y), L).r);
+    return zmin > m;
+}
 
 static float signack_rung_error(constant SignackInstanceUniforms& U, uint k) {
     return U.rungError[k / 4][k % 4];
@@ -68,9 +127,15 @@ kernel void signack_instances_classify(
     device const uint4*                source   [[buffer(2)]],   // instanceCount × stride
     device uint4*                      lists    [[buffer(3)]],   // 2 · buckets · instanceCount × stride
     device atomic_uint*                counters [[buffer(4)]],   // [list · buckets + bucket]
+    constant SignackInstOcclusionUniforms& O    [[buffer(6)]],   // DH-1466
+    constant SignackInstanceShadowViews& V      [[buffer(7)]],   // DH-1493
+    device atomic_uint*                viewBook [[buffer(8)]],   // DH-1493 — [count | base | cursor]
+    device uint*                       instView [[buffer(9)]],   // DH-1493 — per instance: bucket | mask << 8
+    texture2d<float, access::read>     hzb      [[texture(0)]],
     uint i                                      [[thread_position_in_grid]])
 {
     if (i >= U.instanceCount) return;
+    if (U.viewCount > 0) instView[i] = 0xFFu;   // "not drawn" unless classified below
     SignackInstanceBounds b = bounds[i];
     float3 c = b.sphere.xyz;
     float r = b.sphere.w;
@@ -93,6 +158,26 @@ kernel void signack_instances_classify(
             if (dot(pl.xyz, c) + pl.w < -r) { onScreen = false; break; }
         }
     }
+    // DH-1466: a plant hidden behind last frame's depth is drawn by the shadow passes only.
+    if (onScreen && O.enabled != 0 && signack_inst_occluded(c, r, O, hzb)) onScreen = false;
+    // DH-1493: which shadow views can this plant land in? (The same sphere the shadow list keeps.)
+    if (U.viewCount > 0) {
+        uint mask = 0;
+        uint nv = min(U.viewCount, SIGNACK_INST_MAX_VIEWS);
+        for (uint v = 0; v < nv; ++v) {
+            bool in = true;
+            for (uint p = 0; p < 6; ++p) {
+                float4 pl = V.planes[6 * v + p];
+                if (dot(pl.xyz, c) + pl.w < -r) { in = false; break; }
+            }
+            if (in) {
+                mask |= 1u << v;
+                atomic_fetch_add_explicit(&viewBook[SIGNACK_VIEW_COUNT + v * SIGNACK_MAX_BUCKETS + bucket], 1u,
+                                          memory_order_relaxed);
+            }
+        }
+        instView[i] = bucket | (mask << 8);
+    }
     uint words = U.instanceStride / 16u;
     device const uint4* src = source + i * words;
     for (uint list = onScreen ? 0u : 1u; list < 2u; ++list) {
@@ -102,10 +187,57 @@ kernel void signack_instances_classify(
     }
 }
 
+/// DH-1493 — one thread: each view's region of `lists` (instanceCount records, after the two lists)
+/// split into its buckets' ranges, and the write cursors set to them.
+kernel void signack_instances_views_prefix(
+    constant SignackInstanceUniforms& U         [[buffer(0)]],
+    device uint*                       viewBook [[buffer(8)]],
+    uint t                                      [[thread_position_in_grid]])
+{
+    if (t != 0) return;
+    uint buckets = U.rungCount + (U.impostorIndexCount > 0 ? 1u : 0u);
+    uint nv = min(U.viewCount, SIGNACK_INST_MAX_VIEWS);
+    for (uint v = 0; v < nv; ++v) {
+        uint base = 0;
+        for (uint b = 0; b < buckets; ++b) {
+            uint k = v * SIGNACK_MAX_BUCKETS + b;
+            viewBook[SIGNACK_VIEW_BASE + k] = base;
+            viewBook[SIGNACK_VIEW_CURSOR + k] = base;
+            base += viewBook[SIGNACK_VIEW_COUNT + k];
+        }
+    }
+}
+
+/// DH-1493 — one thread per instance: a copy of its record into every view its mask names.
+kernel void signack_instances_views_write(
+    constant SignackInstanceUniforms& U         [[buffer(0)]],
+    device const uint4*                source   [[buffer(2)]],
+    device uint4*                      lists    [[buffer(3)]],
+    device atomic_uint*                viewBook [[buffer(8)]],
+    device const uint*                 instView [[buffer(9)]],
+    uint i                                      [[thread_position_in_grid]])
+{
+    if (i >= U.instanceCount) return;
+    uint word = instView[i];
+    uint bucket = word & 0xFFu, mask = word >> 8;
+    if (bucket == 0xFFu || mask == 0) return;
+    uint buckets = U.rungCount + (U.impostorIndexCount > 0 ? 1u : 0u);
+    uint words = U.instanceStride / 16u;
+    device const uint4* src = source + i * words;
+    for (uint v = 0; v < SIGNACK_INST_MAX_VIEWS; ++v) {
+        if ((mask & (1u << v)) == 0) continue;
+        uint slot = atomic_fetch_add_explicit(&viewBook[SIGNACK_VIEW_CURSOR + v * SIGNACK_MAX_BUCKETS + bucket], 1u,
+                                              memory_order_relaxed);
+        device uint4* dst = lists + ((2u * buckets + v) * U.instanceCount + slot) * words;
+        for (uint w = 0; w < words; ++w) dst[w] = src[w];
+    }
+}
+
 kernel void signack_instances_finalize(
     constant SignackInstanceUniforms& U         [[buffer(0)]],
     device atomic_uint*                counters [[buffer(4)]],
     device SignackInstancedArgs*       args     [[buffer(5)]],   // [bucket · 2 + list], 32-B stride
+    device uint*                       viewBook [[buffer(8)]],   // DH-1493
     uint b                                      [[thread_position_in_grid]])
 {
     uint buckets = U.rungCount + (U.impostorIndexCount > 0 ? 1u : 0u);
@@ -124,5 +256,22 @@ kernel void signack_instances_finalize(
         device SignackInstancedArgs* dst = (device SignackInstancedArgs*)((device uchar*)args + (b * 2u + list) * 32u);
         *dst = a;
         atomic_store_explicit(&counters[list * buckets + b], 0u, memory_order_relaxed);
+    }
+    // DH-1493: one record per shadow view, at 8·64 + (v·8 + b)·32 — the shadow list's rung (two
+    // coarser), only the instances that can land in that view.
+    uint nv = min(U.viewCount, SIGNACK_INST_MAX_VIEWS);
+    uint r = impostor ? b : min(b + 2u, U.rungCount - 1u);
+    for (uint v = 0; v < nv; ++v) {
+        uint k = v * SIGNACK_MAX_BUCKETS + b;
+        SignackInstancedArgs a;
+        a.indexCount = impostor ? U.impostorIndexCount : U.rungIndexCount[r / 4][r % 4];
+        a.indexStart = impostor ? 0u : U.rungIndexStart[r / 4][r % 4];
+        a.baseVertex = 0;
+        a.baseInstance = (2u * buckets + v) * U.instanceCount + viewBook[SIGNACK_VIEW_BASE + k];
+        a.instanceCount = viewBook[SIGNACK_VIEW_COUNT + k];
+        device SignackInstancedArgs* dst = (device SignackInstancedArgs*)((device uchar*)args
+            + SIGNACK_MAX_BUCKETS * 64u + k * 32u);
+        *dst = a;
+        viewBook[SIGNACK_VIEW_COUNT + k] = 0u;
     }
 }

@@ -87,5 +87,10 @@ public enum SignackGPUDrawArgs {
     /// `softThreadsPerGroup` threads per threadgroup (the host's vertex stage for the soft range).
     public static let softDispatchOffset = 96
     public static let softThreadsPerGroup = 64
-    public static let bufferLength = 128
+    /// DH-1465 — shadow view `v`'s record (`SignackShadowViews.maxViews` slots): the clusters of the
+    /// cut that can land in that light view's frustum, or the shadow record when it sees them all.
+    public static func shadowViewOffset(_ v: Int) -> Int { 128 + 32 * v }
+    /// DH-1466 — clusters the last frame's Hi-Z test hid from the camera (UInt32, a census).
+    public static let occludedCountOffset = 128 + 32 * SignackShadowViews.maxViews
+    public static let bufferLength = occludedCountOffset + 32
 }

@@ -310,6 +310,7 @@ static inline SecondaryShadeParams glassSecondaryParams(constant GlassRTUniforms
     p.interiorAmbient = u.interiorAmbient;
     p.interiorRoomGains = &u.interiorRoomGain[0];
     p.interiorRoomGainEnabled = u.interiorRoomGainMeta.x;
+    p.diffuseRoughnessOn = u.interiorRoomGainMeta.w;   // DH-1301 — the meta's spare lane (Glass.swift)
     p.interiorIrrUp = u.interiorIrrUp.xyz;     p.interiorIrrW = u.interiorIrrUp.w;
     p.interiorIrrSide = u.interiorIrrSide.xyz;
     p.interiorIrrDown = u.interiorIrrDown.xyz;
@@ -504,6 +505,7 @@ static float3 shadeOpaqueHit(thread intersector<triangle_data, instancing>& isec
     SecondaryHit h;
     h.P = hitP; h.N = hitN; h.bary = bary;
     h.instanceID = iid; h.primitiveID = prim;
+    h.muO = saturate(-dot(hitN, rd));                  // DH-1301
     // DH-0622 — a surface-cache card supplies only the hit's multi-bounce indirect term; the
     // hit is shaded by the one secondary shader either way. A non-resident card (budget
     // streaming zeroed its rect) takes the fill estimate of the same light instead.
@@ -719,6 +721,7 @@ fragment float4 illumi_glass_rt_fs(
     const device float4*             cornerN     [[buffer(16)]],
     const device RTAreaLight*        areaLights  [[buffer(17)]],   // DH-0718; gated by meta.y
     const device float*              spotProfiles [[buffer(18)]],  // DH-0540 — the spot-profile rows
+    const device float*              cloudShadow [[buffer(19)]],   // DH-1462 — cloud sun transmittance (dummy when off)
     texture2d<float, access::sample> sky         [[texture(0)]],
     texture2d<float, access::sample> surfAtlas   [[texture(1)]],
     texture2d<float, access::sample> backdrop    [[texture(2)]],
@@ -756,10 +759,12 @@ fragment float4 illumi_glass_rt_fs(
 
     GlassRTState st;
     st.sec.insts = insts;        st.sec.objNormal = objNormal;
+    st.sec.layerInsts = nullptr; st.sec.layerCount = 0u;   // DH-1300 — no layer parameters at glass-pass hits
     st.sec.objUV = objUV;        st.sec.uvScale = albedoUVScale;
     st.sec.pointLights = pointLights; st.sec.spotLights = spotLights;
     st.sec.areaLights = areaLights;
     st.sec.spotProfiles = spotProfiles;   // DH-0540
+    st.sec.cloudShadow = cloudShadow;     // DH-1462
     st.glassData = glassData;
     st.triCard = triCard; st.triUVa = triUVa; st.triUVc = triUVc;
     st.soupTriBase = soupTriBase; st.surfCardRect = surfCardRect; st.surfCards = surfCards;

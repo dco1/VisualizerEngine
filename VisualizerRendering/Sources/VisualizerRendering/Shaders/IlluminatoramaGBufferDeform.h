@@ -109,6 +109,10 @@ constant bool kExtendedGBuffer [[function_constant(11)]];
 // a lamp-lit ROOM BOX behind it, ray-traced analytically per fragment (one draw, no geometry).
 // Only the dedicated pipeline variant compiles it true; every other draw is unchanged.
 constant bool kInteriorMap [[function_constant(12)]];
+// DH-1487 — the LEAF-CUTOUT variant: a fragment outside its card's species leaf
+// (IlluminatoramaLeafCutout.h) is discarded. Only meshes flagged `leafCutout` draw with it; the
+// discard costs early depth for those draws alone.
+constant bool kLeafCutout [[function_constant(13)]];
 
 /// Host mirror: `IlluminatoramaInteriorMapping.GPU`. Metres, in the PANE's frame: u along the
 /// mesh tangent (the pane's width), v world-up, w into the room (−normal).

@@ -24,11 +24,16 @@ extension MTLRenderCommandEncoder {
     /// A mesh with a software-raster record (`softRasterDrawOffset`, S4) draws that record too — in
     /// every shadow pass, and in a camera pass unless the caller rasterises it in software this frame
     /// (`withSoft: false`).
+    ///
+    /// A shadow pass names its `view` (DH-1465): a mesh with a record for that view draws only the
+    /// part of its cut that can land in that light's frustum.
     @MainActor func drawMesh(_ mesh: IlluminatoramaMesh, instanceCount: Int,
-                             pass: IlluminatoramaDrawPass = .primary, withSoft: Bool = true) {
+                             pass: IlluminatoramaDrawPass = .primary, view: IlluminatoramaShadowView? = nil,
+                             withSoft: Bool = true) {
         guard !mesh.tracedOnly else { return }
         if let args = mesh.indirectDrawBuffer {
-            let offset = pass == .shadow ? (mesh.shadowIndirectDrawOffset ?? mesh.indirectDrawOffset)
+            let perView = view.flatMap { mesh.shadowViewDrawOffsets.isEmpty ? nil : mesh.shadowViewDrawOffsets[$0] }
+            let offset = pass == .shadow ? (perView ?? mesh.shadowIndirectDrawOffset ?? mesh.indirectDrawOffset)
                                          : mesh.indirectDrawOffset
             drawIndexedPrimitives(type: .triangle, indexType: mesh.indexType,
                                   indexBuffer: mesh.indexBuffer, indexBufferOffset: 0,

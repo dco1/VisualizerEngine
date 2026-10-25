@@ -1,5 +1,6 @@
 #include <metal_stdlib>
 #include "IlluminatoramaSpotProfile.h"
+#include "IlluminatoramaCloudShadow.h"
 using namespace metal;
 
 // ── ILLUMINATORAMA VOLUMETRIC LIGHT SHAFT ────────────────────────────────────
@@ -52,6 +53,7 @@ kernel void illumi_volumetric(
     texture2d<float, access::read>       gDepth [[texture(0)]],
     texture2d<half,  access::read_write> outHDR [[texture(1)]],
     constant VolUniforms&                u      [[buffer(0)]],
+    const device float*                  cloudShadow [[buffer(1)]],   // DH-1492 — cloud sun transmittance (dummy when off)
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
@@ -86,11 +88,12 @@ kernel void illumi_volumetric(
     // makes the shaft vanish off-axis).
     float phase = mix(1.0 / (4.0 * M_PI_F), hg, 0.82);
 
+    float3 toSun = normalize(u.sunDir);
     float accum = 0.0;
     for (uint i = 0; i < N; ++i) {
         float t = (float(i) + jitter) * dtStep;
         float3 P = ro + rd * t;
-        accum += sunShaft(P, u);
+        accum += sunShaft(P, u) * illumiCloudSunTransmittance(cloudShadow, P, toSun);   // DH-1492
     }
     accum *= dtStep * u.fogDensity * phase * u.scatterStrength;
 

@@ -184,7 +184,8 @@ struct RTInstUniforms {
     // Daydream DH-1395 — a roughness floor (perceptual; α = r²) applied ONLY when a glossy lobe is evaluated toward a
     // LAMP (not to lobe sampling, not to the sun or the windows, which MIS already bounds): path regularisation of the
     // caustic camera → diffuse → glossy → lamp. 0 ⇒ the material's own. Was `_padGlossy1`.
-    float pathGlossyLampMinRoughness; float _padGlossy2;
+    float pathGlossyLampMinRoughness;
+    uint  layerInstanceCount;   // DH-1300 — raster instances in `layerInstances` (TLAS ids below it are raster slots); was _padGlossy2
 };
 
 /// DH-1011 — `RTInstUniforms.pathFlags` bits.
@@ -393,6 +394,7 @@ static inline SecondaryShadeParams fullRadianceParams(constant RTInstUniforms& u
     p.interiorAmbient = u.interiorAmbient;
     p.interiorRoomGains = &u.interiorRoomGain[0];
     p.interiorRoomGainEnabled = u.interiorRoomGainMeta.x;
+    p.diffuseRoughnessOn = (u.pathFlags & kPathFlagDiffuseRoughness) != 0u ? 1.0 : 0.0;   // DH-1301
     p.interiorIrrUp = u.interiorIrrUp.xyz;     p.interiorIrrW = u.interiorIrrUp.w;
     p.interiorIrrSide = u.interiorIrrSide.xyz;
     p.interiorIrrDown = u.interiorIrrDown.xyz;
@@ -938,6 +940,7 @@ static inline float3 pathOutdoorFromResult(thread Isect& isect, instance_acceler
         if (dot(h.N, d) > 0.0) h.N = -h.N;
         h.bary = res.triangle_barycentric_coord;
         h.instanceID = res.instance_id; h.primitiveID = res.primitive_id;
+        h.muO = saturate(-dot(h.N, d));
         return shadeSecondarySurface(isect, accel, h, pOut, sec, irrCube, albedoAtlas, seed);
     }
     if (res.type != intersection_type::none) return float3(0.0);
@@ -969,6 +972,7 @@ static inline float3 pathSkyOrOutdoor(thread Isect& isect, instance_acceleration
         if (dot(h.N, d) > 0.0) h.N = -h.N;
         h.bary = res.triangle_barycentric_coord;
         h.instanceID = res.instance_id; h.primitiveID = res.primitive_id;
+        h.muO = saturate(-dot(h.N, d));
         return shadeSecondarySurface(isect, accel, h, pOut, sec, irrCube, albedoAtlas, seed);
     }
     if (res.type != intersection_type::none) { hitDist = res.distance; return float3(0.0); }
@@ -1039,6 +1043,9 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
     // (`kPathFlagLayeredMultiscatter`): the vertex stack is self-contained, and the app ships with
     // that switch off (DH-1331).
     bool glossy = (u.pathFlags & kPathFlagGlossyVertices) != 0u && lightSampling;
+    // DH-1301 — a vertex whose row carries a diffuse roughness reflects with the EON lobe's directional
+    // albedo toward where the path came from (`secondaryEONRatio`; IlluminatoramaDiffuseRoughness.h).
+    bool diffRoughOn = (u.pathFlags & kPathFlagDiffuseRoughness) != 0u;
     float glossyMinR = max(0.045, u.pathGlossyMinRoughness);
     bool specV = false;
     bool bruteV = false; float3 bruteWdA = float3(0.0);     // the brute-force instrument (8192)
@@ -1081,8 +1088,9 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 bool blocked = isect.intersect(sr, accel, u.transportRayMask).type != intersection_type::none;
                 isect.accept_any_intersection(false);
                 if (!blocked) {
+                    float cT = illumiCloudSunTransmittance(sec.cloudShadow, P, Ld);   // DH-1462
                     if (!st.on) {
-                        Lv += u.sunColor * nl * (1.0 / M_PI_F);
+                        Lv += u.sunColor * cT * nl * (1.0 / M_PI_F);
                     } else {
                         // DH-1363 inc. 2b — the whole stack's sun: the diffuse share at full weight (its
                         // continuation never credits a sun hit), the glossy lobes toward the sun's DISC with
@@ -1093,7 +1101,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                                   + pathGlossyEvalSource(st.lobeC, sr.direction, 0.5 * u.sunSoftnessRad, lampMinAlpha, pc);
                         float rB = (pick.y * ps + pick.z * pc) * sunOmega;    // p_B / p_L
                         float nlS = saturate(dot(N, sr.direction));
-                        Lv += u.sunColor * nlS * (st.WdA * (1.0 / M_PI_F) + fS / (1.0 + rB * rB));
+                        Lv += u.sunColor * cT * nlS * (st.WdA * (1.0 / M_PI_F) + fS / (1.0 + rB * rB));
                     }
                 }
             }
@@ -1275,6 +1283,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         if (dot(h.N, dir) > 0.0) h.N = -h.N;
         h.bary = res.triangle_barycentric_coord;
         h.instanceID = res.instance_id; h.primitiveID = res.primitive_id;
+        h.muO = saturate(-dot(h.N, dir));
         if ((u.pathFlags & kPathFlagDebugNoEmissionHits) == 0u) L += T * secondaryEmission(h.instanceID, sec.insts);
         // DH-1308 — the hit's LOBE, picked before the radiance cache is consulted: the cache holds the
         // light a surface sends back DIFFUSELY (view-independent), so only a diffuse pick may read or
@@ -1298,17 +1307,27 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 float NdotVh = saturate(dot(h.N, wo));
                 float m = mr.x, rB = max(glossyMinR, mr.y);
                 float4 lutB = float4(dfgLUT.sample(lutSmp, float2(NdotVh, rB)));
-                float3 F0 = mix(float3(0.04), Ahit, m);
+                // DH-1300 — the hit's own dielectric F0 (its layer record, by TLAS id = raster slot); DH-1298 —
+                // under its coat, the relative IOR, and the coat's own F0, colour and darkening below.
+                MaterialLayers mlHit = illumiMaterialLayersAt(sec.layerInsts, h.instanceID, sec.layerCount);
+                float2 ccHit = secondaryCoat(h.instanceID, sec.insts);
+                float3 F0 = mix(ccHit.x > 0.0 ? illumiDielectricF0UnderCoat(mlHit, ccHit.x) : illumiDielectricF0(mlHit),
+                                Ahit, m);
                 float3 Es = saturate(layeredEnvSpecular(F0, lutB.xy));
                 float2 cc = secondaryCoat(h.instanceID, sec.insts);
                 float ccS = max(cc.x, 0.0), rC = max(glossyMinR, cc.y), Ec = 0.0;
                 float4 lutC = lutB;
                 if (ccS > 0.0) {
                     lutC = float4(dfgLUT.sample(lutSmp, float2(NdotVh, rC)));
-                    Ec = saturate(ccS * layeredEnvSpecular(float3(0.04), lutC.xy).x);
+                    Ec = saturate(ccS * layeredEnvSpecular(float3(illumiCoatF0(mlHit)), lutC.xy).x);
                 }
-                float under = 1.0 - Ec;
-                float3 Wd = under * (1.0 - m) * (1.0 - Es);
+                // DH-1298 — everything under the coat takes its colour; the diffuse its darkening.
+                float3 under = (1.0 - Ec) * (ccS > 0.0 ? mix(float3(1.0), illumiCoatColor(mlHit), saturate(ccS)) : float3(1.0));
+                float3 Wd = under * (1.0 - m) * (1.0 - Es) * illumiCoatDarkening(mlHit, Ahit, ccS);
+                // DH-1301 — the diffuse share's EON factor, folded into its layer weight so the pick, the
+                // stack's NEE (`WdA`), the lobe weight and the radiance cache (which keeps Lambert A·E/π)
+                // all see it. Exactly 1 for a row without a diffuse roughness.
+                if (diffRoughOn) Wd *= secondaryEONRatio(Ahit, h.instanceID, h.muO, sec.insts);
                 float wD = pathLuma(Wd * Ahit), wS = pathLuma(under * Es), wC = Ec;
                 // INSTRUMENT (`kPathFlagDebugGlossyDiffuseOnly`): never pick a glossy lobe — the vertex is
                 // the layered model's diffuse share alone, so a frame reads (1 − Es)·A against the Lambert A.
@@ -1319,13 +1338,13 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                 stNext.on = (u.pathFlags & kPathFlagDebugGlossyBrute) == 0u;
                 stNext.WdA = Wd * Ahit;
                 stNext.lobe = pathGlossyLobe(h.N, wo, F0, rB, float3(under), lutB);
-                stNext.lobeC = pathGlossyLobe(h.N, wo, float3(0.04), rC, float3(ccS), lutC);
+                stNext.lobeC = pathGlossyLobe(h.N, wo, float3(illumiCoatF0(mlHit)), rC, float3(ccS), lutC);
                 pickNext = float3(wD, wS, wC) / wT;
                 float xi = illumiSobolOwen2DShuffled(sampleIndex, illumiPixelSeed(gid, 0x474C4F53u + v)).x * wT;   // 'GLOS'
                 if ((u.pathFlags & kPathFlagDebugGlossyBrute) != 0u) {
                     bruteNext = true;
                     nextLobe = pathGlossyLobe(h.N, wo, F0, rB, float3(under), lutB);
-                    nextLobeC = pathGlossyLobe(h.N, wo, float3(0.04), rC, float3(ccS), lutC);
+                    nextLobeC = pathGlossyLobe(h.N, wo, float3(illumiCoatF0(mlHit)), rC, float3(ccS), lutC);
                     bruteWdANext = Wd * Ahit;
                     lobeW = float3(1.0); rrAlb = Wd * Ahit + under * Es + Ec;
                 } else if (xi < wS && wS > 0.0) {
@@ -1334,7 +1353,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
                     lobeW = float3(wT / wS); rrAlb = under * Es;
                 } else if (xi < wS + wC && wC > 0.0) {
                     specNext = true;
-                    nextLobe = pathGlossyLobe(h.N, wo, float3(0.04), rC, float3(ccS), lutC);
+                    nextLobe = pathGlossyLobe(h.N, wo, float3(illumiCoatF0(mlHit)), rC, float3(ccS), lutC);
                     lobeW = float3(wT / wC); rrAlb = float3(Ec);
                 } else {
                     if (wD <= 0.0) break;
@@ -1372,12 +1391,19 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         // the roulette (with the throughput from before its 1/q) came out q× dark — 0.17 st, at any cell size.
         // DH-1308 — with glossy vertices a cell holds the LAMBERT radiance A·E/π of the diffuse picks only,
         // and a diffuse pick reads it × its own layer weight / pick probability (`lobeW`).
+        // DH-1301 — the LAMBERT vertex's EON factor (a glossy vertex folds its own into `Wd` above). Applied
+        // with the throughput the cache is read and recorded with, so a cell keeps the Lambert A·E/π.
+        float3 Alam = float3(0.0), eonL = float3(1.0);
+        if (!glossy && !thinT) {
+            Alam = saturate(secondaryAlbedo(h, pFull, sec, albedoAtlas));
+            if (diffRoughOn) eonL = secondaryEONRatio(Alam, h.instanceID, h.muO, sec.insts);
+        }
         if (rcRead && !specNext && !thinV && (v + 1u >= kRCMinVertex || res.distance > kRCFirstMinCells * rcCell)) {
             uint s = rcFind(rcKeys, rcKey(h.P, h.N, rcCell), false);
             if (s != 0xFFFFFFFFu) {
                 float cnt = atomic_load_explicit(&rcData[s * 4u + 3u], memory_order_relaxed);
                 if (cnt >= float(kRCMinCount)) {
-                    float3 Tr = glossy ? T * lobeW : T;
+                    float3 Tr = glossy ? T * lobeW : T * eonL;
                     L += Tr * float3(atomic_load_explicit(&rcData[s * 4u + 0u], memory_order_relaxed),
                                      atomic_load_explicit(&rcData[s * 4u + 1u], memory_order_relaxed),
                                      atomic_load_explicit(&rcData[s * 4u + 2u], memory_order_relaxed)) / cnt;
@@ -1387,7 +1413,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
         }
         if (rcWrite && !specNext && !thinV && rcN < kRCMaxVerts) {    // record it, to write its suffix at the end
             rcSlot[rcN] = rcFind(rcKeys, rcKey(h.P, h.N, rcCell), true);
-            rcT[rcN] = glossy ? T * lobeW : T; rcL[rcN] = L;
+            rcT[rcN] = glossy ? T * lobeW : T * eonL; rcL[rcN] = L;
             ++rcN;
         }
         if (thinV && !thinT) T *= thinW;               // Signack S5 — the reflect branch's 1/(1 − pT)
@@ -1402,8 +1428,7 @@ static inline float3 illumiPathTraceIncoming(thread Isect& isect, instance_accel
             bruteV = bruteNext; lobeC = nextLobeC; bruteWdA = bruteWdANext;
             st = stNext; pick = pickNext;
         } else {
-        float3 A = saturate(secondaryAlbedo(h, pFull, sec, albedoAtlas));
-        T *= A;
+        T *= Alam * eonL;                               // DH-1301 — eonL is exactly 1 without a diffuse roughness
         }
         P = h.P; N = thinT ? -h.N : h.N;
         layerBits = secondaryLayerBits(h.instanceID, sec.insts);
@@ -1497,6 +1522,11 @@ kernel void illumi_rt_lighting_tlas(
     device atomic_uint*                   rcKeys      [[buffer(21)]],
     device atomic_float*                  rcData      [[buffer(22)]],
     const device float*                   spotProfiles [[buffer(23)]],  // DH-0540 — the spot-profile rows
+    const device float*                   cloudShadow [[buffer(25)]],   // DH-1462 — cloud sun transmittance (dummy when off)
+    // Daydream DH-1300 — the material-layer slot target and the raster instance buffer it (and every
+    // TLAS id below `u.layerInstanceCount`) indexes; read only under kPathFlagLayeredSpecular.
+    texture2d<uint, access::read>         gMaterialLayer [[texture(14)]],
+    const device float4*                  layerInstances [[buffer(26)]],
     // Daydream DH-1304 — the per-term AOV capture (running means the deferred pass started this
     // frame) and its frame parameters. Exist only in the `kRTAOVEnabled` variants.
     texture2d_array<float, access::read_write> aovOut   [[texture(13), function_constant(kRTAOVEnabled)]],
@@ -1525,15 +1555,29 @@ kernel void illumi_rt_lighting_tlas(
     // and read `secondaryConeVisible` in IlluminatoramaSecondary.h first.
     float roughness = max(0.045, float(nrH.b));
     float3 albedo = float3(amH.rgb);
+    // DH-1301 — `albedoMetallic.a`: metalness, or (negative) a pure dielectric's diffuse roughness.
+    float  metallicRT = illumiUnpackMetallic(amH.a);
+    float  diffRoughRT = (u.pathFlags & kPathFlagDiffuseRoughness) != 0u ? illumiUnpackDiffuseRoughness(amH.a) : 0.0;
     float3 Pofs = P + N * max(u.rayTMin, 1e-3);
     // DH-1014 — the layered weights (diffuse: × albedo × incoming; reflection: × radiance).
     float3 Vrt = normalize(u.cameraWorldPos - P);
     float  NdotVrt = saturate(dot(N, Vrt));
-    float3 F0rt = mix(float3(0.04), albedo, float(amH.a));
-    LayeredRTWeights lw = layeredRTWeights(u.pathFlags, albedo, float(amH.a), roughness, NdotVrt,
+    // DH-1300 — the primary's layer parameters, by the same G-buffer slot the deferred pass reads.
+    bool layeredSpecRT = (u.pathFlags & kPathFlagLayeredSpecular) != 0u;
+    bool layeredCoatRT = (u.pathFlags & kPathFlagLayeredCoat) != 0u;   // DH-1309
+    MaterialLayers mlRT = (layeredSpecRT || layeredCoatRT)
+                        ? illumiMaterialLayersAt(layerInstances, gMaterialLayer.read(gid).r, 0xFFFFFFFFu)
+                        : illumiMaterialLayersNone();
+    if (!layeredSpecRT) mlRT.spec = false;
+    float coatWRT = layeredCoatRT ? mlRT.coat : 0.0, coatRRT = max(mlRT.coatRoughness, 0.02);
+    float3 dielF0RT = coatWRT > 0.0 ? illumiDielectricF0UnderCoat(mlRT, coatWRT) : illumiDielectricF0(mlRT);
+    float3 F0rt = mix(dielF0RT, albedo, metallicRT);
+    LayeredRTWeights lw = layeredRTWeights(u.pathFlags, albedo, metallicRT, roughness, NdotVrt,
                                            (u.pathFlags & (kPathFlagLayeredMultiscatter | kPathFlagLayeredSheen)) != 0u
                                                ? gEmission.read(gid).a : 0.0h,
-                                           dfgLUT, F0rt + (float3(1.0) - F0rt) * pow(1.0 - NdotVrt, 5.0));
+                                           dfgLUT, F0rt + (float3(1.0) - F0rt) * pow(1.0 - NdotVrt, 5.0),
+                                           diffRoughRT, dielF0RT, coatWRT, coatRRT, illumiCoatF0(mlRT),
+                                           illumiCoatColor(mlRT), illumiCoatDarkening(mlRT, albedo, coatWRT));   // DH-1298
 
     constexpr sampler skySamp(filter::linear, address::repeat);
     // The curve_data tag is compile-time; the base variant keeps the original
@@ -1558,6 +1602,9 @@ kernel void illumi_rt_lighting_tlas(
     sec.pointLights = pointLights; sec.spotLights = spotLights;
     sec.areaLights = areaLights;
     sec.spotProfiles = spotProfiles;   // DH-0540
+    sec.cloudShadow = cloudShadow;     // DH-1462
+    sec.layerInsts = layerInstances;   // DH-1300 — a hit's layer parameters by TLAS id
+    sec.layerCount = layeredSpecRT ? u.layerInstanceCount : 0u;
     SecondaryShadeParams secFull   = fullRadianceParams(u);   // reflections + cache fallbacks
     SecondaryShadeParams secBounce = giBounceParams(u);       // GI bounces (no sky double-count)
 
@@ -1612,14 +1659,13 @@ kernel void illumi_rt_lighting_tlas(
             // clear pane doesn't cast a solid shadow.
             if (isect.intersect(r, accel, u.transportRayMask).type != intersection_type::none) hits++;
         }
-        float vis = 1.0 - float(hits) / float(u.shadowRays);
+        float vis = (1.0 - float(hits) / float(u.shadowRays)) * illumiCloudSunTransmittance(sec.cloudShadow, P, Ld);
         float3 V = normalize(u.cameraWorldPos - P);
         float3 H = normalize(Ld + V);
         float spec = pow(saturate(dot(N, H)), mix(8.0, 90.0, 1.0 - roughness)) * (1.0 - roughness) * u.specStrength;
-        // DH-1301 — Oren-Nayar diffuse roughness on the traced sun, the twin of the deferred lane's
-        // `brdf` (same function, same sigma mapping); flag clear ⇒ the Lambert expression below.
-        float onScale = (u.pathFlags & kPathFlagDiffuseRoughness) != 0u
-                      ? orenNayarDiffuseScale(N, V, Ld, diffuseRoughnessSigma(roughness)) : 1.0;
+        // DH-1301 — the EON lobe on the traced sun, the twin of the deferred lane's `brdf` (same
+        // function); diffuse roughness 0 (or the flag clear) ⇒ exactly the Lambert expression.
+        float3 onScale = illumiEONLambertRatio(albedo, diffRoughRT, NdotL, saturate(dot(N, V)), dot(Ld, V));
         direct = u.sunColor * NdotL * vis * (albedo * (1.0 / M_PI_F) * onScale + spec);
     }
 
@@ -1685,6 +1731,7 @@ kernel void illumi_rt_lighting_tlas(
                 if (dot(h.N, dir) > 0.0) h.N = -h.N;      // face the incoming ray
                 h.bary = res.triangle_barycentric_coord;
                 h.instanceID = res.instance_id; h.primitiveID = res.primitive_id;
+                h.muO = saturate(-dot(h.N, dir));         // DH-1301
                 // DH-0622 — a surface-cache card supplies ONLY the hit's multi-bounce
                 // indirect term; it never stands in for the shading. A TLAS hit is
                 // per-instance-local, so resolve the global soup triangle first.
@@ -1806,7 +1853,8 @@ kernel void illumi_rt_lighting_tlas(
     // (as this pass did) left a mirror showing the sunset horizon with the room ghosted
     // faintly through it — the whole of the Primary Bathroom report.
     float reflHitFraction = 0.0;
-    if (u.reflEnabled != 0 && u.reflStrength > 0.0 && roughness <= u.reflRoughnessCutoff) {
+    float reflRough = lw.reflRoughness;
+    if (u.reflEnabled != 0 && u.reflStrength > 0.0 && reflRough <= u.reflRoughnessCutoff) {
         float3 V = normalize(u.cameraWorldPos - P);
         float3 R = reflect(-V, N);
         float NdotV = saturate(dot(N, V));
@@ -1815,8 +1863,8 @@ kernel void illumi_rt_lighting_tlas(
         // chrome surface (metalness 1) reflects the room at ~full strength and
         // tinted by its own colour. This is what turns the metal spheres into
         // mirrors instead of a 4 % gloss over the deferred specular-IBL base.
-        float metalness = float(amH.a);
-        float3 F0 = mix(float3(0.04), albedo, metalness);
+        float metalness = metallicRT;
+        float3 F0 = mix(dielF0RT, albedo, metalness);   // DH-1300 — the material's own dielectric F0
         // Plain Schlick at the macro NdotV — identical to the sibling RT path
         // (IlluminatoramaRT.metal). The roughness spread is already captured by
         // the cone sampling below, so a roughness-aware grazing floor here would
@@ -1826,7 +1874,7 @@ kernel void illumi_rt_lighting_tlas(
         float3 fres = F0 + (float3(1.0) - F0) * pow(1.0 - NdotV, 5.0);
         // DH-1014 — with the layered model on, the split-sum env BRDF the specular IBL this
         // reflection replaces is weighted by (`lw.reflection`); `fres` itself otherwise.
-        if ((u.pathFlags & (kPathFlagLayeredMultiscatter | kPathFlagLayeredSheen)) != 0u) fres = lw.reflection;
+        if ((u.pathFlags & (kPathFlagLayeredMultiscatter | kPathFlagLayeredSheen)) != 0u || coatWRT > 0.0) fres = lw.reflection;
         // Glossy cone widens with roughness² (GGX α scales as roughness²); mirror
         // surfaces stay tight. Harmonised with the soup-path kernel in
         // IlluminatoramaRT.metal (#60 task 5) — was the linear `roughness * 0.5`,
@@ -1863,8 +1911,8 @@ kernel void illumi_rt_lighting_tlas(
         uint hits = 0u;
         isect.accept_any_intersection(false);
         for (uint i = 0; i < rrays; ++i) {
-            float3 dir = secondaryConeVisible(roughness, kReflConeK)
-                ? coneSample(R, secondaryConeRad(roughness, kReflConeK), rnd(seed), rnd(seed)) : R;
+            float3 dir = secondaryConeVisible(reflRough, kReflConeK)
+                ? coneSample(R, secondaryConeRad(reflRough, kReflConeK), rnd(seed), rnd(seed)) : R;
             if (dot(dir, N) <= 0.0) continue;
             ray r; r.origin = Pofs; r.direction = dir;
             r.min_distance = max(u.rayTMin, 1e-3); r.max_distance = u.reflMaxDist;
@@ -1914,6 +1962,7 @@ kernel void illumi_rt_lighting_tlas(
             if (dot(h.N, dir) > 0.0) h.N = -h.N;          // face the incoming ray
             h.bary = res.triangle_barycentric_coord;
             h.instanceID = res.instance_id; h.primitiveID = res.primitive_id;
+            h.muO = saturate(-dot(h.N, dir));             // DH-1301
             // DH-0622 — same card resolution as the GI path: the cache supplies only the
             // indirect term the shader would otherwise estimate with its fill.
             uint cardState = SURF_STAT_RESHADE;
@@ -2194,6 +2243,7 @@ kernel void illumi_volumetric_rt_admittance(
     instance_acceleration_structure       accel       [[buffer(0)]],
     constant VolRTUniforms&               u           [[buffer(1)]],
     device atomic_uint*                   counts      [[buffer(2)]],
+    const device float*                   cloudShadow [[buffer(3)]],   // DH-1492 — cloud sun transmittance (dummy when off)
     uint2 gid [[thread_position_in_grid]])
 {
     uint gx = max(u.admittanceGrid, 1u);
@@ -2211,16 +2261,19 @@ kernel void illumi_volumetric_rt_admittance(
     bool sunOn = volRTSunOn(u);
     uint N = clamp(u.steps, 1u, 64u);
     float dt = tEnd / float(N);
+    // Counted in 1/64ths of a sample, so a sample under a cloud admits only the sun the deck lets
+    // through (DH-1492); with the deck off every sunlit sample counts 64 and the ratio is unchanged.
     uint roofed = 0u, sunlit = 0u;
     for (uint i = 0u; i < N; ++i) {
         float3 X = u.cameraWorldPos + rd * ((float(i) + 0.5) * dt);
         ray up; up.origin = X; up.direction = float3(0.0, 1.0, 0.0);
         up.min_distance = 0.0; up.max_distance = u.roofReach;
         if (isect.intersect(up, accel, u.transportMask).type == intersection_type::none) continue;
-        roofed++;
+        roofed += 64u;
         if (!sunOn) continue;
         ray sr; sr.origin = X; sr.direction = toSun; sr.min_distance = max(u.rayTMin, 1e-3); sr.max_distance = 1e4;
-        if (isect.intersect(sr, accel, u.transportMask).type == intersection_type::none) sunlit++;
+        if (isect.intersect(sr, accel, u.transportMask).type == intersection_type::none)
+            sunlit += uint(round(64.0 * illumiCloudSunTransmittance(cloudShadow, X, toSun)));
     }
     if (roofed > 0u) atomic_fetch_add_explicit(&counts[0], roofed, memory_order_relaxed);
     if (sunlit > 0u) atomic_fetch_add_explicit(&counts[1], sunlit, memory_order_relaxed);
@@ -2254,6 +2307,7 @@ kernel void illumi_volumetric_rt(
     constant VolRTUniforms&               u           [[buffer(1)]],
     const device RTAreaLight*             areaLights  [[buffer(2)]],
     const device uint*                    admittance  [[buffer(3)]],   // counts from the pre-pass
+    const device float*                   cloudShadow [[buffer(4)]],   // DH-1492 — cloud sun transmittance (dummy when off)
     uint2 gid [[thread_position_in_grid]])
 {
     if (gid.x >= u.width || gid.y >= u.height || u.density <= 0.0) return;
@@ -2313,7 +2367,7 @@ kernel void illumi_volumetric_rt(
         if (sunOn) {
             ray sr; sr.origin = X; sr.direction = toSun; sr.min_distance = tMin; sr.max_distance = 1e4;
             if (isect.intersect(sr, accel, u.transportMask).type == intersection_type::none) {
-                Lx += u.sunColor * (sunSigmaPhase * u.sunScatter);
+                Lx += u.sunColor * (sunSigmaPhase * u.sunScatter * illumiCloudSunTransmittance(cloudShadow, X, toSun));   // DH-1492
             }
         }
 

@@ -268,6 +268,27 @@ extension ForestTreeGeometry {
     /// `// winding-ok:` native Illuminatorama soup (no SCNGeometry winding).
 
     // ===== emitLeaves+emitLeafCard (lines 3717-3932) =====
+    /// DH-1487 — the crown-FILL leaf cutout. A/B lever (default ON): off = the ovate 4-triangle card,
+    /// byte-identical to before.
+    nonisolated(unsafe) public static var fillCardCutout = true
+
+    /// The engine's species code for `illumiLeafCutoutKeep` (1 oak, 2 maple, 3 birch, 4 elliptic;
+    /// 0 = no cutout) and the card scale that gives its leaf the ovate card's area. The areas are the
+    /// mask's own, in card units (`IlluminatoramaLeafCutout.area`, held to these by a test): ovate card
+    /// 1.066 ÷ leaf area, square-rooted, applied to both axes.
+    public static func leafCutoutCode(_ species: Species) -> (code: Int, scale: Float) {
+        guard fillCardCutout else { return (0, 1) }
+        switch species {
+        case .oak:                         return (1, (1.066 / leafCutoutArea[1]).squareRoot())
+        case .maple:                       return (2, (1.066 / leafCutoutArea[2]).squareRoot())
+        case .birch:                       return (3, (1.066 / leafCutoutArea[3]).squareRoot())
+        case .orange, .lemon, .elderberry: return (4, (1.066 / leafCutoutArea[4]).squareRoot())
+        case .fir:                         return (0, 1)
+        }
+    }
+    /// Leaf area per cutout code inside the roomy card, in (v, u) card units.
+    public static let leafCutoutArea: [Float] = [1.066, 0.895, 0.582, 0.864, 1.032]
+
     public static func emitLeafCard(_ s: inout Soup, pos: SIMD3<Float>,
                                      xAxis: SIMD3<Float>, yAxis: SIMD3<Float>,
                                      normal bentNormal: SIMD3<Float>, w: Float, h: Float,
@@ -386,8 +407,13 @@ extension ForestTreeGeometry {
                 // three normals, so any per-half difference comes back as the crease.
                 let jitA = 0.80 + 0.40 * rng.unit()            // aspect variety
                 let jitS = 0.90 + 0.36 * rng.unit()            // size variety (a capped budget: area per triangle buys opacity)
-                let hwN = w * 0.44 * farEnlarge * jitS * jitA.squareRoot()
-                let hhN = h * 0.98 * farEnlarge * jitS / jitA.squareRoot()
+                // DH-1487 — with the leaf CUTOUT on, the card is a roomier hexagon the species' leaf
+                // is cut out of per pixel (`leafCutoutCode`), scaled so the leaf covers what the
+                // ovate card did; off (or a species without an outline), the ovate card exactly.
+                let cut = Self.leafCutoutCode(species)
+                let cardScale = cut.code > 0 ? cut.scale : 1
+                let hwN = w * 0.44 * farEnlarge * jitS * jitA.squareRoot() * cardScale
+                let hhN = h * 0.98 * farEnlarge * jitS / jitA.squareRoot() * cardScale
                 let sink = bentNormal * (hwN * 0.04)
                 // Ovate outline from SIX points (4 triangles, fanned from the base): base,
                 // shoulder at 30 % (u .80), upper margin at 72 % (u .70), tip. A 2-triangle
@@ -399,14 +425,31 @@ extension ForestTreeGeometry {
                     pos + yAxis * (hhN * (v - 0.45)) + xAxis * (hwN * u)
                         + bentNormal * (hwN * 0.12 * u * u) - sink
                 }
+                let (p1, p2) = cut.code > 0 ? (SIMD2<Float>(0.15, 0.95), SIMD2<Float>(0.85, 0.95))
+                                            : (SIMD2<Float>(0.30, 0.80), SIMD2<Float>(0.72, 0.70))
                 let bN = at(0, 0), tN = at(1, 0)
-                let r1 = at(0.30, 0.80), r2 = at(0.72, 0.70)
-                let l1 = at(0.30, -0.80), l2 = at(0.72, -0.70)
+                let r1 = at(p1.x, p1.y), r2 = at(p2.x, p2.y)
+                let l1 = at(p1.x, -p1.y), l2 = at(p2.x, -p2.y)
                 let nCard = bentNormal
+                // The cutout coordinate of a card point (v along, u across): (u, v + 2·code).
+                func cu(_ v: Float, _ u: Float) -> SIMD2<Float> { cut.code > 0 ? SIMD2(u, v + 2 * Float(cut.code)) : .zero }
+                // `tri` drops a culled / degenerate triangle, so stamp only what it actually appended.
+                var mark = s.cardUVs.count
+                func stamp(_ a: SIMD2<Float>, _ b: SIMD2<Float>, _ c: SIMD2<Float>) {
+                    let n = s.cardUVs.count
+                    if n == mark + 3 { s.cardUVs[n - 3] = a; s.cardUVs[n - 2] = b; s.cardUVs[n - 1] = c }
+                    mark = n
+                }
+                let cb = cu(0, 0), ct = cu(1, 0)
+                let cr1 = cu(p1.x, p1.y), cr2 = cu(p2.x, p2.y), cl1 = cu(p1.x, -p1.y), cl2 = cu(p2.x, -p2.y)
                 s.tri(bN, r1, r2, n0: nCard, n1: nCard, n2: nCard, c0: midribCol, c1: marginCol, c2: marginCol)
+                stamp(cb, cr1, cr2)
                 s.tri(bN, r2, tN, n0: nCard, n1: nCard, n2: nCard, c0: midribCol, c1: marginCol, c2: tipCol)
+                stamp(cb, cr2, ct)
                 s.tri(bN, tN, l2, n0: nCard, n1: nCard, n2: nCard, c0: midribCol, c1: tipCol, c2: marginCol)
+                stamp(cb, ct, cl2)
                 s.tri(bN, l2, l1, n0: nCard, n1: nCard, n2: nCard, c0: midribCol, c1: marginCol, c2: marginCol)
+                stamp(cb, cl2, cl1)
                 return
             }
             let hw0 = w * 0.74 * farEnlarge

@@ -24,6 +24,9 @@ extension IlluminatoramaRenderer {
         // to 0xFFFFFFFF (sky/no-geometry) — the all-bits default means no scene that
         // leaves layers/masks untouched sees any change.
         var layer: MTLTexture
+        /// Daydream DH-1300 — the material-layer target (R32Uint): each fragment's instance slot, or
+        /// 0xFFFFFFFF when its instance carries no layer parameters (IlluminatoramaMaterialLayers.h).
+        var materialLayer: MTLTexture
         var historyA: MTLTexture
         var historyB: MTLTexture
         /// The TAA resolve's DOWNSTREAM output — the sharpened frame bloom and
@@ -85,12 +88,15 @@ extension IlluminatoramaRenderer {
 
     /// `illumi_fs` specialised for one lane (DH-0140): `extended` selects the six-target output
     /// struct. The fragment carries a function constant now, so it can no longer be made by name alone.
-    static func makeGBufferFragment(library: MTLLibrary, extended: Bool, interior: Bool = false) throws -> MTLFunction {
+    static func makeGBufferFragment(library: MTLLibrary, extended: Bool, interior: Bool = false,
+                                    leafCutout: Bool = false) throws -> MTLFunction {
         let c = MTLFunctionConstantValues()
         var ext = extended
         c.setConstantValue(&ext, type: .bool, index: 11)
         var imap = interior
         c.setConstantValue(&imap, type: .bool, index: 12)
+        var cut = leafCutout
+        c.setConstantValue(&cut, type: .bool, index: 13)
         return try library.makeFunction(name: "illumi_fs", constantValues: c)
     }
 
@@ -116,11 +122,57 @@ extension IlluminatoramaRenderer {
         d.colorAttachments[2].pixelFormat = .rgba16Float
         d.colorAttachments[3].pixelFormat = .rg16Float
         d.colorAttachments[4].pixelFormat = .r32Uint
+        d.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot
         if extended { d.colorAttachments[5].pixelFormat = .rgba16Float }
         d.depthAttachmentPixelFormat = .depth32Float
         Self.declareVisBufferAttachment(d, device: device)
         let p = try? device.makeRenderPipelineState(descriptor: d)
         if extended { gbs.gbufferPipelineInteriorExt = p } else { gbs.gbufferPipelineInterior = p }
+        return p
+    }
+
+    /// Daydream DH-1487 — honour meshes' `leafCutout` (default ON). Off = every card draws whole, in
+    /// every pass: the A/B lever.
+    public var leafCutoutEnabled: Bool {
+        get { gbs.leafCutoutEnabled }
+        set { gbs.leafCutoutEnabled = newValue }
+    }
+
+    /// How many of the nearest sun cascades cut leaves out in their shadow maps (DH-1487; default 1 —
+    /// see `bindShadowPipeline`). 0 = no cascade, `cascadeCount` = every one.
+    public var leafCutoutShadowCascades: Int {
+        get { gbs.leafCutoutShadowCascades }
+        set { gbs.leafCutoutShadowCascades = newValue }
+    }
+
+    /// The leaf-cutout G-buffer pipeline for this lane (Daydream DH-1487; built once, nil if it fails
+    /// to compile — the mesh then draws whole cards with the ordinary pipeline).
+    func leafCutoutGBufferPipeline(extended: Bool) -> MTLRenderPipelineState? {
+        if let p = extended ? gbs.gbufferPipelineCutoutExt : gbs.gbufferPipelineCutout { return p }
+        guard let library = engine.library else { return nil }
+        let d = MTLRenderPipelineDescriptor()
+        d.label = extended ? "Illuminatorama.gbuffer.leafCutout.ext" : "Illuminatorama.gbuffer.leafCutout"
+        let vsC = MTLFunctionConstantValues()
+        var pv = false
+        vsC.setConstantValue(&pv, type: .bool, index: 10)
+        do {
+            d.vertexFunction = try library.makeFunction(name: "illumi_vs", constantValues: vsC)
+            d.fragmentFunction = try Self.makeGBufferFragment(library: library, extended: extended, leafCutout: true)
+        } catch {
+            Self.log.error("leaf-cutout G-buffer: compile failed: \(error.localizedDescription)")
+            return nil
+        }
+        d.colorAttachments[0].pixelFormat = .rgba16Float
+        d.colorAttachments[1].pixelFormat = .rgba16Float
+        d.colorAttachments[2].pixelFormat = .rgba16Float
+        d.colorAttachments[3].pixelFormat = .rg16Float
+        d.colorAttachments[4].pixelFormat = .r32Uint
+        d.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot
+        if extended { d.colorAttachments[5].pixelFormat = .rgba16Float }
+        d.depthAttachmentPixelFormat = .depth32Float
+        Self.declareVisBufferAttachment(d, device: device)
+        let p = try? device.makeRenderPipelineState(descriptor: d)
+        if extended { gbs.gbufferPipelineCutoutExt = p } else { gbs.gbufferPipelineCutout = p }
         return p
     }
 
@@ -140,6 +192,7 @@ extension IlluminatoramaRenderer {
         d.colorAttachments[2].pixelFormat = .rgba16Float
         d.colorAttachments[3].pixelFormat = .rg16Float
         d.colorAttachments[4].pixelFormat = .r32Uint
+        d.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot
         d.colorAttachments[5].pixelFormat = .rgba16Float
         d.depthAttachmentPixelFormat = .depth32Float
         declareVisBufferAttachment(d, device: device)
@@ -241,6 +294,9 @@ extension IlluminatoramaRenderer {
         let layer = try make(label: "Illuminatorama.gbuffer.layer",
                              format: .r32Uint, w: internalW, h: internalH,
                              usage: [.renderTarget, .shaderRead])
+        let materialLayer = try make(label: "Illuminatorama.gbuffer.materialLayer",
+                                     format: .r32Uint, w: internalW, h: internalH,
+                                     usage: [.renderTarget, .shaderRead])
         let historyA = try make(label: "Illuminatorama.historyA",
                                 format: .rgba16Float, w: internalW, h: internalH,
                                 usage: [.shaderRead, .shaderWrite])
@@ -368,7 +424,7 @@ extension IlluminatoramaRenderer {
         return Targets(
             albedoMet: am, normalRgh: nr, emission: em, depth: depth,
             hdr: hdr, ao: ao, hdrComposite: hdrComposite, rtDiffuse: rtDiffuse,
-            velocity: velocity, layer: layer, historyA: historyA, historyB: historyB,
+            velocity: velocity, layer: layer, materialLayer: materialLayer, historyA: historyA, historyB: historyB,
             taaResolved: taaResolved,
             bloomDown: bloomDown, bloomUp: bloomUp,
             halationBright: hb, halationBlurH: hbh, halationBlurV: hbv,

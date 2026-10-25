@@ -51,53 +51,18 @@ using namespace metal;
 /// FrameUniforms.frameFlags bit 3 — cloth sheen read from the LUT's fitted albedo (both
 /// environment arms) and energy-conserving against the base (albedo scaling).
 #define kFrameFlagLayeredSheen        8u
-/// FrameUniforms.frameFlags bit 7 (128) — DIFFUSE ROUGHNESS (Daydream DH-1301): the DIRECT diffuse
-/// lobe of rough surfaces is the qualitative Oren-Nayar term instead of Lambert (see
-/// `orenNayarDiffuseScale`). Mirrored for the ray-traced lighting kernel as
-/// RTInstUniforms.pathFlags kPathFlagDiffuseRoughness. Clear (the default) ⇒ every caller keeps
-/// its Lambert expression, so a host that never opts in is byte-identical.
+/// FrameUniforms.frameFlags bit 7 (128) — DIFFUSE ROUGHNESS (Daydream DH-1301): the master switch for
+/// the EON lobe (IlluminatoramaDiffuseRoughness.h). The per-pixel value rides the sign of
+/// `albedoMetallic.a`, so with the flag set a pixel whose material never set one is still Lambert,
+/// bit for bit. Mirrored for the ray-traced lighting kernel as RTInstUniforms.pathFlags
+/// kPathFlagDiffuseRoughness (the traced primary's sun, its GI weight, every secondary / path
+/// vertex). Clear ⇒ every lane is Lambert whatever the materials carry.
 #define kFrameFlagDiffuseRoughness    128u
-/// RTInstUniforms.pathFlags bit 14 (16384) — the same switch for the ray-traced primary sun.
+/// RTInstUniforms.pathFlags bit 14 (16384) — the same switch for the ray-traced lighting kernel.
 #define kPathFlagDiffuseRoughness     16384u
 
-// ── Diffuse roughness: qualitative Oren-Nayar (Daydream DH-1301) ───────────────────────────────
-//
-// A Lambert surface looks flat and plastic from a low angle: real rough diffuse (plaster, carpet,
-// matte paint, unglazed ceramic) BACKSCATTERS — it is brighter when the light comes from the
-// viewer's side, and stays bright toward grazing instead of falling off like cos(theta).
-//
-// Fujii's improved qualitative Oren-Nayar ("A tiny improvement of Oren-Nayar reflectance model",
-// 2012), per Oren & Nayar 1994 with the interreflection term folded into the constants:
-//     A = 1 / (pi + (pi/2 - 2/3) sigma),    B = sigma * A
-//     s = L.V - (N.L)(N.V),                 t = s > 0 ? max(N.L, N.V) : 1
-//     f = albedo * (A + B * s / t)                  [times N.L, applied by the caller]
-// Relative to Lambert (albedo/pi) that is the dimensionless scale
-//     scale = pi * A * (1 + sigma * s / t)
-// which this function returns, so every caller just multiplies the Lambert diffuse it already
-// has. Needs only N.L, N.V and L.V. sigma = 0 gives A = 1/pi, B = 0 => scale == 1.0 EXACTLY
-// (and the function returns the literal 1.0 for sigma <= 0 so it is bit-exact). Backscatter
-// (s > 0, light and eye on the same side) lifts the scale above 1 toward grazing; forward
-// scatter (s < 0, t = 1) dims it a little. For sigma <= 0.6 the result stays within ~[0.4, 1.6].
-//
-// sigma (radians) comes from the material roughness already in the G-buffer, no new field:
-//     sigma = saturate((roughness - 0.40) / 0.60) * 0.60
-// so anything at roughness <= 0.40 (glossy, glazed, polished) is exactly Lambert, and a fully
-// rough surface (roughness 1) is sigma 0.60 (~34 degrees facet slope).
-//
-// NOT applied: LTC / area-light diffuse and every IBL / irradiance diffuse (their cosine
-// integral over a whole patch of sky or emitter has no L to evaluate at) stay Lambert.
-static inline float diffuseRoughnessSigma(float roughness) {
-    return saturate((roughness - 0.40) / 0.60) * 0.60;
-}
-static inline float orenNayarDiffuseScale(float3 N, float3 V, float3 L, float sigma) {
-    if (!(sigma > 0.0)) return 1.0;
-    float NdotL = saturate(dot(N, L));
-    float NdotV = saturate(dot(N, V));
-    float s = dot(L, V) - NdotL * NdotV;
-    float t = s > 0.0 ? max(max(NdotL, NdotV), 1e-4) : 1.0;
-    float A = 1.0 / (M_PI_F + (0.5 * M_PI_F - 2.0 / 3.0) * sigma);
-    return M_PI_F * A * (1.0 + sigma * s / t);
-}
+#include "IlluminatoramaDiffuseRoughness.h"
+#include "IlluminatoramaMaterialLayers.h"   // DH-1300 — the per-material specular F0
 
 // ── Cloth sheen lobe (moved here from IlluminatoramaLighting.metal so the LUT bake integrates
 //    the IDENTICAL functions the direct lobe evaluates — the two arms cannot drift) ──────────
@@ -174,10 +139,32 @@ struct LayeredEnergy {
     float  baseUnderSheen;
     /// Directional albedo of the sheen lobe at μo — the environment arm's magnitude.
     float  sheenAlbedo;
-    /// Daydream DH-1301 — Oren-Nayar sigma (radians) for the DIRECT diffuse lobe; 0 ⇒ Lambert.
-    float  onSigma;
+    /// Daydream DH-1301 — the pixel's diffuse roughness (OpenPBR `base_diffuse_roughness`, EON);
+    /// 0 ⇒ Lambert. Read by `brdf` / `brdfDiffuse` (the full lobe, per light direction).
+    float  diffuseRoughness;
+    /// E_EON(μo)/ρ — what every INTEGRATED source (area lights, IBL, ambient) multiplies ρ by; 1 ⇒ Lambert.
+    float3 eonAlbedoRatio;
     /// Whether the multiscatter / diffuse-weight half is live (else callers keep the legacy terms).
     bool   multiscatter;
+    /// Daydream DH-1300 — the dielectric base's F0 (OpenPBR `specular_weight · F0(specular_ior)`,
+    /// tinted by `specular_color`; IlluminatoramaMaterialLayers.h). What every lobe's
+    /// `mix(F0, albedo, metallic)` mixes from; the literal 0.04 unless the material set one.
+    float3 dielectricF0;
+    /// Daydream DH-1309 — the COAT as a layer (`layeredWithCoat`). `coatOn` false ⇒ every caller keeps
+    /// its pre-DH-1309 expression and the fields below are unread.
+    bool   coatOn;
+    float  coatWeight;        // OpenPBR coat_weight (the instance's clearcoat strength)
+    float  coatRoughness;     // perceptual; the LUT's axis
+    float  coatF0;            // F0 of the coat interface (0.04 = IOR 1.5)
+    float  coatSpecMS;        // Turquin multiple-scattering factor of the coat's direct lobe
+    float  coatEnvAlbedo;     // E_env(F0c, μo): the coat's environment lobe albedo (× prefiltered radiance)
+    /// What reaches the base and comes back out under a punctual / area light: `1 − w·E_coat,direct(μo)`
+    /// (the coat lobe's OWN directional albedo, from the DFG LUT) — × the coat tint (DH-1298).
+    float3 underCoatDirect;
+    /// …and under the environment: `1 − w·E_coat,env(μo)`, × the tint.
+    float3 underCoatEnv;
+    /// DH-1298 — the base's DIFFUSE darkening under the coat (internal reflection; 1 = none).
+    float3 coatDarken;
 };
 
 /// Fdez-Agüera 2019 ("A Multiple-Scattering Microfacet Model for Real-Time Image-Based
@@ -212,7 +199,12 @@ static inline LayeredEnergy layeredOff() {
     e.baseUnderSheen = 1.0;
     e.sheenAlbedo = 0.0;
     e.multiscatter = false;
-    e.onSigma = 0.0;
+    e.diffuseRoughness = 0.0;
+    e.eonAlbedoRatio = float3(1.0);
+    e.dielectricF0 = float3(0.04);
+    e.coatOn = false; e.coatWeight = 0.0; e.coatRoughness = 0.08; e.coatF0 = 0.04;
+    e.coatSpecMS = 1.0; e.coatEnvAlbedo = 0.0;
+    e.underCoatDirect = float3(1.0); e.underCoatEnv = float3(1.0); e.coatDarken = float3(1.0);
     return e;
 }
 
@@ -225,11 +217,14 @@ static inline LayeredEnergy layeredOff() {
 static inline LayeredEnergy layeredEnergy(float3 albedo, float metallic,
                                           float4 lut, float sheenLutA,
                                           float sheenStrength,
-                                          bool multiscatter, bool sheen) {
-    LayeredEnergy e;
-    float3 F0 = mix(float3(0.04), albedo, metallic);
+                                          bool multiscatter, bool sheen,
+                                          float3 dielectricF0 = float3(0.04)) {
+    LayeredEnergy e = layeredOff();
+    e.dielectricF0 = dielectricF0;     // DH-1300
+    float3 F0 = mix(dielectricF0, albedo, metallic);
     e.multiscatter = multiscatter;
-    e.onSigma = 0.0;   // set by the lighting kernel under kFrameFlagDiffuseRoughness
+    e.diffuseRoughness = 0.0;          // set by `layeredWithDiffuseRoughness`
+    e.eonAlbedoRatio = float3(1.0);
     e.envSpec = layeredEnvSpecular(F0, lut.xy);
     if (multiscatter) {
         float Ed = clamp(lut.z, 1e-3, 1.0);
@@ -259,6 +254,59 @@ static inline LayeredEnergy layeredEnergy(float3 albedo, float metallic,
     return e;
 }
 
+/// Daydream DH-1301 — stamp a pixel's diffuse roughness onto its energy terms: the EON lobe for
+/// every light with a direction (`brdf`, `brdfDiffuse`) and the lobe's directional albedo for
+/// every integrated source (`eonAlbedoRatio`). r ≤ 0 leaves `e` exactly as it was.
+static inline LayeredEnergy layeredWithDiffuseRoughness(LayeredEnergy e, float3 albedo,
+                                                        float diffuseRoughness, float NdotV) {
+    if (!(diffuseRoughness > 0.0)) return e;
+    e.diffuseRoughness = diffuseRoughness;
+    e.eonAlbedoRatio = illumiEONAlbedoRatio(albedo, diffuseRoughness, NdotV);
+    return e;
+}
+
+// ── The COAT layer (Daydream DH-1309) ───────────────────────────────────────────────────────
+//
+// OpenPBR's coat is a dielectric layer over everything below it: its own GGX lobe (the coat's IOR,
+// its own roughness), and whatever that lobe reflects is gone from the layers beneath ("albedo
+// scaling", the rule the sheen layer already follows). The Phase-7 clearcoat was a special case:
+// a fixed-F0 lobe for the SUN and the IBL only — no lamp, spot, fill or window portal ever lit it,
+// so a lacquered floor under a room of cans showed none of them — and the base under it was
+// attenuated by `1 − cc·Schlick(N·V)`, a number unrelated to what the coat lobe actually reflects.
+//
+// Here the coat is a second lobe evaluated by the SAME light loops as the base, the base below it
+// takes `1 − w·E_coat(μo)` — the coat lobe's own directional albedo, from the DFG LUT texel at
+// (μo, coat roughness): the DIRECT lobe's for the lights, the ENVIRONMENT lobe's for the IBL — and
+// a white base under any coat returns exactly 1 under a uniform light (the furnace's coated row).
+// The coat's direct lobe is the LUT's `.b` lobe (analytic-k Schlick-GGX G, Schlick F) with a
+// RELATIVE-guarded D (`pathGGXD`): the deferred `distributionGGX`'s `+1e-7` clips the peak below
+// roughness ~0.2 (DH-1306) — a polish (0.08) would keep ~5 % of its highlight and its energy would
+// no longer match the albedo the base was charged. A punctual light with a physical size widens the
+// coat lobe by its angular radius (`sourceTan`; the convolution of two GGX-like lobes keeps unit
+// energy), so a lamp in a lacquered floor is a soft-edged reflection of the lamp, not a 1-px spark.
+
+/// The coat's terms for a pixel: weight `w`, roughness `r`, interface F0 `f0`, the LUT texel at
+/// (μo, r), the coat tint (DH-1298, 1 = clear) and the base's diffuse darkening (1 = none).
+/// `w ≤ 0` returns `e` unchanged.
+static inline LayeredEnergy layeredWithCoat(LayeredEnergy e, float w, float r, float f0, float4 lutC,
+                                            float3 tint, float3 darken) {
+    if (!(w > 0.0)) return e;
+    e.coatOn = true;
+    e.coatWeight = saturate(w);
+    e.coatRoughness = r;
+    e.coatF0 = f0;
+    float Ed = clamp(lutC.z, 1e-3, 1.0);
+    float AB = max(lutC.x + lutC.y, 1e-4);
+    e.coatSpecMS = 1.0 + f0 * ((1.0 - Ed) / Ed);
+    float EcD = saturate(Ed * (f0 * lutC.x + lutC.y) / AB * e.coatSpecMS);
+    e.coatEnvAlbedo = saturate(layeredEnvSpecular(float3(f0), lutC.xy).x);
+    float3 t = mix(float3(1.0), tint, e.coatWeight);
+    e.underCoatDirect = (1.0 - e.coatWeight * EcD) * t;
+    e.underCoatEnv    = (1.0 - e.coatWeight * e.coatEnvAlbedo) * t;
+    e.coatDarken = darken;
+    return e;
+}
+
 // ── The ray-traced lighting kernel's half (IlluminatoramaRTInstanced.metal) ─────────────────
 //
 // The traced GI (one-bounce or the path-traced Maximum lane) REPLACES the deferred pass's
@@ -280,6 +328,8 @@ static inline LayeredEnergy layeredEnergy(float3 albedo, float metallic,
 struct LayeredRTWeights {
     float3 diffuse;      // × albedo × incoming irradiance
     float3 reflection;   // × traced reflected radiance
+    /// The roughness the reflection is traced at (the surface's own — the base's, under a coat too).
+    float  reflRoughness;
 };
 
 /// `fresLegacy` is the kernel's historical reflection Fresnel, returned unchanged when the
@@ -287,12 +337,31 @@ struct LayeredRTWeights {
 static inline LayeredRTWeights layeredRTWeights(uint pathFlags, float3 albedo, float metallic,
                                                 float roughness, float NdotV, half emissionAlpha,
                                                 texture2d<half, access::sample> dfgLUT,
-                                                float3 fresLegacy) {
+                                                float3 fresLegacy, float diffuseRoughness = 0.0,
+                                                float3 dielectricF0 = float3(0.04),
+                                                float coatW = 0.0, float coatR = 0.08, float coatF0 = 0.04,
+                                                float3 coatTint = float3(1.0), float3 coatDarken = float3(1.0)) {
     LayeredRTWeights w;
-    w.diffuse = float3(1.0);
+    w.reflRoughness = roughness;
+    // DH-1301 — the traced GI replaces the deferred diffuse ENVIRONMENT, which a rough diffuse
+    // surface weights by its EON directional albedo; the replacement takes the same factor
+    // (exactly 1 at diffuse roughness 0, with or without the layered switches).
+    w.diffuse = illumiEONAlbedoRatio(albedo, diffuseRoughness, NdotV);
     w.reflection = fresLegacy;
     bool ms = (pathFlags & kPathFlagLayeredMultiscatter) != 0u;
     bool sh = (pathFlags & kPathFlagLayeredSheen) != 0u;
+    // DH-1309 — the coat layer (the deferred pass's `layeredWithCoat`, from the same LUT). The traced
+    // diffuse and the traced reflection replace the deferred diffuse environment and the BASE's
+    // specular IBL, both of which sit under the coat: each takes the coat's `1 − w·E_env` (× tint;
+    // the diffuse also the darkening). `coatW` 0 (the coat layer off, or no coat) ⇒ untouched.
+    constexpr sampler cs(filter::linear, address::clamp_to_edge);
+    LayeredEnergy coat = layeredOff();
+    if (coatW > 0.0) {
+        coat = layeredWithCoat(coat, coatW, coatR, coatF0, float4(dfgLUT.sample(cs, float2(NdotV, coatR))),
+                               coatTint, coatDarken);
+        w.diffuse *= coat.underCoatEnv * coat.coatDarken;
+        w.reflection *= coat.underCoatEnv;
+    }
     if (!ms && !sh) return w;
     // The sheen decode is the deferred kernel's (`emission.alpha = -(band + strength)`).
     float sheenStrength = 0.0, sheenRoughness = clothSheenRoughnessForBand(0);
@@ -305,8 +374,8 @@ static inline LayeredRTWeights layeredRTWeights(uint pathFlags, float3 albedo, f
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     float4 lut = float4(dfgLUT.sample(s, float2(NdotV, roughness)));
     float sheenA = (sh && sheenStrength > 0.0) ? float(dfgLUT.sample(s, float2(NdotV, sheenRoughness)).a) : 0.0;
-    LayeredEnergy e = layeredEnergy(albedo, metallic, lut, sheenA, sheenStrength, ms, sh);
-    if (ms) { w.diffuse = e.diffuseEnv; w.reflection = e.envSpec; }
+    LayeredEnergy e = layeredEnergy(albedo, metallic, lut, sheenA, sheenStrength, ms, sh, dielectricF0);
+    if (ms) { w.diffuse *= e.diffuseEnv; w.reflection = e.envSpec * coat.underCoatEnv; }
     w.diffuse *= e.baseUnderSheen;
     w.reflection *= e.baseUnderSheen;
     return w;
@@ -471,4 +540,22 @@ static inline float3 pathGlossySample(PathGlossyLobe b, float2 u, thread float3&
     pdf = pathGGXD(b.alpha, saturate(Hl.z)) * b.G1v / (4.0 * b.NdotV);
     float3 F = b.F0 + (1.0 - b.F0) * pow(1.0 - VdotH, 5.0);
     return F * b.scale * (layeredSmithG_IBL(b.NdotV, NdotL, b.roughness) / b.G1v);
+}
+
+/// The coat's direct lobe toward `L` (BRDF × w × multiscatter, NOT × cos): see the section comment.
+/// `sourceTan` — the light's angular radius (its size over its distance); 0 = a point.
+static inline float layeredCoatDirect(float3 N, float3 V, float3 L, LayeredEnergy e, float sourceTan) {
+    float NdotL = dot(N, L);
+    float NdotV = max(dot(N, V), 1e-4);
+    if (!e.coatOn || NdotL <= 0.0) return 0.0;
+    float3 H = normalize(V + L);
+    float NdotH = saturate(dot(N, H));
+    float VdotH = saturate(dot(V, H));
+    float a = max(e.coatRoughness * e.coatRoughness, 1e-4);
+    float aEff = min(1.0, sqrt(a * a + 0.25 * sourceTan * sourceTan));
+    float D = pathGGXD(aEff, NdotH);
+    float rk = e.coatRoughness + 1.0, k = rk * rk / 8.0;
+    float G = (NdotV / (NdotV * (1.0 - k) + k)) * (NdotL / (NdotL * (1.0 - k) + k));
+    float F = e.coatF0 + (1.0 - e.coatF0) * pow(1.0 - VdotH, 5.0);
+    return e.coatWeight * e.coatSpecMS * (D * G * F) / (4.0 * NdotV * NdotL);
 }

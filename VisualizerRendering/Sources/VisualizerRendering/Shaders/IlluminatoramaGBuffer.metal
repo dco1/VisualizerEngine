@@ -5,6 +5,7 @@
 
 #include <metal_stdlib>
 #include "IlluminatoramaGBufferShade.h"
+#include "IlluminatoramaLeafCutout.h"
 using namespace metal;
 
 // The shading itself (vertex deformation + material evaluation + their helpers) lives in
@@ -74,6 +75,7 @@ vertex VSOut illumi_vs(
     o.previousClip = frame.previousViewProjection * prevWorldP;
     o.worldTangent = float4(worldT, v.tangent.w);
     o.vertexColor  = v.color;
+    o.cardUV       = v.cardUV;
     return o;
 }
 // ── Shadow depth pass (Phase 2.5) ────────────────────────────────────────────
@@ -83,16 +85,7 @@ vertex VSOut illumi_vs(
 // uniforms because the matrix changes per draw call. No fragment shader: the
 // rasterizer writes depth into the assigned slice of the cascade array
 // automatically.
-vertex float4 illumi_shadow_vs(
-    uint                        vid       [[vertex_id]],
-    uint                        iid       [[instance_id]],
-    const device Vertex*        verts     [[buffer(0)]],
-    const device Instance*      instances [[buffer(2)]],
-    constant float4x4&          lightVP   [[buffer(3)]],
-    constant float4&            shadowClock [[buffer(4)]]   // x = time, y = wind strength, z = wind heading, w = field sink
-) {
-    Vertex v = verts[vid];
-    Instance inst = instances[iid];
+static inline float4 illumiShadowClip(Vertex v, Instance inst, constant float4x4& lightVP, constant float4& shadowClock) {
     float4 worldP = inst.modelMatrix * float4(v.position, 1.0);
     // Match the visible pose: a swaying object casts its leaned shadow (no-op unless
     // swayMode != 0). Position-only — the depth pass needs no normal/tangent.
@@ -103,6 +96,44 @@ vertex float4 illumi_shadow_vs(
                            inst.swayLean, inst.swayJostle, shadowClock.x, shadowClock.y, shadowClock.z, nDummy, tDummy);
     worldP.y -= fieldSinkOffset(inst.tagGlow.y, shadowClock.w, inst.tagGlow.z, inst.modelMatrix);
     return lightVP * worldP;
+}
+
+vertex float4 illumi_shadow_vs(
+    uint                        vid       [[vertex_id]],
+    uint                        iid       [[instance_id]],
+    const device Vertex*        verts     [[buffer(0)]],
+    const device Instance*      instances [[buffer(2)]],
+    constant float4x4&          lightVP   [[buffer(3)]],
+    constant float4&            shadowClock [[buffer(4)]]   // x = time, y = wind strength, z = wind heading, w = field sink
+) {
+    return illumiShadowClip(verts[vid], instances[iid], lightVP, shadowClock);
+}
+
+// DH-1487 — the leaf-cutout shadow stage: the same depth, plus a fragment that drops what lies
+// outside the card's species leaf, so a cutout leaf casts its own outline (meshes flagged
+// `leafCutout` only; every other caster keeps the fragment-less pipeline).
+struct ShadowCutoutOut {
+    float4 position [[position]];
+    float2 cardUV;
+};
+
+vertex ShadowCutoutOut illumi_shadow_cutout_vs(
+    uint                        vid       [[vertex_id]],
+    uint                        iid       [[instance_id]],
+    const device Vertex*        verts     [[buffer(0)]],
+    const device Instance*      instances [[buffer(2)]],
+    constant float4x4&          lightVP   [[buffer(3)]],
+    constant float4&            shadowClock [[buffer(4)]]
+) {
+    Vertex v = verts[vid];
+    ShadowCutoutOut o;
+    o.position = illumiShadowClip(v, instances[iid], lightVP, shadowClock);
+    o.cardUV = v.cardUV;
+    return o;
+}
+
+fragment void illumi_shadow_cutout_fs(ShadowCutoutOut in [[stage_in]]) {
+    if (!illumiLeafCutoutKeep(in.cardUV)) discard_fragment();
 }
 
 fragment GBufferOut illumi_fs(
@@ -130,6 +161,10 @@ fragment GBufferOut illumi_fs(
     const device float4*                        nonColorSliceMean [[buffer(8)]],
     // Interior mapping (only the kInteriorMap pipeline declares it).
     constant InteriorMapParams&                 imap            [[buffer(9), function_constant(kInteriorMap)]],
+    // DH-1300 — the draw group's first record in the frame's instance ring (the ring is bound at the
+    // group's offset, so `instance_id` is group-LOCAL), or 0xFFFFFFFF when the group's records are not
+    // in the ring (a GPU-compacted batch, Signack S6): the material-layer slot is base + instance_id.
+    constant uint&                              layerSlotBase   [[buffer(10)]],
     // Phase 4.0 — atlas of diffuse-albedo textures. Each slice is the
     // 512×512 BGRA8-sRGB upload from `IlluminatoramaTextureAtlas`; the
     // texture-format's sRGB→linear decode happens automatically inside
@@ -150,9 +185,19 @@ fragment GBufferOut illumi_fs(
     float2 duvdx = dfdx(in.uv);
     float2 duvdy = dfdy(in.uv);
     float3 worldPosFwidth = fwidth(in.worldPos);
+    // DH-1487 — the cutout variant: outside the card's species leaf, nothing is drawn.
+    if (kLeafCutout && !illumiLeafCutoutKeep(in.cardUV)) {
+        discard_fragment();
+        GBufferOut none;
+        return none;
+    }
     InteriorMapParams ip = {};
     if (kInteriorMap) { ip = imap; }
-    return illumiGBufferShade(in, frontFacing, duvdx, duvdy, worldPosFwidth, instances, frame,
+    GBufferOut o = illumiGBufferShade(in, frontFacing, duvdx, duvdy, worldPosFwidth, instances, frame,
                               albedoUVScale, nonColorUVScale, albedoSliceMean, nonColorSliceMean,
                               ip, albedoAtlas, nonColorAtlas);
+    // DH-1300 — make the material-layer slot global (see `layerSlotBase`).
+    if (o.materialLayer != kMaterialLayerNone)
+        o.materialLayer = (layerSlotBase == kMaterialLayerNone) ? kMaterialLayerNone : layerSlotBase + o.materialLayer;
+    return o;
 }

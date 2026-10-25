@@ -152,6 +152,23 @@ static inline float patternCellHash(float2 cell) {
 }
 
 
+// DH-1497 — the physical-unit index the per-pattern-cell jitter hashes. `floor(uv * cells)` for
+// a grid; a NEGATIVE `cells.x` declares a horizontal RUNNING BOND of |cells.x| units per tile,
+// whose odd courses are offset half a unit — the index then follows the offset, so every
+// physical brick (not just every course) draws its own tone and a cell boundary never cuts a
+// brick mid-face. A bake can only declare this for a bond whose courses are rows of the tile
+// (v) and whose row count per tile is even, so the parity of `floor(uv.y * cells.y)` is the
+// course's parity everywhere on the surface. Mirrored in Swift by
+// `MaterialChannels.patternCellIndex`; every positive/zero declaration is unchanged.
+static inline float2 patternCellIndex(float2 uv, float2 cells) {
+    if (cells.x < 0.0f) {
+        float cy = floor(uv.y * cells.y);
+        float odd = cy - 2.0f * floor(cy * 0.5f);
+        return float2(floor(uv.x * -cells.x + 0.5f * odd), cy);
+    }
+    return floor(uv * cells);
+}
+
 // DH-0513 — the per-panel figure shift, in tile-v units [0, 1). The seamless slice wraps in v, so any
 // shift is a valid, in-register view of the same wood; a different hash stream from the tone jitter
 // (cell.y is a constant offset) keeps a panel's tone and its figure position uncorrelated.

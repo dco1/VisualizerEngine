@@ -152,6 +152,7 @@ extension IlluminatoramaRenderer {
     func defersToVisBuffer(_ mesh: IlluminatoramaMesh, kind: MeshKind, count: Int) -> Bool {
         mesh.visBuffer && !mesh.tracedOnly && mesh.indexType == .uint32 && count <= 0x7FFF
             && interiorMappedMeshKinds[kind] == nil
+            && !(mesh.leafCutout && leafCutoutEnabled)   // DH-1487 — the cutout lives in the conventional pass
             && !fxs.gpuRepackTasks.contains { $0.kind == kind && !$0.direct }
     }
 
@@ -209,6 +210,8 @@ extension IlluminatoramaRenderer {
         }
         d.colorAttachments[6].pixelFormat = .rg32Uint
         d.colorAttachments[6].writeMask = resolve ? [] : .all
+        d.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot (the resolve writes it)
+        d.colorAttachments[7].writeMask = resolve ? .all : []
         d.depthAttachmentPixelFormat = .depth32Float
         return try device.makeRenderPipelineState(descriptor: d)
     }

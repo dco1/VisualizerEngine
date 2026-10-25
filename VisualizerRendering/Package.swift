@@ -9,11 +9,12 @@ let package = Package(
     ],
     dependencies: [
         .package(path: "../VisualizerCore"),
+        .package(path: "../VisualizerStill"),
     ],
     targets: [
         .target(
             name: "VisualizerRendering",
-            dependencies: ["VisualizerCore"],
+            dependencies: ["VisualizerCore", .product(name: "VisualizerStill", package: "VisualizerStill")],
             // The Shaders/ folder holds the GPU kernels for every solver this
             // package ships (PBD, PBDField, MLS-MPM, Marching Cubes, Foam).
             // `.process` lets SwiftPM hand the .metal files to Xcode's Metal

@@ -21,6 +21,7 @@
 // When changing one side, change both.
 
 #pragma once
+#include "IlluminatoramaMaterialLayers.h"   // DH-1300 — the layer record offsets asserted below
 
 // ── ILLUMINATORAMA — SHARED FRAME TYPES AND MATH ────────────────────────────
 //
@@ -932,12 +933,47 @@ struct Instance {
     //   z = field-sink stagger key (> 0: fract(z) is the delay, shared by an object's parts;
     //       0 = hash of the instance origin) · w reserved
     float4   tagGlow;
+
+    // ── OpenPBR material extension (Daydream DH-1301) ──
+    // NEW 16-byte cluster (offsets 384-399): stride 384 -> 400. The per-instance home for the
+    // OpenPBR parameters the G-buffer has no channel of its own for (DH-1014's parameter model).
+    //   x = base_diffuse_roughness [0, 1] — the EON lobe (IlluminatoramaDiffuseRoughness.h); 0 = Lambert
+    //   y = specular_ior (DH-1300; 0 = the legacy 1.5 / F0 0.04)
+    //   z = coat_ior (DH-1298; 0 = 1.5) · w = coat_darkening [0, 1] (DH-1298; 0 = none)
+    // Mirrors `IlluminatoramaInstance.materialExt`.
+    float4   materialExt;
+
+    // ── OpenPBR specular colour + weight (Daydream DH-1300) ──
+    // NEW 16-byte cluster (offsets 400-415): stride 400 -> 416. rgb = specular_color, w =
+    // specular_weight; ALL ZERO (the default) = (1, 1, 1, 1) — untinted, full strength. Read only
+    // through the material-layer target (IlluminatoramaMaterialLayers.h). Mirrors
+    // `IlluminatoramaInstance.specularTint`.
+    float4   specularTint;
+
+    // ── OpenPBR coat colour (Daydream DH-1298) ──
+    // NEW 16-byte cluster (offsets 416-431): stride 416 -> 432. rgb = coat_color; ALL ZERO (the
+    // default) = white (1, 1, 1), a clear coat; w reserved. Read only through the material-layer
+    // target. Mirrors `IlluminatoramaInstance.coatTint`.
+    float4   coatTint;
 };
 
 // The Swift mirror (`IlluminatoramaInstance._assertStride240`) has always asserted this
 // side of the contract; this is the other side, and it costs a compile. A Swift field
 // added without its Metal twin used to be caught only by a wrong-looking render.
-static_assert(sizeof(Instance) == 384, "Instance must match IlluminatoramaInstance (384 bytes)");
+static_assert(sizeof(Instance) == 432, "Instance must match IlluminatoramaInstance (432 bytes)");
+// DH-1300 — the material-layer record is read as raw float4s by kernels that do not see `Instance`
+// (IlluminatoramaMaterialLayers.h); hold its offsets to the struct.
+static_assert(sizeof(Instance) == kInstanceF4Stride * 16, "kInstanceF4Stride must be sizeof(Instance)/16");
+static_assert(__builtin_offsetof(Instance, metallic) == kInstanceF4Coat * 16, "kInstanceF4Coat");
+static_assert(__builtin_offsetof(Instance, materialExt) == kInstanceF4MaterialExt * 16, "kInstanceF4MaterialExt");
+static_assert(__builtin_offsetof(Instance, specularTint) == kInstanceF4SpecularTint * 16, "kInstanceF4SpecularTint");
+static_assert(__builtin_offsetof(Instance, coatTint) == kInstanceF4CoatTint * 16, "kInstanceF4CoatTint");
+
+/// DH-1300/1309 — whether the G-buffer writes this instance's slot to the material-layer target.
+static inline bool illumiInstanceHasMaterialLayers(Instance i) {
+    return illumiHasMaterialLayers(float4(i.metallic, i.clearcoat, i.clearcoatRoughness, i.sheen),
+                                   i.materialExt, i.specularTint, i.coatTint);
+}
 
 // Every field at the Swift mirror's default (`IlluminatoramaInstance`'s property initialisers).
 // A GPU kernel that WRITES instances must start from this, not from `Instance inst;` — a local
@@ -962,6 +998,7 @@ inline Instance illumiDefaultInstance() {
     d.grainTangentTextureSlice = -1; d.thinTransmission = 0.0f;
     d.leafVenation = 0;              d.surfaceWear = 0.0f;
     d.uvWarp = float4(0.0f);         d.hueCycle = float4(0.0f);      d.tagGlow = float4(0.0f);
+    d.materialExt = float4(0.0f);    d.specularTint = float4(0.0f);   d.coatTint = float4(0.0f);
     return d;
 }
 
@@ -995,7 +1032,9 @@ struct Vertex {
     float3 normal;
     float  _padNrm;
     float2 uv;
-    float2 _padUv;
+    // DH-1487 — leaf-cutout card coordinates (IlluminatoramaLeafCutout.h); (0, 0) = no cutout.
+    // Was `_padUv`, the padding that kept the stride at 48: every writer already zeroed it.
+    float2 cardUV;
     // Phase 4.5 — tangent (xyz) + handedness (w). Bitangent =
     // cross(normal, tangent.xyz) * tangent.w. Zero tangent means "no
     // normal-map data for this vertex" and the fragment shader falls
@@ -1036,6 +1075,8 @@ struct VSOut {
     // SCNGeometry (HotAirBalloon's chevron stripes; GiantGummyBears'
     // candy gradients; anything procedural-coloured per-vertex).
     float4 vertexColor;
+    // DH-1487 — the vertex's leaf-cutout coordinates, interpolated (read only by the cutout variant).
+    float2 cardUV;
 };
 
 // Octahedral encoding — packs a normalized vec3 into 2 channels. Standard

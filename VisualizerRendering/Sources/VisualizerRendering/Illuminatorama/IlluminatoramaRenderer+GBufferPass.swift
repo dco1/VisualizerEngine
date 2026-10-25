@@ -60,6 +60,12 @@ extension IlluminatoramaRenderer {
             pass.colorAttachments[5].storeAction = .store
             pass.colorAttachments[5].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
         }
+        // DH-1300 — the material-layer slot. Cleared to kMaterialLayerNone (0xFFFFFFFF): sky, and every
+        // instance without layer parameters, reads "none" and keeps the legacy material model.
+        pass.colorAttachments[7].texture = gbs.gbufferMaterialLayer
+        pass.colorAttachments[7].loadAction = .clear
+        pass.colorAttachments[7].storeAction = .store
+        pass.colorAttachments[7].clearColor = MTLClearColor(red: Double(UInt32.max), green: 0, blue: 0, alpha: 0)
         attachVisBufferTarget(pass)   // Signack S3: the memoryless triangle-id attachment (color 6)
         pass.depthAttachment.texture = gbs.depthTexture
         pass.depthAttachment.loadAction = .clear
@@ -132,6 +138,7 @@ extension IlluminatoramaRenderer {
         // groups are all ordinary meshes (the common case).
         var prevVertsBound = false
         var interiorBound = false
+        var cutoutBound = false   // DH-1487
         var substrateBiased = false
         for (gi, group) in gbs.meshGroups.enumerated() {
             if deferred.contains(gi) { continue }   // the visibility buffer draws it (culled above)
@@ -167,22 +174,34 @@ extension IlluminatoramaRenderer {
                 if !interiorBound { enc.setRenderPipelineState(ip) }
                 interiorBound = true
                 prevVertsBound = false
+                cutoutBound = false
                 var gpu = imap.gpu
                 enc.setFragmentBytes(&gpu, length: MemoryLayout<IlluminatoramaInteriorMapping.GPU>.stride, index: 9)
             } else if prevPos != nil {
-                if !prevVertsBound || interiorBound { enc.setRenderPipelineState(prevPipe) }
+                if !prevVertsBound || interiorBound || cutoutBound { enc.setRenderPipelineState(prevPipe) }
                 prevVertsBound = true
                 interiorBound = false
-            } else if prevVertsBound || interiorBound {
+                cutoutBound = false
+            } else if mesh.leafCutout, leafCutoutEnabled, let cp = leafCutoutGBufferPipeline(extended: extended) {
+                if !cutoutBound { enc.setRenderPipelineState(cp) }   // DH-1487
+                cutoutBound = true
+                prevVertsBound = false
+                interiorBound = false
+            } else if prevVertsBound || interiorBound || cutoutBound {
                 enc.setRenderPipelineState(basePipe)
                 prevVertsBound = false
                 interiorBound = false
+                cutoutBound = false
             }
             enc.setVertexBuffer(mesh.vertexBuffer, offset: 0, index: 0)
             enc.setVertexBuffer(frameUniformBuffer, offset: 0, index: 1)
             let inst = mesh.instanceBinding(ring: currentInstanceBuffer, groupOffset: off)
             enc.setVertexBuffer(inst.buffer, offset: inst.offset, index: 2)
             enc.setFragmentBuffer(inst.buffer, offset: inst.offset, index: 2)
+            // DH-1300 — the group's first record in the ring, so the material-layer slot is global (the
+            // lighting / RT kernels read the ring from 0); a GPU-compacted batch is not in the ring.
+            var layerSlotBase: UInt32 = inst.buffer === currentInstanceBuffer ? UInt32(inst.offset / instStride) : UInt32.max
+            enc.setFragmentBytes(&layerSlotBase, length: 4, index: 10)
             // Phase 2.7 — previous-frame instances at buffer(4) for the
             // motion-vector reconstruction. Same per-group offset as
             // current — the ping-pong buffers share the grouped layout
@@ -220,6 +239,8 @@ extension IlluminatoramaRenderer {
                 enc.setFragmentBuffer(currentInstanceBuffer, offset: off, index: 2)
                 enc.setFragmentBuffer(previousInstanceBuffer, offset: off, index: 4)
                 enc.setFragmentBuffer(superquadricParamBuffer, offset: poff, index: 6)
+                var layerSlotBase = UInt32(group.start)   // DH-1300 — the group's first ring record
+                enc.setFragmentBytes(&layerSlotBase, length: 4, index: 10)
                 enc.drawMesh(mesh, instanceCount: group.count)
             }
         }

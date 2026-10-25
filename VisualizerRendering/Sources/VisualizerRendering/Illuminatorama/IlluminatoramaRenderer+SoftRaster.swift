@@ -184,6 +184,8 @@ extension IlluminatoramaRenderer {
         }
         d.colorAttachments[6].pixelFormat = .rg32Uint
         d.colorAttachments[6].writeMask = .all
+        d.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot (untouched here)
+        d.colorAttachments[7].writeMask = []
         d.depthAttachmentPixelFormat = .depth32Float
         do { vbs.soft.merge[extended] = try device.makeRenderPipelineState(descriptor: d) } catch {
             VisBufferState.log.error("software raster merge unavailable: \(error.localizedDescription)")

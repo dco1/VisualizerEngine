@@ -225,7 +225,7 @@ extension ForestTreeGeometry {
         // silhouette, the leaves gather into masses, and the gaps open between them. The
         // shading normal leans out of the clump as well as out of the crown, so each mass
         // shades as its own volume. Backdrop trees (not near) keep the even fill.
-        var clumps: [(c: SIMD3<Float>, k: Float)] = []
+        var clumps: [(c: SIMD3<Float>, k: Float, r: Float)] = []
         if site.nearCamera {
             var cr = ForestRNG(seed: site.seed &+ 0xC1_0E_0C_1E)
             let k = max(10, min(60, Int(8 + rx * rx * 2.2)))
@@ -240,8 +240,9 @@ extension ForestTreeGeometry {
                 let c = SIMD3<Float>(crownCX + cr0 * rx * cw * cSin * cos(cPhi),
                                      crownCY + cr0 * ry * lobe.aspect * cd * cCos,
                                      crownCZ + cr0 * rz * cw * cSin * sin(cPhi))
-                clumps.append((c, 0.46 + 0.20 * cr.unit()))
+                clumps.append((c, Self.clumpContraction.lo + Self.clumpContraction.span * cr.unit(), 0))
             }
+            Self.sizeClumps(&clumps)
         }
 
         for i in 0..<clusters {
@@ -387,7 +388,7 @@ extension ForestTreeGeometry {
                     if d < bestD { bestD = d; best = ci }
                 }
                 let cl = clumps[best]
-                pos = cl.c + (pos - cl.c) * cl.k
+                pos = cl.c + Self.clumpOffset(pos - cl.c, k: cl.k, radius: cl.r, u: jit())
                 pos.y = max(0.15, pos.y)
                 let off = pos - cl.c
                 clumpOut = simd_length(off) > 0.02 ? simd_normalize(off) : nil
@@ -457,7 +458,7 @@ extension ForestTreeGeometry {
                 // Only force the broadside-out shell orientation on BIG crowns that
                 // need the side-view sky-seal. On small crowns it stacks into the
                 // tier rings (the conifer-spire tell), so keep them in the spray.
-                if isShell && lobe.sizeDamp > 0.55 {
+                if isShell && lobe.sizeDamp > 0.55 && !(site.nearCamera && Self.nearCrownSprayRim) {
                     bentN = simd_normalize(outVec * 0.82 + SIMD3<Float>(0, 0.18, 0))
                     // Build a card plane perpendicular to the outward normal.
                     let up = SIMD3<Float>(0, 1, 0)
@@ -487,8 +488,9 @@ extension ForestTreeGeometry {
                 // Enlargement also damped by sizeDamp: a small crown's few shell
                 // cards must not balloon into the scalloped tier rings — keep them
                 // near single-leaf scale so the small crown reads as a soft blob.
+                let rimGain: Float = site.nearCamera && Self.nearCrownSprayRim ? 0.12 : 0.55
                 let rimScale: Float = isShell
-                    ? (1.0 + 0.55 * lobe.sizeDamp * max(0.0, min(1.0, (warp - 0.80) / 0.40)))
+                    ? (1.0 + rimGain * lobe.sizeDamp * max(0.0, min(1.0, (warp - 0.80) / 0.40)))
                     : 1.0
                 let cs = look.leafCardSize * fillScale * sizeJit * rimScale
                 // detail: 0.0 forces the cheap 2-tri flat-card path regardless of
@@ -498,7 +500,11 @@ extension ForestTreeGeometry {
                 // vs 50K) and starving the mid/far treeline of geometry entirely.
                 // The expensive silhouette cards are still used at twig tips (emitLeaves),
                 // where they are individually visible at close range.
-                emitLeafCard(&s, pos: pos, xAxis: xAxisRim, yAxis: yAxisRim,
+                // Near crowns: the cluster is a WHORL radiating from one point (an oak's terminal
+                // leaf cluster), not five blades stacked on one centre — that star of overlapping
+                // cards read as a crumpled rosette and wasted most of its own area.
+                let whorl = site.nearCamera ? yAxisRim * (cs * look.leafAspectH * Self.nearWhorlReach) : .zero
+                emitLeafCard(&s, pos: pos + whorl, xAxis: xAxisRim, yAxis: yAxisRim,
                              normal: bentN,
                              w: cs, h: cs * look.leafAspectH,
                              color: col, species: look.species,

@@ -33,6 +33,13 @@ struct GBufferOut {
     // A pipeline that does not write this target (impostors, any legacy PSO) leaves the clear
     // value, and every reader treats 0 as "fall back to the live-lane behaviour".
     half4 material         [[color(5), function_constant(kExtendedGBuffer)]];
+    // (color 6 is the visibility buffer's memoryless id target — IlluminatoramaVisBuffer.metal.)
+    // Daydream DH-1300 — the material-layer target (R32Uint): this fragment's INSTANCE SLOT when
+    // the instance carries per-material layer parameters (specular IOR / weight / colour …), else
+    // kMaterialLayerNone — the clear value, and what every instance of a host that never sets one
+    // writes. The lighting and RT kernels read the parameters out of the instance buffer by it
+    // (IlluminatoramaMaterialLayers.h). Every lane, live and photo.
+    uint  materialLayer    [[color(7)]];
 };
 
 static inline __attribute__((always_inline)) GBufferOut illumiGBufferPack(
@@ -45,7 +52,9 @@ static inline __attribute__((always_inline)) GBufferOut illumiGBufferPack(
     texture2d_array<float, access::sample> nonColorAtlas, sampler texSampler
 ) {
     GBufferOut o;
-    o.albedoMetallic  = half4(half3(albedo), half(metallic));
+    // DH-1301 — a pure dielectric's diffuse roughness rides the sign of the metalness channel
+    // (IlluminatoramaDiffuseRoughness.h); 0 (every material that never sets one) packs `metallic`.
+    o.albedoMetallic  = half4(half3(albedo), illumiPackMetallicDiffuseRoughness(metallic, inst.materialExt.x));
     float2 oct = octEncode(n);
     // normalRoughness.w is otherwise unused (always 1) — repurpose it as a
     // foliage flag. Scenes that want leaf thin-sheet transmission tag their
@@ -168,7 +177,13 @@ static inline __attribute__((always_inline)) GBufferOut illumiGBufferPack(
     float sheenAlpha = (inst.sheen > 0.0f)
         ? float(clothSheenBandForRoughness(inst.sheenRoughness)) + min(sheenStrength, 0.98f)
         : 0.0f;
-    o.emission        = half4(half3(emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -sheenAlpha));
+    // Daydream DH-1299 — with the coat a LAYER (kFrameFlagLayeredCoat), a material may be both: the
+    // channel keeps the SHEEN (it varies per texel — the carpet lay above) and the coat rides the
+    // instance's material-layer record (IlluminatoramaMaterialLayers.h), which the lighting and RT
+    // kernels read whenever emission.a carries no coat. Fuzz over coat over base. Without the flag a
+    // coated cloth packs its coat, as it always did.
+    bool coatAndSheen = (frame.frameFlags & kFrameFlagLayeredCoat) != 0u && inst.clearcoat > 0.0 && inst.sheen > 0.0;
+    o.emission        = half4(half3(emission), half((inst.clearcoat > 0.0 && !coatAndSheen) ? inst.clearcoat : -sheenAlpha));
     if (kExtendedGBuffer) {
         // DH-0478 — per-texel grain DIRECTION for the anisotropy lobe. The material's map holds
         // (cos 2θ, sin 2θ), θ from its U axis in tangent space; here it becomes a world-space angle
@@ -214,6 +229,8 @@ static inline __attribute__((always_inline)) GBufferOut illumiGBufferPack(
     float2 velocityUV = ((currNDC - prevNDC) - frame.taaJitterDelta.xy) * float2(0.5, -0.5);
     o.velocity        = half2(velocityUV);
     o.layer           = in.layer;   // light-layer bitfield (default 0xFFFFFFFF)
+    // DH-1300 — the slot of an instance with layer parameters (IlluminatoramaMaterialLayers.h).
+    o.materialLayer   = illumiInstanceHasMaterialLayers(inst) ? in.instanceID : kMaterialLayerNone;
     return o;
     return o;
 }

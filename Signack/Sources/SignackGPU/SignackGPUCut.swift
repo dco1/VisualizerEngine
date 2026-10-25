@@ -19,17 +19,36 @@ public final class SignackGPUCut: @unchecked Sendable {
     public let drawArgs: MTLBuffer
     let flags: MTLBuffer
     let counters: MTLBuffer
+    /// DH-1465 — per cluster, bit v set when it can land in shadow view v.
+    let viewMask: MTLBuffer
+    /// DH-1465 — indices the per-view pool (after the main output, `[C, C + pool)`) holds.
+    public let shadowViewPool: Int
+    /// DH-1465 — this frame's shadow views (object-space frustums; at most
+    /// `SignackShadowViews.maxViews`): set by the host before `encode`, like `routing`. Empty = none
+    /// (every view slot holds the whole-cut shadow record, exactly S2).
+    public var shadowViews: [SignackFrustum] = []
+    /// DH-1466 — this frame's Hi-Z occlusion source (object → the pyramid's clip), or nil = no test.
+    public var occlusion: SignackGPUOcclusion?
     /// S4 — route this instance's sub-pixel on-screen triangles to the software rasterizer's range
     /// (set by the host each frame before `encode`; nil = none, exactly S2).
     public var routing: SignackGPURouting?
 
-    public init?(hierarchy: SignackGPUHierarchy, device: MTLDevice, label: String = "Signack.cut") {
-        guard let out = device.makeBuffer(length: max(4, hierarchy.maxCutIndices * 4), options: .storageModeShared),
+    /// `shadowViewPool` (indices, default one full cut) bounds what the per-view copies may use; a
+    /// view that does not fit draws the whole cut instead.
+    public init?(hierarchy: SignackGPUHierarchy, device: MTLDevice, label: String = "Signack.cut",
+                 shadowViewPool: Int? = nil) {
+        let pool = max(0, shadowViewPool ?? hierarchy.maxCutIndices)
+        guard let out = device.makeBuffer(length: max(4, (hierarchy.maxCutIndices + pool) * 4), options: .storageModeShared),
               let clusterIDs = device.makeBuffer(length: max(4, hierarchy.maxCutIndices / 3 * 4), options: .storageModeShared),
               let args = device.makeBuffer(length: SignackGPUDrawArgs.bufferLength, options: .storageModeShared),
               let flags = device.makeBuffer(length: max(4, hierarchy.clusterCount), options: .storageModeShared),
-              let counters = device.makeBuffer(length: 32, options: .storageModeShared)
+              let counters = device.makeBuffer(length: 128, options: .storageModeShared),
+              let mask = device.makeBuffer(length: max(4, hierarchy.clusterCount), options: .storageModeShared)
         else { return nil }
+        memset(mask.contents(), 0, mask.length)
+        mask.label = "\(label).viewMask"
+        viewMask = mask
+        self.shadowViewPool = pool
         // Zeroed: an instance draws nothing until its first cut lands.
         memset(args.contents(), 0, args.length)
         memset(counters.contents(), 0, counters.length)
@@ -46,7 +65,9 @@ public final class SignackGPUCut: @unchecked Sendable {
     }
 
     /// Bytes this instance holds on the GPU (its output + bookkeeping; the DAG is the type's).
-    public var instanceBytes: Int { outputIndices.length + outputClusterIDs.length + drawArgs.length + flags.length + counters.length }
+    public var instanceBytes: Int {
+        outputIndices.length + outputClusterIDs.length + drawArgs.length + flags.length + counters.length + viewMask.length
+    }
 
     /// Encode this instance's select → compact → finalize for `view` into `encoder` (serial).
     public func encode(view: SignackView, pipelines: SignackGPUPipelines, encoder enc: MTLComputeCommandEncoder) {
@@ -72,11 +93,19 @@ public final class SignackGPUCut: @unchecked Sendable {
         enc.setBuffer(outputIndices, offset: 0, index: 5)
         enc.setBuffer(drawArgs, offset: 0, index: 6)
         enc.setBuffer(outputClusterIDs, offset: 0, index: 7)
+        SignackGPUShadowViewUniforms(shadowViews, poolCapacity: shadowViewPool).bind(enc, index: 10)
+        enc.setBuffer(viewMask, offset: 0, index: 11)
+        SignackGPUOcclusion.bind(occlusion, enc, buffer: 12, texture: 0, fallback: pipelines.blankHiZ)
 
         enc.setComputePipelineState(pipelines.classify)
         let w = min(64, pipelines.classify.maxTotalThreadsPerThreadgroup)
         enc.dispatchThreads(MTLSize(width: n, height: 1, depth: 1),
                             threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
+        if !shadowViews.isEmpty {   // DH-1465: each view's pool range, before any cluster is copied
+            enc.setComputePipelineState(pipelines.viewsPrefix)
+            enc.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
+                                threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+        }
         enc.setComputePipelineState(pipelines.write)
         // ≤128 triangles per cluster: one thread per triangle (each copies its 3 indices' worth by stride).
         let tg = min(128, pipelines.write.maxTotalThreadsPerThreadgroup)
@@ -107,13 +136,24 @@ public final class SignackGPUCut: @unchecked Sendable {
     /// and `onScreen` (flag 2, what the camera draws), as ascending cluster ids. Read it only after
     /// the command buffer that encoded it has completed (tests, diagnostics).
     public func readSelection() -> (lodCut: [UInt32], onScreen: [UInt32]) {
+        let s = readSelectionWithOcclusion()
+        return (s.lodCut, s.onScreen)
+    }
+
+    /// `readSelection` plus DH-1466's `occluded` (flag 3: in the camera frustum, hidden by the Hi-Z test).
+    public func readSelectionWithOcclusion() -> (lodCut: [UInt32], onScreen: [UInt32], occluded: [UInt32]) {
         let f = flags.contents().bindMemory(to: UInt8.self, capacity: hierarchy.clusterCount)
-        var cut: [UInt32] = [], on: [UInt32] = []
+        var cut: [UInt32] = [], on: [UInt32] = [], occ: [UInt32] = []
         for i in 0..<hierarchy.clusterCount where f[i] != 0 {
             cut.append(UInt32(i))
-            if f[i] == 2 { on.append(UInt32(i)) }
+            if f[i] == 2 { on.append(UInt32(i)) } else if f[i] == 3 { occ.append(UInt32(i)) }
         }
-        return (cut, on)
+        return (cut, on, occ)
+    }
+
+    /// Clusters the last completed frame's Hi-Z test hid (async, may lag) — census.
+    public var lastOccludedClusterCount: Int {
+        Int(drawArgs.contents().load(fromByteOffset: SignackGPUDrawArgs.occludedCountOffset, as: UInt32.self))
     }
 }
 

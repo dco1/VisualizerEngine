@@ -564,7 +564,12 @@ extension ForestTreeGeometry {
         // otherwise the de-plated crown develops sky gaps. Only a few dozen trees
         // qualify (the near flank/cluster ones) so the tri budget holds: ≈3 dozen ×
         // ~6000 clusters × 3 leaves × 2 tris ≈ 1.3 M extra tris, well under the cap.
-        let clustersRaw = site.nearCamera ? Int(Float(clusters) * 2.6) : clusters
+        // The birch boost lifts only a crown BELOW its tier cap (`baseClusters`): a big birch
+        // already reaches the cap, and boosting it too baked a 14 m birch at 624 k triangles.
+        let clustersRaw = site.nearCamera
+            ? Int(min(Float(clusters) * (look.isBirch ? Self.nearBirchFillBoost : 1),
+                      Float(max(clusters, baseClusters))) * 2.6)
+            : clusters
         // Apply the density knob. **This read `Self.foliageDensityScale` — the STATIC — until
         // 2026-08-09 (PHOTOREALISM #9 / D3), which is why `HouseRenderBridge.treeFoliageScale`
         // was a dead control: the biggest leaf population in the tree never saw the caller's

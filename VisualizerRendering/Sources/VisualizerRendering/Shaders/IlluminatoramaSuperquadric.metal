@@ -169,6 +169,7 @@ struct SQImpostorFSOut {
     half4 emission         [[color(2)]];
     half2 velocity         [[color(3)]];
     uint  layer            [[color(4)]];   // light-layer bitfield (default 0xFFFFFFFF)
+    uint  materialLayer    [[color(7)]];   // DH-1300 — the material-layer slot (GBufferOut.materialLayer)
     float depth            [[depth(less)]];
 };
 
@@ -177,7 +178,8 @@ fragment SQImpostorFSOut illumi_superquadric_impostor_fs(
     constant FrameUniforms&    frame         [[buffer(1)]],
     const device Instance*     instances     [[buffer(2)]],
     const device Instance*     prevInstances [[buffer(4)]],
-    const device SQParam*      params        [[buffer(6)]]
+    const device SQParam*      params        [[buffer(6)]],
+    constant uint&             layerSlotBase [[buffer(10)]]   // DH-1300 — the group's first ring record
 ) {
     Instance inst = instances[in.iid];
     SQParam  p    = params[in.iid];
@@ -214,7 +216,7 @@ fragment SQImpostorFSOut illumi_superquadric_impostor_fs(
     float2 velUV   = (curNDC - prevNDC) * float2(0.5, -0.5);
 
     SQImpostorFSOut o;
-    o.albedoMetallic  = half4(half3(inst.albedo), half(inst.metallic));
+    o.albedoMetallic  = half4(half3(inst.albedo), illumiPackMetallicDiffuseRoughness(inst.metallic, inst.materialExt.x));   // DH-1301
     float2 oct = octEncode(wN);
     // .w tag: 1.0 = opaque (default); 1.0 + anisotropy (>1) carries the grain-highlight stretch
     // for the deferred pass (all existing tag tests are < 1.0, so this reads as opaque to them).
@@ -233,6 +235,7 @@ fragment SQImpostorFSOut illumi_superquadric_impostor_fs(
     o.emission        = half4(half3(inst.emission), half(inst.clearcoat > 0.0 ? inst.clearcoat : -sqSheenAlpha));
     o.velocity        = half2(velUV);
     o.layer           = inst.layer;   // light-layer bitfield (default 0xFFFFFFFF)
+    o.materialLayer   = illumiInstanceHasMaterialLayers(inst) ? layerSlotBase + in.iid : kMaterialLayerNone;
     o.depth           = curClip.z / curClip.w;   // Metal NDC z ∈ [0,1]
     return o;
 }

@@ -48,6 +48,30 @@ extension IlluminatoramaRenderer {
         Self.log.warning("Illuminatorama RT auto-disabled (\(trip.rawValue)) — \(detail). Falling back to non-RT.")
     }
 
+    /// **Retire a TLAS this frame is about to rebuild, BEFORE any pass traces it** (Daydream DH-1473).
+    ///
+    /// `updateRTAccel` runs mid-frame, AFTER the SSAO (RTAO) and deferred lighting (traced sun /
+    /// area shadows) passes, which bind whatever TLAS was live when they were encoded. On a
+    /// topology change `rebuildRTAccel` then prunes the BLASes of meshes that are gone, drops
+    /// `rtBLASList`, builds new BLASes, and waits for them — all before this frame's command buffer
+    /// runs. So the early passes traversed a TLAS whose BLAS addresses had just been freed and
+    /// handed to the new builds. Garbage traversal does not fault, it spins: the GPU sat at 99 %
+    /// forever. Reproduced deterministically by a photo settle (RT sun + RTAO on) that is the first
+    /// frame to meet new traced plants after an EARLIER photo settle left a TLAS live (DH-1473's
+    /// `testPlantingSmoke`). A live frame in between avoided it only because the live lane traces
+    /// nothing before `updateRTAccel`, so the rebuild landed harmlessly there.
+    ///
+    /// Called once per frame before the first pass. A frame whose topology moved takes the
+    /// shadow-map / GTAO fallbacks in those early passes (exactly a fresh renderer's first
+    /// frame); `updateRTAccel` rebuilds and re-arms the TLAS for every pass after it.
+    func retireTLASIfTopologyMoved() {
+        guard rts.rtTLASActive else { return }
+        if IlluminatoramaCurveRegistry.shared.version != rts.rtCurveSyncVersion
+            || rtTopologyHash() != rts.rtTLASTopologyHash {
+            rts.rtTLASActive = false
+        }
+    }
+
     func updateRTAccel(_ cb: MTLCommandBuffer) {
         // P1c — surface-cache scenes now ride the TLAS too: the lighting pass
         // reads cards via `soupTriBase[instance_id] + primitive_id`, while the

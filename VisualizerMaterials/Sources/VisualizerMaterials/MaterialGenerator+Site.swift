@@ -359,45 +359,60 @@ extension MaterialGenerator {
         hedgeFoliage(.holly, size: size, seed: seed)
     }
 
-    /// Asphalt road surface: near-black base aging to worn gray; Voronoi aggregate pitting;
-    /// roughness 0.82–0.95 spatially varied; micro-crack scatter via sparse fbm.
+    /// Asphalt road surface: a dark bitumen binder holding a dense-graded aggregate, the stones
+    /// showing through as the binder weathers off them.
+    ///
+    /// DH-0941 rewrite. The old tile scattered 18 Voronoi "pits" across its 2 m bake — 11 cm
+    /// pale dots on a regular-looking lattice, which read up close as a dimpled plastic sheet
+    /// (`street-before-close.png`) and from the street as a faint polka-dot grid. Real asphalt
+    /// has no structure at that scale: its texture is the AGGREGATE, 4–12 mm stones of varied
+    /// grey (a few warm), packed edge to edge in black binder, with fines between and the odd
+    /// void. Everything larger than that — wheel paths, oil, patches, crack seal — belongs to
+    /// the road, not the tile, and the street dressing lays it in the geometry. So the macro
+    /// term here is deliberately weak: it only has to stop the tile reading as one flat colour.
+    ///
+    /// `age` 0 = fresh (black binder, stones coated), 1 = old (grey binder, stones exposed).
     public static func asphalt(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 61, age: Double = 0.4) -> MaterialChannels {
         var ch = MaterialChannels(size: size, category: .ground)
-        let age01 = clamp01(age)   // 0 = fresh black, 1 = worn gray
+        let age01 = clamp01(age)
+        // ~1.2 cm stones at the 2 m road tile; a coarser lattice of larger stones over it.
+        let fineCells = 160, coarseCells = 72
         for y in 0..<size {
             for x in 0..<size {
                 let u = Double(x) / Double(size), v = Double(y) / Double(size)
-                // Voronoi for aggregate pitting — each cell centre is a pit.
-                let cell = Noise.voronoiTiled(u, v, cells: 18, seed: seed)
-                let pit = clamp01(1.0 - cell.f1 * 2.5)   // bright at cell edge, dark in center
-                // Large-scale macro tone variation (weathering patches).
+                let fine = Noise.voronoiTiled(u, v, cells: fineCells, jitter: 0.95, seed: seed)
+                let coarse = Noise.voronoiTiled(u, v, cells: coarseCells, jitter: 0.95, seed: seed ^ 0x5A)
+                // A stone body is the inner part of its cell; the binder fills the rim between.
+                let stoneF = 1 - smoothstep(0.22, 0.42, fine.f1)
+                let stoneC = 1 - smoothstep(0.20, 0.36, coarse.f1)
+                let hF = Noise.unit(fine.cellId), hC = Noise.unit(coarse.cellId)
+                // How much of each stone the weathered binder has uncovered.
+                let exposed = clamp01(0.25 + 0.75 * age01) * (0.55 + 0.45 * Noise.unit(Noise.mix(fine.cellId)))
+                let fineStone = stoneF * (hF < 0.50 ? 1 : 0) * exposed
+                let coarseStone = stoneC * (hC < 0.45 ? 1 : 0) * clamp01(exposed + 0.15)
+                let stone = max(fineStone, coarseStone)
+                let stoneTone = coarseStone > fineStone ? 0.10 + 0.13 * hC : 0.09 + 0.11 * hF
+                let warmStone = (coarseStone > fineStone ? hC : hF) > 0.88
+                // Fines + binder: dark, with a little sand in it.
+                let sand = Noise.fbmTiled(u, v, baseCells: 128, octaves: 2, seed: seed ^ 0x33)
                 let macro = Noise.fbmTiled(u, v, baseCells: 2, octaves: 3, seed: seed ^ 0x11)
-                // Micro-crack scatter — sparse, thin, dark lines.
-                let micro = Noise.fbmTiled(u, v, baseCells: 12, octaves: 2, seed: seed ^ 0x33)
-                let crack = clamp01(micro - 0.45) * 2.0   // sparse dark filaments
-
-                // Albedo: fresh near-black (0.05) aging toward worn gray (0.30).
-                let freshBase = 0.05 + 0.04 * macro
-                let wornBase  = 0.25 + 0.05 * macro
-                var lum = freshBase + (wornBase - freshBase) * age01
-                lum += 0.03 * pit          // slight aggregate spec at cell edges
-                lum -= 0.015 * crack       // cracks are darker
-                lum = clamp01(lum)
-                ch.albedo[ch.idx(x, y)] = Vec3(lum, lum * 0.99, lum * 0.97)
-
-                // Roughness: very rough (0.88–0.95 worn, 0.82–0.90 fresh); pits add roughness.
-                let roughBase = 0.82 + 0.06 * age01
-                ch.roughness[ch.idx(x, y)] = clamp01(roughBase + 0.07 * pit + 0.04 * macro)
-
-                // Height: pitting at Voronoi edges; macro undulation; cracks are low.
-                ch.height[ch.idx(x, y)] = clamp01(0.50 + 0.18 * macro + 0.10 * pit - 0.08 * crack)
+                let binder = (0.052 + 0.07 * age01) * (0.85 + 0.30 * sand) * (0.94 + 0.12 * macro)
+                // The odd void: an empty pocket between stones, darker than the binder.
+                let void = (1 - smoothstep(0.0, 0.18, fine.f1)) * (hF > 0.97 ? 1.0 : 0.0)
+                var lum = binder + (stoneTone - binder) * stone
+                lum *= 1 - 0.45 * void
+                let tint = warmStone ? Vec3(1.06, 1.0, 0.92) : Vec3(1.0, 0.995, 0.985)
+                ch.albedo[ch.idx(x, y)] = Vec3(max(0.045, lum * tint.x), max(0.045, lum * tint.y),
+                                               max(0.045, lum * tint.z))
+                // Binder is very rough; a weathered stone face is a little smoother.
+                ch.roughness[ch.idx(x, y)] = clamp01(0.93 - 0.20 * stone + 0.04 * (sand - 0.5) + 0.05 * void)
+                // Stones stand proud of the binder; voids sink.
+                ch.height[ch.idx(x, y)] = clamp01(0.42 + 0.30 * stone + 0.08 * sand - 0.25 * void + 0.06 * macro)
             }
         }
         ch.clearcoat = 0.0
-        ch.deriveNormals(strength: 1.4)
-        // Coarse aggregate grit — asphalt is a very rough sand/stone matrix; without the
-        // fine tooth it reads as a flat black plastic sheet at grazing angles.
-        addMicroDetail(&ch, seed: seed ^ 0xB6, baseCells: 90, octaves: 2, strength: 0.80)
+        ch.deriveNormals(strength: 1.6)
+        addMicroDetail(&ch, seed: seed ^ 0xB6, baseCells: 180, octaves: 2, strength: 0.55)
         return ch
     }
 
@@ -611,6 +626,13 @@ extension MaterialGenerator {
         // `testEveryIntegerTileCountIsSeamless`.)
         let layout = params.layout
         let cellsU = layout.cols, cellsV = layout.rows
+        // DH-1496 — declare the grid this bake draws (a stack of `cellsU × cellsV` units). It is the
+        // per-PHYSICAL-paver tone de-repeat a coherent unit grid gets in place of the hex blend, and
+        // declaring a grid is what classifies the bake as COHERENT for anti-tiling
+        // (`MaterialChannels.laysUnitGrid`): pavers are `.ground`, a stochastic category, so until
+        // this the hex de-repeat blended offset copies of the bond and printed a ghost second grid.
+        ch.patternCells = Vec2(Double(cellsU), Double(cellsV))
+        ch.patternJitter = 0.05
         // Floored at the thinnest drawable line, the same way tile is — this generator shares
         // `UnitPatternParams` AND the width control with tile, so it has to honour the same range
         // the control offers. It also has a hard-edged joint (no antialias band), which is exactly
@@ -660,6 +682,7 @@ extension MaterialGenerator {
             }
         }
         ch.clearcoat = 0.0
+        ch.diffuseRoughness = 1.0   // DH-1301 — fired brick / cast paver + mortar: OpenPBR's brick example, 1.0
         ch.deriveNormals(strength: 2.5)
         // Fine masonry tooth on the brick/mortar faces — real pavers are gritty, not
         // molded plastic. Isotropic micro over both body and joint.

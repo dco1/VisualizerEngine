@@ -162,6 +162,12 @@ public enum ForestTreeGeometry {
         public var uvs:     [SIMD2<Float>] = []
         public var uvMark:  SIMD2<Float> = .zero
 
+        // Per-vertex LEAF-CUTOUT coordinates (DH-1487), the engine vertex's `cardUV`: (0, 0) = no
+        // cutout; on a crown-fill card (u across the card in half-widths, v + 2·species along it,
+        // species ≥ 1) — the engine's `illumiLeafCutoutKeep` cuts the species' leaf out of the card.
+        // `tri()` appends zeros; `emitLeafCard` overwrites its fill card's.
+        public var cardUVs: [SIMD2<Float>] = []
+
         // Per-vertex tangent. Unused for shading here (no normal-map atlas), so
         // TREES pack hierarchical-wind weights into it (issue #58 #1): tangent =
         // (swayWeight, treePhase, flutter, 1). swayWeight = quadratic of height
@@ -461,6 +467,7 @@ public enum ForestTreeGeometry {
             colors.append(c0);    colors.append(c1);    colors.append(c2)
             foliage.append(foliageMark); foliage.append(foliageMark); foliage.append(foliageMark)
             uvs.append(uvMark);   uvs.append(uvMark);   uvs.append(uvMark)
+            cardUVs.append(.zero); cardUVs.append(.zero); cardUVs.append(.zero)
             if windActive {
                 let flutter: Float = foliageMark > 0.5 ? 1.0 : 0.0
                 // tangent.w doubles as a material marker the G-buffer reads:
