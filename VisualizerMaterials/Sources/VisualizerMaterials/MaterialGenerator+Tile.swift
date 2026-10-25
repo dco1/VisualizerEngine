@@ -446,7 +446,7 @@ public struct TileLayout: Equatable, Hashable, Sendable {
     /// sane repeat. Lower this to buy finer joints at the cost of a shorter repeat.
     public static let targetRunMeters: Double = 1.2
 
-    /// Tile at or below this edge (≈ 2.4″) is MOSAIC: hairline joints, and the finer grid described at `of(_:on:)`.
+    /// Tile whose short edge is at or below this (≈ 2.4″) is MOSAIC: hairline joints, and the finer grid described at `of(_:on:)`.
     public static let mosaicUnitMeters: Double = 0.06
 
     /// Derive the grid for `params` on a surface. `tiling.isAdjustable` says whether the mesh's
@@ -480,8 +480,9 @@ public struct TileLayout: Equatable, Hashable, Sendable {
         // bath tile rendered as fat dark canyons. The period follows the UNIT (12 units across, never below 0.6 m,
         // never above the 1.2 m run), NOT the asked joint, so the joint control keeps one grid to floor against —
         // anything over 2.4″ keeps the 1.2 m run exactly.
-        let fineRun = params.unitSizeMeters <= Self.mosaicUnitMeters
-            ? Swift.min(targetRunMeters, Swift.max(0.6, params.unitSizeMeters * 12)) : targetRunMeters
+        // The test is on the SHORT edge: a 4″ plank is a 1.3″ stick whose joint is as hairline as a 1″ mosaic's.
+        let fineRun = params.shortEdgeMeters <= Self.mosaicUnitMeters
+            ? Swift.min(targetRunMeters, Swift.max(0.6, params.shortEdgeMeters * 12)) : targetRunMeters
         let target = tiling.isAdjustable ? Swift.min(tiling.metresPerRepeat, fineRun)
                                          : tiling.metresPerRepeat
         let wanted = target / Swift.max(params.unitSizeMeters, 1e-4)
