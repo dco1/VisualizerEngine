@@ -1093,6 +1093,8 @@ public final class PaperClothSolver {
 
     private func encodeSubstep(to cb: MTLCommandBuffer, dt: Float) {
         writeUniforms(dt: dt)
+        beginSharedEncoder(cb)
+        defer { endSharedEncoder() }
 
         // 1. Integrate (Verlet + gravity + damping).
         encodePass(cb, pipeline: integratePipeline,
@@ -1108,7 +1110,9 @@ public final class PaperClothSolver {
         }
 
         // 2. Reset XPBD λ for this substep (distance AND dihedral).
-        if constraintBuffer.count > 0, let blit = cb.makeBlitCommandEncoder() {
+        if constraintBuffer.count > 0 {
+            endSharedEncoder()                       // a blit cannot live inside a compute encoder
+            if let blit = cb.makeBlitCommandEncoder() {
             blit.label = "PaperCloth.lambdaReset"
             blit.fill(buffer: lambdaBuffer,
                       range: 0..<(MemoryLayout<Float>.stride * constraintBuffer.count), value: 0)
@@ -1118,6 +1122,8 @@ public final class PaperClothSolver {
                           value: 0)
             }
             blit.endEncoding()
+            }
+            beginSharedEncoder(cb)
         }
         if bendConstraintBuffer.count > 0 {
             let bPtr = bendUniformBuffer.contents().bindMemory(to: PaperBendUniforms.self, capacity: 1)
@@ -1141,15 +1147,15 @@ public final class PaperClothSolver {
                 encodeBendSubpass(cb, start: bendGroupStart[g], count: bendGroupCount[g],
                                   label: "PaperCloth.bend[\(g)]")
             }
-            if let tb = tetherBuffer, let pipe = tetherPipeline, let enc = cb.makeComputeCommandEncoder() {
-                enc.label = "PaperCloth.tether"
-                enc.setComputePipelineState(pipe)
-                enc.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
-                enc.setBuffer(tb, offset: 0, index: 1)
-                var n = UInt32(particleBuffer.count)
-                enc.setBytes(&n, length: 4, index: 2)
-                dispatch1D(enc, pipeline: pipe, count: particleBuffer.count)
-                enc.endEncoding()
+            if let tb = tetherBuffer, let pipe = tetherPipeline {
+                withEncoder(cb, label: "PaperCloth.tether") { enc in
+                    enc.setComputePipelineState(pipe)
+                    enc.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
+                    enc.setBuffer(tb, offset: 0, index: 1)
+                    var n = UInt32(particleBuffer.count)
+                    enc.setBytes(&n, length: 4, index: 2)
+                    dispatch1D(enc, pipeline: pipe, count: particleBuffer.count)
+                }
             }
             if interleavedCollide, i % 3 == 2, colliderCount > 0, !killSDF {
                 encodeClothCollide(cb)
@@ -1170,12 +1176,16 @@ public final class PaperClothSolver {
         //    See paperStaticFriction in PaperCloth.metal: resting contacts below
         //    `stickSpeed` hold instead of creeping.
         if stickSpeed > 0, colliderCount > 0 || floorEnabled {
-            if pendingAnchorClear, let blit = cb.makeBlitCommandEncoder() {
-                blit.label = "PaperCloth.anchorClear"
-                blit.fill(buffer: anchorBuffer,
-                          range: 0..<(MemoryLayout<SIMD4<Float>>.stride * particleBuffer.count),
-                          value: 0)
-                blit.endEncoding()
+            if pendingAnchorClear {
+                endSharedEncoder()
+                if let blit = cb.makeBlitCommandEncoder() {
+                    blit.label = "PaperCloth.anchorClear"
+                    blit.fill(buffer: anchorBuffer,
+                              range: 0..<(MemoryLayout<SIMD4<Float>>.stride * particleBuffer.count),
+                              value: 0)
+                    blit.endEncoding()
+                }
+                beginSharedEncoder(cb)
                 pendingAnchorClear = false
             }
             let sPtr = stickUniformBuffer.contents().bindMemory(to: PaperStickUniforms.self, capacity: 1)
@@ -1453,28 +1463,46 @@ public final class PaperClothSolver {
 
     // ── Encoders ────────────────────────────────────────────────────────
 
+    // ONE compute encoder per substep. Every constraint colour group, hinge group, collide, tether and friction pass used
+    // to open and close its own encoder (~30 per iteration × 20 iterations × 120 Hz): on a 6 k-particle sheet the GPU spent
+    // its time on encoder boundaries, not on cloth (11 ms/substep for ~6 k threads of arithmetic). A serial compute
+    // encoder orders its dispatches and makes each one's writes visible to the next, so the arithmetic — and every
+    // settled grid that depends on it — is unchanged. Blit passes (λ reset, anchor clear) cannot live in a compute
+    // encoder; `encodeSubstep` closes the shared encoder around them.
+    private var sharedEncoder: MTLComputeCommandEncoder?
+    private func beginSharedEncoder(_ cb: MTLCommandBuffer) { if sharedEncoder == nil { sharedEncoder = cb.makeComputeCommandEncoder() } }
+    private func endSharedEncoder() { sharedEncoder?.endEncoding(); sharedEncoder = nil }
+    /// Run `body` on the shared encoder if one is open, else on a private one for just this pass.
+    private func withEncoder(_ cb: MTLCommandBuffer, label: String, _ body: (MTLComputeCommandEncoder) -> Void) {
+        if let e = sharedEncoder { e.pushDebugGroup(label); body(e); e.popDebugGroup(); return }
+        guard let e = cb.makeComputeCommandEncoder() else { return }
+        e.label = label
+        body(e)
+        e.endEncoding()
+    }
+
     private func encodePass(_ cb: MTLCommandBuffer, pipeline: MTLComputePipelineState,
                             buffers: [MTLBuffer], count: Int, label: String) {
-        guard count > 0, let enc = cb.makeComputeCommandEncoder() else { return }
-        enc.label = label
-        enc.setComputePipelineState(pipeline)
-        for (i, b) in buffers.enumerated() { enc.setBuffer(b, offset: 0, index: i) }
-        dispatch1D(enc, pipeline: pipeline, count: count)
-        enc.endEncoding()
+        guard count > 0 else { return }
+        withEncoder(cb, label: label) { enc in
+            enc.setComputePipelineState(pipeline)
+            for (i, b) in buffers.enumerated() { enc.setBuffer(b, offset: 0, index: i) }
+            dispatch1D(enc, pipeline: pipeline, count: count)
+        }
     }
 
     private func encodeConstraintSubpass(_ cb: MTLCommandBuffer,
                                          start: Int, count: Int, label: String) {
-        guard count > 0, let enc = cb.makeComputeCommandEncoder() else { return }
-        enc.label = label
-        enc.setComputePipelineState(constraintPipeline)
-        enc.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
-        enc.setBuffer(constraintBuffer.buffer,
-                      offset: start * MemoryLayout<PBDConstraint>.stride, index: 1)
-        enc.setBuffer(uniformBuffer, offset: 0, index: 2)
-        enc.setBuffer(lambdaBuffer, offset: start * MemoryLayout<Float>.stride, index: 3)
-        dispatch1D(enc, pipeline: constraintPipeline, count: count)
-        enc.endEncoding()
+        guard count > 0 else { return }
+        withEncoder(cb, label: label) { enc in
+            enc.setComputePipelineState(constraintPipeline)
+            enc.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
+            enc.setBuffer(constraintBuffer.buffer,
+                          offset: start * MemoryLayout<PBDConstraint>.stride, index: 1)
+            enc.setBuffer(uniformBuffer, offset: 0, index: 2)
+            enc.setBuffer(lambdaBuffer, offset: start * MemoryLayout<Float>.stride, index: 3)
+            dispatch1D(enc, pipeline: constraintPipeline, count: count)
+        }
     }
 
     /// Cloth-specific SDF collide (paperClothSDFCollide), not the shared pbdSDFCollide:
@@ -1498,16 +1526,16 @@ public final class PaperClothSolver {
 
     private func encodeBendSubpass(_ cb: MTLCommandBuffer,
                                    start: Int, count: Int, label: String) {
-        guard count > 0, let enc = cb.makeComputeCommandEncoder() else { return }
-        enc.label = label
-        enc.setComputePipelineState(bendPipeline)
-        enc.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
-        enc.setBuffer(bendConstraintBuffer.buffer,
-                      offset: start * MemoryLayout<PaperBendConstraint>.stride, index: 1)
-        enc.setBuffer(bendUniformBuffer, offset: 0, index: 2)
-        enc.setBuffer(bendLambdaBuffer, offset: start * MemoryLayout<Float>.stride, index: 3)
-        dispatch1D(enc, pipeline: bendPipeline, count: count)
-        enc.endEncoding()
+        guard count > 0 else { return }
+        withEncoder(cb, label: label) { enc in
+            enc.setComputePipelineState(bendPipeline)
+            enc.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
+            enc.setBuffer(bendConstraintBuffer.buffer,
+                          offset: start * MemoryLayout<PaperBendConstraint>.stride, index: 1)
+            enc.setBuffer(bendUniformBuffer, offset: 0, index: 2)
+            enc.setBuffer(bendLambdaBuffer, offset: start * MemoryLayout<Float>.stride, index: 3)
+            dispatch1D(enc, pipeline: bendPipeline, count: count)
+        }
     }
 
     private func dispatch1D(_ enc: MTLComputeCommandEncoder,
