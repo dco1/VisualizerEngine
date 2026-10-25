@@ -33,6 +33,7 @@ extension IlluminatoramaRenderer {
     /// fixed Timer cadence, and to skip re-presenting a stale `outputTexture`.
     @discardableResult
     public func render(blocking: Bool = false) -> Bool {
+        Self.perfAB.apply(to: self)   // env-gated perf bisect (VIZ_PERF_AB); inert when unset
         // Read-and-CLEAR the awaited-frame arming here, before any early return, so no exit
         // path can leave it set for the next caller (see `renderAwaited()`). A nil
         // `pendingFrameCompletion` is what an early return leaves behind, and

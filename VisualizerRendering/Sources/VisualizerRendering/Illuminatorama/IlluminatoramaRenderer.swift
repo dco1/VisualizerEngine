@@ -330,6 +330,7 @@ public final class IlluminatoramaRenderer {
     /// storage — `readAOV` blits it.
     public var aovLightingTexture: MTLTexture? { aovs.aovTexture }
     /// Function-constant indices: `kLightingAOVEnabled` (illumi_lighting) / `kRTAOVEnabled` (TLAS kernel).
+    static let perfAB = IlluminatoramaPerfAB()
     static let lightingAOVFunctionConstantIndex = 8
 
     /// **Daydream DH-1308 — glossy path vertices.** True: a path vertex past the primary samples the
@@ -1342,4 +1343,28 @@ public final class IlluminatoramaRenderer {
     var currentHistoryTexture: MTLTexture { pfx.historyToggle ? pfx.historyB : pfx.historyA }
     var previousHistoryTexture: MTLTexture { pfx.historyToggle ? pfx.historyA : pfx.historyB }
 
+}
+
+
+/// Env-gated pass bisector for GPU-cost audits: `VIZ_PERF_AB=nodof,nogi,nort,nosc,novol,noshadow,noglass,noref,notaa`
+/// force-disables the named pass every frame (after the scene's own per-frame setup), so a
+/// `VIZ_ILLUMI_GPUMS_PATH` p50 delta attributes cost to that pass. Inert when unset.
+struct IlluminatoramaPerfAB: Sendable {
+    let flags: Set<String>
+    init() {
+        let v = ProcessInfo.processInfo.environment["VIZ_PERF_AB"] ?? ""
+        flags = Set(v.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
+    }
+    @MainActor func apply(to r: IlluminatoramaRenderer) {
+        if flags.isEmpty { return }
+        if flags.contains("nodof") { r.dofEnabled = false }
+        if flags.contains("nogi") { r.rtGIStrength = 0 }
+        if flags.contains("nort") { r.rtEnabled = false; r.rtReflectionsEnabled = false; r.rtGlassEnabled = false }
+        if flags.contains("nosc") { r.surfaceCacheEnabled = false }
+        if flags.contains("novol") { r.volumetricEnabled = false; r.volumetricRTEnabled = false }
+        if flags.contains("noshadow") { r.shadowsEnabled = false }
+        if flags.contains("noglass") { r.rtGlassEnabled = false }
+        if flags.contains("noref") { r.rtReflectionsEnabled = false }
+        if flags.contains("notaa") { r.taaEnabled = false }
+    }
 }
