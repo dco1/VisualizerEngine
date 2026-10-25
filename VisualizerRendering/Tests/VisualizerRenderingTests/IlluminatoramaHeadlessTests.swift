@@ -171,3 +171,36 @@ final class IlluminatoramaAccumulationStepTests: XCTestCase {
         r.applyAccumulation(.off); XCTAssertEqual(r.taaJitterPixels, 0)
     }
 }
+
+@MainActor
+final class IlluminatoramaAdaptiveStillDriverTests: XCTestCase {
+    func testDriverRunsBatchesPrintsAndReportsAndRestoresTheRenderer() throws {
+        let cam = IlluminatoramaCamera(position: SIMD3(0, 1, 4), target: .zero, up: SIMD3(0, 1, 0),
+                                       fovYRadians: .pi / 3, aspect: 4.0 / 3.0, zNear: 0.05, zFar: 100)
+        let r = try IlluminatoramaRenderer(engine: SimEngine.shared, width: 128, height: 96, camera: cam)
+        stageScene(r)
+        _ = r.render(blocking: true)
+        var budget = AdaptiveStill.Budget()
+        budget.framesPerBatch = 2; budget.minBatches = 2; budget.maxBatches = 3; budget.maxSeconds = 60
+        var hold: [Bool] = [], restarts = 0, folded: [Int] = [], finished = false
+        var hooks = IlluminatoramaAdaptiveStillDriver.Hooks()
+        hooks.holdHistory = { hold.append($0) }
+        hooks.restartColourAccumulator = { restarts += 1 }
+        hooks.batchFolded = { folded.append($0) }
+        hooks.finished = { _ in finished = true }
+        let scramble = r.aoAccumulationScramble
+        let driver = try XCTUnwrap(IlluminatoramaAdaptiveStillDriver(renderer: r, budget: budget, buildFrames: 0, hooks: hooks),
+                                   "batch passes unavailable")
+        var steps: [IlluminatoramaAdaptiveStillDriver.Step] = []
+        while let step = driver.next() { steps.append(step); _ = r.render(blocking: true); driver.rendered(step) }
+
+        XCTAssertTrue(finished)
+        XCTAssertNotNil(driver.report)
+        XCTAssertEqual(steps.last, .print, "the held mean is printed last")
+        XCTAssertEqual(steps.filter { $0 == .accumulate }.count, 2 * driver.run.batches)
+        XCTAssertEqual(restarts, driver.run.batches, "the colour accumulator restarts once per batch")
+        XCTAssertEqual(folded, Array(0..<driver.run.batches))
+        XCTAssertEqual(hold, [true, false], "history held for the print frame only")
+        XCTAssertEqual(r.aoAccumulationScramble, scramble, "AO sample stream restored")
+    }
+}
