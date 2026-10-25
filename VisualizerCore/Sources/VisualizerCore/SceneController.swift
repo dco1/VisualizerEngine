@@ -231,12 +231,12 @@ public extension SceneController {
 
 // MARK: - tvOS: settings panel placeholder
 
-#if os(tvOS)
+#if !os(macOS)
 /// Apple TV v1 ships no per-scene settings panel: tvOS SwiftUI has no `Slider`
 /// / `Stepper` / `ColorPicker`, and the shared `LabeledSlider` /
 /// `OrbitCameraSection` / `SettingsExportSection` controls are macOS-only
 /// (excluded above). Scene packages wrap their `…SettingsView` file and the
-/// controller's `makeSettingsView` in `#if !os(tvOS)`; this default then
+/// controller's `makeSettingsView` in `#if os(macOS)`; this default then
 /// witnesses the requirement with a blurb-only view, so the tvOS app still
 /// has something to show for "about this scene". A scene whose settings UI
 /// does compile on tvOS keeps its own `makeSettingsView` — the concrete

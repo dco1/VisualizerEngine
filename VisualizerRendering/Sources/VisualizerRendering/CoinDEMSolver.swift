@@ -596,7 +596,7 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// joint solve's threadgroup cache (CD_JSOLVE_MAXJ / CD_JSOLVE_MAXB in CoinDEM.metal);
     /// 0 ⇒ the direct (device-memory) path.
     var frameJointTGBodies = 0
-    static let jointTGMaxJoints = 40
+    static let jointTGMaxJoints = 20   // == CD_JSOLVE_MAXJ in CoinDEM.metal (threadgroup memory ≤ 32 KB)
     static let jointTGMaxBodies = 80
     /// Active (enabled) joints.
     public var activeJointCount: Int {

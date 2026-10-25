@@ -24,7 +24,7 @@ import SwiftUI
 //     `ProceduralCanvas.image(size:) { ctx in … }` (PlatformDrawing.swift),
 //     which is the same CGContext on both platforms.
 //   • `NSEvent` / `NSGestureRecognizer` — input has no tvOS analogue; the few
-//     scenes that read the mouse wrap that code in `#if !os(tvOS)`.
+//     scenes that read the mouse wrap that code in `#if os(macOS)`.
 //
 // Mac Catalyst is excluded on purpose: it can import real AppKit, and the
 // engine's PlatformTypes.swift already routes Catalyst through UIKit with its

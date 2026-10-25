@@ -1,6 +1,6 @@
 // Settings-panel UI only — no render-path role. Excluded from tvOS builds
 // because SwiftUI.Slider (and .help) don't exist there.
-#if !os(tvOS)
+#if os(macOS)
 import SwiftUI
 
 // ──────────────────────────────────────────────────────────────────────────

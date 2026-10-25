@@ -71,7 +71,7 @@ extension IlluminatoramaRenderer {
     func encodePostResolveFX(_ cb: MTLCommandBuffer) {
         pfx.overlayApplied = false
         let hasEmitters = fxs.particleEmitters.contains { $0.enabled }
-        guard !fxs.particleFields.isEmpty || hasEmitters || !fxs.particleStreaks.isEmpty else { return }
+        guard !fxs.particleFields.isEmpty || hasEmitters || !fxs.particleStreaks.isEmpty || !fxs.crystalFlakeSources.isEmpty else { return }
 
         // Seed the display buffer with the resolved opaque image.
         let resolved = postFXSource
@@ -92,6 +92,7 @@ extension IlluminatoramaRenderer {
         encodeParticleDraw(cb)
         encodeExternalPointDraw(cb)
         encodeStreakDraw(cb)           // Phase 4.44b — velocity-aligned streak quads
+        encodeCrystalFlakeDraw(cb)     // near-camera ice-crystal flakes
         pfx.overlayApplied = true
     }
 

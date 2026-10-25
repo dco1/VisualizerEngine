@@ -1,6 +1,6 @@
 // Settings-panel UI only — no render-path role. Excluded from tvOS builds
 // because SwiftUI.Slider doesn't exist there.
-#if !os(tvOS)
+#if os(macOS)
 import SwiftUI
 
 /// Reusable **Camera** settings section — the six orbit sliders
