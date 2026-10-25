@@ -20,8 +20,8 @@ extension MaterialGenerator {
                 let wash  = Noise.fbmTiled(u, v, baseCells: 2, octaves: 3, seed: seed) - 0.5
                 let patch = Noise.fbmTiled(u, v, baseCells: 5, octaves: 3, seed: seed ^ 0x33) - 0.5
                 // The trowel's pass: stretch the patch field along one diagonal by sampling it on a
-                // skewed axis, so the cloud has a grain rather than reading as isotropic noise.
-                let su = (u + 0.35 * v).truncatingRemainder(dividingBy: 1)
+                // 45° skewed axis, so the cloud has a grain rather than reading as isotropic noise.
+                let su = (u + v).truncatingRemainder(dividingBy: 1)   // integer skew: tiles in both axes
                 let streak = Noise.fbmTiled(su, v, baseCells: 3, octaves: 2, seed: seed ^ 0x77) - 0.5
                 let tooth = Noise.fbmTiled(u, v, baseCells: 120, octaves: 2, seed: seed ^ 0x9D) - 0.5
                 let tone = 1.0 + 0.11 * wash + 0.07 * patch + 0.05 * streak + 0.015 * tooth
