@@ -83,6 +83,10 @@ public final class PaperClothSolver {
     private let bendUniformBuffer: MTLBuffer   // PaperBendUniforms
     private let stickUniformBuffer: MTLBuffer  // PaperStickUniforms
     private let anchorBuffer: MTLBuffer        // float4 per particle (xyz anchor, w armed)
+    /// Per-particle long-range tether (anchor index, max length) — see `SheetSpec.tetherNode`. Nil until a sheet asks.
+    private var tetherBuffer: MTLBuffer?
+    private lazy var tetherPipeline: MTLComputePipelineState? =
+        engine.pipelineCache.pipelineState(name: "paperTether", device: engine.device)
     private let clothCollideUniformBuffer: MTLBuffer  // PaperClothCollideUniforms
     private var bendGroupStart: [Int] = []
     private var bendGroupCount: [Int] = []
@@ -427,13 +431,23 @@ public final class PaperClothSolver {
         /// rest lengths are measured off the initial layout: with a flat layout they would encode
         /// the shape of a bag that has never been stuffed.
         public var nodeLift: [Float]
+        /// Grid nodes held fixed (`invMass 0`), as row-major indices `y * gridW + x` — a cloth
+        /// hung from a single corner (`[0]`), a hook loop, or any pin pattern `pinFirstRow`
+        /// cannot say. Unioned with `pinFirstRow`. Empty (the default) pins nothing extra.
+        public var pinnedNodes: [Int]
+        /// Tether every OTHER node to this one (row-major grid index, normally also in `pinnedNodes`):
+        /// a node may never be farther from it than its flat-layout rest distance. Needed to HANG a long
+        /// sheet from a point — see `paperTether` in PaperCloth.metal. `nil` = no tether.
+        public var tetherNode: Int?
 
         public init(origin: SIMD3<Float>, right: SIMD3<Float>, down: SIMD3<Float>,
                     sizeW: Float, sizeH: Float, pinFirstRow: Bool = false,
-                    nodeLift: [Float] = []) {
+                    nodeLift: [Float] = [], pinnedNodes: [Int] = [], tetherNode: Int? = nil) {
             self.origin = origin; self.right = right; self.down = down
             self.sizeW = sizeW; self.sizeH = sizeH; self.pinFirstRow = pinFirstRow
             self.nodeLift = nodeLift
+            self.pinnedNodes = pinnedNodes
+            self.tetherNode = tetherNode
         }
     }
 
@@ -575,13 +589,14 @@ public final class PaperClothSolver {
             let n = simd_normalize(simd_cross(d, r))
             precondition(spec.nodeLift.isEmpty || spec.nodeLift.count == M,
                          "SheetSpec.nodeLift must be empty or gridW*gridH (\(M))")
+            let extraPins = Set(spec.pinnedNodes)
             for y in 0..<H {
                 for x in 0..<W {
                     let fx = W > 1 ? Float(x) / Float(W - 1) : 0
                     let fy = H > 1 ? Float(y) / Float(H - 1) : 0
                     var p = spec.origin + r * (spec.sizeW * fx) + d * (spec.sizeH * fy)
                     if !spec.nodeLift.isEmpty { p += n * spec.nodeLift[y * W + x] }
-                    let pinned = spec.pinFirstRow && y == 0
+                    let pinned = (spec.pinFirstRow && y == 0) || extraPins.contains(y * W + x)
                     var particle = PBDParticle(position: p, invMass: pinned ? 0 : 1)
                     particle.prevPositionAndPad = SIMD4(p, 0)
                     particles.append(particle)
@@ -608,6 +623,23 @@ public final class PaperClothSolver {
         }
         particleBuffer.write(particles)
         clearAnchors()
+
+        // ── Long-range tethers (hung sheets) ──
+        if specs.contains(where: { $0.tetherNode != nil }) {
+            var tethers = [SIMD2<UInt32>](repeating: SIMD2(0xFFFF_FFFF, 0), count: specs.count * M)
+            for (s, spec) in specs.enumerated() {
+                guard let k = spec.tetherNode, k >= 0, k < M else { continue }
+                func flat(_ i: Int) -> SIMD2<Float> {
+                    SIMD2(spec.sizeW * Float(i % W) / Float(max(1, W - 1)), spec.sizeH * Float(i / W) / Float(max(1, H - 1)))
+                }
+                for i in 0 ..< M where i != k {
+                    tethers[s * M + i] = SIMD2(UInt32(s * M + k), simd_length(flat(i) - flat(k)).bitPattern)
+                }
+            }
+            tetherBuffer = tethers.withUnsafeBytes { raw in
+                device.makeBuffer(bytes: raw.baseAddress!, length: raw.count, options: .storageModeShared)
+            }
+        } else { tetherBuffer = nil }
 
         // ── Constraints (8 colour groups) ──
         // index of (x,y) in sheet s
@@ -872,6 +904,7 @@ public final class PaperClothSolver {
             if !nrm.x.isFinite { nrm = SIMD3(0, 1, 0) }
             let pp = positionBuffers[s].contents().bindMemory(to: Float.self, capacity: M * 3)
             let np = normalBuffers[s].contents().bindMemory(to: Float.self, capacity: M * 3)
+            let extraPins = Set(spec.pinnedNodes)
             for y in 0..<H {
                 for x in 0..<W {
                     let fx = W > 1 ? Float(x) / Float(W - 1) : 0
@@ -1107,6 +1140,16 @@ public final class PaperClothSolver {
             for g in bendGroupCount.indices where bendGroupCount[g] > 0 {
                 encodeBendSubpass(cb, start: bendGroupStart[g], count: bendGroupCount[g],
                                   label: "PaperCloth.bend[\(g)]")
+            }
+            if let tb = tetherBuffer, let pipe = tetherPipeline, let enc = cb.makeComputeCommandEncoder() {
+                enc.label = "PaperCloth.tether"
+                enc.setComputePipelineState(pipe)
+                enc.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
+                enc.setBuffer(tb, offset: 0, index: 1)
+                var n = UInt32(particleBuffer.count)
+                enc.setBytes(&n, length: 4, index: 2)
+                dispatch1D(enc, pipeline: pipe, count: particleBuffer.count)
+                enc.endEncoding()
             }
             if interleavedCollide, i % 3 == 2, colliderCount > 0, !killSDF {
                 encodeClothCollide(cb)

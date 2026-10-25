@@ -444,6 +444,38 @@ kernel void paperClothSDFCollide(
     }
 }
 
+// ── KERNEL: long-range tether to a pinned anchor ─────────────────────────────
+//
+// A cloth HUNG from one pinned node is a chain as long as the cloth: a Gauss-Seidel solve's
+// distance constraints pass a correction roughly one node per iteration, so a 100-row sheet
+// stretches under its own weight (measured: a 0.7 m towel at 7 mm pitch hangs 1.04 m long
+// after 300 iterations, 58 % strain at 14 mm / 100 iterations). The standard cure is a
+// UNILATERAL max-distance constraint from every node to the anchor — a node may never be
+// farther from the pin than the cloth between them is long (Muller et al.'s "long range
+// attachments"). One independent write per particle, reading only the static anchor: race-free
+// and deterministic. The correction is made velocity-neutral (prev moves with the position).
+struct PaperTether {
+    uint  anchor;     // global particle index of the pinned node; 0xFFFFFFFF = none
+    float maxLength;  // longest the node may be from it (m)
+};
+
+kernel void paperTether(device PBDParticle*       P [[ buffer(0) ]],
+                        device const PaperTether* T [[ buffer(1) ]],
+                        constant uint&            count [[ buffer(2) ]],
+                        uint id [[ thread_position_in_grid ]]) {
+    if (id >= count) return;
+    PaperTether t = T[id];
+    if (t.anchor == 0xFFFFFFFFu) return;
+    float4 pa = P[id].positionAndInvMass;
+    if (pa.w == 0.0) return;
+    float3 d = pa.xyz - P[t.anchor].positionAndInvMass.xyz;
+    float len = length(d);
+    if (len <= t.maxLength || len < 1e-6) return;
+    float3 corr = d * (t.maxLength / len - 1.0);
+    P[id].positionAndInvMass.xyz = pa.xyz + corr;
+    P[id].prevPositionAndPad.xyz += corr;
+}
+
 kernel void paperStaticFriction(
     device PBDParticle*        particles [[ buffer(0) ]],
     device const PBDCollider*  colliders [[ buffer(1) ]],
