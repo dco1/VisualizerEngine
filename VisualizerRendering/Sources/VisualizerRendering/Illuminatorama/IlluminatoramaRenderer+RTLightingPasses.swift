@@ -77,6 +77,8 @@ extension IlluminatoramaRenderer {
         u.pathGlossyLampSize = pathOn ? max(0, rtPathGlossyLampSize) : 1   // DH-1395
         u.layerInstanceCount = UInt32(instances.count)                       // DH-1300
         u.pathGlossyLampMinRoughness = pathOn ? max(0, rtPathGlossyLampMinRoughness) : 0
+        let specDenoiseOn = prepareSpecularDenoise()                         // DH-0539
+        u.specDenoise = specDenoiseOn ? 1 : 0
         // DH-1293 — the lamps' near-field levers (0 ⇒ the shipped point-source law).
         u.pathLampMinDist = pathOn ? rtPathLampMinDistance : 0
         u.pathLampSourceRadius = pathOn ? max(0, rtPathLampSourceRadius) : 0
@@ -271,6 +273,8 @@ extension IlluminatoramaRenderer {
         enc.setTexture(gbs.gbufferMaterialLayer, index: 14)
         enc.setBuffer(currentInstanceBuffer, offset: 0, index: 26)
         // DH-0653 hit/miss counters (buffer 19). Dummy = instData, never added to while
+        enc.setTexture(specDenoiseOn ? rts.spec.raw : rts.rtDiffuseTexture, index: 15)   // DH-0539 — the reflection's own target (a stand-in when off)
+        enc.setTexture(specDenoiseOn ? rts.spec.fres : rts.rtDiffuseTexture, index: 16)
         // `surfStatsEnabled` is 0.
         enc.setBuffer(hitStats ?? instData, offset: 0, index: 19)
         // DH-1304 — the AOV capture (texture 13 + buffer 24 exist only in the `aov` variants).

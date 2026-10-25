@@ -15,6 +15,8 @@ final class RTState {
     /// in `render`); nil while still mode is off.
     var lastStillViewProjection: simd_float4x4?
     var previousRTGIStatic = false
+    /// DH-0539 — the RT reflection (specular) denoise chain's textures + knobs; see IlluminatoramaRenderer+SpecularDenoise.swift.
+    let spec = SpecDenoiseState()
 
     var rcFramesSinceReset = 0
     var rcKeysBuffer: MTLBuffer?

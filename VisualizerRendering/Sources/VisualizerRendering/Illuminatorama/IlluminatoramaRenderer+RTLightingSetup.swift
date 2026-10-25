@@ -279,6 +279,8 @@ extension IlluminatoramaRenderer {
         var pathGlossyLampSize: Float = 1, pathGlossyLampMinRoughness: Float = 0
         /// DH-1300 — the raster instances bound as `layerInstances` (was `padGlossy2`, same 4 bytes).
         var layerInstanceCount: UInt32 = 0
+        /// DH-0539 — 1 ⇒ the reflection goes to the specular denoise chain, not into the HDR (Metal twin appended last).
+        var specDenoise: UInt32 = 0
 
         mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
             let p = InteriorRoomGains.pack(gains, enabled: enabled)

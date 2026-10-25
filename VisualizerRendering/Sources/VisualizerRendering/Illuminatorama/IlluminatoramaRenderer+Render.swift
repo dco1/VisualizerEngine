@@ -295,6 +295,7 @@ extension IlluminatoramaRenderer {
         if rts.rtTLASActive && rtEnabled && rtOpaqueLightingEnabled {
             encodeRTLightingTLASPass(cb)
             encodeRTDiffuseDenoiseChain(cb)
+            encodeRTSpecularDenoise(cb)   // DH-0539 — no-op unless the lever is on and the pass wrote `spec.raw`
         } else if !rts.rtTLASActive {
             encodeRTLightingPass(cb)
             encodeRTDiffuseDenoiseChain(cb)

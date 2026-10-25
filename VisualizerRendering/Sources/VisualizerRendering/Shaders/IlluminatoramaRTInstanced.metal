@@ -186,6 +186,10 @@ struct RTInstUniforms {
     // caustic camera → diffuse → glossy → lamp. 0 ⇒ the material's own. Was `_padGlossy1`.
     float pathGlossyLampMinRoughness;
     uint  layerInstanceCount;   // DH-1300 — raster instances in `layerInstances` (TLAS ids below it are raster slots); was _padGlossy2
+    // Daydream DH-0539 — 1 ⇒ the glossy reflection is NOT added into the HDR here: it goes (minus the sky it
+    // replaces) to `rtSpecular` for the specular denoise chain (IlluminatoramaSpecDenoise.metal). 0 ⇒ the raw
+    // add below, exactly as before (byte-identical).
+    uint  specDenoise;
 };
 
 /// DH-1011 — `RTInstUniforms.pathFlags` bits.
@@ -1527,6 +1531,12 @@ kernel void illumi_rt_lighting_tlas(
     // TLAS id below `u.layerInstanceCount`) indexes; read only under kPathFlagLayeredSpecular.
     texture2d<uint, access::read>         gMaterialLayer [[texture(14)]],
     const device float4*                  layerInstances [[buffer(26)]],
+    // Daydream DH-0539 — the reflection term's own target (rgb = reflection − the sky it replaces, a = mean
+    // hit distance, 0 ⇒ untraced). Written only when `u.specDenoise`; the host binds a stand-in otherwise.
+    texture2d<half, access::write>        rtSpecular  [[texture(15)]],
+    // …and the Fresnel (× reflStrength) it was DEMODULATED by, so the chain filters the room's radiance and not
+    // the surface's own F0 texture (the composite multiplies it back in). Same gating as `rtSpecular`.
+    texture2d<half, access::write>        rtSpecularFres [[texture(16)]],
     // Daydream DH-1304 — the per-term AOV capture (running means the deferred pass started this
     // frame) and its frame parameters. Exist only in the `kRTAOVEnabled` variants.
     texture2d_array<float, access::read_write> aovOut   [[texture(13), function_constant(kRTAOVEnabled)]],
@@ -1535,6 +1545,7 @@ kernel void illumi_rt_lighting_tlas(
 {
     if (gid.x >= u.width || gid.y >= u.height) return;
     float depth = gDepth.read(gid).r;
+    if (u.specDenoise != 0u) rtSpecular.write(half4(0.0h), gid);   // DH-0539 — untraced until proven otherwise
     if (depth >= 0.99999) return;
 
     float2 ndc = (float2(gid) + 0.5) / float2(u.width, u.height) * 2.0 - 1.0;
@@ -1853,6 +1864,9 @@ kernel void illumi_rt_lighting_tlas(
     // (as this pass did) left a mirror showing the sunset horizon with the room ghosted
     // faintly through it — the whole of the Primary Bathroom report.
     float reflHitFraction = 0.0;
+    bool  reflTraced = false;       // DH-0539 — this pixel cast reflection rays
+    float reflDistAcc = 0.0; float reflDistN = 0.0;
+    float3 reflFresS = float3(1.0);   // DH-0539 — fres × reflStrength, the demodulation
     float reflRough = lw.reflRoughness;
     if (u.reflEnabled != 0 && u.reflStrength > 0.0 && reflRough <= u.reflRoughnessCutoff) {
         float3 V = normalize(u.cameraWorldPos - P);
@@ -1923,6 +1937,8 @@ kernel void illumi_rt_lighting_tlas(
             // would put a ceiling in the frame that is nowhere else in it. Flagged
             // for Danny; measured in `testRTReflectionRaysDoNotShowInvisibleCeilings`.
             auto res = isect.intersect(r, accel, 0x01u);
+            reflDistAcc += (res.type == intersection_type::none) ? u.reflMaxDist : res.distance;   // DH-0539
+            reflDistN += 1.0;
             if (kRTCurvesEnabled && res.type == intersection_type::curve) {
                 // Curve reflection hit (#60 item 7) — same shading shape as the
                 // triangle re-shade below (ambient + sun + the set's emission).
@@ -1998,7 +2014,9 @@ kernel void illumi_rt_lighting_tlas(
             cacheRefl += cacheTerm;
         }
         reflection = (acc / float(rrays)) * fres * u.reflStrength;
+        reflFresS = max(fres * u.reflStrength, float3(0.02));
         reflHitFraction = saturate(float(hits) / float(rrays) * u.reflStrength);
+        reflTraced = reflDistN > 0.0;
         cacheTerms += (cacheRefl / float(rrays)) * fres * u.reflStrength;
     }
 
@@ -2043,7 +2061,16 @@ kernel void illumi_rt_lighting_tlas(
     if (u.giReplacesDiffuseSky != 0u && u.giRays > 0 && u.giStrength > 0.0) {
         diffSkyReplaced = float3(diffSky.read(gid).rgb);
     }
-    outHDR.write(half4(max(prev.rgb - half3(skySeenThrough) - half3(diffSkyReplaced), half3(0.0h)) + half3(reflection), prev.a), gid);
+    if (u.specDenoise != 0u && reflTraced) {
+        // DH-0539 — the reflection and the sky it replaces BOTH leave the HDR here and travel together, as one
+        // signed delta, through the specular chain; the composite adds the cleaned delta back. Taking only the
+        // sky out here would leave its hit-fraction noise in the picture.
+        outHDR.write(half4(max(prev.rgb - half3(diffSkyReplaced), half3(0.0h)), prev.a), gid);
+        rtSpecular.write(half4(half3((reflection - skySeenThrough) / reflFresS), half(max(reflDistAcc / reflDistN, 1e-3))), gid);
+        rtSpecularFres.write(half4(half3(reflFresS), 1.0h), gid);
+    } else {
+        outHDR.write(half4(max(prev.rgb - half3(skySeenThrough) - half3(diffSkyReplaced), half3(0.0h)) + half3(reflection), prev.a), gid);
+    }
     rtDiffuse.write(half4(half3(direct + indirect), 1.0h), gid);
     if (kRTAOVEnabled) {
         // ── DH-1304 — this pass's share of every term, into the means the deferred pass began ──
