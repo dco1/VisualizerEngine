@@ -372,6 +372,16 @@ public struct TileLayout: Equatable, Hashable, Sendable {
         Swift.max(asked, minJointFraction)
     }
 
+    /// **How deep a joint of this width is cut, as a fraction of the full recess.** A real joint is about as deep
+    /// as it is wide: an 8 mm grout line on a 6″ tile is a real groove, a 2 mm line between 2″ mosaic tiles is
+    /// a hairline. The bake draws every joint through the same height step, so without this a hairline reads
+    /// as a canyon — dark outlined tiles standing on a grid (the photographed 2″ bath tile, DH-1525). Joints of
+    /// 6 mm or more keep the full recess (every default-size tile is bit-for-bit what it was); thinner ones cut
+    /// proportionally shallower, never below a fifth so the line still reads.
+    public static func jointDepthScale(widthMeters: Double) -> Double {
+        Swift.min(1, Swift.max(0.2, widthMeters / 0.006))
+    }
+
     /// The realised joint width in METRES — the number to show the user, because it is the one
     /// they get. Quoted against `realisedSizeMeters`, so a quantised size can't make it a lie.
     public func jointWidthMeters(_ asked: Double) -> Double {
@@ -436,6 +446,9 @@ public struct TileLayout: Equatable, Hashable, Sendable {
     /// sane repeat. Lower this to buy finer joints at the cost of a shorter repeat.
     public static let targetRunMeters: Double = 1.2
 
+    /// Tile at or below this edge (≈ 2.4″) is MOSAIC: hairline joints, and the finer grid described at `of(_:on:)`.
+    public static let mosaicUnitMeters: Double = 0.06
+
     /// Derive the grid for `params` on a surface. `tiling.isAdjustable` says whether the mesh's
     /// UV period can be set from the material (the structural wall/floor/ceiling convert path)
     /// or is fixed by a mesh baked earlier (every instanced placeable).
@@ -462,7 +475,14 @@ public struct TileLayout: Equatable, Hashable, Sendable {
         // grid that draws the crispest joint (`targetRunMeters`) rather than the surface's nominal
         // patch size. On a fixed-period mesh we get no such choice — the count must match the
         // period the mesh already baked, or the tile size is a lie.
-        let target = tiling.isAdjustable ? Swift.min(tiling.metresPerRepeat, targetRunMeters)
+        // …and a FINE tile asks for a finer grid still (DH-1525). Mosaic tile carries hairline joints (2″ tile ≈ 2 mm),
+        // and the thinnest joint the bake can draw is 1.6 texels: at the 1.2 m run that is 3.7 mm — the photographed
+        // bath tile rendered as fat dark canyons. The period follows the UNIT (12 units across, never below 0.6 m,
+        // never above the 1.2 m run), NOT the asked joint, so the joint control keeps one grid to floor against —
+        // anything over 2.4″ keeps the 1.2 m run exactly.
+        let fineRun = params.unitSizeMeters <= Self.mosaicUnitMeters
+            ? Swift.min(targetRunMeters, Swift.max(0.6, params.unitSizeMeters * 12)) : targetRunMeters
+        let target = tiling.isAdjustable ? Swift.min(tiling.metresPerRepeat, fineRun)
                                          : tiling.metresPerRepeat
         let wanted = target / Swift.max(params.unitSizeMeters, 1e-4)
         var cols = Swift.max(Swift.min(minCols, maxCols), Swift.min(maxCols, Int(wanted.rounded())))
@@ -654,7 +674,7 @@ public extension MaterialGenerator {
                 let chamfer = bevel > 0 ? (1 - smoothstep(0, bevel, c.rim)) : 0
                 let relief = params.edge.handmadeRelief(rim: c.rim, fx: fx, fy: fy, unitHash: th,
                                                         wobble: handmade ? Noise.fbmTiled(u, v, baseCells: Swift.max(cols, 2) * 2, octaves: 3, seed: p.seed ^ 0x44) : 0.5)
-                ch.height[ch.idx(x, y)] = clamp01((handmade ? 0.88 + relief : 1) - joint * 0.7 - chamfer * bevel * 6
+                ch.height[ch.idx(x, y)] = clamp01((handmade ? 0.88 + relief : 1) - joint * 0.7 * TileLayout.jointDepthScale(widthMeters: layout.jointWidthMeters(p.jointFraction)) - chamfer * bevel * 6
                                                   - real.rimEase(c, edge: params.edge)
                                                   + grout.heightAdd * joint + flaw.heightAdd * (1 - joint))
             }
@@ -753,7 +773,7 @@ public extension MaterialGenerator {
                 let chamfer = bevel > 0 ? (1 - smoothstep(0, bevel, dMin)) : 0
                 let relief = params.edge.handmadeRelief(rim: dMin, fx: faceU, fy: faceV, unitHash: th,
                                                         wobble: handmade ? Noise.fbmTiled(u, v, baseCells: Swift.max(cells, 2) * 2, octaves: 3, seed: p.seed ^ 0x44) : 0.5)
-                ch.height[ch.idx(x, y)] = clamp01((handmade ? 0.88 + relief : 1) - joint * 0.7 - chamfer * bevel * 6
+                ch.height[ch.idx(x, y)] = clamp01((handmade ? 0.88 + relief : 1) - joint * 0.7 * TileLayout.jointDepthScale(widthMeters: layout.jointWidthMeters(p.jointFraction)) - chamfer * bevel * 6
                                                   - real.rimEase(c, edge: params.edge)
                                                   + grout.heightAdd * joint + flaw.heightAdd * (1 - joint))
             }
