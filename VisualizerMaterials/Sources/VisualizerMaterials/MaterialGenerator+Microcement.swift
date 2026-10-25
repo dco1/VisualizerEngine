@@ -9,8 +9,8 @@ extension MaterialGenerator {
     /// sealer. Albedo mottle here is the material's identity — it is baked into the colour, so it
     /// does not move with the light and is not the lighting mottle the export gates police.
     ///
-    /// Bands on the paint tile (0.6 m): wash 2 cells (30 cm, ±5.5 %), patch 5 cells (12 cm, ±3.5 %),
-    /// stroke — Worley arcs from two cell sizes, soft, ±2 % in tone — and a 5 mm micro tooth.
+    /// Bands on the paint tile (0.6 m): wash 2 cells (30 cm, ±12 %), patch 5 cells (12 cm, ±8 %),
+    /// stroke — a diagonal trowel pass, soft, ±5 % in tone — and a 5 mm micro tooth.
     public static func microcement(size: Int = MaterialGenerator.bakeSize, color: Vec3 = Vec3(0.42, 0.41, 0.38),
                                    seed: UInt64 = 71) -> MaterialChannels {
         var ch = MaterialChannels(size: size, category: .paint)
@@ -24,7 +24,7 @@ extension MaterialGenerator {
                 let su = (u + v).truncatingRemainder(dividingBy: 1)   // integer skew: tiles in both axes
                 let streak = Noise.fbmTiled(su, v, baseCells: 3, octaves: 2, seed: seed ^ 0x77) - 0.5
                 let tooth = Noise.fbmTiled(u, v, baseCells: 120, octaves: 2, seed: seed ^ 0x9D) - 0.5
-                let tone = 1.0 + 0.11 * wash + 0.07 * patch + 0.05 * streak + 0.015 * tooth
+                let tone = 1.0 + 0.24 * wash + 0.16 * patch + 0.11 * streak + 0.02 * tooth
                 // A faint warm/cool drift between patches — cement never cures one neutral.
                 let drift = 0.025 * (Noise.fbmTiled(u, v, baseCells: 3, octaves: 2, seed: seed ^ 0x5A) - 0.5)
                 ch.albedo[ch.idx(x, y)] = clampBand(Vec3(color.x * tone * (1 + drift),
