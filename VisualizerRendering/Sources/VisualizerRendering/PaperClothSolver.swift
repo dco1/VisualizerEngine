@@ -114,6 +114,10 @@ public final class PaperClothSolver {
     /// Contact pressure (m of penetration into the rest thickness per pass) at which the pile has
     /// lost half its compressible range. Saturating: heavier loads approach the floor, never pass it.
     public var pileStiffness: Float = 0.0005
+    /// Smallest contact radius rigid colliders ever hold the cloth at, however crushed its pile (m). 0 = the crush moves the
+    /// cloth closer to what it lies on (a towel on a rim). Set it to the standoff a skin is drawn at to keep the crush a
+    /// property of the cloth only (a duvet beside a bed frame).
+    public var pileContactFloor: Float = 0
     /// (thickness, pressure) per particle, written by `paperClothSDFCollide`.
     private let pileBuffer: MTLBuffer
     /// How far self-collision pushed each node last pass (m); zeroed at configure, folded into pressure by the collide pass.
@@ -1586,7 +1590,8 @@ public final class PaperClothSolver {
             friction: collideFriction,
             pileRest: pileRestThickness,
             pileMinFraction: pileMinFraction,
-            pileStiffness: pileStiffness)
+            pileStiffness: pileStiffness,
+            pileContactFloor: pileContactFloor)
         encodePass(cb, pipeline: clothCollidePipeline,
                    buffers: [particleBuffer.buffer, colliderBuffer.buffer, clothCollideUniformBuffer,
                              sdfBinding, pileBuffer, selfLoadBuffer],
@@ -1652,7 +1657,7 @@ struct PaperClothCollideUniforms {
     var pileRest: Float = 0
     var pileMinFraction: Float = 1
     var pileStiffness: Float = 1
-    var _pad0: Float = 0
+    var pileContactFloor: Float = 0
 }
 
 // ── PaperStickUniforms mirror ────────────────────────────────────────────────

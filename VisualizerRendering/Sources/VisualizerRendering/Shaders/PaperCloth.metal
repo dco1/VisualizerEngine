@@ -412,7 +412,10 @@ struct PaperClothCollideUniforms {
     float pileRest;
     float pileMinFraction;
     float pileStiffness;   // pressure (m) at which the pile has lost half its compressible range
-    float _pad0;
+    // Smallest contact radius the RIGID colliders ever see, however crushed the pile (0 = none). A skin drawn
+    // around the cloth needs a fixed standoff from the frame it lies on; the crush is then a property of the
+    // cloth (`pile`), not of where it is held.
+    float pileContactFloor;
 };
 
 kernel void paperClothSDFCollide(
@@ -429,7 +432,7 @@ kernel void paperClothSDFCollide(
     if (p.positionAndInvMass.w == 0.0) return;   // pinned
     const bool compressible = u.pileRest > 0.0;
     float2 pl = compressible ? pile[id] : float2(u.selfRadius, 0.0);
-    float radius = compressible ? pl.x : u.selfRadius;
+    float radius = compressible ? max(pl.x, u.pileContactFloor) : u.selfRadius;
     float pushed = 0.0;    // how far the colliders moved this node this pass (the normal impulse, as a length)
     float nearest = 1e30;  // signed distance to the nearest collider surface, before the push
 
