@@ -405,7 +405,14 @@ struct PaperClothCollideUniforms {
     // cloth drains laterally off the surface within a few substeps and the settled
     // top irons into a perfect plane.
     float friction;
-    float _pad0, _pad1;
+    // Compressible pile (DH-1538). pileRest = 0 disables it and the kernel is the old one bit
+    // for bit. Otherwise each particle's contact thickness lives in pile[id].x, between
+    // pileMinFraction·pileRest and pileRest, and pile[id].y is the smoothed contact pressure
+    // (m of penetration into the REST thickness per pass — what the node is being pushed in by).
+    float pileRest;
+    float pileMinFraction;
+    float pileStiffness;   // pressure (m) at which the pile has lost half its compressible range
+    float _pad0;
 };
 
 kernel void paperClothSDFCollide(
@@ -413,11 +420,17 @@ kernel void paperClothSDFCollide(
     device const PBDCollider*           colliders [[ buffer(1) ]],
     constant PaperClothCollideUniforms& u         [[ buffer(2) ]],
     device const float*                 sdf       [[ buffer(3) ]],   // the SDF volume, if any
+    device float2*                      pile      [[ buffer(4) ]],   // (thickness, pressure) per particle
     uint id [[ thread_position_in_grid ]]
 ) {
     if (id >= u.particleCount) return;
     PBDParticle p = particles[id];
     if (p.positionAndInvMass.w == 0.0) return;   // pinned
+    const bool compressible = u.pileRest > 0.0;
+    float2 pl = compressible ? pile[id] : float2(u.selfRadius, 0.0);
+    float radius = compressible ? pl.x : u.selfRadius;
+    float pushed = 0.0;    // how far the colliders moved this node this pass (the normal impulse, as a length)
+    float nearest = 1e30;  // signed distance to the nearest collider surface, before the push
 
     float3 pos  = p.positionAndInvMass.xyz;
     float3 prev = p.prevPositionAndPad.xyz;
@@ -425,14 +438,28 @@ kernel void paperClothSDFCollide(
     float3 cn = float3(0, 1, 0);
     for (uint c = 0u; c < u.colliderCount; ++c) {
         float3 n;
-        float d = paperColliderDistance(pos, colliders[c], u.selfRadius, n, sdf);
+        float d = paperColliderDistance(pos, colliders[c], radius, n, sdf);
+        nearest = min(nearest, d);
         if (d < 0.0) {
             float disp = min(-d * u.stiffness, u.maxPush);
+            pushed += disp;
             pos  += n * disp;
             prev += n * disp * 0.5;   // bleed off inward velocity, same as the shared kernel
             cn = n;
             hit = true;
         }
+    }
+    if (compressible) {
+        // Pressure is the push the colliders had to give this node (an impulse measured as a length),
+        // smoothed. A node resting on the surface is pushed on some passes and merely touching on
+        // others, so a touch holds the pressure; only leaving the contact band releases it.
+        // Thickness is a saturating function of pressure, so a heavy load flattens the pile toward
+        // its floor, never through it.
+        if (hit)                                   pl.y += (pushed - pl.y) * 0.25;
+        else if (nearest > 0.25 * u.pileRest)      pl.y *= 0.9;
+        float lo = u.pileRest * u.pileMinFraction;
+        pl.x = lo + (u.pileRest - lo) / (1.0 + pl.y / max(u.pileStiffness, 1e-9));
+        pile[id] = pl;
     }
     if (hit) {
         // Kinetic contact friction: retain only `friction` of the tangential motion.

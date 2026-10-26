@@ -102,6 +102,34 @@ public final class PaperClothSolver {
     private let hashUniformBuffer: MTLBuffer      // PaperHashUniforms
     private let selfSnapshotBuffer: MTLBuffer     // frozen copy read by paperSelfCollide
     public var selfCollisionEnabled: Bool = true
+
+    // ── Compressible pile (DH-1538) ─────────────────────────────────────────
+    /// Contact thickness of the cloth against rigid colliders when UNLOADED (m). 0 (the default)
+    /// turns the pile off and the collide pass is the old one bit for bit (`clothThickness` rules).
+    /// Otherwise each node's thickness falls from this toward `pileMinFraction · pileRestThickness`
+    /// as its contact pressure rises, and relaxes back when the load is lifted.
+    public var pileRestThickness: Float = 0
+    /// The floor of the compression, as a fraction of `pileRestThickness`.
+    public var pileMinFraction: Float = 0.3
+    /// Contact pressure (m of penetration into the rest thickness per pass) at which the pile has
+    /// lost half its compressible range. Saturating: heavier loads approach the floor, never pass it.
+    public var pileStiffness: Float = 0.0005
+    /// (thickness, pressure) per particle, written by `paperClothSDFCollide`.
+    private let pileBuffer: MTLBuffer
+    /// Per-node contact pressure after the last `encode` — read AFTER the command buffer completes.
+    public func pilePressure() -> [Float] { pileValues().map { $0.y } }
+    /// Per-node current contact thickness (m) after the last `encode`.
+    public func pileThickness() -> [Float] { pileValues().map { $0.x } }
+    private func pileValues() -> [SIMD2<Float>] {
+        let n = particleBuffer.count
+        let p = pileBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: max(1, maxParticles))
+        return (0..<n).map { p[$0] }
+    }
+    /// Reset every node to the unloaded state; `configureSheets` does this.
+    private func resetPile() {
+        let p = pileBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: max(1, maxParticles))
+        for i in 0..<max(1, maxParticles) { p[i] = SIMD2(pileRestThickness, 0) }
+    }
     /// Run one more collider pass AFTER the per-frame self-collision, so a rigid collider always has
     /// the final say on where a node ends up.
     ///
@@ -348,7 +376,9 @@ public final class PaperClothSolver {
             let ancBuf = device.makeBuffer(length: max(1, maxParticles) * MemoryLayout<SIMD4<Float>>.stride,
                                            options: .storageModePrivate),
             let huBuf = device.makeBuffer(length: MemoryLayout<PaperHashUniforms>.stride,
-                                          options: .storageModeShared)
+                                          options: .storageModeShared),
+            let pileBuf = device.makeBuffer(length: max(1, maxParticles) * MemoryLayout<SIMD2<Float>>.stride,
+                                            options: .storageModeShared)
         else {
             Self.log.error("PaperCloth buffer allocation failed")
             return nil
@@ -398,6 +428,8 @@ public final class PaperClothSolver {
         self.selfSnapshotBuffer = snapBuf
         ancBuf.label = "PaperCloth.anchors"
         self.anchorBuffer = ancBuf
+        pileBuf.label = "PaperCloth.pile"
+        self.pileBuffer = pileBuf
         self.maxSheets       = maxSheets
         self.maxParticles    = maxParticles
         self.maxConstraints  = maxConstraints
@@ -439,10 +471,17 @@ public final class PaperClothSolver {
         /// a node may never be farther from it than its flat-layout rest distance. Needed to HANG a long
         /// sheet from a point — see `paperTether` in PaperCloth.metal. `nil` = no tether.
         public var tetherNode: Int?
+        /// Tether every node to the pinned TOP-ROW node nearest its own column, at the flat distance between them: a
+        /// sheet hung from a ROW of pins (a curtain on its rings) cannot stretch down its own length, while the cloth
+        /// between pins stays free to gather. `tetherNode` is one anchor — wrong for a row, where it leaves the far
+        /// columns lateral slack that a hanging sheet spends as vertical stretch. Ignored when `tetherNode` is set.
+        public var tetherToNearestPin: Bool
 
         public init(origin: SIMD3<Float>, right: SIMD3<Float>, down: SIMD3<Float>,
                     sizeW: Float, sizeH: Float, pinFirstRow: Bool = false,
-                    nodeLift: [Float] = [], pinnedNodes: [Int] = [], tetherNode: Int? = nil) {
+                    nodeLift: [Float] = [], pinnedNodes: [Int] = [], tetherNode: Int? = nil,
+                    tetherToNearestPin: Bool = false) {
+            self.tetherToNearestPin = tetherToNearestPin
             self.origin = origin; self.right = right; self.down = down
             self.sizeW = sizeW; self.sizeH = sizeH; self.pinFirstRow = pinFirstRow
             self.nodeLift = nodeLift
@@ -550,6 +589,7 @@ public final class PaperClothSolver {
         precondition(specs.count <= maxSheets, "configureSheets: \(specs.count) > maxSheets \(maxSheets)")
         let W = gridW, H = gridH, M = W * H
         sheetCount = specs.count
+        resetPile()
 
         // Rest-slack field: smooth seeded plane-wave octaves, clamped to surplus-only
         // (slack may never PRE-TENSION the sheet). Evaluated at each constraint's
@@ -625,13 +665,26 @@ public final class PaperClothSolver {
         clearAnchors()
 
         // ── Long-range tethers (hung sheets) ──
-        if specs.contains(where: { $0.tetherNode != nil }) {
+        if specs.contains(where: { $0.tetherNode != nil || $0.tetherToNearestPin }) {
             var tethers = [SIMD2<UInt32>](repeating: SIMD2(0xFFFF_FFFF, 0), count: specs.count * M)
             for (s, spec) in specs.enumerated() {
-                guard let k = spec.tetherNode, k >= 0, k < M else { continue }
                 func flat(_ i: Int) -> SIMD2<Float> {
                     SIMD2(spec.sizeW * Float(i % W) / Float(max(1, W - 1)), spec.sizeH * Float(i / W) / Float(max(1, H - 1)))
                 }
+                if spec.tetherNode == nil, spec.tetherToNearestPin {
+                    // A row of pins: each node is held to the pinned top-row node nearest its own column.
+                    let pinCols: [Int] = spec.pinFirstRow ? Array(0 ..< W) : spec.pinnedNodes.filter { $0 >= 0 && $0 < W }.sorted()
+                    guard !pinCols.isEmpty else { continue }
+                    for i in 0 ..< M {
+                        let x = i % W
+                        var best = pinCols[0]
+                        for c in pinCols where abs(c - x) < abs(best - x) { best = c }     // ascending ⇒ ties keep the lower column
+                        if i == best { continue }
+                        tethers[s * M + i] = SIMD2(UInt32(s * M + best), simd_length(flat(i) - flat(best)).bitPattern)
+                    }
+                    continue
+                }
+                guard let k = spec.tetherNode, k >= 0, k < M else { continue }
                 for i in 0 ..< M where i != k {
                     tethers[s * M + i] = SIMD2(UInt32(s * M + k), simd_length(flat(i) - flat(k)).bitPattern)
                 }
@@ -1517,10 +1570,13 @@ public final class PaperClothSolver {
             stiffness: collideStiffness,
             maxPush: sdfMaxPushPerStep > 0 ? sdfMaxPushPerStep : 1e30,
             selfRadius: clothThickness,
-            friction: collideFriction)
+            friction: collideFriction,
+            pileRest: pileRestThickness,
+            pileMinFraction: pileMinFraction,
+            pileStiffness: pileStiffness)
         encodePass(cb, pipeline: clothCollidePipeline,
                    buffers: [particleBuffer.buffer, colliderBuffer.buffer, clothCollideUniformBuffer,
-                             sdfBinding],
+                             sdfBinding, pileBuffer],
                    count: particleBuffer.count, label: "PaperCloth.sdf")
     }
 
@@ -1580,8 +1636,10 @@ struct PaperClothCollideUniforms {
     var maxPush: Float
     var selfRadius: Float
     var friction: Float
+    var pileRest: Float = 0
+    var pileMinFraction: Float = 1
+    var pileStiffness: Float = 1
     var _pad0: Float = 0
-    var _pad1: Float = 0
 }
 
 // ── PaperStickUniforms mirror ────────────────────────────────────────────────
