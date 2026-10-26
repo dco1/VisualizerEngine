@@ -1,5 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
+#include "PBDCollider.h"
 
 // ── PBD.metal ─────────────────────────────────────────────────────────────────
 //
@@ -86,18 +87,7 @@ static bool ringSeamCrosses(uint i, uint j, uint stride, constant PBDUniforms& u
     return false;
 }
 
-// SDF collider — one of {sphere, capsule, box} packed into 48 bytes. Matches
-// `PBDCollider` in PBDSolver.swift exactly; keep the two in lockstep.
-//   a.xyz = primary point (centre or endpoint A); a.w = type tag, bit-cast from
-//           uint (0 = sphere, 1 = capsule, 2 = box).
-//   b.xyz = secondary point (capsule endpoint B / box halfExtents); b.w = radius.
-//   meta.x = ownerID (skip-self filter); meta.y = a box's yaw about +Y (bit-cast float, 0 =
-//   axis-aligned); meta.zw unused.
-struct PBDCollider {
-    float4 a;
-    float4 b;
-    uint4  meta;
-};
+// SDF collider record: see PBDCollider.h (the one shared definition).
 
 struct TubeExpandUniforms {
     uint  ringSegments;

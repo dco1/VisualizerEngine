@@ -1,5 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
+#include "PBDCollider.h"
 
 // ── SHAPE-MATCH SOFT BODY ────────────────────────────────────────────────────
 //
@@ -64,14 +65,8 @@ struct SMUniforms {
     float _pad0;
 };
 
-// Box collider — same {float4 a; float4 b; uint4 meta} layout as PBDCollider so
-// the scene reuses PBDCollider.box(...). a.xyz = center, b.xyz = halfExtents,
-// meta.x = kind (2 = box; we only consume boxes here).
-struct SMCollider {
-    float4 a;
-    float4 b;
-    uint4  meta;
-};
+// Box colliders are PBDCollider records (PBDCollider.h); this solver only consumes boxes
+// (kind 2: a.xyz = centre, b.xyz = half-extents).
 
 struct SMHashUniforms {
     uint  particleCount;
@@ -246,7 +241,7 @@ kernel void sm_apply_goals(
 
 kernel void sm_collide(
     device SMParticle*         particles [[buffer(0)]],
-    device const SMCollider*   colliders [[buffer(1)]],
+    device const PBDCollider*   colliders [[buffer(1)]],
     constant SMUniforms&       u         [[buffer(2)]],
     uint id [[thread_position_in_grid]])
 {
@@ -259,7 +254,7 @@ kernel void sm_collide(
     bool hit = false;
 
     for (uint c = 0; c < u.colliderCount; ++c) {
-        SMCollider col = colliders[c];
+        PBDCollider col = colliders[c];
         float3 center = col.a.xyz;
         float3 he     = col.b.xyz;        // half extents
         float3 d = pos - center;

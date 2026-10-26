@@ -91,6 +91,15 @@ public struct PBDCollider {
 
     public enum Kind: UInt32 { case sphere = 0, capsule = 1, box = 2, sdfVolume = 3 }
 
+    /// The owner of a collider that belongs to the WORLD, not to any solver body (DH-1547).
+    ///
+    /// A solver skips every collider whose `ownerID` equals its own, and the default for both is
+    /// `.max` — so a collider built with the factories' default owner is silently dropped by a
+    /// default-owned solver, and the cloth or rope falls straight through it. Callers used to pick
+    /// a private small integer each (0, 1, 7 …) and re-explain the trap in a comment. Use this
+    /// instead: it can never equal a solver's own id (those are small slot numbers, or `.max`).
+    public static let worldOwnerID: UInt32 = .max - 1
+
     public init(a: SIMD4<Float>, b: SIMD4<Float>, ownerID: UInt32) {
         self.a = a; self.b = b
         self.meta = SIMD4(ownerID, 0, 0, 0)

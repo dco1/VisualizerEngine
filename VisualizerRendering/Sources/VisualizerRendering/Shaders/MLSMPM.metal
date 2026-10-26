@@ -1,5 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
+#include "PBDCollider.h"
 
 // ── MLSMPM.metal ──────────────────────────────────────────────────────────────
 //
@@ -809,15 +810,7 @@ kernel void mlsG2P(
 // it. The energy that would have produced a bounce becomes the tangential
 // flow that the foam spawn picks up as a splash.
 //
-// PBDCollider mirror — MUST match the layout in PBD.metal / PBDSolver.swift.
-// We can't include the PBD header from here, so the struct is duplicated
-// verbatim. If you change one, change all three.
-
-struct PBDColliderMLS {
-    float4 a;       // xyz = endpoint A, w = type tag (bit-cast uint: 1 = capsule)
-    float4 b;       // xyz = endpoint B, w = radius
-    uint4  meta;    // x = ownerID (unused here; only the PBD self-skip needs it)
-};
+// Collider record: PBDCollider.h (the one shared definition).
 
 struct MLSColliderUniforms {
     uint  particleCount;
@@ -835,7 +828,7 @@ struct MLSColliderUniforms {
 
 kernel void mlsCollideCapsules(
     device MLSParticle*                particles  [[ buffer(0) ]],
-    device const PBDColliderMLS*       colliders  [[ buffer(1) ]],
+    device const PBDCollider*       colliders  [[ buffer(1) ]],
     constant MLSColliderUniforms&      U          [[ buffer(2) ]],
     uint                               pid        [[ thread_position_in_grid ]])
 {
@@ -849,7 +842,7 @@ kernel void mlsCollideCapsules(
     bool   touched = false;
 
     for (uint c = 0; c < U.colliderCount; c++) {
-        PBDColliderMLS col = colliders[c];
+        PBDCollider col = colliders[c];
         // Type tag at a.w; we only consume capsules here.
         uint kind = as_type<uint>(col.a.w);
         if (kind != 1u) continue;

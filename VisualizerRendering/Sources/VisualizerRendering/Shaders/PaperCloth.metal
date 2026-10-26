@@ -1,5 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
+#include "PBDCollider.h"
 
 // ── PaperCloth.metal ──────────────────────────────────────────────────────────
 //
@@ -33,16 +34,7 @@ struct PBDParticle {
     float4 prevPositionAndPad;  // xyz = prevPosition, w = unused
 };
 
-// Mirrors PBDCollider in PBD.metal / PBDSolver.swift (each .metal file is its
-// own translation unit — PBD.metal's definition is not visible here).
-//   a.xyz = centre / endpoint A; a.w = type tag (0 sphere, 1 capsule, 2 box)
-//   b.xyz = endpoint B / box halfExtents; b.w = radius
-//   meta.x = ownerID
-struct PBDCollider {
-    float4 a;
-    float4 b;
-    uint4  meta;
-};
+// Collider record: see PBDCollider.h (the one shared definition).
 
 // Per-sheet mesh-pack uniforms. The particle buffer is bound with a byte offset
 // to this sheet's base, so `id` indexes 0..<vertexCount within the sheet and the
