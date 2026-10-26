@@ -421,6 +421,7 @@ kernel void paperClothSDFCollide(
     constant PaperClothCollideUniforms& u         [[ buffer(2) ]],
     device const float*                 sdf       [[ buffer(3) ]],   // the SDF volume, if any
     device float2*                      pile      [[ buffer(4) ]],   // (thickness, pressure) per particle
+    device const float*                 selfLoad  [[ buffer(5) ]],   // push the self-collision gave each node (DH-1538)
     uint id [[ thread_position_in_grid ]]
 ) {
     if (id >= u.particleCount) return;
@@ -455,7 +456,11 @@ kernel void paperClothSDFCollide(
         // others, so a touch holds the pressure; only leaving the contact band releases it.
         // Thickness is a saturating function of pressure, so a heavy load flattens the pile toward
         // its floor, never through it.
-        if (hit)                                   pl.y += (pushed - pl.y) * 0.25;
+        // Layers pressing on each other crush it just as a collider does: their push counts as load, and a node
+        // with a layer on it is in contact even when nothing rigid is near.
+        float layered = selfLoad[id];
+        float load = pushed + layered;
+        if (hit || layered > 0.0)                  pl.y += (load - pl.y) * 0.25;
         else if (nearest > 0.25 * u.pileRest)      pl.y *= 0.9;
         float lo = u.pileRest * u.pileMinFraction;
         pl.x = lo + (u.pileRest - lo) / (1.0 + pl.y / max(u.pileStiffness, 1e-9));
@@ -596,6 +601,10 @@ struct PaperHashUniforms {
     // duvet needed 2·18 mm of layer separation and could tolerate only 2·9 mm of
     // self separation. 0 means "same as radius" (every caller before this).
     float layerRadius;
+    // Compressible pile (DH-1538): > 0 = two layers are held apart by the SUM of their current pile
+    // thicknesses (never less than the radii above), and the push each node took is left in `selfLoad`
+    // for the collide pass to fold into its pressure. 0 = the kernel is the old one bit for bit.
+    float pileRest;
 };
 
 static int3 paperCellCoord(float3 p, float cs) { return int3(floor(p / cs)); }
@@ -620,15 +629,31 @@ kernel void paperHashCount(device const PBDParticle* P  [[ buffer(0) ]],
     atomic_fetch_add_explicit(&counts[h], 1u, memory_order_relaxed);
 }
 
-// Single-thread exclusive prefix sum (tableSize is modest, runs once/frame).
-// Re-zeros counts so the scatter pass can reuse it as a write cursor.
+// Exclusive prefix sum of the bucket counts, in ONE threadgroup (DH-1530). It used to be a single GPU thread walking all
+// 16 384 buckets — about 45 % of a towel's settle. Each thread now owns a contiguous chunk of buckets, the chunk totals are
+// scanned in threadgroup memory, and every thread writes its chunk's offsets. Integer arithmetic, so the result is exactly
+// the serial scan's. Re-zeros counts so the scatter pass can reuse them as a write cursor. Dispatch ONE threadgroup of at
+// most 1024 threads (`sums` is sized for that).
 kernel void paperHashScan(device atomic_uint* counts [[ buffer(0) ]],
                           device uint* offsets        [[ buffer(1) ]],
                           constant uint& tableSize    [[ buffer(2) ]],
-                          uint id [[ thread_position_in_grid ]]) {
-    if (id != 0u) return;
-    uint acc = 0u;
-    for (uint i = 0u; i < tableSize; ++i) {
+                          uint tid [[ thread_position_in_threadgroup ]],
+                          uint tgs [[ threads_per_threadgroup ]]) {
+    threadgroup uint sums[1024];
+    uint chunk = (tableSize + tgs - 1u) / tgs;
+    uint lo = min(tid * chunk, tableSize), hi = min(lo + chunk, tableSize);
+    uint mine = 0u;
+    for (uint i = lo; i < hi; ++i) mine += atomic_load_explicit(&counts[i], memory_order_relaxed);
+    sums[tid] = mine;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint off = 1u; off < tgs; off <<= 1) {          // Hillis-Steele inclusive scan of the chunk totals
+        uint v = (tid >= off) ? sums[tid - off] : 0u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        sums[tid] += v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint acc = sums[tid] - mine;                          // exclusive: everything before this chunk
+    for (uint i = lo; i < hi; ++i) {
         uint c = atomic_load_explicit(&counts[i], memory_order_relaxed);
         offsets[i] = acc;
         acc += c;
@@ -659,8 +684,12 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
                              device const uint* sorted       [[ buffer(3) ]],
                              constant PaperHashUniforms& u   [[ buffer(4) ]],
                              device const PBDParticle* S     [[ buffer(5) ]],
+                             device const float2* pile       [[ buffer(6) ]],   // (thickness, pressure); read only here
+                             device float* selfLoad          [[ buffer(7) ]],   // this node's own push, for the collide pass
                              uint id [[ thread_position_in_grid ]]) {
     if (id >= u.particleCount) return;
+    const bool compressible = u.pileRest > 0.0;
+    if (compressible) selfLoad[id] = 0.0;
     PBDParticle pi = S[id];
     if (pi.positionAndInvMass.w == 0.0) return;   // pinned
 
@@ -718,6 +747,7 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
                 if (uint(max(abs(jx - x), abs(jy - y))) <= u.skipRadius) continue;
             }
             float md = sameSheet ? minDist : layerDist;
+            if (compressible) md = max(md, pile[id].x + pile[j].x);   // two crushable layers: their thicknesses add
             float3 d = pos - S[j].positionAndInvMass.xyz;
             float dist = length(d);
             if (dist < md && dist > 1e-6) {
@@ -756,6 +786,7 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
         }
         P[id].positionAndInvMass.xyz = pos + corr;
         P[id].prevPositionAndPad.xyz = pi.prevPositionAndPad.xyz + corr * 0.5;  // bleed off inward velocity
+        if (compressible) selfLoad[id] = length(corr);
 
         // Static friction BETWEEN layers (see stickDisp above). Relative slip is
         // judged tangentially — the pushout direction is the contact normal — and

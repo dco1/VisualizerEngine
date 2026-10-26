@@ -116,6 +116,8 @@ public final class PaperClothSolver {
     public var pileStiffness: Float = 0.0005
     /// (thickness, pressure) per particle, written by `paperClothSDFCollide`.
     private let pileBuffer: MTLBuffer
+    /// How far self-collision pushed each node last pass (m); zeroed at configure, folded into pressure by the collide pass.
+    private let selfLoadBuffer: MTLBuffer
     /// Per-node contact pressure after the last `encode` — read AFTER the command buffer completes.
     public func pilePressure() -> [Float] { pileValues().map { $0.y } }
     /// Per-node current contact thickness (m) after the last `encode`.
@@ -129,6 +131,7 @@ public final class PaperClothSolver {
     private func resetPile() {
         let p = pileBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: max(1, maxParticles))
         for i in 0..<max(1, maxParticles) { p[i] = SIMD2(pileRestThickness, 0) }
+        memset(selfLoadBuffer.contents(), 0, selfLoadBuffer.length)
     }
     /// Run one more collider pass AFTER the per-frame self-collision, so a rigid collider always has
     /// the final say on where a node ends up.
@@ -378,6 +381,8 @@ public final class PaperClothSolver {
             let huBuf = device.makeBuffer(length: MemoryLayout<PaperHashUniforms>.stride,
                                           options: .storageModeShared),
             let pileBuf = device.makeBuffer(length: max(1, maxParticles) * MemoryLayout<SIMD2<Float>>.stride,
+                                            options: .storageModeShared),
+            let loadBuf = device.makeBuffer(length: max(1, maxParticles) * MemoryLayout<Float>.stride,
                                             options: .storageModeShared)
         else {
             Self.log.error("PaperCloth buffer allocation failed")
@@ -430,6 +435,9 @@ public final class PaperClothSolver {
         self.anchorBuffer = ancBuf
         pileBuf.label = "PaperCloth.pile"
         self.pileBuffer = pileBuf
+        memset(loadBuf.contents(), 0, loadBuf.length)
+        loadBuf.label = "PaperCloth.selfLoad"
+        self.selfLoadBuffer = loadBuf
         self.maxSheets       = maxSheets
         self.maxParticles    = maxParticles
         self.maxConstraints  = maxConstraints
@@ -1026,8 +1034,10 @@ public final class PaperClothSolver {
             e.setBuffer(cellCountsBuffer, offset: 0, index: 0)
             e.setBuffer(cellOffsetsBuffer, offset: 0, index: 1)
             e.setBytes(&T, length: 4, index: 2)
-            e.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
+            // One threadgroup scans the whole table (DH-1530); the kernel's `sums` array holds 1024 chunk totals.
+            e.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
+                                   threadsPerThreadgroup: MTLSize(width: min(1024, hashScanPipeline.maxTotalThreadsPerThreadgroup),
+                                                                  height: 1, depth: 1))
             e.endEncoding()
         }
         if let e = cb.makeComputeCommandEncoder() {
@@ -1060,6 +1070,8 @@ public final class PaperClothSolver {
                 e.setBuffer(sortedBuffer, offset: 0, index: 3)
                 e.setBuffer(hashUniformBuffer, offset: 0, index: 4)
                 e.setBuffer(selfSnapshotBuffer, offset: 0, index: 5)
+                e.setBuffer(pileBuffer, offset: 0, index: 6)
+                e.setBuffer(selfLoadBuffer, offset: 0, index: 7)
                 dispatch1D(e, pipeline: selfCollidePipeline, count: n); e.endEncoding()
             }
         }
@@ -1141,7 +1153,8 @@ public final class PaperClothSolver {
             // Layers stick below the same threshold as obstacle contact — one
             // notion of "at rest" for the whole cloth.
             stickDisp: stickSpeed * fixedDt,
-            layerRadius: legacyPushout ? 0 : (interLayerRadius ?? 0))
+            layerRadius: legacyPushout ? 0 : (interLayerRadius ?? 0),
+            pileRest: pileRestThickness)
     }
 
     private func encodeSubstep(to cb: MTLCommandBuffer, dt: Float) {
@@ -1576,7 +1589,7 @@ public final class PaperClothSolver {
             pileStiffness: pileStiffness)
         encodePass(cb, pipeline: clothCollidePipeline,
                    buffers: [particleBuffer.buffer, colliderBuffer.buffer, clothCollideUniformBuffer,
-                             sdfBinding, pileBuffer],
+                             sdfBinding, pileBuffer, selfLoadBuffer],
                    count: particleBuffer.count, label: "PaperCloth.sdf")
     }
 
@@ -1709,4 +1722,5 @@ struct PaperHashUniforms {
     var legacy: UInt32 = 0
     var stickDisp: Float = 0
     var layerRadius: Float = 0
+    var pileRest: Float = 0
 }
