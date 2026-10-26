@@ -1,4 +1,5 @@
 import Foundation
+import VisualizerMaterials
 import simd
 
 // Bark plate field + bark/leaf colour variation.
@@ -32,7 +33,7 @@ extension ForestTreeGeometry {
             // Thin horizontal peel curls: gentle outward lift in bands, no deep
             // furrow. Keeps the paper-bark read without faking blocky plates.
             let band = valueNoise(t * 7.0 + Float(seed % 31), u * 1.3)
-            let peel = smoothstepf(0.62, 0.92, band)
+            let peel = smoothstep(0.62, 0.92, band)
             return BarkPlate(disp: peel * 0.05, liftN: peel * 0.5,
                              plateId: band, seam: 0)
         }
@@ -73,14 +74,14 @@ extension ForestTreeGeometry {
         // Seam strength: F2−F1 is small at a cell border (two features equidistant)
         // → that's the furrow floor. Ramp it.
         let border = f2 - f1                                   // ~0 at seam, large mid-plate
-        let seam = 1.0 - smoothstepf(0.0, 0.22, border)        // 1 in seam, 0 mid-plate
+        let seam = 1.0 - smoothstep(0.0, 0.22, border)        // 1 in seam, 0 mid-plate
         // Plate crown: bulge mid-plate, recess in the seam. Oak deeper than maple.
         let depth: Float = isMaple ? 0.10 : 0.14
-        let crown = (1.0 - smoothstepf(0.0, 0.85, f1))          // 1 at centre → 0 at edge
+        let crown = (1.0 - smoothstep(0.0, 0.85, f1))          // 1 at centre → 0 at edge
         let disp = crown * depth - seam * depth * 1.15
         // Lifting/shedding edge: maple plates LIFT at their lower edge (shaggy);
         // tilt the normal outward there. Keyed to per-plate id so only some lift.
-        let liftN = (isMaple ? 0.6 : 0.28) * smoothstepf(0.45, 0.85, border) * (0.4 + bestId)
+        let liftN = (isMaple ? 0.6 : 0.28) * smoothstep(0.45, 0.85, border) * (0.4 + bestId)
         return BarkPlate(disp: disp, liftN: liftN, plateId: bestId, seam: seam)
     }
 
@@ -105,17 +106,17 @@ extension ForestTreeGeometry {
             // across the trunk (low freq in u = around the circumference, high
             // freq in t = stacked up the height) → short dark dashes in
             // horizontal bands. Two scales (bold + fine) for paper-bark realism.
-            let lent = smoothstepf(0.66, 0.86, valueNoise(t * 9.0, u * 1.1)) * 1.0
-            let lentFine = smoothstepf(0.80, 0.95, valueNoise(t * 22, u * 2.4)) * 0.8
+            let lent = smoothstep(0.66, 0.86, valueNoise(t * 9.0, u * 1.1)) * 1.0
+            let lentFine = smoothstep(0.80, 0.95, valueNoise(t * 22, u * 2.4)) * 0.8
             var c = look.bark * (0.74 + 0.30 * streak)
-            c = mixv(c, grey, smoothstepf(0.55, 0.82, coarse) * 0.55)
-            c = mixv(c, dark, max(lent, lentFine))
+            c = mixClamped(c, grey, smoothstep(0.55, 0.82, coarse) * 0.55)
+            c = mixClamped(c, dark, max(lent, lentFine))
             c *= (0.88 + 0.20 * fine)
             return c
         }
         // Deciduous: deep fissures (dark) between lighter ridges.
         var c = look.bark * (0.55 + 0.6 * streak)
-        c = mixv(c, look.bark * 0.34, smoothstepf(0.55, 0.9, coarse) * 0.6)  // fissures
+        c = mixClamped(c, look.bark * 0.34, smoothstep(0.55, 0.9, coarse) * 0.6)  // fissures
         c *= (0.88 + 0.24 * fine)                                            // fine grain
         return c
     }
@@ -130,23 +131,23 @@ extension ForestTreeGeometry {
         var c = barkColorAt(look, u: u, t: t, seed: seed)
         if look.isBirch {
             // Birch peel: lift the curled band a touch warmer/paler, no furrow.
-            c = mixv(c, c * 1.18 + SIMD3<Float>(0.02, 0.018, 0.012), plate.plateId * 0.0)
+            c = mixClamped(c, c * 1.18 + SIMD3<Float>(0.02, 0.018, 0.012), plate.plateId * 0.0)
             return c
         }
         // Weathered ridge top: plate crowns (low seam) read drier, greyer, lighter
         // (sun-bleached). Damp furrow floor (high seam) reads darker, cooler.
         let crown = 1.0 - plate.seam
         let weathered = SIMD3<Float>(0.30, 0.28, 0.25)         // dry grey ridge cap
-        c = mixv(c, weathered, crown * (0.18 + 0.22 * plate.plateId))   // per-plate grey amount
-        c = mixv(c, c * 0.42, plate.seam * 0.85)               // dark damp furrow floor
+        c = mixClamped(c, weathered, crown * (0.18 + 0.22 * plate.plateId))   // per-plate grey amount
+        c = mixClamped(c, c * 0.42, plate.seam * 0.85)               // dark damp furrow floor
         // Per-plate albedo jitter so adjacent plates don't read identical.
         c *= 0.86 + 0.30 * plate.plateId
         // Occasional lichen: ~22% of plates carry a pale sage-green blotch, denser
         // on the (cooler/north) shaded side handled by the caller's u-phase.
         if plate.plateId > 0.78 {
             let lichen = SIMD3<Float>(0.115, 0.135, 0.085)     // pale sage-green, linear
-            let blot = smoothstepf(0.78, 0.94, plate.plateId) * (0.55 + 0.45 * crown)
-            c = mixv(c, lichen, blot)
+            let blot = smoothstep(0.78, 0.94, plate.plateId) * (0.55 + 0.45 * crown)
+            c = mixClamped(c, lichen, blot)
         }
         return c
     }
@@ -179,21 +180,21 @@ extension ForestTreeGeometry {
         let olive  = SIMD3<Float>(0.055, 0.100, 0.028)  // deep stacked-leaf, linear (slightly darkened)
         let j = rng.unit()
         // Per-tree/per-leaf autumn turn (some warm leaves to glow through).
-        var c = mixv(look.leaf, golden, j * 0.30)
+        var c = mixClamped(look.leaf, golden, j * 0.30)
         // Warm↔lime hue jitter, ±~15%: half the leaves lean lime, half toward
         // the olive/warm base. Keyed to a second random so it's independent of
         // the autumn turn.
         let hueJit = rng.unit()                          // 0..1
         if hueJit > 0.55 {
-            c = mixv(c, lime, (hueJit - 0.55) / 0.45 * 0.45)   // toward lime
+            c = mixClamped(c, lime, (hueJit - 0.55) / 0.45 * 0.45)   // toward lime
         } else {
-            c = mixv(c, olive, (0.55 - hueJit) / 0.55 * 0.40)  // toward deep olive
+            c = mixClamped(c, olive, (0.55 - hueJit) / 0.55 * 0.40)  // toward deep olive
         }
         // Cluster-depth modulation: tip leaves slightly brighter, interior slightly
         // darker. Reduced multipliers to stay in a plausible range (old 0.80+0.45=1.25
         // at tip was blowing the budget even after color fix).
         let depthBoost = 0.88 + 0.17 * frac              // tip → up to 1.05×
-        c = mixv(c, lime, frac * 0.18) * depthBoost
+        c = mixClamped(c, lime, frac * 0.18) * depthBoost
         // Brightness jitter (per-leaf thickness variance). Tighter range to avoid
         // bright-outlier cards reading as a different material.
         // ROUND-5 polish: the side-view sun-facing canopy bleached to CREAM (the

@@ -1,4 +1,5 @@
 import Foundation
+import VisualizerMaterials
 import simd
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -28,10 +29,10 @@ struct TreeLeafStitch: LeafCardSink {
 
     /// Midrib → margin → tip albedo, by the vertex's own place on the blade.
     private func colour(_ p: LeafStripVertex<Float>) -> SIMD3<Float> {
-        let edge = ForestTreeGeometry.mixv(midribCol, marginCol, min(1, p.u * 1.4))
+        let edge = mixClamped(midribCol, marginCol, min(1, p.u * 1.4))
         // Tip whitens.
-        return ForestTreeGeometry.mixv(edge, tipCol,
-                                       ForestTreeGeometry.smoothstepf(0.82, 1.0, p.v))
+        return mixClamped(edge, tipCol,
+                                       smoothstep(0.82, 1.0, p.v))
     }
 
     /// Per-vertex shading normal blends the outward `bentNormal` with the strip's local
@@ -319,7 +320,7 @@ extension ForestTreeGeometry {
         // only; the deferred thin-sheet TRANSMISSION term stays physically
         // back-face-gated in-shader (we do NOT crush exposure — that would kill the
         // god-ray shafts; we gate the term itself per memory illuminatorama_shaft).
-        let sunFace = smoothstepf(0.0, 0.55, simd_dot(bentNormal, worldSunDir))
+        let sunFace = smoothstep(0.0, 0.55, simd_dot(bentNormal, worldSunDir))
         // ROUND-5 polish #4: the side-view SUNLIT leaf mass still bleached to pale
         // khaki — the lit-hemisphere albedo compounded with the full directional sun
         // and clipped to cream. Pull the lit-hemisphere base albedo down ~15 % (a
@@ -347,13 +348,13 @@ extension ForestTreeGeometry {
         // instead of cream. The backlit rim is carried by the in-shader transmission
         // term (untouched), so this does NOT dim the SSS glow.
         let marginBoost = 1.0 + 0.06 * sunFace
-        let marginCol = mixv(color, color + SIMD3<Float>(0.05, 0.08, 0.025), 0.60) * marginBoost
+        let marginCol = mixClamped(color, color + SIMD3<Float>(0.05, 0.08, 0.025), 0.60) * marginBoost
         // Thin-edge tip colour: only sun-facing leaves get the warm rim lift.
         // Clamp so the peak stays warm-translucent GREEN — never near-white cream.
         let tipLift = sunFace
         let thinEdge = color * (1.0 + 0.11 * tipLift)
                      + SIMD3<Float>(0.030, 0.044, 0.008) * tipLift
-        let tipCol = mixv(color, thinEdge, 0.50) * (1.0 + 0.04 * tipLift)
+        let tipCol = mixClamped(color, thinEdge, 0.50) * (1.0 + 0.04 * tipLift)
 
         let tierHero = detail >= 0.85
         let tierMid  = detail >= 0.45

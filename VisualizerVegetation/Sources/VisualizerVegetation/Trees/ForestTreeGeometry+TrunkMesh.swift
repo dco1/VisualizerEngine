@@ -1,4 +1,5 @@
 import Foundation
+import VisualizerMaterials
 import simd
 
 // Trunk/branch revolution meshes, moss, ring stitching.
@@ -187,7 +188,7 @@ extension ForestTreeGeometry {
                 // furrows. Displacement fades over the canopy-reaching top where
                 // bark smooths and the plates are sub-pixel anyway.
                 let plate = barkPlateField(look: look, u: uFrac, t: tShaped, seed: seed)
-                let plateFade = 1.0 - smoothstepf(0.55, 0.95, tShaped)   // smooth near top
+                let plateFade = 1.0 - smoothstep(0.55, 0.95, tShaped)   // smooth near top
                 let plateDisp = plate.disp * plateFade
                 let bt = buttress(angle, tShaped)
                 let rJit = max(0.001, r * (1 + radialNoise[radialIdx] * noiseScale + perRing + plateDisp)
@@ -237,8 +238,8 @@ extension ForestTreeGeometry {
                     if cov > 0.2 {
                         let mossWash = SIMD3<Float>(0.066, 0.140, 0.046)   // damp velvet, linear
                         // Furrow seams hold more moss (damper) → push tint there.
-                        let amt = smoothstepf(0.2, 0.85, cov) * (0.55 + 0.4 * plate.seam)
-                        col = mixv(col, mossWash, min(0.9, amt))
+                        let amt = smoothstep(0.2, 0.85, cov) * (0.55 + 0.4 * plate.seam)
+                        col = mixClamped(col, mossWash, min(0.9, amt))
                     }
                 }
                 row.append((xf(world, lp), xfDir(world, ln), col))
@@ -281,7 +282,7 @@ extension ForestTreeGeometry {
         let shadedAz = worldShadedAz + scatter
         let angle = u * 2 * .pi
         let tFrac = t / maxBandFrac                                   // 0 base → 1 top of band
-        let up = 1.0 - smoothstepf(0.0, 1.0, tFrac)
+        let up = 1.0 - smoothstep(0.0, 1.0, tFrac)
         let shade = 0.5 + 0.5 * cos(angle - shadedAz)
         let sideHeight = (up * up) + (up - up * up) * shade
         let patch = valueNoise(angle * 2.6 + Float(seed % 41), t * 9.0 * (1.0/max(0.01,maxBandFrac)))
@@ -353,13 +354,13 @@ extension ForestTreeGeometry {
                 // cushions land exactly where the trunk reads damp+green.
                 let coverage = mossCoverageAt(u: uFracCov, t: tForR, look: look,
                                               detail: detail, seed: seed)
-                let up = 1.0 - smoothstepf(0.0, maxBandFrac, tFrac)
+                let up = 1.0 - smoothstep(0.0, maxBandFrac, tFrac)
                 if coverage < 0.42 { continue }
                 // Plate displacement at this site so the cushion hugs the bark
                 // relief (sits in/over the furrows, not on a smooth phantom tube).
                 let uFrac = angle / (2 * .pi)
                 let plate = barkPlateField(look: look, u: uFrac, t: tForR, seed: seed)
-                let plateFade = 1.0 - smoothstepf(0.55, 0.95, tForR)
+                let plateFade = 1.0 - smoothstep(0.55, 0.95, tForR)
                 let rSurf = max(0.01, r * (1 + plate.disp * plateFade))
                 let ca = cos(angle), sa = sin(angle)
                 let outward = SIMD3<Float>(ca, 0, sa)
@@ -393,7 +394,7 @@ extension ForestTreeGeometry {
                         + outward * (sz * 0.20)        // rim lifts slightly off bark
                     let n = simd_normalize(outward * 0.7
                             + (tx * cos(a) + ty * sin(a)) * 0.3)
-                    let cc = mixv(mossEdge, cCentre, 0.35) * (0.85 + 0.3 * valueNoise(a*3, Float(ci)))
+                    let cc = mixClamped(mossEdge, cCentre, 0.35) * (0.85 + 0.3 * valueNoise(a*3, Float(ci)))
                     if k > 0 {
                         // Fan triangle: centre(dome top) → prev rim → this rim.
                         s.tri(centre, prev, rimLocal,

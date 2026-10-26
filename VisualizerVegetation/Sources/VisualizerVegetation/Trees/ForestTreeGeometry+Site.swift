@@ -1,4 +1,5 @@
 import Foundation
+import VisualizerMaterials
 import simd
 
 // Per-tree site sampling (TreeSite/makeSite) and the addTree orchestrator.
@@ -62,7 +63,7 @@ extension ForestTreeGeometry {
         // spread), shrink age's radius pull (it was over-fattening emergents to
         // telephone-pole gauge), and split the per-tree variation into a vigor
         // term (so SAME-height trees still differ) + a modest random jitter.
-        let heightT = smoothstepf(4.0, 14.0, h)          // 0 sapling .. 1 emergent
+        let heightT = smoothstep(4.0, 14.0, h)          // 0 sapling .. 1 emergent
         let age: Float = 0.25 + heightT * 0.55 + rng.unit() * 0.20
         // Dominance: tall trees are the canopy winners; bias their gauge up a
         // touch and saplings' down, on top of the height-correlated slope.
@@ -163,7 +164,7 @@ extension ForestTreeGeometry {
         for camXZ in Self.reviewCameraXZ {
             camDist = min(camDist, simd_distance(SIMD2(site.pos.x, site.pos.z), camXZ))
         }
-        let haze = smoothstepf(16.0, 40.0, camDist) * 0.55
+        let haze = smoothstep(16.0, 40.0, camDist) * 0.55
         let prevHazeMix = s.hazeMix
         s.hazeMix = haze
         s.hazeColor = SIMD3<Float>(0.60, 0.46, 0.30)   // warm golden-hour haze

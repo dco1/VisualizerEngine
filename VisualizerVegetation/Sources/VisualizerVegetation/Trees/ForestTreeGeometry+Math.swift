@@ -1,4 +1,5 @@
 import Foundation
+import VisualizerMaterials
 import simd
 
 // Transform, interpolation and noise helpers for the tree bake.
@@ -55,11 +56,6 @@ extension ForestTreeGeometry {
     }
 
     // ── Noise / value-noise / interpolation support (was file-scope) ──────
-    @inline(__always) public static func mixv(_ a: SIMD3<Float>, _ b: SIMD3<Float>,
-                                         _ t: Float) -> SIMD3<Float> {
-        a + (b - a) * max(0, min(1, t))
-    }
-
     // ── Degenerate-safe normalize (NaN guard) ───────────────────────────────────
     // `simd_normalize(v)` returns NaN when `|v| ≈ 0` (v/0). That happens all over the
     // tree bake on the random draws that make a sliver leaf card, a cancelling
@@ -75,11 +71,6 @@ extension ForestTreeGeometry {
         // garbage/NaN. Also reject a non-finite input outright.
         guard len > 1e-6, v.x.isFinite, v.y.isFinite, v.z.isFinite else { return fallback }
         return v / len
-    }
-
-    @inline(__always) public static func smoothstepf(_ e0: Float, _ e1: Float, _ x: Float) -> Float {
-        let t = max(0, min(1, (x - e0) / (e1 - e0 == 0 ? 1 : (e1 - e0))))
-        return t * t * (3 - 2 * t)
     }
 
     /// sRGB display value → linear, per channel. The Illuminatorama soup treats

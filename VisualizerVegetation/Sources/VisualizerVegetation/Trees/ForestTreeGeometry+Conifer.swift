@@ -1,4 +1,5 @@
 import Foundation
+import VisualizerMaterials
 import simd
 
 // A CONIFER, grown the way a conifer grows: a leader, WHORLS of primary branches, SPRIGS along every
@@ -71,7 +72,6 @@ extension ForestTreeGeometry {
     public static func growConiferSkeleton(bottomY: Float, apexY: Float, baseRadius: Float,
                                            look c: ConiferLook, density: Float = 1,
                                            seed: UInt64) -> ConiferSkeleton {
-        func lerp(_ a: Float, _ b: Float, _ t: Float) -> Float { a + (b - a) * t }
         var rng = ForestRNG(seed: seed &+ 0xF12F_0001)
         var sk = ConiferSkeleton(bottomY: bottomY, apexY: apexY, baseRadius: baseRadius,
                                  convexity: c.convexity, look: c, branches: [], whorls: [])
@@ -92,9 +92,9 @@ extension ForestTreeGeometry {
                 var L = sk.radius(atFraction: f) * (0.88 + 0.24 * rng.unit())
                 if rng.unit() < 0.07 { L *= 0.6 }                     // a short, broken branch
                 L = max(L, 0.06)
-                let pitch = lerp(-0.10, 0.50, f) + (rng.unit() - 0.5) * 0.12
-                let droop = lerp(0.34, 0.15, f) * (0.85 + 0.3 * rng.unit())
-                let lift = lerp(0.52, 0.22, f)
+                let pitch = mix(-0.10, 0.50, f) + (rng.unit() - 0.5) * 0.12
+                let droop = mix(0.34, 0.15, f) * (0.85 + 0.3 * rng.unit())
+                let lift = mix(0.52, 0.22, f)
                 let ca = cos(az), sa = sin(az), tp = tan(pitch)
                 // A little sideways sway: branches wander, they are not ruler-straight spokes.
                 let swayAmp = L * (0.03 + 0.06 * rng.unit()) * (rng.unit() < 0.5 ? -1 : 1)
@@ -214,7 +214,7 @@ extension ForestTreeGeometry {
             let k = ramp * jitter
             var stitch = TreeLeafStitch(bentNormal: bn,
                                         midribCol: c.needleShade * (0.9 * k),
-                                        marginCol: mixv(c.needleShade, c.needleLit, 0.45) * k,
+                                        marginCol: mixClamped(c.needleShade, c.needleLit, 0.45) * k,
                                         tipCol: c.needleLit * (0.95 * k))
             swap(&stitch.soup, &s)
             LeafConstructor.emitBlade(

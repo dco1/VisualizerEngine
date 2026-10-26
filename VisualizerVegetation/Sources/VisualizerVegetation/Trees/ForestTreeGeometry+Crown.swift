@@ -1,4 +1,5 @@
 import Foundation
+import VisualizerMaterials
 import simd
 
 // Canonical crown-lobe field + volumetric leaf fill.
@@ -67,7 +68,7 @@ extension ForestTreeGeometry {
             // RAGGED (lobes still bite in), the bottom narrows to a skirt.
             // Teardrop radial envelope: full near the upper-middle, pinched at
             // the bottom so the crown doesn't bulge into a sphere underside.
-            let teardrop = 1.0 - 0.34 * smoothstepLocal(0.0, -1.0, cosT)
+            let teardrop = 1.0 - 0.34 * smoothstep(0.0, -1.0, cosT)
             // Radial lobe warp, stronger on the lit upper hemisphere so the bays
             // read clearest against the sky.
             // Base gain raised 0.92→1.08 so the bays cut deeper into the envelope —
@@ -129,12 +130,6 @@ extension ForestTreeGeometry {
         let sizeDamp   = max(0.22, min(1.0, (crownRadius - 1.8) / 2.0))
         return CrownLobe(n: n, phase: phase, phase2: phase2, amp: amp,
                          droopPhase: droopPhase, aspect: aspect, sizeDamp: sizeDamp)
-    }
-
-    @inline(__always)
-    public static func smoothstepLocal(_ a: Float, _ b: Float, _ x: Float) -> Float {
-        let t = max(0.0, min(1.0, (x - a) / (b - a)))
-        return t * t * (3.0 - 2.0 * t)
     }
 
     // ── Volumetric crown fill ─────────────────────────────────────────────
