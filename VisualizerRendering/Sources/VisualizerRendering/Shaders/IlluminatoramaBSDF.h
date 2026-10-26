@@ -51,6 +51,11 @@ using namespace metal;
 /// FrameUniforms.frameFlags bit 3 — cloth sheen read from the LUT's fitted albedo (both
 /// environment arms) and energy-conserving against the base (albedo scaling).
 #define kFrameFlagLayeredSheen        8u
+/// FrameUniforms.frameFlags bit 11 (2048) - Daydream DH-1534: a METAL has no diffuse lobe, so the host's
+/// flat ambient supplement (`ambientColor` x albedo - a stand-in for diffuse room bounce) is scaled by
+/// `(1 - metallic)`. Without it ~76% of a metal's pixel inside a room was one uniform constant (the knob
+/// that reads pale pearl where the photo mirrors a dim room). Clear => the supplement is untouched.
+#define kFrameFlagMetalNoAmbient      2048u
 /// FrameUniforms.frameFlags bit 7 (128) — DIFFUSE ROUGHNESS (Daydream DH-1301): the master switch for
 /// the EON lobe (IlluminatoramaDiffuseRoughness.h). The per-pixel value rides the sign of
 /// `albedoMetallic.a`, so with the flag set a pixel whose material never set one is still Lambert,

@@ -7,6 +7,7 @@ import VisualizerCore
 
 // Forwarders for `LightingKnobs` — storage lives in IlluminatoramaLightingKnobs.swift.
 extension IlluminatoramaRenderer {
+    public var metalNoFlatAmbient: Bool { get { kLighting.metalNoFlatAmbient } set { kLighting.metalNoFlatAmbient = newValue } _modify { yield &kLighting.metalNoFlatAmbient } }
     public var instances: [InstanceRef] { get { kLighting.instances } set { kLighting.instances = newValue } _modify { yield &kLighting.instances } }
     public internal(set) var staticSkipStats: StaticSkipStats { get { kLighting.staticSkipStats } set { kLighting.staticSkipStats = newValue } _modify { yield &kLighting.staticSkipStats } }
     public var onEncodeFrameCompute: ((_ cb: MTLCommandBuffer) -> Void)? { get { kLighting.onEncodeFrameCompute } set { kLighting.onEncodeFrameCompute = newValue } _modify { yield &kLighting.onEncodeFrameCompute } }

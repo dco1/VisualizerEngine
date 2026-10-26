@@ -2166,6 +2166,8 @@ kernel void illumi_lighting(
         float3 ambSupp = mix(ambCol * 0.4, ambCol, upness) * albedo * le.eonAlbedoRatio;   // DH-1301
         if (le.coatOn) ambSupp *= le.underCoatEnv * le.coatDarken;                            // DH-1309
         if (layeredSheen) ambSupp *= le.baseUnderSheen;   // DH-1014 — 1.0 off cloth
+        // DH-1534 — a metal has no diffuse lobe for the flat room-bounce stand-in to light.
+        if ((frame.frameFlags & kFrameFlagMetalNoAmbient) != 0u) ambSupp *= (1.0 - metallic);
         indirect += ambSupp * ao * interiorAmbK;
         dbgAmbient = ambSupp * ao * interiorAmbK;
         // DH-0989 — the path-traced lane walks the light every one of these terms stands in

@@ -208,6 +208,10 @@ final class LightingKnobs {
     /// the base under the sheen loses what the sheen reflected (albedo scaling), in the deferred
     /// pass and the RT weights. `false` (the default) is byte-identical.
     var layeredClothSheen: Bool = false
+    /// **Daydream DH-1534 - a metal takes no flat ambient.** `true`: the ambient supplement (a stand-in
+    /// for diffuse room bounce) is scaled by `1 - metallic`, so a metal's pixel is its environment
+    /// reflection + lights instead of ~76% one uniform constant. `false` (the default) is byte-identical.
+    var metalNoFlatAmbient: Bool = false
     /// Phase-by-phase breakdown of how long `init` took (see
     /// `IlluminatoramaInitTiming`). Recorded unconditionally so a host can fold it
     /// into its own launch timeline without a special build; `VIZ_ILLUMI_INIT_TIMING`
