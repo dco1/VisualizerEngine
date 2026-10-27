@@ -320,7 +320,9 @@ public enum LeafSheet {
 
     static func monsteraMidrib(_ a: Double) -> Vec2 {
         guard a > monsteraLobeFan else { return Vec2(0, 0) }
-        return Vec2(0, monsteraMidribTop * pow((a - monsteraLobeFan) / (1 - monsteraLobeFan), 0.85))
+        // The exponent > 1 lets the attachment lag the margin, so each vein — and the slit along it —
+        // sweeps FORWARD toward the tip, the pinnate angle of a real blade, not straight out.
+        return Vec2(0, monsteraMidribTop * pow((a - monsteraLobeFan) / (1 - monsteraLobeFan), 1.35))
     }
 
     /// A point of the right half at vein coordinates (a, r). Each vein bows a little toward the tip.
@@ -371,8 +373,16 @@ public enum LeafSheet {
             let t = (a - mid) / 0.0035
             return exp(-t * t)
         }
+        // Each lobe between two slits ends ROUNDED: near a slit's mouth the outer band is pulled in
+        // toward the midrib, most at the slit edge, so the lobe tip is a curve, not a square chord.
+        let mouths = cuts.splits.filter { $0.depth < 1 }.flatMap { [$0.a - $0.width / 2, $0.a + $0.width / 2] }
+        func rounded(_ a: Double, _ r: Double) -> Double {
+            guard r > 0.6, let d = mouths.map({ abs(a - $0) }).min() else { return r }
+            let near = 1 - min(1, d / 0.05)
+            return r - 0.10 * near * near * smoothstep(0.6, 1, r)
+        }
         func site(_ a: Double, _ r: Double) -> Site {
-            let q = monsteraPoint(a: a, r: r)
+            let q = monsteraPoint(a: a, r: rounded(a, r))
             return Site(x: q.x * side, y: q.y, vein: r > 0.08 ? vein(a) : 0, edge: r)
         }
         for i in 0 ..< cols.count - 1 {

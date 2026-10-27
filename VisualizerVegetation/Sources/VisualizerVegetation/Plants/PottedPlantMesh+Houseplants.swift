@@ -236,7 +236,9 @@ extension PottedPlantMesh {
             let blade = size * (newest ? 0.30 : 0.58 - 0.14 * t) * (0.90 + rng.unit() * 0.20)
             let reach = size * (0.42 - 0.22 * t) * (0.85 + rng.unit() * 0.3)
             let height = size * (0.28 + 0.38 * t) * (0.90 + rng.unit() * 0.20)
-            let foot = Vec3(0, soilY + size * (0.02 + 0.06 * t), 0) + outDir * (size * 0.012)
+            // Petioles leave a short climbing stem at successive nodes — older leaves lower — not one
+            // point at the soil, so the stalks fan from a column instead of bunching like a bouquet.
+            let foot = Vec3(0, soilY + size * (0.03 + 0.20 * t), 0) + outDir * (size * 0.02)
             let bladeBase = Vec3(0, soilY + height, 0) + outDir * reach
             // The petiole ARCHES: steeply up out of the crown, then bending out to the blade — a
             // quadratic whose control point stands high over the foot.
@@ -267,7 +269,7 @@ extension PottedPlantMesh {
                               roll: (rng.unit() - 0.5) * 0.95)
             var s = LeafSheet.Surface(base: bladeBase, xAxis: f.x, yAxis: f.y, normal: f.n,
                                       length: blade, halfWidth: 0.48)
-            s.cup = newest ? 0.30 : -0.04 - rng.unit() * 0.08   // a mature blade domes; the new one cups
+            s.cup = newest ? 0.55 : -0.04 - rng.unit() * 0.08   // a mature blade domes; the new one cups
             s.cupPower = 1.9
             s.droop = newest ? 0.04 : 0.14 + rng.unit() * 0.14
             s.midribGroove = 0.006
