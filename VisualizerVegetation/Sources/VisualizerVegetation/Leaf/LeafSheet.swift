@@ -318,6 +318,13 @@ public enum LeafSheet {
         var edges: Set<Double> = [0, 0.05, 0.10, monsteraLobeFan, 1]
         for s in cuts.splits { edges.insert(s.a - s.width / 2); edges.insert(s.a + s.width / 2) }
         for h in cuts.holes { edges.insert(h.a - h.width / 2); edges.insert(h.a + h.width / 2) }
+        // A lateral vein runs half-way between two cuts; narrow columns either side of it let the
+        // painter draw it as a thin pale line instead of a soft band.
+        let centres = (cuts.splits.map(\.a) + [monsteraLobeFan, 1.0]).sorted()
+        for i in 1 ..< centres.count {
+            let mid = (centres[i - 1] + centres[i]) / 2
+            if centres[i] - centres[i - 1] > 0.08 { edges.insert(mid - 0.008); edges.insert(mid + 0.008) }
+        }
         let sorted = edges.filter { $0 >= 0 && $0 <= 1 }.sorted()
         var out: [Double] = [sorted[0]]
         for i in 1 ..< sorted.count {
@@ -342,7 +349,7 @@ public enum LeafSheet {
             var lo = 0.0, hi = 1.0
             for c in cutCentres { if c <= a { lo = c } else { hi = c; break } }
             let mid = (lo + hi) / 2, half = max(1e-6, (hi - lo) / 2)
-            let t = (a - mid) / (half * 0.35)
+            let t = (a - mid) / (half * 0.13)
             return exp(-t * t)
         }
         func site(_ a: Double, _ r: Double) -> Site {

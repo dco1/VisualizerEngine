@@ -66,9 +66,11 @@ public extension PlantStyle {
                                   veinStrength: 0, stalk: Vec3(0.200, 0.210, 0.120),
                                   leafValueJitter: 0.10, leafHueJitter: 0.06)
         case .monstera:
-            return FoliagePalette(mature: m, young: Vec3(0.300, 0.540, 0.160),
-                                  underside: Vec3(0.280, 0.400, 0.230), rib: Vec3(0.340, 0.500, 0.200),
-                                  veinStrength: 0.30, stalk: Vec3(0.200, 0.370, 0.130),
+            // The photographed monstera is a much deeper, glossier green than the room-calibrated
+            // `leafColor` (which the colour gates read), so the paint runs darker than it.
+            return FoliagePalette(mature: m * 0.62, young: Vec3(0.240, 0.470, 0.130),
+                                  underside: Vec3(0.250, 0.380, 0.200), rib: Vec3(0.360, 0.520, 0.200),
+                                  veinStrength: 0.50, stalk: Vec3(0.200, 0.370, 0.130),
                                   leafValueJitter: 0.09, leafHueJitter: 0.05)
         case .snakePlant:
             // The painter's banding (`snakePlantBand`) carries this style's pattern; `young` is the

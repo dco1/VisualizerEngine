@@ -227,7 +227,7 @@ extension PottedPlantMesh {
             let outDir = Vec3(cos(azimuth), 0, sin(azimuth))
             let newest = i == count - 1 && count >= 3
             let maturity = newest ? 0.1 : 1 - 0.55 * t
-            let youth = newest ? 0.75 : smoothstep(0.75, 1.0, t) * 0.5
+            let youth = newest ? 0.45 : smoothstep(0.75, 1.0, t) * 0.5
             let tone = FoliagePaint.tone(youth: youth, palette: palette, rng: &rng)
             // Blade and where its petiole holds it: the old leaves low and far out, the new ones high
             // and close — a monstera spreads wider than it is tall, a FOUNTAIN of overlapping leaves.
@@ -271,7 +271,7 @@ extension PottedPlantMesh {
             for side in [1.0, -1.0] {
                 let cuts = monsteraCuts(maturity: maturity, rng: &rng)
                 LeafSheet.emitMonsteraHalf(into: &leaf, surface: s, cuts: cuts, side: side,
-                                           spacing: 0.068) { site, face in
+                                           spacing: 0.080) { site, face in
                     FoliagePaint.sheet(palette, tone, site: site, face: face, ribHalfWidth: ribHalf)
                 }
             }
