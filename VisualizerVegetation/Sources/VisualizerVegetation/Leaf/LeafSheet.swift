@@ -385,6 +385,16 @@ public enum LeafSheet {
                          surface: surface, paint: paint)
             }
         }
+        // A fenestration is an oval, not a rectangle: wedges fill all four corners, leaving a diamond
+        // that the smoothed normals and the eye both read as round.
+        for h in cuts.holes {
+            let lo = h.a - h.width / 2, hi = h.a + h.width / 2, c = (h.r1 - h.r0) * 0.42
+            guard lo >= 0, hi <= 1, c > 0 else { continue }
+            for (r, dir) in [(h.r0, 1.0), (h.r1, -1.0)] {
+                emitTriangle(into: &p, [site(lo, r), site(lo, r + dir * c), site(h.a, r)], surface: surface, paint: paint)
+                emitTriangle(into: &p, [site(hi, r), site(h.a, r), site(hi, r + dir * c)], surface: surface, paint: paint)
+            }
+        }
         // A slit ends in a point, not a square: two corner wedges of tissue fill the inner corners.
         for sp in cuts.splits where sp.depth < 1 {
             let lo = sp.a - sp.width / 2, hi = sp.a + sp.width / 2, d = sp.depth, c = 0.07
