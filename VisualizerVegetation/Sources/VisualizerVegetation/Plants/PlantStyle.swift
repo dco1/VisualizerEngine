@@ -116,7 +116,7 @@ public extension PlantStyle {
     public var leafColor: Vec3 {
         switch self {
         case .fiddleLeafFig: return Vec3(0.186, 0.336, 0.125)  // deep, glossy green
-        case .monstera:      return Vec3(0.158, 0.314, 0.130)  // rich deep green, a touch bluer
+        case .monstera:      return Vec3(0.050, 0.190, 0.080)  // deep blue-green, as a real monstera photographs
         case .snakePlant:    return Vec3(0.112, 0.212, 0.095)  // dark sword green (its bands are paler)
         case .fern:          return Vec3(0.240, 0.440, 0.130)  // bright fresh yellow-green
         case .succulent:     return Vec3(0.450, 0.550, 0.400)  // farina-dusted pale sage
@@ -163,7 +163,7 @@ public extension PlantStyle {
     public var leafTranslucency: Float {
         switch self {
         case .fiddleLeafFig:                        return 0.08   // thick, leathery, waxed
-        case .monstera:                             return 0.10
+        case .monstera:                             return 0.04
         case .snakePlant:                           return 0.04   // a fibrous, water-filled sword
         case .succulent:                            return 0.03   // a fleshy pad
         case .fern:                                 return 0.22   // paper-thin pinnae

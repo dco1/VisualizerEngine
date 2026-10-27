@@ -101,11 +101,17 @@ extension PottedPlantMesh {
     }
 
     /// A painted stalk (petiole, rachis): a smooth tube swept along `path`, tapering `rBase` → `rTip`.
-    static func paintedStalk(_ path: [Vec3], rBase: Double, rTip: Double, sides: Int, color: Vec3) -> PaintedMesh {
+    static func paintedStalk(_ path: [Vec3], rBase: Double, rTip: Double, sides: Int, color: Vec3,
+                             knuckle: Double = 1) -> PaintedMesh {
         guard path.count >= 2 else { return PaintedMesh() }
         var m = Mesh3()
         let n = path.count
-        let scales = (0 ..< n).map { 1 + (rTip / rBase - 1) * Double($0) / Double(n - 1) }
+        // `knuckle` swells the last two stations: a monstera's geniculum, the thickened joint where
+        // the petiole meets the blade.
+        let scales = (0 ..< n).map { k -> Double in
+            let base = 1 + (rTip / rBase - 1) * Double(k) / Double(n - 1)
+            return base * (k >= n - 2 ? knuckle : 1)
+        }
         guard m.sweep(profile: .circle(radius: rBase, segments: sides), along: path, scales: scales) else {
             return PaintedMesh()
         }
@@ -196,13 +202,13 @@ extension PottedPlantMesh {
         let a0 = 0.23, a1 = 0.86
         for k in 0 ..< n {
             let a = a0 + (a1 - a0) * Double(k) / Double(max(1, n - 1)) + (rng.unit() - 0.5) * 0.02
-            let w = 0.016 + rng.unit() * 0.018
+            let w = 0.020 + rng.unit() * 0.014
             let r = rng.unit()
-            let depth = k == n - 1 ? 0.72 : (r < 0.20 ? 0.30 : (r < 0.80 ? 0.48 : 0.72))
+            let depth = k == n - 1 ? 0.72 : (r < 0.15 ? 0.30 : (r < 0.35 ? 0.48 : 0.72))
             splits.append(.init(a: a, width: w, depth: depth))
             if depth >= 0.48, k < n - 1, rng.unit() < 0.55 * maturity {
                 // In line with its split and exactly as wide — shared column edges, no sliver.
-                holes.append(.init(a: a, width: w, r0: 0.18, r1: 0.30))
+                holes.append(.init(a: a, width: w, r0: 0.18, r1: 0.30 + 0.18 * rng.unit()))
             }
         }
         return .init(splits: splits, holes: holes)
@@ -211,8 +217,9 @@ extension PottedPlantMesh {
     static func monsteraFoliage(params: some PottedPlantGeometry, soilY: Double, rng: inout SplitMix) -> Foliage {
         let palette = PlantStyle.monstera.foliagePalette
         let size = params.plantSize
-        let count = leafCount(8, params.foliageDensity, minimum: 3)
+        let count = leafCount(9, params.foliageDensity, minimum: 3)
         var out = Foliage()
+        var woodyRoots = Mesh3()
         let start = rng.unit() * 2 * Double.pi
         for i in 0 ..< count {
             let t = count > 1 ? Double(i) / Double(count - 1) : 1   // 0 oldest, outermost → 1 newest
@@ -220,44 +227,45 @@ extension PottedPlantMesh {
             let outDir = Vec3(cos(azimuth), 0, sin(azimuth))
             let newest = i == count - 1 && count >= 3
             let maturity = newest ? 0.1 : 1 - 0.55 * t
-            let youth = newest ? 1.0 : smoothstep(0.75, 1.0, t) * 0.5
+            let youth = newest ? 0.75 : smoothstep(0.75, 1.0, t) * 0.5
             let tone = FoliagePaint.tone(youth: youth, palette: palette, rng: &rng)
             // Blade and where its petiole holds it: the old leaves low and far out, the new ones high
             // and close — a monstera spreads wider than it is tall, a FOUNTAIN of overlapping leaves.
             // (Held nearly flat at the top of tall straight stalks, the blades read as parasols.)
-            let blade = size * (newest ? 0.30 : 0.50 - 0.12 * t) * (0.90 + rng.unit() * 0.20)
+            let blade = size * (newest ? 0.30 : 0.58 - 0.14 * t) * (0.90 + rng.unit() * 0.20)
             let reach = size * (0.42 - 0.22 * t) * (0.85 + rng.unit() * 0.3)
             let height = size * (0.28 + 0.38 * t) * (0.90 + rng.unit() * 0.20)
             let foot = Vec3(0, soilY + size * (0.02 + 0.06 * t), 0) + outDir * (size * 0.012)
             let bladeBase = Vec3(0, soilY + height, 0) + outDir * reach
             // The petiole ARCHES: steeply up out of the crown, then bending out to the blade — a
             // quadratic whose control point stands high over the foot.
-            let ctrl = foot + Vec3(0, (bladeBase.y - foot.y) * 0.85, 0) + outDir * (reach * 0.25)
+            let ctrl = foot + Vec3(0, (bladeBase.y - foot.y) * 0.85, 0) + outDir * (reach * 0.40)
             let path = (0 ... 8).map { k -> Vec3 in
                 let u = Double(k) / 8
                 return foot * ((1 - u) * (1 - u)) + ctrl * (2 * u * (1 - u)) + bladeBase * (u * u)
             }
             let petR = max(0.004, size * 0.010) * (newest ? 0.75 : 1)
             out.leaves.append(paintedStalk(path, rBase: petR, rTip: petR * 0.7, sides: 7,
-                                           color: FoliagePaint.base(palette, LeafTone(youth: 0.3, value: tone.value), face: .upper) * 1.25))
+                                           color: FoliagePaint.base(palette, LeafTone(youth: 0.3, value: tone.value), face: .upper) * 1.25,
+                                           knuckle: 1.55))
 
             // The blade HANGS from the top of its stalk (the bend at the geniculum): a mature leaf's
             // midrib runs 0–20° below horizontal, the oldest lowest, each rolled a little about its
             // midrib so no two present the same face; the newest, still unfurling, stands up.
-            let tilt = (newest ? 0.70 : 1.57 + 0.33 * (1 - t)) + (rng.unit() - 0.5) * 0.25
+            let tilt = (newest ? 0.70 : 1.25 + 0.65 * (1 - t)) + (rng.unit() - 0.5) * 0.42
             let f = leafFrame(azimuth: azimuth + (rng.unit() - 0.5) * 0.3, tilt: tilt,
-                              roll: (rng.unit() - 0.5) * 0.7)
+                              roll: (rng.unit() - 0.5) * 0.95)
             var s = LeafSheet.Surface(base: bladeBase, xAxis: f.x, yAxis: f.y, normal: f.n,
                                       length: blade, halfWidth: 0.48)
-            s.cup = newest ? 0.10 : -0.03 - rng.unit() * 0.04   // a mature blade domes; the new one cups
+            s.cup = newest ? 0.10 : -0.04 - rng.unit() * 0.08   // a mature blade domes; the new one cups
             s.cupPower = 1.9
-            s.droop = newest ? 0.04 : 0.10 + rng.unit() * 0.08
+            s.droop = newest ? 0.04 : 0.14 + rng.unit() * 0.14
             s.midribGroove = 0.006
             s.midribHalfWidth = 0.02
-            s.ripple = 0.006
+            s.ripple = 0.0035
             s.rippleWaves = 1.6
             s.ripplePhase = rng.unit() * 2 * Double.pi
-            s.twist = (rng.unit() - 0.5) * 0.2
+            s.twist = (rng.unit() - 0.5) * 0.45
             let ribHalf = 0.013
             var leaf = PaintedMesh()
             for side in [1.0, -1.0] {
@@ -269,6 +277,24 @@ extension PottedPlantMesh {
             }
             out.leaves.append(leaf.smoothed())
         }
+        // Aerial roots: a few brown cords leaving the stem a hand above the soil and arching down to it.
+        for k in 0 ..< 3 {
+            let az = start + Double(k) * 2.1 + rng.unit() * 0.6
+            let d = Vec3(cos(az), 0, sin(az))
+            let top = Vec3(0, soilY + size * (0.07 + 0.04 * rng.unit()), 0) + d * (size * 0.012)
+            let out = d * (size * (0.05 + 0.03 * rng.unit()))
+            let path = (0 ... 6).map { q -> Vec3 in
+                let u = Double(q) / 6
+                return top + out * (u * (2 - u)) - Vec3(0, (top.y - soilY + 0.004) * u * u, 0)
+            }
+            var m = Mesh3()
+            let r = max(0.0016, size * 0.0035)
+            if m.sweep(profile: .circle(radius: r, segments: 5), along: path,
+                       scales: (0 ..< path.count).map { 1 - 0.5 * Double($0) / Double(path.count - 1) }) {
+                woodyRoots.append(m.smoothed())
+            }
+        }
+        out.woody.append(woodyRoots)
         return out
     }
 
