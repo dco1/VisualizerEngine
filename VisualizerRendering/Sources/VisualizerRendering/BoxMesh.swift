@@ -16,16 +16,8 @@ public enum BoxMesh {
 
     /// A unit cube centred at the origin, side length 1 (half-extent 0.5).
     public static func unit() -> CoinMesh.Mesh {
-        let h: Float = 0.5
-        // (face normal, 4 corner positions CCW seen from outside).
-        let faces: [(SIMD3<Float>, [SIMD3<Float>])] = [
-            (SIMD3( 1, 0, 0), [SIMD3( h,-h, h), SIMD3( h,-h,-h), SIMD3( h, h,-h), SIMD3( h, h, h)]),
-            (SIMD3(-1, 0, 0), [SIMD3(-h,-h,-h), SIMD3(-h,-h, h), SIMD3(-h, h, h), SIMD3(-h, h,-h)]),
-            (SIMD3( 0, 1, 0), [SIMD3(-h, h, h), SIMD3( h, h, h), SIMD3( h, h,-h), SIMD3(-h, h,-h)]),
-            (SIMD3( 0,-1, 0), [SIMD3(-h,-h,-h), SIMD3( h,-h,-h), SIMD3( h,-h, h), SIMD3(-h,-h, h)]),
-            (SIMD3( 0, 0, 1), [SIMD3(-h,-h, h), SIMD3( h,-h, h), SIMD3( h, h, h), SIMD3(-h, h, h)]),
-            (SIMD3( 0, 0,-1), [SIMD3( h,-h,-h), SIMD3(-h,-h,-h), SIMD3(-h, h,-h), SIMD3( h, h,-h)]),
-        ]
+        // 6 faces × 4 verts; each face has its own normal so flats stay sharp.
+        let faces = UnitCube.faces
         var pos: [SIMD3<Float>] = [], nrm: [SIMD3<Float>] = []
         var uv:  [SIMD2<Float>] = [], idx: [Int32] = []
         for (normal, quad) in faces {
