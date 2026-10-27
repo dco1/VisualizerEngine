@@ -22,6 +22,17 @@ struct SignackQuadric {
         weight = w
     }
 
+    /// The quadric of one plane (unit normal `n` through `p`), its squared distance counted `penalty`
+    /// times over while adding only `weight` to the mean's denominator — a constraint plane that
+    /// costs far more to leave than the surface's own planes (an open border's, `SignackEdgeCollapse`).
+    init(planeNormal n: SIMD3<Double>, through p: SIMD3<Double>, weight w: Double, penalty k: Double) {
+        let d = -simd_dot(n, p)
+        m = [n.x * n.x, n.x * n.y, n.x * n.z, n.x * d,
+             n.y * n.y, n.y * n.z, n.y * d,
+             n.z * n.z, n.z * d, d * d].map { $0 * w * k }
+        weight = w
+    }
+
     init() {}
 
     static func += (l: inout SignackQuadric, r: SignackQuadric) {

@@ -282,7 +282,7 @@ extension PottedPlantMesh {
             for side in [1.0, -1.0] {
                 let cuts = monsteraCuts(maturity: maturity, rng: &rng)
                 LeafSheet.emitMonsteraHalf(into: &leaf, surface: s, cuts: cuts, side: side,
-                                           spacing: 0.060) { site, face in
+                                           spacing: 0.035) { site, face in
                     FoliagePaint.sheet(palette, tone, site: site, face: face, ribHalfWidth: ribHalf)
                 }
             }

@@ -298,7 +298,7 @@ public enum LeafSheet {
     /// The last lateral vein leaves the midrib this far up the blade.
     public static let monsteraMidribTop = 0.90
     /// Where the `r` rows fall: the rib band, the fenestration band (0.18–0.30), then out to the margin.
-    public static let monsteraRows: [Double] = [0, 0.06, 0.18, 0.30, 0.48, 0.72, 1.0]
+    public static let monsteraRows: [Double] = [0, 0.06, 0.12, 0.18, 0.24, 0.30, 0.39, 0.48, 0.60, 0.72, 0.80, 0.86, 0.92, 0.96, 1.0]
 
     /// The margin sampled densely and parameterised by arc length (0 lobe → 1 tip).
     static let monsteraMarginCurve: (points: [Vec2], t: [Double]) = {
@@ -394,7 +394,7 @@ public enum LeafSheet {
             guard lo >= 0, hi <= 1, let j0 = cut.first, let j1 = cut.last else { continue }
             let rLo = rows[j0], rHi = rows[j1 + 1]
             let ca = (lo + hi) / 2, cr = (rLo + rHi) / 2, ha = (hi - lo) / 2, hr = (rHi - rLo) / 2
-            var angles = (0 ..< 12).map { Double($0) / 12 * 2 * Double.pi }
+            var angles = (0 ..< 20).map { Double($0) / 20 * 2 * Double.pi }
             for (sa, sr) in [(1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)] {
                 let t = atan2(sr * hr, sa * ha)
                 angles.append(t < 0 ? t + 2 * Double.pi : t)
