@@ -47,8 +47,11 @@ public struct LeafTone: Sendable, Equatable {
     public var value: Double
     /// −1 … 1: lean toward blue-green (−) or yellow-green (+).
     public var hue: Double
-    public init(youth: Double, value: Double = 1, hue: Double = 0) {
+    /// 0 … 1 — how old and worn: yellowing, a browning margin, scattered spots (the oldest leaves).
+    public var age: Double
+    public init(youth: Double, value: Double = 1, hue: Double = 0, age: Double = 0) {
         self.youth = max(0, min(1, youth)); self.value = value; self.hue = max(-1, min(1, hue))
+        self.age = max(0, min(1, age))
     }
 }
 
@@ -140,6 +143,20 @@ public enum FoliagePaint {
         // Lateral veins: on the upper face a soft pale line; below, raised and paler still.
         let vs = palette.veinStrength * (face == .lower ? 1.2 : 1.0)
         c = mix3(c, mix3(c, palette.rib, 0.8), min(1, site.vein * vs))
+        if palette.veinStrength > 0.4 {
+            // A monstera's blade: a paler patch where it fans out of the petiole, then, on an old
+            // leaf, yellowing, a crisp brown margin and a few brown flecks.
+            let junction = max(0, 1 - hypot(site.x, max(0, site.y)) / 0.16)
+            c = mix3(c, palette.rib, 0.18 * junction * junction)
+            if tone.age > 0 {
+                let a = tone.age
+                c = mix3(c, Vec3(0.40, 0.38, 0.10), 0.16 * a * smoothstep(0.5, 1, site.edge))
+                let rim = smoothstep(0.955, 1.0, site.edge)
+                c = mix3(c, Vec3(0.30, 0.17, 0.06), min(1, 0.9 * a * rim))
+                let h = sin(site.x * 91.7 + site.y * 57.3) * sin(site.x * 43.1 - site.y * 77.9)
+                c = mix3(c, Vec3(0.26, 0.16, 0.07), a * smoothstep(0.82, 0.93, h))
+            }
+        }
         return clampColor(c)
     }
 
