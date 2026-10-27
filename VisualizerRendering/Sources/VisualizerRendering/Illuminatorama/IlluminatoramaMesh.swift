@@ -59,6 +59,11 @@ public final class IlluminatoramaMesh {
     /// that is not in the map falls back to `shadowIndirectDrawOffset`. Set by the host each frame
     /// (`IlluminatoramaRenderer.shadowViewsThisFrame()` names the views).
     public var shadowViewDrawOffsets: [IlluminatoramaShadowView: Int] = [:]
+    /// More indirect records this mesh draws, after its own (Daydream DH-1470): a batched planting packs
+    /// every LOD bucket (each rung, the impostor) into ONE mesh — one vertex buffer, one index buffer —
+    /// so a species variant costs ONE mesh group instead of one per bucket (the RT guard caps a scene's
+    /// groups at 512). Each record is drawn exactly as the mesh's own would be, in every raster pass.
+    public var additionalIndirectRecords: [IlluminatoramaIndirectRecord] = []
     /// Signack S6 (DH-1461) — instance records a COMPUTE pass wrote this frame (a batched planting:
     /// every instance of one baked type, LOD-bucketed, culled and compacted). When set, every raster
     /// pass binds THIS buffer at offset 0 as both the current and previous instances (the records

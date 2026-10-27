@@ -307,6 +307,7 @@ static inline float3 sampleSky(texture2d<float, access::sample> sky, float3 dir,
 // in IlluminatoramaRT.metal uses the same 1.2).
 constant float kSecondaryMinConeRad = 1.0e-3;   // ≈0.06°, about half a pixel at a normal lens
 constant float kGlassConeK          = 1.4;      // glass refraction / reflection
+constant float kReflCutoffFade       = 0.12;     // DH-1537 — RT reflection roughness cutoff fades over this band below it
 constant float kReflConeK           = 1.2;      // deferred glossy reflection (GGX α)
 
 static inline float secondaryConeRad(float roughness, float k) { return roughness * roughness * k; }

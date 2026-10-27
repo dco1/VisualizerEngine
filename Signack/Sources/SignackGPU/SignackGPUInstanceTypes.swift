@@ -55,7 +55,8 @@ struct SignackGPUInstanceUniforms {
     var cull: UInt32
     var maxDistance: Float
     var viewCount: UInt32 = 0          // DH-1493
-    var pad1: UInt32 = 0, pad2: UInt32 = 0
+    var impostorIndexStart: UInt32 = 0 // DH-1470
+    var pad2: UInt32 = 0
 
     init(view: SignackInstanceView, batch: SignackGPUInstanceBatch) {
         let p = view.frustum?.planes ?? []
@@ -73,6 +74,7 @@ struct SignackGPUInstanceUniforms {
         impostorPixels = view.impostorPixels
         rungCount = UInt32(r.count)
         impostorIndexCount = UInt32(batch.impostorIndexCount)
+        impostorIndexStart = UInt32(batch.impostorIndexStart)
         instanceCount = UInt32(batch.instanceCount)
         instanceStride = UInt32(batch.instanceStride)
         isOrthographic = view.isOrthographic ? 1 : 0

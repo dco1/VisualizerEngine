@@ -112,5 +112,47 @@ struct SignackScatterTests {
         }
         #expect(!index.covers(SIMD2(-50, -50)))
     }
-}
 
+    /// DH-1470 — strata: trees space by canopy among themselves; shrubs grow under their crowns, kept
+    /// clear only of the trunk, thinned by shade; and a single-stratum rule is unchanged by the feature.
+    @Test func understoryGrowsUnderCrownsButClearOfTrunks() {
+        let tree = ScatterSpecies(id: 9, weight: 0.25, canopyRadius: 4, scaleRange: 0.8...1.1, variantCount: 2,
+                                  stratum: 1, stemRadius: 0.6)
+        var r = Self.rule(density: 1.2)
+        r.species = Self.species + [tree]
+        let pts = SignackScatter.scatter(r)
+        let trees = pts.filter { $0.stratum == 1 }, shrubs = pts.filter { $0.stratum == 0 }
+        #expect(trees.count >= 3)
+        #expect(shrubs.count > 40)
+        for (i, a) in trees.enumerated() {
+            for b in trees.dropFirst(i + 1) {
+                #expect(simd_distance(a.position, b.position) >= (a.radius + b.radius) * r.canopyOverlap * 0.65 + r.minSpacing - 1e-9)
+            }
+        }
+        var under = 0
+        for s in shrubs {
+            for t in trees {
+                let d = simd_distance(s.position, t.position)
+                #expect(d >= t.stemRadius + s.radius * r.canopyOverlap * 0.65 + r.minSpacing - 1e-9)
+                if d < t.radius * 0.85 { under += 1 }
+            }
+        }
+        #expect(under > 0, "shrubs must be able to grow under a crown")
+        // Full shade: nothing grows under a crown.
+        r.understoryKeep = 0
+        let dark = SignackScatter.scatter(r)
+        let darkTrees = dark.filter { $0.stratum == 1 }
+        #expect(dark.filter { $0.stratum == 0 }.allSatisfy { s in darkTrees.allSatisfy { simd_distance(s.position, $0.position) >= $0.radius * 0.85 - 1e-9 } })
+        // Shade: fewer shrubs per m² under crowns than in the open.
+        let none = SignackScatter.scatter(Self.rule(density: 1.2))
+        #expect(none == SignackScatter.scatter(Self.rule(density: 1.2)))
+        #expect(none.allSatisfy { $0.stratum == 0 })
+    }
+
+    @Test func discsKeepPlantsOut() {
+        let mask = ScatterMask(discs: [ScatterMask.Disc(center: SIMD2(10, 7), radius: 2)])
+        let pts = SignackScatter.scatter(Self.rule(density: 1.2), mask: mask)
+        #expect(pts.count > 40)
+        #expect(pts.allSatisfy { simd_distance($0.position, SIMD2(10, 7)) >= 2 + $0.radius * 0.7 - 1e-9 })
+    }
+}

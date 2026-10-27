@@ -28,4 +28,8 @@ public struct ScatterPoint: Sendable, Equatable {
     /// Stable identity within the planting (the world cell it was drawn in) — keys anything a
     /// host caches per plant.
     public var key: UInt64
+    /// Canopy layer (`ScatterSpecies.stratum`) and the trunk clearance as planted (stem radius ×
+    /// scale) — what another stratum's plants keep clear of. DH-1470.
+    public var stratum: Int = 0
+    public var stemRadius: Double = 0
 }

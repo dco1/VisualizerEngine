@@ -51,6 +51,7 @@ extension IlluminatoramaRenderer {
     public var rtPathRadianceCacheBuildFrames: Int { get { kRT.rtPathRadianceCacheBuildFrames } set { kRT.rtPathRadianceCacheBuildFrames = newValue } _modify { yield &kRT.rtPathRadianceCacheBuildFrames } }
     public var rtPathRadianceCacheBuildRays: Int { get { kRT.rtPathRadianceCacheBuildRays } set { kRT.rtPathRadianceCacheBuildRays = newValue } _modify { yield &kRT.rtPathRadianceCacheBuildRays } }
     public var svgfStillLuminanceStop: Bool { get { kRT.svgfStillLuminanceStop } set { kRT.svgfStillLuminanceStop = newValue } _modify { yield &kRT.svgfStillLuminanceStop } }
+    public var svgfStillVarianceGate: Float { get { kRT.svgfStillVarianceGate } set { kRT.svgfStillVarianceGate = newValue } _modify { yield &kRT.svgfStillVarianceGate } }
     public var rtReflectionsEnabled: Bool { get { kRT.rtReflectionsEnabled } set { kRT.rtReflectionsEnabled = newValue } _modify { yield &kRT.rtReflectionsEnabled } }
     public var rtTLASForReflections: Bool { get { kRT.rtTLASForReflections } set { kRT.rtTLASForReflections = newValue } _modify { yield &kRT.rtTLASForReflections } }
     public var rtReflStrength: Float { get { kRT.rtReflStrength } set { kRT.rtReflStrength = newValue } _modify { yield &kRT.rtReflStrength } }

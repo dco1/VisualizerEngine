@@ -278,6 +278,9 @@ final class RTKnobs {
     /// protecting no in-plane indirect shadow edge (Oak Credenza Hall, Sunset Gallery, 2026-10-14).
     /// Depth and normal stops keep geometric edges either way. Default `true`: byte-identical.
     var svgfStillLuminanceStop: Bool = true
+    /// Daydream DH-1016 — relative-noise threshold of the still filter's variance gate (`√Var / lum`);
+    /// 0 = off (default, byte-identical). See `varGate` in IlluminatoramaSVGF.metal.
+    var svgfStillVarianceGate: Float = 0
     // ── Hardware-RT reflections ──────────────────────────────────────
     //
     // Runs inside the same `illumi_rt_lighting` pass (reuses the AS,

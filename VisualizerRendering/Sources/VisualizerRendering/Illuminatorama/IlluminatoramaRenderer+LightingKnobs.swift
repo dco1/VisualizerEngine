@@ -7,7 +7,6 @@ import VisualizerCore
 
 // Forwarders for `LightingKnobs` — storage lives in IlluminatoramaLightingKnobs.swift.
 extension IlluminatoramaRenderer {
-    public var metalNoFlatAmbient: Bool { get { kLighting.metalNoFlatAmbient } set { kLighting.metalNoFlatAmbient = newValue } _modify { yield &kLighting.metalNoFlatAmbient } }
     public var instances: [InstanceRef] { get { kLighting.instances } set { kLighting.instances = newValue } _modify { yield &kLighting.instances } }
     public internal(set) var staticSkipStats: StaticSkipStats { get { kLighting.staticSkipStats } set { kLighting.staticSkipStats = newValue } _modify { yield &kLighting.staticSkipStats } }
     public var onEncodeFrameCompute: ((_ cb: MTLCommandBuffer) -> Void)? { get { kLighting.onEncodeFrameCompute } set { kLighting.onEncodeFrameCompute = newValue } _modify { yield &kLighting.onEncodeFrameCompute } }
@@ -49,5 +48,7 @@ extension IlluminatoramaRenderer {
     public var layeredSpecularEnabled: Bool { get { kLighting.layeredSpecularEnabled } set { kLighting.layeredSpecularEnabled = newValue } _modify { yield &kLighting.layeredSpecularEnabled } }
     public var diffuseRoughnessEnabled: Bool { get { kLighting.diffuseRoughnessEnabled } set { kLighting.diffuseRoughnessEnabled = newValue } _modify { yield &kLighting.diffuseRoughnessEnabled } }
     public var layeredClothSheen: Bool { get { kLighting.layeredClothSheen } set { kLighting.layeredClothSheen = newValue } _modify { yield &kLighting.layeredClothSheen } }
+    public var layeredDyedSheen: Bool { get { kLighting.layeredDyedSheen } set { kLighting.layeredDyedSheen = newValue } _modify { yield &kLighting.layeredDyedSheen } }
+    public var metalNoFlatAmbient: Bool { get { kLighting.metalNoFlatAmbient } set { kLighting.metalNoFlatAmbient = newValue } _modify { yield &kLighting.metalNoFlatAmbient } }
     public internal(set) var initTiming: IlluminatoramaInitTiming { get { kLighting.initTiming } set { kLighting.initTiming = newValue } _modify { yield &kLighting.initTiming } }
 }

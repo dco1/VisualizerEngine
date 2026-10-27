@@ -510,8 +510,9 @@ kernel void illumi_rt_lighting(
     // the environment. Host is expected to zero `ssrIntensity` when this is
     // on, so RT owns scene-geometry reflections (no SSR double-count).
     float3 reflection = float3(0.0);
-    if (u.reflEnabled != 0 && u.reflStrength > 0.0 &&
-        roughness <= u.reflRoughnessCutoff) {
+    // DH-1537 — fade, not step (see IlluminatoramaRTInstanced.metal; 0.12 = kReflCutoffFade).
+    const float reflFade = 1.0 - smoothstep(u.reflRoughnessCutoff - 0.12, u.reflRoughnessCutoff, roughness);
+    if (u.reflEnabled != 0 && u.reflStrength > 0.0 && reflFade > 0.0) {
         float3 V = normalize(u.cameraWorldPos - P);
         float NdotV = saturate(dot(N, V));
         float3 R = reflect(-V, N);
@@ -604,7 +605,7 @@ kernel void illumi_rt_lighting(
             }
             acc += hitRad;
         }
-        reflection = (acc / float(rrays)) * fres * u.reflStrength;
+        reflection = (acc / float(rrays)) * fres * u.reflStrength * reflFade;
     }
 
     // Split the RT contribution by frequency:

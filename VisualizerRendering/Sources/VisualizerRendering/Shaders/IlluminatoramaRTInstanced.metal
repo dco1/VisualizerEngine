@@ -1868,7 +1868,14 @@ kernel void illumi_rt_lighting_tlas(
     float reflDistAcc = 0.0; float reflDistN = 0.0;
     float3 reflFresS = float3(1.0);   // DH-0539 — fres × reflStrength, the demodulation
     float reflRough = lw.reflRoughness;
-    if (u.reflEnabled != 0 && u.reflStrength > 0.0 && reflRough <= u.reflRoughnessCutoff) {
+    // DH-1537 — the roughness cutoff is a FADE, not a step. A hard `<=` cut made the traced room reflection
+    // (which REPLACES the sky IBL specular) appear on exactly the texels whose roughness fell under the
+    // cutoff: paint centred near it (satin 0.62 ± its roughness breakup vs 0.6) rendered sharp-edged
+    // camouflage patches of 'traced' vs 'IBL-only' on a plain wall. `reflFade` ramps the contribution (and
+    // the sky it replaces) smoothly to 0 over the `kReflCutoffFade` below the cutoff, so a continuous
+    // roughness field gives a continuous picture.
+    const float reflFade = 1.0 - smoothstep(u.reflRoughnessCutoff - kReflCutoffFade, u.reflRoughnessCutoff, reflRough);
+    if (u.reflEnabled != 0 && u.reflStrength > 0.0 && reflFade > 0.0) {
         float3 V = normalize(u.cameraWorldPos - P);
         float3 R = reflect(-V, N);
         float NdotV = saturate(dot(N, V));
@@ -2013,11 +2020,11 @@ kernel void illumi_rt_lighting_tlas(
                                          cacheIrr, cacheTerm);
             cacheRefl += cacheTerm;
         }
-        reflection = (acc / float(rrays)) * fres * u.reflStrength;
+        reflection = (acc / float(rrays)) * fres * u.reflStrength * reflFade;
         reflFresS = max(fres * u.reflStrength, float3(0.02));
-        reflHitFraction = saturate(float(hits) / float(rrays) * u.reflStrength);
+        reflHitFraction = saturate(float(hits) / float(rrays) * u.reflStrength) * reflFade;
         reflTraced = reflDistN > 0.0;
-        cacheTerms += (cacheRefl / float(rrays)) * fres * u.reflStrength;
+        cacheTerms += (cacheRefl / float(rrays)) * fres * u.reflStrength * reflFade;
     }
 
     half4 prev = outHDR.read(gid);

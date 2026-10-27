@@ -28,6 +28,11 @@ extension MaterialGenerator {
         ch.sheenRoughness = 0.45                    // dense cut pile → a BROAD, soft grazing glow
                                                     // (DH-0081; was the 0.30 library default)
         ch.deriveNormals(strength: 0.7)      // was 2 on the crossed-band weave; on the isotropic nap that read as crushed suede
+        // DH-1316: the NAP — the pile leans one way (the fibre angle below, 0.6 rad), swirled and crushed in ~5 cm
+        // patches: ~6° of lean, invisible face-on, the light/dark pile marks at grazing (MaterialGenerator+FabricLook).
+        if refinedFabricLook {
+            applyNapLean(&ch, seed: seed ^ 0x4A9, angle: 0.6, lean: 0.11, patchCells: 6, swirl: 1.1, crushLift: 0.07)
+        }
         // Very fine sub-thread nap so the pile catches grazing light as fuzz, not plastic.
         // DH-1339: real pile fibre. ~1 mm cut fibres (14 texels at ~0.07 mm) ~0.13 mm wide, laid mostly one way with a wide
         // scatter — the nap — added (not layered) so they pile into a soft fuzz rather than read as hairs.
@@ -260,7 +265,11 @@ extension MaterialGenerator {
     /// sun-facing seat — not a dark gridded screen), and the weave never beats into moiré on
     /// grazing panels. Every band is a smooth band-limited sinusoid (TAA-stable).
     public static func linen(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 107,
-                             base: Vec3 = Vec3(0.76, 0.72, 0.65)) -> MaterialChannels {
+                             base: Vec3 = Vec3(0.76, 0.72, 0.65),
+                             weaveContrast: Double = 1.0) -> MaterialChannels {
+        // `weaveContrast` scales how far the interlace shows (albedo crown-vs-valley, roughness, normal relief). 1.0 is the
+        // upholstery whisper — every existing caller, byte-identical. Drapery hangs in raking window light at arm's length,
+        // where a bare cloth reads as a flat sheet unless the thread structure carries (see `draperyLinen`).
         var ch = MaterialChannels(size: size, category: .fabric)
         let sh = seed
         let tau = 2.0 * Double.pi
@@ -288,15 +297,18 @@ extension MaterialGenerator {
                 let macro = 0.955 + 0.06 * Noise.fbmTiled(u, v, baseCells: 2, octaves: 3, seed: sh ^ 0x7B)
                 // WHISPER albedo weave: crown vs valley differ by only ~5% so the surface stays
                 // an even light oatmeal — the weave is a texture hint, never a two-tone grid.
-                let shade = 0.955 + 0.05 * crown
-                ch.albedo[ch.idx(x, y)] = clampBand(base * macro * slub * shade)
+                let shade = 1.0 - 0.045 * weaveContrast + 0.05 * weaveContrast * crown
+                // DH-1316: real linen's yarn — heathered per yarn, crossed by thick / thin slub streaks.
+                let yarn = refinedFabricLook ? linenSlub(x: x, y: y, size: size, seed: sh ^ 0x51B)
+                                             : (tone: 1.0, lift: 0.0, gloss: 0.0)
+                ch.albedo[ch.idx(x, y)] = clampBand(base * macro * slub * shade * yarn.tone)
                 // Roughness is high and EVEN: linen is a very matte cloth, so keep the mean up
                 // (~0.90). The variation is LOW-FREQUENCY (broad smooth patches, NOT fine per-texel
                 // speckle and NOT the periodic weave) so it gives subtle fabric life without a grain
                 // that reads as a dirty mottle on a dimly-lit panel.
-                ch.roughness[ch.idx(x, y)] = clamp01(0.90 - crown * 0.02
+                ch.roughness[ch.idx(x, y)] = clamp01(0.90 - crown * 0.02 * weaveContrast - yarn.gloss
                     + (Noise.fbmTiled(u * 2.5, v * 2.5, baseCells: 2, octaves: 2, seed: sh ^ 0x3F) - 0.5) * 0.18)
-                ch.height[ch.idx(x, y)] = clamp01(0.40 + 0.34 * crown * slub + 0.05 * fuzz)
+                ch.height[ch.idx(x, y)] = clamp01(0.40 + 0.34 * crown * slub + 0.05 * fuzz + yarn.lift)
             }
         }
         // A MODERATE cloth sheen — the soft directional nap glow real linen has. Kept well below
@@ -309,7 +321,7 @@ extension MaterialGenerator {
         // measures — leaving it default keeps that frame byte-identical (DH-0081).
         ch.sheenRoughness = 0.30
         ch.grainTangent = [Vec2](repeating: Vec2(1, 0), count: size * size)
-        ch.deriveNormals(strength: 0.1)            // near-flat — the weave is only a hint, so a
+        ch.deriveNormals(strength: 0.1 * weaveContrast)            // near-flat — the weave is only a hint, so a
                                                    // grazing back cushion stays even soft cloth,
                                                    // never a specular mesh/screen grid
         // Fine sub-thread fuzz — the linen tooth at grazing range, kept to a whisper (a stronger
@@ -325,8 +337,14 @@ extension MaterialGenerator {
         addFibreDetail(&ch, seed: seed ^ 0xBC, fibres: [
             .init(count: 2600, length: 34, width: 2.0, angle: 0, spread: .pi, layered: false, widthJitter: 0.5)],
             baseCells: 100, weave: .init(pitch: 8, depth: 0.8, threadJitter: 0.35, slub: 0.6),
-            strength: 0.25, occlusionStrength: 0.55)
+            strength: 0.25 * min(weaveContrast, 2), occlusionStrength: min(0.55 * weaveContrast, 0.95))
         return ch
+    }
+
+    /// Linen for curtains: the same plain weave with its interlace pushed (`weaveContrast` 3) so the thread structure reads
+    /// on a hanging panel. A separate catalog entry — sofas, placemats and shades keep the upholstery whisper.
+    public static func draperyLinen(size: Int = MaterialGenerator.bakeSize) -> MaterialChannels {
+        linen(size: size, seed: 109, weaveContrast: 3.0)
     }
 
     /// Top-grain leather — smooth hide with a fine pore dimple pattern and subtle

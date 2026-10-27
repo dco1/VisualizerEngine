@@ -51,11 +51,18 @@ using namespace metal;
 /// FrameUniforms.frameFlags bit 3 — cloth sheen read from the LUT's fitted albedo (both
 /// environment arms) and energy-conserving against the base (albedo scaling).
 #define kFrameFlagLayeredSheen        8u
+/// FrameUniforms.frameFlags bit 10 (1024) — Daydream DH-1316: the cloth sheen takes the DYE's colour
+/// (`clothSheenColorDyed`) instead of the near-white fibre-tip mix, on the bolted-on sheen and the
+/// layered one alike (`LayeredEnergy.dyedSheen`). Mirrored for the ray-traced kernel as
+/// RTInstUniforms.pathFlags kPathFlagDyedSheen (with the layered sheen, its GI / reflection weights
+/// take the matching albedo scaling). Clear ⇒ every lane keeps `clothSheenColor`, bit for bit.
+#define kFrameFlagDyedSheen           1024u
 /// FrameUniforms.frameFlags bit 11 (2048) - Daydream DH-1534: a METAL has no diffuse lobe, so the host's
 /// flat ambient supplement (`ambientColor` x albedo - a stand-in for diffuse room bounce) is scaled by
 /// `(1 - metallic)`. Without it ~76% of a metal's pixel inside a room was one uniform constant (the knob
 /// that reads pale pearl where the photo mirrors a dim room). Clear => the supplement is untouched.
 #define kFrameFlagMetalNoAmbient      2048u
+#define kPathFlagDyedSheen            262144u
 /// FrameUniforms.frameFlags bit 7 (128) — DIFFUSE ROUGHNESS (Daydream DH-1301): the master switch for
 /// the EON lobe (IlluminatoramaDiffuseRoughness.h). The per-pixel value rides the sign of
 /// `albedoMetallic.a`, so with the flag set a pixel whose material never set one is still Lambert,
@@ -97,6 +104,27 @@ static inline float clothSheenV(float NdotV, float NdotL) {
 /// Fibre-tip colour: cloth sheen is scattered by the pale tips of the nap, not by the dyed
 /// core, so it is markedly whiter than the base albedo. Same mix the Phase-7b bolt-on used.
 static inline float3 clothSheenColor(float3 albedo) { return albedo * 0.4 + float3(0.6); }
+
+/// **Daydream DH-1316 — the sheen of a DYED pile is the dye's colour, lighter.** The mix above makes
+/// every sheen near-white: a purple velvet's grazing rim came out (0.66, 0.63, 0.69) — a grey veil
+/// that turned the pile dusty lavender, where real velvet's rims are a lighter, still-saturated
+/// version of its own colour (a red pile glows pink-red, a green one pale green). The grazing lobe is
+/// low-order scattering inside the dyed fibres, so its colour is the fibres' SINGLE-scattering albedo
+/// ω, not the bulk reflectance ρ the base carries. Inverting the two-stream / Hapke relation of an
+/// optically thick isotropic layer, ρ = (1 − √(1 − ω)) / (1 + √(1 − ω)), gives ω = 4ρ / (1 + ρ)²;
+/// 15 % of the lobe stays white — the fibre cuticle's own surface reflection. Exactly 1 at ρ = 1, so
+/// a white cloth (every furnace) is unchanged; ≤ 1 everywhere, so the albedo scaling stays exact.
+/// Purple velvet (0.16, 0.07, 0.22) → (0.55, 0.35, 0.65); pale linen (0.76, 0.72, 0.65) → 0.98.
+static inline float3 clothSheenColorDyed(float3 albedo) {
+    float3 r = saturate(albedo);
+    float3 omega = 4.0 * r / ((1.0 + r) * (1.0 + r));
+    return omega * 0.85 + float3(0.15);
+}
+
+/// The sheen colour a lobe uses: the dyed form when the host opted in (`LayeredEnergy.dyedSheen`).
+static inline float3 clothSheenTint(float3 albedo, bool dyed) {
+    return dyed ? clothSheenColorDyed(albedo) : clothSheenColor(albedo);
+}
 
 // ── Cloth sheen roughness bands (DH-0081) ─────────────────────────────────────────────────
 // The sheen lobe's roughness is carried per-material by folding a small BAND index into the
@@ -144,6 +172,8 @@ struct LayeredEnergy {
     float  baseUnderSheen;
     /// Directional albedo of the sheen lobe at μo — the environment arm's magnitude.
     float  sheenAlbedo;
+    /// Daydream DH-1316 — the sheen lobe takes the dye's colour (`clothSheenColorDyed`).
+    bool   dyedSheen;
     /// Daydream DH-1301 — the pixel's diffuse roughness (OpenPBR `base_diffuse_roughness`, EON);
     /// 0 ⇒ Lambert. Read by `brdf` / `brdfDiffuse` (the full lobe, per light direction).
     float  diffuseRoughness;
@@ -203,6 +233,7 @@ static inline LayeredEnergy layeredOff() {
     e.diffuseEnv = float3(1.0);
     e.baseUnderSheen = 1.0;
     e.sheenAlbedo = 0.0;
+    e.dyedSheen = false;
     e.multiscatter = false;
     e.diffuseRoughness = 0.0;
     e.eonAlbedoRatio = float3(1.0);
@@ -223,9 +254,11 @@ static inline LayeredEnergy layeredEnergy(float3 albedo, float metallic,
                                           float4 lut, float sheenLutA,
                                           float sheenStrength,
                                           bool multiscatter, bool sheen,
-                                          float3 dielectricF0 = float3(0.04)) {
+                                          float3 dielectricF0 = float3(0.04),
+                                          bool dyedSheen = false) {
     LayeredEnergy e = layeredOff();
     e.dielectricF0 = dielectricF0;     // DH-1300
+    e.dyedSheen = dyedSheen;           // DH-1316
     float3 F0 = mix(dielectricF0, albedo, metallic);
     e.multiscatter = multiscatter;
     e.diffuseRoughness = 0.0;          // set by `layeredWithDiffuseRoughness`
@@ -253,7 +286,7 @@ static inline LayeredEnergy layeredEnergy(float3 albedo, float metallic,
     e.sheenAlbedo = saturate(sheenLutA);
     e.baseUnderSheen = 1.0;
     if (sheen && sheenStrength > 0.0) {
-        float3 c = clothSheenColor(albedo);
+        float3 c = clothSheenTint(albedo, e.dyedSheen);
         e.baseUnderSheen = saturate(1.0 - sheenStrength * max(c.r, max(c.g, c.b)) * e.sheenAlbedo);
     }
     return e;
@@ -379,7 +412,8 @@ static inline LayeredRTWeights layeredRTWeights(uint pathFlags, float3 albedo, f
     constexpr sampler s(filter::linear, address::clamp_to_edge);
     float4 lut = float4(dfgLUT.sample(s, float2(NdotV, roughness)));
     float sheenA = (sh && sheenStrength > 0.0) ? float(dfgLUT.sample(s, float2(NdotV, sheenRoughness)).a) : 0.0;
-    LayeredEnergy e = layeredEnergy(albedo, metallic, lut, sheenA, sheenStrength, ms, sh, dielectricF0);
+    LayeredEnergy e = layeredEnergy(albedo, metallic, lut, sheenA, sheenStrength, ms, sh, dielectricF0,
+                                    (pathFlags & kPathFlagDyedSheen) != 0u);   // DH-1316
     if (ms) { w.diffuse *= e.diffuseEnv; w.reflection = e.envSpec * coat.underCoatEnv; }
     w.diffuse *= e.baseUnderSheen;
     w.reflection *= e.baseUnderSheen;

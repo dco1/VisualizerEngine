@@ -175,6 +175,7 @@ extension IlluminatoramaRenderer {
         if dfgLUTEnabled && layeredMultiscatter { u.shadowEnabled |= 4 }
         if dfgLUTEnabled && layeredClothSheen { u.shadowEnabled |= 8 }
         if metalNoFlatAmbient { u.shadowEnabled |= 2048 }   // DH-1534 — `kFrameFlagMetalNoAmbient`
+        if layeredDyedSheen { u.shadowEnabled |= 1024 }   // DH-1316 — `kFrameFlagDyedSheen` (bolted-on or layered sheen)
         if diffuseRoughnessEnabled { u.shadowEnabled |= 128 }   // DH-1301 — `kFrameFlagDiffuseRoughness`
         if layeredSpecularEnabled { u.shadowEnabled |= 256 }    // DH-1300 — `kFrameFlagLayeredSpecular`
         if dfgLUTEnabled && layeredCoatEnabled { u.shadowEnabled |= 512 }   // DH-1309 — `kFrameFlagLayeredCoat`

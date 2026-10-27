@@ -17,6 +17,8 @@ import simd
 ///                  an already-accepted plant stands closer than (rᵢ + rⱼ)·overlap + minSpacing
 ///                  (overlap tightens by up to 35 % toward a clump's heart — a drift interlocks)
 ///     individual   age, scale, yaw, lean, tint, wind phase from the candidate's stream
+///     strata       (DH-1470) trees before shrubs; across strata only a trunk is kept clear, and a
+///                  higher crown's shade thins what grows under it (`understoryKeep`)
 ///
 /// Deterministic: every draw is a function of (seed, world cell), and acceptance runs in a fixed
 /// total order, so the same rule, mask and terrain give bit-identical points on every run.
@@ -65,20 +67,45 @@ public enum SignackScatter {
                 candidates.append(Candidate(point: plant, priority: priority, tight: 1 - 0.35 * clump.weight))
             }
         }
-        // Blue noise: accept in priority order (ties broken by position — a total order).
+        // Blue noise: accept TALLER STRATA FIRST (trees claim their ground before the border fills in
+        // beneath them), then in priority order (ties broken by position — a total order).
         candidates.sort { a, b in
-            a.priority != b.priority ? a.priority < b.priority
+            a.point.stratum != b.point.stratum ? a.point.stratum > b.point.stratum
+                : a.priority != b.priority ? a.priority < b.priority
                 : (a.point.position.y, a.point.position.x) < (b.point.position.y, b.point.position.x)
         }
         let maxR = candidates.map(\.point.radius).max() ?? 0.1
-        var index = ScatterDiscIndex(cell: max(0.1, 2 * maxR * rule.canopyOverlap + rule.minSpacing))
+        let strata = Set(candidates.map(\.point.stratum))
+        var canopies: [Int: ScatterDiscIndex] = [:], stems: [Int: ScatterDiscIndex] = [:]
+        for s in strata {
+            let r = candidates.filter { $0.point.stratum == s }.map(\.point.radius).max() ?? 0.1
+            canopies[s] = ScatterDiscIndex(cell: max(0.1, 2 * r * rule.canopyOverlap + rule.minSpacing))
+            stems[s] = ScatterDiscIndex(cell: max(0.25, 2 * r))
+        }
         var out: [ScatterPoint] = []
         for c in candidates {
-            let r = c.point.radius
+            let r = c.point.radius, s = c.point.stratum
             let overlap = rule.canopyOverlap * c.tight
             let law: (Double) -> Double = { (r + $0) * overlap + rule.minSpacing }
-            if index.conflicts(c.point.position, reach: law(maxR), distance: law) { continue }
-            index.insert(c.point.position, radius: r)
+            if canopies[s]!.conflicts(c.point.position, reach: law(maxR), distance: law) { continue }
+            // Another stratum: a lower plant keeps clear of a taller one's trunk (stem + its own canopy),
+            // and grows under its crown only at `understoryKeep` (shade).
+            var blocked = false, shaded = false
+            for t in strata where t != s {
+                if t > s {
+                    let stemLaw: (Double) -> Double = { $0 + r * overlap + rule.minSpacing }
+                    if stems[t]!.conflicts(c.point.position, reach: stemLaw(stems[t]!.maxRadius), distance: stemLaw) { blocked = true; break }
+                    if canopies[t]!.conflicts(c.point.position, reach: canopies[t]!.maxRadius, distance: { $0 * 0.85 }) { shaded = true }
+                } else {
+                    let mine = c.point.stemRadius
+                    let lowLaw: (Double) -> Double = { mine + $0 * overlap + rule.minSpacing }
+                    if canopies[t]!.conflicts(c.point.position, reach: lowLaw(canopies[t]!.maxRadius), distance: lowLaw) { blocked = true; break }
+                }
+            }
+            if blocked { continue }
+            if shaded, Double(c.priority >> 11) / Double(1 << 53) >= rule.understoryKeep { continue }
+            canopies[s]!.insert(c.point.position, radius: r)
+            stems[s]!.insert(c.point.position, radius: c.point.stemRadius)
             out.append(c.point)
         }
         // Stable output order: north-to-south rows, west to east.

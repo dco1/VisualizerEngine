@@ -40,8 +40,8 @@ final class IlluminatoramaLayeredBSDFFurnaceTests: XCTestCase {
         bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
         return float(bits) * 2.3283064365386963e-10;
     }
-    // in: [r, NdotV, metallic, flags] [sheenStrength, sheenRoughness, 0, 0]
-    // out: [direct, env, maximum, maximumReflReplaced] [directSpecOnly, directPeakClipped, 0, 0]
+    // in: [r, NdotV, metallic, flags] [sheenStrength, sheenRoughness, grey albedo (0 ⇒ 1), 0]
+    // out: [direct, env, maximum, maximumReflReplaced] [directSpecOnly, directPeakClipped, sheen colour .g, 0]
     kernel void dh1014Furnace(device const float4* inp [[buffer(0)]],
                               device float4* outp [[buffer(1)]],
                               texture2d<half, access::sample> dfg [[texture(0)]],
@@ -49,16 +49,17 @@ final class IlluminatoramaLayeredBSDFFurnaceTests: XCTestCase {
         float4 a = inp[gid * 2], b = inp[gid * 2 + 1];
         float r = a.x, mu = a.y, metal = a.z; uint flags = uint(a.w + 0.5);   // a plain float: a bit-cast small uint is a denormal the GPU may flush
         float sheenS = b.x, sheenR = b.y;
-        float3 albedo = float3(1.0);
+        float3 albedo = float3(b.z > 0.0 ? b.z : 1.0);   // DH-1316: a grey cloth for the dyed-sheen rows
         float3 N = float3(0, 0, 1);
         float3 V = float3(sqrt(max(0.0, 1.0 - mu * mu)), 0.0, mu);
         bool ms = (flags & kFrameFlagLayeredMultiscatter) != 0u;
         bool sh = (flags & kFrameFlagLayeredSheen) != 0u;
+        bool dyed = (flags & kFrameFlagDyedSheen) != 0u;   // DH-1316
         constexpr sampler ls(filter::linear, address::clamp_to_edge);
         float4 lut = float4(dfg.sample(ls, float2(mu, r)));
         float  sheenA = (sh && sheenS > 0.0) ? float(dfg.sample(ls, float2(mu, sheenR)).a) : 0.0;
         LayeredEnergy le = layeredOff();
-        if (ms || sh) le = layeredEnergy(albedo, metal, lut, sheenA, sheenS, ms, sh);
+        if (ms || sh) le = layeredEnergy(albedo, metal, lut, sheenA, sheenS, ms, sh, float3(0.04), dyed);
 
         // ── direct: ∫ brdf·cos dω, balance-heuristic MIS of cosine + GGX-NDF sampling ──
         const uint NS = 4096u;
@@ -101,11 +102,12 @@ final class IlluminatoramaLayeredBSDFFurnaceTests: XCTestCase {
         float3 specW = layeredEnvSpecular(F0, lut.xy);
         if (sh) specW *= le.baseUnderSheen;
         float sheenE = sh ? le.sheenAlbedo : clothSheenEnvAlbedo(mu);
-        float3 sheenEnv = (sheenS > 0.0) ? clothSheenColor(albedo) * sheenS * sheenE : float3(0.0);
+        float3 sheenEnv = (sheenS > 0.0) ? clothSheenTint(albedo, le.dyedSheen) * sheenS * sheenE : float3(0.0);
         float env = (kD * albedo + specW + sheenEnv).g;
 
         // ── maximum: the path lane owns the diffuse; the deferred keeps specular IBL + sheen ──
-        uint pathFlags = (ms ? kPathFlagLayeredMultiscatter : 0u) | (sh ? kPathFlagLayeredSheen : 0u);
+        uint pathFlags = (ms ? kPathFlagLayeredMultiscatter : 0u) | (sh ? kPathFlagLayeredSheen : 0u)
+                       | (dyed ? kPathFlagDyedSheen : 0u);
         // emission.alpha as the G-buffer packs it: -(band + strength).
         half emA = sheenS > 0.0 ? half(-(float(clothSheenBandForRoughness(sheenR)) + min(sheenS, 0.98))) : 0.0h;
         float3 fresLegacy = F0 + (1.0 - F0) * pow(1.0 - mu, 5.0);
@@ -118,14 +120,14 @@ final class IlluminatoramaLayeredBSDFFurnaceTests: XCTestCase {
         float dpk = a2 / (M_PI_F * a2 * a2 + 1e-7);
         float clip = dpk * (M_PI_F * a2);              // D_guarded(peak) / D_ideal(peak)
         outp[gid * 2]     = float4(direct, env, maximum, maximumRefl);
-        outp[gid * 2 + 1] = float4(directSpec, clip, 0.0, 0.0);
+        outp[gid * 2 + 1] = float4(directSpec, clip, clothSheenTint(albedo, le.dyedSheen).g, 0.0);
     }
     """
 
     private struct Row { var r: Float; var mu: Float; var metal: Float; var flags: UInt32
-                         var sheen: Float = 0; var sheenR: Float = 0.30 }
+                         var sheen: Float = 0; var sheenR: Float = 0.30; var albedo: Float = 0 }
     private struct Out { var direct: Double; var env: Double; var maximum: Double; var maxRefl: Double
-                         var directSpec: Double; var peak: Double; }
+                         var directSpec: Double; var peak: Double; var sheenColor: Double = 0 }
 
     private struct Rig { let device: MTLDevice; let queue: MTLCommandQueue
                          let probe: MTLComputePipelineState; let lut: MTLTexture }
@@ -173,7 +175,7 @@ final class IlluminatoramaLayeredBSDFFurnaceTests: XCTestCase {
         var packed: [SIMD4<Float>] = []
         for r in rows {
             packed.append(SIMD4(r.r, r.mu, r.metal, Float(r.flags)))
-            packed.append(SIMD4(r.sheen, r.sheenR, 0, 0))
+            packed.append(SIMD4(r.sheen, r.sheenR, r.albedo, 0))
         }
         guard let ib = rig.device.makeBuffer(bytes: packed, length: packed.count * 16, options: .storageModeShared),
               let ob = rig.device.makeBuffer(length: packed.count * 16, options: .storageModeShared),
@@ -188,7 +190,8 @@ final class IlluminatoramaLayeredBSDFFurnaceTests: XCTestCase {
         let o = ob.contents().bindMemory(to: SIMD4<Float>.self, capacity: packed.count)
         return (0..<rows.count).map { i in
             Out(direct: Double(o[i * 2].x), env: Double(o[i * 2].y), maximum: Double(o[i * 2].z),
-                maxRefl: Double(o[i * 2].w), directSpec: Double(o[i * 2 + 1].x), peak: Double(o[i * 2 + 1].y))
+                maxRefl: Double(o[i * 2].w), directSpec: Double(o[i * 2 + 1].x), peak: Double(o[i * 2 + 1].y),
+                sheenColor: Double(o[i * 2 + 1].z))
         }
     }
 
@@ -197,6 +200,7 @@ final class IlluminatoramaLayeredBSDFFurnaceTests: XCTestCase {
     static let off: UInt32 = 0
     static let ms: UInt32 = 4      // kFrameFlagLayeredMultiscatter
     static let msSheen: UInt32 = 12
+    static let msSheenDyed: UInt32 = 12 | 1024   // + kFrameFlagDyedSheen (DH-1316)
 
     /// Mean over the view sweep, the number the report quotes per roughness.
     private func sweep(metal: Float, flags: UInt32, sheen: Float = 0, sheenR: Float = 0.30)
@@ -285,6 +289,42 @@ final class IlluminatoramaLayeredBSDFFurnaceTests: XCTestCase {
             }
             // The bolted-on sheen invented light at grazing, where its lobe lives.
             XCTAssertGreaterThan(b.last!.env, 1.02, "the bolted-on sheen should over-return at grazing")
+        }
+    }
+
+    /// **DH-1316 — the dyed sheen colour.** A white cloth is exactly the old colour (1), so the white
+    /// velvet furnace stays 1.000 on every arm with the dye flag on; a grey cloth's sheen colour is the
+    /// fibres' single-scattering albedo, `0.85·4ρ/(1+ρ)² + 0.15` (CPU mirror) — darker than the near-white
+    /// fibre-tip mix for a dark pile, lighter for a pale cloth — and its env arm never returns more than it received.
+    func testDyedSheenKeepsTheWhiteFurnaceAndTakesTheDyeColour() throws {
+        let after = try sweep(metal: 0, flags: Self.msSheenDyed, sheen: 0.85, sheenR: 0.45)
+        say("── DH-1316 white furnace — white VELVET, DYED sheen colour (per N·V 1/.7/.4/.15) ──")
+        for (k, r) in Self.roughnesses.enumerated() where k % 2 == 0 || k == 10 {
+            let a = after[k].rows
+            func list(_ kp: KeyPath<Out, Double>) -> String { a.map { f($0[keyPath: kp]) }.joined(separator: "/") }
+            say(String(format: "  %.2f  | direct ", r) + list(\.direct) + " | env " + list(\.env) + " | maximum " + list(\.maximum))
+            for row in a where r >= 0.2 {
+                XCTAssertEqual(row.env, 1.0, accuracy: 0.01, "dyed velvet env furnace r \(r)")
+                XCTAssertEqual(row.maximum, 1.0, accuracy: 0.01, "dyed velvet Maximum furnace r \(r)")
+                XCTAssertEqual(row.direct, 1.0, accuracy: 0.02, "dyed velvet direct furnace r \(r)")
+                XCTAssertEqual(row.sheenColor, 1.0, accuracy: 1e-4, "white cloth: the dyed colour is 1")
+            }
+        }
+        say("── DH-1316 grey cloth: sheen colour, dyed vs fibre-tip mix; env arm (≤ 1) at N·V .15 ──")
+        for rho: Float in [0.05, 0.16, 0.4, 0.76] {
+            var rows: [Row] = []
+            for flags in [Self.msSheen, Self.msSheenDyed] {
+                rows.append(Row(r: 0.84, mu: 0.15, metal: 0, flags: flags, sheen: 0.85, sheenR: 0.45, albedo: rho))
+            }
+            let o = try run(rows)
+            let r = Double(rho), cpu = 0.85 * 4 * r / ((1 + r) * (1 + r)) + 0.15
+            say("  ρ \(f(r)) | colour tip-mix \(f(o[0].sheenColor)) → dyed \(f(o[1].sheenColor)) (cpu \(f(cpu))) | env \(f(o[0].env)) → \(f(o[1].env))")
+            XCTAssertEqual(o[1].sheenColor, cpu, accuracy: 1e-3, "dyed colour vs CPU mirror at ρ \(r)")
+            XCTAssertEqual(o[0].sheenColor, 0.4 * r + 0.6, accuracy: 1e-3, "flag off keeps the fibre-tip mix")
+            // A dark pile's sheen is darker (and keeps its hue) than the near-white tip mix; a pale cloth's lighter.
+            if rho < 0.2 { XCTAssertLessThan(o[1].sheenColor, o[0].sheenColor, "dark pile at ρ \(r)") }
+            if rho > 0.3 { XCTAssertGreaterThan(o[1].sheenColor, o[0].sheenColor, "pale cloth at ρ \(r)") }
+            XCTAssertLessThanOrEqual(o[1].env, 1.0 + 1e-3)
         }
     }
 

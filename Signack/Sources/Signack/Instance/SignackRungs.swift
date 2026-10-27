@@ -19,11 +19,24 @@ public struct SignackRungs: Sendable, Equatable {
         public var indexStart: Int
         public var indexCount: Int
         public var triangleCount: Int { indexCount / 3 }
+
+        public init(error: Float, indexStart: Int, indexCount: Int) {
+            self.error = error; self.indexStart = indexStart; self.indexCount = indexCount
+        }
     }
 
     public let rungs: [Rung]
     /// Every rung's triangles, concatenated — indexes the hierarchy's vertex buffer.
     public let indices: [UInt32]
+
+    /// Rungs a host built itself (DH-1470 — a planted tree appends far rungs below its DAG's floor):
+    /// `rungs` index `indices`, finest first, errors rising.
+    public init(rungs: [Rung], indices: [UInt32]) {
+        precondition(rungs.allSatisfy { $0.indexStart >= 0 && $0.indexStart + $0.indexCount <= indices.count },
+                     "a rung outside its index list")
+        self.rungs = rungs
+        self.indices = indices
+    }
 
     /// Up to `maxRungs` rungs, each at most `ratio` × the previous rung's triangles. Stops early when
     /// the DAG can get no coarser (its roots).

@@ -24,6 +24,10 @@ public final class SignackGPUInstanceBatch: @unchecked Sendable {
     public let instanceStride: Int
     public let rungs: [SignackRungs.Rung]
     public let impostorIndexCount: Int
+    /// DH-1470 — where the impostor's indices start in the index buffer its bucket draws from: 0 when the
+    /// impostor is its own mesh, the rungs' index count when a host packs every bucket into ONE buffer
+    /// (one raster mesh drawing every bucket's record — see `IlluminatoramaMesh.additionalIndirectRecords`).
+    public let impostorIndexStart: Int
     public var bucketCount: Int { rungs.count + (impostorIndexCount > 0 ? 1 : 0) }
     /// The host's instance records (capacity × stride), written by `setInstances`.
     public let source: MTLBuffer
@@ -44,8 +48,8 @@ public final class SignackGPUInstanceBatch: @unchecked Sendable {
 
     public static let maxBuckets = 8
 
-    public init?(device: MTLDevice, rungs: SignackRungs, impostorIndexCount: Int, capacity: Int,
-                 instanceStride: Int, label: String = "Signack.instances") {
+    public init?(device: MTLDevice, rungs: SignackRungs, impostorIndexCount: Int, impostorIndexStart: Int = 0,
+                 capacity: Int, instanceStride: Int, label: String = "Signack.instances") {
         let buckets = rungs.rungs.count + (impostorIndexCount > 0 ? 1 : 0)
         guard capacity > 0, instanceStride % 16 == 0, !rungs.rungs.isEmpty, buckets <= Self.maxBuckets,
               let src = device.makeBuffer(length: capacity * instanceStride, options: .storageModeShared),
@@ -69,6 +73,7 @@ public final class SignackGPUInstanceBatch: @unchecked Sendable {
         self.instanceStride = instanceStride
         self.rungs = rungs.rungs
         self.impostorIndexCount = impostorIndexCount
+        self.impostorIndexStart = max(0, impostorIndexStart)
         source = src; bounds = bnd; lists = lst; drawArgs = args; counters = cnt
     }
 

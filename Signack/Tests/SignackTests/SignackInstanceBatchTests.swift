@@ -93,6 +93,32 @@ final class SignackInstanceBatchTests: XCTestCase {
         XCTAssertTrue(used.contains(buckets - 1), "far plants go to the impostor")
     }
 
+    /// DH-1470 — a host that packs the impostor after the rungs in ONE index buffer names where it
+    /// starts; the impostor bucket's records (primary and shadow) draw from there, rungs unchanged.
+    func testImpostorIndexStartReachesTheRecords() throws {
+        guard let device = MTLCreateSystemDefaultDevice(), let queue = device.makeCommandQueue(),
+              let pipelines = SignackGPUPipelines.shared(device: device) else { throw XCTSkip("no Metal") }
+        let rungs = Self.rungs()
+        let start = rungs.indices.count
+        guard let batch = SignackGPUInstanceBatch(device: device, rungs: rungs, impostorIndexCount: 24,
+                                                  impostorIndexStart: start, capacity: 4, instanceStride: 16)
+        else { return XCTFail("batch") }
+        batch.setInstances(count: 1) { raw, b in
+            raw.storeBytes(of: SIMD4<UInt32>(0, 7, 7, 7), as: SIMD4<UInt32>.self)
+            b[0] = SignackGPUInstanceBounds(center: SIMD3(0, 0, -5000), radius: 1, scale: 1)
+        }
+        guard let cb = queue.makeCommandBuffer() else { return XCTFail("cb") }
+        SignackGPUInstancePass.encode([(batch, Self.view())], pipelines: pipelines, commandBuffer: cb)
+        cb.commit(); cb.waitUntilCompleted()
+        let imp = rungs.rungs.count
+        for off in [SignackGPUInstanceBatch.primaryOffset(bucket: imp), SignackGPUInstanceBatch.shadowOffset(bucket: imp)] {
+            let a = batch.drawArgs.contents().advanced(by: off).bindMemory(to: UInt32.self, capacity: 5)
+            XCTAssertEqual(Int(a[2]), start); XCTAssertEqual(Int(a[0]), 24)
+        }
+        let r0 = batch.drawArgs.contents().advanced(by: SignackGPUInstanceBatch.primaryOffset(bucket: 0)).bindMemory(to: UInt32.self, capacity: 5)
+        XCTAssertEqual(Int(r0[2]), rungs.rungs[0].indexStart)
+    }
+
     /// DH-1493 — per-light shadow views: every (view, bucket) record holds exactly the instances the CPU
     /// reference puts there (in that bucket, sphere touching the view), each once, records intact; the
     /// primary and shadow lists are unchanged by the views; views straddle, contain and miss instances.

@@ -50,6 +50,7 @@ enum ScatterIndividual {
         return ScatterPoint(position: p, groundHeight: ground, species: sp.id, variant: variant,
                             age: age, scale: scale, radius: sp.canopyRadius * scale,
                             yaw: yaw, tilt: tilt, tiltAzimuth: azimuth, tint: tint,
-                            windPhase: wind, key: key)
+                            windPhase: wind, key: key, stratum: sp.stratum,
+                            stemRadius: (sp.stemRadius ?? sp.canopyRadius) * scale)
     }
 }

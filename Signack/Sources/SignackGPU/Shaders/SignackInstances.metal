@@ -46,7 +46,8 @@ struct SignackInstanceUniforms {        // mirror of Swift SignackGPUInstanceUni
     uint   cull;                        // 0 = no frustum test (everything on screen)
     float  maxDistance;                 // beyond this a plant is not drawn at all (0 = no limit)
     uint   viewCount;                   // DH-1493 — shadow views (0 = none: exactly the two lists)
-    uint   _pad1, _pad2;
+    uint   impostorIndexStart;          // DH-1470 — the impostor's first index (0 = its own index buffer)
+    uint   _pad2;
 };
 static_assert(sizeof(SignackInstanceUniforms) == 256, "mirror of Swift SignackGPUInstanceUniforms");
 
@@ -249,7 +250,7 @@ kernel void signack_instances_finalize(
         // density; a shadow texel is coarser than the camera's pixel anyway).
         uint r = (list == 1u && !impostor) ? min(b + 2u, U.rungCount - 1u) : b;
         a.indexCount = impostor ? U.impostorIndexCount : U.rungIndexCount[r / 4][r % 4];
-        a.indexStart = impostor ? 0u : U.rungIndexStart[r / 4][r % 4];
+        a.indexStart = impostor ? U.impostorIndexStart : U.rungIndexStart[r / 4][r % 4];
         a.baseVertex = 0;
         a.baseInstance = (list * buckets + b) * U.instanceCount;
         a.instanceCount = atomic_load_explicit(&counters[list * buckets + b], memory_order_relaxed);
@@ -265,7 +266,7 @@ kernel void signack_instances_finalize(
         uint k = v * SIGNACK_MAX_BUCKETS + b;
         SignackInstancedArgs a;
         a.indexCount = impostor ? U.impostorIndexCount : U.rungIndexCount[r / 4][r % 4];
-        a.indexStart = impostor ? 0u : U.rungIndexStart[r / 4][r % 4];
+        a.indexStart = impostor ? U.impostorIndexStart : U.rungIndexStart[r / 4][r % 4];
         a.baseVertex = 0;
         a.baseInstance = (2u * buckets + v) * U.instanceCount + viewBook[SIGNACK_VIEW_BASE + k];
         a.instanceCount = viewBook[SIGNACK_VIEW_COUNT + k];

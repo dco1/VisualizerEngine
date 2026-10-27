@@ -38,6 +38,11 @@ extension MTLRenderCommandEncoder {
             drawIndexedPrimitives(type: .triangle, indexType: mesh.indexType,
                                   indexBuffer: mesh.indexBuffer, indexBufferOffset: 0,
                                   indirectBuffer: args, indirectBufferOffset: offset)
+            for rec in mesh.additionalIndirectRecords {   // DH-1470 — a packed batch's other buckets
+                drawIndexedPrimitives(type: .triangle, indexType: mesh.indexType,
+                                      indexBuffer: mesh.indexBuffer, indexBufferOffset: 0,
+                                      indirectBuffer: args, indirectBufferOffset: rec.offset(pass: pass, view: view))
+            }
             if withSoft, let soft = mesh.softRasterDrawOffset {
                 drawIndexedPrimitives(type: .triangle, indexType: mesh.indexType,
                                       indexBuffer: mesh.indexBuffer, indexBufferOffset: 0,
@@ -66,10 +71,16 @@ extension IlluminatoramaMesh {
     public var drawnTriangleEstimate: Int {
         guard let args = indirectDrawBuffer, args.storageMode != .private,
               args.length >= indirectDrawOffset + 4 else { return indexCount / 3 }
-        var n = Int(args.contents().load(fromByteOffset: indirectDrawOffset, as: UInt32.self))
-        if gpuInstanceBuffer != nil {   // S6: a batched record draws many instances
-            n *= Int(args.contents().load(fromByteOffset: indirectDrawOffset + 4, as: UInt32.self))
+        func record(_ o: Int) -> Int {
+            guard args.length >= o + 8 else { return 0 }
+            var n = Int(args.contents().load(fromByteOffset: o, as: UInt32.self))
+            if gpuInstanceBuffer != nil {   // S6: a batched record draws many instances
+                n *= Int(args.contents().load(fromByteOffset: o + 4, as: UInt32.self))
+            }
+            return n
         }
+        var n = record(indirectDrawOffset)
+        for rec in additionalIndirectRecords { n += record(rec.primary) }   // DH-1470
         if let soft = softRasterDrawOffset, args.length >= soft + 4 {   // S4: the soft-routed part
             n += Int(args.contents().load(fromByteOffset: soft, as: UInt32.self))
         }
@@ -91,4 +102,22 @@ extension IlluminatoramaMesh {
     /// limb weight ≤ 1. Added for every mesh (it cannot see which vertices carry a limb record): a
     /// few centimetres of extra padding at a yard breeze, a valid bound always.
     nonisolated public static let branchWindReach: Float = 0.55 * (1 + 0.45 + 0.25)
+}
+
+/// One more indirect record an `IlluminatoramaMesh` draws (DH-1470 — a packed batch's bucket): its
+/// camera-pass record, the shadow passes' record (nil = the camera's), and per-light shadow views'.
+public struct IlluminatoramaIndirectRecord: Sendable, Equatable {
+    public var primary: Int
+    public var shadow: Int?
+    public var shadowViews: [IlluminatoramaShadowView: Int]
+
+    public init(primary: Int, shadow: Int? = nil, shadowViews: [IlluminatoramaShadowView: Int] = [:]) {
+        self.primary = primary; self.shadow = shadow; self.shadowViews = shadowViews
+    }
+
+    /// The byte offset a pass draws this record from — the same choice the mesh makes for its own.
+    func offset(pass: IlluminatoramaDrawPass, view: IlluminatoramaShadowView?) -> Int {
+        guard pass == .shadow else { return primary }
+        return view.flatMap { shadowViews[$0] } ?? shadow ?? primary
+    }
 }

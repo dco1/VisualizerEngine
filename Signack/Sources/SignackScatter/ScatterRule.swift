@@ -17,9 +17,17 @@ public struct ScatterSpecies: Sendable, Equatable {
     /// How strongly this species gathers in drifts (0 = scattered evenly through the mix,
     /// 1 = mostly in its own clumps).
     public var clumpAffinity: Double
+    /// **Canopy layer** (DH-1470): 0 = ground cover and shrubs, 1 = trees. Plants of the SAME stratum
+    /// space by canopy; plants of different strata share ground — a shrub grows under a tree's
+    /// crown, kept clear only of its trunk (`stemRadius`). Taller strata are placed first.
+    public var stratum: Int
+    /// Radius (m, at scale 1) a LOWER stratum keeps clear of: a tree's trunk and root flare. nil =
+    /// the canopy radius (a shrub's stem is its canopy as far as a tree is concerned).
+    public var stemRadius: Double?
 
     public init(id: Int, weight: Double = 1, canopyRadius: Double, scaleRange: ClosedRange<Double> = 0.8...1.2,
-                variantCount: Int = 1, maxTiltDegrees: Double = 4, clumpAffinity: Double = 0.5) {
+                variantCount: Int = 1, maxTiltDegrees: Double = 4, clumpAffinity: Double = 0.5,
+                stratum: Int = 0, stemRadius: Double? = nil) {
         self.id = id
         self.weight = max(0, weight)
         self.canopyRadius = max(0.01, canopyRadius)
@@ -27,6 +35,8 @@ public struct ScatterSpecies: Sendable, Equatable {
         self.variantCount = max(1, variantCount)
         self.maxTiltDegrees = max(0, maxTiltDegrees)
         self.clumpAffinity = min(1, max(0, clumpAffinity))
+        self.stratum = max(0, stratum)
+        self.stemRadius = stemRadius.map { max(0.01, $0) }
     }
 }
 
@@ -73,11 +83,14 @@ public struct ScatterRule: Sendable, Equatable {
     public var altitudeRange: ClosedRange<Double>?
     /// The planting's seed (Daydream: `id.seed64`, never `hashValue`).
     public var seed: UInt64
+    /// 0…1: the share of would-be understory plants that still grow under a higher stratum's crown
+    /// (shade thins a border beneath trees; 1 = shade changes nothing). DH-1470.
+    public var understoryKeep: Double
 
     public init(regions: [[SIMD2<Double>]], density: Double, minSpacing: Double = 0.1,
                 canopyOverlap: Double = 0.85, edgeMargin: Double = 0, clumping: ScatterClumping = .none,
                 species: [ScatterSpecies], speciesDrift: Double = 0.5, maxSlopeDegrees: Double? = nil,
-                altitudeRange: ClosedRange<Double>? = nil, seed: UInt64) {
+                altitudeRange: ClosedRange<Double>? = nil, seed: UInt64, understoryKeep: Double = 0.6) {
         self.regions = regions
         self.density = max(0, density)
         self.minSpacing = max(0, minSpacing)
@@ -89,6 +102,7 @@ public struct ScatterRule: Sendable, Equatable {
         self.maxSlopeDegrees = maxSlopeDegrees
         self.altitudeRange = altitudeRange
         self.seed = seed
+        self.understoryKeep = min(1, max(0, understoryKeep))
     }
 }
 

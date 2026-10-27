@@ -255,6 +255,11 @@ struct SVGFAtrousUniforms {
     // Daydream DH-1344 — bit 2: NO luminance edge-stop (`wLum = 1`; depth + normal stops kept).
     uint  flags;
     float sigmaL;  float sigmaZ;  float sigmaN;  float lumFloor;
+    // Daydream DH-1016 — variance gate (0 = off, byte-identical): a pixel whose neighbourhood's relative
+    // noise `√Var / lum` is below this fades the filter out toward the pixel itself, so a converged
+    // surface keeps its detail while a noisy one is smoothed as before. No luminance edge-stop, so no
+    // bias (DH-1344).
+    float varGate;
 };
 
 // B3-spline 1-D à-trous weights (sum = 1). 2D weight = h[i+2] × h[j+2].
@@ -368,6 +373,9 @@ kernel void illumi_svgf_atrous(
     float lumSigma = u.sigmaL * sqrt(max(gVar, 0.0))
                    + u.lumFloor * max(lumCenter, 0.02);
 
+    float gC = 1.0;
+    if (u.varGate > 0.0) gC = saturate(sqrt(max(float(varIn.read(gid).r), 0.0)) / max(lumCenter, 0.02) / u.varGate);
+
     float3 colorSum  = float3(0.0);
     float  varSum    = 0.0;
     float  weightSum = 0.0;
@@ -414,7 +422,16 @@ kernel void illumi_svgf_atrous(
             // 0.00 ± 0.03 st, and no in-plane indirect shadow edge any wider.
             float  wLum = (u.flags & 4u) != 0u ? 1.0 : exp(-lDif / lumSigma);
 
-            float w    = hW * wDepth * wNorm * wLum;
+            // Daydream DH-1016 — the variance gate as a SYMMETRIC pair weight, min(g_centre, g_tap): a gate on
+            // the output (mix toward the pixel) is not energy-conserving — the noisy pixels that spread
+            // their light out are exactly the ones the quiet neighbours refuse to take — and measured
+            // −0.03 st. Per-pixel gate: relative noise √Var / lum of the pixel's own neighbourhood.
+            float wGate = 1.0;
+            if (u.varGate > 0.0 && (i != 0 || j != 0)) {
+                float gT = saturate(sqrt(max(float(varIn.read(np).r), 0.0)) / max(lumN, 0.02) / u.varGate);
+                wGate = min(gC, gT);
+            }
+            float w    = hW * wDepth * wNorm * wLum * wGate;
             colorSum  += giN * w;
             varSum    += float(varIn.read(np).r) * (w * w);
             weightSum += w;

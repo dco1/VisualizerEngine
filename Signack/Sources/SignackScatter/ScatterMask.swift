@@ -36,15 +36,23 @@ public struct ScatterMask: Sendable, Equatable {
         }
     }
 
+    /// A round keep-out (a tree trunk another planting already grew, DH-1470).
+    public struct Disc: Sendable, Equatable {
+        public var center: SIMD2<Double>
+        public var radius: Double
+        public init(center: SIMD2<Double>, radius: Double) { self.center = center; self.radius = radius }
+    }
+
     public var polygons: [Polygon] = []
     public var ribbons: [Ribbon] = []
     public var boxes: [Box] = []
+    public var discs: [Disc] = []
 
-    public init(polygons: [Polygon] = [], ribbons: [Ribbon] = [], boxes: [Box] = []) {
-        self.polygons = polygons; self.ribbons = ribbons; self.boxes = boxes
+    public init(polygons: [Polygon] = [], ribbons: [Ribbon] = [], boxes: [Box] = [], discs: [Disc] = []) {
+        self.polygons = polygons; self.ribbons = ribbons; self.boxes = boxes; self.discs = discs
     }
 
-    public var isEmpty: Bool { polygons.isEmpty && ribbons.isEmpty && boxes.isEmpty }
+    public var isEmpty: Bool { polygons.isEmpty && ribbons.isEmpty && boxes.isEmpty && discs.isEmpty }
 
     /// Is a disc of `radius` at `p` clear of every shape (each widened by its own clearance)?
     public func isClear(_ p: SIMD2<Double>, radius: Double) -> Bool {
@@ -58,6 +66,7 @@ public struct ScatterMask: Sendable, Equatable {
                 return false
             }
         }
+        for d in discs where simd_distance(p, d.center) < radius + d.radius { return false }
         for b in boxes {
             // Into the box's frame; distance from a point to a rectangle.
             let c = cos(b.angle), s = sin(b.angle)

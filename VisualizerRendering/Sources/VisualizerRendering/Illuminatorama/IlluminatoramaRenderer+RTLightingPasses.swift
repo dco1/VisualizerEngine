@@ -66,6 +66,7 @@ extension IlluminatoramaRenderer {
         // DH-1014 — the layered weights apply to the one-bounce GI too, so NOT gated on `pathOn`.
         u.pathFlags |= (dfgLUTEnabled && layeredMultiscatter ? 256 : 0)
             | (dfgLUTEnabled && layeredClothSheen ? 512 : 0)
+            | (dfgLUTEnabled && layeredClothSheen && layeredDyedSheen ? 262144 : 0)   // DH-1316 — `kPathFlagDyedSheen`
             | (diffuseRoughnessEnabled ? 16384 : 0)           // DH-1301 — `kPathFlagDiffuseRoughness`
             | (layeredSpecularEnabled ? 65536 : 0)            // DH-1300 — `kPathFlagLayeredSpecular`
             | (dfgLUTEnabled && layeredCoatEnabled ? 131072 : 0)   // DH-1309 — `kPathFlagLayeredCoat`
@@ -76,9 +77,9 @@ extension IlluminatoramaRenderer {
         u.pathGlossyMinRoughness = pathOn ? max(0, rtPathGlossyMinRoughness) : 0
         u.pathGlossyLampSize = pathOn ? max(0, rtPathGlossyLampSize) : 1   // DH-1395
         u.layerInstanceCount = UInt32(instances.count)                       // DH-1300
-        u.pathGlossyLampMinRoughness = pathOn ? max(0, rtPathGlossyLampMinRoughness) : 0
         let specDenoiseOn = prepareSpecularDenoise()                         // DH-0539
         u.specDenoise = specDenoiseOn ? 1 : 0
+        u.pathGlossyLampMinRoughness = pathOn ? max(0, rtPathGlossyLampMinRoughness) : 0
         // DH-1293 — the lamps' near-field levers (0 ⇒ the shipped point-source law).
         u.pathLampMinDist = pathOn ? rtPathLampMinDistance : 0
         u.pathLampSourceRadius = pathOn ? max(0, rtPathLampSourceRadius) : 0
@@ -272,9 +273,9 @@ extension IlluminatoramaRenderer {
         // below `layerInstanceCount`) indexes — IlluminatoramaMaterialLayers.h.
         enc.setTexture(gbs.gbufferMaterialLayer, index: 14)
         enc.setBuffer(currentInstanceBuffer, offset: 0, index: 26)
-        // DH-0653 hit/miss counters (buffer 19). Dummy = instData, never added to while
         enc.setTexture(specDenoiseOn ? rts.spec.raw : rts.rtDiffuseTexture, index: 15)   // DH-0539 — the reflection's own target (a stand-in when off)
         enc.setTexture(specDenoiseOn ? rts.spec.fres : rts.rtDiffuseTexture, index: 16)
+        // DH-0653 hit/miss counters (buffer 19). Dummy = instData, never added to while
         // `surfStatsEnabled` is 0.
         enc.setBuffer(hitStats ?? instData, offset: 0, index: 19)
         // DH-1304 — the AOV capture (texture 13 + buffer 24 exist only in the `aov` variants).
@@ -466,6 +467,8 @@ extension IlluminatoramaRenderer {
         /// `flags` (DH-0966): bit 0 ⇒ the input is irradiance; multiply the centre albedo back in (last level).
         var width: UInt32; var height: UInt32; var stepSize: UInt32; var flags: UInt32 = 0
         var sigmaL: Float; var sigmaZ: Float; var sigmaN: Float; var lumFloor: Float = 0
+        /// DH-1016 — the variance gate (0 = off); see `svgfStillVarianceGate`.
+        var varGate: Float = 0
     }
 
     /// SVGF denoiser for the RT GI term: variance estimate + N à-trous cascade
@@ -530,7 +533,8 @@ extension IlluminatoramaRenderer {
                 | (!svgfStillLuminanceStop && rtGIStaticAccumulation ? 4 : 0)
             var u = SVGFAtrousUniforms(width: W, height: H, stepSize: stepSize, flags: flags,
                                         sigmaL: svgfSigmaL, sigmaZ: svgfSigmaZ, sigmaN: svgfSigmaN,
-                                        lumFloor: effectiveSVGFLumFloor)
+                                        lumFloor: effectiveSVGFLumFloor,
+                                        varGate: rtGIStaticAccumulation ? svgfStillVarianceGate : 0)
             enc.setBytes(&u, length: MemoryLayout<SVGFAtrousUniforms>.stride, index: 0)
             enc.setBuffer(frameUniformBuffer, offset: 0, index: 1)  // invProjection for linear depth
             dispatch(enc, pipeline: rts.svgfAtrousPipeline, width: width, height: height)

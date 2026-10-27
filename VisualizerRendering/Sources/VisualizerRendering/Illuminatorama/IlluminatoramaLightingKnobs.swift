@@ -208,7 +208,14 @@ final class LightingKnobs {
     /// the base under the sheen loses what the sheen reflected (albedo scaling), in the deferred
     /// pass and the RT weights. `false` (the default) is byte-identical.
     var layeredClothSheen: Bool = false
-    /// **Daydream DH-1534 - a metal takes no flat ambient.** `true`: the ambient supplement (a stand-in
+    /// **Daydream DH-1316 — the cloth sheen takes the dye's colour.** `true`: the sheen lobe's colour
+    /// (every light + the environment, bolted-on or layered) is the fibres' single-scattering albedo,
+    /// `0.85·4ρ/(1+ρ)² + 0.15` (`clothSheenColorDyed`, IlluminatoramaBSDF.h) — a dark velvet's rim is a
+    /// lighter version of its own colour instead of a grey veil. With `layeredClothSheen` the base's
+    /// albedo scaling and the RT kernel's weights follow. Exactly the old colour for a white cloth
+    /// (furnace unchanged). `false` (the default) is byte-identical.
+    var layeredDyedSheen: Bool = false
+    /// **Daydream DH-1534 — a metal takes no flat ambient.** `true`: the ambient supplement (a stand-in
     /// for diffuse room bounce) is scaled by `1 - metallic`, so a metal's pixel is its environment
     /// reflection + lights instead of ~76% one uniform constant. `false` (the default) is byte-identical.
     var metalNoFlatAmbient: Bool = false

@@ -508,7 +508,7 @@ static inline float3 brdf(
         float3 coated = (diff * le.coatDarken + spec) * le.underCoatDirect
                       + float3(layeredCoatDirect(N, V, L, le, sourceTan));
         if (!(sheenStrength > 0.0)) return coated * lightColor * NdotL;
-        float3 sheenC = clothSheenColor(albedo) * (sheenStrength * clothSheenD(sheenRoughness, NdotH)
+        float3 sheenC = clothSheenTint(albedo, le.dyedSheen) * (sheenStrength * clothSheenD(sheenRoughness, NdotH)
                                                    * clothSheenV(NdotV, NdotL));
         if (sheenOut != nullptr) *sheenOut += sheenC * lightColor * NdotL;
         // DH-1299 — fuzz over coat over base: the sheen sits on top of the coated stack.
@@ -520,7 +520,7 @@ static inline float3 brdf(
 
     float  Ds = clothSheenD(sheenRoughness, NdotH);
     float  Vs = clothSheenV(NdotV, NdotL);
-    float3 sheen = clothSheenColor(albedo) * (sheenStrength * Ds * Vs);
+    float3 sheen = clothSheenTint(albedo, le.dyedSheen) * (sheenStrength * Ds * Vs);   // DH-1316
     if (sheenOut != nullptr) *sheenOut += sheen * lightColor * NdotL;
     // DH-1014 — the sheen layer sits ON TOP: what it reflects never reaches the base.
     return ((diff + spec) * le.baseUnderSheen + sheen) * lightColor * NdotL;
@@ -1337,8 +1337,12 @@ kernel void illumi_lighting(
         float4 leLUT = float4(dfgLUT.sample(leSampler, float2(leNdotV, roughness)));
         float  leSheenA = (layeredSheen && sheenStrength > 0.0)
                         ? float(dfgLUT.sample(leSampler, float2(leNdotV, sheenRoughness)).a) : 0.0;
-        le = layeredEnergy(albedo, metallic, leLUT, leSheenA, sheenStrength, layeredMS, layeredSheen, dielF0);
+        le = layeredEnergy(albedo, metallic, leLUT, leSheenA, sheenStrength, layeredMS, layeredSheen, dielF0,
+                           (frame.frameFlags & kFrameFlagDyedSheen) != 0u);   // DH-1316
     }
+    // DH-1316 — the dyed sheen colour applies to the bolted-on sheen too (the layered BSDF is a host
+    // opt-in of its own); `layeredOff()` leaves it false, so a host that sets neither is bit-identical.
+    le.dyedSheen = (frame.frameFlags & kFrameFlagDyedSheen) != 0u;
     // DH-1301 — diffuse roughness (EON): the lights with a direction below (sun, points, spots, fill
     // directionals, the SSS diffuse peel) evaluate the full lobe; the integrated sources (LTC area /
     // portal lights, the diffuse IBL + bands, the ambient supplement) its directional albedo.
@@ -2149,7 +2153,7 @@ kernel void illumi_lighting(
             // DH-0597 / DH-1014 — the fitted Charlie albedo from the LUT (`.a`, keyed on the
             // material's own sheen roughness) replaces the hand-fitted curve when the host opts in.
             float sheenE = layeredSheen ? le.sheenAlbedo : clothSheenEnvAlbedo(NdotV);
-            float3 sheenEnv = clothSheenColor(albedo)
+            float3 sheenEnv = clothSheenTint(albedo, le.dyedSheen)
                             * (sheenStrength * sheenE)
                             * irradianceSat * ao * frame.iblIntensity * interiorIBLKd;
             indirect += sheenEnv;
@@ -2187,7 +2191,7 @@ kernel void illumi_lighting(
         // `interiorAmbK` for the same reason the supplement above does. Exact no-op when
         // `ambientColor` is 0 (every Daydream Home scene today) or the surface is not cloth.
         if (sheenStrength > 0.0) {
-            float3 ambSheen = clothSheenColor(albedo)
+            float3 ambSheen = clothSheenTint(albedo, le.dyedSheen)
                             * (sheenStrength * (layeredSheen ? le.sheenAlbedo : clothSheenEnvAlbedo(NdotV)))
                             * mix(ambCol * 0.4, ambCol, upness) * ao * interiorAmbK;
             indirect += ambSheen;
