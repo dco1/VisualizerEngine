@@ -17,6 +17,7 @@
 // the sheen LUT) and the cloth-sheen lobe itself, shared with the DFG bake + the RT kernel.
 #include "IlluminatoramaBSDF.h"
 #include "IlluminatoramaLeafOptics.h"
+#include "IlluminatoramaHairBSDF.h"
 using namespace metal;
 
 static inline float distributionGGX(float NdotH, float roughness) {
@@ -455,13 +456,57 @@ static inline float clothSheenEnvAlbedo(float NdotV) {
 /// lobe takes its multiple-scattering factor and the diffuse base the share the specular layer
 /// did not reflect; with sheen on, everything under the sheen layer its albedo scaling. The
 /// default `layeredOff()` is the historical expression, bit for bit (× 1.0 is exact).
+/// ── SPHERE LIGHTS (opt-in: `IlluminatoramaRenderer.sphereLightsEnabled`, `kFrameFlagSphereLights`) ──
+/// A point light with `bulbRadius > 0` is a luminous SPHERE of that radius whose far-field intensity
+/// is still the light's `color` (I). Radiance L = I / (π r²), so at distance d >> r the result is
+/// EXACTLY the point law I·cosθ/d². Diffuse is the analytic, horizon-clipped sphere irradiance
+/// (Frostbite "Moving Frostbite to PBR", illuminanceSphereOrDisk), expressed as a RATIO to the point
+/// law so `brdf`'s own NdotL stays. Specular is Karis's representative-point (Real Shading in UE4):
+/// the point on the sphere nearest the mirror ray replaces the centre direction in the GGX half
+/// vector, and (α/α')² renormalises the widened lobe's energy. Approximations: light a sphere
+/// partly above the horizon would wrap onto cosθ <= 0 is NOT added (brdf early-outs); anisotropic
+/// base lobes and cloth sheen keep point behaviour; the SSS diffuse peel uses the point law.
+/// `sphereR == 0` (the default, and every host with the frame flag clear) never enters these paths.
+static inline float illumiSphereDiffuseRatio(float cosTheta, float sphereR, float dist) {
+    float sinSigma2 = min((sphereR * sphereR) / max(dist * dist, 1e-8), 1.0 / 1.002);
+    float c = clamp(cosTheta, -0.999, 0.999);
+    float illum;
+    if (c * c > sinSigma2) {
+        illum = M_PI_F * sinSigma2 * saturate(c);
+    } else {
+        float sinTheta = sqrt(1.0 - c * c);
+        float x = sqrt(1.0 / sinSigma2 - 1.0);
+        float y = -x * (c / sinTheta);
+        float sinThetaSqrtY = sinTheta * sqrt(max(1.0 - y * y, 0.0));
+        illum = (c * acos(clamp(y, -1.0, 1.0)) - x * sinThetaSqrtY) * sinSigma2 + atan(sinThetaSqrtY / x);
+    }
+    return illum / (M_PI_F * sinSigma2 * max(cosTheta, 1e-3));
+}
+
+/// Representative-point half vector for a sphere light + the (α/α')² lobe-energy normalisation.
+/// `L` is the unit centre direction, `dist` the centre distance.
+static inline float3 illumiSphereRepresentativeH(float3 N, float3 V, float3 L, float roughness,
+                                                 float sphereR, float dist, thread float *norm) {
+    float3 Lvec = L * dist;
+    float3 R = reflect(-V, N);
+    float3 centerToRay = dot(Lvec, R) * R - Lvec;
+    float3 closest = Lvec + centerToRay * saturate(sphereR / max(length(centerToRay), 1e-5));
+    float3 Ls = normalize(closest);
+    float a  = roughness * roughness;
+    float ap = saturate(a + sphereR / (2.0 * max(dist, 1e-3)));
+    *norm = (a * a) / max(ap * ap, 1e-8);
+    return normalize(V + Ls);
+}
+
 static inline float3 brdf(
     float3 N, float3 V, float3 L, float3 albedo, float metallic, float roughness, float3 lightColor,
     float anisotropy = 0.0, float3 grainT = float3(0.0),
     float sheenStrength = 0.0, thread float3 *sheenOut = nullptr,
     float sheenRoughness = kClothSheenRoughness,
     LayeredEnergy le = layeredOff(),
-    float sourceTan = 0.0
+    float sourceTan = 0.0,
+    float sphereR = 0.0, float sphereDist = 0.0,  // sphere light (see illumiSphereDiffuseRatio); 0 ⇒ a point
+    float specScale = 1.0                         // per-light specular scale (PointLight.specularScale); 1 ⇒ exact no-op, 0 ⇒ diffuse only
 ) {
     float3 H = normalize(V + L);
     float NdotL = saturate(dot(N, L));
@@ -469,9 +514,16 @@ static inline float3 brdf(
     float NdotV = saturate(dot(N, V));
     float NdotH = saturate(dot(N, H));
     float HdotV = saturate(dot(H, V));
+    // Sphere light: representative-point H for the BASE specular lobe only (sheen keeps the centre H).
+    float NdotHs = NdotH, HdotVs = HdotV, sphereNorm = 1.0;
+    if (sphereR > 0.0 && !(anisotropy > 0.001 && dot(grainT, grainT) > 0.25)) {
+        float3 Hs = illumiSphereRepresentativeH(N, V, L, roughness, sphereR, sphereDist, &sphereNorm);
+        NdotHs = saturate(dot(N, Hs));
+        HdotVs = saturate(dot(Hs, V));
+    }
 
     float3 F0 = mix(le.dielectricF0, albedo, metallic);   // DH-1300
-    float3 F  = fresnelSchlick(HdotV, F0);
+    float3 F  = fresnelSchlick(HdotVs, F0);
     float  G  = geometrySmith(NdotV, NdotL, roughness);
     float  D;
     if (anisotropy > 0.001 && dot(grainT, grainT) > 0.25) {
@@ -486,11 +538,12 @@ static inline float3 brdf(
         float  d  = ToH * ToH / (at * at) + BoH * BoH / (ab * ab) + NdotH * NdotH;
         D = 1.0 / (M_PI_F * at * ab * d * d);
     } else {
-        D = distributionGGX(NdotH, roughness);
+        D = distributionGGX(NdotHs, roughness) * sphereNorm;
     }
 
     float3 spec = (D * G * F) / (4.0 * NdotV * NdotL + 1e-7);
-    float3 kd = (1.0 - F) * (1.0 - metallic);
+    // The diffuse's Fresnel share uses the CENTRE half vector (the rep-point H is a specular-lobe device only).
+    float3 kd = (1.0 - (sphereR > 0.0 ? fresnelSchlick(HdotV, F0) : F)) * (1.0 - metallic);
     // DH-1014 — the layered base: multiple scattering puts back what the single-scatter lobe
     // dropped, and the diffuse gets what the specular layer (now including that energy) did
     // not reflect. A white surface under a uniform light then returns exactly 1.
@@ -498,15 +551,17 @@ static inline float3 brdf(
         spec *= le.specDirectMS;
         kd = le.diffuseDirect;
     }
+    spec *= specScale;   // × 1.0 is exact; × 0 leaves the diffuse-only result
     // DH-1301 — diffuse roughness: the EON lobe as a factor on Lambert (IlluminatoramaDiffuseRoughness.h);
     // `le.diffuseRoughness` 0 ⇒ the literal 1.0, i.e. exactly the Lambert term.
     float3 diff = kd * albedo / M_PI_F * illumiEONLambertRatio(albedo, le.diffuseRoughness, NdotL, NdotV, dot(L, V));
+    if (sphereR > 0.0) diff *= illumiSphereDiffuseRatio(dot(N, L), sphereR, sphereDist);   // horizon-clipped sphere irradiance
     // DH-1309 — the COAT layer over the base (IlluminatoramaBSDF.h `layeredWithCoat`): the base takes
     // what the coat's own lobe did not reflect (× the coat tint, its diffuse × the darkening), and
     // the coat lobe answers this light too — a lamp shows in a lacquered floor.
     if (le.coatOn) {
         float3 coated = (diff * le.coatDarken + spec) * le.underCoatDirect
-                      + float3(layeredCoatDirect(N, V, L, le, sourceTan));
+                      + float3(layeredCoatDirect(N, V, L, le, sourceTan)) * specScale;   // the coat lobe is specular too
         if (!(sheenStrength > 0.0)) return coated * lightColor * NdotL;
         float3 sheenC = clothSheenColor(albedo) * (sheenStrength * clothSheenD(sheenRoughness, NdotH)
                                                    * clothSheenV(NdotV, NdotL));
@@ -1304,6 +1359,17 @@ kernel void illumi_lighting(
              ? normalize(frame.invView[2].xyz)
              : normalize(frame.cameraWorldPos - worldPos);
 
+    // Hair fibre (FurStrandField): the G-buffer normal slot carries the strand TANGENT. Everything that
+    // follows shades with the fibre's FACING normal (the view vector minus its tangent component — the
+    // cylinder normal at the strand's visible centre-line), and the sun swaps to the hair BSDF below.
+    const bool isHair = (nrH.a > kHairTagLo && nrH.a < kHairTagHi);
+    float3 hairT = float3(0.0);
+    if (isHair) {
+        hairT = N;
+        float3 vp = V - hairT * dot(V, hairT);
+        N = (length(vp) > 1e-3) ? normalize(vp) : N;
+    }
+
     // ── DH-1014 — the layered BSDF's per-pixel energy terms (IlluminatoramaBSDF.h) ──────────
     // One DFG LUT read at (N·V, roughness) buys every light's multiple-scattering factor and the
     // diffuse base's share; cloth reads its sheen albedo at (N·V, sheenRoughness). Host-gated:
@@ -1447,6 +1513,16 @@ kernel void illumi_lighting(
     float3 directSun = brdf(N, V, Ld, albedo, metallic, roughness,
                             frame.directionalLightColor, aniso, grainT,
                             sheenStrength, &directSunSheen, sheenRoughness, le) * visibility;
+    if (isHair) {
+        // Stochastic across-width offset (hashed per pixel; TAA's sub-pixel jitter averages it over the
+        // strand width). The sun is the one light that gets the full fibre BSDF; fills/points use the
+        // facing-normal diffuse like any surface.
+        uint hh = gid.x * 1973u + gid.y * 9277u + 0x68E31DA4u; hh = (hh ^ (hh >> 15)) * 2246822519u; hh ^= hh >> 13;
+        float hOff = 2.0 * (float(hh & 0xFFFFu) / 65535.0) - 1.0;
+        float3 fib = hairFiberBSDF(hairT, V, Ld, albedo, hOff) + hairMultiScatter(hairT, Ld, albedo);
+        directSun = frame.directionalLightColor * fib * visibility * 4.5;
+        directSunSheen = float3(0.0);
+    }
     clothSheen += directSunSheen * visibility;
     if (isSSS) sssDiffuse += brdfDiffuse(N, V, Ld, albedo, metallic,
                                          frame.directionalLightColor, le) * visibility;
@@ -1549,6 +1625,7 @@ kernel void illumi_lighting(
 
     // Point lights — inverse-square with smooth radius cutoff. (Includes the
     // synthesised emissive-as-light points from the extractor, Phase 4.27.)
+    const bool sphereOn = (frame.frameFlags & kFrameFlagSphereLights) != 0u;
     for (uint i = 0; i < frame.pointLightCount; ++i) {
         PointLight pl = pointLights[i];
         // Light-layer mask: skip lights that don't share a bit with this fragment's
@@ -1617,7 +1694,9 @@ kernel void illumi_lighting(
         if (visibility <= 0.0) continue;
         pointSum += brdf(N, V, L, albedo, metallic, roughness, pl.color * atten * visibility,
                          0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness, le,
-                         max(pl.openingRadius, max(pl.bulbRadius, pl.softRadius)) / max(dist, 1e-3));   // DH-1309 — the coat sees the source's luminous size
+                         max(pl.openingRadius, max(pl.bulbRadius, pl.softRadius)) / max(dist, 1e-3),   // DH-1309 — the coat sees the source's luminous size
+                         sphereOn ? pl.bulbRadius : 0.0, max(dist, pl.bulbRadius * 1.001),            // sphere light: flag off ⇒ 0 ⇒ the point path
+                         pl.specularScale);
         if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic,
                                              pl.color * atten * visibility, le);
     }
