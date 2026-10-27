@@ -195,7 +195,7 @@ extension PottedPlantMesh {
     /// One monstera blade's cuts for one half, seeded. A juvenile (`maturity` near 0) leaf is entire;
     /// a mature one carries 5–7 splits of varied depth, some with a fenestration in line inside them.
     public static func monsteraCuts(maturity: Double, rng: inout SplitMix) -> LeafSheet.MonsteraCuts {
-        let n = maturity < 0.25 ? 0 : Int((4 + 3 * maturity).rounded())
+        let n = maturity < 0.25 ? 0 : max(3, Int((4 + 3 * maturity + (rng.unit() - 0.5) * 2.2).rounded()))
         var splits: [LeafSheet.MonsteraCuts.Split] = []
         var holes: [LeafSheet.MonsteraCuts.Hole] = []
         guard n > 0 else { return .init(splits: [], holes: []) }
@@ -227,13 +227,13 @@ extension PottedPlantMesh {
             let outDir = Vec3(cos(azimuth), 0, sin(azimuth))
             let newest = i == count - 1 && count >= 3
             let maturity = newest ? 0.1 : 1 - 0.55 * t
-            let youth = newest ? 0.30 : smoothstep(0.75, 1.0, t) * 0.5
+            let youth = newest ? 0.70 : smoothstep(0.75, 1.0, t) * 0.5
             var tone = FoliagePaint.tone(youth: youth, palette: palette, rng: &rng)
             tone.age = newest ? 0 : max(0, 1 - 3.2 * t) * (0.35 + 0.35 * rng.unit())   // the lowest leaves are the oldest
             // Blade and where its petiole holds it: the old leaves low and far out, the new ones high
             // and close — a monstera spreads wider than it is tall, a FOUNTAIN of overlapping leaves.
             // (Held nearly flat at the top of tall straight stalks, the blades read as parasols.)
-            let blade = size * (newest ? 0.30 : 0.58 - 0.14 * t) * (0.90 + rng.unit() * 0.20)
+            let blade = size * (newest ? 0.30 : 0.58 - 0.14 * t) * (0.82 + rng.unit() * 0.36)
             let reach = size * (0.42 - 0.22 * t) * (0.85 + rng.unit() * 0.3)
             let height = size * (0.28 + 0.38 * t) * (0.90 + rng.unit() * 0.20)
             // Petioles leave a short climbing stem at successive nodes — older leaves lower — not one
@@ -242,7 +242,9 @@ extension PottedPlantMesh {
             let bladeBase = Vec3(0, soilY + height, 0) + outDir * reach
             // The petiole ARCHES: steeply up out of the crown, then bending out to the blade — a
             // quadratic whose control point stands high over the foot.
+            let sideDir = Vec3(-outDir.z, 0, outDir.x)
             let ctrl = foot + Vec3(0, (bladeBase.y - foot.y) * 0.90, 0) + outDir * (reach * 0.30)
+                + sideDir * (reach * 0.35 * (rng.unit() - 0.5))
             let path = (0 ... 8).map { k -> Vec3 in
                 let u = Double(k) / 8
                 return foot * ((1 - u) * (1 - u)) + ctrl * (2 * u * (1 - u)) + bladeBase * (u * u)
