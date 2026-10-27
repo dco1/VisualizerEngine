@@ -202,7 +202,7 @@ extension PottedPlantMesh {
         let a0 = 0.23, a1 = 0.86
         for k in 0 ..< n {
             let a = a0 + (a1 - a0) * Double(k) / Double(max(1, n - 1)) + (rng.unit() - 0.5) * 0.02
-            let w = 0.020 + rng.unit() * 0.014
+            let w = 0.026 + rng.unit() * 0.016
             let r = rng.unit()
             let depth = k == n - 1 ? 0.72 : (r < 0.15 ? 0.30 : (r < 0.35 ? 0.48 : 0.72))
             splits.append(.init(a: a, width: w, depth: depth))
@@ -227,8 +227,9 @@ extension PottedPlantMesh {
             let outDir = Vec3(cos(azimuth), 0, sin(azimuth))
             let newest = i == count - 1 && count >= 3
             let maturity = newest ? 0.1 : 1 - 0.55 * t
-            let youth = newest ? 0.45 : smoothstep(0.75, 1.0, t) * 0.5
-            let tone = FoliagePaint.tone(youth: youth, palette: palette, rng: &rng)
+            let youth = newest ? 0.30 : smoothstep(0.75, 1.0, t) * 0.5
+            var tone = FoliagePaint.tone(youth: youth, palette: palette, rng: &rng)
+            tone.age = newest ? 0 : max(0, 1 - 3.2 * t) * (0.35 + 0.35 * rng.unit())   // the lowest leaves are the oldest
             // Blade and where its petiole holds it: the old leaves low and far out, the new ones high
             // and close — a monstera spreads wider than it is tall, a FOUNTAIN of overlapping leaves.
             // (Held nearly flat at the top of tall straight stalks, the blades read as parasols.)
@@ -245,6 +246,15 @@ extension PottedPlantMesh {
                 return foot * ((1 - u) * (1 - u)) + ctrl * (2 * u * (1 - u)) + bladeBase * (u * u)
             }
             let petR = max(0.004, size * 0.010) * (newest ? 0.75 : 1)
+            if newest {
+                // The cataphyll: the papery tan sheath a new leaf unrolls from, clasping its petiole's foot.
+                var sheath = Mesh3()
+                let seg = Array(path[0 ... 3])
+                if sheath.sweep(profile: .circle(radius: petR * 1.9, segments: 8), along: seg,
+                                scales: [1.0, 0.95, 0.75, 0.42]) {
+                    woodyRoots.append(sheath.smoothed())
+                }
+            }
             out.leaves.append(paintedStalk(path, rBase: petR, rTip: petR * 0.7, sides: 7,
                                            color: FoliagePaint.base(palette, LeafTone(youth: 0.3, value: tone.value), face: .upper) * 1.25,
                                            knuckle: 1.55))
@@ -257,10 +267,11 @@ extension PottedPlantMesh {
                               roll: (rng.unit() - 0.5) * 0.95)
             var s = LeafSheet.Surface(base: bladeBase, xAxis: f.x, yAxis: f.y, normal: f.n,
                                       length: blade, halfWidth: 0.48)
-            s.cup = newest ? 0.10 : -0.04 - rng.unit() * 0.08   // a mature blade domes; the new one cups
+            s.cup = newest ? 0.30 : -0.04 - rng.unit() * 0.08   // a mature blade domes; the new one cups
             s.cupPower = 1.9
             s.droop = newest ? 0.04 : 0.14 + rng.unit() * 0.14
             s.midribGroove = 0.006
+            s.pucker = newest ? 0 : 0.014   // quilted: tissue between lateral veins domes up
             s.midribHalfWidth = 0.02
             s.ripple = 0.0035
             s.rippleWaves = 1.6

@@ -38,7 +38,11 @@ public enum LeafSheet {
         public var y: Double
         /// 0 … 1 — how close this point sits to a lateral vein's line (1 on the vein).
         public var vein: Double
-        public init(x: Double, y: Double, vein: Double = 0) { self.x = x; self.y = y; self.vein = vein }
+        /// 0 … 1 — how far out toward the margin along its vein (a monstera's `r`); 0 where unknown.
+        public var edge: Double
+        public init(x: Double, y: Double, vein: Double = 0, edge: Double = 0) {
+            self.x = x; self.y = y; self.vein = vein; self.edge = edge
+        }
     }
 
     /// The curved surface the flat blade is lifted onto. Lengths in BLADE units (× `length` = metres).
@@ -152,6 +156,21 @@ public enum LeafSheet {
             let c = q.map { paint($0, face) }
             p.addQuad(P[0], P[1], P[2], P[3], colors: c[0], c[1], c[2], c[3],
                       uvs: (uv[0], uv[1], uv[2], uv[3]), outward: out)
+        }
+    }
+
+    /// One painted triangle of a blade (both faces) — the corner pieces a cell grid cannot make.
+    public static func emitTriangle(into p: inout PaintedMesh, _ q: [Site], surface: Surface, paint: Paint) {
+        guard q.count == 3 else { return }
+        let P = q.map { surface.point($0) }
+        let centre = Site(x: (q[0].x + q[1].x + q[2].x) / 3, y: (q[0].y + q[1].y + q[2].y) / 3,
+                          vein: (q[0].vein + q[1].vein + q[2].vein) / 3)
+        let up = surface.upper(at: centre)
+        let uv = q.map(bladeUV)
+        for face in [LeafFace.upper, .lower] {
+            let out = face == .upper ? up : Vec3(-up.x, -up.y, -up.z)
+            let c = q.map { paint($0, face) }
+            p.addTriangle(P[0], P[1], P[2], colors: c[0], c[1], c[2], uvs: (uv[0], uv[1], uv[2]), outward: out)
         }
     }
 
@@ -354,7 +373,7 @@ public enum LeafSheet {
         }
         func site(_ a: Double, _ r: Double) -> Site {
             let q = monsteraPoint(a: a, r: r)
-            return Site(x: q.x * side, y: q.y, vein: r > 0.08 ? vein(a) : 0)
+            return Site(x: q.x * side, y: q.y, vein: r > 0.08 ? vein(a) : 0, edge: r)
         }
         for i in 0 ..< cols.count - 1 {
             let a0 = cols[i], a1 = cols[i + 1], am = (a0 + a1) / 2
@@ -365,6 +384,13 @@ public enum LeafSheet {
                 emitCell(into: &p, [site(a0, r0), site(a0, r1), site(a1, r1), site(a1, r0)],
                          surface: surface, paint: paint)
             }
+        }
+        // A slit ends in a point, not a square: two corner wedges of tissue fill the inner corners.
+        for sp in cuts.splits where sp.depth < 1 {
+            let lo = sp.a - sp.width / 2, hi = sp.a + sp.width / 2, d = sp.depth, c = 0.07
+            guard lo >= 0, hi <= 1 else { continue }
+            emitTriangle(into: &p, [site(lo, d), site(lo, d + c), site(sp.a, d)], surface: surface, paint: paint)
+            emitTriangle(into: &p, [site(hi, d), site(sp.a, d), site(hi, d + c)], surface: surface, paint: paint)
         }
     }
 
