@@ -73,7 +73,7 @@ public extension PlantStyle {
             // `leafColor` (which the colour gates read), so the paint runs darker than it.
             return FoliagePalette(mature: m * 0.62, young: Vec3(0.240, 0.470, 0.130),
                                   underside: Vec3(0.250, 0.380, 0.200), rib: Vec3(0.360, 0.520, 0.200),
-                                  veinStrength: 0.50, stalk: Vec3(0.200, 0.370, 0.130),
+                                  veinStrength: 0.42, stalk: Vec3(0.200, 0.370, 0.130),
                                   leafValueJitter: 0.09, leafHueJitter: 0.05)
         case .snakePlant:
             // The painter's banding (`snakePlantBand`) carries this style's pattern; `young` is the

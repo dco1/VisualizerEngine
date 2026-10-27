@@ -342,7 +342,7 @@ public enum LeafSheet {
         let centres = (cuts.splits.map(\.a) + [monsteraLobeFan, 1.0]).sorted()
         for i in 1 ..< centres.count {
             let mid = (centres[i - 1] + centres[i]) / 2
-            if centres[i] - centres[i - 1] > 0.08 { edges.insert(mid - 0.008); edges.insert(mid + 0.008) }
+            if centres[i] - centres[i - 1] > 0.08 { edges.insert(mid - 0.006); edges.insert(mid); edges.insert(mid + 0.006) }
         }
         let sorted = edges.filter { $0 >= 0 && $0 <= 1 }.sorted()
         var out: [Double] = [sorted[0]]
@@ -368,7 +368,7 @@ public enum LeafSheet {
             var lo = 0.0, hi = 1.0
             for c in cutCentres { if c <= a { lo = c } else { hi = c; break } }
             let mid = (lo + hi) / 2, half = max(1e-6, (hi - lo) / 2)
-            let t = (a - mid) / (half * 0.13)
+            let t = (a - mid) / 0.0035
             return exp(-t * t)
         }
         func site(_ a: Double, _ r: Double) -> Site {
@@ -385,22 +385,51 @@ public enum LeafSheet {
                          surface: surface, paint: paint)
             }
         }
-        // A fenestration is an oval, not a rectangle: wedges fill all four corners, leaving a diamond
-        // that the smoothed normals and the eye both read as round.
+        // A fenestration is an ELLIPSE. Its cells are left out above; the tissue between that
+        // rectangle and an ellipse inscribed in it is filled back as a ring of quads, one per
+        // sampled angle, with the rectangle's corners among the angles so nothing is left open.
         for h in cuts.holes {
-            let lo = h.a - h.width / 2, hi = h.a + h.width / 2, c = (h.r1 - h.r0) * 0.42
-            guard lo >= 0, hi <= 1, c > 0 else { continue }
-            for (r, dir) in [(h.r0, 1.0), (h.r1, -1.0)] {
-                emitTriangle(into: &p, [site(lo, r), site(lo, r + dir * c), site(h.a, r)], surface: surface, paint: paint)
-                emitTriangle(into: &p, [site(hi, r), site(h.a, r), site(hi, r + dir * c)], surface: surface, paint: paint)
+            let lo = h.a - h.width / 2, hi = h.a + h.width / 2
+            let cut = (0 ..< rows.count - 1).filter { let rm = (rows[$0] + rows[$0 + 1]) / 2; return rm >= h.r0 && rm <= h.r1 }
+            guard lo >= 0, hi <= 1, let j0 = cut.first, let j1 = cut.last else { continue }
+            let rLo = rows[j0], rHi = rows[j1 + 1]
+            let ca = (lo + hi) / 2, cr = (rLo + rHi) / 2, ha = (hi - lo) / 2, hr = (rHi - rLo) / 2
+            var angles = (0 ..< 12).map { Double($0) / 12 * 2 * Double.pi }
+            for (sa, sr) in [(1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)] {
+                let t = atan2(sr * hr, sa * ha)
+                angles.append(t < 0 ? t + 2 * Double.pi : t)
+            }
+            angles.sort()
+            func rim(_ t: Double) -> (Double, Double) {
+                let c = cos(t), s = sin(t)
+                let k = min(abs(c) > 1e-9 ? ha / abs(c) : .infinity, abs(s) > 1e-9 ? hr / abs(s) : .infinity)
+                return (ca + c * k, cr + s * k)
+            }
+            func oval(_ t: Double) -> (Double, Double) { (ca + cos(t) * ha * 0.72, cr + sin(t) * hr * 0.80) }
+            for k in 0 ..< angles.count {
+                let t0 = angles[k], t1 = angles[(k + 1) % angles.count]
+                let b0 = rim(t0), b1 = rim(t1), e0 = oval(t0), e1 = oval(t1)
+                emitCell(into: &p, [site(b0.0, b0.1), site(b1.0, b1.1), site(e1.0, e1.1), site(e0.0, e0.1)],
+                         surface: surface, paint: paint)
             }
         }
-        // A slit ends in a point, not a square: two corner wedges of tissue fill the inner corners.
+        // A slit TAPERS: nearly closed where it starts near the midrib, opening to its full width
+        // at the margin. Tissue is filled back along both sides, row by row, so it follows the
+        // blade's curve.
         for sp in cuts.splits where sp.depth < 1 {
-            let lo = sp.a - sp.width / 2, hi = sp.a + sp.width / 2, d = sp.depth, c = 0.07
+            let lo = sp.a - sp.width / 2, hi = sp.a + sp.width / 2, half = sp.width / 2
             guard lo >= 0, hi <= 1 else { continue }
-            emitTriangle(into: &p, [site(lo, d), site(lo, d + c), site(sp.a, d)], surface: surface, paint: paint)
-            emitTriangle(into: &p, [site(hi, d), site(sp.a, d), site(hi, d + c)], surface: surface, paint: paint)
+            func fill(_ r: Double) -> Double { half * 0.82 * pow(max(0, 1 - (r - sp.depth) / (1 - sp.depth)), 1.4) }
+            for j in 0 ..< rows.count - 1 where rows[j] >= sp.depth - 1e-9 {
+                let r0 = rows[j], r1 = rows[j + 1]
+                let steps = r1 - r0 > 0.2 ? 2 : 1
+                for k in 0 ..< steps {
+                    let ra = r0 + (r1 - r0) * Double(k) / Double(steps), rb = r0 + (r1 - r0) * Double(k + 1) / Double(steps)
+                    let fa = fill(ra), fb = fill(rb)
+                    emitCell(into: &p, [site(lo, ra), site(lo, rb), site(lo + fb, rb), site(lo + fa, ra)], surface: surface, paint: paint)
+                    emitCell(into: &p, [site(hi - fa, ra), site(hi - fb, rb), site(hi, rb), site(hi, ra)], surface: surface, paint: paint)
+                }
+            }
         }
     }
 

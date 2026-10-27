@@ -201,10 +201,10 @@ extension PottedPlantMesh {
         guard n > 0 else { return .init(splits: [], holes: []) }
         let a0 = 0.23, a1 = 0.86
         for k in 0 ..< n {
-            let a = a0 + (a1 - a0) * Double(k) / Double(max(1, n - 1)) + (rng.unit() - 0.5) * 0.02
-            let w = 0.026 + rng.unit() * 0.016
+            let a = a0 + (a1 - a0) * Double(k) / Double(max(1, n - 1)) + (rng.unit() - 0.5) * 0.05
+            let w = 0.024 + rng.unit() * 0.026
             let r = rng.unit()
-            let depth = k == n - 1 ? 0.72 : (r < 0.15 ? 0.30 : (r < 0.35 ? 0.48 : 0.72))
+            let depth = k == n - 1 ? 0.72 : (r < 0.35 ? 0.30 : (r < 0.75 ? 0.48 : 0.72))
             splits.append(.init(a: a, width: w, depth: depth))
             if depth >= 0.48, k < n - 1, rng.unit() < 0.55 * maturity {
                 // In line with its split and exactly as wide — shared column edges, no sliver.
@@ -240,12 +240,12 @@ extension PottedPlantMesh {
             let bladeBase = Vec3(0, soilY + height, 0) + outDir * reach
             // The petiole ARCHES: steeply up out of the crown, then bending out to the blade — a
             // quadratic whose control point stands high over the foot.
-            let ctrl = foot + Vec3(0, (bladeBase.y - foot.y) * 0.85, 0) + outDir * (reach * 0.40)
+            let ctrl = foot + Vec3(0, (bladeBase.y - foot.y) * 0.90, 0) + outDir * (reach * 0.30)
             let path = (0 ... 8).map { k -> Vec3 in
                 let u = Double(k) / 8
                 return foot * ((1 - u) * (1 - u)) + ctrl * (2 * u * (1 - u)) + bladeBase * (u * u)
             }
-            let petR = max(0.004, size * 0.010) * (newest ? 0.75 : 1)
+            let petR = max(0.005, size * 0.013) * (newest ? 0.75 : 1)
             if newest {
                 // The cataphyll: the papery tan sheath a new leaf unrolls from, clasping its petiole's foot.
                 var sheath = Mesh3()
@@ -262,7 +262,7 @@ extension PottedPlantMesh {
             // The blade HANGS from the top of its stalk (the bend at the geniculum): a mature leaf's
             // midrib runs 0–20° below horizontal, the oldest lowest, each rolled a little about its
             // midrib so no two present the same face; the newest, still unfurling, stands up.
-            let tilt = (newest ? 0.70 : 1.25 + 0.65 * (1 - t)) + (rng.unit() - 0.5) * 0.42
+            let tilt = (newest ? 0.70 : 1.80 + 0.40 * (1 - t)) + (rng.unit() - 0.5) * 0.30
             let f = leafFrame(azimuth: azimuth + (rng.unit() - 0.5) * 0.3, tilt: tilt,
                               roll: (rng.unit() - 0.5) * 0.95)
             var s = LeafSheet.Surface(base: bladeBase, xAxis: f.x, yAxis: f.y, normal: f.n,
@@ -271,7 +271,7 @@ extension PottedPlantMesh {
             s.cupPower = 1.9
             s.droop = newest ? 0.04 : 0.14 + rng.unit() * 0.14
             s.midribGroove = 0.006
-            s.pucker = newest ? 0 : 0.014   // quilted: tissue between lateral veins domes up
+            s.pucker = newest ? 0 : 0.004   // quilted: tissue between lateral veins domes up
             s.midribHalfWidth = 0.02
             s.ripple = 0.0035
             s.rippleWaves = 1.6
@@ -282,7 +282,7 @@ extension PottedPlantMesh {
             for side in [1.0, -1.0] {
                 let cuts = monsteraCuts(maturity: maturity, rng: &rng)
                 LeafSheet.emitMonsteraHalf(into: &leaf, surface: s, cuts: cuts, side: side,
-                                           spacing: 0.080) { site, face in
+                                           spacing: 0.060) { site, face in
                     FoliagePaint.sheet(palette, tone, site: site, face: face, ribHalfWidth: ribHalf)
                 }
             }
