@@ -36,7 +36,6 @@ extension MaterialGenerator {
         let horizonV = 0.63                      // horizon a touch below centre (sky-dominant, calm)
         let sunU = 0.34, sunV = 0.30             // soft sun position (upper-left)
 
-        func lerp(_ a: Vec3, _ b: Vec3, _ t: Double) -> Vec3 { a + (b - a) * clamp01(t) }
         func ss(_ t: Double) -> Double { let x = clamp01(t); return x * x * (3 - 2 * x) }
         // Ridgeline: the v of the ridge crest at column u — seeded, horizontally seamless (tiled).
         func ridge(baseV: Double, amp: Double, cells: Int, s: UInt64) -> (Double) -> Double {
@@ -51,13 +50,13 @@ extension MaterialGenerator {
             for x in 0..<size {
                 let u = (Double(x) + 0.5) / Double(size)
                 // Sky: vertical blend zenith → horizon haze, plus a soft radial sun glow.
-                var c = lerp(skyTop, skyHaze, ss(v / horizonV))
+                var c = mixClamped(skyTop, skyHaze, ss(v / horizonV))
                 let du = u - sunU, dv = v - sunV
                 let sunDist = (du * du + dv * dv).squareRoot()
                 let glow = clamp01(1.0 - sunDist / 0.42)
-                c = lerp(c, sun, 0.55 * glow * glow)
+                c = mixClamped(c, sun, 0.55 * glow * glow)
                 // Hills — painted back-to-front so nearer, darker ridges overwrite.
-                if v >= rFar(u)  { c = lerp(c, hillFar, 0.85) }
+                if v >= rFar(u)  { c = mixClamped(c, hillFar, 0.85) }
                 if v >= rMid(u)  { c = hillMid }
                 if v >= rNear(u) { c = hillNear }
                 // A whisper of tonal break so it isn't a dead-flat print (drives roughness too).

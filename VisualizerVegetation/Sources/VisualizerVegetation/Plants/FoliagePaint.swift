@@ -162,7 +162,7 @@ public enum FoliagePaint {
 
     // MARK: helpers
 
-    public static func mix3(_ a: Vec3, _ b: Vec3, _ t: Double) -> Vec3 { a + (b - a) * max(0, min(1, t)) }
+    public static func mix3(_ a: Vec3, _ b: Vec3, _ t: Double) -> Vec3 { mixClamped(a, b, t) }
     public static func clampColor(_ c: Vec3) -> Vec3 {
         Vec3(max(0, min(1, c.x)), max(0, min(1, c.y)), max(0, min(1, c.z)))
     }
