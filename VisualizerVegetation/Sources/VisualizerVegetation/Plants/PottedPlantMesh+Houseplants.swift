@@ -234,13 +234,13 @@ extension PottedPlantMesh {
             let outDir = Vec3(cos(azimuth), 0, sin(azimuth))
             let newest = i == count - 1 && count >= 3
             let maturity = newest ? 0.1 : 1 - 0.55 * t
-            let youth = newest ? 0.70 : smoothstep(0.75, 1.0, t) * 0.5
+            let youth = newest ? 0.55 : smoothstep(0.75, 1.0, t) * 0.5
             var tone = FoliagePaint.tone(youth: youth, palette: palette, rng: &rng)
             tone.age = newest ? 0 : max(0, 1 - 3.2 * t) * (0.35 + 0.35 * rng.unit())   // the lowest leaves are the oldest
             // Blade and where its petiole holds it: the old leaves low and far out, the new ones high
             // and close — a monstera spreads wider than it is tall, a FOUNTAIN of overlapping leaves.
             // (Held nearly flat at the top of tall straight stalks, the blades read as parasols.)
-            let blade = size * (newest ? 0.30 : 0.58 - 0.14 * t) * (0.82 + rng.unit() * 0.36)
+            let blade = size * (newest ? 0.24 : 0.58 - 0.14 * t) * (0.82 + rng.unit() * 0.36)
             let reach = size * (0.42 - 0.22 * t) * (0.85 + rng.unit() * 0.3)
             let height = size * (0.28 + 0.38 * t) * (0.90 + rng.unit() * 0.20)
             // Petioles leave a short climbing stem at successive nodes — older leaves lower — not one
