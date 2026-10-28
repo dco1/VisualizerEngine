@@ -290,7 +290,7 @@ extension PottedPlantMesh {
             }
             var s = LeafSheet.Surface(base: bladeBase, xAxis: f.x, yAxis: f.y, normal: f.n,
                                       length: blade, halfWidth: 0.53)
-            s.cup = newest ? 1.30 : -0.04 - rng.unit() * 0.08   // a mature blade domes; the new one cups
+            s.cup = newest ? 1.30 : -0.09 - rng.unit() * 0.09   // a mature blade domes; the new one cups
             s.cupPower = 1.9
             s.droop = newest ? 0.04 : 0.04 + rng.unit() * 0.05
             s.midribGroove = 0.012
@@ -299,7 +299,7 @@ extension PottedPlantMesh {
             s.ripple = 0.0035
             s.rippleWaves = 1.6
             s.ripplePhase = rng.unit() * 2 * Double.pi
-            s.twist = (rng.unit() - 0.5) * 0.45
+            s.twist = (rng.unit() - 0.5) * 0.65
             let ribHalf = 0.013
             // Upper faces and undersides into separate meshes: the cuticle coats only the top.
             var leaf = PaintedMesh(), under = PaintedMesh()
