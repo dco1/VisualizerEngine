@@ -71,7 +71,7 @@ public extension PlantStyle {
         case .monstera:
             // The photographed monstera is a much deeper, glossier green than the room-calibrated
             // `leafColor` (which the colour gates read), so the paint runs darker than it.
-            return FoliagePalette(mature: Vec3(m.x * 0.55, m.y * 0.61, m.z * 0.84), young: Vec3(0.165, 0.395, 0.150),
+            return FoliagePalette(mature: Vec3(m.x * 0.50, m.y * 0.58, m.z * 0.95), young: Vec3(0.165, 0.395, 0.150),
                                   underside: Vec3(0.160, 0.290, 0.175), rib: Vec3(0.215, 0.375, 0.180),
                                   veinStrength: 0.28, stalk: Vec3(0.200, 0.370, 0.130),
                                   leafValueJitter: 0.09, leafHueJitter: 0.05)
