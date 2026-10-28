@@ -210,9 +210,9 @@ extension PottedPlantMesh {
             let r = rng.unit()
             let depth = k == n - 1 ? 0.72 : (r < 0.18 ? 0.30 : (r < 0.55 ? 0.48 : 0.72))
             splits.append(.init(a: a, width: w, depth: depth))
-            if depth >= 0.48, k < n - 1, rng.unit() < 0.65 * maturity {
+            if depth >= 0.48, k < n - 1, rng.unit() < 0.92 * maturity {
                 // In line with its split and exactly as wide — shared column edges, no sliver.
-                holes.append(.init(a: a, width: w, r0: 0.18, r1: 0.30 + 0.18 * rng.unit()))
+                holes.append(.init(a: a, width: w, r0: 0.18, r1: 0.34 + 0.12 * rng.unit()))
             }
         }
         return .init(splits: splits, holes: holes)
