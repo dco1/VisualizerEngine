@@ -222,7 +222,9 @@ extension PottedPlantMesh {
                                 detail: LeafSheet.LeafDetail = .coarse) -> Foliage {
         let palette = PlantStyle.monstera.foliagePalette
         let size = params.plantSize
-        let count = leafCount(9, params.foliageDensity, minimum: 3)
+        // A potted plant (drawn through a LOD cut) carries the full crown of the photographs; a garden
+        // bed's, drawn whole, keeps nine.
+        let count = leafCount(detail == .fine ? 12 : 9, params.foliageDensity, minimum: 3)
         var out = Foliage()
         var woodyRoots = Mesh3()
         let start = rng.unit() * 2 * Double.pi
