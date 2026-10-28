@@ -1576,13 +1576,19 @@ kernel void illumi_rt_lighting_tlas(
     // DH-1300 — the primary's layer parameters, by the same G-buffer slot the deferred pass reads.
     bool layeredSpecRT = (u.pathFlags & kPathFlagLayeredSpecular) != 0u;
     bool layeredCoatRT = (u.pathFlags & kPathFlagLayeredCoat) != 0u;   // DH-1309
-    MaterialLayers mlRT = (layeredSpecRT || layeredCoatRT)
+    bool filmRT = (u.pathFlags & kPathFlagThinFilm) != 0u;   // DH-1014 thin film
+    MaterialLayers mlRT = (layeredSpecRT || layeredCoatRT || filmRT)
                         ? illumiMaterialLayersAt(layerInstances, gMaterialLayer.read(gid).r, 0xFFFFFFFFu)
                         : illumiMaterialLayersNone();
     if (!layeredSpecRT) mlRT.spec = false;
     float coatWRT = layeredCoatRT ? mlRT.coat : 0.0, coatRRT = max(mlRT.coatRoughness, 0.02);
     float3 dielF0RT = coatWRT > 0.0 ? illumiDielectricF0UnderCoat(mlRT, coatWRT) : illumiDielectricF0(mlRT);
     float3 F0rt = mix(dielF0RT, albedo, metallicRT);
+    if (filmRT && mlRT.film) {   // DH-1014 — the film's tint on the primary's reflection Fresnel
+        float3 filmT = illumiThinFilmTint(mlRT, NdotVrt, metallicRT);
+        F0rt = saturate(F0rt * filmT);
+        dielF0RT = saturate(dielF0RT * filmT);
+    }
     LayeredRTWeights lw = layeredRTWeights(u.pathFlags, albedo, metallicRT, roughness, NdotVrt,
                                            (u.pathFlags & (kPathFlagLayeredMultiscatter | kPathFlagLayeredSheen)) != 0u
                                                ? gEmission.read(gid).a : 0.0h,

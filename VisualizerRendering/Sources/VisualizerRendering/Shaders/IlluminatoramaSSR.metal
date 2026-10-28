@@ -117,11 +117,13 @@ kernel void illumi_ssr_gather(
                                 float2(0.0), float2(W - 1, H - 1)));
         float3 refl = float3(inHDR.read(hPx).rgb);
         // DH-1300 — the material's own dielectric F0 (the literal 0.04 for one without layer parameters).
-        MaterialLayers ml = ((frame.frameFlags & kFrameFlagLayeredSpecular) != 0u)
+        bool filmSSR = (frame.frameFlags & kFrameFlagThinFilm) != 0u;   // DH-1014
+        MaterialLayers ml = ((frame.frameFlags & kFrameFlagLayeredSpecular) != 0u || filmSSR)
             ? illumiMaterialLayersAt(layerInstances, gMaterialLayer.read(gid).r, 0xFFFFFFFFu)
             : illumiMaterialLayersNone();
         float3 F0 = mix(illumiDielectricF0(ml), albedo, metallic);
         float NdotV = saturate(dot(Nview, Vview));
+        if (filmSSR && ml.film) F0 = saturate(F0 * illumiThinFilmTint(ml, NdotV, metallic));
         float3 F = F0 + (1.0 - F0) * pow(saturate(1.0 - NdotV), 5.0);
         float2 fade2 = smoothstep(float2(0.0), float2(0.15),
                                   min(hitUV, 1.0 - hitUV));

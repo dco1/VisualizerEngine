@@ -203,6 +203,16 @@ final class LightingKnobs {
     /// (DH-1298). `false` (the default) is the Phase-7 clearcoat, byte-identical — it changes every
     /// coated material, so a host opts in.
     var layeredCoatEnabled: Bool = false
+    /// **DH-1014 — thin-film iridescence on opaque surfaces.** `true`: an instance with `thinFilmWeight > 0`
+    /// tints its base F0 by the interference film's view-angle reflectance (`illumiThinFilmTint`) under every
+    /// light, the environment, SSR and the traced primary's reflection. `false` (the default) is byte-identical.
+    /// Costs one material-layer texel read per pixel while on.
+    var thinFilmEnabled: Bool = false
+    /// **DH-1302 — per-material thin-sheet translucency on every lane.** `true`: an instance with
+    /// `translucencyWeight > 0` lets that fraction of the light reaching its far face through, tinted
+    /// by `translucencyColor` (the albedo when unset) — live and still alike. `false` (the default) is
+    /// byte-identical (the photo lane's `thinTransmission` is unaffected either way).
+    var translucencyEnabled: Bool = false
     /// **DH-1014 / DH-0597 — cloth sheen as a layer.** `true`: the sheen's environment arms read
     /// the fitted Charlie albedo from the DFG LUT (`.a`) instead of the hand-fitted curve, and
     /// the base under the sheen loses what the sheen reflected (albedo scaling), in the deferred

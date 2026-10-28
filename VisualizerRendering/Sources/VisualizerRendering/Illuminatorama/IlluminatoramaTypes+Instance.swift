@@ -458,6 +458,55 @@ public struct IlluminatoramaInstance {
         }
     }
 
+    /// **OpenPBR thin film on an opaque base** (Daydream DH-1014; offsets 432–447, stride 432 → 448):
+    /// x = `thin_film_weight`, y = thickness (nm), z = film IOR, w reserved. Weight 0 (the default, `.zero`)
+    /// is no film and an exact shader no-op. Set it through `thinFilmWeight` / `thinFilmThickness` /
+    /// `thinFilmIOR`. Read only under `IlluminatoramaRenderer.thinFilmEnabled`, through the material-layer
+    /// target. Mirrors `Instance.thinFilm` in `IlluminatoramaCommon.h`.
+    public var thinFilm: SIMD4<Float> = .zero
+
+    /// **Thin-film weight** [0, 1] — 0 (default) is no film; 1 is the full interference tint.
+    public var thinFilmWeight: Float {
+        get { thinFilm.x }
+        set { thinFilm.x = min(max(newValue, 0), 1) }
+    }
+
+    /// **Thin-film thickness** in nanometres. 400 (stored as 0) is the default; oil on water is ~200–800,
+    /// a soap film ~100–600, anodised titanium / heat-tinted steel ~50–250.
+    public var thinFilmThickness: Float {
+        get { thinFilm.y > 0 ? thinFilm.y : 400 }
+        set { thinFilm.y = newValue == 400 ? 0 : max(newValue, 1) }
+    }
+
+    /// **Thin-film IOR** — 1.4 (stored as 0) by default (oil ~1.45, water 1.33, titanium oxide ~2.4).
+    public var thinFilmIOR: Float {
+        get { thinFilm.z > 0 ? thinFilm.z : 1.4 }
+        set { thinFilm.z = newValue == 1.4 ? 0 : max(newValue, 1) }
+    }
+
+    /// **Per-material thin-sheet translucency** (Daydream DH-1302; offsets 448–463, stride 448 → 464):
+    /// x = weight, yzw = colour. `.zero` (the default) is none — an exact shader no-op. Set it through
+    /// `translucencyWeight` / `translucencyColor`. Read under `IlluminatoramaRenderer.translucencyEnabled`
+    /// through the material-layer target, so unlike `thinTransmission` it reaches the LIVE lane too.
+    /// Mirrors `Instance.translucency` in `IlluminatoramaCommon.h`.
+    public var translucency: SIMD4<Float> = .zero
+
+    /// **Translucency weight** [0, 1] — the fraction of the light reaching the far face that comes
+    /// through diffusely (milky polycarbonate ≈ 0.5, a woven shade ≈ 0.3). 0 (default) = opaque.
+    public var translucencyWeight: Float {
+        get { translucency.x }
+        set { translucency.x = min(max(newValue, 0), 1) }
+    }
+
+    /// **Translucency colour** — what the transmitted light is tinted by. (0, 0, 0) / unset = the albedo.
+    public var translucencyColor: SIMD3<Float> {
+        get { SIMD3(translucency.y, translucency.z, translucency.w) }
+        set {
+            let c = simd_clamp(newValue, SIMD3<Float>(repeating: 0), SIMD3<Float>(repeating: 1))
+            translucency = SIMD4(translucency.x, c.x, c.y, c.z)
+        }
+    }
+
     private mutating func setSpecularTint(color: SIMD3<Float>, weight: Float) {
         let c = simd_max(color, .zero), w = max(weight, 0)
         specularTint = (c == SIMD3(1, 1, 1) && w == 1) ? .zero : SIMD4(c, w)
@@ -495,10 +544,10 @@ public struct IlluminatoramaInstance {
         self.normalMatrix = Self.normalMatrix(from: m)
     }
 
-    /// Compile-time guard: Swift and Metal structs must agree on 432 bytes.
+    /// Compile-time guard: Swift and Metal structs must agree on 464 bytes.
     /// If this fires, either a Swift field was added without the matching Metal
     /// field (or vice versa), or alignment changed unexpectedly.
-    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 432, "IlluminatoramaInstance stride must be 432") }()
+    static let _assertStride240: Void = { assert(MemoryLayout<IlluminatoramaInstance>.stride == 464, "IlluminatoramaInstance stride must be 464") }()
 
     // ── Perfect analytic superquadric impostor — per-instance GPU param ────────
     //

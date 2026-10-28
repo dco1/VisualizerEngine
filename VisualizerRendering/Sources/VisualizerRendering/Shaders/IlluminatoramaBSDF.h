@@ -200,7 +200,18 @@ struct LayeredEnergy {
     float3 underCoatEnv;
     /// DH-1298 — the base's DIFFUSE darkening under the coat (internal reflection; 1 = none).
     float3 coatDarken;
+    /// DH-1014 thin film — the view-angle tint on the base's F0 (`illumiThinFilmTint`). `filmOn` false
+    /// ⇒ `layeredBaseF0` is the historical `mix(dielectricF0, albedo, metallic)`, bit for bit.
+    bool   filmOn;
+    float3 filmTint;
 };
+
+/// The base's F0 every lobe mixes from: `mix(dielectricF0, albedo, metallic)`, times the thin film's
+/// tint (saturated, so a film can recolour a reflection but never push a lobe past 1) when one is on.
+static inline float3 layeredBaseF0(LayeredEnergy e, float3 albedo, float metallic) {
+    float3 f0 = mix(e.dielectricF0, albedo, metallic);
+    return e.filmOn ? saturate(f0 * e.filmTint) : f0;
+}
 
 /// Fdez-Agüera 2019 ("A Multiple-Scattering Microfacet Model for Real-Time Image-Based
 /// Lighting", JCGT 8.1): the single-scatter split sum `F0·A + B`, plus the energy lost to
@@ -241,6 +252,7 @@ static inline LayeredEnergy layeredOff() {
     e.coatOn = false; e.coatWeight = 0.0; e.coatRoughness = 0.08; e.coatF0 = 0.04;
     e.coatSpecMS = 1.0; e.coatEnvAlbedo = 0.0;
     e.underCoatDirect = float3(1.0); e.underCoatEnv = float3(1.0); e.coatDarken = float3(1.0);
+    e.filmOn = false; e.filmTint = float3(1.0);
     return e;
 }
 
@@ -255,11 +267,13 @@ static inline LayeredEnergy layeredEnergy(float3 albedo, float metallic,
                                           float sheenStrength,
                                           bool multiscatter, bool sheen,
                                           float3 dielectricF0 = float3(0.04),
-                                          bool dyedSheen = false) {
+                                          bool dyedSheen = false,
+                                          bool filmOn = false, float3 filmTint = float3(1.0)) {
     LayeredEnergy e = layeredOff();
     e.dielectricF0 = dielectricF0;     // DH-1300
     e.dyedSheen = dyedSheen;           // DH-1316
-    float3 F0 = mix(dielectricF0, albedo, metallic);
+    e.filmOn = filmOn; e.filmTint = filmTint;   // DH-1014 thin film
+    float3 F0 = layeredBaseF0(e, albedo, metallic);
     e.multiscatter = multiscatter;
     e.diffuseRoughness = 0.0;          // set by `layeredWithDiffuseRoughness`
     e.eonAlbedoRatio = float3(1.0);

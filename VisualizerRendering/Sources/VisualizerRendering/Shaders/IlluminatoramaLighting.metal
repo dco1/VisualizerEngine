@@ -470,7 +470,7 @@ static inline float3 brdf(
     float NdotH = saturate(dot(N, H));
     float HdotV = saturate(dot(H, V));
 
-    float3 F0 = mix(le.dielectricF0, albedo, metallic);   // DH-1300
+    float3 F0 = layeredBaseF0(le, albedo, metallic);   // DH-1300
     float3 F  = fresnelSchlick(HdotV, F0);
     float  G  = geometrySmith(NdotV, NdotL, roughness);
     float  D;
@@ -541,7 +541,7 @@ static inline float3 brdfDiffuse(
     if (NdotL <= 0.0) return float3(0);
     float3 H = normalize(V + L);
     float  HdotV = saturate(dot(H, V));
-    float3 F0 = mix(le.dielectricF0, albedo, metallic);   // DH-1300
+    float3 F0 = layeredBaseF0(le, albedo, metallic);   // DH-1300
     float3 F  = fresnelSchlick(HdotV, F0);
     float3 kd = (1.0 - F) * (1.0 - metallic);
     // DH-1014 — must stay `brdf`'s diffuse exactly (the SSS composite subtracts it).
@@ -816,7 +816,7 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
     float  ff = ltcPolygonForm(N, p0, p1, p2, p3, twoSided);
     float3 diffuse = (1.0 - metallic) * albedo * ff;
 
-    float3 F0 = mix(le.dielectricF0, albedo, metallic);
+    float3 F0 = layeredBaseF0(le, albedo, metallic);
     float3 spec = areaLightSpecular(al, worldPos, N, V, F0, roughness, ltcMat, ltcMag, ltcEnabled,
                                     nL, p0, p1, p2, p3, ff);
     if (le.multiscatter) {
@@ -1316,7 +1316,9 @@ kernel void illumi_lighting(
     // legacy literal 0.04, so the flag costs one texel read and changes nothing else.
     MaterialLayers ml = illumiMaterialLayersNone();
     bool layeredCoat = kLightingDFGLUTEnabled && (frame.frameFlags & kFrameFlagLayeredCoat) != 0u;
-    if ((frame.frameFlags & kFrameFlagLayeredSpecular) != 0u || layeredCoat)
+    bool filmOn = (frame.frameFlags & kFrameFlagThinFilm) != 0u;   // DH-1014 thin film
+    bool transOn = (frame.frameFlags & kFrameFlagTranslucency) != 0u;   // DH-1302 per-material translucency
+    if ((frame.frameFlags & kFrameFlagLayeredSpecular) != 0u || layeredCoat || filmOn || transOn)
         ml = illumiMaterialLayersAt(layerInstances, gMaterialLayer.read(gid).r, 0xFFFFFFFFu);
     if ((frame.frameFlags & kFrameFlagLayeredSpecular) == 0u) ml.spec = false;
     // DH-1309 / DH-1298 — the coat's weight and roughness first: the base's F0 depends on what it is
@@ -1329,8 +1331,12 @@ kernel void illumi_lighting(
         ccR = max(ccR, 0.02);
     }
     float3 dielF0 = (ccW > 0.001) ? illumiDielectricF0UnderCoat(ml, ccW) : illumiDielectricF0(ml);
+    // DH-1014 — the thin film's tint at this pixel's view angle (float3(1) with no film on the instance).
+    float3 filmTint = filmOn ? illumiThinFilmTint(ml, saturate(dot(N, V)), metallic) : float3(1.0);
+    filmOn = filmOn && ml.film;
     LayeredEnergy le = layeredOff();
     le.dielectricF0 = dielF0;
+    le.filmOn = filmOn; le.filmTint = filmTint;
     if (layeredMS || layeredSheen) {
         constexpr sampler leSampler(filter::linear, address::clamp_to_edge);
         float leNdotV = saturate(dot(N, V));
@@ -1338,7 +1344,8 @@ kernel void illumi_lighting(
         float  leSheenA = (layeredSheen && sheenStrength > 0.0)
                         ? float(dfgLUT.sample(leSampler, float2(leNdotV, sheenRoughness)).a) : 0.0;
         le = layeredEnergy(albedo, metallic, leLUT, leSheenA, sheenStrength, layeredMS, layeredSheen, dielF0,
-                           (frame.frameFlags & kFrameFlagDyedSheen) != 0u);   // DH-1316
+                           (frame.frameFlags & kFrameFlagDyedSheen) != 0u,   // DH-1316
+                           filmOn, filmTint);                                // DH-1014 thin film
     }
     // DH-1316 — the dyed sheen colour applies to the bolted-on sheen too (the layered BSDF is a host
     // opt-in of its own); `layeredOff()` leaves it false, so a host that sets neither is bit-identical.
@@ -1863,8 +1870,16 @@ kernel void illumi_lighting(
     // from the back side — the same convolved cube the diffuse IBL reads, sampled with −N, with
     // the same interior dimming. Energy: never more than arrives (albedo ≤ 1, t ≤ 1). Only the
     // ordinary-opaque class (the leaf, plush and shade classes have their own thin-sheet terms).
-    if (frame.extendedGBuffer != 0.0 && nrH.a >= 1.0h) {
-        float tt = saturate(float(gMaterial.read(gid).r));
+    // DH-1302 — the same term from the material-layer record on EVERY lane (live and still), tinted by
+    // the material's own transmission colour (the albedo when none): `max` with the photo lane's
+    // `thinTransmission`, so a host that sets both loses nothing.
+    if ((frame.extendedGBuffer != 0.0 || (transOn && ml.trans)) && nrH.a >= 1.0h) {
+        float tt = frame.extendedGBuffer != 0.0 ? saturate(float(gMaterial.read(gid).r)) : 0.0;
+        float3 ttTint = albedo;
+        if (transOn && ml.trans) {
+            tt = max(tt, ml.transWeight);
+            if (ml.transColorSet) ttTint = ml.transColor;
+        }
         if (tt > 0.001) {
             float back = saturate(dot(-N, Ld));
             float3 incident = frame.directionalLightColor * back * visibility;
@@ -1873,8 +1888,8 @@ kernel void illumi_lighting(
                 constexpr sampler ttSampler(filter::linear, mip_filter::linear);
                 skyBack = float3(irradianceCube.sample(ttSampler, -N).rgb) * frame.iblIntensity * interiorIBLK;
             }
-            transmission += albedo * (incident + skyBack) * tt;
-            transmissionEnv += albedo * skyBack * tt;
+            transmission += ttTint * (incident + skyBack) * tt;
+            transmissionEnv += ttTint * skyBack * tt;
         }
     }
     // The DIFFUSE lobe's interior factor. As the host's irradiance bands take over
@@ -1906,7 +1921,7 @@ kernel void illumi_lighting(
     if (kLightingIBLEnabled) {  // function_constant(0)
         constexpr sampler cubeSampler(filter::linear, mip_filter::linear);
 
-        float3 F0 = mix(le.dielectricF0, albedo, metallic);   // DH-1300
+        float3 F0 = layeredBaseF0(le, albedo, metallic);   // DH-1300
         float NdotV = saturate(dot(N, V));
         float3 F  = fresnelSchlickRoughness(NdotV, F0, roughness);
         float3 kD = (1.0 - F) * (1.0 - metallic);

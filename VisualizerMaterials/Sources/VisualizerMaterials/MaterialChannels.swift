@@ -47,6 +47,23 @@ public struct MaterialChannels: Equatable, Sendable {
     /// `IlluminatoramaDiffuseRoughness.h`). Uniform per material, set by the generator per family —
     /// OpenPBR's example library uses 1.0 for brick, sand and velvet. Only a dielectric uses it.
     public var diffuseRoughness: Double = 0
+    /// **Thin-film iridescence** (Daydream DH-1014) — OpenPBR `thin_film_weight` [0, 1]: an interference
+    /// film (oil on a polished metal, anodised titanium, heat-tinted steel, a soap-bubble sheen) tints the
+    /// base's specular by a colour that shifts with the view angle. 0 (the default) is no film and renders
+    /// exactly as before. The renderer reads it under `IlluminatoramaRenderer.thinFilmEnabled`.
+    public var thinFilmWeight: Double = 0
+    /// Film thickness in nanometres (OpenPBR `thin_film_thickness`) — oil on water 200–800, anodised
+    /// titanium 50–250. Only meaningful where `thinFilmWeight > 0`.
+    public var thinFilmThicknessNm: Double = 400
+    /// Film index of refraction (OpenPBR `thin_film_ior`) — oil ~1.45, titanium oxide ~2.4.
+    public var thinFilmIOR: Double = 1.4
+    /// **Thin-sheet translucency** (Daydream DH-1302) — the fraction [0, 1] of the light reaching the FAR
+    /// face that comes through diffusely: milky polycarbonate ≈ 0.5, a woven shade ≈ 0.3, a thin leaf-like
+    /// sheet. 0 (the default) is opaque. Unlike the photo-lane-only `thinTransmission`, it reaches the LIVE
+    /// canvas too. Only a non-metal uses it.
+    public var translucency: Double = 0
+    /// The colour the transmitted light takes; `nil` ⇒ the albedo.
+    public var translucencyColor: Vec3? = nil
     /// High-frequency (close-range) detail normal map — pores, weave, grain.
     /// Sampled at `detailNormalUVScale × uv` (shader-side) and blended over the
     /// macro normal via partial-derivative add. `nil` = no detail layer.

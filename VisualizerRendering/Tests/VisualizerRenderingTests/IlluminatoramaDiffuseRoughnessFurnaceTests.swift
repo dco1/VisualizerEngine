@@ -262,6 +262,6 @@ final class IlluminatoramaDiffuseRoughnessFurnaceTests: XCTestCase {
         metal.diffuseRoughness = 1
         XCTAssertEqual(IlluminatoramaRenderer.rtPackBaseLane(metal), IlluminatoramaRenderer.rtPackMaterialLane(0.3, 0.5),
                        "a partly metallic row keeps its metalness and is Lambert")
-        XCTAssertEqual(MemoryLayout<IlluminatoramaInstance>.stride, 432)
+        XCTAssertEqual(MemoryLayout<IlluminatoramaInstance>.stride, 464)
     }
 }

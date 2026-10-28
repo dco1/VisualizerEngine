@@ -44,15 +44,32 @@ using namespace metal;
 #define kFrameFlagLayeredCoat      512u
 #define kPathFlagLayeredCoat       131072u
 
+/// FrameUniforms.frameFlags bit 12 (4096) — DH-1014 thin-film: iridescence on OPAQUE surfaces (an
+/// interference film of `thinFilm` thickness / IOR over the base), as a view-angle tint on the base's
+/// F0 under every light, the environment, SSR and the traced primary's reflection. Mirrored as
+/// RTInstUniforms.pathFlags kPathFlagThinFilm. Clear ⇒ every F0 is untouched, bit for bit. Path
+/// vertices past the primary keep a plain F0 (declared approximation).
+#define kFrameFlagThinFilm         4096u
+#define kPathFlagThinFilm          524288u
+
+/// FrameUniforms.frameFlags bit 13 (8192) — DH-1302: per-material thin-sheet TRANSLUCENCY (weight +
+/// colour, OpenPBR transmission_weight / transmission_color for a thin sheet) on EVERY lane — the
+/// instance's `translucency` record read through the material-layer target, where `thinTransmission`
+/// reached only the photo lane's extended G-buffer. Deferred kernel only (the traced lanes own the
+/// indirect, not this term). Clear ⇒ the DH-0140 slice-3 behaviour, bit for bit.
+#define kFrameFlagTranslucency     8192u
+
 /// `GBufferOut.materialLayer`'s clear value and the "no layer parameters" slot.
 #define kMaterialLayerNone 0xFFFFFFFFu
 
 /// The `Instance` record as float4s (static_asserted in IlluminatoramaCommon.h).
-#define kInstanceF4Stride       27u   // sizeof(Instance) / 16
+#define kInstanceF4Stride       29u   // sizeof(Instance) / 16
 #define kInstanceF4Coat          9u   // (metallic, clearcoat, clearcoatRoughness, sheen)
 #define kInstanceF4MaterialExt  24u   // (diffuseRoughness, specularIOR, coatIOR, coatDarkening)
 #define kInstanceF4SpecularTint 25u   // (specular_color.rgb, specular_weight); all 0 ⇒ (1, 1, 1, 1)
 #define kInstanceF4CoatTint     26u   // (coat_color.rgb, —); all 0 ⇒ (1, 1, 1)
+#define kInstanceF4ThinFilm     27u   // (weight, thickness nm, film IOR, —); weight 0 ⇒ no film
+#define kInstanceF4Translucency 28u   // (weight, colour.rgb); weight 0 ⇒ none, colour 0 ⇒ the albedo
 
 /// One instance's layer parameters, decoded. `any == false` ⇒ every field is its legacy value and
 /// the caller keeps its historical expression.
@@ -73,6 +90,17 @@ struct MaterialLayers {
     float3 specularTint;
     /// OpenPBR `specular_ior` (1.5 ⇒ F0 0.04).
     float  specularIOR;
+    /// DH-1014 — OpenPBR `thin_film_weight` / `thin_film_thickness` (nm) / `thin_film_ior`. `film` false ⇒ none.
+    bool   film;
+    float  filmWeight;
+    float  filmThicknessNm;
+    float  filmIOR;
+    /// DH-1302 — thin-sheet translucency: the fraction of the light reaching the FAR face that comes
+    /// through (`transWeight`), tinted by `transColor` (the albedo when none was set). `trans` false ⇒ none.
+    bool   trans;
+    float  transWeight;
+    float3 transColor;
+    bool   transColorSet;
 };
 
 static inline MaterialLayers illumiMaterialLayersNone() {
@@ -87,6 +115,8 @@ static inline MaterialLayers illumiMaterialLayersNone() {
     m.coatDarkening = 0.0;
     m.specularTint = float3(1.0);
     m.specularIOR = 1.5;
+    m.film = false; m.filmWeight = 0.0; m.filmThicknessNm = 400.0; m.filmIOR = 1.4;
+    m.trans = false; m.transWeight = 0.0; m.transColor = float3(1.0); m.transColorSet = false;
     return m;
 }
 
@@ -96,15 +126,29 @@ static inline MaterialLayers illumiMaterialLayersNone() {
 /// clearcoatRoughness, sheen): a coated instance points at its record so the coat layer (DH-1309)
 /// reads its own roughness on every lane, and a coat can coexist with a sheen (DH-1299).
 static inline bool illumiHasMaterialLayers(float4 coatRec, float4 materialExt, float4 specularTint,
-                                           float4 coatTint = float4(0.0)) {
+                                           float4 coatTint = float4(0.0), float4 thinFilm = float4(0.0),
+                                           float4 translucency = float4(0.0)) {
     return coatRec.y > 0.0 || any(materialExt.yzw != float3(0.0)) || any(specularTint != float4(0.0))
-        || any(coatTint.xyz != float3(0.0));
+        || any(coatTint.xyz != float3(0.0)) || thinFilm.x > 0.0 || translucency.x > 0.0;
 }
 
 static inline MaterialLayers illumiDecodeMaterialLayers(float4 coatRec, float4 materialExt, float4 specularTint,
-                                                       float4 coatTint = float4(0.0)) {
+                                                       float4 coatTint = float4(0.0), float4 thinFilm = float4(0.0),
+                                                       float4 translucency = float4(0.0)) {
     MaterialLayers m = illumiMaterialLayersNone();
-    if (!illumiHasMaterialLayers(coatRec, materialExt, specularTint, coatTint)) return m;
+    if (!illumiHasMaterialLayers(coatRec, materialExt, specularTint, coatTint, thinFilm, translucency)) return m;
+    if (translucency.x > 0.0) {
+        m.trans = true;
+        m.transWeight = saturate(translucency.x);
+        m.transColorSet = any(translucency.yzw != float3(0.0));
+        if (m.transColorSet) m.transColor = saturate(translucency.yzw);
+    }
+    if (thinFilm.x > 0.0) {
+        m.film = true;
+        m.filmWeight = saturate(thinFilm.x);
+        if (thinFilm.y > 0.0) m.filmThicknessNm = thinFilm.y;
+        if (thinFilm.z > 0.0) m.filmIOR = max(thinFilm.z, 1.0);
+    }
     m.coatParams = materialExt.z != 0.0 || materialExt.w != 0.0 || any(coatTint.xyz != float3(0.0));
     if (materialExt.z > 0.0) m.coatIOR = materialExt.z;
     m.coatDarkening = saturate(materialExt.w);
@@ -124,7 +168,7 @@ static inline MaterialLayers illumiMaterialLayersAt(const device float4* inst, u
     if (slot == kMaterialLayerNone || slot >= count || inst == nullptr) return illumiMaterialLayersNone();
     const device float4* r = inst + slot * kInstanceF4Stride;
     return illumiDecodeMaterialLayers(r[kInstanceF4Coat], r[kInstanceF4MaterialExt], r[kInstanceF4SpecularTint],
-                                      r[kInstanceF4CoatTint]);
+                                      r[kInstanceF4CoatTint], r[kInstanceF4ThinFilm], r[kInstanceF4Translucency]);
 }
 
 /// Normal-incidence Fresnel reflectance of a dielectric interface of relative index `n`.
@@ -191,3 +235,32 @@ static inline float3 illumiCoatDarkening(MaterialLayers m, float3 albedo, float 
 
 /// The coat tint: float3(1) unless set.
 static inline float3 illumiCoatColor(MaterialLayers m) { return m.coatParams ? m.coatColor : float3(1.0); }
+
+// ── Thin-film iridescence on opaque surfaces (Daydream DH-1014 — OpenPBR thin_film_*) ─────────────
+//
+// A film of index n2 and thickness d on a base of index n3 reflects by two-beam interference
+// (Airy): with r12 = (1 − n2)/(1 + n2), r23 = (n2 − n3)/(n2 + n3) and the phase
+// δ(λ) = 4π·n2·d·cosθ2 / λ, the film's reflectance is
+//     R(λ) = (r12² + r23² + 2·r12·r23·cos δ) / (1 + r12²·r23² + 2·r12·r23·cos δ),
+// with cosθ2 from Snell inside the film. Evaluated at the three channel wavelengths it is a colour
+// that SHIFTS WITH VIEW ANGLE (the oil-slick look). It is applied as a TINT on the base's F0 — the
+// Filament / Belcour–Barla form: Schlick's F0 is replaced by the film's reflectance at N·V — so one
+// per-pixel evaluation serves every lobe. The tint is normalised to unit MEAN across the channels
+// (the film redistributes the reflected energy between channels, it does not invent any), and
+// blended in by `thin_film_weight`; the caller saturates the resulting F0, so no lobe exceeds 1.
+// Real-valued Fresnel coefficients (no polarisation split) — the standard real-time simplification.
+static inline float3 illumiThinFilmTint(MaterialLayers m, float cosTheta, float metallic) {
+    if (!m.film) return float3(1.0);
+    float n2 = max(m.filmIOR, 1.0);
+    float n3 = mix(max(m.specularIOR, 1.0), 2.8, saturate(metallic));
+    float sin2 = saturate(1.0 - cosTheta * cosTheta);
+    float cos2 = sqrt(saturate(1.0 - sin2 / (n2 * n2)));
+    float r12 = (1.0 - n2) / (1.0 + n2);
+    float r23 = (n2 - n3) / (n2 + n3);
+    const float3 lambda = float3(610.0, 550.0, 465.0);        // R, G, B channel wavelengths (nm)
+    float3 cd = cos(12.5663706 * n2 * m.filmThicknessNm * cos2 / lambda);   // cos δ, 4π = 12.566…
+    float  c  = 2.0 * r12 * r23;
+    float3 R  = (r12 * r12 + r23 * r23 + c * cd) / (1.0 + r12 * r12 * r23 * r23 + c * cd);
+    float  mean = max((R.x + R.y + R.z) * (1.0 / 3.0), 1e-5);
+    return mix(float3(1.0), R / mean, m.filmWeight);
+}
