@@ -303,7 +303,7 @@ public enum LeafSheet {
     public static let monsteraRows: [Double] = [0, 0.06, 0.18, 0.30, 0.48, 0.72, 1.0]
     /// The `.fine` rows (`LeafDetail`): every coarse row plus the ones a smooth margin and rounded lobe
     /// tips need. Only a host that draws the leaves through a LOD cut can afford them (a potted plant).
-    public static let monsteraRowsFine: [Double] = [0, 0.06, 0.12, 0.18, 0.24, 0.30, 0.39, 0.48, 0.60, 0.72, 0.80, 0.86, 0.92, 0.96, 1.0]
+    public static let monsteraRowsFine: [Double] = [0, 0.06, 0.18, 0.30, 0.39, 0.48, 0.60, 0.72, 0.80, 0.86, 0.92, 0.96, 1.0]
 
     /// How finely a monstera blade is gridded: `.coarse` for a mesh drawn whole every frame (a
     /// garden bed's), `.fine` for one drawn through a Signack LOD cut (a potted plant's).
@@ -350,7 +350,7 @@ public enum LeafSheet {
             edges.insert(s.a - s.width / 2); edges.insert(s.a + s.width / 2)
             // Extra stations beside each slit mouth so the rounded lobe tip is a curve, not one chamfer.
             if veinColumns, s.depth < 1 {
-                for d in [0.008, 0.018, 0.032, 0.048] { edges.insert(s.a - s.width / 2 - d); edges.insert(s.a + s.width / 2 + d) }
+                for d in [0.010, 0.024, 0.042] { edges.insert(s.a - s.width / 2 - d); edges.insert(s.a + s.width / 2 + d) }
             }
         }
         for h in cuts.holes { edges.insert(h.a - h.width / 2); edges.insert(h.a + h.width / 2) }

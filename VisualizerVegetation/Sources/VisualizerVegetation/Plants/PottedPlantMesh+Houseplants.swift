@@ -224,7 +224,7 @@ extension PottedPlantMesh {
         let size = params.plantSize
         // A potted plant (drawn through a LOD cut) carries the full crown of the photographs; a garden
         // bed's, drawn whole, keeps nine.
-        let count = leafCount(detail == .fine ? 12 : 9, params.foliageDensity, minimum: 3)
+        let count = leafCount(detail == .fine ? 15 : 9, params.foliageDensity, minimum: 3)
         var out = Foliage()
         var woodyRoots = Mesh3()
         let start = rng.unit() * 2 * Double.pi
