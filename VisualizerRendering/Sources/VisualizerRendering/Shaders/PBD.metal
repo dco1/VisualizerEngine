@@ -1,6 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 #include "PBDCollider.h"
+#include "SimSpatialHash.h"
 
 // ── PBD.metal ─────────────────────────────────────────────────────────────────
 //
@@ -448,13 +449,10 @@ kernel void pbdFloorCollide(
 // near-neighbour band leaves exactly the coil-on-coil and coil-on-pile contacts
 // that build the stack.
 //
-// TOPOLOGY / PERF: this is an honest O(n²) pass — each thread walks the whole
-// particle buffer. For the prototype's few-hundred-particle rope (e.g. 280 →
-// ~78K distance tests, once per substep) it's well under the GPU budget and
-// measured to hold 60 fps. The documented scale-up (thousands of particles) is
-// a uniform spatial hash: a build-bins kernel + a nearby-cell walk — the SAME
-// hash the SPH-fluid roadmap wants, built once and shared. Until a real
-// particle count forces it, O(n²) is the simplest correct thing.
+// TOPOLOGY / PERF: neighbours come from the shared SimSpatialHash grid
+// (SimSpatialHash.h/.metal). The host builds it over the frozen snapshot, cell edge =
+// contact distance, and each thread walks the 27 cells around its particle, so the cost
+// is O(n · neighbours) instead of every thread scanning the whole buffer.
 //
 // RACE SAFETY: each thread writes ONLY its own particle slot. The push is
 // symmetric — this thread moves particle `id` by half the overlap toward its
@@ -477,12 +475,18 @@ struct PBDSelfCollideUniforms {
     float wallCx;          // cup-axis X
     float wallCz;          // cup-axis Z
     float wallBottomY;     // confinement applies only above this Y (cup floor)
+    // ── Shared spatial hash (SimSpatialHash): cell edge = contact distance, built over the `others` snapshot ──
+    uint  tableSize;
+    float cellSize;
 };
 
 kernel void pbdSelfCollide(
     device PBDParticle*               particles [[ buffer(0) ]],
     constant PBDSelfCollideUniforms&  u         [[ buffer(1) ]],
     device const PBDParticle*         others    [[ buffer(2) ]],
+    device const uint*                offsets   [[ buffer(3) ]],
+    device const uint*                counts    [[ buffer(4) ]],
+    device const uint*                sorted    [[ buffer(5) ]],
     uint id [[ thread_position_in_grid ]]
 ) {
     if (id >= u.particleCount) return;
@@ -506,25 +510,41 @@ kernel void pbdSelfCollide(
     float3 pushSum = float3(0.0);   // accumulated separation (≈ contact normal × mag)
     float  hits    = 0.0;
 
-    for (uint j = 0; j < u.particleCount; ++j) {
-        uint d = (j > id) ? (j - id) : (id - j);
-        if (d <= u.selfSkip) continue;            // self + chain neighbours
+    // Walk the 27 cells around this particle (cell edge = contact distance, so every contact lies inside them).
+    // Two cells can hash to one bucket: remember the buckets already read so a particle is never counted twice.
+    const int3 base = simCellCoord(pos, u.cellSize);
+    uint seen[27];
+    uint nSeen = 0u;
+    for (int dz = -1; dz <= 1; ++dz)
+    for (int dy = -1; dy <= 1; ++dy)
+    for (int dx = -1; dx <= 1; ++dx) {
+        const uint b = simHashCell(base + int3(dx, dy, dz), u.tableSize);
+        bool dup = false;
+        for (uint q = 0u; q < nSeen; ++q) dup = dup || (seen[q] == b);
+        if (dup) continue;
+        seen[nSeen++] = b;
+        const uint o = offsets[b], n = counts[b];
+        for (uint k = 0u; k < n; ++k) {
+            const uint j = sorted[o + k];
+            uint d = (j > id) ? (j - id) : (id - j);
+            if (d <= u.selfSkip) continue;            // self + chain neighbours
 
-        float4 pbb   = others[j].positionAndInvMass;
-        if (pbb.w == 0.0) continue;   // skip PINNED neighbours: parked/un-extruded
-                                      // cream stacked at the nozzle + the anchor
-                                      // must not shove the live rope.
-        float3 pb    = pbb.xyz;
-        float3 delta = pos - pb;
-        float  dist2 = dot(delta, delta);
-        if (dist2 >= contact2 || dist2 < 1e-12) continue;
+            float4 pbb   = others[j].positionAndInvMass;
+            if (pbb.w == 0.0) continue;   // skip PINNED neighbours: parked/un-extruded
+                                          // cream stacked at the nozzle + the anchor
+                                          // must not shove the live rope.
+            float3 pb    = pbb.xyz;
+            float3 delta = pos - pb;
+            float  dist2 = dot(delta, delta);
+            if (dist2 >= contact2 || dist2 < 1e-12) continue;
 
-        float  dist = sqrt(dist2);
-        float3 n    = delta / dist;
-        // Half the overlap to this particle; j's thread applies the mirror half.
-        float  pen  = (contact - dist) * 0.5 * u.stiffness;
-        pushSum += n * pen;
-        hits    += 1.0;
+            float  dist = sqrt(dist2);
+            float3 n    = delta / dist;
+            // Half the overlap to this particle; j's thread applies the mirror half.
+            float  pen  = (contact - dist) * 0.5 * u.stiffness;
+            pushSum += n * pen;
+            hits    += 1.0;
+        }
     }
 
     if (hits > 0.0) {

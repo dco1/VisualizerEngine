@@ -220,6 +220,9 @@ struct PBDSelfCollideUniforms {
     var wallCx:        Float = 0
     var wallCz:        Float = 0
     var wallBottomY:   Float = 0
+    // Shared spatial hash (SimSpatialHash); cell edge = contact distance. See PBD.metal.
+    var tableSize:     UInt32 = 0
+    var cellSize:      Float = 0
 }
 
 // Uniforms for the endless-feed recycle (treadmill) kernel. Internal — driven
@@ -733,6 +736,8 @@ public final class PBDSolver {
     // sized to the live particle count). Frozen-read source so contact pushes
     // are symmetric — see pbdSelfCollide in PBD.metal.
     private var selfCollideSnapshot: MTLBuffer?
+    /// Broadphase for the self-collide pass: the engine's shared grid, built lazily on first use.
+    private var selfCollideGrid: SimSpatialHash?
     private let recycleUniformBuffer: MTLBuffer
     private let conveyorUniformBuffer: MTLBuffer
     private let probeUniformBuffer: MTLBuffer
@@ -1551,13 +1556,12 @@ public final class PBDSolver {
 
     /// Bind buffers + dispatch the particle self-collision kernel into a
     /// caller-owned encoder. No-op unless `selfCollideEnabled` and a positive
-    /// radius are set. One dispatch = one full O(n²) self-contact sweep; call
-    /// it once per constraint iteration so the distance constraints can react
-    /// to the pushed positions on the next iteration (same rationale as the SDF
-    /// pass — run inside the loop, not once at the end). Writes its own uniform
-    /// buffer each call; cheap shared-memory struct write.
-    public func dispatchSelfCollide(into encoder: MTLComputeCommandEncoder,
-                                    snapshot: MTLBuffer? = nil) {
+    /// radius are set. One dispatch = one self-contact sweep over the 27 grid cells
+    /// around each particle; the grid (`selfCollideGrid`) must already be built over
+    /// `snapshot` — `encodeSelfCollidePass` does that. Writes its own uniform buffer
+    /// each call; cheap shared-memory struct write.
+    private func dispatchSelfCollide(into encoder: MTLComputeCommandEncoder,
+                                     snapshot: MTLBuffer?, grid: SimSpatialHash) {
         guard selfCollideEnabled, selfCollideRadius > 0 else { return }
         let count = particleBuffer.count
         guard count > 0 else { return }
@@ -1573,7 +1577,9 @@ public final class PBDSolver {
             wallRadius:    wallRadius,
             wallCx:        wallCenterX,
             wallCz:        wallCenterZ,
-            wallBottomY:   wallBottomY
+            wallBottomY:   wallBottomY,
+            tableSize:     UInt32(grid.tableSize),
+            cellSize:      2 * selfCollideRadius
         )
         encoder.setComputePipelineState(selfCollidePipeline)
         encoder.setBuffer(particleBuffer.buffer,       offset: 0, index: 0)
@@ -1581,6 +1587,9 @@ public final class PBDSolver {
         // Frozen-read snapshot for symmetric Jacobi contacts. Falls back to the
         // live buffer (old racy behaviour) only if a caller didn't supply one.
         encoder.setBuffer(snapshot ?? particleBuffer.buffer, offset: 0, index: 2)
+        encoder.setBuffer(grid.offsets, offset: 0, index: 3)
+        encoder.setBuffer(grid.counts,  offset: 0, index: 4)
+        encoder.setBuffer(grid.sorted,  offset: 0, index: 5)
         let w = min(count, selfCollidePipeline.maxTotalThreadsPerThreadgroup)
         encoder.dispatchThreads(
             MTLSize(width: count, height: 1, depth: 1),
@@ -1684,9 +1693,15 @@ public final class PBDSolver {
                       to: snapshot, destinationOffset: 0, size: bytes)
             blit.endEncoding()
         }
+        if selfCollideGrid == nil {
+            selfCollideGrid = SimSpatialHash(device: device, maxParticles: particleBuffer.capacity, label: "PBD.selfCollide")
+        }
+        guard let grid = selfCollideGrid else { return }
+        grid.encodeBuild(commandBuffer, particles: snapshot, particleCount: count,
+                         cellSize: 2 * selfCollideRadius, label: "PBD.selfCollide")
         guard let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         encoder.label = "PBD.selfCollide"
-        dispatchSelfCollide(into: encoder, snapshot: snapshot)
+        dispatchSelfCollide(into: encoder, snapshot: snapshot, grid: grid)
         encoder.endEncoding()
     }
 
