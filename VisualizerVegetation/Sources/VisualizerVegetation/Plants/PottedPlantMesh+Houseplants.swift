@@ -250,7 +250,7 @@ extension PottedPlantMesh {
             // The petiole ARCHES: steeply up out of the crown, then bending out to the blade — a
             // quadratic whose control point stands high over the foot.
             let sideDir = Vec3(-outDir.z, 0, outDir.x)
-            let ctrl = foot + Vec3(0, (bladeBase.y - foot.y) * 0.90, 0) + outDir * (reach * 0.30)
+            let ctrl = foot + Vec3(0, (bladeBase.y - foot.y) * 0.78, 0) + outDir * (reach * 0.42)
                 + sideDir * (reach * 0.35 * (rng.unit() - 0.5))
             let path = (0 ... 8).map { k -> Vec3 in
                 let u = Double(k) / 8
@@ -282,7 +282,7 @@ extension PottedPlantMesh {
                 let lean = f.y * 0.82 + outDir * 0.18
                 let cigar = (0 ... 8).map { k -> Vec3 in
                     let u = Double(k) / 8
-                    return bladeBase + lean * (blade * 1.15 * u) + outDir * (blade * 0.10 * u * u)
+                    return bladeBase + lean * (blade * 0.85 * u) + outDir * (blade * 0.10 * u * u)
                 }
                 out.leaves.append(paintedStalk(cigar, rBase: petR * 1.45, rTip: petR * 0.22, sides: 9,
                                                color: FoliagePaint.base(palette, tone, face: .upper)))
