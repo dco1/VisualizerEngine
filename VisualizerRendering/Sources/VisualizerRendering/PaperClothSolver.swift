@@ -246,6 +246,10 @@ public final class PaperClothSolver {
     // is the paper's swept thickness added to every collider's surface.
     public var floorEnabled: Bool = false
     public var floorY: Float = 0
+    /// Coefficient of restitution against the floor plane (`PBD.metal` `pbdFloorCollide`): the downward speed a node
+    /// brings to the floor comes back up as this fraction. 0.1 (the default) is the long-standing cloth value — a
+    /// duvet or napkin laid onto a surface; raise it for cloth that is DROPPED (a folded towel thumping the floor).
+    public var floorRestitution: Float = 0.1
     public var clothThickness: Float = 0.012
     public var collideStiffness: Float = 1.0
     /// Tangential-velocity RETENTION on contact, not friction — 0 stops a sliding contact dead,
@@ -1512,7 +1516,7 @@ public final class PaperClothSolver {
             floorBand: 0.01, colliderCount: UInt32(colliderCount), ownerID: .max,
             collideStiffness: collideStiffness, collideFriction: collideFriction,
             selfRadius: clothThickness,
-            velRestitution: 0.2, floorRestitution: 0.1,
+            velRestitution: 0.2, floorRestitution: floorRestitution,
             maxSDFPush: sdfMaxPushPerStep)
     }
 
