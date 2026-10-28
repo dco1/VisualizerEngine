@@ -236,7 +236,7 @@ extension PottedPlantMesh {
             let maturity = newest ? 0.1 : 1 - 0.55 * t
             let youth = newest ? 0.20 : smoothstep(0.75, 1.0, t) * 0.5
             var tone = FoliagePaint.tone(youth: youth, palette: palette, rng: &rng)
-            tone.age = newest ? 0 : max(0, 1 - 3.2 * t) * (0.35 + 0.35 * rng.unit())   // the lowest leaves are the oldest
+            tone.age = newest ? 0 : max(0, 1 - 3.2 * t) * (0.18 + 0.22 * rng.unit())   // the lowest leaves are the oldest
             // Blade and where its petiole holds it: the old leaves low and far out, the new ones high
             // and close — a monstera spreads wider than it is tall, a FOUNTAIN of overlapping leaves.
             // (Held nearly flat at the top of tall straight stalks, the blades read as parasols.)
@@ -273,7 +273,7 @@ extension PottedPlantMesh {
             // The blade HANGS from the top of its stalk (the bend at the geniculum): a mature leaf's
             // midrib runs 0–20° below horizontal, the oldest lowest, each rolled a little about its
             // midrib so no two present the same face; the newest, still unfurling, stands up.
-            let tilt = (newest ? 0.45 : 1.62 + 0.62 * (1 - t)) + (rng.unit() - 0.5) * 0.44
+            let tilt = (newest ? 0.45 : 2.02 + 0.40 * (1 - t)) + (rng.unit() - 0.5) * 0.30
             let f = leafFrame(azimuth: azimuth + (rng.unit() - 0.5) * 0.3, tilt: tilt,
                               roll: (rng.unit() - 0.5) * 0.95)
             if newest {
@@ -292,9 +292,9 @@ extension PottedPlantMesh {
                                       length: blade, halfWidth: 0.53)
             s.cup = newest ? 1.30 : -0.04 - rng.unit() * 0.08   // a mature blade domes; the new one cups
             s.cupPower = 1.9
-            s.droop = newest ? 0.04 : 0.07 + rng.unit() * 0.08
+            s.droop = newest ? 0.04 : 0.04 + rng.unit() * 0.05
             s.midribGroove = 0.012
-            s.pucker = newest ? 0 : 0.0045   // quilted: tissue between lateral veins domes up
+            s.pucker = newest ? 0 : 0.0025   // quilted: tissue between lateral veins domes up
             s.midribHalfWidth = 0.02
             s.ripple = 0.0035
             s.rippleWaves = 1.6

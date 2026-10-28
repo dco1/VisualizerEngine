@@ -143,7 +143,7 @@ public enum FoliagePaint {
         // Lateral veins: on the upper face a soft pale line; below, raised and paler still.
         let vs = palette.veinStrength * (face == .lower ? 1.2 : 1.0)
         c = mix3(c, mix3(c, palette.rib, 0.8), min(1, site.vein * vs))
-        if palette.veinStrength > 0.4 {
+        if palette.veinStrength > 0.25 {   // only the monstera's palette carries veins this strong
             // A monstera's blade: a paler patch where it fans out of the petiole, then, on an old
             // leaf, yellowing, a crisp brown margin and a few brown flecks.
             let junction = max(0, 1 - hypot(site.x, max(0, site.y)) / 0.16)
