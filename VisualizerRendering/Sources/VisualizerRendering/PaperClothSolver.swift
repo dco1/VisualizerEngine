@@ -52,10 +52,6 @@ public final class PaperClothSolver {
     private let windPipeline:       MTLComputePipelineState
     private let floorPipeline:      MTLComputePipelineState
     private let collidePipeline:    MTLComputePipelineState
-    private let hashClearPipeline:  MTLComputePipelineState
-    private let hashCountPipeline:  MTLComputePipelineState
-    private let hashScanPipeline:   MTLComputePipelineState
-    private let hashScatterPipeline:MTLComputePipelineState
     private let selfCollidePipeline:MTLComputePipelineState
     private let writePosPipeline:   MTLComputePipelineState
     private let normalsPipeline:    MTLComputePipelineState
@@ -96,9 +92,7 @@ public final class PaperClothSolver {
 
     // Self-collision spatial hash (counting sort over all particles).
     private static let hashTableSize = 1 << 14   // 16384 buckets
-    private let cellCountsBuffer: MTLBuffer       // atomic_uint[tableSize] (count → cursor → count)
-    private let cellOffsetsBuffer: MTLBuffer      // uint[tableSize]
-    private let sortedBuffer: MTLBuffer           // uint[maxParticles]
+    private let hashGrid: SimSpatialHash          // shared broadphase (counts / offsets / sorted)
     private let hashUniformBuffer: MTLBuffer      // PaperHashUniforms
     private let selfSnapshotBuffer: MTLBuffer     // frozen copy read by paperSelfCollide
     public var selfCollisionEnabled: Bool = true
@@ -309,6 +303,9 @@ public final class PaperClothSolver {
     /// through a layer thinner than that (a 4 m/s towel at 1/120 s moves 33 mm — three plies). Default 1/120 is unchanged.
     public var fixedDt: Float = 1.0 / 120.0
     private var accumulator: Float = 0
+    /// Rest decision (see `SimSettling`). Default policy only measures; `restPolicy = .cloth` turns on static friction
+    /// (`stickSpeed`) and freezes the sheets once they stop.
+    public let settleGate = SettleGate()
     private var time: Float = 0
 
     // Capacity ceilings (set at init).
@@ -325,10 +322,6 @@ public final class PaperClothSolver {
         let dev = engine.device
         guard let pbd = cache.pbdPipelines(for: dev),
               let wind = cache.pipelineState(name: "paperWind", device: dev),
-              let hClear = cache.pipelineState(name: "paperHashClear", device: dev),
-              let hCount = cache.pipelineState(name: "paperHashCount", device: dev),
-              let hScan = cache.pipelineState(name: "paperHashScan", device: dev),
-              let hScatter = cache.pipelineState(name: "paperHashScatter", device: dev),
               let selfCol = cache.pipelineState(name: "paperSelfCollide", device: dev),
               let writePos = cache.pipelineState(name: "paperWritePositions", device: dev),
               let normals  = cache.pipelineState(name: "paperRecomputeNormals", device: dev),
@@ -379,12 +372,7 @@ public final class PaperClothSolver {
             let mBuf = device.makeBuffer(length: MemoryLayout<PaperMeshUniforms>.stride,
                                          options: .storageModeShared),
             let lBuf = device.makeBuffer(length: lambdaBytes, options: .storageModePrivate),
-            let ccBuf = device.makeBuffer(length: Self.hashTableSize * MemoryLayout<UInt32>.stride,
-                                          options: .storageModePrivate),
-            let coBuf = device.makeBuffer(length: Self.hashTableSize * MemoryLayout<UInt32>.stride,
-                                          options: .storageModePrivate),
-            let srBuf = device.makeBuffer(length: max(1, maxParticles) * MemoryLayout<UInt32>.stride,
-                                          options: .storageModePrivate),
+            let grid = SimSpatialHash(device: device, maxParticles: maxParticles, tableSize: Self.hashTableSize, label: "PaperCloth"),
             let snapBuf = device.makeBuffer(length: max(1, maxParticles) * MemoryLayout<PBDParticle>.stride,
                                             options: .storageModePrivate),
             let ancBuf = device.makeBuffer(length: max(1, maxParticles) * MemoryLayout<SIMD4<Float>>.stride,
@@ -414,10 +402,6 @@ public final class PaperClothSolver {
         self.windPipeline       = wind
         self.floorPipeline      = pbd.floor
         self.collidePipeline    = pbd.collide
-        self.hashClearPipeline  = hClear
-        self.hashCountPipeline  = hCount
-        self.hashScanPipeline   = hScan
-        self.hashScatterPipeline = hScatter
         self.selfCollidePipeline = selfCol
         self.writePosPipeline   = writePos
         self.normalsPipeline    = normals
@@ -436,9 +420,7 @@ public final class PaperClothSolver {
         self.windUniformBuffer  = wBuf
         self.meshUniformBuffer  = mBuf
         self.lambdaBuffer       = lBuf
-        self.cellCountsBuffer   = ccBuf
-        self.cellOffsetsBuffer  = coBuf
-        self.sortedBuffer       = srBuf
+        self.hashGrid           = grid
         self.hashUniformBuffer  = huBuf
         snapBuf.label = "PaperCloth.selfSnapshot"
         self.selfSnapshotBuffer = snapBuf
@@ -996,7 +978,7 @@ public final class PaperClothSolver {
     /// pack into `cb`. The caller commits (no waitUntilCompleted). Wind time
     /// advances by wallDt regardless of substep count.
     public func encode(to cb: MTLCommandBuffer, wallDt: Float) {
-        guard sheetCount > 0 else { return }
+        guard sheetCount > 0, !settleGate.frozen else { return }
         if statsEnabled {
             statsFrame += 1
             if statsFrame % 30 == 0 { logStats() }   // reads LAST committed frame's state
@@ -1020,46 +1002,14 @@ public final class PaperClothSolver {
         }
         // Pack the deformed grid into the render buffers once per frame.
         encodeMeshPack(cb)
+        encodeSettling(cb, elapsed: Float(steps) * fixedDt, stepDt: fixedDt)
     }
 
     private func encodeSelfCollide(_ cb: MTLCommandBuffer) {
         let n = particleBuffer.count
         writeHashUniforms()
-        var T = UInt32(Self.hashTableSize)
-
-        if let e = cb.makeComputeCommandEncoder() {
-            e.label = "PaperCloth.hashClear"; e.setComputePipelineState(hashClearPipeline)
-            e.setBuffer(cellCountsBuffer, offset: 0, index: 0)
-            e.setBytes(&T, length: 4, index: 1)
-            dispatch1D(e, pipeline: hashClearPipeline, count: Self.hashTableSize); e.endEncoding()
-        }
-        if let e = cb.makeComputeCommandEncoder() {
-            e.label = "PaperCloth.hashCount"; e.setComputePipelineState(hashCountPipeline)
-            e.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
-            e.setBuffer(cellCountsBuffer, offset: 0, index: 1)
-            e.setBuffer(hashUniformBuffer, offset: 0, index: 2)
-            dispatch1D(e, pipeline: hashCountPipeline, count: n); e.endEncoding()
-        }
-        if let e = cb.makeComputeCommandEncoder() {
-            e.label = "PaperCloth.hashScan"; e.setComputePipelineState(hashScanPipeline)
-            e.setBuffer(cellCountsBuffer, offset: 0, index: 0)
-            e.setBuffer(cellOffsetsBuffer, offset: 0, index: 1)
-            e.setBytes(&T, length: 4, index: 2)
-            // One threadgroup scans the whole table (DH-1530); the kernel's `sums` array holds 1024 chunk totals.
-            e.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1),
-                                   threadsPerThreadgroup: MTLSize(width: min(1024, hashScanPipeline.maxTotalThreadsPerThreadgroup),
-                                                                  height: 1, depth: 1))
-            e.endEncoding()
-        }
-        if let e = cb.makeComputeCommandEncoder() {
-            e.label = "PaperCloth.hashScatter"; e.setComputePipelineState(hashScatterPipeline)
-            e.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
-            e.setBuffer(cellCountsBuffer, offset: 0, index: 1)   // reused as write cursor
-            e.setBuffer(cellOffsetsBuffer, offset: 0, index: 2)
-            e.setBuffer(sortedBuffer, offset: 0, index: 3)
-            e.setBuffer(hashUniformBuffer, offset: 0, index: 4)
-            dispatch1D(e, pipeline: hashScatterPipeline, count: n); e.endEncoding()
-        }
+        hashGrid.encodeBuild(cb, particles: particleBuffer.buffer, particleCount: n,
+                             cellSize: legacyPushout ? 0.05 : selfCellSize, label: "PaperCloth")
         // Two Jacobi relaxation passes against the same buckets. Each pass reads
         // from a SNAPSHOT of the particle buffer and writes only its own particle —
         // without it the kernel races its own writes (whether a thread sees a
@@ -1076,9 +1026,9 @@ public final class PaperClothSolver {
             if let e = cb.makeComputeCommandEncoder() {
                 e.label = "PaperCloth.selfCollide"; e.setComputePipelineState(selfCollidePipeline)
                 e.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
-                e.setBuffer(cellOffsetsBuffer, offset: 0, index: 1)
-                e.setBuffer(cellCountsBuffer, offset: 0, index: 2)   // per-bucket count post-scatter
-                e.setBuffer(sortedBuffer, offset: 0, index: 3)
+                e.setBuffer(hashGrid.offsets, offset: 0, index: 1)
+                e.setBuffer(hashGrid.counts, offset: 0, index: 2)   // per-bucket count post-scatter
+                e.setBuffer(hashGrid.sorted, offset: 0, index: 3)
                 e.setBuffer(hashUniformBuffer, offset: 0, index: 4)
                 e.setBuffer(selfSnapshotBuffer, offset: 0, index: 5)
                 e.setBuffer(pileBuffer, offset: 0, index: 6)
@@ -1735,4 +1685,10 @@ struct PaperHashUniforms {
     var stickDisp: Float = 0
     var layerRadius: Float = 0
     var pileRest: Float = 0
+}
+
+extension PaperClothSolver: SimSettling {
+    public func settleSource() -> SettleSource? { .particles(particleBuffer.buffer, count: particleBuffer.count) }
+    /// `holdSpeed` is this solver's static-friction stick regime (`stickSpeed`); 0 leaves whatever was set.
+    public func applyRestPolicy(_ policy: RestPolicy) { if policy.holdSpeed > 0 { stickSpeed = policy.holdSpeed } }
 }

@@ -646,6 +646,8 @@ public final class PBDSolver {
     // NEXT STEP (XPBD): use compliance-based constraints that are truly
     // dt-independent. Then fixedDt can be coarser without visual softening.
     private let fixedDt: Float = 1.0 / 120.0
+    /// Rest decision (see `SimSettling`). A frozen solver is not stepped, by `advance` or by a tube renderer's `encode`.
+    public let settleGate = SettleGate()
     public var accumulator: Float = 0.0
 
     // ── Init ─────────────────────────────────────────────────────────────────
@@ -1097,6 +1099,7 @@ public final class PBDSolver {
     // ── Advance (standalone) ─────────────────────────────────────────────────
 
     public func advance(wallDt: Float) {
+        guard !settleGate.frozen else { return }
         accumulator += wallDt
         var steps = 0
         while accumulator >= fixedDt && steps < 4 {
@@ -1132,6 +1135,8 @@ public final class PBDSolver {
     /// at the moment of the call. Use the split form when multiple bodies share
     /// a collider buffer that must be rebuilt mid-substep.
     public func encode(to commandBuffer: MTLCommandBuffer, dt: Float) {
+        guard !settleGate.frozen else { return }
+        defer { encodeSettling(commandBuffer, elapsed: dt, stepDt: dt) }
         encodeIntegrate(to: commandBuffer, dt: dt)
         encodeConstraintsAndContacts(to: commandBuffer, dt: dt)
     }
@@ -1749,4 +1754,10 @@ public final class PBDSolver {
         )
         encoder.endEncoding()
     }
+}
+
+extension PBDSolver: SimSettling {
+    public func settleSource() -> SettleSource? { .particles(particleBuffer.buffer, count: particleBuffer.count) }
+    /// A cord has no contact-friction model to switch on: the policy is the measurement and the freeze.
+    public func applyRestPolicy(_ policy: RestPolicy) {}
 }

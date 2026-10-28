@@ -1,6 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 #include "PBDCollider.h"
+#include "SimSpatialHash.h"
 
 // ── PaperCloth.metal ──────────────────────────────────────────────────────────
 //
@@ -602,71 +603,7 @@ struct PaperHashUniforms {
     float pileRest;
 };
 
-static int3 paperCellCoord(float3 p, float cs) { return int3(floor(p / cs)); }
-static uint paperHashCell(int3 c, uint tableSize) {
-    uint h = (uint(c.x) * 73856093u) ^ (uint(c.y) * 19349663u) ^ (uint(c.z) * 83492791u);
-    return h % tableSize;
-}
-
-kernel void paperHashClear(device atomic_uint* counts [[ buffer(0) ]],
-                           constant uint& tableSize   [[ buffer(1) ]],
-                           uint id [[ thread_position_in_grid ]]) {
-    if (id >= tableSize) return;
-    atomic_store_explicit(&counts[id], 0u, memory_order_relaxed);
-}
-
-kernel void paperHashCount(device const PBDParticle* P  [[ buffer(0) ]],
-                           device atomic_uint* counts    [[ buffer(1) ]],
-                           constant PaperHashUniforms& u [[ buffer(2) ]],
-                           uint id [[ thread_position_in_grid ]]) {
-    if (id >= u.particleCount) return;
-    uint h = paperHashCell(paperCellCoord(P[id].positionAndInvMass.xyz, u.cellSize), u.tableSize);
-    atomic_fetch_add_explicit(&counts[h], 1u, memory_order_relaxed);
-}
-
-// Exclusive prefix sum of the bucket counts, in ONE threadgroup (DH-1530). It used to be a single GPU thread walking all
-// 16 384 buckets — about 45 % of a towel's settle. Each thread now owns a contiguous chunk of buckets, the chunk totals are
-// scanned in threadgroup memory, and every thread writes its chunk's offsets. Integer arithmetic, so the result is exactly
-// the serial scan's. Re-zeros counts so the scatter pass can reuse them as a write cursor. Dispatch ONE threadgroup of at
-// most 1024 threads (`sums` is sized for that).
-kernel void paperHashScan(device atomic_uint* counts [[ buffer(0) ]],
-                          device uint* offsets        [[ buffer(1) ]],
-                          constant uint& tableSize    [[ buffer(2) ]],
-                          uint tid [[ thread_position_in_threadgroup ]],
-                          uint tgs [[ threads_per_threadgroup ]]) {
-    threadgroup uint sums[1024];
-    uint chunk = (tableSize + tgs - 1u) / tgs;
-    uint lo = min(tid * chunk, tableSize), hi = min(lo + chunk, tableSize);
-    uint mine = 0u;
-    for (uint i = lo; i < hi; ++i) mine += atomic_load_explicit(&counts[i], memory_order_relaxed);
-    sums[tid] = mine;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint off = 1u; off < tgs; off <<= 1) {          // Hillis-Steele inclusive scan of the chunk totals
-        uint v = (tid >= off) ? sums[tid - off] : 0u;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        sums[tid] += v;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    uint acc = sums[tid] - mine;                          // exclusive: everything before this chunk
-    for (uint i = lo; i < hi; ++i) {
-        uint c = atomic_load_explicit(&counts[i], memory_order_relaxed);
-        offsets[i] = acc;
-        acc += c;
-        atomic_store_explicit(&counts[i], 0u, memory_order_relaxed);
-    }
-}
-
-kernel void paperHashScatter(device const PBDParticle* P  [[ buffer(0) ]],
-                             device atomic_uint* cursor    [[ buffer(1) ]],
-                             device const uint* offsets     [[ buffer(2) ]],
-                             device uint* sorted            [[ buffer(3) ]],
-                             constant PaperHashUniforms& u  [[ buffer(4) ]],
-                             uint id [[ thread_position_in_grid ]]) {
-    if (id >= u.particleCount) return;
-    uint h = paperHashCell(paperCellCoord(P[id].positionAndInvMass.xyz, u.cellSize), u.tableSize);
-    uint slot = atomic_fetch_add_explicit(&cursor[h], 1u, memory_order_relaxed);
-    sorted[offsets[h] + slot] = id;
-}
+// Hash grid build + cell hash: shared (SimSpatialHash.metal / .h).
 
 // `S` is a SNAPSHOT of the particle buffer taken just before this dispatch. All
 // reads (own state AND neighbours) come from the snapshot; only P[id] is written.
@@ -689,7 +626,7 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
     if (pi.positionAndInvMass.w == 0.0) return;   // pinned
 
     float3 pos = pi.positionAndInvMass.xyz;
-    int3 base  = paperCellCoord(pos, u.cellSize);
+    int3 base  = simCellCoord(pos, u.cellSize);
     uint sheet = id / u.verticesPerSheet;
     uint local = id - sheet * u.verticesPerSheet;
     int  x = int(local % u.gridW), y = int(local / u.gridW);
@@ -704,7 +641,7 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
     for (int dz = -1; dz <= 1; ++dz)
     for (int dy = -1; dy <= 1; ++dy)
     for (int dx = -1; dx <= 1; ++dx) {
-        uint h = paperHashCell(base + int3(dx, dy, dz), u.tableSize);
+        uint h = simHashCell(base + int3(dx, dy, dz), u.tableSize);
         uint start = offsets[h], cnt = counts[h];
         // DETERMINISM: the scatter fills buckets through an atomic cursor, so the
         // stored order differs run to run — and float accumulation is not

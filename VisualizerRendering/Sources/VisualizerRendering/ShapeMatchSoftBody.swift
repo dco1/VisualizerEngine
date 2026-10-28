@@ -1,3 +1,4 @@
+import simd
 import Foundation
 import Metal
 import OSLog
@@ -132,10 +133,6 @@ public final class ShapeMatchSoftBody {
     private let clusterFitPipeline: MTLComputePipelineState
     private let applyGoalsPipeline: MTLComputePipelineState
     private let collidePipeline:    MTLComputePipelineState
-    private let hashClearPipeline:  MTLComputePipelineState
-    private let hashCountPipeline:  MTLComputePipelineState
-    private let hashScanPipeline:   MTLComputePipelineState
-    private let hashScatterPipeline:MTLComputePipelineState
     private let selfCollidePipeline:MTLComputePipelineState
     private let skinWritePipeline:  MTLComputePipelineState
 
@@ -164,9 +161,7 @@ public final class ShapeMatchSoftBody {
 
     // ── Self-collision hash ──
     private static let hashTableSize = 1 << 14
-    private let cellCountsBuffer:  MTLBuffer
-    private let cellOffsetsBuffer: MTLBuffer
-    private let sortedBuffer:      MTLBuffer
+    private let hashGrid:          SimSpatialHash   // shared broadphase (counts / offsets / sorted)
     private let hashUniformBuffer: MTLBuffer
 
     // ── Per-slot render output + mesh ──
@@ -194,6 +189,8 @@ public final class ShapeMatchSoftBody {
     public var selfCollisionEnabled = true
     private let fixedDt: Float = 1.0 / 120.0
     private var accumulator: Float = 0
+    /// Rest decision (see `SimSettling`).
+    public let settleGate = SettleGate()
 
     // ── Init ──
 
@@ -208,10 +205,6 @@ public final class ShapeMatchSoftBody {
             let fit     = cache.pipelineState(name: "sm_cluster_fit", device: dev),
             let goals   = cache.pipelineState(name: "sm_apply_goals", device: dev),
             let coll    = cache.pipelineState(name: "sm_collide",     device: dev),
-            let hClear  = cache.pipelineState(name: "sm_hashClear",   device: dev),
-            let hCount  = cache.pipelineState(name: "sm_hashCount",   device: dev),
-            let hScan   = cache.pipelineState(name: "sm_hashScan",    device: dev),
-            let hScatter = cache.pipelineState(name: "sm_hashScatter", device: dev),
             let selfC   = cache.pipelineState(name: "sm_selfCollide", device: dev),
             let skin    = cache.pipelineState(name: "sm_skin_write",  device: dev)
         else {
@@ -229,10 +222,6 @@ public final class ShapeMatchSoftBody {
         self.clusterFitPipeline = fit
         self.applyGoalsPipeline = goals
         self.collidePipeline = coll
-        self.hashClearPipeline = hClear
-        self.hashCountPipeline = hCount
-        self.hashScanPipeline = hScan
-        self.hashScatterPipeline = hScatter
         self.selfCollidePipeline = selfC
         self.skinWritePipeline = skin
 
@@ -243,9 +232,7 @@ public final class ShapeMatchSoftBody {
             let csBuf = dev.makeBuffer(length: maxBodies * C * MemoryLayout<SMClusterState>.stride, options: .storageModeShared),
             let colBuf = SimBuffer<PBDCollider>(device: dev, capacity: 8, label: "SoftBody.colliders"),
             let uBuf = dev.makeBuffer(length: MemoryLayout<SMUniforms>.stride, options: .storageModeShared),
-            let ccBuf = dev.makeBuffer(length: Self.hashTableSize * 4, options: .storageModePrivate),
-            let coBuf = dev.makeBuffer(length: Self.hashTableSize * 4, options: .storageModePrivate),
-            let srBuf = dev.makeBuffer(length: max(1, maxParticles) * 4, options: .storageModePrivate),
+            let grid = SimSpatialHash(device: dev, maxParticles: maxParticles, tableSize: Self.hashTableSize, label: "SoftBody"),
             let huBuf = dev.makeBuffer(length: MemoryLayout<SMHashUniforms>.stride, options: .storageModeShared),
             let skuBuf = dev.makeBuffer(length: MemoryLayout<SMSkinUniforms>.stride, options: .storageModeShared)
         else {
@@ -257,9 +244,7 @@ public final class ShapeMatchSoftBody {
         self.clusterStateBuffer = csBuf
         self.colliderBuffer = colBuf
         self.uniformBuffer = uBuf
-        self.cellCountsBuffer = ccBuf
-        self.cellOffsetsBuffer = coBuf
-        self.sortedBuffer = srBuf
+        self.hashGrid = grid
         self.hashUniformBuffer = huBuf
         self.skinUniformBuffer = skuBuf
 
@@ -462,7 +447,7 @@ public final class ShapeMatchSoftBody {
     /// Advance all alive bodies and re-skin their meshes. Encodes into one command
     /// buffer on the shared queue and commits (non-blocking).
     public func step(dt: Float) {
-        guard bodyCount > 0 else { return }
+        guard bodyCount > 0, !settleGate.frozen else { return }
         accumulator += max(0, min(dt, 1.0 / 30.0))
         var steps = 0
         guard let cb = commandQueue.makeCommandBuffer() else { return }
@@ -477,6 +462,7 @@ public final class ShapeMatchSoftBody {
             steps += 1
         }
         encodeSkin(cb)
+        encodeSettling(cb, elapsed: Float(steps) * fixedDt, stepDt: fixedDt)
         cb.commit()
     }
 
@@ -553,38 +539,13 @@ public final class ShapeMatchSoftBody {
         hu.pointee = SMHashUniforms(particleCount: UInt32(n), tableSize: UInt32(Self.hashTableSize),
                                     cellSize: selfCellSize, radius: selfRadius,
                                     particlesPerBody: UInt32(P))
-        var T = UInt32(Self.hashTableSize)
-        encode(cb, hashClearPipeline, count: Self.hashTableSize, label: "SoftBody.hashClear") { e in
-            e.setBuffer(self.cellCountsBuffer, offset: 0, index: 0)
-            e.setBytes(&T, length: 4, index: 1)
-        }
-        encode(cb, hashCountPipeline, count: n, label: "SoftBody.hashCount") { e in
-            e.setBuffer(self.particleBuffer.buffer, offset: 0, index: 0)
-            e.setBuffer(self.cellCountsBuffer, offset: 0, index: 1)
-            e.setBuffer(self.hashUniformBuffer, offset: 0, index: 2)
-        }
-        if let e = cb.makeComputeCommandEncoder() {
-            e.label = "SoftBody.hashScan"; e.setComputePipelineState(hashScanPipeline)
-            e.setBuffer(cellCountsBuffer, offset: 0, index: 0)
-            e.setBuffer(cellOffsetsBuffer, offset: 0, index: 1)
-            e.setBytes(&T, length: 4, index: 2)
-            e.dispatchThreads(MTLSize(width: 1, height: 1, depth: 1),
-                              threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
-            e.endEncoding()
-        }
-        encode(cb, hashScatterPipeline, count: n, label: "SoftBody.hashScatter") { e in
-            e.setBuffer(self.particleBuffer.buffer, offset: 0, index: 0)
-            e.setBuffer(self.cellCountsBuffer, offset: 0, index: 1)
-            e.setBuffer(self.cellOffsetsBuffer, offset: 0, index: 2)
-            e.setBuffer(self.sortedBuffer, offset: 0, index: 3)
-            e.setBuffer(self.hashUniformBuffer, offset: 0, index: 4)
-        }
+        hashGrid.encodeBuild(cb, particles: particleBuffer.buffer, particleCount: n, cellSize: selfCellSize, label: "SoftBody")
         for _ in 0..<6 {
             encode(cb, selfCollidePipeline, count: n, label: "SoftBody.selfCollide") { e in
                 e.setBuffer(self.particleBuffer.buffer, offset: 0, index: 0)
-                e.setBuffer(self.cellOffsetsBuffer, offset: 0, index: 1)
-                e.setBuffer(self.cellCountsBuffer, offset: 0, index: 2)
-                e.setBuffer(self.sortedBuffer, offset: 0, index: 3)
+                e.setBuffer(self.hashGrid.offsets, offset: 0, index: 1)
+                e.setBuffer(self.hashGrid.counts, offset: 0, index: 2)
+                e.setBuffer(self.hashGrid.sorted, offset: 0, index: 3)
                 e.setBuffer(self.hashUniformBuffer, offset: 0, index: 4)
             }
         }
@@ -630,4 +591,10 @@ public final class ShapeMatchSoftBody {
         e.dispatchThreads(MTLSize(width: count, height: 1, depth: 1),
                           threadsPerThreadgroup: MTLSize(width: max(1, w), height: 1, depth: 1))
     }
+}
+
+extension ShapeMatchSoftBody: SimSettling {
+    /// Alive particles only (`bodyCount · P`); the buffer's capacity is for the largest pile it may ever hold.
+    public func settleSource() -> SettleSource? { .particles(particleBuffer.buffer, count: bodyCount * P) }
+    public func applyRestPolicy(_ policy: RestPolicy) {}
 }

@@ -1,6 +1,7 @@
 #include <metal_stdlib>
 using namespace metal;
 #include "PBDCollider.h"
+#include "SimSpatialHash.h"
 
 // ── SHAPE-MATCH SOFT BODY ────────────────────────────────────────────────────
 //
@@ -286,67 +287,7 @@ kernel void sm_collide(
 // ── Self-collision spatial hash (bear↔bear) ──────────────────────────────────
 // Counting-sort broadphase + Jacobi pairwise pushout, skipping same-body pairs.
 
-static inline uint sm_hashCell(int3 cell, uint tableSize) {
-    // Large primes (Teschner et al.).
-    int h = (cell.x * 92837111) ^ (cell.y * 689287499) ^ (cell.z * 283923481);
-    return uint(h & 0x7fffffff) % tableSize;
-}
-
-kernel void sm_hashClear(
-    device atomic_uint* counts [[buffer(0)]],
-    constant uint&      tableSize [[buffer(1)]],
-    uint id [[thread_position_in_grid]])
-{
-    if (id >= tableSize) return;
-    atomic_store_explicit(&counts[id], 0u, memory_order_relaxed);
-}
-
-kernel void sm_hashCount(
-    device const SMParticle* particles [[buffer(0)]],
-    device atomic_uint*      counts    [[buffer(1)]],
-    constant SMHashUniforms& h         [[buffer(2)]],
-    uint id [[thread_position_in_grid]])
-{
-    if (id >= h.particleCount) return;
-    float3 p = particles[id].pos.xyz;
-    int3 cell = int3(floor(p / h.cellSize));
-    uint b = sm_hashCell(cell, h.tableSize);
-    atomic_fetch_add_explicit(&counts[b], 1u, memory_order_relaxed);
-}
-
-kernel void sm_hashScan(
-    device uint*       counts  [[buffer(0)]],
-    device uint*       offsets [[buffer(1)]],
-    constant uint&     tableSize [[buffer(2)]],
-    uint id [[thread_position_in_grid]])
-{
-    // Single-thread prefix sum, then RESET counts to 0 so the same buffer serves
-    // as the zero-initialised scatter write cursor; after scatter it holds the
-    // per-bucket count again, which sm_selfCollide reads. (PaperCloth idiom.)
-    if (id != 0u) return;
-    uint acc = 0u;
-    for (uint i = 0; i < tableSize; ++i) {
-        offsets[i] = acc;
-        acc += counts[i];
-        counts[i] = 0u;
-    }
-}
-
-kernel void sm_hashScatter(
-    device const SMParticle* particles [[buffer(0)]],
-    device atomic_uint*      cursor    [[buffer(1)]],   // reused counts as write cursor
-    device const uint*       offsets   [[buffer(2)]],
-    device uint*             sorted    [[buffer(3)]],
-    constant SMHashUniforms& h         [[buffer(4)]],
-    uint id [[thread_position_in_grid]])
-{
-    if (id >= h.particleCount) return;
-    float3 p = particles[id].pos.xyz;
-    int3 cell = int3(floor(p / h.cellSize));
-    uint b = sm_hashCell(cell, h.tableSize);
-    uint slot = atomic_fetch_add_explicit(&cursor[b], 1u, memory_order_relaxed);
-    sorted[offsets[b] + slot] = id;
-}
+// Hash grid build + cell hash: shared (SimSpatialHash.metal / .h).
 
 kernel void sm_selfCollide(
     device SMParticle*       particles [[buffer(0)]],
@@ -369,7 +310,7 @@ kernel void sm_selfCollide(
     for (int dz = -1; dz <= 1; ++dz)
     for (int dy = -1; dy <= 1; ++dy)
     for (int dx = -1; dx <= 1; ++dx) {
-        uint b = sm_hashCell(base + int3(dx, dy, dz), h.tableSize);
+        uint b = simHashCell(base + int3(dx, dy, dz), h.tableSize);
         uint o = offsets[b];
         uint n = counts[b];
         for (uint k = 0; k < n; ++k) {

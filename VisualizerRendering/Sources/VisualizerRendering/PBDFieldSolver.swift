@@ -127,6 +127,8 @@ public final class PBDFieldSolver {
 
     /// Fixed substep dt. Field-scale grass simulates fine at 1/120 s.
     private let fixedDt: Float = 1.0 / 120.0
+    /// Rest decision (see `SimSettling`).
+    public let settleGate = SettleGate()
     public var accumulator: Float = 0.0
 
     // Wall-clock time used as the wind noise seed. Advanced inside
@@ -299,6 +301,7 @@ public final class PBDFieldSolver {
     /// regardless of how many substeps run, so the noise field animates at
     /// real-time even when the substep budget caps out.
     public func encode(to cb: MTLCommandBuffer, wallDt: Float) {
+        guard !settleGate.frozen else { return }
         time += wallDt
         accumulator += wallDt
         var steps = 0
@@ -307,6 +310,7 @@ public final class PBDFieldSolver {
             accumulator -= fixedDt
             steps += 1
         }
+        encodeSettling(cb, elapsed: Float(steps) * fixedDt, stepDt: fixedDt)
     }
 
     private func encodeSubstep(to cb: MTLCommandBuffer, dt: Float) {
@@ -478,4 +482,10 @@ struct PBDFieldForcesUniforms {
     var windDirZ:     Float
     var springK:      Float
     var springDamp:   Float
+}
+
+extension PBDFieldSolver: SimSettling {
+    /// ~180 k blades: sample every 16th — a field that is moving moves everywhere, and a full read costs more than it tells.
+    public func settleSource() -> SettleSource? { .particles(particleBuffer.buffer, count: particleBuffer.count, sampleStride: 16) }
+    public func applyRestPolicy(_ policy: RestPolicy) {}
 }

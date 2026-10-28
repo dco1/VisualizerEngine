@@ -821,3 +821,23 @@ public final class CoinJointPool {
         give(w.slot)
     }
 }
+
+extension CoinDEMSolver: SimSettling {
+    /// The bodies' linear velocities, skipping sleeping islands (asleep is, by definition, at rest) and inactive slots.
+    public func settleSource() -> SettleSource? {
+        guard highWater > 0 else { return nil }
+        return SettleSource(buffer: coinBuffer.buffer, count: highWater, byteStride: MemoryLayout<CoinBody>.stride,
+                            posOffset: MemoryLayout<CoinBody>.offset(of: \.posInvMass)!,
+                            prevOffset: MemoryLayout<CoinBody>.offset(of: \.vel)!,
+                            velocityMode: true, asleep: asleepBuffer)
+    }
+    /// The per-island sleep stays as the internal layer under the shared gate (the gate is all-or-nothing; without
+    /// island sleep a pile with one moving coin would simulate everything): speed → `sleepLinVel`, seconds → `sleepFrames`
+    /// at the 60 Hz frame the sleep counts in. `sleepEnabled` is not touched — turning island sleep off is its own decision.
+    public func applyRestPolicy(_ policy: RestPolicy) {
+        sleepLinVel = policy.speed
+        sleepFrames = UInt32(max(1, (policy.seconds * 60).rounded()))
+    }
+    /// Waking also wakes every sleeping island — the gate alone would leave them asleep.
+    public func wake() { settleGate.wake(); wakeAll() }
+}

@@ -825,6 +825,9 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// for `sleepFrames`, so a settled heap skips the whole solve. On by default for the
     /// constraint path (it's pure perf + the per-island gate prevents premature freezing).
     public var sleepEnabled: Bool = true
+    /// Rest decision (see `SimSettling`). The rigid solver already sleeps whole islands and skips the whole solve when the
+    /// pile is asleep; the gate adds the shared surface (`isSettled`, `freeze()`, `wake()`) over that, and a hard `freeze()`.
+    public let settleGate = SettleGate()
     public var sleepFrames: UInt32 = 30         // ~0.5 s of stillness before an island sleeps
     /// True if the last `encode(to:)` skipped all solver work (the whole pile was
     /// frozen). For tests / perf instrumentation.
@@ -2151,6 +2154,14 @@ public final class CoinDEMSolver: PenetrationProbing {
     /// Encode a frame's worth of fixed-dt substeps + orientation + transforms
     /// into `cb`. No `waitUntilCompleted` here — the caller commits once.
     public func encode(to cb: MTLCommandBuffer, wallDt: Float) {
+        guard highWater > 0, !settleGate.frozen else { return }
+        encodeFrame(to: cb, wallDt: wallDt)
+        // The shared gate: the fastest AWAKE body this frame (see `SimSettling`). Island sleep stays underneath it, and a
+        // frame the whole-pile sleep skipped covers no time. (`lastStepCount` is left alone: tests read it across skips.)
+        encodeSettling(cb, elapsed: didSkipLastFrame ? 0 : Float(lastStepCount) * fixedDt, stepDt: fixedDt)
+    }
+
+    private func encodeFrame(to cb: MTLCommandBuffer, wallDt: Float) {
         let bound = highWater
         guard bound > 0 else { return }
 
