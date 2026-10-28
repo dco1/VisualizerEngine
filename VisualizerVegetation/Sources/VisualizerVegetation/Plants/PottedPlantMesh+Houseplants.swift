@@ -234,13 +234,13 @@ extension PottedPlantMesh {
             let outDir = Vec3(cos(azimuth), 0, sin(azimuth))
             let newest = i == count - 1 && count >= 3
             let maturity = newest ? 0.1 : 1 - 0.55 * t
-            let youth = newest ? 0.38 : smoothstep(0.75, 1.0, t) * 0.5
+            let youth = newest ? 0.20 : smoothstep(0.75, 1.0, t) * 0.5
             var tone = FoliagePaint.tone(youth: youth, palette: palette, rng: &rng)
             tone.age = newest ? 0 : max(0, 1 - 3.2 * t) * (0.35 + 0.35 * rng.unit())   // the lowest leaves are the oldest
             // Blade and where its petiole holds it: the old leaves low and far out, the new ones high
             // and close — a monstera spreads wider than it is tall, a FOUNTAIN of overlapping leaves.
             // (Held nearly flat at the top of tall straight stalks, the blades read as parasols.)
-            let blade = size * (newest ? 0.24 : 0.58 - 0.14 * t) * (0.82 + rng.unit() * 0.36)
+            let blade = size * (newest ? 0.19 : 0.58 - 0.14 * t) * (0.82 + rng.unit() * 0.36)
             let reach = size * (0.42 - 0.22 * t) * (0.85 + rng.unit() * 0.3)
             let height = size * (0.44 + 0.46 * t) * (0.85 + rng.unit() * 0.30)
             // Petioles leave a short climbing stem at successive nodes — older leaves lower — not one
@@ -273,12 +273,24 @@ extension PottedPlantMesh {
             // The blade HANGS from the top of its stalk (the bend at the geniculum): a mature leaf's
             // midrib runs 0–20° below horizontal, the oldest lowest, each rolled a little about its
             // midrib so no two present the same face; the newest, still unfurling, stands up.
-            let tilt = (newest ? 0.55 : 1.95 + 0.34 * (1 - t)) + (rng.unit() - 0.5) * 0.50
+            let tilt = (newest ? 0.45 : 1.62 + 0.62 * (1 - t)) + (rng.unit() - 0.5) * 0.44
             let f = leafFrame(azimuth: azimuth + (rng.unit() - 0.5) * 0.3, tilt: tilt,
                               roll: (rng.unit() - 0.5) * 0.95)
+            if newest {
+                // The new leaf has not opened yet: a glossy rolled "cigar" standing out of the crown,
+                // bowing a little toward the light — an open, pale, cupped blade read as a scoop.
+                let lean = f.y * 0.82 + outDir * 0.18
+                let cigar = (0 ... 8).map { k -> Vec3 in
+                    let u = Double(k) / 8
+                    return bladeBase + lean * (blade * 1.15 * u) + outDir * (blade * 0.10 * u * u)
+                }
+                out.leaves.append(paintedStalk(cigar, rBase: petR * 1.45, rTip: petR * 0.22, sides: 9,
+                                               color: FoliagePaint.base(palette, tone, face: .upper)))
+                continue
+            }
             var s = LeafSheet.Surface(base: bladeBase, xAxis: f.x, yAxis: f.y, normal: f.n,
                                       length: blade, halfWidth: 0.53)
-            s.cup = newest ? 0.85 : -0.04 - rng.unit() * 0.08   // a mature blade domes; the new one cups
+            s.cup = newest ? 1.30 : -0.04 - rng.unit() * 0.08   // a mature blade domes; the new one cups
             s.cupPower = 1.9
             s.droop = newest ? 0.04 : 0.07 + rng.unit() * 0.08
             s.midribGroove = 0.012
