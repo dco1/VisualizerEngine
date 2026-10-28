@@ -242,7 +242,7 @@ extension PottedPlantMesh {
             // (Held nearly flat at the top of tall straight stalks, the blades read as parasols.)
             let blade = size * (newest ? 0.19 : 0.58 - 0.14 * t) * (0.82 + rng.unit() * 0.36)
             let reach = size * (0.42 - 0.22 * t) * (0.85 + rng.unit() * 0.3)
-            let height = size * (0.44 + 0.46 * t) * (0.85 + rng.unit() * 0.30)
+            let height = size * (0.62 + 0.40 * t) * (0.85 + rng.unit() * 0.30)
             // Petioles leave a short climbing stem at successive nodes — older leaves lower — not one
             // point at the soil, so the stalks fan from a column instead of bunching like a bouquet.
             let foot = Vec3(0, soilY + size * (0.03 + 0.20 * t), 0) + outDir * (size * 0.02)
