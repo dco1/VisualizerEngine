@@ -152,6 +152,19 @@ public extension PlantStyle {
         }
     }
 
+    /// The waxy CUTICLE over a leaf — a clear coat (strength, roughness) on top of the blade's own
+    /// `leafRoughness`. A monstera or fig leaf photographs with crisp window and sky highlights that
+    /// a single rough lobe cannot give: the blade below is satin, the wax on it is near-glass. Zero =
+    /// no coat (a fern's matte pinnae, a succulent's powder bloom).
+    public var leafCuticle: (strength: Float, roughness: Float) {
+        switch self {
+        case .monstera:      return (0.75, 0.10)
+        case .fiddleLeafFig: return (0.65, 0.12)
+        case .snakePlant:    return (0.35, 0.20)
+        case .fern, .succulent, .flowers, .driedSpray, .christmasTree: return (0, 0.08)
+        }
+    }
+
     /// The fraction of the light reaching a leaf's FAR face that comes through it — why a leaf
     /// between you and a bright window glows yellow-green instead of standing as a dark cut-out
     /// (DH-0946). Measured leaf transmittance runs ~5–10 % for a leathery, cuticled leaf, 10–25 % for

@@ -274,8 +274,8 @@ extension PottedPlantMesh {
             s.cup = newest ? 0.55 : -0.04 - rng.unit() * 0.08   // a mature blade domes; the new one cups
             s.cupPower = 1.9
             s.droop = newest ? 0.04 : 0.14 + rng.unit() * 0.14
-            s.midribGroove = 0.006
-            s.pucker = newest ? 0 : 0.004   // quilted: tissue between lateral veins domes up
+            s.midribGroove = 0.012
+            s.pucker = newest ? 0 : 0.007   // quilted: tissue between lateral veins domes up
             s.midribHalfWidth = 0.02
             s.ripple = 0.0035
             s.rippleWaves = 1.6
