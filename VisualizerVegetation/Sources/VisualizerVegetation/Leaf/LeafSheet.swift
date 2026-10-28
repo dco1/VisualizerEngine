@@ -346,7 +346,13 @@ public enum LeafSheet {
     /// segment of tissue is wider than `spacing`.
     static func monsteraColumns(_ cuts: MonsteraCuts, spacing: Double, veinColumns: Bool = true) -> [Double] {
         var edges: Set<Double> = [0, 0.05, 0.10, monsteraLobeFan, 1]
-        for s in cuts.splits { edges.insert(s.a - s.width / 2); edges.insert(s.a + s.width / 2) }
+        for s in cuts.splits {
+            edges.insert(s.a - s.width / 2); edges.insert(s.a + s.width / 2)
+            // Extra stations beside each slit mouth so the rounded lobe tip is a curve, not one chamfer.
+            if veinColumns, s.depth < 1 {
+                for d in [0.008, 0.018, 0.032, 0.048] { edges.insert(s.a - s.width / 2 - d); edges.insert(s.a + s.width / 2 + d) }
+            }
+        }
         for h in cuts.holes { edges.insert(h.a - h.width / 2); edges.insert(h.a + h.width / 2) }
         // A lateral vein runs half-way between two cuts; narrow columns either side of it let the
         // painter draw it as a thin pale line instead of a soft band.
@@ -389,8 +395,8 @@ public enum LeafSheet {
         let mouths = cuts.splits.filter { $0.depth < 1 }.flatMap { [$0.a - $0.width / 2, $0.a + $0.width / 2] }
         func rounded(_ a: Double, _ r: Double) -> Double {
             guard r > 0.6, let d = mouths.map({ abs(a - $0) }).min() else { return r }
-            let near = 1 - min(1, d / 0.05)
-            return r - 0.10 * near * near * smoothstep(0.6, 1, r)
+            let near = 1 - min(1, d / 0.06)
+            return r - 0.14 * (1 - (1 - near * near).squareRoot()) * smoothstep(0.6, 1, r)
         }
         func site(_ a: Double, _ r: Double) -> Site {
             let q = monsteraPoint(a: a, r: rounded(a, r))
