@@ -304,7 +304,10 @@ public final class PaperClothSolver {
 
     public var dihedralYieldAngle: Float = .pi
     public var dihedralCreepRate: Float = 0
-    private let fixedDt: Float = 1.0 / 120.0
+    /// The substep. The inter-sheet / self collision pass runs once per `encode(to:wallDt:)`, so a caller that wants a collision
+    /// pass every substep calls `encode` with `wallDt == fixedDt`. A cloth landing at v moves v·fixedDt per step and tunnels
+    /// through a layer thinner than that (a 4 m/s towel at 1/120 s moves 33 mm — three plies). Default 1/120 is unchanged.
+    public var fixedDt: Float = 1.0 / 120.0
     private var accumulator: Float = 0
     private var time: Float = 0
 
