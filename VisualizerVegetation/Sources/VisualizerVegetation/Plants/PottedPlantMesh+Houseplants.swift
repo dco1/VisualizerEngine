@@ -199,18 +199,18 @@ extension PottedPlantMesh {
     /// One monstera blade's cuts for one half, seeded. A juvenile (`maturity` near 0) leaf is entire;
     /// a mature one carries 5–7 splits of varied depth, some with a fenestration in line inside them.
     public static func monsteraCuts(maturity: Double, rng: inout SplitMix) -> LeafSheet.MonsteraCuts {
-        let n = maturity < 0.25 ? 0 : max(3, Int((4 + 3 * maturity + (rng.unit() - 0.5) * 2.2).rounded()))
+        let n = maturity < 0.25 ? 0 : max(3, Int((3.4 + 2.6 * maturity + (rng.unit() - 0.5) * 1.6).rounded()))
         var splits: [LeafSheet.MonsteraCuts.Split] = []
         var holes: [LeafSheet.MonsteraCuts.Hole] = []
         guard n > 0 else { return .init(splits: [], holes: []) }
         let a0 = 0.23, a1 = 0.86
         for k in 0 ..< n {
             let a = a0 + (a1 - a0) * Double(k) / Double(max(1, n - 1)) + (rng.unit() - 0.5) * 0.05
-            let w = 0.016 + rng.unit() * 0.016
+            let w = 0.022 + rng.unit() * 0.018
             let r = rng.unit()
-            let depth = k == n - 1 ? 0.72 : (r < 0.35 ? 0.30 : (r < 0.75 ? 0.48 : 0.72))
+            let depth = k == n - 1 ? 0.72 : (r < 0.18 ? 0.30 : (r < 0.55 ? 0.48 : 0.72))
             splits.append(.init(a: a, width: w, depth: depth))
-            if depth >= 0.48, k < n - 1, rng.unit() < 0.55 * maturity {
+            if depth >= 0.48, k < n - 1, rng.unit() < 0.65 * maturity {
                 // In line with its split and exactly as wide — shared column edges, no sliver.
                 holes.append(.init(a: a, width: w, r0: 0.18, r1: 0.30 + 0.18 * rng.unit()))
             }
@@ -267,15 +267,15 @@ extension PottedPlantMesh {
                 }
             }
             out.leaves.append(paintedStalk(path, rBase: petR, rTip: petR * 0.7, sides: 7,
-                                           color: FoliagePaint.base(palette, LeafTone(youth: 0.3, value: tone.value), face: .upper) * 1.25,
+                                           color: FoliagePaint.base(palette, LeafTone(youth: 0.3, value: tone.value), face: .upper) * 1.05,
                                            knuckle: 1.55))
 
             // The blade HANGS from the top of its stalk (the bend at the geniculum): a mature leaf's
             // midrib runs 0–20° below horizontal, the oldest lowest, each rolled a little about its
             // midrib so no two present the same face; the newest, still unfurling, stands up.
-            let tilt = (newest ? 0.45 : 2.02 + 0.40 * (1 - t)) + (rng.unit() - 0.5) * 0.30
+            let tilt = (newest ? 0.45 : 1.90 + 0.42 * (1 - t)) + (rng.unit() - 0.5) * 0.30
             let f = leafFrame(azimuth: azimuth + (rng.unit() - 0.5) * 0.3, tilt: tilt,
-                              roll: (rng.unit() - 0.5) * 0.95)
+                              roll: (rng.unit() - 0.5) * 0.55)
             if newest {
                 // The new leaf has not opened yet: a glossy rolled "cigar" standing out of the crown,
                 // bowing a little toward the light — an open, pale, cupped blade read as a scoop.
