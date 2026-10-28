@@ -144,14 +144,15 @@ public enum LeafSheet {
 
     /// Emit one cell of the flat blade — corners in order round the cell — on BOTH faces, each
     /// vertex carrying its paint and its blade coordinates (`bladeUV`).
-    public static func emitCell(into p: inout PaintedMesh, _ q: [Site], surface: Surface, paint: Paint) {
+    public static func emitCell(into p: inout PaintedMesh, _ q: [Site], surface: Surface,
+                                faces: [LeafFace] = [.upper, .lower], paint: Paint) {
         guard q.count == 4 else { return }
         let P = q.map { surface.point($0) }
         let centre = Site(x: (q[0].x + q[2].x) / 2, y: (q[0].y + q[2].y) / 2,
                           vein: (q[0].vein + q[2].vein) / 2)
         let up = surface.upper(at: centre)
         let uv = q.map(bladeUV)
-        for face in [LeafFace.upper, .lower] {
+        for face in faces {
             let out = face == .upper ? up : Vec3(-up.x, -up.y, -up.z)
             let c = q.map { paint($0, face) }
             p.addQuad(P[0], P[1], P[2], P[3], colors: c[0], c[1], c[2], c[3],
@@ -160,14 +161,15 @@ public enum LeafSheet {
     }
 
     /// One painted triangle of a blade (both faces) — the corner pieces a cell grid cannot make.
-    public static func emitTriangle(into p: inout PaintedMesh, _ q: [Site], surface: Surface, paint: Paint) {
+    public static func emitTriangle(into p: inout PaintedMesh, _ q: [Site], surface: Surface,
+                                    faces: [LeafFace] = [.upper, .lower], paint: Paint) {
         guard q.count == 3 else { return }
         let P = q.map { surface.point($0) }
         let centre = Site(x: (q[0].x + q[1].x + q[2].x) / 3, y: (q[0].y + q[1].y + q[2].y) / 3,
                           vein: (q[0].vein + q[1].vein + q[2].vein) / 3)
         let up = surface.upper(at: centre)
         let uv = q.map(bladeUV)
-        for face in [LeafFace.upper, .lower] {
+        for face in faces {
             let out = face == .upper ? up : Vec3(-up.x, -up.y, -up.z)
             let c = q.map { paint($0, face) }
             p.addTriangle(P[0], P[1], P[2], colors: c[0], c[1], c[2], uvs: (uv[0], uv[1], uv[2]), outward: out)
@@ -298,7 +300,14 @@ public enum LeafSheet {
     /// The last lateral vein leaves the midrib this far up the blade.
     public static let monsteraMidribTop = 0.90
     /// Where the `r` rows fall: the rib band, the fenestration band (0.18–0.30), then out to the margin.
-    public static let monsteraRows: [Double] = [0, 0.06, 0.12, 0.18, 0.24, 0.30, 0.39, 0.48, 0.60, 0.72, 0.80, 0.86, 0.92, 0.96, 1.0]
+    public static let monsteraRows: [Double] = [0, 0.06, 0.18, 0.30, 0.48, 0.72, 1.0]
+    /// The `.fine` rows (`LeafDetail`): every coarse row plus the ones a smooth margin and rounded lobe
+    /// tips need. Only a host that draws the leaves through a LOD cut can afford them (a potted plant).
+    public static let monsteraRowsFine: [Double] = [0, 0.06, 0.12, 0.18, 0.24, 0.30, 0.39, 0.48, 0.60, 0.72, 0.80, 0.86, 0.92, 0.96, 1.0]
+
+    /// How finely a monstera blade is gridded: `.coarse` for a mesh drawn whole every frame (a
+    /// garden bed's), `.fine` for one drawn through a Signack LOD cut (a potted plant's).
+    public enum LeafDetail: Sendable { case coarse, fine }
 
     /// The margin sampled densely and parameterised by arc length (0 lobe → 1 tip).
     static let monsteraMarginCurve: (points: [Vec2], t: [Double]) = {
@@ -335,7 +344,7 @@ public enum LeafSheet {
 
     /// The (a) stations of one half: the lobe fan, then every cut's two edges, filled in so no
     /// segment of tissue is wider than `spacing`.
-    static func monsteraColumns(_ cuts: MonsteraCuts, spacing: Double) -> [Double] {
+    static func monsteraColumns(_ cuts: MonsteraCuts, spacing: Double, veinColumns: Bool = true) -> [Double] {
         var edges: Set<Double> = [0, 0.05, 0.10, monsteraLobeFan, 1]
         for s in cuts.splits { edges.insert(s.a - s.width / 2); edges.insert(s.a + s.width / 2) }
         for h in cuts.holes { edges.insert(h.a - h.width / 2); edges.insert(h.a + h.width / 2) }
@@ -344,7 +353,7 @@ public enum LeafSheet {
         let centres = (cuts.splits.map(\.a) + [monsteraLobeFan, 1.0]).sorted()
         for i in 1 ..< centres.count {
             let mid = (centres[i - 1] + centres[i]) / 2
-            if centres[i] - centres[i - 1] > 0.08 { edges.insert(mid - 0.006); edges.insert(mid); edges.insert(mid + 0.006) }
+            if veinColumns, centres[i] - centres[i - 1] > 0.08 { edges.insert(mid - 0.006); edges.insert(mid); edges.insert(mid + 0.006) }
         }
         let sorted = edges.filter { $0 >= 0 && $0 <= 1 }.sorted()
         var out: [Double] = [sorted[0]]
@@ -360,9 +369,11 @@ public enum LeafSheet {
     /// `vein` is 1 along the middle of each tissue segment between two cuts — where the lateral vein
     /// runs — so the painter can draw it.
     public static func emitMonsteraHalf(into p: inout PaintedMesh, surface: Surface, cuts: MonsteraCuts,
-                                        side: Double, spacing: Double = 0.045, paint: Paint) {
-        let cols = monsteraColumns(cuts, spacing: spacing)
-        let rows = monsteraRows
+                                        side: Double, spacing: Double = 0.045,
+                                        faces: [LeafFace] = [.upper, .lower], detail: LeafDetail = .coarse,
+                                        paint: Paint) {
+        let cols = monsteraColumns(cuts, spacing: spacing, veinColumns: detail == .fine)
+        let rows = detail == .fine ? monsteraRowsFine : monsteraRows
         // The vein proximity of a column: 1 half-way between two cuts (the lateral vein there),
         // falling off toward each cut. Cut centres sorted for the lookup.
         let cutCentres = (cuts.splits.map(\.a) + [monsteraLobeFan, 1.0]).sorted()
@@ -392,7 +403,7 @@ public enum LeafSheet {
                 if cuts.splits.contains(where: { abs(am - $0.a) <= $0.width / 2 && rm >= $0.depth }) { continue }
                 if cuts.holes.contains(where: { abs(am - $0.a) <= $0.width / 2 && rm >= $0.r0 && rm <= $0.r1 }) { continue }
                 emitCell(into: &p, [site(a0, r0), site(a0, r1), site(a1, r1), site(a1, r0)],
-                         surface: surface, paint: paint)
+                         surface: surface, faces: faces, paint: paint)
             }
         }
         // A fenestration is an ELLIPSE. Its cells are left out above; the tissue between that
@@ -404,7 +415,8 @@ public enum LeafSheet {
             guard lo >= 0, hi <= 1, let j0 = cut.first, let j1 = cut.last else { continue }
             let rLo = rows[j0], rHi = rows[j1 + 1]
             let ca = (lo + hi) / 2, cr = (rLo + rHi) / 2, ha = (hi - lo) / 2, hr = (rHi - rLo) / 2
-            var angles = (0 ..< 20).map { Double($0) / 20 * 2 * Double.pi }
+            let ring = detail == .fine ? 20 : 6
+            var angles = (0 ..< ring).map { Double($0) / Double(ring) * 2 * Double.pi }
             for (sa, sr) in [(1.0, 1.0), (-1.0, 1.0), (-1.0, -1.0), (1.0, -1.0)] {
                 let t = atan2(sr * hr, sa * ha)
                 angles.append(t < 0 ? t + 2 * Double.pi : t)
@@ -420,7 +432,7 @@ public enum LeafSheet {
                 let t0 = angles[k], t1 = angles[(k + 1) % angles.count]
                 let b0 = rim(t0), b1 = rim(t1), e0 = oval(t0), e1 = oval(t1)
                 emitCell(into: &p, [site(b0.0, b0.1), site(b1.0, b1.1), site(e1.0, e1.1), site(e0.0, e0.1)],
-                         surface: surface, paint: paint)
+                         surface: surface, faces: faces, paint: paint)
             }
         }
         // A slit TAPERS: nearly closed where it starts near the midrib, opening to its full width
@@ -430,14 +442,15 @@ public enum LeafSheet {
             let lo = sp.a - sp.width / 2, hi = sp.a + sp.width / 2, half = sp.width / 2
             guard lo >= 0, hi <= 1 else { continue }
             func fill(_ r: Double) -> Double { half * 0.82 * pow(max(0, 1 - (r - sp.depth) / (1 - sp.depth)), 1.4) }
-            for j in 0 ..< rows.count - 1 where rows[j] >= sp.depth - 1e-9 {
+            // Coarse: only the rows short of the margin band, where the taper reads; fine: every row.
+            for j in 0 ..< rows.count - 1 where rows[j] >= sp.depth - 1e-9 && (detail == .fine || rows[j] < 0.7) {
                 let r0 = rows[j], r1 = rows[j + 1]
-                let steps = r1 - r0 > 0.2 ? 2 : 1
+                let steps = detail == .fine && r1 - r0 > 0.2 ? 2 : 1
                 for k in 0 ..< steps {
                     let ra = r0 + (r1 - r0) * Double(k) / Double(steps), rb = r0 + (r1 - r0) * Double(k + 1) / Double(steps)
                     let fa = fill(ra), fb = fill(rb)
-                    emitCell(into: &p, [site(lo, ra), site(lo, rb), site(lo + fb, rb), site(lo + fa, ra)], surface: surface, paint: paint)
-                    emitCell(into: &p, [site(hi - fa, ra), site(hi - fb, rb), site(hi, rb), site(hi, ra)], surface: surface, paint: paint)
+                    emitCell(into: &p, [site(lo, ra), site(lo, rb), site(lo + fb, rb), site(lo + fa, ra)], surface: surface, faces: faces, paint: paint)
+                    emitCell(into: &p, [site(hi - fa, ra), site(hi - fb, rb), site(hi, rb), site(hi, ra)], surface: surface, faces: faces, paint: paint)
                 }
             }
         }

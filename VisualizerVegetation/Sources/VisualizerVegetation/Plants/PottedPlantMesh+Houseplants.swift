@@ -63,18 +63,22 @@ extension PottedPlantMesh {
     /// A foliage style's painted leaves, plus anything woody that belongs with the trunk.
     public struct Foliage: Sendable {
         public var leaves: PaintedMesh
+        /// Leaf undersides kept apart from `leaves` (empty = they are in `leaves`) — see
+        /// `PottedPlantMesh.Parts.foliageUnder`.
+        public var undersides: PaintedMesh
         public var woody: Mesh3
-        public init(leaves: PaintedMesh = PaintedMesh(), woody: Mesh3 = Mesh3()) {
-            self.leaves = leaves; self.woody = woody
+        public init(leaves: PaintedMesh = PaintedMesh(), undersides: PaintedMesh = PaintedMesh(),
+                    woody: Mesh3 = Mesh3()) {
+            self.leaves = leaves; self.undersides = undersides; self.woody = woody
         }
     }
 
     /// Grow a foliage style's leaves (nil for the bouquet and tree styles, which build their own).
     public static func houseplantFoliage(params: some PottedPlantGeometry, soilY: Double,
-                                         rng: inout SplitMix) -> Foliage? {
+                                         rng: inout SplitMix, detail: LeafSheet.LeafDetail = .coarse) -> Foliage? {
         switch params.plantStyle {
         case .fiddleLeafFig: return figFoliage(params: params, soilY: soilY, rng: &rng)
-        case .monstera:      return monsteraFoliage(params: params, soilY: soilY, rng: &rng)
+        case .monstera:      return monsteraFoliage(params: params, soilY: soilY, rng: &rng, detail: detail)
         case .snakePlant:    return snakePlantFoliage(params: params, soilY: soilY, rng: &rng)
         case .fern:          return fernFoliage(params: params, soilY: soilY, rng: &rng)
         case .succulent:     return succulentFoliage(params: params, soilY: soilY, rng: &rng)
@@ -214,7 +218,8 @@ extension PottedPlantMesh {
         return .init(splits: splits, holes: holes)
     }
 
-    static func monsteraFoliage(params: some PottedPlantGeometry, soilY: Double, rng: inout SplitMix) -> Foliage {
+    static func monsteraFoliage(params: some PottedPlantGeometry, soilY: Double, rng: inout SplitMix,
+                                detail: LeafSheet.LeafDetail = .coarse) -> Foliage {
         let palette = PlantStyle.monstera.foliagePalette
         let size = params.plantSize
         let count = leafCount(9, params.foliageDensity, minimum: 3)
@@ -282,15 +287,20 @@ extension PottedPlantMesh {
             s.ripplePhase = rng.unit() * 2 * Double.pi
             s.twist = (rng.unit() - 0.5) * 0.45
             let ribHalf = 0.013
-            var leaf = PaintedMesh()
+            // Upper faces and undersides into separate meshes: the cuticle coats only the top.
+            var leaf = PaintedMesh(), under = PaintedMesh()
             for side in [1.0, -1.0] {
                 let cuts = monsteraCuts(maturity: maturity, rng: &rng)
-                LeafSheet.emitMonsteraHalf(into: &leaf, surface: s, cuts: cuts, side: side,
-                                           spacing: 0.035) { site, face in
+                let paint: LeafSheet.Paint = { site, face in
                     FoliagePaint.sheet(palette, tone, site: site, face: face, ribHalfWidth: ribHalf)
                 }
+                LeafSheet.emitMonsteraHalf(into: &leaf, surface: s, cuts: cuts, side: side,
+                                           spacing: detail == .fine ? 0.035 : 0.11, faces: [.upper], detail: detail, paint: paint)
+                LeafSheet.emitMonsteraHalf(into: &under, surface: s, cuts: cuts, side: side,
+                                           spacing: detail == .fine ? 0.035 : 0.11, faces: [.lower], detail: detail, paint: paint)
             }
             out.leaves.append(leaf.smoothed())
+            out.undersides.append(under.smoothed())
         }
         // Aerial roots: a few brown cords leaving the stem a hand above the soil and arching down to it.
         for k in 0 ..< 3 {

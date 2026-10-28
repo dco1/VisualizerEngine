@@ -67,6 +67,11 @@ public enum PottedPlantMesh {
         /// top to underside, rib to margin. EMPTY for a style that is not painted (the bouquet greens,
         /// the fir canopy) — the bridge then stamps the style's one `leafColor`, as it always did.
         public var foliageColors: [Vec3]
+        /// The leaves' UNDERSIDES, when a style emits them apart (the monstera): its own draw group so
+        /// the waxy cuticle coats only the upper face (`PlantStyle.leafCuticle`). Empty = the
+        /// undersides are in `foliage`. `foliageUnderColors`: one per vertex, as `foliageColors`.
+        public var foliageUnder: Mesh3
+        public var foliageUnderColors: [Vec3]
         public var blooms: [ColoredGroup]
         /// The string-light BULBS — the one self-lit part of any plant (`PlantStyle.hasStringLights`),
         /// so it is its own draw group: the bridge gives it emission when the string is on and a
@@ -74,12 +79,16 @@ public enum PottedPlantMesh {
         public var bulbs: Mesh3
 
         public init(vessel: Mesh3, substrate: Mesh3, foliage: Mesh3, foliageColors: [Vec3] = [],
-                    blooms: [ColoredGroup] = [], bulbs: Mesh3 = Mesh3()) {
+                    blooms: [ColoredGroup] = [], bulbs: Mesh3 = Mesh3(),
+                    foliageUnder: Mesh3 = Mesh3(), foliageUnderColors: [Vec3] = []) {
+            precondition(foliageUnderColors.isEmpty || foliageUnderColors.count == foliageUnder.vertexCount,
+                         "painted undersides need one colour per vertex")
             precondition(foliageColors.isEmpty || foliageColors.count == foliage.vertexCount,
                          "painted foliage needs one colour per vertex")
             self.vessel = vessel; self.substrate = substrate
             self.foliage = foliage; self.foliageColors = foliageColors
             self.blooms = blooms; self.bulbs = bulbs
+            self.foliageUnder = foliageUnder; self.foliageUnderColors = foliageUnderColors
         }
 
         /// The opaque solid the winding/volume auditors check: the vessel shell closed by the
@@ -128,6 +137,14 @@ public enum PottedPlantMesh {
         // substrate, NOT the vessel finish) + the painted leaves.
         let stem = stemMesh(params: params, baseY: soilY)
         substrate.append(stem)
+        if params.plantStyle != .christmasTree,
+           // A potted plant's leaves draw through a Signack LOD cut (Daydream DH-1432): the fine grid.
+           let grown = houseplantFoliage(params: params, soilY: soilY, rng: &rng, detail: .fine) {
+            substrate.append(grown.woody)
+            return Parts(vessel: vessel, substrate: substrate, foliage: grown.leaves.mesh,
+                         foliageColors: grown.leaves.colors,
+                         foliageUnder: grown.undersides.mesh, foliageUnderColors: grown.undersides.colors)
+        }
         let grown = foliage(params: params, soilY: soilY, rng: &rng)
         substrate.append(grown.woody)
         return Parts(vessel: vessel, substrate: substrate, foliage: grown.mesh, foliageColors: grown.colors)
@@ -140,6 +157,7 @@ public enum PottedPlantMesh {
         let p = parts(params: params, localBendDir: localBendDir)
         var m = p.opaqueBody
         m.append(p.foliage)
+        m.append(p.foliageUnder)
         for g in p.blooms { m.append(g.mesh) }
         m.append(p.bulbs)
         return m
@@ -158,7 +176,10 @@ public enum PottedPlantMesh {
         guard let grown = houseplantFoliage(params: params, soilY: soilY, rng: &rng) else {
             return (Mesh3(), [], Mesh3())
         }
-        return (grown.leaves.mesh, grown.leaves.colors, grown.woody)
+        // One mesh for a caller that draws the leaves as one group (the garden plant): undersides in.
+        var leaves = grown.leaves
+        leaves.append(grown.undersides)
+        return (leaves.mesh, leaves.colors, grown.woody)
     }
 
     // MARK: - Vessel: pot or vase (dispatch on the resolved vessel kind)
