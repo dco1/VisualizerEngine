@@ -236,7 +236,7 @@ extension PottedPlantMesh {
             let maturity = newest ? 0.1 : 1 - 0.55 * t
             let youth = newest ? 0.20 : smoothstep(0.75, 1.0, t) * 0.5
             var tone = FoliagePaint.tone(youth: youth, palette: palette, rng: &rng)
-            tone.age = newest ? 0 : max(0, 1 - 3.2 * t) * (0.18 + 0.22 * rng.unit())   // the lowest leaves are the oldest
+            tone.age = newest ? 0 : max(0, 1 - 3.2 * t) * (0.10 + 0.14 * rng.unit())   // the lowest leaves are the oldest
             // Blade and where its petiole holds it: the old leaves low and far out, the new ones high
             // and close — a monstera spreads wider than it is tall, a FOUNTAIN of overlapping leaves.
             // (Held nearly flat at the top of tall straight stalks, the blades read as parasols.)
