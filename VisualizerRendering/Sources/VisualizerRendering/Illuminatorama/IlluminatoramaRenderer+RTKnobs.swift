@@ -28,6 +28,7 @@ extension IlluminatoramaRenderer {
     public var rtPathLampBulbs: Bool { get { kRT.rtPathLampBulbs } set { kRT.rtPathLampBulbs = newValue } _modify { yield &kRT.rtPathLampBulbs } }
     public var rtShadowRays: Int { get { kRT.rtShadowRays } set { kRT.rtShadowRays = newValue } _modify { yield &kRT.rtShadowRays } }
     public var rtAreaShadowRays: Int { get { kRT.rtAreaShadowRays } set { kRT.rtAreaShadowRays = newValue } _modify { yield &kRT.rtAreaShadowRays } }
+    public var skipHandedApertures: Bool { get { kRT.skipHandedApertures } set { kRT.skipHandedApertures = newValue } _modify { yield &kRT.skipHandedApertures } }
     public var rtStillCapsRelaxed: Bool { get { kRT.rtStillCapsRelaxed } set { kRT.rtStillCapsRelaxed = newValue } _modify { yield &kRT.rtStillCapsRelaxed } }
     public var rtaoEnabled: Bool { get { kRT.rtaoEnabled } set { kRT.rtaoEnabled = newValue } _modify { yield &kRT.rtaoEnabled } }
     public var rtaoIntensity: Float { get { kRT.rtaoIntensity } set { kRT.rtaoIntensity = newValue } _modify { yield &kRT.rtaoIntensity } }

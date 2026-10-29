@@ -182,6 +182,9 @@ extension IlluminatoramaRenderer {
         if thinFilmEnabled { u.shadowEnabled |= 4096 }   // DH-1014 — `kFrameFlagThinFilm`
         if translucencyEnabled { u.shadowEnabled |= 8192 }   // DH-1302 — `kFrameFlagTranslucency`
         if ggxRelativeGuardEnabled { u.shadowEnabled |= 16384 }   // DH-1306 — `kFrameFlagGGXRelativeGuard`
+        // DH-0952 — `kFrameFlagSkipHandedApertures`. Not with SSR on: its gather reads the lit HDR
+        // BEFORE the traced pass takes the handed share out, so there the aperture term is not dead.
+        if skipHandedApertures && ssrIntensity <= 0 { u.shadowEnabled |= 32768 }
         u.leafTransmittanceRatio = max(0, leafTransmittanceRatio)   // Signack S5
         // Tree wind (#58 #1): repurpose the two free pad floats as the vertex-
         // shader vegetation-wind knobs. _padPhase2A = strength (max canopy sway,

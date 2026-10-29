@@ -349,6 +349,10 @@ constant uint kRTSunShadowRayMask = 0x01 | 0x04;
 // Below this unshadowed luminance (HDR, pre-exposure) a portal's visibility is not traced —
 // the light's whole contribution is under a rounding error of the frame's exposure range.
 constant float kRTAreaShadowSkipLuma = 0.002;
+/// FrameUniforms.frameFlags bit 15 (32768) — Daydream DH-0952 (`IlluminatoramaRenderer.skipHandedApertures`):
+/// the deferred kernel does not evaluate a window aperture whose share is handed to the traced pass
+/// this frame (see the area-light loop). The term cancels, so this only removes dead work.
+#define kFrameFlagSkipHandedApertures 32768u
 
 static inline float rtSunSoftVisibility(
     instance_acceleration_structure accel,
@@ -1776,8 +1780,18 @@ kernel void illumi_lighting(
     // path-traced lane takes over; emitters (strips, skylight lenses) stay in the composite.
     float3 apertureSum = float3(0.0);
     bool areaLTC = frame.areaLTCEnabled != 0u;
+    // Daydream DH-0952 — a window APERTURE whose share the traced pass takes over this frame
+    // (`kFrameFlagPathOwnsIndirect` / `kFrameFlagGIOwnsApertures`) is added to `color` AND to
+    // `diffSkyInComposite`, and the traced pass subtracts the latter wherever its GI runs — every
+    // surface pixel, the same uniforms decide both. Its LTC evaluation and its visibility rays (one
+    // per lit portal per pixel) therefore cancel — up to the half-float rounding of that subtraction —
+    // so with `kFrameFlagSkipHandedApertures` they are not computed: measured on 4000 Sunset's settled
+    // refine (17 portals) this kernel went 141 → 48 ms, held frame unchanged. Clear ⇒ the loop as before.
+    bool skipHandedApertures = (frame.frameFlags & kFrameFlagSkipHandedApertures) != 0u
+        && (frame.frameFlags & (kFrameFlagPathOwnsIndirect | kFrameFlagGIOwnsApertures)) != 0u;
     for (uint i = 0; i < frame.areaLightCount; ++i) {
         AreaLight al = areaLights[i];
+        if (skipHandedApertures && al.isAperture > 0.5) continue;
         // Light-layer mask — same rule as point/spot. For an UNSHADOWED area light (a
         // diffuse cove/softbox, shadowSliceIndex < 0) the mask is its only containment
         // (a window portal without it lights the yard through the back of its own wall).

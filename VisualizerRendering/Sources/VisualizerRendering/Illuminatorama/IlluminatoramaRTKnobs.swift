@@ -177,6 +177,14 @@ final class RTKnobs {
     /// shadow a room's dominant source has to cast. Per-frame Monte-Carlo like the sun rays,
     /// so it belongs to a still that accumulates. 0 (default) keeps the PCF path byte-identical.
     var rtAreaShadowRays: Int = 0
+    /// **Daydream DH-0952 — don't light what the traced pass subtracts.** When a frame hands the
+    /// window APERTURES to the traced GI (`rtGIOwnsRoomFill` contains `.apertures`, or the path lane
+    /// owns the indirect), the deferred kernel's aperture term — LTC form factor plus one visibility
+    /// ray per portal per pixel — goes into `color` and into the hand-off texture the traced pass
+    /// takes back out, so it cancels exactly. True (default): the kernel skips it (measured on the
+    /// settled refine: the deferred pass's single biggest cost). False: computed and cancelled as before
+    /// — the A/B lever. No effect on a frame without the hand-off.
+    var skipHandedApertures: Bool = true
     /// **S4.4 — a STILL may build the extracted-scene TLAS under the glass-arm caps.** The
     /// live-RT caps (128 mesh groups / 150 k triangles) exist because a live loop's first
     /// rebuild of a heavy scene never returns; a still that accumulates pays that rebuild
