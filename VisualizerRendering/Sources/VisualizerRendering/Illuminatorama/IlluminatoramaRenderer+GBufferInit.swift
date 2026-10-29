@@ -80,6 +80,7 @@ extension IlluminatoramaRenderer {
                         && $0.data.swayJostle == $1.data.swayJostle
                 }
             gbs.instanceShapeStableFrames = shapeHeld ? gbs.instanceShapeStableFrames + 1 : 0
+            if !shapeHeld { recordShadowCasterChange(old: gbs.lastUploadedInstances, new: instances) }   // DH-1590
             gbs.instanceStableFrames = 0
             gbs.lastUploadedInstances = instances   // COW reference, no deep copy
             gbs.contentHasSway = instances.contains { $0.data.swayMode >= 2 }

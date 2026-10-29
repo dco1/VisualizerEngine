@@ -27,6 +27,10 @@ final class ShadowKnobs {
     /// Daydream DH-1064 — test lever: false re-renders every spot/area slice every frame (no
     /// static reuse at all), so a gate can diff a reused atlas against a freshly rasterised one.
     var spotShadowReuseEnabled: Bool = true
+    /// Daydream DH-1590 — A/B lever for PER-SLICE caster dirtying (default on). On, a caster whose
+    /// shadow shape changed (moved, swapped mesh, re-swung) re-renders only the slices whose light
+    /// frustum its old or new bounds reach. Off = any shape change re-renders every slice.
+    var spotShadowPerSliceDirtyEnabled: Bool = true
     // ── Phase 2.5 shadow knobs ───────────────────────────────────────
     /// Toggle the cascaded-shadow pass + sampling. Off = direct sun lights
     /// every pixel, regardless of occlusion (Phase 2 behaviour).

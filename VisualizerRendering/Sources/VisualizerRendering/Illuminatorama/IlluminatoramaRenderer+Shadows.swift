@@ -400,6 +400,9 @@ extension IlluminatoramaRenderer {
     /// spots are present, or when the host hasn't pushed any instances
     /// (no occluders → no shadow data needed).
     func encodeSpotShadowPasses(_ cb: MTLCommandBuffer) {
+        // DH-1590 — after this encode every slice either re-rendered or was checked against the
+        // pending caster changes, so they are spent whichever way the function leaves.
+        defer { consumeShadowCasterChanges() }
         guard spotShadowsEnabled, !shd.spotShadowCasters.isEmpty, !instances.isEmpty else {
             // Nothing is rendered into the atlas this frame, so after it no slice can vouch for
             // the scene — without this a scene edited while spot shadows were off came back on
@@ -415,7 +418,10 @@ extension IlluminatoramaRenderer {
         // the atlas already contains exactly these maps — reuse them.
         let mats = shd.spotShadowCasters.map { $0.matrix }
         let reuseAllowed = spotShadowReuseEnabled
-        if reuseAllowed && sceneStaticForShadows && mats == shd.lastSpotShadowMats {
+        let perSliceDirty = spotShadowPerSliceDirtyEnabled && !Self.staticSkipDisabled
+        // DH-1590 — a change recorded on a frame this pass did not run is still owed to the atlas.
+        let noPendingChange = !perSliceDirty || (shd.pendingCasterChange.isEmpty && !shd.pendingCasterChangeUnbounded)
+        if reuseAllowed && sceneStaticForShadows && noPendingChange && mats == shd.lastSpotShadowMats {
             staticSkipStats.spotShadowPassesSkipped += count
             return
         }
@@ -427,7 +433,7 @@ extension IlluminatoramaRenderer {
         // already holds exactly that map, so `lastSpotShadowMats = mats` stays the atlas's truth.
         let lastMats = shd.lastSpotShadowMats
         func sliceHeld(_ slice: Int) -> Bool { slice < lastMats.count && lastMats[slice] == mats[slice] }
-        let wholeSceneStatic = reuseAllowed && sceneStaticForShadows
+        let wholeSceneStatic = reuseAllowed && sceneStaticForShadows && noPendingChange
         // DH-0631 / DH-0637 — per-slice reuse when the only things keeping the scene from "static"
         // are live GPU-fed geometry (the lawn) and/or swaying pendants. A slice still holds a valid
         // map from the last time it was rendered with this same matrix if (a) every CPU-visible
@@ -435,8 +441,12 @@ extension IlluminatoramaRenderer {
         // cone, and (c) no swaying instance's swing-sphere intersects its cone. Slices that fail
         // (b) or (c) — exterior cones, the can above a swinging pendant — re-render as before.
         let gpuGeometryLive = !fxs.gpuRepackTasks.isEmpty || onEncodeGPUInstances != nil
-        let perSliceBase = reuseAllowed && spotShadowGPUGeometryOptOutEnabled
-            && gbs.instanceShapeStableFrames >= 1
+        // DH-1590 — (d) a caster whose shape changed no longer invalidates the whole atlas: with
+        // `perSliceDirty` a slice whose light frustum excludes every changed caster's old AND new
+        // bounds still holds its map. Off = any shape change re-renders every slice (pre-DH-1590).
+        let shapeBounded = perSliceDirty ? !shd.pendingCasterChangeUnbounded
+                                         : gbs.instanceShapeStableFrames >= 1
+        let perSliceBase = reuseAllowed && spotShadowGPUGeometryOptOutEnabled && shapeBounded
         shd.lastSpotShadowMats = mats
         // Pass descriptors + labels are cached per slice (they never change after
         // the atlas exists) — this loop used to allocate a fresh descriptor and
@@ -468,7 +478,8 @@ extension IlluminatoramaRenderer {
                 case .spot(let li): swayOK = !swayingGeometryCanEnter(spotLights[li])
                 case .area:         swayOK = shd.swayingSpheres.isEmpty
                 }
-                if gpuOK && swayOK {
+                let changeOK = !perSliceDirty || !casterChangeTouches(caster.matrix)
+                if gpuOK && swayOK && changeOK {
                     staticSkipStats.spotShadowPassesSkipped += 1
                     continue
                 }
@@ -712,6 +723,14 @@ final class ShadowState {
     /// Spot-shadow skip signature: the atlas slices currently hold depth maps
     /// rendered with exactly these light matrices (and the stable content).
     var lastSpotShadowMats: [simd_float4x4] = []
+    /// DH-1590 — world bounds of every caster whose shadow SHAPE changed (old pose AND new pose)
+    /// since the spot atlas was last encoded; `pendingCasterChangeUnbounded` = a change could not
+    /// be bounded (no CPU bounds, or too many), so every slice must re-render. Recorded by
+    /// `updateSceneStability`, consumed by `encodeSpotShadowPasses` — see +SpotShadowDirty.swift.
+    var pendingCasterChange: [IlluminatoramaCullBounds] = []
+    var pendingCasterChangeUnbounded = false
+    var lastCasterChange: [IlluminatoramaCullBounds] = []
+    var lastCasterChangeUnbounded = false
 
     var spotShadowCasters: [IlluminatoramaRenderer.ShadowCaster] = []
     /// Point-shadow skip signature: (position, radius) per cube-holding light in
