@@ -135,6 +135,22 @@ final class RTKnobs {
     /// (the glowing shades' share of the noise, by its absence); 32 / 16 / 8: no local lights /
     /// no sun / no window apertures at the path's vertices (the noise budget by source).
     var rtPathDebugFlags: UInt32 = 0
+    /// Daydream DH-0952 INSTRUMENT — the one-bounce TLAS pass's cost by ablation, OR'd into its path
+    /// flags on EVERY lane; never set by a host (the picture is wrong under each bit). 1<<24: no sun
+    /// shadow ray at GI / reflection hits · 1<<25: GI hits traced but not shaded · 1<<26: reflection
+    /// hits not shaded · 1<<27: GI rays cut at 4 m. See `kRTAblate*` in IlluminatoramaRTInstanced.metal.
+    var rtTLASAblationFlags: UInt32 = 0
+    /// **Daydream DH-0952 — probe only where the probe can move anything.** The snap probe below
+    /// (`rtSurfaceSnapEnabled`) is a full TLAS descent per pixel in every traced pass — measured on
+    /// an M1 Max at 1920×1200: 42 ms of the TLAS lighting pass, ~70 ms of the whole frame — and on a
+    /// surface that is not a substrate it finds nothing. A host whose substrates all face UP (ground,
+    /// paving) sets this to the lowest normal y one of them can show: a pixel whose G-buffer normal
+    /// y is at or below it is not probed, unless 4 depth ULPs there span more than
+    /// `rtSurfaceSnapClearance` (the probe's other job — depth rounding at range — stays on for
+    /// distant walls). Default −2 ⇒ every pixel probed, byte-identical.
+    var rtSurfaceSnapMinUpY: Float = -2
+    /// The origin clearance (metres) the traced passes' rays already leave with; see `rtSurfaceSnapMinUpY`.
+    var rtSurfaceSnapClearance: Float = 0.0005
     /// **DH-1293 INSTRUMENT — floor the lamps' `1/d²` at path vertices** (metres; 0 ⇒ off,
     /// byte-identical). A lamp / can / sconce reaching a path vertex closer than this lights it as
     /// if it were this far away. BIASED by construction — it removes the near-field energy it

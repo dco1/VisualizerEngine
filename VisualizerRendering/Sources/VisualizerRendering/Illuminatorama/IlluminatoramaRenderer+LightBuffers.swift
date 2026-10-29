@@ -402,7 +402,7 @@ extension IlluminatoramaRenderer {
         u.scotopicParams = SIMD4<Float>(max(0, scotopicKnee), max(0, scotopicTint.x), max(0, scotopicTint.y), max(0, scotopicTint.z))
         // Pre-exposure + hue-stable toe (all zero by default ⇒ the shader's legacy paths).
         let toeHi = max(0, hueStableToe.y)
-        u.rtSurfaceSnap = SIMD4<Float>(effectiveRTSurfaceSnapULPs, 0, 0, 0)
+        u.rtSurfaceSnap = SIMD4<Float>(effectiveRTSurfaceSnapULPs, rtSurfaceSnapMinUpY, rtSurfaceSnapClearance, 0)   // DH-0952 yz
         u.displayParams = SIMD4<Float>(preExposureDivisor == 1 ? 0 : preExposureDivisor,
                                        toeHi > 0 ? max(0, min(hueStableToe.x, toeHi * 0.999)) : 0, toeHi,
                                        toeHi > 0 && hueStableToeBareLevel ? 1 : 0)

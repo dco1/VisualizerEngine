@@ -152,4 +152,26 @@ static inline float3 illumiSnapToVisibleSurface(
     return (h.type != metal::raytracing::intersection_type::none) ? P + r.direction * h.distance : P;
 }
 
+// Daydream DH-0952 — the probe only where it can move anything. A probe is a full TLAS descent (on
+// an M1 it was 42 ms of a 330 ms refine-frame GI pass, and as much again in the deferred sun and the
+// AO), and on a surface that is NOT a substrate it finds nothing: such a point is on its surface to
+// within the depth's own rounding. So a host whose substrates all face UP (Daydream's: the yard's
+// paving and ground) declares `minUpY`, and a pixel whose normal is at or below it is left alone —
+// unless its depth rounding alone (4 ULPs, the probe's other job: "range") could exceed `clearance`,
+// the origin offset its rays already leave with, which keeps far exterior walls probed. `minUpY` < −1
+// ⇒ always probe, exactly the call above (byte-identical).
+static inline float3 illumiSnapToVisibleSurface(
+    metal::raytracing::instance_acceleration_structure accel,
+    float3 P, float3 cameraPos, float2 ndc, float depth, float4x4 invVP, float snapULPs,
+    float3 N, float minUpY, float clearance)
+{
+    if (snapULPs <= 0.0f) return P;
+    if (minUpY >= -1.0f && N.y <= minUpY) {
+        float step = as_type<float>(as_type<uint>(depth) + 1u) - depth;
+        float4 q = invVP * float4(ndc, max(depth - 4.0f * step, 0.0f), 1.0f);
+        if (length(q.xyz / q.w - P) < clearance) return P;
+    }
+    return illumiSnapToVisibleSurface(accel, P, cameraPos, ndc, depth, invVP, snapULPs);
+}
+
 #endif

@@ -47,6 +47,8 @@ extension IlluminatoramaRenderer {
         // DH-0887 — the GI's progressive sample index: contiguous per dispatch of THIS pass.
         u.giProgressiveIndex = rts.rtGIProgressiveIndex
         u.surfaceSnapULPs = effectiveRTSurfaceSnapULPs
+        u.surfaceSnapMinUpY = rtSurfaceSnapMinUpY          // DH-0952
+        u.surfaceSnapClearance = rtSurfaceSnapClearance
         rts.rtGIProgressiveIndex &+= 1
         // DH-0896 — a reflection hit REPLACES the sky the deferred pass put there.
         let specIBLOn = rtReflectionsEnabled && ibls.specIBLWrittenThisFrame && ibls.specIBLTexture != nil
@@ -75,6 +77,7 @@ extension IlluminatoramaRenderer {
             // DH-1308 — `kPathFlagGlossyVertices`: only with light sampling + the DFG LUT (the lobe's albedo).
             | (pathOn && rtPathGlossyVertices && rtPathLightSampling && dfgLUTEnabled ? 2048 : 0)
             | (pathOn && rtPathThinTransmission ? 32768 : 0)   // Signack S5 — `kPathFlagThinTransmission`
+        u.pathFlags |= rtTLASAblationFlags & 0x0F00_0000   // DH-0952 instrument (`kRTAblate*`)
         u.pathGlossyMinRoughness = pathOn ? max(0, rtPathGlossyMinRoughness) : 0
         u.pathGlossyLampSize = pathOn ? max(0, rtPathGlossyLampSize) : 1   // DH-1395
         u.layerInstanceCount = UInt32(instances.count)                       // DH-1300

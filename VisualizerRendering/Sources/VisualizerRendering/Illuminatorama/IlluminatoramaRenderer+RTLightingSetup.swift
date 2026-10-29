@@ -281,6 +281,9 @@ extension IlluminatoramaRenderer {
         var layerInstanceCount: UInt32 = 0
         /// DH-0539 — 1 ⇒ the reflection goes to the specular denoise chain, not into the HDR (Metal twin appended last).
         var specDenoise: UInt32 = 0
+        /// DH-0952 — the snap probe's gate (Metal twin appended last).
+        var surfaceSnapMinUpY: Float = -2
+        var surfaceSnapClearance: Float = 0
 
         mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
             let p = InteriorRoomGains.pack(gains, enabled: enabled)

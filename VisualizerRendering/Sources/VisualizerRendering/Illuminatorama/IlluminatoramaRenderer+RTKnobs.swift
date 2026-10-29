@@ -23,6 +23,9 @@ extension IlluminatoramaRenderer {
     public var rtPathLightSampling: Bool { get { kRT.rtPathLightSampling } set { kRT.rtPathLightSampling = newValue } _modify { yield &kRT.rtPathLightSampling } }
     public var rtPathLampShadows: Bool { get { kRT.rtPathLampShadows } set { kRT.rtPathLampShadows = newValue } _modify { yield &kRT.rtPathLampShadows } }
     public var rtPathDebugFlags: UInt32 { get { kRT.rtPathDebugFlags } set { kRT.rtPathDebugFlags = newValue } _modify { yield &kRT.rtPathDebugFlags } }
+    public var rtTLASAblationFlags: UInt32 { get { kRT.rtTLASAblationFlags } set { kRT.rtTLASAblationFlags = newValue } _modify { yield &kRT.rtTLASAblationFlags } }
+    public var rtSurfaceSnapMinUpY: Float { get { kRT.rtSurfaceSnapMinUpY } set { kRT.rtSurfaceSnapMinUpY = newValue } _modify { yield &kRT.rtSurfaceSnapMinUpY } }
+    public var rtSurfaceSnapClearance: Float { get { kRT.rtSurfaceSnapClearance } set { kRT.rtSurfaceSnapClearance = newValue } _modify { yield &kRT.rtSurfaceSnapClearance } }
     public var rtPathLampMinDistance: Float { get { kRT.rtPathLampMinDistance } set { kRT.rtPathLampMinDistance = newValue } _modify { yield &kRT.rtPathLampMinDistance } }
     public var rtPathLampSourceRadius: Float { get { kRT.rtPathLampSourceRadius } set { kRT.rtPathLampSourceRadius = newValue } _modify { yield &kRT.rtPathLampSourceRadius } }
     public var rtPathLampBulbs: Bool { get { kRT.rtPathLampBulbs } set { kRT.rtPathLampBulbs = newValue } _modify { yield &kRT.rtPathLampBulbs } }

@@ -124,7 +124,8 @@ extension IlluminatoramaRenderer {
             rayCount: UInt32(rays), sampleBase: 0, scramble: aoAccumulationScramble,
             transportRayMask: 0x01 | 0x04,
             fullWidth: UInt32(width), fullHeight: UInt32(height),
-            surfaceSnapULPs: effectiveRTSurfaceSnapULPs)
+            surfaceSnapULPs: effectiveRTSurfaceSnapULPs,
+            surfaceSnapMinUpY: rtSurfaceSnapMinUpY, surfaceSnapClearance: rtSurfaceSnapClearance)
         let encoded = acc.encode(device: device,
                                  encoder: { [unowned self] label in self.timedComputeEncoder(cb, label) },
                                  dispatch: { [unowned self] enc, p, w, h in self.dispatch(enc, pipeline: p, width: w, height: h) },

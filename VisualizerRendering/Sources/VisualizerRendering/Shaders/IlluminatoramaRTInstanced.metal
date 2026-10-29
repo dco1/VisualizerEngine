@@ -190,6 +190,11 @@ struct RTInstUniforms {
     // replaces) to `rtSpecular` for the specular denoise chain (IlluminatoramaSpecDenoise.metal). 0 ⇒ the raw
     // add below, exactly as before (byte-identical).
     uint  specDenoise;
+    // Daydream DH-0952 — the snap probe's gate (`illumiSnapToVisibleSurface`'s gated overload): skipped where the
+    // G-buffer normal's y ≤ `surfaceSnapMinUpY` and 4 depth ULPs span less than `surfaceSnapClearance` (metres).
+    // `surfaceSnapMinUpY` < −1 ⇒ always probe (byte-identical).
+    float surfaceSnapMinUpY;
+    float surfaceSnapClearance;
 };
 
 /// DH-1011 — `RTInstUniforms.pathFlags` bits.
@@ -499,6 +504,15 @@ constant float kPathLampShadowGap = 0.25;
 constant uint kPathLightCache = 64u;
 constant uint kPathPortalCache = 32u;   // per-vertex aperture-weight cache (thread memory)
 
+// Daydream DH-0952 INSTRUMENTS (`IlluminatoramaRenderer.rtTLASAblationFlags`, OR'd into `pathFlags`; never set by a
+// host). Each removes one piece of the one-bounce pass's per-pixel work so the pass timer attributes its milliseconds:
+// the sun shadow ray at every GI / reflection hit (the hit is lit as if unoccluded), the GI hit's whole shading (the
+// ray is traced, the hit adds nothing), the reflection hit's shading, and GI rays cut at 4 m (what the long rays —
+// out of the windows into the yard — cost). The picture is wrong under every one of them, by design.
+#define kRTAblateHitSunRay     (1u << 24)
+#define kRTAblateGIHitShade    (1u << 25)
+#define kRTAblateReflHitShade  (1u << 26)
+#define kRTAblateGIShortRays   (1u << 27)
 static inline float pathLuma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
 // ── Daydream DH-1344 — a world-space RADIANCE CACHE for the path lane (a still's) ───────────────────
@@ -1552,12 +1566,12 @@ kernel void illumi_rt_lighting_tlas(
     ndc.y = -ndc.y;
     // Rays leave from the surface the camera SEES (a substrate's biased depth buries the
     // rebuilt point — see `illumiSnapToVisibleSurface`).
-    float3 P = illumiSnapToVisibleSurface(accel, worldPosFromDepth(ndc, depth, u.invViewProjection),
-                                          u.cameraWorldPos, ndc, depth, u.invViewProjection,
-                                          u.surfaceSnapULPs);
     half4 nrH = gNormalRgh.read(gid);
     half4 amH = gAlbedoMet.read(gid);
     float3 N = octDecode(float2(nrH.rg));
+    float3 P = illumiSnapToVisibleSurface(accel, worldPosFromDepth(ndc, depth, u.invViewProjection),
+                                          u.cameraWorldPos, ndc, depth, u.invViewProjection,
+                                          u.surfaceSnapULPs, N, u.surfaceSnapMinUpY, u.surfaceSnapClearance);
     // LOAD-BEARING FLOOR, not a cosmetic clamp: the glossy-reflection cone below is
     // `roughness² · k` gated on a threshold, and this 0.045 is what keeps that cone
     // (≥ 2.4e-3 rad) above the ~1e-3 rad at which a cone is sub-pixel and a single
@@ -1624,6 +1638,10 @@ kernel void illumi_rt_lighting_tlas(
     sec.layerCount = layeredSpecRT ? u.layerInstanceCount : 0u;
     SecondaryShadeParams secFull   = fullRadianceParams(u);   // reflections + cache fallbacks
     SecondaryShadeParams secBounce = giBounceParams(u);       // GI bounces (no sky double-count)
+    // Daydream DH-0952 INSTRUMENT — the pass's cost by ablation (`rtTLASAblationFlags`; never set by a host).
+    const bool ablHitShade = (u.pathFlags & kRTAblateGIHitShade) != 0u;
+    const bool ablReflShade = (u.pathFlags & kRTAblateReflHitShade) != 0u;
+    if ((u.pathFlags & kRTAblateHitSunRay) != 0u) { secBounce.shadowRays = 0u; secFull.shadowRays = 0u; }
 
     // ── DH-0653: chart-assignment overlay (DebugTerm.surfaceCacheCharts) ─────
     // Terms 8/9 show what the SECONDARY rays read; this shows the PRIMARY surface's
@@ -1732,6 +1750,7 @@ kernel void illumi_rt_lighting_tlas(
             float3 dir = illumiCosineHemisphereAxisSafe(N, gq);
             ray r; r.origin = Pofs; r.direction = dir;
             r.min_distance = max(u.rayTMin, 1e-3); r.max_distance = u.maxGIDist;
+            if ((u.pathFlags & kRTAblateGIShortRays) != 0u) r.max_distance = min(r.max_distance, 4.0);
             // C3: transport mask — opaque + curve + INVISIBLE OCCLUDER. Without
             // 0x04 a GI ray leaving an interior through the roofless dollhouse's
             // open top misses everything and returns full sky.
@@ -1793,7 +1812,8 @@ kernel void illumi_rt_lighting_tlas(
                     cacheIrr = secondaryIndirectFill(h.N, secondaryLayerBits(res.instance_id, insts),
                                                      secFull, irrCube);
                 }
-                float3 cacheTerm;
+                float3 cacheTerm = float3(0.0);
+                if (!ablHitShade)
                 indirect += shadeSecondarySurface(isect, accel, h, secBounce, sec, irrCube, albedoAtlas, seed,
                                                   hitFill || cardState == SURF_STAT_CACHED || cardState == SURF_STAT_FALLBACK,
                                                   cacheIrr, cacheTerm);
@@ -2020,7 +2040,8 @@ kernel void illumi_rt_lighting_tlas(
                 }
             }
             surfStat(surfHitStats, u.surfStatsEnabled, 4u + cardState);
-            float3 cacheTerm;
+            float3 cacheTerm = float3(0.0);
+            if (!ablReflShade)
             acc += shadeSecondarySurface(isect, accel, h, secFull, sec, irrCube, albedoAtlas, seed,
                                          cardState == SURF_STAT_CACHED || cardState == SURF_STAT_FALLBACK,
                                          cacheIrr, cacheTerm);

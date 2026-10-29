@@ -567,7 +567,9 @@ struct FrameUniforms {
     float4   displayParams;
     // Traced-ray origin snap (Daydream DH-0715, `illumiSnapToVisibleSurface`): x = how many
     // depth ULPs the depth-rebuilt point may sit behind the surface the camera sees (0 ⇒ off,
-    // byte-identical); yzw reserved. ONE new 16-byte cluster (stride 1664 → 1680).
+    // byte-identical); y, z = the probe's gate (DH-0952: min normal y, clearance in metres — see
+    // `illumiSnapToVisibleSurface`'s gated overload; y < −1 ⇒ always probe); w reserved.
+    // ONE new 16-byte cluster (stride 1664 → 1680).
     float4   rtSurfaceSnap;
     // DIGITAL SENSOR NOISE (Daydream DH-0992): x = strength (0 ⇒ off, byte-identical), y = photo-
     // electrons per unit of EXPOSED scene radiance at the camera's ISO before the meter's push,

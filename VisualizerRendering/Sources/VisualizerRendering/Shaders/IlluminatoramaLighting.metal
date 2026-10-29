@@ -1348,7 +1348,8 @@ kernel void illumi_lighting(
     float3 rtPos = worldPos;
     if (kLightingRTSunShadow && kLightingShadowEnabled) {
         rtPos = illumiSnapToVisibleSurface(rtSunAccel, worldPos, frame.cameraWorldPos, ndc, depth,
-                                           frame.invViewProjection, frame.rtSurfaceSnap.x);
+                                           frame.invViewProjection, frame.rtSurfaceSnap.x,
+                                           N, frame.rtSurfaceSnap.y, frame.rtSurfaceSnap.z);   // DH-0952 gate
     }
     // Surface → eye. Under a PARALLEL projection the eye is not a point: every
     // pixel is viewed along the same direction, so `cameraWorldPos − worldPos`

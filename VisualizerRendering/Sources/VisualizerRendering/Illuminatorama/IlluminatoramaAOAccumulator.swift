@@ -46,8 +46,9 @@ final class IlluminatoramaAOAccumulator {
         var fullHeight: UInt32
         /// DH-0715 — the traced-origin snap's reach in depth ULPs (0 ⇒ off; was `reserved0`).
         var surfaceSnapULPs: Float = 0
-        var reserved1: UInt32 = 0
-        var reserved2: UInt32 = 0
+        /// DH-0952 — the snap probe's gate (`IlluminatoramaRenderer.rtSurfaceSnapMinUpY`; was `reserved1`/`reserved2`).
+        var surfaceSnapMinUpY: Float = -2
+        var surfaceSnapClearance: Float = 0
     }
     /// Mirror of `AOAccumulateUniforms` — 16 bytes.
     struct AccumulateUniforms {

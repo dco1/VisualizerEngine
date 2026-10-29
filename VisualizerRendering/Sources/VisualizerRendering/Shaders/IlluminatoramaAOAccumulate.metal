@@ -41,8 +41,8 @@ struct RTAOv2Uniforms {
     uint     fullWidth;           // full-res depth dims (AO is half-res)
     uint     fullHeight;
     float    surfaceSnapULPs;     // DH-0715 traced-origin snap reach (0 ⇒ off; was _reserved0)
-    uint     _reserved1;
-    uint     _reserved2;
+    float    surfaceSnapMinUpY;   // DH-0952 — the snap probe's gate (< −1 ⇒ always probe; was _reserved1)
+    float    surfaceSnapClearance;   // DH-0952 — metres (was _reserved2)
 };
 static_assert(sizeof(RTAOv2Uniforms) == 128, "RTAOv2Uniforms layout must match the Swift mirror");
 
@@ -105,7 +105,7 @@ kernel void illumi_rtao_tlas_v2(
     float2 ndcP = (float2(p) + 0.5) / fdim * 2.0 - 1.0;
     ndcP.y = -ndcP.y;
     P = illumiSnapToVisibleSurface(accel, P, u.cameraWorldPos.xyz, ndcP, depth, u.invViewProjection,
-                                   u.surfaceSnapULPs);
+                                   u.surfaceSnapULPs, N, u.surfaceSnapMinUpY, u.surfaceSnapClearance);
     toCam = u.cameraWorldPos.xyz - P;
     float dist = length(toCam);
     float3 origin = P + N * max(u.rayTMin, 2e-4 * dist);
