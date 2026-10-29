@@ -181,6 +181,7 @@ extension IlluminatoramaRenderer {
         if dfgLUTEnabled && layeredCoatEnabled { u.shadowEnabled |= 512 }   // DH-1309 — `kFrameFlagLayeredCoat`
         if thinFilmEnabled { u.shadowEnabled |= 4096 }   // DH-1014 — `kFrameFlagThinFilm`
         if translucencyEnabled { u.shadowEnabled |= 8192 }   // DH-1302 — `kFrameFlagTranslucency`
+        if ggxRelativeGuardEnabled { u.shadowEnabled |= 16384 }   // DH-1306 — `kFrameFlagGGXRelativeGuard`
         u.leafTransmittanceRatio = max(0, leafTransmittanceRatio)   // Signack S5
         // Tree wind (#58 #1): repurpose the two free pad floats as the vertex-
         // shader vegetation-wind knobs. _padPhase2A = strength (max canopy sway,

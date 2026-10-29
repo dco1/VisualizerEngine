@@ -63,6 +63,15 @@ using namespace metal;
 /// that reads pale pearl where the photo mirrors a dim room). Clear => the supplement is untouched.
 #define kFrameFlagMetalNoAmbient      2048u
 #define kPathFlagDyedSheen            262144u
+/// FrameUniforms.frameFlags bit 14 (16384) — Daydream DH-1306: the deferred kernel's GGX NDF takes a
+/// RELATIVE guard (`pathGGXD`, the path lane's own D) instead of `distributionGGX`'s absolute `+1e-7`,
+/// which kept 24 % of the lobe's peak at roughness 0.1 and 0.1 % at 0.05 (the white furnace's direct
+/// arm read 0.594 / 0.054 for a white metal). With the peak restored, a punctual light's lobe is the
+/// convolution with the light's own disc (`sourceTan`, as the coat already did): width
+/// √(α² + (ρ/2)²), still unit energy — the sun's angular radius, a lamp's bulb over its distance.
+/// Carried per pixel as `LayeredEnergy.ggxRelative`. Clear ⇒ every lobe is the historical expression,
+/// bit for bit. (The path lane and the RT kernel always used the relative guard.)
+#define kFrameFlagGGXRelativeGuard    16384u
 /// FrameUniforms.frameFlags bit 7 (128) — DIFFUSE ROUGHNESS (Daydream DH-1301): the master switch for
 /// the EON lobe (IlluminatoramaDiffuseRoughness.h). The per-pixel value rides the sign of
 /// `albedoMetallic.a`, so with the flag set a pixel whose material never set one is still Lambert,
@@ -204,6 +213,9 @@ struct LayeredEnergy {
     /// ⇒ `layeredBaseF0` is the historical `mix(dielectricF0, albedo, metallic)`, bit for bit.
     bool   filmOn;
     float3 filmTint;
+    /// Daydream DH-1306 — `kFrameFlagGGXRelativeGuard`: the direct GGX lobe's D uses the relative guard
+    /// and widens by the light's angular size. false ⇒ the historical `distributionGGX`, bit for bit.
+    bool   ggxRelative;
 };
 
 /// The base's F0 every lobe mixes from: `mix(dielectricF0, albedo, metallic)`, times the thin film's
@@ -253,6 +265,7 @@ static inline LayeredEnergy layeredOff() {
     e.coatSpecMS = 1.0; e.coatEnvAlbedo = 0.0;
     e.underCoatDirect = float3(1.0); e.underCoatEnv = float3(1.0); e.coatDarken = float3(1.0);
     e.filmOn = false; e.filmTint = float3(1.0);
+    e.ggxRelative = false;
     return e;
 }
 

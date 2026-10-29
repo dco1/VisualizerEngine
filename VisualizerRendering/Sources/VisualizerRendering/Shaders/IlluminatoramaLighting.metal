@@ -26,6 +26,19 @@ static inline float distributionGGX(float NdotH, float roughness) {
     return a2 / (M_PI_F * d * d + 1e-7);
 }
 
+/// Daydream DH-1306 — the direct lobe's D toward a light of angular radius `sourceTan`.
+/// `relative` false ⇒ `distributionGGX` exactly (the absolute `+1e-7` guard, which clips the peak
+/// below roughness ~0.2: 24 % kept at 0.1, 0.1 % at 0.05). `relative` true ⇒ the path lane's
+/// relative-guarded `pathGGXD`, with the lobe convolved by the source's disc — √(α² + (ρ/2)²),
+/// unit energy preserved (the coat's `layeredCoatDirect` form). A point (`sourceTan` 0) is the
+/// ideal GGX peak, 1/(π α²).
+static inline float distributionGGXSource(float NdotH, float roughness, float sourceTan, bool relative) {
+    if (!relative) return distributionGGX(NdotH, roughness);
+    float a = roughness * roughness;
+    float aEff = min(1.0, sqrt(a * a + 0.25 * sourceTan * sourceTan));
+    return pathGGXD(aEff, NdotH);
+}
+
 static inline float3 fresnelSchlick(float cosTheta, float3 F0) {
     return F0 + (1.0 - F0) * pow(saturate(1.0 - cosTheta), 5.0);
 }
@@ -522,7 +535,7 @@ static inline float3 brdf(
         float  d  = ToH * ToH / (at * at) + BoH * BoH / (ab * ab) + NdotH * NdotH;
         D = 1.0 / (M_PI_F * at * ab * d * d);
     } else {
-        D = distributionGGX(NdotH, roughness);
+        D = distributionGGXSource(NdotH, roughness, sourceTan, le.ggxRelative);   // DH-1306
     }
 
     float3 spec = (D * G * F) / (4.0 * NdotV * NdotL + 1e-7);
@@ -681,7 +694,8 @@ static inline int ltcClipQuadToHorizon(thread float3* L) {
 static inline float3 areaLightSpecular(AreaLight al, float3 worldPos, float3 N, float3 V,
                                        float3 F0, float roughness,
                                        texture2d<float> ltcMat, texture2d<float> ltcMag, bool ltcEnabled,
-                                       float3 nL, float3 p0, float3 p1, float3 p2, float3 p3, float ff) {
+                                       float3 nL, float3 p0, float3 p1, float3 p2, float3 p3, float ff,
+                                       bool ggxRelative = false) {
     float3 spec = float3(0.0);
     if (ltcEnabled) {
         // LTC specular — transform the light polygon by the per-(roughness, NdotV)
@@ -766,7 +780,9 @@ static inline float3 areaLightSpecular(AreaLight al, float3 worldPos, float3 N, 
             float  NdotH = saturate(dot(N, H));
             float  HdotV = saturate(dot(H, V));
             float3 F     = fresnelSchlick(HdotV, F0);
-            float  D     = distributionGGX(NdotH, roughness);
+            // DH-1306 — `ggxRelative`: the unclipped peak. The normalisation below reads its
+            // D₁ from the SAME function, so peak × footprint stays one lobe's energy either way.
+            float  D     = distributionGGXSource(NdotH, roughness, 0.0, ggxRelative);
             float  G     = geometrySmith(NdotV, NdotLs, roughness);
             // ENERGY NORMALISATION (VZ-0141; the rect-light form of Karis 2013's
             // representative-point normalisation). This used to be `… * NdotLs * ff`: the
@@ -783,9 +799,9 @@ static inline float3 areaLightSpecular(AreaLight al, float3 worldPos, float3 N, 
             //
             // The lobe's footprint: a unit-energy GGX lobe of peak D₁ spans
             // Ω_lobe = 4·VoH / D₁ steradians of L-space (4·VoH is the H → L Jacobian). D₁ is
-            // taken from this kernel's own `distributionGGX` (its +1e-7 guard included), so
-            // peak × footprint is exactly one lobe's energy whatever that guard does to low
-            // roughness. The solid angle the lobe collects from a light of solid angle Ω is
+            // taken from this kernel's own D (`distributionGGXSource`: the legacy +1e-7 guard, or
+            // the DH-1306 relative one), so peak × footprint is exactly one lobe's energy whatever
+            // the guard does to low roughness — nothing here was calibrated against the clip. The solid angle the lobe collects from a light of solid angle Ω is
             // Ω·Ω_lobe / (Ω + Ω_lobe). That is exact for a centred cap under small-α GGX, whose
             // cumulative distribution is t²/(α² + t²), and it is Karis's widened
             // α'² = α² + Ω/(4π·VoH) in solid-angle form. It tends to Ω for a small light and to
@@ -797,7 +813,7 @@ static inline float3 areaLightSpecular(AreaLight al, float3 worldPos, float3 N, 
             // band, never above the passive-reflector ceiling (max 0.14 of it), and within 4 %
             // of the LTC lane where the light covers the lobe.
             float  omega     = areaRectSolidAngle(p0, p1, p2, p3);
-            float  Dpeak     = distributionGGX(1.0, roughness);
+            float  Dpeak     = distributionGGXSource(1.0, roughness, 0.0, ggxRelative);
             float  collected = omega / (1.0 + omega * Dpeak / (4.0 * max(HdotV, 1e-4)));
             float  projSA    = min(M_PI_F * ff, NdotLs * collected * kAreaLightFormScale);
             spec = (D * G * F) / (4.0 * NdotV * NdotLs + 1e-7) * projSA;
@@ -854,7 +870,7 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
 
     float3 F0 = layeredBaseF0(le, albedo, metallic);
     float3 spec = areaLightSpecular(al, worldPos, N, V, F0, roughness, ltcMat, ltcMag, ltcEnabled,
-                                    nL, p0, p1, p2, p3, ff);
+                                    nL, p0, p1, p2, p3, ff, le.ggxRelative);
     if (le.multiscatter) {
         spec *= le.specDirectMS;
         diffuse = le.diffuseDirect * albedo * ff;
@@ -867,7 +883,7 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
         spec = spec * le.underCoatDirect
              + (le.coatWeight * le.coatSpecMS)
                * areaLightSpecular(al, worldPos, N, V, float3(le.coatF0), le.coatRoughness,
-                                   ltcMat, ltcMag, ltcEnabled, nL, p0, p1, p2, p3, ff);
+                                   ltcMat, ltcMag, ltcEnabled, nL, p0, p1, p2, p3, ff, le.ggxRelative);
     }
 
     return (diffuse + spec) * al.color * window;
@@ -1386,6 +1402,8 @@ kernel void illumi_lighting(
     // DH-1316 — the dyed sheen colour applies to the bolted-on sheen too (the layered BSDF is a host
     // opt-in of its own); `layeredOff()` leaves it false, so a host that sets neither is bit-identical.
     le.dyedSheen = (frame.frameFlags & kFrameFlagDyedSheen) != 0u;
+    // DH-1306 — the unclipped GGX peak (IlluminatoramaBSDF.h `kFrameFlagGGXRelativeGuard`).
+    le.ggxRelative = (frame.frameFlags & kFrameFlagGGXRelativeGuard) != 0u;
     // DH-1301 — diffuse roughness (EON): the lights with a direction below (sun, points, spots, fill
     // directionals, the SSS diffuse peel) evaluate the full lobe; the integrated sources (LTC area /
     // portal lights, the diffuse IBL + bands, the ambient supplement) its directional albedo.
@@ -1493,7 +1511,10 @@ kernel void illumi_lighting(
     float3 directSunSheen = float3(0.0);
     float3 directSun = brdf(N, V, Ld, albedo, metallic, roughness,
                             frame.directionalLightColor, aniso, grainT,
-                            sheenStrength, &directSunSheen, sheenRoughness, le) * visibility;
+                            sheenStrength, &directSunSheen, sheenRoughness, le,
+                            // DH-1306 — the unclipped lobe sees the sun's disc (its angular radius,
+                            // the same number the traced penumbra cones over); 0 on the legacy path.
+                            le.ggxRelative ? frame.rtSunShadowAngle : 0.0) * visibility;
     clothSheen += directSunSheen * visibility;
     if (isSSS) sssDiffuse += brdfDiffuse(N, V, Ld, albedo, metallic,
                                          frame.directionalLightColor, le) * visibility;
@@ -2303,7 +2324,8 @@ kernel void illumi_lighting(
         float ccNdotV = saturate(dot(N, V));
         if (NdotL_sun > 0.0) {
             float3 Hcc = normalize(V + Ld);
-            float  Dcc = distributionGGX(saturate(dot(N, Hcc)), ccRough);
+            float  Dcc = distributionGGXSource(saturate(dot(N, Hcc)), ccRough, frame.rtSunShadowAngle,
+                                               (frame.frameFlags & kFrameFlagGGXRelativeGuard) != 0u);   // DH-1306
             float  Gcc = geometrySmith(ccNdotV, NdotL_sun, ccRough);
             float  Fcc = ccF0 + (1.0 - ccF0) * pow(1.0 - saturate(dot(Hcc, V)), 5.0);
             float  spec = (Dcc * Gcc * Fcc) / max(4.0 * ccNdotV * NdotL_sun, 1e-4);
@@ -2360,7 +2382,8 @@ kernel void illumi_lighting(
         float ccNdotV = saturate(dot(N, V));
         if (NdotL_sun > 0.0) {
             float3 Hcc = normalize(V + Ld);
-            float  Dcc = distributionGGX(saturate(dot(N, Hcc)), ccRough);
+            float  Dcc = distributionGGXSource(saturate(dot(N, Hcc)), ccRough, frame.rtSunShadowAngle,
+                                               (frame.frameFlags & kFrameFlagGGXRelativeGuard) != 0u);   // DH-1306
             float  Gcc = geometrySmith(ccNdotV, NdotL_sun, ccRough);
             float  Fcc = ccF0 + (1.0 - ccF0) * pow(1.0 - saturate(dot(Hcc, V)), 5.0);
             float  spec = (Dcc * Gcc * Fcc) / max(4.0 * ccNdotV * NdotL_sun, 1e-4);

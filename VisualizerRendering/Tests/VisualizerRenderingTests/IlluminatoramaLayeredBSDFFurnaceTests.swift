@@ -60,6 +60,7 @@ final class IlluminatoramaLayeredBSDFFurnaceTests: XCTestCase {
         float  sheenA = (sh && sheenS > 0.0) ? float(dfg.sample(ls, float2(mu, sheenR)).a) : 0.0;
         LayeredEnergy le = layeredOff();
         if (ms || sh) le = layeredEnergy(albedo, metal, lut, sheenA, sheenS, ms, sh, float3(0.04), dyed);
+        le.ggxRelative = (flags & kFrameFlagGGXRelativeGuard) != 0u;   // DH-1306
 
         // ── direct: ∫ brdf·cos dω, balance-heuristic MIS of cosine + GGX-NDF sampling ──
         const uint NS = 4096u;
@@ -116,9 +117,9 @@ final class IlluminatoramaLayeredBSDFFurnaceTests: XCTestCase {
         // …and where an RT reflection ray HIT: the reflection replaces the specular IBL.
         float maximumRefl = (albedo * w.diffuse + w.reflection + sheenEnv).g;
 
-        // How much of the direct lobe the D guard (`+1e-7` in distributionGGX) clips at the peak.
-        float dpk = a2 / (M_PI_F * a2 * a2 + 1e-7);
-        float clip = dpk * (M_PI_F * a2);              // D_guarded(peak) / D_ideal(peak)
+        // How much of the direct lobe the D guard clips at the peak: the D `brdf` actually evaluates
+        // (`distributionGGXSource`, legacy `+1e-7` or the DH-1306 relative guard) over the ideal.
+        float clip = distributionGGXSource(1.0, r, 0.0, le.ggxRelative) * (M_PI_F * a2);
         outp[gid * 2]     = float4(direct, env, maximum, maximumRefl);
         outp[gid * 2 + 1] = float4(directSpec, clip, clothSheenTint(albedo, le.dyedSheen).g, 0.0);
     }
@@ -201,6 +202,7 @@ final class IlluminatoramaLayeredBSDFFurnaceTests: XCTestCase {
     static let ms: UInt32 = 4      // kFrameFlagLayeredMultiscatter
     static let msSheen: UInt32 = 12
     static let msSheenDyed: UInt32 = 12 | 1024   // + kFrameFlagDyedSheen (DH-1316)
+    static let msRelative: UInt32 = 4 | 16384    // + kFrameFlagGGXRelativeGuard (DH-1306)
 
     /// Mean over the view sweep, the number the report quotes per roughness.
     private func sweep(metal: Float, flags: UInt32, sheen: Float = 0, sheenR: Float = 0.30)
@@ -247,6 +249,31 @@ final class IlluminatoramaLayeredBSDFFurnaceTests: XCTestCase {
                     if r >= 0.2 {
                         XCTAssertEqual(row.direct, 1.0, accuracy: 0.02, "direct furnace \(label) r \(r)")
                     }
+                }
+            }
+        }
+    }
+
+    /// **DH-1306 — the unclipped peak.** With `kFrameFlagGGXRelativeGuard` the direct lobe keeps its
+    /// whole GGX peak, so the direct furnace for a white metal reads ~1 at the polished end too
+    /// (0.054 / 0.594 at roughness 0.05 / 0.1 under the `+1e-7` guard) — and nothing above
+    /// roughness 0.2, where the guard never bound, moves.
+    func testRelativeGuardRestoresThePolishedDirectLobe() throws {
+        for (label, metal) in [("white METAL", Float(1)), ("white DIELECTRIC", Float(0))] {
+            let legacy = try sweep(metal: metal, flags: Self.ms)
+            let fixed  = try sweep(metal: metal, flags: Self.msRelative)
+            say("── DH-1306 direct furnace — \(label): +1e-7 guard → relative guard (mean over N·V) [peak kept] ──")
+            for (k, r) in Self.roughnesses.enumerated() {
+                func mean(_ rows: [Out]) -> Double { rows.map(\.direct).reduce(0, +) / Double(rows.count) }
+                let b = legacy[k].rows, a = fixed[k].rows
+                say(String(format: "  %.2f  | %.3f → %.3f  [min %.3f]  peak %.3f → %.3f", r, mean(b), mean(a),
+                           a.map(\.direct).min()!, b[0].peak, a[0].peak))
+                for row in a {
+                    XCTAssertEqual(row.peak, 1.0, accuracy: 0.01, "relative guard keeps the whole peak, r \(r)")
+                    if metal == 1 { XCTAssertEqual(row.direct, 1.0, accuracy: 0.03, "direct furnace \(label) r \(r)") }
+                }
+                if r >= 0.3 {
+                    XCTAssertEqual(mean(a), mean(b), accuracy: 0.002, "no change where the guard never bound, r \(r)")
                 }
             }
         }

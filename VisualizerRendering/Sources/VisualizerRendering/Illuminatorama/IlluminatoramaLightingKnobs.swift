@@ -208,6 +208,13 @@ final class LightingKnobs {
     /// light, the environment, SSR and the traced primary's reflection. `false` (the default) is byte-identical.
     /// Costs one material-layer texel read per pixel while on.
     var thinFilmEnabled: Bool = false
+    /// **Daydream DH-1306 — the unclipped GGX peak.** `true`: the deferred kernel's direct lobe (sun,
+    /// points, spots, fills, the area-light MRP fallback, the clearcoat) uses the relative-guarded D
+    /// the path lane always used, widened by each light's angular size (unit energy); the white
+    /// furnace's direct arm then reads ~1 down to roughness 0.05. `false` (the default) is the
+    /// historical `+1e-7` guard — a polished highlight kept 24 % of its peak at roughness 0.1 —
+    /// byte-identical.
+    var ggxRelativeGuardEnabled: Bool = false
     /// **DH-1302 — per-material thin-sheet translucency on every lane.** `true`: an instance with
     /// `translucencyWeight > 0` lets that fraction of the light reaching its far face through, tinted
     /// by `translucencyColor` (the albedo when unset) — live and still alike. `false` (the default) is

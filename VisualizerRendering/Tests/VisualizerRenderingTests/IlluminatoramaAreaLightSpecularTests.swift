@@ -71,14 +71,30 @@ final class IlluminatoramaAreaLightSpecularTests: XCTestCase {
         float  r = a.w;
         // albedo 0, metallic 0 ⇒ diffuse = 0 and F0 = 0.04: the return is the specular alone
         // (× colour 1 × the radius window, ≈ 1 at the test's 10 km radius).
-        float3 mrp = evalAreaLight(al, P, N, V, float3(0.0), 0.0, r, ltcMat, ltcMag, false);
-        float3 ltc = evalAreaLight(al, P, N, V, float3(0.0), 0.0, r, ltcMat, ltcMag, true);
+        // b.w > 0.5 ⇒ the DH-1306 relative GGX guard (`LayeredEnergy.ggxRelative`).
+        LayeredEnergy le = layeredOff();
+        le.ggxRelative = b.w > 0.5;
+        float3 mrp = evalAreaLight(al, P, N, V, float3(0.0), 0.0, r, ltcMat, ltcMag, false, le);
+        float3 ltc = evalAreaLight(al, P, N, V, float3(0.0), 0.0, r, ltcMat, ltcMag, true, le);
         float3 p0 = al.center - al.ex - al.ey - P, p1 = al.center - al.ex + al.ey - P;
         float3 p2 = al.center + al.ex + al.ey - P, p3 = al.center + al.ex - al.ey - P;
         float  ff = ltcPolygonForm(N, p0, p1, p2, p3, al.twoSided > 0.5);
         out[gid] = float4(mrp.x, ltc.x, ff, vz0141ProbeSolidAngle(p0, p1, p2, p3));
     }
     """
+
+    /// DH-1306 — evaluate with the relative GGX guard (`kFrameFlagGGXRelativeGuard`).
+    private var relativeGuard = false
+
+    /// DH-1306 — the MRP fallback with the UNCLIPPED peak. Its normalisation reads D₁ from the same
+    /// function as its D, so nothing was calibrated against the `+1e-7` clip: the bezel and the
+    /// randomised sweep (whose CPU reference already uses the ideal NDF) must hold unchanged.
+    func testRelativeGuardKeepsTheMRPOnTheIntegral() throws {
+        relativeGuard = true
+        try testDigitalClockBezelUnderTheWindowPortal()
+        try testEnergyBoundAndBothLimitsAcrossLightsAndRoughness()
+        try testMRPAgreesWithLTCWhereTheLightCoversTheLobe()
+    }
 
     private func makeProbe() throws -> Probe {
         guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal") }
@@ -125,7 +141,7 @@ final class IlluminatoramaAreaLightSpecularTests: XCTestCase {
         var packed: [SIMD4<Float>] = []
         for r in recv {
             packed.append(SIMD4(SIMD3<Float>(r.p), Float(r.roughness)))
-            packed.append(SIMD4(SIMD3<Float>(r.n), 0))
+            packed.append(SIMD4(SIMD3<Float>(r.n), relativeGuard ? 1 : 0))
             packed.append(SIMD4(SIMD3<Float>(r.v), 0))
         }
         let dev = probe.device
