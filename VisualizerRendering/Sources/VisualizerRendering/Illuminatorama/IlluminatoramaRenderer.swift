@@ -201,6 +201,9 @@ public final class IlluminatoramaRenderer {
         public var uploadsSkipped = 0
         public var tlasRefitsSkipped = 0
         public var spotShadowPassesSkipped = 0
+        /// Spot/area atlas slices actually RASTERISED (DH-1064). `spotShadowPassesSkipped` alone
+        /// cannot say what a frame paid — a rising skip count read as "more passes" once.
+        public var spotShadowPassesRendered = 0
         public var pointShadowPassesSkipped = 0
     }
     /// Debug window for tests/instruments: the current stability streak lengths

@@ -18,6 +18,15 @@ final class ShadowKnobs {
     /// A/B lever for the per-slice reuse above (default on). Off = every slice re-renders whenever
     /// GPU-fed geometry is live, the pre-DH-0631 behaviour.
     var spotShadowGPUGeometryOptOutEnabled: Bool = true
+    /// Daydream DH-1064 — A/B lever for STICKY spot-atlas slices (default on). On, a caster whose
+    /// light matrix already sits in some slice keeps that slice when the set of casters changes,
+    /// so a membership change re-renders only the slices that genuinely changed. Off = slices are
+    /// handed out compactly in caster order every frame (the pre-DH-1064 rule), where one portal
+    /// joining the set shifted every later slice and re-rendered them all.
+    var spotShadowStickySlicesEnabled: Bool = true
+    /// Daydream DH-1064 — test lever: false re-renders every spot/area slice every frame (no
+    /// static reuse at all), so a gate can diff a reused atlas against a freshly rasterised one.
+    var spotShadowReuseEnabled: Bool = true
     // ── Phase 2.5 shadow knobs ───────────────────────────────────────
     /// Toggle the cascaded-shadow pass + sampling. Off = direct sun lights
     /// every pixel, regardless of occlusion (Phase 2 behaviour).

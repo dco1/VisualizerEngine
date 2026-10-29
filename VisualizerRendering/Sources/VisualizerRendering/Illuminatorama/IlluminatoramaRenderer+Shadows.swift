@@ -329,6 +329,7 @@ extension IlluminatoramaRenderer {
             case .area(let i): areaLights[i].shadowSliceIndex = -1
             }
         }
+        stickSpotShadowSlicesToLastFrame()   // DH-1064 — +SpotShadowSlots.swift
     }
 
     /// DH-0601 — the light-space view-projection for a window portal's VISIBILITY shadow map.
@@ -399,7 +400,13 @@ extension IlluminatoramaRenderer {
     /// spots are present, or when the host hasn't pushed any instances
     /// (no occluders → no shadow data needed).
     func encodeSpotShadowPasses(_ cb: MTLCommandBuffer) {
-        guard spotShadowsEnabled, !shd.spotShadowCasters.isEmpty, !instances.isEmpty else { return }
+        guard spotShadowsEnabled, !shd.spotShadowCasters.isEmpty, !instances.isEmpty else {
+            // Nothing is rendered into the atlas this frame, so after it no slice can vouch for
+            // the scene — without this a scene edited while spot shadows were off came back on
+            // to maps of the old scene, passing the matrix test.
+            shd.lastSpotShadowMats.removeAll()
+            return
+        }
         let count = shd.spotShadowCasters.count
         // PERF (static-scene skip): spot shadow maps are LIGHT-space — a camera
         // orbit re-rendered every slice (up to 8 full scene depth passes) into
@@ -407,10 +414,20 @@ extension IlluminatoramaRenderer {
         // `sceneStaticForShadows`) and every slice's light matrix is unchanged,
         // the atlas already contains exactly these maps — reuse them.
         let mats = shd.spotShadowCasters.map { $0.matrix }
-        if sceneStaticForShadows && mats == shd.lastSpotShadowMats {
+        let reuseAllowed = spotShadowReuseEnabled
+        if reuseAllowed && sceneStaticForShadows && mats == shd.lastSpotShadowMats {
             staticSkipStats.spotShadowPassesSkipped += count
             return
         }
+        // DH-1064 — reuse is decided PER SLICE against the matrix that slice was last rendered
+        // with, not against the whole array: when the caster set changes (a portal or cone joins
+        // the budget as the camera travels), `stickSpotShadowSlicesToLastFrame` has kept every
+        // surviving caster on its old slice, so only the slices whose matrix really moved
+        // re-render. Every slice is either re-rendered with `mats[slice]` or reused because it
+        // already holds exactly that map, so `lastSpotShadowMats = mats` stays the atlas's truth.
+        let lastMats = shd.lastSpotShadowMats
+        func sliceHeld(_ slice: Int) -> Bool { slice < lastMats.count && lastMats[slice] == mats[slice] }
+        let wholeSceneStatic = reuseAllowed && sceneStaticForShadows
         // DH-0631 / DH-0637 — per-slice reuse when the only things keeping the scene from "static"
         // are live GPU-fed geometry (the lawn) and/or swaying pendants. A slice still holds a valid
         // map from the last time it was rendered with this same matrix if (a) every CPU-visible
@@ -418,8 +435,8 @@ extension IlluminatoramaRenderer {
         // cone, and (c) no swaying instance's swing-sphere intersects its cone. Slices that fail
         // (b) or (c) — exterior cones, the can above a swinging pendant — re-render as before.
         let gpuGeometryLive = !fxs.gpuRepackTasks.isEmpty || onEncodeGPUInstances != nil
-        let perSliceBase = spotShadowGPUGeometryOptOutEnabled
-            && gbs.instanceShapeStableFrames >= 1 && mats == shd.lastSpotShadowMats
+        let perSliceBase = reuseAllowed && spotShadowGPUGeometryOptOutEnabled
+            && gbs.instanceShapeStableFrames >= 1
         shd.lastSpotShadowMats = mats
         // Pass descriptors + labels are cached per slice (they never change after
         // the atlas exists) — this loop used to allocate a fresh descriptor and
@@ -436,7 +453,11 @@ extension IlluminatoramaRenderer {
             shd.spotShadowPassLabels.append("Illuminatorama.spotShadow.s\(slice)")
         }
         for slice in 0..<count {
-            if perSliceBase {
+            if wholeSceneStatic && sliceHeld(slice) {
+                staticSkipStats.spotShadowPassesSkipped += 1
+                continue
+            }
+            if perSliceBase && sliceHeld(slice) {
                 // (b) GPU geometry: none live, or the owner asserted none can enter its frustum.
                 // (c) Sway (DH-0637): no swaying instance's swing-sphere intersects a spot's cone; an
                 //     area-light slice has no cone to test, so it re-renders while anything sways.
@@ -453,6 +474,7 @@ extension IlluminatoramaRenderer {
                 }
             }
             guard let enc = timedRenderEncoder(cb, shd.spotShadowPassDescs[slice], "shadow.spot") else { continue }
+            staticSkipStats.spotShadowPassesRendered += 1
             enc.label = shd.spotShadowPassLabels[slice]
             enc.setRenderPipelineState(shd.shadowPipeline)
             var cutoutBound = false   // DH-1487 — the fragment-less pipeline is bound
