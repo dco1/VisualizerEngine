@@ -292,7 +292,6 @@ kernel void illumi_ssao(
     // Screen-space march extent. A view-space offset of `radius` at this pixel's depth
     // projects to `radius · focal · 0.5 · dim / |z|` pixels; because focalX·W == focalY·H
     // for a standard perspective the count is isotropic, so one scalar covers both axes.
-    float focalX = frame.projection[0][0];
     float focalY = frame.projection[1][1];
     float invZ   = 1.0 / max(1e-3, -Pview.z);
     // The lower clamp must leave room for `kGtaoMinPix` plus a real march; a 2 px extent
@@ -358,10 +357,18 @@ kernel void illumi_ssao(
         float phi = (float(M_PI_F) / float(kGtaoSlices)) * (float(s) + sliceJitter);
         float2 omega = float2(cos(phi), sin(phi));        // screen-space (pixel) direction
 
-        // View-space direction for that screen direction. Divide by the focal lengths so
-        // an anisotropic FOV does not skew the slice plane; horizons themselves are read
-        // from reconstructed 3-D positions and are unaffected by this approximation.
-        float3 dirVec = normalize(float3(omega.x / focalX, omega.y / focalY, 0.0));
+        // View-space direction of a +omega pixel step — the slice plane `n` is measured in.
+        // It MUST be the plane the depth-marched horizons lie in, or the arc integral compares
+        // a normal from one slice with horizons from another. A pixel step (dx, dy) — y DOWN —
+        // moves view space by (2dx / (W·focalX), −2dy / (H·focalY))·|z|, and focalX·W ==
+        // focalY·H for a standard perspective, so the direction is simply (omega.x, −omega.y):
+        // XeGTAO's `omega = (cos φ, −sin φ)` for the same reason.
+        //
+        // DH-0950: this was `(omega.x / focalX, omega.y / focalY)` — mirrored vertically
+        // (`signN` flipped on every non-horizontal slice, so a horizontal crease's occluder was
+        // clamped away) and stretched by the aspect (an open floor integrated to ~0.91, not
+        // 1.0). `focalY` still sizes the march extent above.
+        float3 dirVec = normalize(float3(omega.x, -omega.y, 0.0));
         float3 orthoDir = dirVec - dot(dirVec, V) * V;
         float3 axis = cross(dirVec, V);
         float axisLen = length(axis);
