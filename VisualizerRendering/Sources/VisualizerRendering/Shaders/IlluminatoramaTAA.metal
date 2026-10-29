@@ -123,7 +123,7 @@ struct TAAStillParams {
     uint still;    // 1 ⇒ frozen-camera running average
     uint karis;    // 1 ⇒ keep the Karis 1/(1+Y) weights in still mode (firefly damping, biased)
     uint noSharpen; // 1 ⇒ hand the accumulation downstream unsharpened (Daydream DH-1365, Maximum)
-    uint _r1;
+    float fade;     // DH-0952 — weight of `crossfadeSrc` mixed over the DISPLAY output only (0 ⇒ off)
 };
 
 kernel void illumi_taa_resolve(
@@ -143,6 +143,9 @@ kernel void illumi_taa_resolve(
     // Previous frame's depth — for disocclusion rejection (see below).
     depth2d<float,   access::read>    gPrevDepth  [[texture(5)]],
     texture2d<half,  access::write>   outResolved [[texture(6)]],
+    // DH-0952 — a frozen picture (what was on screen before a still restarted its average) that
+    // the display dissolves out of; read only when `still.fade > 0`.
+    texture2d<half,  access::read>    crossfadeSrc [[texture(7)]],
     constant FrameUniforms&           frame       [[buffer(0)]],
     constant TAAStillParams&          still       [[buffer(1)]],
     uint2                             gid         [[thread_position_in_grid]]
@@ -175,7 +178,9 @@ kernel void illumi_taa_resolve(
         result = max(float3(0.0), result);
         outHistory.write(half4(half3(result), 1.0h), gid);
         if (still.noSharpen != 0u) {
-            outResolved.write(half4(half3(result), 1.0h), gid);
+            float3 shown = result;
+            if (still.fade > 0.0) shown = mix(shown, float3(crossfadeSrc.read(gid).rgb), saturate(still.fade));
+            outResolved.write(half4(half3(shown), 1.0h), gid);
             return;
         }
         // Acutance from the accumulation's own neighbourhood (last frame's history), clamped
@@ -192,7 +197,11 @@ kernel void illumi_taa_resolve(
         yMean /= 9.0;
         float3 sh = rY;
         sh.x = clamp(rY.x + 0.25 * (rY.x - yMean), min(yMin, rY.x), max(yMax, rY.x));
-        outResolved.write(half4(half3(max(float3(0.0), YCoCgtoRGB(sh))), 1.0h), gid);
+        float3 shown = max(float3(0.0), YCoCgtoRGB(sh));
+        // DH-0952 — dissolve out of the frozen picture on the DISPLAY only; the accumulator above
+        // stays the unbiased mean of the frames it has averaged.
+        if (still.fade > 0.0) shown = mix(shown, float3(crossfadeSrc.read(gid).rgb), saturate(still.fade));
+        outResolved.write(half4(half3(shown), 1.0h), gid);
         return;
     }
 

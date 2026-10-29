@@ -18,6 +18,9 @@ extension IlluminatoramaRenderer {
     public var taaStillAccumulation: Bool { get { kPost.taaStillAccumulation } set { kPost.taaStillAccumulation = newValue } _modify { yield &kPost.taaStillAccumulation } }
     public var taaStillKarisWeights: Bool { get { kPost.taaStillKarisWeights } set { kPost.taaStillKarisWeights = newValue } _modify { yield &kPost.taaStillKarisWeights } }
     public var taaStillSharpen: Bool { get { kPost.taaStillSharpen } set { kPost.taaStillSharpen = newValue } _modify { yield &kPost.taaStillSharpen } }
+    public var taaStillCrossfade: Float { get { kPost.taaStillCrossfade } set { kPost.taaStillCrossfade = newValue } _modify { yield &kPost.taaStillCrossfade } }
+    /// Freeze the picture currently on screen as `taaStillCrossfade`'s source (taken at the next TAA resolve).
+    public func requestTAAStillCrossfadeCapture() { kPost.taaStillCrossfadeCaptureRequested = true }
     public var displayTransform: DisplayTransform { get { kPost.displayTransform } set { kPost.displayTransform = newValue } _modify { yield &kPost.displayTransform } }
     public var projectionShiftNDC: SIMD2<Float> { get { kPost.projectionShiftNDC } set { kPost.projectionShiftNDC = newValue } _modify { yield &kPost.projectionShiftNDC } }
     public var autoExposureHold: Bool { get { kPost.autoExposureHold } set { kPost.autoExposureHold = newValue } _modify { yield &kPost.autoExposureHold } }

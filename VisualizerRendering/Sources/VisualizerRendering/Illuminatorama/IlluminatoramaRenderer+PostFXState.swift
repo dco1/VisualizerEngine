@@ -114,6 +114,8 @@ final class PostFXState {
     var historyB: MTLTexture!
     /// The TAA resolve's downstream output (see `Targets.taaResolved`).
     var taaResolvedTexture: MTLTexture!
+    /// `taaStillCrossfade`'s frozen picture (DH-0952) — allocated on capture, released once the fade ends.
+    var taaCrossfadeSource: MTLTexture?
     /// When true, historyA holds the previous frame's TAA output and we
     /// write the current frame's resolve into historyB. Toggled each frame.
     var historyToggle: Bool = false

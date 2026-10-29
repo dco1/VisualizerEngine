@@ -88,6 +88,16 @@ final class PostKnobs {
     /// shipped still); Daydream's Maximum turns it off — its 2× render + declared reconstruction filter
     /// carry the detail (DH-1365). Rides `TAAStillParams.noSharpen`.
     var taaStillSharpen: Bool = true
+    /// With `taaStillAccumulation`: the weight (0…1) of a FROZEN picture mixed over the frame handed
+    /// downstream — never into the accumulator. A host that restarts its average under new lighting
+    /// (Daydream's settled-canvas refine, DH-0952) captures what was on screen with
+    /// `requestTAAStillCrossfadeCapture()` and fades this 1 → 0 over a few frames, so the swap
+    /// dissolves in while the history stays an UNBIASED mean of the new frames. (The old way to
+    /// dissolve — counting the previous picture as prior frames of the average — leaves it in the
+    /// held frame at prior/(k + prior) forever.) Default 0: byte-identical. Rides `TAAStillParams.fade`.
+    var taaStillCrossfade: Float = 0
+    /// One-shot: on the next TAA resolve, copy the frame last handed downstream into the crossfade source.
+    var taaStillCrossfadeCaptureRequested = false
     var displayTransform: DisplayTransform = .acesRec709
     /// **Off-axis lens shift**, in NDC (clip.xy += shift · clip.w): slides the image under a fixed
     /// eye without turning the view — a view camera's rise/shift, and the shear that keeps a focus

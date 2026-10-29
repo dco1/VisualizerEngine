@@ -12,6 +12,7 @@ extension IlluminatoramaRenderer {
     /// disabled — bloom + tonemap then read directly from hdrCompositeTexture.
     func encodeTAAResolve(_ cb: MTLCommandBuffer) {
         guard taaEnabled else { return }
+        prepareTAAStillCrossfade(cb)
         guard let enc = timedComputeEncoder(cb, "taa") else { return }
         enc.label = "Illuminatorama.taa"
         enc.setComputePipelineState(pfx.taaResolvePipeline)
@@ -30,12 +31,41 @@ extension IlluminatoramaRenderer {
         // resolve's acutance sharpen is applied once on the way out instead of
         // compounding inside the history every frame.
         enc.setTexture(pfx.taaResolvedTexture,      index: 6)
+        let fade = taaStillAccumulation ? max(0, min(1, taaStillCrossfade)) : 0
+        enc.setTexture(fade > 0 ? (pfx.taaCrossfadeSource ?? pfx.taaResolvedTexture) : pfx.taaResolvedTexture, index: 7)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
         var still = TAAStillParams(still: taaStillAccumulation ? 1 : 0, karis: taaStillKarisWeights ? 1 : 0,
-                                   noSharpen: taaStillSharpen ? 0 : 1)
+                                   noSharpen: taaStillSharpen ? 0 : 1,
+                                   fade: pfx.taaCrossfadeSource == nil ? 0 : fade)
         enc.setBytes(&still, length: MemoryLayout<TAAStillParams>.stride, index: 1)
         dispatch(enc, pipeline: pfx.taaResolvePipeline, width: width, height: height)
         enc.endEncoding()
+    }
+
+    /// DH-0952 — `taaStillCrossfade`'s source: on request, a copy of the frame last handed downstream
+    /// (`taaResolvedTexture` still holds it until this frame's resolve overwrites it); released once
+    /// the host's fade reaches 0, so the 8 bytes/px are held only for the few frames of a dissolve.
+    private func prepareTAAStillCrossfade(_ cb: MTLCommandBuffer) {
+        if kPost.taaStillCrossfadeCaptureRequested, let src = pfx.taaResolvedTexture {
+            kPost.taaStillCrossfadeCaptureRequested = false
+            var dst = pfx.taaCrossfadeSource
+            if dst == nil || dst!.width != src.width || dst!.height != src.height || dst!.pixelFormat != src.pixelFormat {
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: src.pixelFormat, width: src.width,
+                                                                 height: src.height, mipmapped: false)
+                d.usage = [.shaderRead]
+                d.storageMode = .private
+                dst = device.makeTexture(descriptor: d)
+                dst?.label = "Illuminatorama.taaCrossfadeSource"
+                pfx.taaCrossfadeSource = dst
+            }
+            if let dst, let blit = cb.makeBlitCommandEncoder() {
+                blit.label = "Illuminatorama.taaCrossfade.capture"
+                blit.copy(from: src, to: dst)
+                blit.endEncoding()
+            }
+        } else if kPost.taaStillCrossfade <= 0 {
+            pfx.taaCrossfadeSource = nil
+        }
     }
 
     /// What bloom + tonemap should read from this frame. With TAA on, that's
