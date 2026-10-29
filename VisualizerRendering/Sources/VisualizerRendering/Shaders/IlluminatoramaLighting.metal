@@ -128,6 +128,24 @@ constant bool kLightingAOVEnabled = is_function_constant_defined(kLightingAOVEna
 // the three cascade-dependent quantities below (matrix, depth bias, normal-offset
 // push) has to travel with the index, and having them inline made a second
 // evaluation impossible without duplicating them.
+static inline float4x4 cascadeViewProj(constant FrameUniforms& frame, uint cascade) {
+    if (cascade == 0u) return frame.shadowVP0;
+    if (cascade == 1u) return frame.shadowVP1;
+    return frame.shadowVP2;
+}
+
+// World size of one shadow-map texel in `cascade`. Derived from the cascade's ortho extent: the
+// first matrix row's linear length is 1/radius, and the map spans 2·radius across `width` texels.
+static inline float cascadeTexelWorld(constant FrameUniforms& frame, uint cascade, uint mapWidth) {
+    float4x4 vp = cascadeViewProj(frame, cascade);
+    float3 row0 = float3(vp[0][0], vp[1][0], vp[2][0]);
+    return 2.0 / max(length(row0), 1e-6) / float(mapWidth);
+}
+
+// `pushTexelWorld` is the texel size the normal offset below is scaled by. It is the caller's,
+// not this cascade's own, so that two cascades blended at a split can push the receiver by the
+// SAME world distance (DH-1450 — see `sunVisibility`). It is never smaller than this cascade's
+// own texel, which is what keeps the offset acne-free.
 static inline float cascadeVisibility(
     depth2d_array<float, access::sample> shadowMap,
     sampler                              shadowSampler,
@@ -136,7 +154,8 @@ static inline float cascadeVisibility(
     float3 N,
     float  slope,
     uint   cascade,
-    uint   pcfRadius
+    uint   pcfRadius,
+    float  pushTexelWorld
 ) {
     // Slope-scaled depth bias — surfaces nearly parallel to the light direction
     // need more bias to avoid acne, but biasing too much causes peter-panning.
@@ -145,10 +164,7 @@ static inline float cascadeVisibility(
     // tight in light-NDC space — scale by cascade index.
     bias *= (1.0 + float(cascade) * 0.5);
 
-    float4x4 cascadeVP;
-    if (cascade == 0u)      cascadeVP = frame.shadowVP0;
-    else if (cascade == 1u) cascadeVP = frame.shadowVP1;
-    else                    cascadeVP = frame.shadowVP2;
+    float4x4 cascadeVP = cascadeViewProj(frame, cascade);
 
     // Normal-offset bias. Depth bias along the light ray peter-pans grazing
     // surfaces (it scales with 1-NdotL, so walls detach from their contact
@@ -156,11 +172,8 @@ static inline float cascadeVisibility(
     // out along its own surface normal by ~1 shadow texel of WORLD size, so a
     // flat top no longer samples its own occluder (kills self-shadow acne)
     // while the in-plane shift barely moves the shadow edge. Texel world size
-    // is derived from the cascade's ortho extent: the first matrix row's linear
-    // length is 1/radius, and the map spans 2·radius across `width` texels.
-    float3 row0 = float3(cascadeVP[0][0], cascadeVP[1][0], cascadeVP[2][0]);
-    float  radius = 1.0 / max(length(row0), 1e-6);
-    float  texelWorld = 2.0 * radius / float(shadowMap.get_width());
+    // is `cascadeTexelWorld` — passed in by the caller (see the note on the signature).
+    float  texelWorld = pushTexelWorld;
     // How far the sample must be pushed is set by TWO things, and the old factor
     // `(0.4 + 0.8 * slope)` — a 0.4…1.2 ramp, then clamped to an absolute 6 mm — carried
     // only a weak version of one of them.
@@ -247,29 +260,52 @@ static inline float sunVisibility(
     uint cascade = pickCascade(viewDist, splits);
     float slope = clamp(1.0 - NdotL, 0.0, 1.0);
 
+    // ── DH-1450: one push for both sides of a split ──────────────────────────────────────
+    // The normal offset in `cascadeVisibility` moves the lookup sideways by
+    // push · tanθ along the light, and the push is texel-relative — so each cascade drew the
+    // shadow edge at a DIFFERENT place (measured on a wall's shadow at a 29.5° sun:
+    // 30 / 61 / 160 mm for cascades 0 / 1 / 2, ≈ 3·texel·tan²θ). A visibility cross-fade cannot
+    // reconcile two edges further apart than their penumbra: the 50 % crossing stays on the
+    // first edge until t = ½ and then JUMPS to the second, which is the kink (≈ 3 px at
+    // 15 m). So the push is made continuous instead: over the band-length stretch BEFORE the
+    // fade, this cascade's push eases from its own texel up to the next cascade's, and inside
+    // the fade both taps push by that same next-cascade texel. The two taps then look up the
+    // same world point and agree on where the edge is, and the edge's displacement changes
+    // smoothly with depth instead of stepping. The push is never below the texel of the
+    // cascade being sampled, so no tap gains acne; the cost is the coarser cascade's
+    // (already shipping) offset arriving one band-length early.
+    uint  mapW   = shadowMap.get_width();
+    float texelC = cascadeTexelWorld(frame, cascade, mapW);
+    float pushTexel = texelC;
+    float t = 0.0;
+    if (cascade < 2u) {
+        float nearZ = (cascade == 0u) ? 0.0 : splits.x;
+        float farZ  = (cascade == 0u) ? splits.x : splits.y;
+        float band  = (farZ - nearZ) * kCascadeBlendFraction;
+        if (band > 1e-4) {
+            float rampStart = (cascade == 0u) ? (farZ - 2.0 * band) : nearZ;
+            float r = saturate((viewDist - rampStart) / max(farZ - band - rampStart, 1e-4));
+            r = r * r * (3.0 - 2.0 * r);
+            pushTexel = mix(texelC, cascadeTexelWorld(frame, cascade + 1u, mapW), r);
+            t = saturate((viewDist - (farZ - band)) / band);
+            // Ease the ramp (DH-1450): smoothstep has zero slope at both ends, so the fade
+            // leaves each cascade tangentially rather than stopping dead at the split.
+            t = t * t * (3.0 - 2.0 * t);
+        }
+    }
+
     float v = cascadeVisibility(shadowMap, shadowSampler, frame, worldPos, N, slope, cascade,
-                                frame.shadowPcfRadius);
+                                frame.shadowPcfRadius, pushTexel);
 
     // Inside the last `kCascadeBlendFraction` of this cascade's range, fade into the
     // next one. `cascade == 2` is the outermost, so it has nothing to fade into (its
     // far edge is `shadowMaxDistance`, where `sampleCascade` already falls back to
     // "lit" — a different boundary with a different fix).
-    if (cascade < 2u) {
-        float nearZ = (cascade == 0u) ? 0.0 : splits.x;
-        float farZ  = (cascade == 0u) ? splits.x : splits.y;
-        float band  = (farZ - nearZ) * kCascadeBlendFraction;
-        float t = (band > 1e-4) ? saturate((viewDist - (farZ - band)) / band) : 0.0;
-        // Ease the ramp (DH-1450). A linear fade moves the edge at a constant rate across the
-        // band and then STOPS dead at the split, which is itself a slope discontinuity — the
-        // kink the blend exists to remove, relocated to the band's two ends. smoothstep has zero
-        // slope at both, so the edge's displacement leaves each cascade tangentially.
-        t = t * t * (3.0 - 2.0 * t);
-        if (t > 0.0) {
-            float vNext = cascadeVisibility(shadowMap, shadowSampler, frame,
-                                            worldPos, N, slope, cascade + 1u,
-                                            frame.shadowPcfRadius);
-            v = mix(v, vNext, t);
-        }
+    if (t > 0.0) {
+        float vNext = cascadeVisibility(shadowMap, shadowSampler, frame,
+                                        worldPos, N, slope, cascade + 1u,
+                                        frame.shadowPcfRadius, pushTexel);
+        v = mix(v, vNext, t);
     }
     return v;
 }
