@@ -421,6 +421,7 @@ static inline SecondaryShadeParams fullRadianceParams(constant RTInstUniforms& u
     // lands on a floor under a lighting-only ceiling would come back full-sunlit and
     // put the light straight back that the transport mask on the bounce ray removed.
     p.occluderMask = u.transportRayMask;
+    p.sunShadowProven = 0u;            // DH-1588 — set per hit by the caller (`illumiSunCascadeProvesShadow`)
     return p;
 }
 
@@ -513,6 +514,81 @@ constant uint kPathPortalCache = 32u;   // per-vertex aperture-weight cache (thr
 #define kRTAblateGIHitShade    (1u << 25)
 #define kRTAblateReflHitShade  (1u << 26)
 #define kRTAblateGIShortRays   (1u << 27)
+
+// ── Daydream DH-1588 — the sun cascades PROVE a hit's shadow; the TLAS answers everywhere else ─────────
+// The sun shadow ray at every GI / reflection hit was ~112 ms of the ~300 ms settled refine on a software-RT
+// GPU (M1 Max), and almost all of it is the fixed cost of one incoherent TLAS descent per ray: splitting the
+// ray into a near and a far segment (the same boolean) cost +80 ms, and an occlusion-only intersector
+// (no triangle data, triangle-only geometry) measured the same as the shared one. So the lever is fewer
+// rays, not cheaper ones. Most of those hits are inside a room whose sun is stopped by a wall or the roof
+// metres before it, which the sun's own shadow cascades (rendered every frame for the deferred pass) can
+// state with a texture read.
+//
+// The cascades are only a PROOF of shadow, never the answer: a hit is skipped (sun term 0) only when
+//   • it projects inside a cascade with a 3-texel border, depth inside (0, 1),
+//   • its normal faces the sun by at least `minNdotL` (a grazing receiver's own slope would eat the margin),
+//   • every one of the 3×3 texels around it holds a caster at least `margin` nearer the sun than the hit,
+//     margin = marginMetres + slopeTexels · texel · (1 + tan θ) — the receiver's own surface, a contact
+//     corner and a caster that ends inside the hit's texel all fail it.
+// Anything else traces the TLAS ray exactly as before, so a lit hit, a penumbra and a hit outside the
+// cascades are unchanged. The only way the proof differs from the ray is a caster the RASTER has and the
+// TLAS does not (Daydream: Signack foliage, lawn tiles, tree crowns are raster-only — the TLAS carries
+// proxies; lamps go the other way and only ever make the proof fail) or a gap narrower than a texel.
+// `audit` 1 = the INSTRUMENT: prove, then trace anyway (the picture is the shipped one) and count
+// [0] hits asked · [1] proven · [2] proven but the ray found no occluder — the proof's false-shadow rate.
+struct RTSunCascadeCull {
+    float4x4 vp[3];
+    uint  enabled;  uint  mapSize;  float marginMetres;  float slopeTexels;
+    uint  audit;    float minNdotL; uint  _pad0;         uint  _pad1;
+};
+
+static inline bool illumiSunCascadeProvesShadow(depth2d_array<float, access::read> map,
+                                                constant RTSunCascadeCull& cc,
+                                                float3 P, float3 N, float3 Ld)
+{
+    float nl = dot(N, Ld);
+    if (nl < cc.minNdotL) return false;
+    float tanT = sqrt(max(0.0, 1.0 - nl * nl)) / nl;
+    float texNDC = 2.0 / float(cc.mapSize);
+    for (uint c = 0u; c < 3u; ++c) {
+        float4x4 vp = cc.vp[c];
+        float3 ndc = (vp * float4(P, 1.0)).xyz;   // orthographic: w = 1
+        if (any(abs(ndc.xy) > 1.0 - 3.0 * texNDC) || ndc.z <= 0.0 || ndc.z >= 1.0) continue;
+        float texelWorld = 2.0 / max(length(float3(vp[0][0], vp[1][0], vp[2][0])), 1e-6) / float(cc.mapSize);
+        float zPerMetre = length(float3(vp[0][2], vp[1][2], vp[2][2]));
+        float margin = (cc.marginMetres + cc.slopeTexels * texelWorld * (1.0 + tanT)) * zPerMetre;
+        float zr = ndc.z - margin;
+        if (zr <= 0.0) return false;
+        int2 t = int2(float2(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5) * float(cc.mapSize));
+        for (int dy = -1; dy <= 1; ++dy)
+            for (int dx = -1; dx <= 1; ++dx)
+                if (!(map.read(uint2(t + int2(dx, dy)), c) < zr)) return false;
+        return true;
+    }
+    return false;
+}
+
+/// The per-hit decision: 1 ⇒ `SecondaryShadeParams.sunShadowProven` (skip the sun ray). Under `audit` the
+/// proof is checked against a traced ray and counted, and 0 is returned so the picture is the shipped one.
+template <typename Isect>
+static inline uint illumiHitSunProven(thread Isect& isect, instance_acceleration_structure accel,
+                                      depth2d_array<float, access::read> map, constant RTSunCascadeCull& cc,
+                                      device atomic_uint* stats, float3 P, float3 N, float3 Ld, uint mask)
+{
+    if (cc.enabled == 0u || dot(N, Ld) <= 0.0) return 0u;
+    bool proven = illumiSunCascadeProvesShadow(map, cc, P, N, Ld);
+    if (cc.audit == 0u) return proven ? 1u : 0u;
+    atomic_fetch_add_explicit(&stats[0], 1u, memory_order_relaxed);
+    if (proven) {
+        atomic_fetch_add_explicit(&stats[1], 1u, memory_order_relaxed);
+        isect.accept_any_intersection(true);
+        ray sr; sr.origin = P + N * 2e-3; sr.direction = Ld; sr.min_distance = 2e-3; sr.max_distance = 1e4;
+        if (isect.intersect(sr, accel, mask).type == intersection_type::none)
+            atomic_fetch_add_explicit(&stats[2], 1u, memory_order_relaxed);
+        isect.accept_any_intersection(false);
+    }
+    return 0u;
+}
 static inline float pathLuma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
 
 // ── Daydream DH-1344 — a world-space RADIANCE CACHE for the path lane (a still's) ───────────────────
@@ -1545,6 +1621,11 @@ kernel void illumi_rt_lighting_tlas(
     // TLAS id below `u.layerInstanceCount`) indexes; read only under kPathFlagLayeredSpecular.
     texture2d<uint, access::read>         gMaterialLayer [[texture(14)]],
     const device float4*                  layerInstances [[buffer(26)]],
+    // Daydream DH-1588 — the sun cascades as a shadow PROOF at GI / reflection hits (`illumiSunCascadeProvesShadow`);
+    // `cascadeCull.enabled` 0 ⇒ never read (the host binds a 1-slice stand-in), and the counters only under `audit`.
+    depth2d_array<float, access::read>    sunCascades [[texture(17)]],
+    constant RTSunCascadeCull&            cascadeCull [[buffer(27)]],
+    device atomic_uint*                   cascadeCullStats [[buffer(28)]],
     // Daydream DH-0539 — the reflection term's own target (rgb = reflection − the sky it replaces, a = mean
     // hit distance, 0 ⇒ untraced). Written only when `u.specDenoise`; the host binds a stand-in otherwise.
     texture2d<half, access::write>        rtSpecular  [[texture(15)]],
@@ -1813,8 +1894,11 @@ kernel void illumi_rt_lighting_tlas(
                                                      secFull, irrCube);
                 }
                 float3 cacheTerm = float3(0.0);
+                SecondaryShadeParams pHit = secBounce;   // DH-1588 — the cascades may prove this hit's sun shadow
+                pHit.sunShadowProven = pHit.shadowRays == 0u ? 0u
+                    : illumiHitSunProven(isect, accel, sunCascades, cascadeCull, cascadeCullStats, h.P, h.N, Ld, pHit.occluderMask);
                 if (!ablHitShade)
-                indirect += shadeSecondarySurface(isect, accel, h, secBounce, sec, irrCube, albedoAtlas, seed,
+                indirect += shadeSecondarySurface(isect, accel, h, pHit, sec, irrCube, albedoAtlas, seed,
                                                   hitFill || cardState == SURF_STAT_CACHED || cardState == SURF_STAT_FALLBACK,
                                                   cacheIrr, cacheTerm);
                 cacheGI += cacheTerm;
@@ -2041,8 +2125,11 @@ kernel void illumi_rt_lighting_tlas(
             }
             surfStat(surfHitStats, u.surfStatsEnabled, 4u + cardState);
             float3 cacheTerm = float3(0.0);
+            SecondaryShadeParams pHit = secFull;   // DH-1588 — the cascades may prove this hit's sun shadow
+            pHit.sunShadowProven = pHit.shadowRays == 0u ? 0u
+                : illumiHitSunProven(isect, accel, sunCascades, cascadeCull, cascadeCullStats, h.P, h.N, Ld, pHit.occluderMask);
             if (!ablReflShade)
-            acc += shadeSecondarySurface(isect, accel, h, secFull, sec, irrCube, albedoAtlas, seed,
+            acc += shadeSecondarySurface(isect, accel, h, pHit, sec, irrCube, albedoAtlas, seed,
                                          cardState == SURF_STAT_CACHED || cardState == SURF_STAT_FALLBACK,
                                          cacheIrr, cacheTerm);
             cacheRefl += cacheTerm;

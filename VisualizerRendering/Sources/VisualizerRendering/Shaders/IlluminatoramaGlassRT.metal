@@ -327,6 +327,7 @@ static inline SecondaryShadeParams glassSecondaryParams(constant GlassRTUniforms
     // path refracted into one and re-shaded it as a flat slab. The invisible-
     // occluder bit is for TRANSPORT rays only.
     p.occluderMask = 0x01u;
+    p.sunShadowProven = 0u;   // DH-1588 — the glass pass always traces its hit's sun ray
     return p;
 }
 

@@ -24,6 +24,10 @@ extension IlluminatoramaRenderer {
     public var rtPathLampShadows: Bool { get { kRT.rtPathLampShadows } set { kRT.rtPathLampShadows = newValue } _modify { yield &kRT.rtPathLampShadows } }
     public var rtPathDebugFlags: UInt32 { get { kRT.rtPathDebugFlags } set { kRT.rtPathDebugFlags = newValue } _modify { yield &kRT.rtPathDebugFlags } }
     public var rtTLASAblationFlags: UInt32 { get { kRT.rtTLASAblationFlags } set { kRT.rtTLASAblationFlags = newValue } _modify { yield &kRT.rtTLASAblationFlags } }
+    public var rtHitSunCascadeCull: Bool { get { kRT.rtHitSunCascadeCull } set { kRT.rtHitSunCascadeCull = newValue } _modify { yield &kRT.rtHitSunCascadeCull } }
+    public var rtHitSunCascadeMargin: Float { get { kRT.rtHitSunCascadeMargin } set { kRT.rtHitSunCascadeMargin = newValue } _modify { yield &kRT.rtHitSunCascadeMargin } }
+    public var rtHitSunCascadeSlopeTexels: Float { get { kRT.rtHitSunCascadeSlopeTexels } set { kRT.rtHitSunCascadeSlopeTexels = newValue } _modify { yield &kRT.rtHitSunCascadeSlopeTexels } }
+    public var rtHitSunCascadeAudit: Bool { get { kRT.rtHitSunCascadeAudit } set { kRT.rtHitSunCascadeAudit = newValue } _modify { yield &kRT.rtHitSunCascadeAudit } }
     public var rtSurfaceSnapMinUpY: Float { get { kRT.rtSurfaceSnapMinUpY } set { kRT.rtSurfaceSnapMinUpY = newValue } _modify { yield &kRT.rtSurfaceSnapMinUpY } }
     public var rtSurfaceSnapClearance: Float { get { kRT.rtSurfaceSnapClearance } set { kRT.rtSurfaceSnapClearance = newValue } _modify { yield &kRT.rtSurfaceSnapClearance } }
     public var rtPathLampMinDistance: Float { get { kRT.rtPathLampMinDistance } set { kRT.rtPathLampMinDistance = newValue } _modify { yield &kRT.rtPathLampMinDistance } }

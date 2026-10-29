@@ -277,6 +277,7 @@ extension IlluminatoramaRenderer {
         // below `layerInstanceCount`) indexes — IlluminatoramaMaterialLayers.h.
         enc.setTexture(gbs.gbufferMaterialLayer, index: 14)
         enc.setBuffer(currentInstanceBuffer, offset: 0, index: 26)
+        bindHitSunCascadeCull(enc)                         // DH-1588 — texture 17, buffers 27–28
         enc.setTexture(specDenoiseOn ? rts.spec.raw : rts.rtDiffuseTexture, index: 15)   // DH-0539 — the reflection's own target (a stand-in when off)
         enc.setTexture(specDenoiseOn ? rts.spec.fres : rts.rtDiffuseTexture, index: 16)
         // DH-0653 hit/miss counters (buffer 19). Dummy = instData, never added to while
@@ -594,5 +595,52 @@ extension IlluminatoramaRenderer {
         enc.setBuffer(rts.rtDenoiseUniformBuffer, offset: 0, index: 1)
         dispatch(enc, pipeline: rts.rtDenoisePipeline, width: width, height: height)
         enc.endEncoding()
+    }
+}
+
+// MARK: - DH-1588 — the sun cascades as a shadow proof at GI / reflection hits
+
+/// Mirror of `RTSunCascadeCull` (IlluminatoramaRTInstanced.metal).
+struct RTSunCascadeCull {
+    var vp0: simd_float4x4, vp1: simd_float4x4, vp2: simd_float4x4
+    var enabled: UInt32, mapSize: UInt32, marginMetres: Float, slopeTexels: Float
+    var audit: UInt32, minNdotL: Float, pad0: UInt32 = 0, pad1: UInt32 = 0
+}
+
+extension IlluminatoramaRenderer {
+
+    /// What the audit instrument counted since the last reset (`rtHitSunCascadeAudit`): GI / reflection
+    /// hits facing the sun that were asked, how many the cascades proved shadowed, and how many of those
+    /// the traced ray then found UNoccluded (the proof's false shadows). Read after a blocking render.
+    public var rtHitSunCascadeCullStats: (asked: UInt32, proven: UInt32, falseShadow: UInt32) {
+        guard let b = rts.hitSunCullStats else { return (0, 0, 0) }
+        let p = b.contents().bindMemory(to: UInt32.self, capacity: 4)
+        return (p[0], p[1], p[2])
+    }
+
+    public func resetRTHitSunCascadeCullStats() {
+        guard let b = rts.hitSunCullStats else { return }
+        memset(b.contents(), 0, 16)
+    }
+
+    /// Texture 17 (the cascade depth array — always bound; a cleared slice reads 1.0 and proves nothing),
+    /// buffer 27 (the `RTSunCascadeCull` block) and buffer 28 (the audit counters).
+    func bindHitSunCascadeCull(_ enc: MTLComputeCommandEncoder) {
+        if rts.hitSunCullStats == nil {
+            rts.hitSunCullStats = device.makeBuffer(length: 16, options: .storageModeShared)
+            rts.hitSunCullStats?.label = "Illuminatorama.rt.hitSunCullStats"
+            resetRTHitSunCascadeCullStats()
+        }
+        let on = rtHitSunCascadeCull && shadowsEnabled && shd.shadowMap != nil && shd.cascadeVPs.count >= 3
+        var cc = RTSunCascadeCull(
+            vp0: on ? shd.cascadeVPs[0] : matrix_identity_float4x4,
+            vp1: on ? shd.cascadeVPs[1] : matrix_identity_float4x4,
+            vp2: on ? shd.cascadeVPs[2] : matrix_identity_float4x4,
+            enabled: on ? 1 : 0, mapSize: UInt32(shd.shadowMap?.width ?? 1),
+            marginMetres: max(0, rtHitSunCascadeMargin), slopeTexels: max(0, rtHitSunCascadeSlopeTexels),
+            audit: on && rtHitSunCascadeAudit ? 1 : 0, minNdotL: 0.1)
+        enc.setTexture(shd.shadowMap, index: 17)
+        enc.setBytes(&cc, length: MemoryLayout<RTSunCascadeCull>.stride, index: 27)
+        enc.setBuffer(rts.hitSunCullStats, offset: 0, index: 28)
     }
 }

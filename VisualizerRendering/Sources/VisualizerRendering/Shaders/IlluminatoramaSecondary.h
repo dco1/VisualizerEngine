@@ -471,6 +471,10 @@ struct SecondaryShadeParams {
     // excluding those slabs from RT is the reason this bit exists as a third state
     // instead of just un-excluding them (see HouseRenderBridge's `rtExclude`).
     uint   occluderMask;
+    // Daydream DH-1588 — 1 ⇒ the caller has already PROVEN this hit's sun disc occluded (the TLAS lighting
+    // kernel's sun-cascade proof, `illumiSunCascadeProvesShadow`), so the sun term is 0 and its shadow ray is
+    // not traced. Every constructor sets 0 ⇒ the shadow ray is traced, exactly as before.
+    uint   sunShadowProven;
 };
 
 /// The device buffers the shading reads. Textures are passed separately —
@@ -858,7 +862,7 @@ static inline float3 shadeSecondarySurface(thread Isect& isect,
     // to the side kept it. Measured on the real document at `rtGlassShadowRays = 0`: the
     // through-glass world fell from 1.197× the open aperture to 1.049×, i.e. the sun it should
     // have been given was 15 points of ratio, silently absent.
-    if (nl > 0.0) {
+    if (nl > 0.0 && p.sunShadowProven == 0u) {
         float vis = secondarySunVisibility(isect, accel, h.P, h.N, Ld, p, seed)
                   * illumiCloudSunTransmittance(sc.cloudShadow, h.P, Ld);
         rad += A * (1.0 / M_PI_F) * p.sunColor * nl * vis;

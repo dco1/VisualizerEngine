@@ -140,6 +140,22 @@ final class RTKnobs {
     /// shadow ray at GI / reflection hits · 1<<25: GI hits traced but not shaded · 1<<26: reflection
     /// hits not shaded · 1<<27: GI rays cut at 4 m. See `kRTAblate*` in IlluminatoramaRTInstanced.metal.
     var rtTLASAblationFlags: UInt32 = 0
+    /// **Daydream DH-1588 — the sun cascades PROVE a GI / reflection hit's shadow; the TLAS answers the rest.**
+    /// The one-bounce TLAS pass traces one hard sun shadow ray at every GI and reflection hit — on a
+    /// software-RT GPU ~112 ms of a ~300 ms settled refine, nearly all of it the fixed cost of one
+    /// incoherent TLAS descent per ray. With this on, a hit whose 3×3 cascade texels all hold a caster at
+    /// least `rtHitSunCascadeMargin` (+ a slope term) nearer the sun is lit as shadowed without a ray;
+    /// every other hit (lit, penumbra, outside the cascades, grazing) traces exactly as before. It can
+    /// only darken, and only where the RASTER casts a shadow the TLAS lacks (raster-only casters, a gap
+    /// under a texel) — see `illumiSunCascadeProvesShadow`. Default false ⇒ byte-identical.
+    var rtHitSunCascadeCull: Bool = false
+    /// The proof's depth margin (metres) between the cascade's caster and the hit (DH-1588).
+    var rtHitSunCascadeMargin: Float = 0.25
+    /// The proof's slope term, in cascade texels × (1 + tan θ) (DH-1588).
+    var rtHitSunCascadeSlopeTexels: Float = 3
+    /// DH-1588 INSTRUMENT — prove, then trace anyway and count (`rtHitSunCascadeCullStats`); the
+    /// picture is the shipped one. Never set by a host.
+    var rtHitSunCascadeAudit: Bool = false
     /// **Daydream DH-0952 — probe only where the probe can move anything.** The snap probe below
     /// (`rtSurfaceSnapEnabled`) is a full TLAS descent per pixel in every traced pass — measured on
     /// an M1 Max at 1920×1200: 42 ms of the TLAS lighting pass, ~70 ms of the whole frame — and on a

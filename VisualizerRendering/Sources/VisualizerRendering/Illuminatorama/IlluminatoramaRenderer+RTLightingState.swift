@@ -163,6 +163,9 @@ final class RTState {
     var curveDbgPrinted = false   // VIZ_CURVE_DEBUG one-shot
     var rtInstUniformBuffer: MTLBuffer!
     var rtInstFrameSeed: UInt32 = 0
+    /// DH-1588 — the hit sun-cascade proof's audit counters (asked / proven / proven-but-unoccluded) +
+    /// the GPU-side `RTSunCascadeCull` block. Made on first TLAS dispatch.
+    var hitSunCullStats: MTLBuffer?
     /// DH-0887 — +1 per TLAS lighting dispatch, never by any other pass, so the GI's Sobol index
     /// is contiguous (`rtInstFrameSeed` also advances in the glass pass, and every-other Sobol
     /// index covers only half of the unit square).
