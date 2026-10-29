@@ -211,6 +211,8 @@ struct PaperBendUniforms {
     // permanent sharp ridges; gentle curvature stays elastic and smooth.
     float  yieldAngle;   // radians of deviation before plastic flow (≥ π = never)
     float  creepRate;    // fraction of the excess absorbed per visit (0 = elastic only)
+    // INTERNAL DAMPING (paperBendVelocitySolve): share of each hinge's folding rate kept per substep (1 = off).
+    float  velocityKeep;
 };
 
 kernel void paperBendConstraint(
@@ -279,6 +281,57 @@ kernel void paperBendConstraint(
     particles[c.v.w].positionAndInvMass.xyz += q4 * (w4 * scale);
 }
 
+// ── HINGE VELOCITY POST-SOLVE (internal damping of bending) ───────────────────
+//
+// The angular twin of pbdVelocitySolve. Once per substep, after the positions converge, each hinge measures how fast
+// it is folding — dφ = Σ ∇Cᵢ·vᵢ with the SAME gradients as paperBendConstraint (vᵢ = xᵢ − prevᵢ) — and keeps
+// `velocityKeep` of it, by the momentum-conserving impulse Δvᵢ = −(1 − keep)·wᵢ∇Cᵢ·dφ / Σ wⱼ|∇Cⱼ|², written into prev.
+// This is what fabric loses to fibre friction when it flexes: the energy of the cloth DEFORMING goes, rigid motion
+// (a sheet falling, sliding) is untouched. ∇Cᵢ = qᵢ/sinφ, and 1/sinφ cancels between dφ and the denominator, so the
+// pass uses qᵢ directly and stays well-conditioned at a fully folded hinge (φ → 0, sinφ → 0).
+// Writes prev of all four vertices: dispatched per hinge colour group, like paperBendConstraint.
+kernel void paperBendVelocitySolve(
+    device PBDParticle*                particles   [[ buffer(0) ]],
+    device const PaperBendConstraint*  constraints [[ buffer(1) ]],
+    constant PaperBendUniforms&        u           [[ buffer(2) ]],
+    uint id [[ thread_position_in_grid ]]
+) {
+    if (id >= u.constraintCount) return;
+    PaperBendConstraint c = constraints[id];
+    float4 P1 = particles[c.v.x].positionAndInvMass;
+    float4 P2 = particles[c.v.y].positionAndInvMass;
+    float4 P3 = particles[c.v.z].positionAndInvMass;
+    float4 P4 = particles[c.v.w].positionAndInvMass;
+    float w1 = P1.w, w2 = P2.w, w3 = P3.w, w4 = P4.w;
+    if (w1 + w2 + w3 + w4 < 1e-9) return;
+
+    float3 p2 = P2.xyz - P1.xyz, p3 = P3.xyz - P1.xyz, p4 = P4.xyz - P1.xyz;
+    float3 n1r = cross(p2, p3); float l1 = length(n1r);
+    float3 n2r = cross(p2, p4); float l2 = length(n2r);
+    if (l1 < 1e-12 || l2 < 1e-12) return;
+    float3 n1 = n1r / l1, n2 = n2r / l2;
+    float d = clamp(dot(n1, n2), -1.0, 1.0);
+    float3 q3 = (cross(p2, n2) + cross(n1, p2) * d) / l1;
+    float3 q4 = (cross(p2, n1) + cross(n2, p2) * d) / l2;
+    float3 q2 = -(cross(p3, n2) + cross(n1, p3) * d) / l1
+                -(cross(p4, n1) + cross(n2, p4) * d) / l2;
+    float3 q1 = -q2 - q3 - q4;
+
+    float3 v1 = P1.xyz - particles[c.v.x].prevPositionAndPad.xyz;
+    float3 v2 = P2.xyz - particles[c.v.y].prevPositionAndPad.xyz;
+    float3 v3 = P3.xyz - particles[c.v.z].prevPositionAndPad.xyz;
+    float3 v4 = P4.xyz - particles[c.v.w].prevPositionAndPad.xyz;
+    float rate = dot(q1, v1) + dot(q2, v2) + dot(q3, v3) + dot(q4, v4);          // sinφ · dφ
+    float G = w1 * dot(q1, q1) + w2 * dot(q2, q2) + w3 * dot(q3, q3) + w4 * dot(q4, q4);
+    if (G < 1e-12) return;
+    float s = (1.0 - u.velocityKeep) * rate / G;
+    // prev' = x − (v + Δv) = prev + wᵢ qᵢ s
+    particles[c.v.x].prevPositionAndPad.xyz += q1 * (w1 * s);
+    particles[c.v.y].prevPositionAndPad.xyz += q2 * (w2 * s);
+    particles[c.v.z].prevPositionAndPad.xyz += q3 * (w3 * s);
+    particles[c.v.w].prevPositionAndPad.xyz += q4 * (w4 * s);
+}
+
 // ── STATIC FRICTION (contact stick) ───────────────────────────────────────────
 //
 // The one force that makes cloth REST. The collide passes' `collideFriction`
@@ -317,6 +370,9 @@ struct PaperStickUniforms {
     // faster than any sane capture speed (g·dt ≈ 0.08 m/s), so the speed-gated
     // capture can never catch the initial resting state on its own.
     uint  armAll;
+    // 1 → flat (|n.y| >= 0.85) contacts anchor too. For cloth that must lie still under load on a floor — a stack of
+    // towels — rather than buckle freely like a quilt. 0 = the edge-only rule above, bit for bit.
+    uint  anchorFlat;
 };
 
 // Local copy — PBD.metal's `closestOnSegment` has internal linkage there.
@@ -551,7 +607,7 @@ kernel void paperStaticFriction(
                 return;
             }
         }
-        bool edgeContact = contact && fabs(bestN.y) < 0.85;
+        bool edgeContact = contact && (u.anchorFlat != 0u || fabs(bestN.y) < 0.85);
         if (edgeContact && (u.armAll != 0u || length(vt) < u.stickSpeed)) {
             anchors[id] = float4(pos, 1.0);                    // GRIP
         }
@@ -601,6 +657,19 @@ struct PaperHashUniforms {
     // thicknesses (never less than the radii above), and the push each node took is left in `selfLoad`
     // for the collide pass to fold into its pressure. 0 = the kernel is the old one bit for bit.
     float pileRest;
+    // Share of a pushout that is taken OUT of the node's velocity (0…1). The pushout moves the position by the full
+    // correction; this moves the previous position by this fraction of it, so (1 - bleed) of the correction is left in
+    // as outward velocity — the contact's restitution. 0.5 reproduces the old fixed behaviour bit for bit; 1 is a
+    // perfectly dead contact, 0 a lively one.
+    float pushoutBleed;
+    // FOLDS of one sheet are layers too. `radius` is capped by the grid (see PaperClothSolver.effectiveSelfRadius), which
+    // is right for near neighbours and wrong for the far side of a fold: a towel folded over a rail, or folded in four,
+    // must keep its plies a full thickness apart. Same-sheet pairs more than `foldCells` apart on the grid (Chebyshev) —
+    // at least half a fold turn, π·r, apart along the cloth, so never a pair that is legitimately closer than 2r — are
+    // held to 2·foldRadius — unless the cloth is compressible (pileRest > 0), whose plies the pile already holds apart.
+    // 0 = off (the cap is not in force).
+    float foldRadius;
+    uint  foldCells;
 };
 
 // Hash grid build + cell hash: shared (SimSpatialHash.metal / .h).
@@ -673,12 +742,17 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
             // particles only ever come within radius when the cloth genuinely
             // folds onto itself, which is exactly the contact we want.
             bool sameSheet = (j / u.verticesPerSheet == sheet);
+            uint gridDist = 0u;
             if (sameSheet) {
                 uint lj = j - sheet * u.verticesPerSheet;
                 int jx = int(lj % u.gridW), jy = int(lj / u.gridW);
-                if (uint(max(abs(jx - x), abs(jy - y))) <= u.skipRadius) continue;
+                gridDist = uint(max(abs(jx - x), abs(jy - y)));
+                if (gridDist <= u.skipRadius) continue;
             }
             float md = sameSheet ? minDist : layerDist;
+            // Another ply of the same sheet. Compressible cloth already holds its plies by their crushable pile (below);
+            // a rigid floor on top of that cannot absorb a landing and the cloth bounces like rubber.
+            if (!compressible && sameSheet && u.foldRadius > 0.0 && gridDist > u.foldCells) md = max(md, 2.0 * u.foldRadius);
             if (compressible) md = max(md, pile[id].x + pile[j].x);   // two crushable layers: their thicknesses add
             float3 d = pos - S[j].positionAndInvMass.xyz;
             float dist = length(d);
@@ -717,7 +791,7 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
             if (cl > clampR) corr *= clampR / cl;
         }
         P[id].positionAndInvMass.xyz = pos + corr;
-        P[id].prevPositionAndPad.xyz = pi.prevPositionAndPad.xyz + corr * 0.5;  // bleed off inward velocity
+        P[id].prevPositionAndPad.xyz = pi.prevPositionAndPad.xyz + corr * u.pushoutBleed;  // bleed off inward velocity
         if (compressible) selfLoad[id] = length(corr);
 
         // Static friction BETWEEN layers (see stickDisp above). Relative slip is
@@ -736,6 +810,7 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
             }
         }
     }
+
 }
 
 // ── KERNEL: pack deformed positions into the render buffer ────────────────────

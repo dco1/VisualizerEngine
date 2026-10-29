@@ -36,13 +36,17 @@ public struct RestPolicy: Equatable, Sendable {
     /// Stop stepping when the gate trips. False measures and reports but never freezes, so a live scene that must
     /// stay able to react (the app canvas) can adopt the contract and choose its own moment to `freeze()`.
     public var autoFreeze: Bool
+    /// Judge the MEAN speed instead of the fastest particle. A pile of plies under load can keep a few contacts
+    /// ping-ponging at ~1 m/s (a millimetre per substep) while the pile as a whole is plainly still; the fastest-particle
+    /// rule never lets such a pile rest. A diverged (non-finite) particle still counts as not at rest.
+    public var useMean: Bool
 
-    public init(speed: Float, seconds: Float, holdSpeed: Float = 0, autoFreeze: Bool = true) {
-        self.speed = speed; self.seconds = seconds; self.holdSpeed = holdSpeed; self.autoFreeze = autoFreeze
+    public init(speed: Float, seconds: Float, holdSpeed: Float = 0, autoFreeze: Bool = true, useMean: Bool = false) {
+        self.speed = speed; self.seconds = seconds; self.holdSpeed = holdSpeed; self.autoFreeze = autoFreeze; self.useMean = useMean
     }
 
     /// Cloth lying on something (a towel on a floor, a duvet on a bed): static friction on, hold until it is still.
-    public static let cloth = RestPolicy(speed: 0.05, seconds: 0.25, holdSpeed: 0.08)
+    public static let cloth = RestPolicy(speed: 0.08, seconds: 0.25, holdSpeed: 0.08, useMean: true)
     /// A cord or tube chain: no contact-friction model to switch on, so measurement and the freeze only.
     public static let cord = RestPolicy(speed: 0.02, seconds: 0.4)
     /// Soft bodies and shape-matched clusters.
@@ -98,11 +102,11 @@ public final class SettleGate {
         var sampleStride: UInt32, velocityMode: UInt32, useAsleep: UInt32
         var invDt: Float
     }
-    private struct GateUniforms { var speed: Float, seconds: Float, autoFreeze: UInt32, elapsed: Float }
+    private struct GateUniforms { var speed: Float, seconds: Float, autoFreeze: UInt32, elapsed: Float, useMean: UInt32 }
 
     /// uint[4]: [0] seconds under speed (float bits), [1] frozen, [2] last peak speed (float bits), [3] observations
     private var state: MTLBuffer?
-    /// atomic uint[2]: [0] max speed bits, [1] a sample landed
+    /// atomic uint[4]: [0] max speed bits, [1] a sample landed, [2] summed clamped speed (mm/s), [3] records counted
     private var peak: MTLBuffer?
     private var emptyAsleep: MTLBuffer?
     private var reduce: MTLComputePipelineState?
@@ -113,12 +117,12 @@ public final class SettleGate {
     private func prepare(device: MTLDevice) -> Bool {
         if state != nil { return reduce != nil && gate != nil }
         state = device.makeBuffer(length: 16, options: .storageModeShared)
-        peak = device.makeBuffer(length: 8, options: .storageModeShared)
+        peak = device.makeBuffer(length: 16, options: .storageModeShared)
         emptyAsleep = device.makeBuffer(length: 4, options: .storageModeShared)
         reduce = SimPipelineCache.shared.pipelineState(name: "simSettleReduce", device: device)
         gate = SimPipelineCache.shared.pipelineState(name: "simSettleGate", device: device)
         if let s = state { memset(s.contents(), 0, 16) }
-        if let p = peak { memset(p.contents(), 0, 8) }
+        if let p = peak { memset(p.contents(), 0, 16) }
         return reduce != nil && gate != nil && state != nil && peak != nil
     }
 
@@ -163,7 +167,7 @@ public final class SettleGate {
         let w = max(1, min(n, reduce.maxTotalThreadsPerThreadgroup))
         e.dispatchThreads(MTLSize(width: n, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: w, height: 1, depth: 1))
 
-        var gu = GateUniforms(speed: policy.speed, seconds: policy.seconds, autoFreeze: policy.autoFreeze ? 1 : 0, elapsed: elapsed)
+        var gu = GateUniforms(speed: policy.speed, seconds: policy.seconds, autoFreeze: policy.autoFreeze ? 1 : 0, elapsed: elapsed, useMean: policy.useMean ? 1 : 0)
         e.setComputePipelineState(gate)
         e.setBuffer(state, offset: 0, index: 0)
         e.setBuffer(peak, offset: 0, index: 1)

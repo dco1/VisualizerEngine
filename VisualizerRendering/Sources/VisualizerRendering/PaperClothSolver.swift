@@ -74,7 +74,7 @@ public final class PaperClothSolver {
     // Empty unless `configureSheets(dihedralCompliance:)` is given a value, so
     // every existing caller (paper) pays nothing. See paperBendConstraint in
     // PaperCloth.metal for why cloth needs a hinge and paper doesn't.
-    private let bendConstraintBuffer: SimBuffer<PaperBendConstraint>
+    let bendConstraintBuffer: SimBuffer<PaperBendConstraint>
     private let bendLambdaBuffer: MTLBuffer
     private let bendUniformBuffer: MTLBuffer   // PaperBendUniforms
     private let stickUniformBuffer: MTLBuffer  // PaperStickUniforms
@@ -83,6 +83,12 @@ public final class PaperClothSolver {
     private var tetherBuffer: MTLBuffer?
     private lazy var tetherPipeline: MTLComputePipelineState? =
         engine.pipelineCache.pipelineState(name: "paperTether", device: engine.device)
+    /// The shared XPBD velocity post-solve (`pbdVelocitySolve`), run over the cloth's own links for `internalDamping`.
+    private lazy var velocitySolvePipeline: MTLComputePipelineState? =
+        engine.pipelineCache.pipelineState(name: "pbdVelocitySolve", device: engine.device)
+    /// Its angular twin over the hinges (`paperBendVelocitySolve`).
+    private lazy var bendVelocitySolvePipeline: MTLComputePipelineState? =
+        engine.pipelineCache.pipelineState(name: "paperBendVelocitySolve", device: engine.device)
     private let clothCollideUniformBuffer: MTLBuffer  // PaperClothCollideUniforms
     private var bendGroupStart: [Int] = []
     private var bendGroupCount: [Int] = []
@@ -108,6 +114,9 @@ public final class PaperClothSolver {
     /// Contact pressure (m of penetration into the rest thickness per pass) at which the pile has
     /// lost half its compressible range. Saturating: heavier loads approach the floor, never pass it.
     public var pileStiffness: Float = 0.0005
+    /// Restitution of the inter-layer (and self) contact: the share of each pushout removed from the node's velocity.
+    /// 0.5 is the long-standing default; higher is a deader contact (a heavy folded pile that thuds), lower a livelier one.
+    public var selfCollidePushoutBleed: Float = 0.5
     /// Smallest contact radius rigid colliders ever hold the cloth at, however crushed its pile (m). 0 = the crush moves the
     /// cloth closer to what it lies on (a towel on a rim). Set it to the standoff a skin is drawn at to keep the crush a
     /// property of the cloth only (a duvet beside a bed frame).
@@ -158,6 +167,7 @@ public final class PaperClothSolver {
     private let killSDF  = ProcessInfo.processInfo.environment["VIZ_PAPER_NO_SDF"]  == "1"
     private let killFloor = ProcessInfo.processInfo.environment["VIZ_PAPER_NO_FLOOR"] == "1"
     private let killSelf = ProcessInfo.processInfo.environment["VIZ_PAPER_NO_SELF"] == "1"
+    private let killSelfCap = ProcessInfo.processInfo.environment["VIZ_PAPER_NO_SELF_CAP"] == "1"   // A/B: enforce `selfRadius` as given
     /// Collision radius — particles separate to 2·radius. MUST stay ≈ 0.7× rest
     /// edge: if it's much larger than the mesh spacing, each vertex straddles a
     /// whole patch of the other sheet and the pushout (even averaged) over-thickens
@@ -169,6 +179,32 @@ public final class PaperClothSolver {
     /// neighbouring pair sat permanently in contact and the sheet inflated like a balloon and
     /// curled its edges upward (Daydream Home, 2026-08-21). See `recommendedSelfRadius`.
     public var selfRadius: Float = 0.006
+    /// The grid's rest spacing (the finest across sheets), set by `configureSheets`; 0 before.
+    public private(set) var restSpacing: Float = 0
+    /// The same-sheet radius the kernel actually enforces: `selfRadius` capped at
+    /// `recommendedSelfRadius(forSpacing: restSpacing)`. Callers used to pass a cloth THICKNESS
+    /// here (a towel's half-ply, a curtain's half-thickness); at half the grid spacing every
+    /// crease sat on its own contact threshold and the cloth shuddered — the top towel of a
+    /// dropped stack wobbled 5.4 mm/frame, 1.3 at the cap. Thickness is a LAYER fact: whatever
+    /// the cap removes still holds other sheets apart (see `effectiveInterLayerRadius`).
+    public var effectiveSelfRadius: Float {
+        capSelfRadiusToGrid && restSpacing > 0 && !killSelfCap
+            ? min(selfRadius, Self.recommendedSelfRadius(forSpacing: restSpacing)) : selfRadius
+    }
+    /// Apply the grid cap in `effectiveSelfRadius`. A host that already sizes `selfRadius` from its own grid (and has
+    /// shipped settled shapes baked under it) can turn this off to keep `selfRadius` exactly as given.
+    public var capSelfRadiusToGrid = true
+    /// `interLayerRadius`, or — when the caller left it nil — the `selfRadius` they asked for, so
+    /// capping the same-sheet radius never lets separate sheets sink into each other.
+    /// What the cap took away still holds FOLDS of one sheet apart: same-sheet pairs more than `foldCells` apart on
+    /// the grid — half a fold turn (π·selfRadius) along the cloth — are kept 2·`selfRadius` apart, as the caller asked.
+    /// 0 when the cap is not in force (the kernel's old rule, bit for bit). Compressible cloth (`pileRestThickness` > 0)
+    /// ignores it: the pile already holds its plies apart, and crushably — a rigid ply floor makes a landing bounce.
+    var foldRadius: Float { !legacyPushout && effectiveSelfRadius < selfRadius ? selfRadius : 0 }
+    var foldCells: UInt32 { foldRadius > 0 ? UInt32((Float.pi * selfRadius / restSpacing).rounded(.up)) : 0 }
+    public var effectiveInterLayerRadius: Float {
+        interLayerRadius ?? (effectiveSelfRadius < selfRadius ? selfRadius : 0)
+    }
     /// How far apart particles of DIFFERENT sheets are held, when that is not the same question
     /// as how far a sheet is held from itself.
     ///
@@ -212,12 +248,20 @@ public final class PaperClothSolver {
     // skip-one bend H (3-colour by x%3) and V (3-colour by y%3) — 14 groups.
     // Dihedral hinge constraints (cloth only) colour separately into
     // `bendGroupStart`/`bendGroupCount` — 16 groups; see configureSheets.
-    private var groupStart: [Int] = []
-    private var groupCount: [Int] = []
+    var groupStart: [Int] = []
+    var groupCount: [Int] = []
 
     // ── Tunables ────────────────────────────────────────────────────────
     public var gravity: Float = 9.81
     public var damping:  Float = 0.99
+    /// INTERNAL damping: the share of each stretch / shear / bend link's relative velocity, and of each hinge's folding
+    /// rate, kept after one simulated second (1 = none, the default — the passes do not run; 0 = dead). The hinges carry
+    /// nearly all of it: woven links barely stretch, so a towel's wobble is bending. Unlike `damping`, which drags every
+    /// particle (a falling sheet falls slower), this only takes energy out of the cloth deforming — what fabric loses to
+    /// fibre friction, and why a towel lands and lies there instead of ringing. Rate-independent: converted per substep.
+    public var internalDamping: Float = 1
+    /// The fabric last given to `apply(_:)`; `configureSheets` re-applies its stiffness to the links it builds.
+    public internal(set) var fabric: ClothFabric?
     public var constraintIterations: Int = 10
 
     // Wind / aero (0 = inert). See PaperCloth.metal::paperWind.
@@ -276,6 +320,9 @@ public final class PaperClothSolver {
     /// this distance. The velocity-gate stick cannot do this job: positional relaxation
     /// redistributes material faster than any velocity threshold and leaves it smooth.
     public var anchorBreak: Float = 0
+    /// With `anchorBreak`: let FLAT contacts (a floor, a tabletop) anchor too, not only wrapped edges. Off by default — a quilt
+    /// lying flat must stay free to buckle; a stack of towels resting on a floor must not creep under its own load.
+    public var anchorFlatContacts = false
     /// Dihedral CREASING — the plastic half of fabric bending; see PaperBendUniforms in
     /// PaperCloth.metal. A hinge folded further than `dihedralYieldAngle` (radians of
     /// deviation from rest) has its rest angle creep toward the folded pose by
@@ -590,6 +637,7 @@ public final class PaperClothSolver {
         precondition(specs.count <= maxSheets, "configureSheets: \(specs.count) > maxSheets \(maxSheets)")
         let W = gridW, H = gridH, M = W * H
         sheetCount = specs.count
+        restSpacing = specs.map { min($0.sizeW / Float(max(W - 1, 1)), $0.sizeH / Float(max(H - 1, 1))) }.min() ?? 0
         resetPile()
 
         // Rest-slack field: smooth seeded plane-wave octaves, clamped to surplus-only
@@ -874,6 +922,7 @@ public final class PaperClothSolver {
             }
             if !allBend.isEmpty { bendConstraintBuffer.write(allBend) }
         }
+        if let fabric { applyStiffness(fabric) }   // a fabric applied before the sheets existed still sets their links
 
         // ── Per-sheet render buffers (packed_float3, stride 12) ──
         positionBuffers.removeAll(keepingCapacity: true)
@@ -1005,6 +1054,37 @@ public final class PaperClothSolver {
         encodeSettling(cb, elapsed: Float(steps) * fixedDt, stepDt: fixedDt)
     }
 
+    /// Re-rest the cloth's BENDING at its current shape: every dihedral hinge's rest angle and every skip-one bend link's
+    /// rest length are measured off the particles as they are now. Stretch and shear keep their flat rest lengths.
+    ///
+    /// `configureSheets` cuts the cloth flat, so a host that then lays the particles out PRE-SHAPED (a folded towel, a
+    /// napkin, a pleat) has loaded every fold as a spring: in free fall nothing holds it shut, the folds spring open
+    /// like an accordion, and the landing squashes them back — cloth that drops like rubber. A folded towel's creases
+    /// are pressed in; call this after laying out the shape to make the shape the rest state. Plastic creep
+    /// (`dihedralYieldAngle`) still works on top of it.
+    public func restBendingToCurrentShape() {
+        let p = particleBuffer.contents
+        func pos(_ i: UInt32) -> SIMD3<Float> { SIMD3(p[Int(i)].positionAndInvMass.x, p[Int(i)].positionAndInvMass.y,
+                                                      p[Int(i)].positionAndInvMass.z) }
+        // Skip-one bend links: colour groups 8…13 (see configureSheets).
+        if groupStart.count >= 14 {
+            let c = constraintBuffer.contents
+            for g in 8 ... 13 { for k in groupStart[g] ..< groupStart[g] + groupCount[g] {
+                c[k].restLength = simd_length(pos(c[k].j) - pos(c[k].i))
+            } }
+        }
+        // Hinges: the same unsigned angle `paperBendConstraint` measures (π = flat).
+        let b = bendConstraintBuffer.contents
+        for k in 0 ..< bendConstraintBuffer.count {
+            let v = b[k].v, o = pos(v.x)
+            let e = pos(v.y) - o
+            let n1 = simd_cross(e, pos(v.z) - o), n2 = simd_cross(e, pos(v.w) - o)
+            let l1 = simd_length(n1), l2 = simd_length(n2)
+            guard l1 > 1e-12, l2 > 1e-12 else { continue }
+            b[k].restAngle = acos(min(max(simd_dot(n1 / l1, n2 / l2), -1), 1))
+        }
+    }
+
     private func encodeSelfCollide(_ cb: MTLCommandBuffer) {
         let n = particleBuffer.count
         writeHashUniforms()
@@ -1102,7 +1182,7 @@ public final class PaperClothSolver {
         // Legacy A/B reproduces BOTH old conditions: the oversized radius (0.018 →
         // minDist 0.036, far beyond the mesh spacing) AND the summed/unclamped
         // pushout. Either alone is milder; the blowup is the combination.
-        let radius = legacyPushout ? 0.018 : selfRadius
+        let radius = legacyPushout ? 0.018 : effectiveSelfRadius
         let cell   = legacyPushout ? 0.05  : selfCellSize
         let p = hashUniformBuffer.contents().bindMemory(to: PaperHashUniforms.self, capacity: 1)
         p.pointee = PaperHashUniforms(
@@ -1114,8 +1194,10 @@ public final class PaperClothSolver {
             // Layers stick below the same threshold as obstacle contact — one
             // notion of "at rest" for the whole cloth.
             stickDisp: stickSpeed * fixedDt,
-            layerRadius: legacyPushout ? 0 : (interLayerRadius ?? 0),
-            pileRest: pileRestThickness)
+            layerRadius: legacyPushout ? 0 : effectiveInterLayerRadius,
+            pileRest: pileRestThickness,
+            pushoutBleed: selfCollidePushoutBleed,
+            foldRadius: foldRadius, foldCells: foldCells)
     }
 
     private func encodeSubstep(to cb: MTLCommandBuffer, dt: Float) {
@@ -1155,7 +1237,8 @@ public final class PaperClothSolver {
         if bendConstraintBuffer.count > 0 {
             let bPtr = bendUniformBuffer.contents().bindMemory(to: PaperBendUniforms.self, capacity: 1)
             bPtr.pointee = PaperBendUniforms(constraintCount: UInt32(bendConstraintBuffer.count), dt: dt,
-                                             yieldAngle: dihedralYieldAngle, creepRate: dihedralCreepRate)
+                                             yieldAngle: dihedralYieldAngle, creepRate: dihedralCreepRate,
+                                             velocityKeep: pow(min(max(internalDamping, 0), 1), dt))
         }
 
         // 3. Constraint iterations — each iteration cycles every distance colour
@@ -1186,6 +1269,33 @@ public final class PaperClothSolver {
             }
             if interleavedCollide, i % 3 == 2, colliderCount > 0, !killSDF {
                 encodeClothCollide(cb)
+            }
+        }
+
+        // 3b. Internal damping: once per substep, after the positions converge, each cloth link keeps `internalDamping`
+        //     of its relative velocity along itself (the shared XPBD velocity post-solve). Cloth groups only, 0…13.
+        if internalDamping < 1, let pipe = velocitySolvePipeline {
+            for g in 0 ..< min(14, groupCount.count) where groupCount[g] > 0 {
+                withEncoder(cb, label: "PaperCloth.internalDamping[\(g)]") { enc in
+                    enc.setComputePipelineState(pipe)
+                    enc.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
+                    enc.setBuffer(constraintBuffer.buffer, offset: groupStart[g] * MemoryLayout<PBDConstraint>.stride, index: 1)
+                    enc.setBuffer(uniformBuffer, offset: 0, index: 2)
+                    dispatch1D(enc, pipeline: pipe, count: groupCount[g])
+                }
+            }
+        }
+        // …and each hinge keeps `internalDamping` of its folding rate: bending is where cloth actually deforms.
+        if internalDamping < 1, let pipe = bendVelocitySolvePipeline {
+            for g in bendGroupCount.indices where bendGroupCount[g] > 0 {
+                withEncoder(cb, label: "PaperCloth.bendDamping[\(g)]") { enc in
+                    enc.setComputePipelineState(pipe)
+                    enc.setBuffer(particleBuffer.buffer, offset: 0, index: 0)
+                    enc.setBuffer(bendConstraintBuffer.buffer,
+                                  offset: bendGroupStart[g] * MemoryLayout<PaperBendConstraint>.stride, index: 1)
+                    enc.setBuffer(bendUniformBuffer, offset: 0, index: 2)
+                    dispatch1D(enc, pipeline: pipe, count: bendGroupCount[g])
+                }
             }
         }
 
@@ -1225,7 +1335,8 @@ public final class PaperClothSolver {
                 stickSpeed: stickSpeed,
                 selfRadius: clothThickness,
                 anchorBreak: anchorBreak,
-                armAll: pendingAnchorArm ? 1 : 0)
+                armAll: pendingAnchorArm ? 1 : 0,
+                anchorFlat: anchorFlatContacts ? 1 : 0)
             pendingAnchorArm = false
             encodePass(cb, pipeline: stickPipeline,
                        buffers: [particleBuffer.buffer, colliderBuffer.buffer, stickUniformBuffer,
@@ -1469,7 +1580,9 @@ public final class PaperClothSolver {
             floorBand: 0.01, colliderCount: UInt32(colliderCount), ownerID: .max,
             collideStiffness: collideStiffness, collideFriction: collideFriction,
             selfRadius: clothThickness,
-            velRestitution: 0.2, floorRestitution: floorRestitution,
+            // Read only by the internal-damping pass. NEGATIVE restitution: the kernel sets the relative normal
+            // velocity to −e·v, so −k keeps k of it with its sign — a damper, not a bounce.
+            velRestitution: -pow(min(max(internalDamping, 0), 1), dt), floorRestitution: floorRestitution,
             maxSDFPush: sdfMaxPushPerStep)
     }
 
@@ -1599,6 +1712,7 @@ struct PaperBendUniforms {
     var dt: Float
     var yieldAngle: Float
     var creepRate: Float
+    var velocityKeep: Float = 1
 }
 
 // ── PaperClothCollideUniforms mirror ─────────────────────────────────────────
@@ -1630,6 +1744,7 @@ struct PaperStickUniforms {
     var selfRadius: Float
     var anchorBreak: Float = 0
     var armAll: UInt32 = 0
+    var anchorFlat: UInt32 = 0
 }
 
 // ── PaperMeshUniforms mirror ─────────────────────────────────────────────────
@@ -1685,6 +1800,9 @@ struct PaperHashUniforms {
     var stickDisp: Float = 0
     var layerRadius: Float = 0
     var pileRest: Float = 0
+    var pushoutBleed: Float = 0.5
+    var foldRadius: Float = 0
+    var foldCells: UInt32 = 0
 }
 
 extension PaperClothSolver: SimSettling {

@@ -24,7 +24,8 @@ struct SettleReduceUniforms {
     float invDt;          // 1 / (time one step covers)
 };
 
-// atomic_uint[2]: [0] max speed as float bits (non-negative floats order like their bit patterns), [1] "a sample landed"
+// atomic_uint[4]: [0] max speed as float bits (non-negative floats order like their bit patterns), [1] "a sample landed",
+// [2] sum of clamped speeds (mm/s fixed point), [3] records counted
 kernel void simSettleReduce(device const uchar*        records [[buffer(0)]],
                             device atomic_uint*        peak    [[buffer(1)]],
                             constant SettleReduceUniforms& u   [[buffer(2)]],
@@ -45,9 +46,17 @@ kernel void simSettleReduce(device const uchar*        records [[buffer(0)]],
             if (!isfinite(s)) s = INFINITY;          // a diverged particle is NOT at rest
         }
     }
+    // MEAN statistic inputs: speed (clamped at 20 m/s, millimetres/second fixed point) and the number of records that counted.
+    const bool counted = (i < u.count) && isfinite(s) && s >= 0.0f;
+    const float sc = (i < u.count) ? ((isfinite(s) ? min(s, 20.0f) : 20.0f)) : 0.0f;
+    const uint  fixedSpeed = uint(sc * 1000.0f);
+    const uint  simdSum   = simd_sum(fixedSpeed);
+    const uint  simdCount = simd_sum(counted && s >= 0.0f && (i < u.count) ? 1u : 0u);
     const float m = simd_max(s);
     if (lane == 0u) {
         atomic_fetch_max_explicit(&peak[0], as_type<uint>(m), memory_order_relaxed);
+        atomic_fetch_add_explicit(&peak[2], simdSum, memory_order_relaxed);
+        atomic_fetch_add_explicit(&peak[3], simdCount, memory_order_relaxed);
         atomic_store_explicit(&peak[1], 1u, memory_order_relaxed);
     }
 }
@@ -57,6 +66,7 @@ struct SettleGateUniforms {
     float seconds;        // ... for this long (simulated time) counts as rest
     uint  autoFreeze;     // 1: freeze the solver when it rests
     float elapsed;        // simulated seconds this observation covers
+    uint  useMean;        // 1: judge the MEAN speed instead of the fastest (a few buzzing contacts must not hold a pile awake)
 };
 
 // uint[4] state: [0] seconds under speed (float bits), [1] frozen, [2] last peak speed (float bits), [3] observations
@@ -69,11 +79,15 @@ kernel void simSettleGate(device uint*        state [[buffer(0)]],
     const uint sampled = atomic_exchange_explicit(&peak[1], 0u, memory_order_relaxed);
     const uint bits    = atomic_exchange_explicit(&peak[0], 0u, memory_order_relaxed);
     if (sampled == 0u || state[1] != 0u) return;     // nothing measured, or already frozen (state is held)
-    const float p = as_type<float>(bits);
+    const uint  sumFixed = atomic_exchange_explicit(&peak[2], 0u, memory_order_relaxed);
+    const uint  cnt      = atomic_exchange_explicit(&peak[3], 0u, memory_order_relaxed);
+    const float mean     = cnt > 0u ? float(sumFixed) * 0.001f / float(cnt) : 0.0f;
+    // A diverged particle (infinite peak) is never at rest, whatever the statistic.
+    const float p = (g.useMean != 0u && isfinite(as_type<float>(bits))) ? mean : as_type<float>(bits);
     float below = as_type<float>(state[0]);
     below = (isfinite(p) && p < g.speed) ? below + g.elapsed : 0.0f;
     state[0] = as_type<uint>(below);
-    state[2] = bits;
+    state[2] = as_type<uint>(p);
     state[3] += 1u;
     if (g.autoFreeze != 0u && below >= g.seconds) state[1] = 1u;
 }
