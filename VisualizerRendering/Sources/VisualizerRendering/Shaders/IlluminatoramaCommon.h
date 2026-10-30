@@ -635,7 +635,12 @@ struct PointLight {
     // ignores it. Appended after `giVisible` (size 72 → 76) inside the stride's tail padding:
     // stride 80, unchanged. Keep in lockstep with `RTPointLight` and the Swift struct.
     float  openingRadius;
-    float  openingOffset;   // Daydream DH-1363 inc. 2 — layout only for a point (76 → 80 = the stride)
+    // PER-LIGHT SPECULAR SCALE (Unreal's "Specular Scale"): multiplies the SPECULAR part (base GGX and
+    // coat lobe) of this light in the deferred pass; diffuse is untouched. Default 1 ⇒ byte-identical;
+    // 0 ⇒ the light is diffuse-only (the host lets an emissive mesh carry the reflection instead).
+    // Reuses the former point-light `openingOffset` slot (a point has no axis; it was layout-only), so
+    // stride 80 is unchanged. `RTPointLight` keeps naming that slot `openingOffset` (ignored for points).
+    float  specularScale;
 };
 #define kGIVisibleSecondaryOnly 2u
 

@@ -48,5 +48,6 @@ extension IlluminatoramaRenderer {
     public var layeredSpecularEnabled: Bool { get { kLighting.layeredSpecularEnabled } set { kLighting.layeredSpecularEnabled = newValue } _modify { yield &kLighting.layeredSpecularEnabled } }
     public var diffuseRoughnessEnabled: Bool { get { kLighting.diffuseRoughnessEnabled } set { kLighting.diffuseRoughnessEnabled = newValue } _modify { yield &kLighting.diffuseRoughnessEnabled } }
     public var layeredClothSheen: Bool { get { kLighting.layeredClothSheen } set { kLighting.layeredClothSheen = newValue } _modify { yield &kLighting.layeredClothSheen } }
+    public var sphereLightsEnabled: Bool { get { kLighting.sphereLightsEnabled } set { kLighting.sphereLightsEnabled = newValue } _modify { yield &kLighting.sphereLightsEnabled } }
     public internal(set) var initTiming: IlluminatoramaInitTiming { get { kLighting.initTiming } set { kLighting.initTiming = newValue } _modify { yield &kLighting.initTiming } }
 }

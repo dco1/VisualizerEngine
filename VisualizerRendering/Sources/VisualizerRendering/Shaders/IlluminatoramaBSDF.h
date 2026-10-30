@@ -58,6 +58,10 @@ using namespace metal;
 /// kPathFlagDiffuseRoughness (the traced primary's sun, its GI weight, every secondary / path
 /// vertex). Clear ⇒ every lane is Lambert whatever the materials carry.
 #define kFrameFlagDiffuseRoughness    128u
+/// FrameUniforms.frameFlags bit 10 (1024) — SPHERE LIGHTS: deferred point lights with `bulbRadius > 0`
+/// shade as luminous spheres (horizon-clipped sphere irradiance + representative-point specular;
+/// see `illumiSphereDiffuseRatio` in IlluminatoramaLighting.metal). Clear ⇒ every light is a point.
+#define kFrameFlagSphereLights        1024u
 /// RTInstUniforms.pathFlags bit 14 (16384) — the same switch for the ray-traced lighting kernel.
 #define kPathFlagDiffuseRoughness     16384u
 

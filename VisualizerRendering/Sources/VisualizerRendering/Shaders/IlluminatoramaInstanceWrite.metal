@@ -228,7 +228,10 @@ kernel void bulbs_write_pointlights(
     if (dot(d, d) > U.cameraCull.w) return;
     uint slot = atomic_fetch_add_explicit(counter, 1u, memory_order_relaxed);
     if (slot >= U.maxLights) return;
-    PointLight pl;
+    PointLight pl = {};   // zero-init: an MSL struct local is NOT zeroed, and `specularScale` / `bulbRadius` are now read by the deferred kernel
+    pl.shadowCubeIndex = -1;
+    pl.giVisible = 1u;
+    pl.specularScale = 1.0;   // Swift default: full specular
     pl.position = bulbPos[i].xyz;
     pl.radius   = U.lightRadius;
     pl.color    = c * U.gain;

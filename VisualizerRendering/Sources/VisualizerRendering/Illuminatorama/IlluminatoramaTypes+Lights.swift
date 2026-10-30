@@ -154,11 +154,14 @@ public struct IlluminatoramaPointLight {
     /// `PointLight.shadowCubeIndex`. Default `-1`.
     public var shadowCubeIndex: Int32 = -1
     /// **The physical size of the lamp at this light** (metres; 0 ⇒ a point, the shipped law).
-    /// Read ONLY by the path-traced still lane (`rtPathLampBulbs`), at path vertices: there a lamp's
+    /// **Sphere lights:** with `IlluminatoramaRenderer.sphereLightsEnabled` the DEFERRED pass also reads
+    /// this — the light shades as a luminous sphere of this radius (`color` stays the far-field intensity;
+    /// sphere-clipped diffuse + representative-point specular). Flag off ⇒ ignored there, as before.
+    /// Read by the path-traced still lane (`rtPathLampBulbs`), at path vertices: there a lamp's
     /// falloff is `1/max(d² + softRadius², bulbRadius²)` — a luminous SPHERE of this radius is
     /// exactly `1/d²` outside itself, and no surface can sit inside the glass, so this is the honest
     /// finite-bulb law rather than a clamp (Daydream DH-1293/DH-1295). The deferred pass and every
-    /// real-time kernel ignore it, so a host that sets it changes nothing off the path lane. Was the
+    /// other real-time kernel (RT secondary fill, glass) ignore it, and the deferred pass ignores it unless `sphereLightsEnabled`, so a host that sets it changes nothing off the path lane. Was the
     /// former `_padPointShadow0` (same 4 bytes, stride unchanged). Mirrors the Metal
     /// `PointLight.bulbRadius` / `RTPointLight.bulbRadius`.
     public var bulbRadius: Float = 0
@@ -191,14 +194,20 @@ public struct IlluminatoramaPointLight {
     /// so the stride stays 80 on both sides. Mirrors the Metal `PointLight` / `RTPointLight
     /// .openingRadius` — keep in lockstep.
     public var openingRadius: Float = 0
-    /// Daydream DH-1363 inc. 2 — where the opening sits along the light's travel direction, from `position` (m;
-    /// a point light has no axis, so this is carried for the layout only and ignored). Size 76 → 80 = the stride.
-    public var openingOffset: Float = 0
+    /// **Per-light specular scale** (Unreal's "Specular Scale"; default 1 ⇒ byte-identical). Multiplies the
+    /// SPECULAR part of this light in the deferred pass — the base GGX lobe and the coat lobe — and leaves the
+    /// diffuse alone; 0 ⇒ diffuse-only. Use it when an emissive mesh already carries the light's glint in
+    /// reflections (a lamp globe) so the analytic light doesn't add a second, hotter, point-sized one.
+    /// Occupies the slot a point light formerly carried as `openingOffset` (a point has no axis, so it was
+    /// layout-only and ignored); size 76 → 80 = the stride, unchanged. Mirrors the Metal `PointLight.specularScale`
+    /// (`RTPointLight` still calls that slot `openingOffset` and ignores it for points).
+    public var specularScale: Float = 1
 
     public init(position: SIMD3<Float>, radius: Float, color: SIMD3<Float>,
                 layerMask: UInt32 = 0xFFFF_FFFF,
                 castsShadow: Bool = false, softRadius: Float = 0, giVisible: Bool = true,
-                bulbRadius: Float = 0, openingRadius: Float = 0, openingOffset: Float = 0) {
+                bulbRadius: Float = 0, openingRadius: Float = 0, openingOffset: Float = 0,
+                specularScale: Float = 1) {
         self.position = position
         self.radius = radius
         self.color = color
@@ -208,7 +217,8 @@ public struct IlluminatoramaPointLight {
         self.giVisible = giVisible ? 1 : 0
         self.bulbRadius = bulbRadius
         self.openingRadius = openingRadius
-        self.openingOffset = openingOffset
+        _ = openingOffset   // a point light has no axis; accepted for source compatibility, ignored
+        self.specularScale = specularScale
     }
 }
 

@@ -193,6 +193,13 @@ final class LightingKnobs {
     /// the environment, in the traced reflection's Fresnel and the traced GI's weight, and at every path
     /// vertex. `true` (the default) changes nothing for a material that never sets them — the instance
     /// then carries no layer parameters and every lane keeps the literal F0 0.04 — so it costs one
+    /// **Sphere lights** (opt-in, default `false` ⇒ every point light is a zero-size point, byte-identical).
+    /// With it set, a deferred point light whose `bulbRadius > 0` shades as a luminous SPHERE of that
+    /// radius: horizon-clipped analytic sphere irradiance for the diffuse and Karis's representative-point
+    /// specular (+ (α/α')² energy normalisation) for the base GGX lobe — so a lamp globe reflects in glossy
+    /// glass as a soft globe-sized glint instead of a hot point-sized oval. `color` keeps its meaning
+    /// (far-field intensity: at d >> r the result equals the point law). See `illumiSphereDiffuseRatio`.
+    var sphereLightsEnabled: Bool = false
     /// G-buffer texel read per pixel. `false` makes every dielectric F0 0.04 whatever the materials carry.
     var layeredSpecularEnabled: Bool = true
     /// **DH-1309 — the coat as a real layer.** `true`: a clearcoated instance's coat is a second GGX lobe
