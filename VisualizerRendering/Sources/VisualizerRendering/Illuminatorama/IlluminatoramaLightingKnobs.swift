@@ -158,6 +158,12 @@ final class LightingKnobs {
     /// uses a 1×1 black fallback (sky pixels render black, IBL contributes
     /// nothing). The texture is sampled, so it must be `.shaderRead`-capable.
     var equirectSky: MTLTexture?
+    /// Optional CAMERA-VISIBLE sky: when set, background (sky) pixels sample this instead of
+    /// `equirectSky`, while IBL, glass reflections and RT keep `equirectSky`. The standard
+    /// studio-CG "light visible to reflections, invisible to camera" split — e.g. softbox
+    /// strips that draw glass edge lines without standing as white slabs in a wide shot.
+    /// nil (default) = the background is `equirectSky`, unchanged.
+    var backgroundEquirect: MTLTexture?
     var iblNeedsRebake: Bool = true
     /// How many seconds may elapse between IBL bakes even when `iblNeedsRebake`
     /// stays false. Default 5 s — enough to keep slow cloud drift from going

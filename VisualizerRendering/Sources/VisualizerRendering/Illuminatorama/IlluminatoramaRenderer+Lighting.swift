@@ -149,7 +149,7 @@ extension IlluminatoramaRenderer {
         enc.setTexture(gbs.depthTexture, index: 3)
         enc.setTexture(gbs.hdrTexture, index: 4)
         enc.setTexture(aoSourceTexture, index: 5)  // denoised AO (or raw when off)
-        enc.setTexture(equirectSky ?? ibls.dummySkyTexture, index: 6)
+        enc.setTexture(backgroundEquirect ?? equirectSky ?? ibls.dummySkyTexture, index: 6)   // sky pixels only
         enc.setTexture(ibls.irradianceCube, index: 7)
         enc.setTexture(ibls.prefilteredCube, index: 8)
         enc.setTexture(shd.shadowMap, index: 9)

@@ -40,6 +40,7 @@ extension IlluminatoramaRenderer {
     public var iblIntensity: Float { get { kLighting.iblIntensity } set { kLighting.iblIntensity = newValue } _modify { yield &kLighting.iblIntensity } }
     public var iblEnabled: Bool { get { kLighting.iblEnabled } set { kLighting.iblEnabled = newValue } _modify { yield &kLighting.iblEnabled } }
     public var equirectSky: MTLTexture? { get { kLighting.equirectSky } set { kLighting.equirectSky = newValue } _modify { yield &kLighting.equirectSky } }
+    public var backgroundEquirect: MTLTexture? { get { kLighting.backgroundEquirect } set { kLighting.backgroundEquirect = newValue } _modify { yield &kLighting.backgroundEquirect } }
     public var iblNeedsRebake: Bool { get { kLighting.iblNeedsRebake } set { kLighting.iblNeedsRebake = newValue } _modify { yield &kLighting.iblNeedsRebake } }
     public var iblRebakeInterval: Float { get { kLighting.iblRebakeInterval } set { kLighting.iblRebakeInterval = newValue } _modify { yield &kLighting.iblRebakeInterval } }
     public var dfgLUTEnabled: Bool { get { kLighting.dfgLUTEnabled } set { kLighting.dfgLUTEnabled = newValue } _modify { yield &kLighting.dfgLUTEnabled } }
