@@ -309,6 +309,32 @@ public final class PaperClothSolver {
     /// How far from a surface still counts as resting for the stick pass, over and above
     /// `clothThickness` (which inflates the colliders the same way the collide pass does).
     public var stickBand: Float = 0.006
+    /// Coulomb friction BETWEEN layers (`paperLayerFriction`): a node lying on another layer (or on a
+    /// fold of its own sheet) holds while its slip along it is under `layerFrictionStatic` × what presses
+    /// it in, and slides with its slip cut by `layerFrictionKinetic` × that load once it breaks free.
+    /// Unlike `stickSpeed`'s fixed threshold the hold scales with load, so a throw's lying patch holds a
+    /// hem hanging off the bed by its own weight — no pinned patch — while a lightly touching ripple
+    /// can still relax. Woven cotton on cotton is μs ≈ 0.5–0.8. 0 = off (default; the pass and its
+    /// contact record do not run).
+    public var layerFrictionStatic: Float = 0
+    /// Kinetic coefficient for `layerFrictionStatic`; usually a little under it.
+    public var layerFrictionKinetic: Float = 0
+    private var layerFriction: PaperLayerFriction?
+    private var sheetLayers: PaperSheetLayers?
+    /// Say which PIECE a sheet belongs to and how thick it is (`paperSelfCollide`'s `sheetLayers`). Two sheets of
+    /// different pieces are then held apart by the SUM of their `halfThickness`es — a quilt drawn with a deep puff
+    /// next to a thin throw — instead of one `interLayerRadius` band for every pair, and layer friction acts only
+    /// between different `frictionGroup`s (a pillow's two skins are two sheets and one piece). Sheets never named
+    /// keep their own group and `interLayerRadius` as their half. Keep `interLayerRadius` at least the largest half:
+    /// it is also the per-pass push clamp. `configureSheets` clears it.
+    public func setSheetLayer(_ sheet: Int, frictionGroup: Int, halfThickness: Float) {
+        if sheetLayers == nil {
+            sheetLayers = PaperSheetLayers(device: engine.device, maxSheets: maxSheets,
+                                           defaultHalf: interLayerRadius ?? selfRadius)
+        }
+        sheetLayers?.set(sheet, group: frictionGroup, half: halfThickness)
+    }
+    private var layerFrictionOn: Bool { layerFrictionStatic > 0 && selfCollisionEnabled && !killSelf }
     /// Run the SDF collide inside the constraint iterations (every 3rd) as well as at the
     /// end of the substep. ON resolves deep contact honestly (without it, wedged cloth can
     /// equilibrate far inside a collider); OFF reproduces the once-per-substep dynamics,
@@ -635,6 +661,7 @@ public final class PaperClothSolver {
                                 restSlackNucleation: Float = 1.0,
                                 struts: [Strut] = []) {
         precondition(specs.count <= maxSheets, "configureSheets: \(specs.count) > maxSheets \(maxSheets)")
+        sheetLayers = nil
         let W = gridW, H = gridH, M = W * H
         sheetCount = specs.count
         restSpacing = specs.map { min($0.sizeW / Float(max(W - 1, 1)), $0.sizeH / Float(max(H - 1, 1))) }.min() ?? 0
@@ -1088,6 +1115,11 @@ public final class PaperClothSolver {
     private func encodeSelfCollide(_ cb: MTLCommandBuffer) {
         let n = particleBuffer.count
         writeHashUniforms()
+        if layerFrictionOn, layerFriction == nil {
+            layerFriction = PaperLayerFriction(engine: engine, maxParticles: maxParticles)
+        }
+        let record = layerFrictionOn ? layerFriction : nil
+        record?.encodeClear(cb, particleCount: n)
         hashGrid.encodeBuild(cb, particles: particleBuffer.buffer, particleCount: n,
                              cellSize: legacyPushout ? 0.05 : selfCellSize, label: "PaperCloth")
         // Two Jacobi relaxation passes against the same buckets. Each pass reads
@@ -1113,6 +1145,9 @@ public final class PaperClothSolver {
                 e.setBuffer(selfSnapshotBuffer, offset: 0, index: 5)
                 e.setBuffer(pileBuffer, offset: 0, index: 6)
                 e.setBuffer(selfLoadBuffer, offset: 0, index: 7)
+                // Unread unless `recordContact`; any buffer satisfies the binding.
+                e.setBuffer(record?.contact ?? selfLoadBuffer, offset: 0, index: 8)
+                e.setBuffer(sheetLayers?.buffer ?? selfLoadBuffer, offset: 0, index: 9)
                 dispatch1D(e, pipeline: selfCollidePipeline, count: n); e.endEncoding()
             }
         }
@@ -1197,7 +1232,9 @@ public final class PaperClothSolver {
             layerRadius: legacyPushout ? 0 : effectiveInterLayerRadius,
             pileRest: pileRestThickness,
             pushoutBleed: selfCollidePushoutBleed,
-            foldRadius: foldRadius, foldCells: foldCells)
+            foldRadius: foldRadius, foldCells: foldCells,
+            recordContact: layerFrictionOn ? 1 : 0,
+            sheetLayers: (sheetLayers != nil && !legacyPushout) ? 1 : 0)
     }
 
     private func encodeSubstep(to cb: MTLCommandBuffer, dt: Float) {
@@ -1297,6 +1334,17 @@ public final class PaperClothSolver {
                     dispatch1D(enc, pipeline: pipe, count: bendGroupCount[g])
                 }
             }
+        }
+
+        // 3b. Coulomb friction between layers, against the contacts the last self-collision recorded. BEFORE the
+        //     collider pass, so a rigid collider has the last word: run after it, the friction moved a duvet node held to
+        //     a pillow back along that pillow and into the headboard, every substep (13-30 mm deep on Daydream Home's beds).
+        if layerFrictionOn, let lf = layerFriction {
+            lf.write(particleCount: particleBuffer.count, muStatic: layerFrictionStatic,
+                     muKinetic: layerFrictionKinetic,
+                     gridW: gridW, gridH: gridH, verticesPerSheet: verticesPerSheet)
+            encodePass(cb, pipeline: lf.pipeline, buffers: [particleBuffer.buffer, lf.contact, lf.uniforms],
+                       count: particleBuffer.count, label: "PaperCloth.layerFriction")
         }
 
         // 4. Collision — AFTER constraints so contacts win the final position.
@@ -1803,6 +1851,8 @@ struct PaperHashUniforms {
     var pushoutBleed: Float = 0.5
     var foldRadius: Float = 0
     var foldCells: UInt32 = 0
+    var recordContact: UInt32 = 0
+    var sheetLayers: UInt32 = 0
 }
 
 extension PaperClothSolver: SimSettling {

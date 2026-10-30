@@ -670,6 +670,16 @@ struct PaperHashUniforms {
     // 0 = off (the cap is not in force).
     float foldRadius;
     uint  foldCells;
+    // Layer friction (see paperLayerFriction): 1 = leave each node's contact normal, pushout and
+    // partner motion in `contact` for the per-substep Coulomb pass. 0 = never touched.
+    uint  recordContact;
+    // Per-SHEET layers (`sheetLayer` buffer): 1 = two different sheets are held apart by the SUM of
+    // their own half-thicknesses, and only sheets in different friction groups record friction
+    // contact. A duvet drawn with a 26 mm quilt puff and a thin throw over it are not the same
+    // thickness, and one band for every pair could not hold the throw clear of the puff without
+    // also inflating everything else; a pillow's two skins are two sheets but ONE piece, and
+    // friction between them held folds inside the pillow. 0 = `layerDist` for every pair, as before.
+    uint  sheetLayers;
 };
 
 // Hash grid build + cell hash: shared (SimSpatialHash.metal / .h).
@@ -687,6 +697,8 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
                              device const PBDParticle* S     [[ buffer(5) ]],
                              device const float2* pile       [[ buffer(6) ]],   // (thickness, pressure); read only here
                              device float* selfLoad          [[ buffer(7) ]],   // this node's own push, for the collide pass
+                             device float4* contact          [[ buffer(8) ]],
+                             device const uint2* sheetLayer  [[ buffer(9) ]],   // per sheet: (friction group, as_type<uint>(half-thickness))   // 2/node: (side of the other layer), (its Δ, 1) — cleared per frame
                              uint id [[ thread_position_in_grid ]]) {
     if (id >= u.particleCount) return;
     const bool compressible = u.pileRest > 0.0;
@@ -705,6 +717,11 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
     float layerDist = (u.layerRadius > 0.0) ? 2.0 * u.layerRadius : minDist;
     float3 delta  = float3(0.0);
     float3 nbrVel = float3(0.0);   // summed Δpos of contacting neighbours (velocity·dt)
+    // Layer friction's record: contacts with another PIECE only (another sheet, and with `sheetLayers` another
+    // friction group). Friction is between layers; a sheet's own folds, and the sheets of one piece, keep the
+    // frictionless contact they always had — gripping a pillow's two skins together held folds inside it.
+    float3 layerPush = float3(0.0), layerVel = float3(0.0);
+    int    layerHits = 0;
     int    hits   = 0;
 
     for (int dz = -1; dz <= 1; ++dz)
@@ -749,7 +766,11 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
                 gridDist = uint(max(abs(jx - x), abs(jy - y)));
                 if (gridDist <= u.skipRadius) continue;
             }
+            uint jSheet = j / u.verticesPerSheet;
             float md = sameSheet ? minDist : layerDist;
+            if (u.sheetLayers != 0u && !sameSheet)
+                md = as_type<float>(sheetLayer[sheet].y) + as_type<float>(sheetLayer[jSheet].y);
+            bool otherPiece = !sameSheet && (u.sheetLayers == 0u || sheetLayer[sheet].x != sheetLayer[jSheet].x);
             // Another ply of the same sheet. Compressible cloth already holds its plies by their crushable pile (below);
             // a rigid floor on top of that cannot absorb a landing and the cloth bounces like rubber.
             if (!compressible && sameSheet && u.foldRadius > 0.0 && gridDist > u.foldCells) md = max(md, 2.0 * u.foldRadius);
@@ -761,8 +782,18 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
                 nbrVel += S[j].positionAndInvMass.xyz - S[j].prevPositionAndPad.xyz;
                 hits++;
             }
+            // A layer RESTING on another sits exactly at the band's edge — the pushout put it there and
+            // the friction pass holds it there — so `dist < md` alone would see its contact only every
+            // other frame, and every frame it missed it slid frictionless (a sheet set to μ 0.6 slipped
+            // off a 22° slope). Record the layer out to a quarter band past contact.
+            if (u.recordContact != 0u && otherPiece && dist < md * 1.25 && dist > 1e-6) {
+                layerPush += d / dist;
+                layerVel  += S[j].positionAndInvMass.xyz - S[j].prevPositionAndPad.xyz;
+                layerHits++;
+            }
         }
     }
+    float pushed = 0.0;                           // this pass's pushout length, for the friction record
     if (hits > 0) {
         // AVERAGE the pushout over the contacts, don't SUM it. When the collision
         // radius is larger than the other sheet's inter-vertex spacing, a single
@@ -791,6 +822,7 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
             if (cl > clampR) corr *= clampR / cl;
         }
         P[id].positionAndInvMass.xyz = pos + corr;
+        pushed = length(corr);
         P[id].prevPositionAndPad.xyz = pi.prevPositionAndPad.xyz + corr * u.pushoutBleed;  // bleed off inward velocity
         if (compressible) selfLoad[id] = length(corr);
 
@@ -811,7 +843,101 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
         }
     }
 
+    // Record the contact for the Coulomb pass: which side the OTHER layer is on (the direction only),
+    // that layer's motion, and — in .w, summed over the passes — how far this frame's pushout moved the
+    // node: a normal load the friction pass spends on its next substep. Written whether or not this pass
+    // pushed anything; side and motion are the latest pass's.
+    if (u.recordContact != 0u && layerHits > 0) {
+        float  cl3 = length(layerPush);
+        if (cl3 > 1e-9) {
+            contact[2u * id]      = float4(layerPush / cl3, contact[2u * id].w + pushed);
+            contact[2u * id + 1u] = float4(layerVel / float(layerHits), 1.0);
+        }
+    }
 }
+
+// ── LAYER FRICTION (Coulomb, cloth on cloth) ──────────────────────────────────
+//
+// `stickDisp` above holds a contact by a fixed slip, and only once a frame: tension moves the
+// cloth every SUBSTEP, so a pull it cannot see slides the layer anyway, and any fixed slip that
+// holds a throw's hanging hem also freezes the ripples it landed with (Daydream Home DH-0781:
+// 4 mm let the hem unzip the throw row by row onto the floor; 3 cm held it, ripples and all).
+// Real cloth holds by LOAD: a contact sticks while its tangential pull is under μs × what presses
+// it together. This is Macklin et al.'s position-based Coulomb friction (Unified Particle
+// Physics, 2014 §6.1), where both sides of the inequality are per-substep displacements, so the
+// normal load is the penetration the contact had to undo:
+//   load  = the substep's motion INTO the layer, which the pass undoes (the layer holds the node up),
+//           plus the last self-collision pushout, spent once
+//   slip  = the substep's motion along the layer, relative to the partner layer's
+//   slip < μs·load  → static: the slip is undone
+//   else            → kinetic: the slip shrinks by μk·load
+// Run every substep after the constraints and colliders, so it judges the substep's final motion.
+// A node on a slope holds exactly while tanθ < μs (gravity's along/into split); a lying patch
+// holds a hanging edge while the edge's pull is under μs × the patch's weight.
+struct PaperLayerFrictionUniforms {
+    uint  particleCount;
+    float muStatic;
+    float muKinetic;
+    uint  gridW;
+    uint  gridH;
+    uint  verticesPerSheet;
+};
+
+kernel void paperLayerFriction(device PBDParticle* P                  [[ buffer(0) ]],
+                               device float4* contact                 [[ buffer(1) ]],
+                               constant PaperLayerFrictionUniforms& u [[ buffer(2) ]],
+                               uint id [[ thread_position_in_grid ]]) {
+    if (id >= u.particleCount) return;
+    float4 c = contact[2u * id];
+    float4 m = contact[2u * id + 1u];
+    if (m.w < 0.5) return;                       // no layer under this node this frame
+    PBDParticle p = P[id];
+    if (p.positionAndInvMass.w == 0.0) return;   // pinned
+
+    // The contact plane is the CLOTH's, not the pushout's. The recorded pushout is a mean over point
+    // contacts and tilts sideways wherever a node sits between the other layer's nodes; judged against
+    // it, part of a layer's NORMAL motion (the pushout's own outward velocity) reads as slip, and
+    // undoing it ratchets the layer under it up through the one on top — measured on Daydream Home's
+    // bed, the duvet climbed 11 mm through a throw that never moved. So the plane comes from the
+    // node's own grid neighbours and the pushout only says which side the partner is on. Neighbours are
+    // read at the START of the substep (prev), which this kernel never writes, so the pass stays race-free
+    // and the bake deterministic.
+    uint sheet = id / u.verticesPerSheet, local = id - sheet * u.verticesPerSheet;
+    uint x = local % u.gridW, y = local / u.gridW, base = sheet * u.verticesPerSheet;
+    uint x0 = (x > 0u) ? x - 1u : x, x1 = min(x + 1u, u.gridW - 1u);
+    uint y0 = (y > 0u) ? y - 1u : y, y1 = min(y + 1u, u.gridH - 1u);
+    float3 du = P[base + y * u.gridW + x1].prevPositionAndPad.xyz - P[base + y * u.gridW + x0].prevPositionAndPad.xyz;
+    float3 dv = P[base + y1 * u.gridW + x].prevPositionAndPad.xyz - P[base + y0 * u.gridW + x].prevPositionAndPad.xyz;
+    float3 sn = cross(du, dv);
+    float  snl = length(sn);
+    if (snl < 1e-12) return;                     // a collapsed patch has no plane to slide in
+    float3 n = sn / snl;
+    if (dot(n, c.xyz) < 0.0) n = -n;             // points away from the partner layer
+    float3 rel = (p.positionAndInvMass.xyz - p.prevPositionAndPad.xyz) - m.xyz;
+    // LOAD and SLIP are measured over the same substep, or the coefficient means nothing. The layer
+    // HOLDS the node: this substep's motion into it is undone, and that motion is the load. Taking the
+    // load from the once-a-frame pushout instead counted normal velocity built up over every substep
+    // since (the slip, undone each substep, never builds), and a sheet on a slope set to μ 0.6 held to
+    // ~50° — μ 1.2. Holding it also stops a resting layer sinking into the one under it between pushouts.
+    //
+    // The other half of the load is the self-collision's own pushout. Against a layer that is itself
+    // moving (a duvet on a mattress, not a pinned sheet), every frame ends with a pushout, and it leaves
+    // the node moving AWAY on the next substep — no inward motion, so no load, so that substep's slip went
+    // free. A throw creeping down a bed by 0.5 mm a step was that. The pushout is a normal impulse; it is
+    // carried in .w and spent once, here.
+    float  into  = -dot(rel, n);
+    float  carry = c.w;
+    if (carry > 0.0) contact[2u * id].w = 0.0;
+    float  load  = max(into, 0.0) + carry;
+    float3 slipT = rel - n * dot(rel, n);        // rel minus its normal part
+    float  slip  = length(slipT);
+    float3 undo  = (into > 0.0) ? -n * into : float3(0.0);   // the support: the layer holds the node up
+    if (slip > 1e-9 && load > 0.0) {
+        undo += (slip < u.muStatic * load) ? slipT : slipT * min(u.muKinetic * load / slip, 1.0);
+    }
+    P[id].positionAndInvMass.xyz = p.positionAndInvMass.xyz - undo;
+}
+
 
 // ── KERNEL: pack deformed positions into the render buffer ────────────────────
 //
