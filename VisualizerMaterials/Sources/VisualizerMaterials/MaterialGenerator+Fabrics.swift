@@ -329,6 +329,52 @@ extension MaterialGenerator {
         return ch
     }
 
+    /// Washed cotton chino twill — what a dad hat, chinos and work shirts are made of. A 2/1 twill: each warp floats over
+    /// two picks and under one, stepping one pick per end, so the floats line up into fine DIAGONAL RIBS (~45°, the
+    /// twill line). Garment-washing softens and slightly fades it: a broad low-contrast mottle, raised fibre fuzz, and a
+    /// very matte surface whose only shine is a soft nap sheen at grazing angles.
+    ///
+    /// The tile is `tileMetres` wide with an INTEGER number of ribs across it (so the diagonal wraps seamlessly at the UV
+    /// seam): 72 ribs over 5 cm ≈ 0.7 mm pitch, the real pitch of a mid-weight chino. Albedo is near-WHITE and neutral so
+    /// a host tints it per instance (instance albedo × map); `base` is the undyed tone.
+    public static func twill(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 211, ribs: Int = 72,
+                             base: Vec3 = Vec3(0.90, 0.90, 0.90)) -> MaterialChannels {
+        var ch = MaterialChannels(size: size, category: .fabric)
+        let tau = 2.0 * Double.pi
+        let R = Double(ribs)
+        for y in 0..<size {
+            for x in 0..<size {
+                let u = (Double(x) + 0.5) / Double(size)
+                let v = (Double(y) + 0.5) / Double(size)
+                // The twill line: ribs run along u = v (45°). Phase (u + v)·R is integer-periodic over the tile.
+                let ph = (u + v) * R
+                // A 2/1 float is a long flat crown and a short sharp valley: skew the cosine so crowns are broad.
+                let c = 0.5 + 0.5 * cos(tau * ph)
+                let rib = pow(c, 0.55)
+                // The individual yarns crossing each rib (the "steps" of the twill), much fainter, across the rib.
+                let yarn = 0.5 + 0.5 * cos(tau * (u - v) * R * 1.5)
+                // Washed: broad soft fading + finer pilling/fuzz.
+                let wash = Noise.fbmTiled(u, v, baseCells: 3, octaves: 4, seed: seed ^ 0x11) - 0.5
+                let fuzz = Noise.fbmTiled(u * 24, v * 24, baseCells: 24, octaves: 2, seed: seed ^ 0x2D) - 0.5
+                let slub = Noise.fbmTiled(ph / R * 6, (u - v) * 8, baseCells: 6, octaves: 2, seed: seed ^ 0x5A) - 0.5
+                let shade = 0.92 + 0.07 * rib + 0.015 * yarn + 0.07 * wash + 0.03 * fuzz + 0.03 * slub
+                ch.albedo[ch.idx(x, y)] = clampBand(base * shade)
+                // Very matte; valleys a touch rougher (shadowed fibre), washed patches slightly rougher.
+                ch.roughness[ch.idx(x, y)] = clamp01(0.86 + 0.06 * (1 - rib) + 0.08 * wash + 0.04 * fuzz)
+                ch.height[ch.idx(x, y)] = clamp01(0.35 + 0.45 * rib * (0.85 + 0.15 * yarn) + 0.06 * fuzz + 0.05 * slub)
+            }
+        }
+        ch.sheen = 0.32                              // cotton nap: a soft grazing glow, not satin
+        ch.sheenRoughness = 0.45
+        ch.diffuseRoughness = 0.8                    // fuzzy fibre surface: flat, chalky Oren-Nayar falloff
+        ch.grainTangent = [Vec2](repeating: Vec2(0.70710678, -0.70710678), count: size * size)   // along the twill line
+        ch.deriveNormals(strength: 0.35)             // the ribs are the twill's identity: visible, not a whisper
+        addFibreDetail(&ch, seed: seed ^ 0xC3, fibres: [
+            .init(count: 4200, length: 22, width: 1.6, angle: .pi / 4, spread: 0.6, layered: false, widthJitter: 0.4)],
+            baseCells: 110, strength: 0.35, occlusionStrength: 0.5)
+        return ch
+    }
+
     /// Top-grain leather — smooth hide with a fine pore dimple pattern and subtle
     /// pull-up effect at creases (darker at recesses). Good for upholstery and headboards.
     public static func leather(size: Int = MaterialGenerator.bakeSize, seed: UInt64 = 127,
