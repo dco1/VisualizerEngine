@@ -66,6 +66,10 @@ extension IlluminatoramaRenderer {
     public var rtReflMaxDistance: Float { get { kRT.rtReflMaxDistance } set { kRT.rtReflMaxDistance = newValue } _modify { yield &kRT.rtReflMaxDistance } }
     public var rtReflRoughnessCutoff: Float { get { kRT.rtReflRoughnessCutoff } set { kRT.rtReflRoughnessCutoff = newValue } _modify { yield &kRT.rtReflRoughnessCutoff } }
     public var rtReflRays: Int { get { kRT.rtReflRays } set { kRT.rtReflRays = newValue } _modify { yield &kRT.rtReflRays } }
+    public var rtReflProgressiveCone: Bool { get { kRT.rtReflProgressiveCone } set { kRT.rtReflProgressiveCone = newValue } _modify { yield &kRT.rtReflProgressiveCone } }
+    public var rtReflStillStride: Int { get { kRT.rtReflStillStride } set { kRT.rtReflStillStride = newValue } _modify { yield &kRT.rtReflStillStride } }
+    public var rtReflStillStrideMaxFresnel: Float { get { kRT.rtReflStillStrideMaxFresnel } set { kRT.rtReflStillStrideMaxFresnel = newValue } _modify { yield &kRT.rtReflStillStrideMaxFresnel } }
+    public var rtReflStillStrideMaxRoughness: Float { get { kRT.rtReflStillStrideMaxRoughness } set { kRT.rtReflStillStrideMaxRoughness = newValue } _modify { yield &kRT.rtReflStillStrideMaxRoughness } }
     public var rtSurfaceSnapEnabled: Bool { get { kRT.rtSurfaceSnapEnabled } set { kRT.rtSurfaceSnapEnabled = newValue } _modify { yield &kRT.rtSurfaceSnapEnabled } }
     public var rtGlassEnabled: Bool { get { kRT.rtGlassEnabled } set { kRT.rtGlassEnabled = newValue } _modify { yield &kRT.rtGlassEnabled } }
     public var rtGlassMaxBounces: UInt32 { get { kRT.rtGlassMaxBounces } set { kRT.rtGlassMaxBounces = newValue } _modify { yield &kRT.rtGlassMaxBounces } }

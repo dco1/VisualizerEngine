@@ -284,6 +284,8 @@ extension IlluminatoramaRenderer {
         /// DH-0952 — the snap probe's gate (Metal twin appended last).
         var surfaceSnapMinUpY: Float = -2
         var surfaceSnapClearance: Float = 0
+        /// DH-0952 — the reflection's sampling (`rtReflSampling`; Metal twin appended last). 0 ⇒ byte-identical.
+        var reflSampling: UInt32 = 0
 
         mutating func setInteriorRoomGains(_ gains: [Float], enabled: Bool) {
             let p = InteriorRoomGains.pack(gains, enabled: enabled)

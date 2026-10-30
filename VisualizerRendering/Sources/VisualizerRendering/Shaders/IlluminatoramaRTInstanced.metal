@@ -195,6 +195,9 @@ struct RTInstUniforms {
     // `surfaceSnapMinUpY` < −1 ⇒ always probe (byte-identical).
     float surfaceSnapMinUpY;
     float surfaceSnapClearance;
+    // Daydream DH-0952 — the reflection's sampling (`rtReflSampling`): bit 0 progressive Sobol cone, bits 8–15
+    // the frame stride (see the reflection block). 0 ⇒ byte-identical.
+    uint  reflSampling;
 };
 
 /// DH-1011 — `RTInstUniforms.pathFlags` bits.
@@ -1985,7 +1988,33 @@ kernel void illumi_rt_lighting_tlas(
     // the sky it replaces) smoothly to 0 over the `kReflCutoffFade` below the cutoff, so a continuous
     // roughness field gives a continuous picture.
     const float reflFade = 1.0 - smoothstep(u.reflRoughnessCutoff - kReflCutoffFade, u.reflRoughnessCutoff, reflRough);
-    if (u.reflEnabled != 0 && u.reflStrength > 0.0 && reflFade > 0.0) {
+    // Daydream DH-0952 — `reflSampling` (0 ⇒ byte-identical): bit 0 draws the cone from the pixel's progressive
+    // Owen-scrambled Sobol stream instead of the per-frame PCG; bits 8–15 = S > 1 traces a pixel on one frame in S
+    // (whole 32-px SIMD rows together, the row's phase hashed) at S× weight, for a frozen still whose frames are
+    // AVERAGED — same mean, 1/S of the rays. The Sobol index is then the pixel's own trace count, so its S-strided
+    // samples stay one contiguous low-discrepancy sequence.
+    // Bits 16–23 = a roughness limit ×255 (0 ⇒ none): only a lobe at or below it is strided — a narrow cone's
+    // samples barely vary frame to frame, so taking 1 in S of them costs the average almost no variance.
+    // Bits 24–31 = a Fresnel limit ×255 (0 ⇒ none): only a pixel whose reflectance (luma of its Schlick F) is at
+    // or below it is strided — the variance a stride adds scales with F², so a head-on dielectric pays ~nothing
+    // and a grazing floor or a metal keeps every frame.
+    const uint reflStrideLimit = (u.reflSampling >> 16u) & 0xFFu;
+    const uint reflStrideFLimit = (u.reflSampling >> 24u) & 0xFFu;
+    const float reflFLuma = dot(F0rt + (float3(1.0) - F0rt) * pow(1.0 - NdotVrt, 5.0), float3(0.2126, 0.7152, 0.0722));
+    const uint reflStride = (reflStrideLimit == 0u || reflRough * 255.0 <= float(reflStrideLimit))
+                         && (reflStrideFLimit == 0u || reflFLuma * 255.0 <= float(reflStrideFLimit))
+                          ? max(1u, (u.reflSampling >> 8u) & 0xFFu) : 1u;
+    uint reflIndex = u.giProgressiveIndex;
+    bool reflThisFrame = true;
+    if (reflStride > 1u) {
+        uint phase = pcgHash((gid.x >> 5u) * 0x9E3779B9u ^ gid.y * 0x85EBCA6Bu ^ 0x52464Cu) % reflStride;
+        uint k = u.giProgressiveIndex + phase;
+        reflThisFrame = (k % reflStride) == 0u;
+        reflIndex = k / reflStride;
+    }
+    const float reflWeight = float(reflStride);
+    uint reflSobolSeed = illumiPixelSeed(gid, 0x5246u);
+    if (u.reflEnabled != 0 && u.reflStrength > 0.0 && reflFade > 0.0 && reflThisFrame) {
         float3 V = normalize(u.cameraWorldPos - P);
         float3 R = reflect(-V, N);
         float NdotV = saturate(dot(N, V));
@@ -2042,8 +2071,15 @@ kernel void illumi_rt_lighting_tlas(
         uint hits = 0u;
         isect.accept_any_intersection(false);
         for (uint i = 0; i < rrays; ++i) {
-            float3 dir = secondaryConeVisible(reflRough, kReflConeK)
-                ? coneSample(R, secondaryConeRad(reflRough, kReflConeK), rnd(seed), rnd(seed)) : R;
+            float3 dir = R;
+            if (secondaryConeVisible(reflRough, kReflConeK)) {
+                if ((u.reflSampling & 1u) != 0u) {   // DH-0952 — the pixel's progressive Sobol stream
+                    float2 cq = illumiSobolOwen2DShuffled(reflIndex * rrays + i, reflSobolSeed);
+                    dir = coneSample(R, secondaryConeRad(reflRough, kReflConeK), cq.x, cq.y);
+                } else {
+                    dir = coneSample(R, secondaryConeRad(reflRough, kReflConeK), rnd(seed), rnd(seed));
+                }
+            }
             if (dot(dir, N) <= 0.0) continue;
             ray r; r.origin = Pofs; r.direction = dir;
             r.min_distance = max(u.rayTMin, 1e-3); r.max_distance = u.reflMaxDist;
@@ -2134,9 +2170,9 @@ kernel void illumi_rt_lighting_tlas(
                                          cacheIrr, cacheTerm);
             cacheRefl += cacheTerm;
         }
-        reflection = (acc / float(rrays)) * fres * u.reflStrength * reflFade;
+        reflection = (acc / float(rrays)) * fres * u.reflStrength * reflFade * reflWeight;
         reflFresS = max(fres * u.reflStrength, float3(0.02));
-        reflHitFraction = saturate(float(hits) / float(rrays) * u.reflStrength) * reflFade;
+        reflHitFraction = saturate(float(hits) / float(rrays) * u.reflStrength) * reflFade * reflWeight;
         reflTraced = reflDistN > 0.0;
         cacheTerms += (cacheRefl / float(rrays)) * fres * u.reflStrength * reflFade;
     }
@@ -2189,6 +2225,10 @@ kernel void illumi_rt_lighting_tlas(
         outHDR.write(half4(max(prev.rgb - half3(diffSkyReplaced), half3(0.0h)), prev.a), gid);
         rtSpecular.write(half4(half3((reflection - skySeenThrough) / reflFresS), half(max(reflDistAcc / reflDistN, 1e-3))), gid);
         rtSpecularFres.write(half4(half3(reflFresS), 1.0h), gid);
+    } else if (reflStride > 1u) {
+        // DH-0952 — a strided frame carries S× the reflection delta (and the sky it replaces): clamp the SUM, not
+        // the stand-in alone, or the S× sky would floor a dim pixel and bias the average up.
+        outHDR.write(half4(half3(max(float3(prev.rgb) - skySeenThrough - diffSkyReplaced + reflection, float3(0.0))), prev.a), gid);
     } else {
         outHDR.write(half4(max(prev.rgb - half3(skySeenThrough) - half3(diffSkyReplaced), half3(0.0h)) + half3(reflection), prev.a), gid);
     }

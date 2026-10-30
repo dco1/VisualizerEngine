@@ -360,6 +360,18 @@ final class RTKnobs {
     var rtReflRoughnessCutoff: Float = 0.6
     /// Glossy samples per pixel (1 = mirror-sharp; TAA denoises the rest).
     var rtReflRays: Int = 1
+    /// Daydream DH-0952 — draw the reflection cone from the pixel's progressive Sobol stream (frame-contiguous,
+    /// like the GI's) instead of an independent PCG draw per frame. Same cost; an averaged still converges faster.
+    var rtReflProgressiveCone: Bool = false
+    /// Daydream DH-0952 — in a frozen-camera still (`taaStillAccumulation`, raw add only) trace each 32-px row's
+    /// reflections on one frame in N, at N× weight. Same mean, 1/N of the rays. 1 = every frame (byte-identical).
+    var rtReflStillStride: Int = 1
+    /// Only lobes at or below this roughness are strided (0 = every traced lobe). A narrow cone's per-frame
+    /// samples barely differ, so striding them costs the averaged still almost no variance.
+    var rtReflStillStrideMaxRoughness: Float = 0
+    /// Only pixels whose reflectance (luma of Schlick F at the view angle) is at or below this are strided
+    /// (0 = every pixel). The variance a stride adds scales with F², so head-on dielectrics are nearly free.
+    var rtReflStillStrideMaxFresnel: Float = 0
     /// **Traced rays leave from the surface the camera sees** (Daydream DH-0715). The substrate's
     /// depth bias above buries its depth-rebuilt world position BEHIND the surface — ≈ 10 cm down
     /// the view ray at 50 m — so every traced sun, portal, bounce and AO ray from the ground started

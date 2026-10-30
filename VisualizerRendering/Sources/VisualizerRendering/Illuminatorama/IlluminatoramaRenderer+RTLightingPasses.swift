@@ -49,6 +49,11 @@ extension IlluminatoramaRenderer {
         u.surfaceSnapULPs = effectiveRTSurfaceSnapULPs
         u.surfaceSnapMinUpY = rtSurfaceSnapMinUpY          // DH-0952
         u.surfaceSnapClearance = rtSurfaceSnapClearance
+        // DH-0952 — progressive Sobol cone (bit 0) and the still-only frame stride (bits 8–15); stride needs the raw add.
+        let reflStride = (taaStillAccumulation && !rts.spec.enabled) ? UInt32(max(1, min(8, rtReflStillStride))) : 1
+        let reflStrideLimit = UInt32(max(0, min(255, (rtReflStillStrideMaxRoughness * 255).rounded())))
+        let reflStrideFLimit = UInt32(max(0, min(255, (rtReflStillStrideMaxFresnel * 255).rounded())))
+        u.reflSampling = (rtReflProgressiveCone ? 1 : 0) | (reflStride << 8) | (reflStrideLimit << 16) | (reflStrideFLimit << 24)
         rts.rtGIProgressiveIndex &+= 1
         // DH-0896 — a reflection hit REPLACES the sky the deferred pass put there.
         let specIBLOn = rtReflectionsEnabled && ibls.specIBLWrittenThisFrame && ibls.specIBLTexture != nil
