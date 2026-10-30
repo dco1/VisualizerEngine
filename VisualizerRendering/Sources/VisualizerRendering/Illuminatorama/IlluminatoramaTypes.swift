@@ -218,8 +218,8 @@ public struct IlluminatoramaFrameUniforms {
     /// as a toggle so smooth-gradient banding can be A/B'd live. Repurposes
     /// the former `_padDenoise0` slot.
     public var debandDitherEnabled: UInt32 = 1
-    /// Former DDGI irradiance-cache pair (DH-1425) — pad; layout unchanged.
-    public var _padDDGI0: UInt32 = 0
+    /// DH-1305 — `IlluminatoramaRenderer.textureFilterMode` (was `_padDDGI0`, same slot).
+    public var textureFilterMode: UInt32 = 0
     /// Signack S5 — `IlluminatoramaRenderer.leafTransmittanceRatio` (was `_padDDGI1`, same slot).
     public var leafTransmittanceRatio: Float = 0
     /// Leaf thin-sheet transmission strength (issue #58 / #20 item 2). 0 = OFF —

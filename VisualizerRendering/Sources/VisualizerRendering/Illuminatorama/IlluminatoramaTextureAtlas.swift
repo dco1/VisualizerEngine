@@ -423,11 +423,19 @@ public final class IlluminatoramaTextureAtlas {
         // no re-quantising an 8-bit image repeatedly). `.shared` storage means
         // `replace(region:mipmapLevel:slice:)` writes each level directly, so this needs
         // no blit encoder and `register(contents:)` stays synchronous.
+        // DH-1305 — the source tiled 3 × 3 at native size (exact copies), built once per upload.
+        let periodic = (Self.wrapFilteredMips && sx >= 1 && sy >= 1)
+            ? Self.tiledSource(cgImage, space: cs, bitmapInfo: bitmapInfo) : nil
         for level in 0..<mipLevels {
             let n = max(1, sliceSize >> level)
             let bytesPerRow = n * 4
             let bufferSize = bytesPerRow * n
             var buffer = [UInt8](repeating: 0, count: bufferSize)
+            // DH-1305 — a resampled level is drawn PERIODICALLY (see `wrapFilteredMips`).
+            if let tiled = periodic,
+               let wrapped = Self.drawWrapped(tiled: tiled, source: cgImage, n: n, space: cs, bitmapInfo: bitmapInfo) {
+                buffer = wrapped
+            } else {
             let drew: Bool = buffer.withUnsafeMutableBytes { raw -> Bool in
                 guard let base = raw.baseAddress,
                       let ctx = CGContext(data: base, width: n, height: n,
@@ -462,6 +470,7 @@ public final class IlluminatoramaTextureAtlas {
             guard drew else {
                 Self.log.error("CGContext init failed for slice \(slice, privacy: .public) mip \(level, privacy: .public)")
                 return false
+            }
             }
             // S2.5 — μ for the variance-preserving hex blend, taken from LEVEL 0 over the
             // VALID (pre-wrap-fill) sub-rect only, in the space the shader samples. See

@@ -183,8 +183,10 @@ struct FrameUniforms {
     uint     ssaoIsFirstFrame;      // 1 = no valid AO history yet
     uint     ssrIsFirstFrame;       // 1 = no valid SSR history yet
     uint     debandDitherEnabled;   // 1 = TPDF dither before 8-bit store
-    // Former DDGI irradiance-cache pair (DH-1425) — kept as pad so the struct layout is unchanged.
-    uint     _padDDGI0;
+    // DH-1305 — texture-filtering lever bits: 1 = detail-normal LOD (IlluminatoramaGBufferSurface.h),
+    // 16 = scaled tonemap resolve (end of file). 0 = the pre-DH-1305 shader exactly. Was `_padDDGI0`
+    // (the former DDGI pair, DH-1425): same 4 bytes at the same offset, stride unchanged.
+    uint     textureFilterMode;
     // Signack S5 (Daydream DH-1461 / DH-1361) — τ/ρ of the PHYSICAL thin-leaf model
     // (IlluminatoramaLeafOptics.h) for foliage whose tag carries a thickness (> 0). 0 = off. Was
     // `_padDDGI1`: same 4 bytes, stride unchanged.
@@ -1301,3 +1303,8 @@ static inline float3 viewPosFromDepth(float2 ndcXY, float depth, float4x4 invPro
     float4 view = invProj * clip;
     return view.xyz / view.w;
 }
+
+// DH-1305 — `FrameUniforms.textureFilterMode` bit read by the TONEMAP's 4-tap resolve: scale the
+// tap offsets by the real input:output ratio so a 1:1 frame is resolved with one exact tap instead
+// of a [1 2 1] tent. (Bit 1 is the G-buffer's, in IlluminatoramaGBufferSurface.h.)
+constant uint kTextureFilterResolveScaled = 16u;

@@ -54,6 +54,13 @@ extension IlluminatoramaRenderer {
     public var liveLookGIWarmth: Float { get { kPost.liveLookGIWarmth } set { kPost.liveLookGIWarmth = newValue } _modify { yield &kPost.liveLookGIWarmth } }
     public var liveLookAODarken: Float { get { kPost.liveLookAODarken } set { kPost.liveLookAODarken = newValue } _modify { yield &kPost.liveLookAODarken } }
     public var antiTilingStrength: Float { get { kPost.antiTilingStrength } set { kPost.antiTilingStrength = newValue } _modify { yield &kPost.antiTilingStrength } }
+    /// DH-1305 — texture-filtering A/B levers, as bits; 0 (default) = the pre-DH-1305 shader exactly.
+    /// `1` — the detail-normal tap takes mip-correct gradients (no sub-pixel aliasing).
+    /// `16` — the tonemap's 4-tap resolve scales its taps to the real input:output ratio (one exact
+    /// tap at 1:1 instead of a [1 2 1] tent). Both measured by Daydream's filtering audit
+    /// (`HouseRenderBridgeGPUTests_FilteringAudit`) against a 64-spp reference; both are visible look
+    /// changes and ship off pending a look call (Daydream DH-1305's decision ticket).
+    public var textureFilterMode: UInt32 { get { kPost.textureFilterMode } set { kPost.textureFilterMode = newValue } _modify { yield &kPost.textureFilterMode } }
     public var iblDiffuseSaturation: Float { get { kPost.iblDiffuseSaturation } set { kPost.iblDiffuseSaturation = newValue } _modify { yield &kPost.iblDiffuseSaturation } }
     public var iblDiffuseDesaturation: Float { get { kPost.iblDiffuseDesaturation } set { kPost.iblDiffuseDesaturation = newValue } _modify { yield &kPost.iblDiffuseDesaturation } }
     public var scotopicDesaturation: Float { get { kPost.scotopicDesaturation } set { kPost.scotopicDesaturation = newValue } _modify { yield &kPost.scotopicDesaturation } }

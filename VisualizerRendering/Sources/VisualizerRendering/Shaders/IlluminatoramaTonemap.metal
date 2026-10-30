@@ -881,6 +881,17 @@ fragment float4 illumi_tonemap_fs(
         float2(-0.5, -0.5), float2( 0.5, -0.5),
         float2(-0.5,  0.5), float2( 0.5,  0.5)
     };
+    // DH-1305 — the ±0.5-texel taps are a 2:1 BOX only when the input is twice the output. At 1:1
+    // (the `standard` settled tier renders at internal scale 1.0) the four bilinear taps sum to a
+    // [1 2 1]/4 tent on each axis: a pure blur that halves the frame's texture micro-contrast at
+    // every distance (measured: 0.5–0.65 of a 64-spp box reference on every audited material). With
+    // the bit set the offset is ±(s−1)/2 texels for s input texels per output pixel — 0 at 1:1 (one
+    // exact tap), ±0.25 at 1.5:1, ±0.5 at 2:1 (unchanged). Computed here, in uniform control flow.
+    float2 tapK = float2(1.0);
+    if ((frame.textureFilterMode & kTextureFilterResolveScaled) != 0u) {
+        float2 sIn = abs(float2(dfdx(in.uv.x), dfdy(in.uv.y))) * inSize;
+        tapK = clamp(sIn - 1.0, 0.0, 1.0);
+    }
     float3 hdr = float3(0.0);
     if (frame.motionBlurStrength > 0.0) {
         // ── Velocity-buffer motion blur (issue #65) ──────────────────────────────
@@ -928,7 +939,7 @@ fragment float4 illumi_tonemap_fs(
         // above so the default-off path keeps its 4 samples).
         float2 caOff = (in.uv - 0.5) * (frame.chromaticAberration * 0.03);
         for (int i = 0; i < 4; ++i) {
-            float2 uv = in.uv + offsets[i] * invInSize;
+            float2 uv = in.uv + offsets[i] * tapK * invInSize;
             hdr.r += float(inHDR.sample(downSampler, uv + caOff).r);
             hdr.g += float(inHDR.sample(downSampler, uv).g);
             hdr.b += float(inHDR.sample(downSampler, uv - caOff).b);
@@ -936,7 +947,7 @@ fragment float4 illumi_tonemap_fs(
         hdr *= 0.25;
     } else {
         for (int i = 0; i < 4; ++i) {
-            float2 uv = in.uv + offsets[i] * invInSize;
+            float2 uv = in.uv + offsets[i] * tapK * invInSize;
             hdr += float3(inHDR.sample(downSampler, uv).rgb);
         }
         hdr *= 0.25;

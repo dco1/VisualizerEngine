@@ -90,6 +90,24 @@ static inline __attribute__((always_inline)) float2 illumiSurfaceMaterialUV(VSOu
     return matUV;
 }
 
+// ── DH-1305 — texture filtering levers (`FrameUniforms.textureFilterMode` bits) ───────────────────
+// 0 = the pre-DH-1305 shader exactly (every bit gates a branch that is otherwise skipped).
+//
+// kTextureFilterDetailLOD — the detail-normal tap takes MIP-CORRECT gradients (× its own uv scale)
+//   instead of the deliberately unscaled pair S1.1 left it (see the long note at that tap). The
+//   unscaled pair samples ~3 mips too sharp, which is sub-pixel aliasing by construction. Measured
+//   by the DH-1305 filtering audit against a 64-spp reference: shimmer under a ¼-px camera step
+//   1.4–2.6× → 1.0–1.3× (the reference's own 1.1–1.6) with detail retained and mean level unchanged
+//   (no material went mirror-smooth — the band's lost variance does not reach the mean at these
+//   roughnesses). Bit 16 (the tonemap's resolve) is in IlluminatoramaCommon.h.
+//
+// Recorded NEGATIVES (built, measured, removed — DH-1305): a Toksvig/vMF roughness widening from the
+// filtered macro normal's length darkened tiled and terrazzo floors 7–22 % below the reference at
+// distance (it over-roughens: the box-averaged length drop is dominated by grout/plank-edge slopes);
+// a −0.5/−1 mip LOD bias raised shimmer (oak near 1.16 → 1.78) for ≤ 0.1 more detail; scaling the
+// per-pattern-cell tone jitter by 1/√cells moved nothing (≤ 0.04).
+constant uint kTextureFilterDetailLOD = 1u;
+
 /// Tangent-space normal map (+ the detail normal band and its micro-occlusion tap) onto `n`.
 static inline __attribute__((always_inline)) void illumiSurfaceNormalMap(
     VSOut in, Instance inst, constant FrameUniforms& frame, float2 matUV, float2 duvdx, float2 duvdy,
@@ -150,9 +168,11 @@ static inline __attribute__((always_inline)) void illumiSurfaceNormalMap(
             // aliasing** — which is also why it reads on mirror-like metal and on nothing
             // else. Retiring the exception means moving the detail NORMAL to a resolvable
             // frequency too, which is a look change, not a filtering fix.
+            const bool detailLOD = (frame.textureFilterMode & kTextureFilterDetailLOD) != 0u;
+            const float dScale = detailLOD ? inst.detailNormalUVScale : 1.0f;
             float4 dnSample = sampleAtlasAspect(nonColorAtlas, texSampler, detailUV,
                                                 uint(inst.detailNormalTextureSlice), nonColorUVScale,
-                                                duvdx, duvdy);
+                                                duvdx * dScale, duvdy * dScale);
             float3 dn = dnSample.xyz * 2.0 - 1.0;
             // NOTE: `dn.z` is deliberately not used — the blend is a partial-derivative add
             // in tangent space, so blue was always dead weight here. S2.4 puts the detail

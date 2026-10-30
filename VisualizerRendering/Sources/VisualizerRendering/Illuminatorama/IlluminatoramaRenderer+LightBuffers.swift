@@ -332,6 +332,7 @@ extension IlluminatoramaRenderer {
         // Phase 7 — opt-in anti-tiling. Clamp to [0,1]; 0 (default) makes the shader
         // take the plain single-sample path, so opted-out scenes are unchanged.
         u.antiTilingStrength = max(0, min(1, antiTilingStrength))
+        u.textureFilterMode = textureFilterMode   // DH-1305 — 0 = pre-DH-1305 shader
         // Point-light cube shadow bias (0 when the feature is off ⇒ no behaviour change).
         u.pointShadowBias = pointShadowsEnabled ? pointShadowBias : 0
         // Scotopic (Purkinje) night desaturation. 0 (default) ⇒ the tonemap branch

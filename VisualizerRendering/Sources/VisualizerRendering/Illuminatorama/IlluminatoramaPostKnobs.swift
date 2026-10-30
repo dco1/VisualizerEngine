@@ -289,6 +289,8 @@ final class PostKnobs {
     /// cubic weights, applied consistently across albedo / roughness / normal so the
     /// channels stay registered. 1.0 = full de-repeat; intermediate values crossfade.
     var antiTilingStrength: Float = 0
+    /// DH-1305 — `IlluminatoramaRenderer.textureFilterMode` (texture-filtering lever bits). 0 = off.
+    var textureFilterMode: UInt32 = 0
     /// Saturation boost on the IBL diffuse term in the lighting kernel.
     /// Procedural-gradient backdrops (HotdogDrop+'s peach→tan, every
     /// `+`-tier sky) integrate to a near-grey irradiance, and the
