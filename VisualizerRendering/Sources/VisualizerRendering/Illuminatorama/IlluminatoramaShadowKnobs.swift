@@ -140,6 +140,12 @@ final class ShadowKnobs {
     /// distributed in [zNear, shadowMaxDistance] using a practical
     /// log/uniform split.
     var shadowMaxDistance: Float = 50.0
+    /// How many sun cascades split [zNear, shadowMaxDistance], 1…3 (default 3, unchanged).
+    /// With fewer, the active ones share the whole range and the rest are never drawn — each
+    /// dropped cascade is one depth pass of the scene's every shadow-casting triangle less per
+    /// frame. For a small, near-only subject (a product shot, a gallery card) 1 cascade with a
+    /// short `shadowMaxDistance` covers it at a texel of ≈ 2 × range / resolution.
+    var sunShadowCascadeCount: Int = 3
     // ── Phase 4.10 — spot light shadow maps ──────────────────────────
     /// Toggle per-spot shadow casting. Off by default — scenes with
     /// dozens of spot lights (Eggs' rail spotlights) would otherwise pay

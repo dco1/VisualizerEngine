@@ -1196,13 +1196,24 @@ public final class IlluminatoramaRenderer {
     ///   texel — finer, less-aliased sun-shadow edges — at 4× shadow-map memory
     ///   per doubling. Safe for PCF: the lighting shader reads its texel size
     ///   from `shadowMap.get_width()`, so no shader change is needed.
+    /// - Parameter textureAtlasCapacity: Slices each of the two texture atlases (albedo,
+    ///   non-colour) starts with. Default `64` (unchanged): 2 × 64 mipmapped 512² slices
+    ///   ≈ 173 MB, allocated whether or not a texture is ever registered. The atlases double
+    ///   on demand (up to 1024), so a small renderer whose scene registers a handful of maps
+    ///   (a gallery card, a thumbnail) can start at 4 and pay ~11 MB. Clamped to ≥ 1.
+    /// - Parameter internalRenderScale: The internal-to-output scale the first targets are
+    ///   allocated at. `nil` (default) keeps `defaultInternalRenderScale` (1.5). A host that
+    ///   sets `internalRenderScale` straight after init otherwise allocates — and then frees —
+    ///   one full 1.5× target set first (~400 MB at 1280×720).
     public init(engine: SimEngine, width: Int, height: Int, camera: IlluminatoramaCamera,
-                shadowMapResolution: Int = 2048) throws {
+                shadowMapResolution: Int = 2048, textureAtlasCapacity: Int = 64,
+                internalRenderScale: Float? = nil) throws {
         // Stopwatch for the init breakdown. Kept in a LOCAL and assigned to
         // `self.initTiming` at the very end — mutating a stored property while the
         // rest of `self` is still uninitialised isn't allowed, and a local also keeps
         // the marks out of every early-throw path.
         var timing = IlluminatoramaInitTiming()
+        timing.device = engine.device
         self.engine = engine
         self.device = engine.device
         self.commandQueue = engine.commandQueue
@@ -1217,8 +1228,11 @@ public final class IlluminatoramaRenderer {
         // target is allocated — a host that can't afford the scene's authored
         // canvas must never allocate it, not shrink it afterwards. Unlimited by
         // default, so this is a no-op for hosts that haven't opted in.
+        let requestedScale = internalRenderScale.map {
+            min(Self.maxInternalRenderScale, max(Self.minInternalRenderScale, $0))
+        } ?? Self.defaultInternalRenderScale
         let budgeted = Self.budgeted(outputW: width, outputH: height,
-                                     scale: Self.defaultInternalRenderScale)
+                                     scale: requestedScale)
         let initialScale = budgeted.scale
         self.outputWidth  = budgeted.w
         self.outputHeight = budgeted.h
@@ -1303,12 +1317,13 @@ public final class IlluminatoramaRenderer {
         // to 64 MB per atlas at default 64 capacity — still well under
         // the per-app texture budget on every Apple Silicon GPU.
         let atlasSliceSize = 512
+        let atlasCapacity = max(1, textureAtlasCapacity)
         self.albedoAtlas = try IlluminatoramaTextureAtlas(
             device: device, pixelFormat: .bgra8Unorm_srgb,
-            sliceSize: atlasSliceSize)
+            sliceSize: atlasSliceSize, capacity: atlasCapacity)
         self.nonColorAtlas = try IlluminatoramaTextureAtlas(
             device: device, pixelFormat: .bgra8Unorm,
-            sliceSize: atlasSliceSize)
+            sliceSize: atlasSliceSize, capacity: atlasCapacity)
         timing.mark("texture atlases (albedo + non-colour)")
 
         // ── Targets ──────────────────────────────────────────────────────

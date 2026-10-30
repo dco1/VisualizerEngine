@@ -27,7 +27,20 @@ extension IlluminatoramaRenderer {
         // printed the previous frame's shadows with the toggle already off. A cleared
         // slice (depth == 1.0) compares as "lit" everywhere, so no consumer can resurrect
         // a shadow regardless of which lighting variant is live. (DH-0619)
+        //
+        // Cascades past `sunShadowCascadeCount` are never sampled except by cascade
+        // `active − 1`'s blend band at the far edge of the range (where a cleared slice reads
+        // "lit", the same answer as past `shadowMaxDistance`). So they are cleared ONCE — when
+        // the count drops or the map is replaced — and then skipped: a depth clear + store of
+        // an empty slice still writes every tile of it.
+        let active = shadowsEnabled ? sunShadowCascadeCount : Self.cascadeCount
+        let inactiveKey = active < Self.cascadeCount ? ObjectIdentifier(shd.shadowMap) : nil
+        let inactiveAlreadyClear = inactiveKey != nil && shd.inactiveCascadesClearedFor == inactiveKey
+            && shd.inactiveCascadesClearedFrom <= active
+        shd.inactiveCascadesClearedFor = inactiveKey
+        shd.inactiveCascadesClearedFrom = active
         for cascade in 0..<Self.cascadeCount {
+            if cascade >= active && inactiveAlreadyClear { continue }
             let pass = MTLRenderPassDescriptor()
             pass.depthAttachment.texture = shd.shadowMap
             pass.depthAttachment.slice = cascade
@@ -38,7 +51,7 @@ extension IlluminatoramaRenderer {
             guard let enc = timedRenderEncoder(cb, pass, "shadow.sunCascades") else { continue }
             enc.label = "Illuminatorama.shadow.c\(cascade)"
             // Disabled → the clear above already made this a fully-lit slice; no draws.
-            guard shadowsEnabled else { enc.endEncoding(); continue }
+            guard shadowsEnabled, cascade < active else { enc.endEncoding(); continue }
             enc.setRenderPipelineState(shd.shadowPipeline)
             var cutoutBound = false   // DH-1487 — the fragment-less pipeline is bound
             enc.setDepthStencilState(gbs.depthState)
@@ -91,7 +104,7 @@ extension IlluminatoramaRenderer {
     func updateCascades() {
         let near = max(camera.zNear, 0.05)
         let far = min(shadowMaxDistance, camera.zFar)
-        let count = Self.cascadeCount
+        let count = sunShadowCascadeCount   // the active ones share the whole range
         let lambda: Float = 0.5
 
         // PSSM split distances (in view-space positive distance) — log + uniform.
@@ -105,6 +118,9 @@ extension IlluminatoramaRenderer {
             let uniSplit = near + (far - near) * f
             splitsPos[i] = lambda * logSplit + (1 - lambda) * uniSplit
         }
+        // Inactive cascades (`count` < 3) end where the range does, so `pickCascade` never
+        // selects them.
+        for i in (count + 1)..<(Self.cascadeCount + 1) { splitsPos[i] = far }
         // Expose far-Z of each cascade to the lighting kernel.
         shd.cascadeSplitsView = SIMD4(splitsPos[1], splitsPos[2], splitsPos[3], 0)
 
@@ -730,6 +746,10 @@ final class ShadowState {
     var spotShadowAtlasCapacity: Int = IlluminatoramaRenderer.spotShadowCapacityDefault
 
     var cascadeSplitsView: SIMD4<Float> = .zero
+    /// The shadow map whose slices from `inactiveCascadesClearedFrom` up were last cleared
+    /// as inactive (`sunShadowCascadeCount` < 3); nil while every cascade is drawn.
+    var inactiveCascadesClearedFor: ObjectIdentifier?
+    var inactiveCascadesClearedFrom = IlluminatoramaRenderer.cascadeCount
 
     // ── Point-light cubemap shadows (lazy — allocated on first enable) ─────────
     // A single depth 2D-array texture holds every shadowed point light's cube as

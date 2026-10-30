@@ -20,6 +20,11 @@ extension IlluminatoramaRenderer {
     public var substrateDepthBias: Float { get { kShadow.substrateDepthBias } set { kShadow.substrateDepthBias = newValue } _modify { yield &kShadow.substrateDepthBias } }
     public var shadowPcfRadius: UInt32 { get { kShadow.shadowPcfRadius } set { kShadow.shadowPcfRadius = newValue } _modify { yield &kShadow.shadowPcfRadius } }
     public var shadowMaxDistance: Float { get { kShadow.shadowMaxDistance } set { kShadow.shadowMaxDistance = newValue } _modify { yield &kShadow.shadowMaxDistance } }
+    /// See `ShadowKnobs.sunShadowCascadeCount`. Clamped to 1…3.
+    public var sunShadowCascadeCount: Int {
+        get { kShadow.sunShadowCascadeCount }
+        set { kShadow.sunShadowCascadeCount = min(Self.cascadeCount, max(1, newValue)) }
+    }
     public var spotShadowsEnabled: Bool { get { kShadow.spotShadowsEnabled } set { kShadow.spotShadowsEnabled = newValue } _modify { yield &kShadow.spotShadowsEnabled } }
     public var spotShadowBias: Float { get { kShadow.spotShadowBias } set { kShadow.spotShadowBias = newValue } _modify { yield &kShadow.spotShadowBias } }
     public var pointShadowsEnabled: Bool { get { kShadow.pointShadowsEnabled } set { kShadow.pointShadowsEnabled = newValue } _modify { yield &kShadow.pointShadowsEnabled } }
