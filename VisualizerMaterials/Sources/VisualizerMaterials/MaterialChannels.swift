@@ -350,6 +350,11 @@ public struct MaterialChannels: Equatable, Sendable {
     return x * x * (3 - 2 * x)
 }
 
+/// `Float` Hermite step (same maths as the `Double` one; `Float(smoothstep(Double…))`).
+@inlinable public func smoothstep(_ edge0: Float, _ edge1: Float, _ t: Float) -> Float {
+    Float(smoothstep(Double(edge0), Double(edge1), Double(t)))
+}
+
 @inlinable public func mix(_ a: Vec3, _ b: Vec3, _ t: Double) -> Vec3 { a + (b - a) * t }
 @inlinable public func mix(_ a: Double, _ b: Double, _ t: Double) -> Double { a + (b - a) * t }
 
