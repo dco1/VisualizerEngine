@@ -386,7 +386,7 @@ extension IlluminatoramaRenderer {
 
     /// Mirror of `TAAStillParams` (IlluminatoramaTAA.metal), 16 bytes.
     struct TAAStillParams {
-        var still: UInt32; var karis: UInt32; var noSharpen: UInt32 = 0; var reserved1: UInt32 = 0
+        var still: UInt32; var karis: UInt32; var noSharpen: UInt32 = 0; var skyNoHistory: UInt32 = 0
     }
 
     /// **Which scene → display rendering the tonemap applies** (DH-0881).

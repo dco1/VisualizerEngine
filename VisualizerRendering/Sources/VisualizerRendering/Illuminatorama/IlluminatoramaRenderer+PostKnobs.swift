@@ -17,6 +17,7 @@ extension IlluminatoramaRenderer {
     public var highlightMaskInstances: [IlluminatoramaInstance] { get { kPost.highlightMaskInstances } set { kPost.highlightMaskInstances = newValue } _modify { yield &kPost.highlightMaskInstances } }
     public var taaStillAccumulation: Bool { get { kPost.taaStillAccumulation } set { kPost.taaStillAccumulation = newValue } _modify { yield &kPost.taaStillAccumulation } }
     public var taaStillKarisWeights: Bool { get { kPost.taaStillKarisWeights } set { kPost.taaStillKarisWeights = newValue } _modify { yield &kPost.taaStillKarisWeights } }
+    public var taaSkyIgnoresHistory: Bool { get { kPost.taaSkyIgnoresHistory } set { kPost.taaSkyIgnoresHistory = newValue } _modify { yield &kPost.taaSkyIgnoresHistory } }
     public var taaStillSharpen: Bool { get { kPost.taaStillSharpen } set { kPost.taaStillSharpen = newValue } _modify { yield &kPost.taaStillSharpen } }
     public var displayTransform: DisplayTransform { get { kPost.displayTransform } set { kPost.displayTransform = newValue } _modify { yield &kPost.displayTransform } }
     public var projectionShiftNDC: SIMD2<Float> { get { kPost.projectionShiftNDC } set { kPost.projectionShiftNDC = newValue } _modify { yield &kPost.projectionShiftNDC } }

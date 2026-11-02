@@ -32,7 +32,7 @@ extension IlluminatoramaRenderer {
         enc.setTexture(pfx.taaResolvedTexture,      index: 6)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
         var still = TAAStillParams(still: taaStillAccumulation ? 1 : 0, karis: taaStillKarisWeights ? 1 : 0,
-                                   noSharpen: taaStillSharpen ? 0 : 1)
+                                   noSharpen: taaStillSharpen ? 0 : 1, skyNoHistory: taaSkyIgnoresHistory ? 1 : 0)
         enc.setBytes(&still, length: MemoryLayout<TAAStillParams>.stride, index: 1)
         dispatch(enc, pipeline: pfx.taaResolvePipeline, width: width, height: height)
         enc.endEncoding()

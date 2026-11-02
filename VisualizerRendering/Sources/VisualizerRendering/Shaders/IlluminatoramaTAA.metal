@@ -123,7 +123,7 @@ struct TAAStillParams {
     uint still;    // 1 ⇒ frozen-camera running average
     uint karis;    // 1 ⇒ keep the Karis 1/(1+Y) weights in still mode (firefly damping, biased)
     uint noSharpen; // 1 ⇒ hand the accumulation downstream unsharpened (Daydream DH-1365, Maximum)
-    uint _r1;
+    uint skyNoHistory; // 1 ⇒ sky pixels take the current frame, no history
 };
 
 kernel void illumi_taa_resolve(
@@ -228,6 +228,11 @@ kernel void illumi_taa_resolve(
     // G-buffer's velocity write: (currNDC − prevNDC) · (0.5, −0.5). Gated on
     // THIS pixel's depth, not the dilated neighbour.
     if (gDepth.read(gid) >= 0.99999) {
+        if (still.skyNoHistory != 0u) {
+            outHistory.write(half4(half3(current), 1.0h), gid);
+            outResolved.write(half4(half3(current), 1.0h), gid);
+            return;
+        }
         float2 ndc = uv * 2.0 - 1.0;
         ndc.y = -ndc.y;
         float4 farWorld = frame.invViewProjection * float4(ndc, 1.0, 1.0);

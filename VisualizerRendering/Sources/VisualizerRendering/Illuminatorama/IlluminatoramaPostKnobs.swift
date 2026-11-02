@@ -88,6 +88,11 @@ final class PostKnobs {
     /// shipped still); Daydream's Maximum turns it off — its 2× render + declared reconstruction filter
     /// carry the detail (DH-1365). Rides `TAAStillParams.noSharpen`.
     var taaStillSharpen: Bool = true
+    /// Skip the TAA history on sky (far-plane) pixels: they take the current frame as is. The resolve gives sky a
+    /// camera-rotation-only velocity, so under an orbiting camera a flat backdrop around a centred subject reprojects
+    /// from where the subject was last frame and trails it. For a host whose sky is a uniform backdrop, with nothing
+    /// to denoise there. Default `false`: byte-identical for every host.
+    var taaSkyIgnoresHistory: Bool = false
     var displayTransform: DisplayTransform = .acesRec709
     /// **Off-axis lens shift**, in NDC (clip.xy += shift · clip.w): slides the image under a fixed
     /// eye without turning the view — a view camera's rise/shift, and the shear that keeps a focus
