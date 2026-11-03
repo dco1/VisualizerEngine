@@ -229,24 +229,33 @@ kernel void illumi_taa_resolve(
     // THIS pixel's depth, not the dilated neighbour.
     if (gDepth.read(gid) >= 0.99999) {
         if (still.skyNoHistory != 0u) {
-            outHistory.write(half4(half3(current), 1.0h), gid);
-            outResolved.write(half4(half3(current), 1.0h), gid);
-            return;
-        }
-        float2 ndc = uv * 2.0 - 1.0;
-        ndc.y = -ndc.y;
-        float4 farWorld = frame.invViewProjection * float4(ndc, 1.0, 1.0);
-        float3 dir = farWorld.xyz / farWorld.w - frame.cameraWorldPos;
-        float4 prevClip = frame.previousViewProjection * float4(dir, 0.0);
-        if (prevClip.w > 1e-5) {
-            float2 prevNDC = prevClip.xy / prevClip.w;
-            // Same jitter removal as the G-buffer's write (S4.2): `ndc` is this
-            // pixel under the JITTERED projection and `prevNDC` is the same ray
-            // under last frame's jittered VP, so the delta of the two offsets
-            // rides on top of the camera's real rotation. Sky has to agree with
-            // geometry here or the horizon reprojects differently from the wall
-            // under it. Zero when jitter is off.
-            vel = ((ndc - prevNDC) - frame.taaJitterDelta.xy) * float2(0.5, -0.5);
+            // Only where the whole 3×3 is sky. A sky pixel touching geometry is the
+            // outer half of a silhouette's coverage: jitter lands it on the surface
+            // in some frames and on the sky in others, and only its history averages
+            // the two. Taking the current frame there left every silhouette binary —
+            // stair-stepped — under a converged TAA. It keeps the dilated surface's
+            // velocity, as the dilation intends for edges.
+            if (closestDepth >= 0.99999) {
+                outHistory.write(half4(half3(current), 1.0h), gid);
+                outResolved.write(half4(half3(current), 1.0h), gid);
+                return;
+            }
+        } else {
+            float2 ndc = uv * 2.0 - 1.0;
+            ndc.y = -ndc.y;
+            float4 farWorld = frame.invViewProjection * float4(ndc, 1.0, 1.0);
+            float3 dir = farWorld.xyz / farWorld.w - frame.cameraWorldPos;
+            float4 prevClip = frame.previousViewProjection * float4(dir, 0.0);
+            if (prevClip.w > 1e-5) {
+                float2 prevNDC = prevClip.xy / prevClip.w;
+                // Same jitter removal as the G-buffer's write (S4.2): `ndc` is this
+                // pixel under the JITTERED projection and `prevNDC` is the same ray
+                // under last frame's jittered VP, so the delta of the two offsets
+                // rides on top of the camera's real rotation. Sky has to agree with
+                // geometry here or the horizon reprojects differently from the wall
+                // under it. Zero when jitter is off.
+                vel = ((ndc - prevNDC) - frame.taaJitterDelta.xy) * float2(0.5, -0.5);
+            }
         }
     }
 
@@ -278,8 +287,23 @@ kernel void illumi_taa_resolve(
             float prevZexpected = prevClip.z / prevClip.w;
             uint2 hpix = uint2(clamp(int2(historyUV * float2(W, H)),
                                      int2(0), int2(int(W) - 1, int(H) - 1)));
-            float prevZactual = gPrevDepth.read(hpix);
-            depthDisocc = smoothstep(0.0015, 0.01, abs(prevZexpected - prevZactual));
+            float zMiss = abs(prevZexpected - gPrevDepth.read(hpix));
+            // Under jitter a silhouette pixel sees the surface one frame and what's
+            // behind it the next, so its own previous depth "misses" every other
+            // frame even with nothing moving, and the edge threw its history away
+            // forever: binary coverage, stair steps. A jittered frame takes the best
+            // match in the 3×3 — a surface that was really there last frame is
+            // within a pixel of it; one that left (a fast mover) is not. Unjittered
+            // hosts keep the single read.
+            if (any(frame.taaJitterDelta.xy != 0.0)) {
+                for (int j = -1; j <= 1; ++j) {
+                    for (int i = -1; i <= 1; ++i) {
+                        uint2 c = uint2(clamp(int2(hpix) + int2(i, j), int2(0), int2(int(W) - 1, int(H) - 1)));
+                        zMiss = min(zMiss, abs(prevZexpected - gPrevDepth.read(c)));
+                    }
+                }
+            }
+            depthDisocc = smoothstep(0.0015, 0.01, zMiss);
         }
     }
 
@@ -293,6 +317,7 @@ kernel void illumi_taa_resolve(
     float3 historyYCoCg = RGBtoYCoCg(history);
 
     float3 m1 = float3(0.0), m2 = float3(0.0);
+    float3 nMin = float3(1e30), nMax = float3(-1e30);
     for (int j = -1; j <= 1; ++j) {
         for (int i = -1; i <= 1; ++i) {
             int2 c = clamp(int2(gid) + int2(i, j),
@@ -300,6 +325,7 @@ kernel void illumi_taa_resolve(
             float3 s = RGBtoYCoCg(float3(currentHDR.read(uint2(c)).rgb));
             m1 += s;
             m2 += s * s;
+            nMin = min(nMin, s); nMax = max(nMax, s);
         }
     }
     m1 /= 9.0;
@@ -316,6 +342,15 @@ kernel void illumi_taa_resolve(
     const float gamma = 1.5;
     float3 minC = m1 - gamma * sigma;
     float3 maxC = m1 + gamma * sigma;
+    // Across a hard silhouette σ is large, so mean ± γσ reaches past both sides: the
+    // Catmull-Rom history read's undershoot (and the sharpen below) got through and
+    // compounded frame on frame into a near-black rim round a light subject on a dark
+    // sky — a ring only a converged, jittered edge gets. There, keep the box inside
+    // what the neighbourhood really holds. Unjittered hosts keep the variance box.
+    if (any(frame.taaJitterDelta.xy != 0.0)) {
+        minC = max(minC, nMin);
+        maxC = min(maxC, nMax);
+    }
 
     // Clip (not per-channel clamp) the history into the neighbourhood AABB along
     // the centre→history ray — kills ghosts without the hue shift a per-channel
