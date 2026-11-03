@@ -94,7 +94,11 @@ final class IlluminatoramaAOAccumulator {
     init(device: MTLDevice, cache: SimPipelineCache) {
         // Optional pipelines, never `throw`: a compile failure here must not abort renderer init
         // for every host — it only leaves this opt-in path unavailable.
+        #if targetEnvironment(simulator)
+        rtaoPipeline = nil   // the Simulator's shader compiler crashes on the RT AO kernels
+        #else
         rtaoPipeline = device.supportsRaytracing ? cache.pipelineState(name: "illumi_rtao_tlas_v2", device: device) : nil
+        #endif
         accumulatePipeline = cache.pipelineState(name: "illumi_ao_accumulate", device: device)
         denoisePipeline = cache.pipelineState(name: "illumi_ao_denoise", device: device)
     }

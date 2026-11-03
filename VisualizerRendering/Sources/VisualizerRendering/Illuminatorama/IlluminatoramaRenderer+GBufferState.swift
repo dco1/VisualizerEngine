@@ -206,12 +206,12 @@ extension IlluminatoramaRenderer {
         pdesc.fragmentFunction = try Self.makeGBufferFragment(library: library, extended: false)
         pdesc.colorAttachments[0].pixelFormat = .rgba16Float
         pdesc.colorAttachments[1].pixelFormat = .rgba16Float
-        pdesc.colorAttachments[2].pixelFormat = .rgba16Float
+        pdesc.colorAttachments[2].pixelFormat = gbufferEmissionFormat
         // Phase 2.7 — velocity attachment (screen-space motion in UV space).
         pdesc.colorAttachments[3].pixelFormat = .rg16Float
         // Light-layer attachment (R32Uint) — carries the per-fragment layer bitfield.
-        pdesc.colorAttachments[4].pixelFormat = .r32Uint
-        pdesc.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot
+        pdesc.colorAttachments[4].pixelFormat = gbufferBitfieldFormat
+        pdesc.colorAttachments[7].pixelFormat = gbufferBitfieldFormat   // DH-1300 — the material-layer slot
         pdesc.depthAttachmentPixelFormat = .depth32Float
         declareVisBufferAttachment(pdesc, device: device)
         // No vertex descriptor — the shader reads from a device-buffer of
@@ -243,10 +243,10 @@ extension IlluminatoramaRenderer {
             sqdesc.fragmentFunction = sqFS
             sqdesc.colorAttachments[0].pixelFormat = .rgba16Float
             sqdesc.colorAttachments[1].pixelFormat = .rgba16Float
-            sqdesc.colorAttachments[2].pixelFormat = .rgba16Float
+            sqdesc.colorAttachments[2].pixelFormat = gbufferEmissionFormat
             sqdesc.colorAttachments[3].pixelFormat = .rg16Float
-            sqdesc.colorAttachments[4].pixelFormat = .r32Uint
-            sqdesc.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot
+            sqdesc.colorAttachments[4].pixelFormat = gbufferBitfieldFormat
+            sqdesc.colorAttachments[7].pixelFormat = gbufferBitfieldFormat   // DH-1300 — the material-layer slot
             sqdesc.depthAttachmentPixelFormat = .depth32Float
             declareVisBufferAttachment(sqdesc, device: device)
             s.superquadricImpostorPipeline =
@@ -281,13 +281,13 @@ extension IlluminatoramaRenderer {
             "illumi_irradiance_bake",
             "illumi_mesh_build_adjacency", "illumi_mesh_synth", "illumi_particles_step",
             "illumi_prefilter_bake", "illumi_repack_pos_norm", "illumi_rt_denoise",
-            "illumi_rt_gi_temporal", "illumi_rtao_tlas", "illumi_ssao", "illumi_ssao_spatial",
+            "illumi_rt_gi_temporal", "illumi_ssao", "illumi_ssao_spatial",
             "illumi_ssao_temporal", "illumi_ssr_composite", "illumi_ssr_gather",
             "illumi_ssr_temporal", "illumi_surfcache_atrous",
             "illumi_surfcache_reframe_chart",
             "illumi_surfcache_reframe_deform", "illumi_surfcache_reframe_tri",
             "illumi_svgf_atrous", "illumi_svgf_variance", "illumi_taa_resolve",
-        ], device: device)
+        ] + rtaoKernelNames, device: device)
     }
 
     /// The init-time `illumi_lighting` variant; doubles as the fallback if a later variant build fails.

@@ -268,6 +268,8 @@ extension IlluminatoramaRenderer {
             throw IlluminatoramaError.pipelineCreationFailed("illumi_ssao_temporal")
         }
         s.ssaoTemporalPipeline = ssaoTemporalPipelineBuilt
+        #if !targetEnvironment(simulator)   // the Simulator's shader compiler crashes on the RT AO kernels
         s.rtaoPipeline = cache.pipelineState(name: "illumi_rtao_tlas", device: device)
+        #endif
     }
 }
