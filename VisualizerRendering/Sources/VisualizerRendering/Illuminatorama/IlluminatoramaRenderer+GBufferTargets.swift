@@ -119,10 +119,10 @@ extension IlluminatoramaRenderer {
         }
         d.colorAttachments[0].pixelFormat = .rgba16Float
         d.colorAttachments[1].pixelFormat = .rgba16Float
-        d.colorAttachments[2].pixelFormat = .rgba16Float
+        d.colorAttachments[2].pixelFormat = gbufferEmissionFormat
         d.colorAttachments[3].pixelFormat = .rg16Float
-        d.colorAttachments[4].pixelFormat = .r32Uint
-        d.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot
+        d.colorAttachments[4].pixelFormat = gbufferBitfieldFormat
+        d.colorAttachments[7].pixelFormat = gbufferBitfieldFormat   // DH-1300 — the material-layer slot
         if extended { d.colorAttachments[5].pixelFormat = .rgba16Float }
         d.depthAttachmentPixelFormat = .depth32Float
         Self.declareVisBufferAttachment(d, device: device)
@@ -164,10 +164,10 @@ extension IlluminatoramaRenderer {
         }
         d.colorAttachments[0].pixelFormat = .rgba16Float
         d.colorAttachments[1].pixelFormat = .rgba16Float
-        d.colorAttachments[2].pixelFormat = .rgba16Float
+        d.colorAttachments[2].pixelFormat = gbufferEmissionFormat
         d.colorAttachments[3].pixelFormat = .rg16Float
-        d.colorAttachments[4].pixelFormat = .r32Uint
-        d.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot
+        d.colorAttachments[4].pixelFormat = gbufferBitfieldFormat
+        d.colorAttachments[7].pixelFormat = gbufferBitfieldFormat   // DH-1300 — the material-layer slot
         if extended { d.colorAttachments[5].pixelFormat = .rgba16Float }
         d.depthAttachmentPixelFormat = .depth32Float
         Self.declareVisBufferAttachment(d, device: device)
@@ -189,10 +189,10 @@ extension IlluminatoramaRenderer {
         d.fragmentFunction = try makeGBufferFragment(library: library, extended: true)
         d.colorAttachments[0].pixelFormat = .rgba16Float
         d.colorAttachments[1].pixelFormat = .rgba16Float
-        d.colorAttachments[2].pixelFormat = .rgba16Float
+        d.colorAttachments[2].pixelFormat = gbufferEmissionFormat
         d.colorAttachments[3].pixelFormat = .rg16Float
-        d.colorAttachments[4].pixelFormat = .r32Uint
-        d.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot
+        d.colorAttachments[4].pixelFormat = gbufferBitfieldFormat
+        d.colorAttachments[7].pixelFormat = gbufferBitfieldFormat   // DH-1300 — the material-layer slot
         d.colorAttachments[5].pixelFormat = .rgba16Float
         d.depthAttachmentPixelFormat = .depth32Float
         declareVisBufferAttachment(d, device: device)
@@ -292,10 +292,10 @@ extension IlluminatoramaRenderer {
         // exactly (no half-float rounding). Written by the G-buffer fragment
         // shaders, read by the lighting kernel at [[texture(18)]].
         let layer = try make(label: "Illuminatorama.gbuffer.layer",
-                             format: .r32Uint, w: internalW, h: internalH,
+                             format: gbufferBitfieldFormat, w: internalW, h: internalH,
                              usage: [.renderTarget, .shaderRead])
         let materialLayer = try make(label: "Illuminatorama.gbuffer.materialLayer",
-                                     format: .r32Uint, w: internalW, h: internalH,
+                                     format: gbufferBitfieldFormat, w: internalW, h: internalH,
                                      usage: [.renderTarget, .shaderRead])
         let historyA = try make(label: "Illuminatorama.historyA",
                                 format: .rgba16Float, w: internalW, h: internalH,

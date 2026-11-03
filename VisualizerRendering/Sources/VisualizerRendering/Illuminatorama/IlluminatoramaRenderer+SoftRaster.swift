@@ -176,7 +176,7 @@ extension IlluminatoramaRenderer {
         d.label = "Illuminatorama.softRaster.merge\(extended ? ".ext" : "")"
         d.vertexFunction = library.makeFunction(name: "illumi_vis_resolve_vs")
         d.fragmentFunction = library.makeFunction(name: "illumi_soft_merge_fs")
-        let formats: [MTLPixelFormat] = [.rgba16Float, .rgba16Float, .rgba16Float, .rg16Float, .r32Uint]
+        let formats: [MTLPixelFormat] = [.rgba16Float, .rgba16Float, gbufferEmissionFormat, .rg16Float, gbufferBitfieldFormat]
             + (extended ? [.rgba16Float] : [])
         for (i, fmt) in formats.enumerated() {
             d.colorAttachments[i].pixelFormat = fmt
@@ -184,7 +184,7 @@ extension IlluminatoramaRenderer {
         }
         d.colorAttachments[6].pixelFormat = .rg32Uint
         d.colorAttachments[6].writeMask = .all
-        d.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot (untouched here)
+        d.colorAttachments[7].pixelFormat = gbufferBitfieldFormat   // DH-1300 — the material-layer slot (untouched here)
         d.colorAttachments[7].writeMask = []
         d.depthAttachmentPixelFormat = .depth32Float
         do { vbs.soft.merge[extended] = try device.makeRenderPipelineState(descriptor: d) } catch {

@@ -112,7 +112,13 @@ extension IlluminatoramaRenderer {
     /// Whether this device carries the id attachment at all (it needs tile-memory reads and
     /// memoryless targets — every Apple GPU). The G-buffer pipelines and pass both ask this, so
     /// they always agree on the attachment set.
-    static func visBufferSupported(_ device: MTLDevice) -> Bool { device.supportsFamily(.apple4) }
+    static func visBufferSupported(_ device: MTLDevice) -> Bool {
+        #if targetEnvironment(simulator)
+        return false   // its id target is one more attachment, past the Simulator GPU's 32 bytes
+        #else
+        return device.supportsFamily(.apple4)
+        #endif
+    }
 
     /// Declare the id attachment on a G-buffer-pass pipeline: present, never written by it.
     static func declareVisBufferAttachment(_ d: MTLRenderPipelineDescriptor, device: MTLDevice) {
@@ -202,7 +208,7 @@ extension IlluminatoramaRenderer {
                                                     constantValues: c)
         d.fragmentFunction = try library.makeFunction(name: resolve ? "illumi_vis_resolve_fs" : "illumi_vis_fs",
                                                       constantValues: c)
-        let formats: [MTLPixelFormat] = [.rgba16Float, .rgba16Float, .rgba16Float, .rg16Float, .r32Uint]
+        let formats: [MTLPixelFormat] = [.rgba16Float, .rgba16Float, gbufferEmissionFormat, .rg16Float, gbufferBitfieldFormat]
             + (extended ? [.rgba16Float] : [])
         for (i, fmt) in formats.enumerated() {
             d.colorAttachments[i].pixelFormat = fmt
@@ -210,7 +216,7 @@ extension IlluminatoramaRenderer {
         }
         d.colorAttachments[6].pixelFormat = .rg32Uint
         d.colorAttachments[6].writeMask = resolve ? [] : .all
-        d.colorAttachments[7].pixelFormat = .r32Uint   // DH-1300 — the material-layer slot (the resolve writes it)
+        d.colorAttachments[7].pixelFormat = gbufferBitfieldFormat   // DH-1300 — the material-layer slot (the resolve writes it)
         d.colorAttachments[7].writeMask = resolve ? .all : []
         d.depthAttachmentPixelFormat = .depth32Float
         return try device.makeRenderPipelineState(descriptor: d)
@@ -323,3 +329,19 @@ extension IlluminatoramaRenderer {
         return MTLScissorRect(x: x0, y: y0, width: x1 - x0, height: y1 - y0)
     }
 }
+
+/// The emission slot (G-buffer colour 2). RGBA16Float everywhere but the iOS Simulator, whose GPU allows 32 bytes of
+/// render-target storage per pixel and the six targets need 36: RGBA8 there (emission clamps to 0…1) brings it to 32.
+#if targetEnvironment(simulator)
+let gbufferEmissionFormat: MTLPixelFormat = .rgba8Unorm
+#else
+let gbufferEmissionFormat: MTLPixelFormat = .rgba16Float
+#endif
+let gbufferBitfieldFormat: MTLPixelFormat = .r32Uint
+
+/// The ray-traced AO kernel, precompiled where the Simulator's shader compiler can take it (it crashes on it).
+#if targetEnvironment(simulator)
+let rtaoKernelNames: [String] = []
+#else
+let rtaoKernelNames: [String] = ["illumi_rtao_tlas"]
+#endif
