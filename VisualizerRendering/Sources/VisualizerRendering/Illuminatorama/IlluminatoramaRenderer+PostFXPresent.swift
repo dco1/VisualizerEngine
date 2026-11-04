@@ -235,3 +235,12 @@ extension IlluminatoramaRenderer {
         cb.commit()
     }
 }
+
+extension IlluminatoramaRenderer {
+    /// The texture the last `render()` wrote its frame into (one of the output pool), for a host that composites over the
+    /// frame itself: encode after `render()` on `commandQueue` (queue order puts it after the frame) and read this.
+    /// `outputTexture` is the newest *finished* frame instead, one or two behind, so an overlay drawn from this frame's
+    /// state over it slid against the picture (Dad Hat Factory's live gallery: card edges ahead of their hats). Nil before
+    /// the first frame.
+    public var frameTarget: MTLTexture? { pfx.tonemapWriteTarget }
+}
