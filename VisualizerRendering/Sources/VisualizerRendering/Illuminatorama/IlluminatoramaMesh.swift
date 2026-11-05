@@ -173,6 +173,26 @@ public final class IlluminatoramaMesh {
         return r
     }
 
+    /// The bounding sphere of `vertices`, the same one `boundingSphere` finds on first ask. Free of the main actor, so a
+    /// caller building a mesh off the main thread can work it out there and hand it to `init(…bounds:)`: the scan is a
+    /// pass over every vertex, ~40 ms of one frame for a few hundred thousand of them (an iPhone 15 Pro, Debug).
+    public nonisolated static func boundingSphere(of vertices: [IlluminatoramaVertex]) -> (center: SIMD3<Float>, radius: Float)? {
+        guard !vertices.isEmpty else { return nil }
+        return vertices.withUnsafeBufferPointer { buf -> (center: SIMD3<Float>, radius: Float) in
+            var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
+            var hi = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
+            var i = 0
+            let n = buf.count
+            while i < n {
+                let p = buf[i].position
+                lo = simd_min(lo, p); hi = simd_max(hi, p)
+                i += 1
+            }
+            let c = (lo + hi) * 0.5
+            return (center: c, radius: simd_length(hi - c))
+        }
+    }
+
     /// Object-space bounding sphere (centre, radius), computed ONCE from the vertex buffer on first
     /// ask (DH-0637). nil when the buffer is `.private` (GPU-only vertices) — callers must then
     /// treat the mesh as unbounded. Used by the spot-shadow reuse to ask "can this swaying
@@ -228,7 +248,11 @@ public final class IlluminatoramaMesh {
     /// that API, and a registration-based rule left every one of them unculled.
     public private(set) var cpuAuthoredVertices: Bool = true
 
-    public init(device: MTLDevice, vertices: [IlluminatoramaVertex], indices: [UInt16]) {
+    /// `bounds`: the vertices' bounding sphere if the caller already worked it out (`boundingSphere(of:)`, off the main
+    /// thread); left nil it's scanned on first ask.
+    public init(device: MTLDevice, vertices: [IlluminatoramaVertex], indices: [UInt16],
+                bounds: (center: SIMD3<Float>, radius: Float)? = nil) {
+        self.cachedBoundingSphere = bounds
         guard let vb = device.makeBuffer(
             bytes: vertices,
             length: MemoryLayout<IlluminatoramaVertex>.stride * vertices.count,
@@ -248,7 +272,11 @@ public final class IlluminatoramaMesh {
         self.vertexCount = vertices.count
     }
 
-    public init(device: MTLDevice, vertices: [IlluminatoramaVertex], indices: [UInt32]) {
+    /// `bounds`: the vertices' bounding sphere if the caller already worked it out (`boundingSphere(of:)`, off the main
+    /// thread); left nil it's scanned on first ask.
+    public init(device: MTLDevice, vertices: [IlluminatoramaVertex], indices: [UInt32],
+                bounds: (center: SIMD3<Float>, radius: Float)? = nil) {
+        self.cachedBoundingSphere = bounds
         guard let vb = device.makeBuffer(
             bytes: vertices,
             length: MemoryLayout<IlluminatoramaVertex>.stride * vertices.count,
