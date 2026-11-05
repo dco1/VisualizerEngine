@@ -144,28 +144,23 @@ final class GBufferState {
     // for motion-vector reconstruction. `currentInstanceBuffer` /
     // `previousInstanceBuffer` resolve through `useBufferA`.
     //
-    // ASSUMPTION (load-bearing): `instances[i]` this frame refers to the
-    // same logical instance as `instances[i]` last frame. The vertex shader
-    // reads `prevInstances[iid]` to build the previous-frame world position;
-    // if the host shuffles the array (or inserts in the middle) between
-    // frames, motion vectors will be wrong and TAA will smear wildly.
-    //
-    // Today this is fine: IlluminatoramaLab pushes a stable [ground, box,
-    // sphere] every frame, and any forthcoming scene extractor should
-    // similarly produce a stable index per logical SCNNode. The agent's
-    // safety-net is `ensureBufferCapacity` setting `taaNeedsFirstFrame =
-    // true` on growth — that catches count CHANGES but not REORDERS.
-    //
-    // When dynamic scene extraction lands, the right fix is a
-    // stable per-instance ID (UUID in the host-side struct, hashed into a
-    // uint32 in the GPU struct); the renderer can then sort `prevInstances`
-    // by ID at the start of each frame so `prevInstances[iid]` lines up
-    // with `instances[iid].id`. Don't ship that scene extractor without
-    // also wiring this through.
+    // Each slot must read ITS OWN last-frame record at `prevInstances[iid]`. The two buffers
+    // share a layout only while the draw list's make-up holds still; a frame where a mesh kind
+    // comes or goes (or a host reorders) shifts every later group. `alignPreviousInstances`
+    // catches that (`InstanceRef.persistentID`, else kind + order within kind) and binds a copy
+    // of last frame's records laid out like this frame's (`prevAlignedRing`), so nobody smears
+    // with a neighbour's history. A draw new this frame gets its own record (no motion).
     var instanceBufferA: MTLBuffer!
     var instanceBufferB: MTLBuffer!
     var instanceCapacity: Int!
     var useBufferA: Bool = true
+    /// Who sat in each grouped slot last upload (`alignPreviousInstances`); empty = unknown.
+    var lastSlotKeys: [IlluminatoramaRenderer.InstanceSlotKey] = []
+    /// Last frame's records re-laid in this frame's layout, one per frame in flight, grown on demand.
+    var prevAlignedRing: [MTLBuffer] = []
+    var prevAlignedCapacity = 0
+    /// This frame binds `prevAlignedRing` as the previous instances (the layout moved since last frame).
+    var prevAlignedActive = false
 
     // One-entry memo of the last resolved lighting variant, so the steady-state
     // path (flags unchanged frame-to-frame, the overwhelmingly common case) is a

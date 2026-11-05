@@ -58,7 +58,7 @@ import VisualizerCore
 @MainActor
 public final class IlluminatoramaTextureAtlas {
 
-    private static let log = Logger(subsystem: AppLog.subsystem,
+    nonisolated static let log = Logger(subsystem: AppLog.subsystem,
                                      category: "illuminatoramaTextureAtlas")
 
     /// Side of each slice, in pixels. Source images are downsampled (or
@@ -73,7 +73,7 @@ public final class IlluminatoramaTextureAtlas {
     public let mipLevels: Int
 
     /// `floor(log2(n)) + 1` — the standard full chain.
-    static func mipLevelCount(for sliceSize: Int) -> Int {
+    nonisolated static func mipLevelCount(for sliceSize: Int) -> Int {
         max(1, Int(floor(log2(Double(max(1, sliceSize))))) + 1)
     }
     /// Current number of slices the atlas can hold. Grows on demand —
@@ -123,8 +123,8 @@ public final class IlluminatoramaTextureAtlas {
 
     private let device: MTLDevice
     private let blitQueue: MTLCommandQueue
-    private let pixelFormat: MTLPixelFormat
-    private var nextSlice: Int = 0
+    let pixelFormat: MTLPixelFormat
+    var nextSlice: Int = 0
     /// Cache keyed by the SCNMaterialProperty contents' identity, so a
     /// single shared `NSImage` referenced by many materials gets uploaded
     /// once. `slice == nil` means "we tried this content and it failed to
@@ -140,8 +140,8 @@ public final class IlluminatoramaTextureAtlas {
     /// state (Daydream's bistable washed-white lawn / "two stable exterior
     /// regimes"). Retaining the object pins the address for the cache's
     /// lifetime, so a live key can never alias. `reset()` releases them.
-    private struct SliceCacheEntry { let retained: AnyObject; let slice: Int32? }
-    private var sliceForObject: [ObjectIdentifier: SliceCacheEntry] = [:]
+    struct SliceCacheEntry { let retained: AnyObject; let slice: Int32? }
+    var sliceForObject: [ObjectIdentifier: SliceCacheEntry] = [:]
 
     /// Pixel format passed at init. Use `.bgra8Unorm_srgb` for colour
     /// (diffuse / albedo / emission) so the GPU sampler decodes sRGB → linear
@@ -219,11 +219,11 @@ public final class IlluminatoramaTextureAtlas {
     /// sRGB → linear, per the IEC 61966-2-1 curve the GPU's `_srgb` texture view applies.
     /// 256-entry table: the mean is a sum over `sliceSize²` texels and a per-texel `pow`
     /// would dominate registration.
-    private static let srgbToLinear256: [Float] = (0..<256).map { i in
+    nonisolated static let srgbToLinear256: [Float] = (0..<256).map { i in
         let c = Float(i) / 255.0
         return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4)
     }
-    private static let identity256: [Float] = (0..<256).map { Float($0) / 255.0 }
+    nonisolated static let identity256: [Float] = (0..<256).map { Float($0) / 255.0 }
 
     /// Drop the slice-allocation table. Underlying texture stays allocated
     /// for re-use; the old slices simply become "free" for future
@@ -240,7 +240,7 @@ public final class IlluminatoramaTextureAtlas {
     /// consuming a fresh slot, so churned custom materials stop growing the atlas
     /// unboundedly (the terrazzo-slider issue). Any content-cache entry pointing at the
     /// freed slot is dropped (releasing its retained image).
-    private var freeSlices: [Int32] = []
+    var freeSlices: [Int32] = []
     /// TEST-OBSERVABLE: how many freed slots are currently awaiting reuse.
     public var freeSliceCount: Int { freeSlices.count }
 
@@ -266,71 +266,15 @@ public final class IlluminatoramaTextureAtlas {
     /// atlas is full, or if no contents were supplied. Cached per content
     /// identity — repeat calls for the same image are O(1).
     public func register(contents: Any?) -> Int32? {
-        guard let contents = contents else { return nil }
-        // Pull a CGImage out of the typed-erased contents. The common
-        // cases that arrive from SCNMaterial:
-        //   • NSImage           — typical Asset Catalog / file loads
-        //   • CGImage           — programmatic; Core Graphics output
-        //   • String (path)     — file URL or asset name (rare here)
-        //   • MTLTexture        — already on the GPU; not handled in 4.0
-        //   • NSColor / CGColor — solid-colour material; not our path
-        let key: ObjectIdentifier
-        let keyObject: AnyObject
-        let cg: CGImage
-        if let img = contents as? PlatformImage {
-            key = ObjectIdentifier(img)
-            keyObject = img
-            if let cached = sliceForObject[key] { return cached.slice }
-            guard let extracted = Self.cgImage(from: img) else {
+        switch resolve(contents) {
+        case .none: return nil
+        case .cached(let slice): return slice
+        case .image(let key, let keyObject, let cg):
+            guard let prepared = Self.prepare(cg, sliceSize: sliceSize, mipLevels: mipLevels, pixelFormat: pixelFormat) else {
                 sliceForObject[key] = SliceCacheEntry(retained: keyObject, slice: nil)
                 return nil
             }
-            cg = extracted
-        } else if CFGetTypeID(contents as CFTypeRef) == CGImage.typeID {
-            // `contents as? CGImage` is rejected by Swift 6 (CF conditional
-            // downcasts always succeed at the type system level, which the
-            // compiler flags as an error). Bridge through `CFTypeRef` and
-            // then force-cast once the type ID confirms we have a CGImage.
-            let img = contents as! CGImage
-            key = ObjectIdentifier(img as AnyObject)
-            keyObject = img as AnyObject
-            if let cached = sliceForObject[key] { return cached.slice }
-            cg = img
-        } else {
-            return nil
-        }
-        // Phase 4.4 — when the atlas runs out of slots, double its capacity
-        // by blitting existing slices into a larger texture2d_array. The
-        // renderer rebinds `albedoAtlas.texture` each draw, so the swap
-        // is invisible from outside. Bounded by Metal's per-device limit
-        // (typically 2048 array layers); we hard-cap below to keep VRAM
-        // sane on small machines.
-        // Reuse an explicitly-freed slot before consuming a fresh one (see `freeSlice`).
-        let slice: Int32
-        let reusedFreeSlot: Bool
-        if let reused = freeSlices.popLast() {
-            slice = reused; reusedFreeSlot = true
-        } else {
-            if nextSlice >= capacity {
-                let maxCap = 1024
-                guard capacity < maxCap, grow(to: min(capacity * 2, maxCap)) else {
-                    Self.log.warning("Atlas exhausted at capacity=\(self.capacity, privacy: .public); falling back to average colour")
-                    sliceForObject[key] = SliceCacheEntry(retained: keyObject, slice: nil)
-                    return nil
-                }
-            }
-            slice = Int32(nextSlice)
-            nextSlice += 1
-            reusedFreeSlot = false
-        }
-        if upload(cgImage: cg, to: Int(slice)) {
-            sliceForObject[key] = SliceCacheEntry(retained: keyObject, slice: slice)
-            return slice
-        } else {
-            // Failed upload — return the slot and remember the failure.
-            if reusedFreeSlot { freeSlices.append(slice) } else { nextSlice -= 1 }
-            sliceForObject[key] = SliceCacheEntry(retained: keyObject, slice: nil)
-            return nil
+            return place(prepared, key: key, keyObject: keyObject)
         }
     }
 
@@ -396,110 +340,13 @@ public final class IlluminatoramaTextureAtlas {
         blit.endEncoding()
     }
 
-    /// Render a CGImage into a transient BGRA buffer at `sliceSize`,
-    /// uploading it into the atlas at `slice`. Returns `true` on success.
+    /// Draw `cgImage` into `slice` (every mip level, its mean, its UV scale). Returns `true` on success.
     private func upload(cgImage: CGImage, to slice: Int) -> Bool {
-        let cs = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
-        // bgra8Unorm_srgb expects BGRA channel order. CG's bitmap info uses
-        // .premultipliedFirst + byteOrder32Little to lay out BGRA on a
-        // little-endian host.
-        let bitmapInfo = CGImageAlphaInfo.premultipliedFirst.rawValue
-                       | CGBitmapInfo.byteOrder32Little.rawValue
-        // Phase 4.25 — aspect-preserving letterbox. Instead of squishing a
-        // non-square source into the full square (which distorted Forest bark,
-        // Eggs warehouse walls, VintageDiner tile), fit the image to the slice
-        // preserving its aspect and record the filled fraction as `uvScale`.
-        //
-        // Anchor at CG-top (y = n − drawH): a CGBitmapContext stores row 0 at the
-        // image top, and Metal texture v=0 is buffer row 0, so drawing at high
-        // CG-y lands the image in texture v ∈ [0, uvScale.y] — exactly the
-        // sub-rect the shader samples. (origin x = 0 → u ∈ [0, uvScale.x].)
-        let aspect = Double(cgImage.width) / Double(max(cgImage.height, 1))  // w / h
-        var sx: CGFloat = 1, sy: CGFloat = 1
-        if aspect >= 1 { sy = CGFloat(1.0 / aspect) } else { sx = CGFloat(aspect) }
-
-        // S1.1 — build the FULL mip chain, one Core Graphics draw per level from the
-        // ORIGINAL source rather than a box-reduction of level 0 (better filtering, and
-        // no re-quantising an 8-bit image repeatedly). `.shared` storage means
-        // `replace(region:mipmapLevel:slice:)` writes each level directly, so this needs
-        // no blit encoder and `register(contents:)` stays synchronous.
-        for level in 0..<mipLevels {
-            let n = max(1, sliceSize >> level)
-            let bytesPerRow = n * 4
-            let bufferSize = bytesPerRow * n
-            var buffer = [UInt8](repeating: 0, count: bufferSize)
-            let drew: Bool = buffer.withUnsafeMutableBytes { raw -> Bool in
-                guard let base = raw.baseAddress,
-                      let ctx = CGContext(data: base, width: n, height: n,
-                                          bitsPerComponent: 8, bytesPerRow: bytesPerRow,
-                                          space: cs, bitmapInfo: bitmapInfo)
-                else { return false }
-                let drawW = CGFloat(n) * sx
-                let drawH = CGFloat(n) * sy
-                ctx.interpolationQuality = .high
-                // WRAP-FILL rather than letterbox-and-leave-black. For a SQUARE source
-                // (sx == sy == 1, which is every slice Daydream Home registers) this is
-                // exactly ONE draw at (0, 0, n, n) — byte-identical to the pre-S1.1
-                // level-0 upload. For a letterboxed source it additionally TILES the
-                // image across the empty band. Level 0 is unchanged either way because
-                // the shader clamps its reads to [halfTexel, sc − halfTexel] and never
-                // touches the padding; what it buys is that the COARSE levels average
-                // image-against-image instead of image-against-BLACK. Without it a 4:1
-                // wall texture would read ~4× too dark in the distance, since the mip
-                // pyramid would be averaging in the zeroed band.
-                let stepX = max(drawW, 1), stepY = max(drawH, 1)
-                let nx = min(64, Int((CGFloat(n) / stepX).rounded(.up)))
-                let ny = min(64, Int((CGFloat(n) / stepY).rounded(.up)))
-                for j in 0..<ny {
-                    let y = CGFloat(n) - drawH - CGFloat(j) * stepY
-                    for i in 0..<nx {
-                        ctx.draw(cgImage, in: CGRect(x: CGFloat(i) * stepX, y: y,
-                                                     width: drawW, height: drawH))
-                    }
-                }
-                return true
-            }
-            guard drew else {
-                Self.log.error("CGContext init failed for slice \(slice, privacy: .public) mip \(level, privacy: .public)")
-                return false
-            }
-            // S2.5 — μ for the variance-preserving hex blend, taken from LEVEL 0 over the
-            // VALID (pre-wrap-fill) sub-rect only, in the space the shader samples. See
-            // `sliceMeanBuffer` for why neither the coarsest mip nor the full square works.
-            if level == 0 {
-                let lut = (pixelFormat == .bgra8Unorm_srgb || pixelFormat == .rgba8Unorm_srgb)
-                        ? Self.srgbToLinear256 : Self.identity256
-                // Buffer row 0 is CG-top, which is texture v = 0 — the same anchor the
-                // draw above uses — so the valid image occupies rows 0..<n·sy, cols 0..<n·sx.
-                let vw = max(1, min(n, Int((CGFloat(n) * sx).rounded())))
-                let vh = max(1, min(n, Int((CGFloat(n) * sy).rounded())))
-                var sumB = 0.0, sumG = 0.0, sumR = 0.0
-                buffer.withUnsafeBytes { raw in
-                    guard let p = raw.bindMemory(to: UInt8.self).baseAddress else { return }
-                    for y in 0..<vh {
-                        var o = y * bytesPerRow
-                        for _ in 0..<vw {
-                            sumB += Double(lut[Int(p[o])])          // BGRA byte order
-                            sumG += Double(lut[Int(p[o + 1])])
-                            sumR += Double(lut[Int(p[o + 2])])
-                            o += 4
-                        }
-                    }
-                }
-                let inv = 1.0 / Double(vw * vh)
-                sliceMeanBuffer.contents().bindMemory(to: SIMD4<Float>.self, capacity: capacity)[slice]
-                    = SIMD4<Float>(Float(sumR * inv), Float(sumG * inv), Float(sumB * inv), 1)
-            }
-            buffer.withUnsafeBytes { raw in
-                guard let base = raw.baseAddress else { return }
-                texture.replace(region: MTLRegionMake3D(0, 0, 0, n, n, 1),
-                                mipmapLevel: level, slice: slice,
-                                withBytes: base, bytesPerRow: bytesPerRow,
-                                bytesPerImage: bufferSize)
-            }
+        guard let prepared = Self.prepare(cgImage, sliceSize: sliceSize, mipLevels: mipLevels, pixelFormat: pixelFormat) else {
+            Self.log.error("CGContext init failed for slice \(slice, privacy: .public)")
+            return false
         }
-        uvScaleBuffer.contents().bindMemory(to: SIMD2<Float>.self, capacity: capacity)[slice]
-            = SIMD2<Float>(Float(sx), Float(sy))
+        commit(prepared, to: slice)
         return true
     }
 
@@ -508,7 +355,7 @@ public final class IlluminatoramaTextureAtlas {
     /// allocation or blit setup fails (caller falls back to "atlas full"
     /// behaviour). Synchronous because in-flight command buffers retain
     /// the old texture; the new texture takes over on subsequent draws.
-    private func grow(to newCapacity: Int) -> Bool {
+    func grow(to newCapacity: Int) -> Bool {
         guard newCapacity > capacity else { return false }
         let d = MTLTextureDescriptor()
         d.textureType = .type2DArray
@@ -569,7 +416,7 @@ public final class IlluminatoramaTextureAtlas {
         return true
     }
 
-    private static func cgImage(from image: PlatformImage) -> CGImage? {
+    static func cgImage(from image: PlatformImage) -> CGImage? {
         image.platformCGImage
     }
 }

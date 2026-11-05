@@ -109,6 +109,7 @@ extension IlluminatoramaRenderer {
         // (so uploadInstances overwrites it with this frame's data), and
         // previousInstanceBuffer now points to last frame's data.
         gbs.useBufferA.toggle()
+        gbs.prevAlignedActive = false   // re-decided by this frame's upload (`alignPreviousInstances`)
         // Advance the per-frame input-buffer ring in lockstep. From here on,
         // `frameUniformBuffer` / the light buffers / `superquadricParamBuffer`
         // resolve to THIS frame's slot — distinct from the slot the previously

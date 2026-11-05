@@ -152,14 +152,24 @@ public final class IlluminatoramaRenderer {
         /// pushes the matching `SuperquadricParam` into the parallel param buffer.
         /// Not uploaded into the GPU instance struct. See IlluminatoramaSuperquadric.swift.
         public var superquadricShape: SIMD2<Float>? = nil
+        /// CPU-only: who this draw is from one frame to the next, for its motion vector (TAA's
+        /// reprojection). Last frame's record is found by `(meshKind, persistentID)`; with 0 (the
+        /// default) by `meshKind` and the order among that kind's unnamed draws. So a draw list may
+        /// gain, lose or reorder whole mesh kinds between frames and every other draw still finds its
+        /// own history. Name the draws when instances SHARING a kind come and go or swap places (a
+        /// grid of objects scrolling on and off screen): unnamed, the n-th draw of a kind is paired
+        /// with last frame's n-th. Not uploaded to the GPU.
+        public var persistentID: UInt64 = 0
         public init(meshKind: MeshKind,
                     data: IlluminatoramaInstance,
                     lightEmission: SIMD3<Float> = .zero,
-                    superquadricShape: SIMD2<Float>? = nil) {
+                    superquadricShape: SIMD2<Float>? = nil,
+                    persistentID: UInt64 = 0) {
             self.meshKind = meshKind
             self.data = data
             self.lightEmission = lightEmission
             self.superquadricShape = superquadricShape
+            self.persistentID = persistentID
         }
     }
 
@@ -1171,7 +1181,12 @@ public final class IlluminatoramaRenderer {
     var frameUniformBuffer: MTLBuffer { lts.frameUniformRing[lts.frameRingIndex] }
 
     var currentInstanceBuffer: MTLBuffer { gbs.useBufferA ? gbs.instanceBufferA : gbs.instanceBufferB }
-    var previousInstanceBuffer: MTLBuffer { gbs.useBufferA ? gbs.instanceBufferB : gbs.instanceBufferA }
+    /// Last frame's records in THIS frame's grouped layout: the other ping-pong buffer, or, on a frame
+    /// whose layout moved, a copy re-ordered to match (`alignPreviousInstances`).
+    var previousInstanceBuffer: MTLBuffer {
+        if gbs.prevAlignedActive { return gbs.prevAlignedRing[lts.frameRingIndex] }
+        return gbs.useBufferA ? gbs.instanceBufferB : gbs.instanceBufferA
+    }
 
     /// Internal rendering size. All compute kernels (G-buffer rasterisation,
     /// SSAO, lighting, SSR, TAA, bloom mid-textures) dispatch over this

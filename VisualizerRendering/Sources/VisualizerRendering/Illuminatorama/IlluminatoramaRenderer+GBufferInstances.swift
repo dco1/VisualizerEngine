@@ -22,6 +22,7 @@ extension IlluminatoramaRenderer {
                 gbs.instanceBufferA = a
                 gbs.instanceBufferB = b
                 gbs.instanceCapacity = newCap
+                gbs.lastSlotKeys.removeAll()   // the previous buffer is blank: nothing to align from
                 pfx.taaNeedsFirstFrame = true
             }
         }
@@ -104,7 +105,7 @@ extension IlluminatoramaRenderer {
         gbs.meshGroups.removeAll(keepingCapacity: true)
         gbs.meshGroupRange.removeAll(keepingCapacity: true)
         gbs.meshGroupsVersion &+= 1   // DH-0534: the cull bounds describe the old grouping now
-        guard !instances.isEmpty else { return }
+        guard !instances.isEmpty else { gbs.lastSlotKeys.removeAll(); return }
 
         // VEGETATION WIND, LIVENESS. `treeWindStrength` is a global, but as of 2026-08-17 the
         // displacement also needs a per-DRAW `windScale` (see the property's own note: without
@@ -167,6 +168,7 @@ extension IlluminatoramaRenderer {
                 kind: kind, start: groupStart, count: srcIndices.count))
             gbs.meshGroupRange[kind] = groupStart ..< (groupStart + srcIndices.count)
         }
+        alignPreviousInstances(order: kindOrder.flatMap { byKind[$0] ?? [] })
     }
 
     /// DH-0534 — rebuild `meshGroupCullBounds` when its inputs changed. Everything the CPU cannot
