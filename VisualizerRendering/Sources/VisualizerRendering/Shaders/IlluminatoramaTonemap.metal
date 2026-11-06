@@ -857,6 +857,29 @@ fragment float4 illumi_tonemap_fs(
                 float a = float(inAO.sample(aoS, in.uv).r);
                 return float4(a, a, a, 1.0);
             }
+            case 19u: { // Material CLASS — which branch of `illumi_lighting` a pixel takes, from normalRoughness.w.
+                // The SAME bands the lighting kernel tests (Daydream DH-1237): foliage < 0.5 · plush (0.5, 0.6) ·
+                // lamp shade (0.60, 0.66) · wet-glaze clearcoat (0.66, 0.9 — Visualizer's sausage CASING; nothing in Daydream) · SSS (0.90, 0.99) · opaque ≈ 1 · wood-grain
+                // anisotropy (1, 2] horizontal / > 2 vertical. Each class one flat hue over the albedo's luma, so a
+                // mis-tagged material is read off the frame instead of guessed from its shading; a value ON a band
+                // edge (no branch takes it) is RED. Sky (depth at the far plane) is black.
+                uint2 dp = uint2(in.uv * float2(gDepth.get_width(), gDepth.get_height()));
+                if (gDepth.read(dp) >= 1.0) return float4(0.0, 0.0, 0.0, 1.0);
+                float w = float(gNormalRgh.read(gp).a);
+                float3 hue;
+                if      (w < 0.5)                hue = float3(0.15, 0.95, 0.25);   // foliage
+                else if (w > 0.5  && w < 0.6)    hue = float3(1.00, 0.55, 0.10);   // plush
+                else if (w > 0.60 && w < 0.66)   hue = float3(1.00, 0.95, 0.55);   // lamp shade
+                else if (w > 0.66 && w < 0.9)    hue = float3(0.10, 0.85, 1.00);   // wet-glaze clearcoat (sausage casing)
+                else if (w > 0.90 && w < 0.99)   hue = float3(1.00, 0.20, 0.90);   // SSS
+                else if (w >= 0.99 && w <= 1.001) hue = float3(0.55);              // opaque
+                else if (w > 1.001 && w <= 2.001) hue = float3(0.25, 0.40, 1.00);  // grain, horizontal axis
+                else if (w > 2.001)              hue = float3(0.60, 0.25, 1.00);   // grain, vertical axis
+                else                             return float4(1.0, 0.0, 0.0, 1.0); // a band edge: no branch
+                float3 alb = float3(gAlbedoMet.read(gp).rgb);
+                float  y = dot(alb, float3(0.2126, 0.7152, 0.0722));
+                return float4(hue * (0.35 + 0.65 * saturate(y * 1.6)), 1.0);
+            }
             default: break;
         }
     }

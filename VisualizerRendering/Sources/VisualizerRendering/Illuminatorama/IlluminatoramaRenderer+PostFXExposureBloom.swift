@@ -499,6 +499,14 @@ extension IlluminatoramaRenderer {
         /// (a TLAS scene). The per-frame hit/miss numbers that go with it are in the
         /// `VIZ_ILLUMI_SURFCACHE_STATS_PATH` sidecar (`hits:` / `atlas:` lines).
         case surfaceCacheCharts = 18
+        /// **Material CLASS map** (Daydream DH-1237) — which branch of `illumi_lighting` each pixel takes,
+        /// decoded from `normalRoughness.w` with the kernel's own thresholds: foliage (green), plush (orange),
+        /// lamp shade (pale yellow), wet-glaze clearcoat (cyan — the HotdogDrop sausage casing, 0.75), SSS (magenta), opaque (grey), wood-grain anisotropy along
+        /// the horizontal (blue) or vertical (violet) axis; a value on a band edge, which no branch takes, is
+        /// RED; sky black. Each hue is shaded by the albedo's luma so the shape stays legible. A G-buffer
+        /// readout like 10–16 (drawn by the tonemap's `>= 10` branch, before tonemapping); the SSS mask the
+        /// screen-space SSS pass uses is the magenta class (it also needs `sssStrength > 0` to blur).
+        case materialClass = 19
     }
 
     // ── Bloom pyramid geometry (S1.2) ─────────────────────────────────────────
