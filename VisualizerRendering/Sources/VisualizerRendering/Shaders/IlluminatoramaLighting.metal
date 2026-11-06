@@ -353,6 +353,182 @@ constant float kRTAreaShadowSkipLuma = 0.002;
 /// the deferred kernel does not evaluate a window aperture whose share is handed to the traced pass
 /// this frame (see the area-light loop). The term cancels, so this only removes dead work.
 #define kFrameFlagSkipHandedApertures 32768u
+/// FrameUniforms.frameFlags bit 16 (65536) — Daydream DH-1406 (`IlluminatoramaRenderer.spotOpeningDiscEnabled`):
+/// a spot with an `openingRadius` lights the primary from its real emitting DISC (`illumiSpotDiscLaw`).
+#define kFrameFlagSpotOpeningDisc 65536u
+/// Beyond this many opening radii the far law averages the rim feather over ONE tap (the disc's centre) instead
+/// of four — the perf half of DH-1406 (hero orbit lighting +0.45 ms with four taps everywhere).
+constant float kSpotDiscFeatherTapsRadii = 20.0;
+
+// ── Daydream DH-1406 — the deferred spot's OPENING DISC ─────────────────────────────────────────────
+//
+// Since DH-1363 inc. 2 a path vertex draws a lamp's NEE target uniformly on the fixture's opening disc
+// (radius `openingRadius`, plane ⊥ the axis at `openingOffset` from the apex) and evaluates the cone's own
+// law FROM the sampled point: rim feather × IES row × N·L × 1/(d² + soft²) × window. The deferred pass —
+// which owns every lane's PRIMARY lamps — lit from the apex as a point, so a wall beside a sconce took one
+// law at the primary and another at every bounce. Here the same integral, deterministically (no noise):
+//   E(P) = mean over the disc of g(o) / (|P − o|² + soft²),   g = feather · IES · N·L
+//        = M(P) · ⟨g⟩_w,   M = the disc mean of 1/(d² + soft²) — EXACT, closed form below,
+//                          ⟨g⟩_w = g's mean weighted by each point's own 1/(d² + soft²).
+// ⟨g⟩_w is exact when g is constant over the disc. Near the disc (< 6 radii) it is a fixed ring rule
+// (4 + 8 taps, 4 + 8 + 12 inside 1.5 radii; equal-area radii, odd rings turned half a step: symmetric, so a g
+// linear across the disc integrates exactly); far from it (> 10 radii) the feather is averaged over four
+// taps (one, the centre's, past kSpotDiscFeatherTapsRadii, where M takes its 1/d² limit too) and N·L is its
+// exact disc mean CLIPPED at the receiver's horizon (computed only where that plane cuts the disc) — what a sconce's mouth needs, since the wall it hangs on cuts
+// through its disc and only the part in front of the wall lights it. Between 6 and 10 radii the two blend.
+// Checked against a 400 k-sample Monte-Carlo of the same integral (sconce half-moon / cylinder, wall and
+// floor, can and lamp pools): within 0.03 st wherever E > 1 % of the peak, except the hottest wall point under
+// a half-moon mouth (−0.13 st) and a lamp pool's outermost fringe (0.11 st at 1.5 % of the peak). The apex
+// law it replaces is off by +1.8 st (hot wedge) to −0.46 st (the wall a metre below) on the same sconce.
+
+/// Mean of 1/(z² + |q − o|²) over a uniform disc of radius r, P at height z off the disc's plane and radial
+/// offset s from its axis — exact. With B = s² + z² − r² and Q = √((r² + z² − s²)² + 4s²z²):
+///   M = ln(1 + ε) / r²,  ε = 2r² / (Q + B)  (B ≥ 0),  ε = (Q − B) / (2z²)  (B < 0)
+/// (one identity, Q² − B² = 4r²z², in the form that does not cancel). On the axis it is ln(1 + r²/z²)/r²;
+/// far away ε → r²/d², M → 1/d². A source-size `soft` enters as z² → z² + soft², exactly.
+static inline float illumiDiscMeanInvSq(float z, float s, float r) {
+    float r2 = r * r, z2 = max(z * z, 1e-6), s2 = s * s;
+    float B = s2 + z2 - r2;
+    float A = r2 + z2 - s2;
+    float Q = sqrt(A * A + 4.0 * s2 * z2);
+    float e = B >= 0.0 ? 2.0 * r2 / max(Q + B, 1e-12) : (Q - B) / (2.0 * z2);
+    float l = e < 1e-3 ? e * (1.0 - e * (0.5 - e * (1.0 / 3.0))) : log(1.0 + e);   // log1p, no cancellation
+    return l / r2;
+}
+
+/// The deferred spot's law from its opening disc. Returns the attenuation to hand `brdf` (per unit light
+/// colour, before shadow visibility; divided by N·L of the returned `Lout` so `brdf`'s own N·L restores E for
+/// the diffuse lobe) and the representative direction in `Lout`; `distOut` = distance to the disc centre.
+/// 0 ⇒ the light does not reach P.
+static inline float illumiSpotDiscLaw(SpotLight sl, float3 P, float3 N, const device float* spotProfiles,
+                                      thread float3& Lout, thread float& distOut) {
+    float3 ax = normalize(sl.direction);
+    float  r  = sl.openingRadius;
+    float3 c  = sl.position + ax * sl.openingOffset;
+    float3 v  = P - c;
+    float  dc = length(v);
+    distOut = dc;
+    Lout = -v / max(dc, 1e-4);
+    if (dc > sl.radius) return 0.0;
+    // Conservative early outs (exact zeros, no approximation) at the apex law's cost: every point of the disc
+    // lies within angle δ = asin(r/dc) of its centre as seen from P, so if the centre is more than δ outside the
+    // outer cone no tap can be inside it; and N·(o − P) ≤ N·(c − P) + |N⊥|·r, so if that bound is ≤ 0 the whole
+    // disc is behind the receiver.
+    {
+        float sd = min(r / max(dc, 1e-4), 1.0), cd = sqrt(max(1.0 - sd * sd, 0.0));
+        float so = sqrt(max(1.0 - sl.outerCone * sl.outerCone, 0.0));
+        // (only while θ_outer + δ < π, where the cosine is still monotone: δ < 30° and θ_outer < 120°)
+        if (dc > 2.0 * r && sl.outerCone > -0.5 && dot(ax, -Lout) < sl.outerCone * cd - so * sd) return 0.0;
+        float3 Nq = N - dot(N, ax) * ax;
+        if (dot(N, -v) + length(Nq) * r <= 0.0) return 0.0;
+    }
+    float  soft2 = sl.softRadius * sl.softRadius;
+    float  bulbFloor = max(sl.bulbRadius * sl.bulbRadius, 1e-4);
+    float  u  = dc / max(r, 1e-4);
+    bool   tapped = u < kSpotDiscFeatherTapsRadii;   // past it no tap is drawn: no basis, and M is its far limit
+    float  M;
+    if (tapped) {
+        float z = dot(v, ax);
+        float s = length(v - z * ax);
+        M = illumiDiscMeanInvSq(sqrt(z * z + soft2), s, r);
+    } else {
+        M = 1.0 / (dc * dc + soft2);   // the closed form's limit, within (r/d)² < 0.25 % here
+    }
+    M = min(M, 1.0 / bulbFloor);                     // + the path lane's bulb floor
+    float  q4 = dc / sl.radius; q4 *= q4;
+    float  window = saturate(1.0 - q4 * q4);
+    float  tFar = saturate((u - 6.0) * 0.25);
+    float3 Lc = Lout;
+
+    float3 t = float3(0.0), bt = float3(0.0);
+    if (tapped) {
+        t  = normalize(abs(ax.y) < 0.999 ? cross(ax, float3(0.0, 1.0, 0.0)) : cross(ax, float3(1.0, 0.0, 0.0)));
+        bt = cross(ax, t);
+    }
+    // Far: the feather × IES averaged over four taps at r/√2 (the disc's second moment, exact for a feather
+    // that is quadratic across it — the pool's rim blurs by the disc as it does on the path lane), N·L its
+    // exact clipped disc mean (α = a / (b r) in the unit disc).
+    float Efar = 0.0;
+    float3 Lfar = Lc;
+    if (tFar > 0.0) {
+        float g = 0.0;
+        if (tapped) {
+            for (uint k = 0u; k < 4u; ++k) {
+                float ph = (float(k) + 0.5) * (0.5 * M_PI_F);
+                float3 Lk = normalize(c + (t * cos(ph) + bt * sin(ph)) * (r * 0.70710678) - P);
+                float cc = dot(ax, -Lk);
+                float gk = smoothstep(sl.outerCone, sl.innerCone, cc);
+                if (gk > 0.0) g += 0.25 * gk * illumiSpotProfile(spotProfiles, sl.profileIndex, cc);
+            }
+        } else {
+            // Past kSpotDiscFeatherTapsRadii the disc subtends < r/d ≈ 3° — far under any feather's width — so
+            // the four-tap mean is the centre's value to (r/d)²: one tap, the apex law's cost.
+            float cc = dot(ax, -Lc);
+            g = smoothstep(sl.outerCone, sl.innerCone, cc);
+            if (g > 0.0) g *= illumiSpotProfile(spotProfiles, sl.profileIndex, cc);
+        }
+        if (g > 0.0) {
+            float  a  = dot(N, -v);                       // N·(c − P)
+            float3 Np = N - dot(N, ax) * ax;              // N's part in the disc's plane
+            float  br = length(Np) * r;
+            float nlMean;
+            if (br < 1e-6 || abs(a) >= br) {
+                // The receiver's plane misses the disc: wholly in front (the clipped mean is N·(c − P) exactly)
+                // or wholly behind (0). Only a plane cutting the disc — the sconce's own wall — needs the integral.
+                nlMean = max(a, 0.0);
+            } else {
+                float al = a / br, be = clamp(-al, -1.0, 1.0), sq = sqrt(max(1.0 - be * be, 0.0));
+                float I1 = 0.5 * (acos(be) - be * sq);
+                float I2 = (1.0 / 3.0) * sq * sq * sq;
+                float I3 = M_PI_F / 16.0 - 0.125 * (asin(be) - be * sq * (1.0 - 2.0 * be * be));
+                float f  = al >= 1.0 ? al : (al <= -1.0 ? 0.0 : (2.0 / M_PI_F) * (al * I1 + I2));
+                nlMean = br * f;
+                // The lit part's centroid (weight a + x), so the direction handed to brdf faces P's lit side.
+                if (f > 0.0) {
+                    float xbar = clamp((2.0 / M_PI_F) * (al * I2 + I3) / f, -1.0, 1.0);
+                    Lfar = normalize(c + Np * (xbar / length(Np)) * r - P);
+                }
+            }
+            Efar = g * nlMean / max(dc, 1e-4);
+        }
+    }
+    // Near: fixed rings of taps, each weighted by its own 1/(d² + soft²) — two rings (4 + 8) to 6 radii,
+    // three (4 + 8 + 12) inside 1.5 radii, where the wall's horizon and the rim feather cut the disc hardest.
+    float Enear = 0.0;
+    float3 Lnear = Lc;
+    if (tFar < 1.0) {
+        float sw = 0.0, swg = 0.0;
+        float3 sL = float3(0.0);
+        uint nR = u < 1.5 ? 3u : 2u;
+        float inv = 1.0 / float(2u * nR * (nR + 1u));                     // taps in all: equal area per tap
+        uint before = 0u;
+        for (uint i = 0u; i < nR; ++i) {
+            uint cnt = 4u * (i + 1u);
+            float rho = r * sqrt((float(before) + 0.5 * float(cnt)) * inv);   // the ring's equal-area midpoint
+            float ph0 = (i & 1u) != 0u ? M_PI_F / float(cnt) : 0.0;         // odd rings turned half a step
+            for (uint k = 0u; k < cnt; ++k) {
+                float ph  = ph0 + float(k) * (2.0 * M_PI_F / float(cnt));
+                float3 o  = c + t * (rho * cos(ph)) + bt * (rho * sin(ph));
+                float3 toL = o - P;
+                float d2  = max(dot(toL, toL), 1e-8);
+                float3 L  = toL * rsqrt(d2);
+                float w   = 1.0 / max(d2 + soft2, bulbFloor);
+                float cc  = dot(ax, -L);
+                float g   = smoothstep(sl.outerCone, sl.innerCone, cc);
+                if (g > 0.0) g *= illumiSpotProfile(spotProfiles, sl.profileIndex, cc) * saturate(dot(N, L));
+                sw += w; swg += w * g; sL += (w * g) * L;
+            }
+            before += cnt;
+        }
+        if (swg > 0.0) { Lnear = normalize(sL); Enear = swg / sw; }
+    }
+    float E = mix(Enear, Efar, tFar);
+    float3 L = tFar <= 0.0 ? Lnear : (tFar >= 1.0 ? Lfar : normalize(mix(Lnear, Lfar, tFar)));
+    float nlL = saturate(dot(N, L));
+    Lout = L;
+    if (E <= 0.0 || nlL <= 1e-4) return 0.0;
+    return M * window * window * E / nlL;
+}
 
 static inline float rtSunSoftVisibility(
     instance_acceleration_structure accel,
@@ -1708,10 +1884,20 @@ kernel void illumi_lighting(
         SpotLight sl = spotLights[i];
         // Light-layer mask (same rule as point lights). Default all-bits ⇒ passes.
         if ((sl.layerMask & fragLayer) == 0u) continue;
+        float3 L;
+        float  dist;
+        float  atten;
+        if (sl.openingRadius > 0.0 && sl.giVisible != 0u && (frame.frameFlags & kFrameFlagSpotOpeningDisc) != 0u) {
+            // Daydream DH-1406 — from the real opening disc (the path lane's law, deterministically). Only for a
+            // light the path lane SEES (`giVisible`): a light it never samples has no disc to agree with, and a
+            // night window's outward glow sits in its own pane's plane, where the disc lit the muntins beside it.
+            atten = illumiSpotDiscLaw(sl, worldPos, N, spotProfiles, L, dist);
+            if (atten <= 0.0) continue;
+        } else {
         float3 toLight = sl.position - worldPos;
-        float  dist    = length(toLight);
+        dist = length(toLight);
         if (dist > sl.radius) continue;
-        float3 L = toLight / max(dist, 1e-4);
+        L = toLight / max(dist, 1e-4);
         float coneCos   = dot(normalize(sl.direction), -L);
         float coneAtten = smoothstep(sl.outerCone, sl.innerCone, coneCos);
         if (coneAtten <= 0.0) continue;
@@ -1719,9 +1905,10 @@ kernel void illumi_lighting(
         coneAtten *= illumiSpotProfile(spotProfiles, sl.profileIndex, coneCos);
         // Source-size softening (see the point-light path): `1/(d² + r²)` flattens the
         // near field into a soft halo. r == 0 ⇒ exactly `1/d²`, byte-identical.
-        float atten = 1.0 / max(dist * dist + sl.softRadius * sl.softRadius, 1e-4);
+        atten = 1.0 / max(dist * dist + sl.softRadius * sl.softRadius, 1e-4);
         float window = saturate(1.0 - pow(dist / sl.radius, 4.0));
         atten *= window * window * coneAtten;
+        }
 
         // Shadow visibility. Skip cheaply when the host hasn't provided a
         // shadow slice for this spot — covers `spotShadowsEnabled = false`

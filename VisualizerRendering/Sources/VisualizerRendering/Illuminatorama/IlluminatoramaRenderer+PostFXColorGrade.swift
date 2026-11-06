@@ -47,6 +47,13 @@ extension IlluminatoramaRenderer {
     // only by the panel, so a headless render can't exercise it; `VIZ_ILLUMI_MOTIONBLUR`
     // (a float, e.g. `1.0`) forces `motionBlurStrength` for every renderer in the
     // process so the velocity-buffer streak can be render-verified. `nil` when unset.
+    // Daydream DH-1406 — `VIZ_ILLUMI_SPOT_DISC=0|1` forces `spotOpeningDiscEnabled` for every renderer in the
+    // process (the headless A/B lever: `TEST_RUNNER_VIZ_ILLUMI_SPOT_DISC=0` reaches an xctest host). `nil` when unset.
+    nonisolated static let spotOpeningDiscEnvOverride: Bool? = {
+        guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_SPOT_DISC"], !v.isEmpty else { return nil }
+        return v != "0"
+    }()
+
     nonisolated static let motionBlurEnvOverride: Float? = {
         guard let v = ProcessInfo.processInfo.environment["VIZ_ILLUMI_MOTIONBLUR"] else { return nil }
         return Float(v)

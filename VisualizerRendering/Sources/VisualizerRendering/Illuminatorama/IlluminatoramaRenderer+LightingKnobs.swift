@@ -48,6 +48,7 @@ extension IlluminatoramaRenderer {
     public var translucencyEnabled: Bool { get { kLighting.translucencyEnabled } set { kLighting.translucencyEnabled = newValue } _modify { yield &kLighting.translucencyEnabled } }
     public var thinFilmEnabled: Bool { get { kLighting.thinFilmEnabled } set { kLighting.thinFilmEnabled = newValue } _modify { yield &kLighting.thinFilmEnabled } }
     public var ggxRelativeGuardEnabled: Bool { get { kLighting.ggxRelativeGuardEnabled } set { kLighting.ggxRelativeGuardEnabled = newValue } _modify { yield &kLighting.ggxRelativeGuardEnabled } }
+    public var spotOpeningDiscEnabled: Bool { get { kLighting.spotOpeningDiscEnabled } set { kLighting.spotOpeningDiscEnabled = newValue } _modify { yield &kLighting.spotOpeningDiscEnabled } }
     public var layeredSpecularEnabled: Bool { get { kLighting.layeredSpecularEnabled } set { kLighting.layeredSpecularEnabled = newValue } _modify { yield &kLighting.layeredSpecularEnabled } }
     public var diffuseRoughnessEnabled: Bool { get { kLighting.diffuseRoughnessEnabled } set { kLighting.diffuseRoughnessEnabled = newValue } _modify { yield &kLighting.diffuseRoughnessEnabled } }
     public var layeredClothSheen: Bool { get { kLighting.layeredClothSheen } set { kLighting.layeredClothSheen = newValue } _modify { yield &kLighting.layeredClothSheen } }

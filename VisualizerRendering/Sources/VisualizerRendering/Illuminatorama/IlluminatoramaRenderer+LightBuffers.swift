@@ -185,6 +185,8 @@ extension IlluminatoramaRenderer {
         // DH-0952 — `kFrameFlagSkipHandedApertures`. Not with SSR on: its gather reads the lit HDR
         // BEFORE the traced pass takes the handed share out, so there the aperture term is not dead.
         if skipHandedApertures && ssrIntensity <= 0 { u.shadowEnabled |= 32768 }
+        // Daydream DH-1406 — `kFrameFlagSpotOpeningDisc`: spots with an opening light from their disc.
+        if Self.spotOpeningDiscEnvOverride ?? spotOpeningDiscEnabled { u.shadowEnabled |= 65536 }
         u.leafTransmittanceRatio = max(0, leafTransmittanceRatio)   // Signack S5
         // Tree wind (#58 #1): repurpose the two free pad floats as the vertex-
         // shader vegetation-wind knobs. _padPhase2A = strength (max canopy sway,

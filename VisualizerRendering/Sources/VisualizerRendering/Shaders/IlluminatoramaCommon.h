@@ -718,9 +718,10 @@ struct SpotLight {
     // tail padding: size 184, stride 192, unchanged. Keep in lockstep with `RTSpotLight` and
     // `VolSpotLight`.
     float    bulbRadius;
-    // Daydream DH-1363 — see `PointLight.openingRadius` (path lane only; ignored here). Size
-    // 184 → 188, still inside the tail padding: stride 192, unchanged. Keep in lockstep with
-    // `RTSpotLight` and `VolSpotLight`.
+    // Daydream DH-1363 — see `PointLight.openingRadius`. Size 184 → 188, still inside the tail
+    // padding: stride 192, unchanged. Keep in lockstep with `RTSpotLight` and `VolSpotLight`.
+    // Daydream DH-1406 — the deferred kernel reads it (and `openingOffset`) too: a `giVisible` spot
+    // with an opening lights from that disc (`illumiSpotDiscLaw`, `kFrameFlagSpotOpeningDisc`).
     float    openingRadius;
     // Daydream DH-1363 inc. 2 — the opening disc's place along `direction` from the apex (path lane only;
     // 188 → 192 = the stride). Keep in lockstep with `RTSpotLight` and `VolSpotLight`.

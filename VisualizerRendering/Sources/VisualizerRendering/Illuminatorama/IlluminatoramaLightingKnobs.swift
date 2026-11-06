@@ -215,6 +215,14 @@ final class LightingKnobs {
     /// historical `+1e-7` guard — a polished highlight kept 24 % of its peak at roughness 0.1 —
     /// byte-identical.
     var ggxRelativeGuardEnabled: Bool = false
+    /// **Daydream DH-1406 — a spot's OPENING DISC in the deferred pass.** `true` (the default): a spot with
+    /// `openingRadius > 0` lights the primary from its real emitting disc (`openingOffset` along the axis from
+    /// the apex) — the exact disc mean of 1/d² times the cone's law (rim feather, IES row, N·L, window)
+    /// averaged over eight fixed taps on the disc, weighted by each tap's own 1/d²: the deterministic twin of
+    /// the path lane's sampled disc (DH-1363 inc. 2). A spot with no opening is unchanged, so every
+    /// Visualizer scene (which never sets one) is byte-identical either way. `false` = the apex point law
+    /// (the shadow lookup is the apex's in both). `VIZ_ILLUMI_SPOT_DISC=0|1` overrides it process-wide.
+    var spotOpeningDiscEnabled: Bool = true
     /// **DH-1302 — per-material thin-sheet translucency on every lane.** `true`: an instance with
     /// `translucencyWeight > 0` lets that fraction of the light reaching its far face through, tinted
     /// by `translucencyColor` (the albedo when unset) — live and still alike. `false` (the default) is
