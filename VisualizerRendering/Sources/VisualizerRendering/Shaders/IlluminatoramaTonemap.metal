@@ -762,6 +762,32 @@ static inline float3 illumiReconstructGather(texture2d<half, access::sample> inH
     return max(acc / (sx * sy), float3(0.0));
 }
 
+// ── Daydream DH-1374 — the HDR (gain-map) rendition of the SAME picture ─────────────────────────────────────────
+//
+// A second, export-only pipeline of this fragment (function constants 44/45; the shipped pipeline defines neither, so
+// it compiles exactly as before) renders into an rgba16Float target: the whole SDR chain runs unchanged — exposure,
+// white balance, bloom, halation, the display transform, the grade, grain, dither — and the finished pixel is then
+// lifted by a GAIN where the SDR display transform compressed the scene: g = 1 wherever the SDR value is below 0.6
+// (midtones are the SDR picture, exactly), ramping in toward the SDR shoulder, and the level asked for is the scene's
+// exposed luminance with its excess over the SDR value rolled off into the display's headroom H (asymptote H, never
+// past it). The SDR image is the gain map's BASE, so a non-HDR screen shows exactly the normal export.
+constant bool  kTonemapHDRFC         [[function_constant(44)]];
+constant bool  kTonemapHDR           = is_function_constant_defined(kTonemapHDRFC) && kTonemapHDRFC;
+constant float kTonemapHDRHeadroomFC [[function_constant(45)]];
+constant float kTonemapHDRHeadroom   = is_function_constant_defined(kTonemapHDRHeadroomFC) ? kTonemapHDRHeadroomFC : 1.0;
+
+/// The rendition's per-pixel gain over the finished SDR pixel (see above). `sceneY` = luminance of the exposed scene the
+/// display transform was handed, `sdrY` = luminance of what it returned, `H` = headroom (linear, ≥ 1).
+static inline float illumiHDRGain(float sceneY, float sdrY, float H) {
+    float w = smoothstep(0.6, 0.95, sdrY);
+    if (w <= 0.0 || H <= 1.0) return 1.0;
+    float excess = max(sceneY - sdrY, 0.0);
+    float room   = max(H - sdrY, 1e-3);
+    float target = sdrY + excess / (1.0 + excess / room);   // → H as the scene runs away, ≈ the scene near the shoulder
+    float g = target / max(sdrY, 1e-4);
+    return clamp(mix(1.0, g, w), 1.0, H);
+}
+
 fragment float4 illumi_tonemap_fs(
     TonemapVSOut                    in       [[stage_in]],
     texture2d<half, access::sample> inHDR    [[texture(0)]],
@@ -1325,6 +1351,12 @@ fragment float4 illumi_tonemap_fs(
     }
 
     float3 mapped = displayTransform(exposedScene, frame.displayTransform);
+    // DH-1374 — what the display transform did to this pixel, for the HDR rendition's gain (export pipeline only).
+    float hdrSceneY = 0.0, hdrSdrY = 0.0;
+    if (kTonemapHDR) {
+        hdrSceneY = dot(max(exposedScene, 0.0), float3(0.2126, 0.7152, 0.0722));
+        hdrSdrY   = dot(max(mapped, 0.0),       float3(0.2126, 0.7152, 0.0722));
+    }
     // Hue-stable toe (opt-in; displayParams.z = 0 ⇒ skipped ⇒ bit-identical). `chromaW` 1 =
     // the shipped transform and saturation push; 0 = the ratio-preserving toe, no push.
     float chromaW = 1.0;
@@ -1664,5 +1696,6 @@ fragment float4 illumi_tonemap_fs(
     // `pow(1/2.2)` here used to double-encode against SceneKit's pass, which
     // washed out blacks and flattened chroma (issue: Illuminatorama colours
     // read desaturated vs the SCN-native `+` scenes).
+    if (kTonemapHDR) mapped *= illumiHDRGain(hdrSceneY, hdrSdrY, kTonemapHDRHeadroom);   // DH-1374 (float target)
     return float4(mapped, 1.0);
 }

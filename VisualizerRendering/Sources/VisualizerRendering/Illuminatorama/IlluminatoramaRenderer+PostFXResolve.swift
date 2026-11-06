@@ -156,7 +156,9 @@ extension IlluminatoramaRenderer {
             makeEncoder: { self.timedComputeEncoder(cb, $0) })
     }
 
-    func encodeTonemapPass(_ cb: MTLCommandBuffer) {
+    /// `pipeline` / `target` default to the frame's own (`pfx.tonemapPipeline` → `pfx.tonemapWriteTarget`); the HDR
+    /// rendition (DH-1374, `renderHDRRendition`) re-encodes this exact pass with its float-target pipeline.
+    func encodeTonemapPass(_ cb: MTLCommandBuffer, pipeline: MTLRenderPipelineState? = nil, target: MTLTexture? = nil) {
         // Phase 4.28 — RENDER pass (not compute). Draws a fullscreen triangle
         // into `tonemapWriteTarget`; the end-of-pass `.store` is what makes the
         // result visible to SceneKit's cross-queue background sample without a
@@ -164,12 +166,12 @@ extension IlluminatoramaRenderer {
         // white overlay frame). `.dontCare` load is fine — the fragment writes
         // every output pixel.
         let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = pfx.tonemapWriteTarget
+        pass.colorAttachments[0].texture = target ?? pfx.tonemapWriteTarget
         pass.colorAttachments[0].loadAction = .dontCare
         pass.colorAttachments[0].storeAction = .store
         guard let enc = timedRenderEncoder(cb, pass, "tonemap") else { return }
         enc.label = "Illuminatorama.tonemap"
-        enc.setRenderPipelineState(pfx.tonemapPipeline)
+        enc.setRenderPipelineState(pipeline ?? pfx.tonemapPipeline)
         enc.setFragmentTexture(bloomTonemapSource, index: 0)
         enc.setFragmentTexture(bloomResultTexture, index: 1)
         // Issue #65 — 3D colour-grade LUT at texture(2). Always bound (identity by
@@ -224,5 +226,70 @@ extension IlluminatoramaRenderer {
             i /= base
         }
         return r
+    }
+}
+
+
+/// **Daydream DH-1374 — the HDR rendition of the frame just rendered, for a gain-map export.**
+///
+/// Re-encodes the tonemap pass of the LAST frame (its uniforms, bloom, halation, exposure state and every input texture
+/// are still bound to that frame) through an export-only pipeline of the same fragment — function constants 44/45 —
+/// into an `rgba16Float` target: the identical SDR chain, then each finished pixel lifted by
+/// `illumiHDRGain` where the display transform compressed the scene (midtones exactly the SDR picture; highlights
+/// rolled off into `headroom`, never past it). Linear, extended-range values in the output's own (sRGB-primaries)
+/// space: 1.0 = SDR white, up to `headroom`. A host pairs it with the normal SDR export as the gain map's base.
+///
+/// Call it right after a still settles, before anything else renders (the next frame rewrites the uniforms).
+/// Export-only: one extra fullscreen pass and a blocking readback; nothing per frame.
+public struct IlluminatoramaHDRRendition {
+    public let width: Int
+    public let height: Int
+    /// Row-major RGBA, `Float16` bit patterns (rgba16Float), `width * height * 4` values.
+    public let rgbaHalf: [UInt16]
+    public let headroom: Float
+}
+
+public extension IlluminatoramaRenderer {
+    @MainActor
+    func renderHDRRendition(headroom: Float) -> IlluminatoramaHDRRendition? {
+        let H = max(1, headroom)
+        guard let library = engine.library,
+              let target0 = pfx.tonemapWriteTarget else { return nil }
+        let w = target0.width, h = target0.height
+        let cv = MTLFunctionConstantValues()
+        var on = true, room = H
+        cv.setConstantValue(&on, type: .bool, index: 44)
+        cv.setConstantValue(&room, type: .float, index: 45)
+        let desc = MTLRenderPipelineDescriptor()
+        desc.label = "Illuminatorama.tonemap.hdr"
+        desc.vertexFunction = library.makeFunction(name: "illumi_tonemap_vs")
+        guard let fs = try? library.makeFunction(name: "illumi_tonemap_fs", constantValues: cv) else { return nil }
+        desc.fragmentFunction = fs
+        desc.colorAttachments[0].pixelFormat = .rgba16Float
+        guard let pipeline = try? device.makeRenderPipelineState(descriptor: desc) else { return nil }
+
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: w, height: h, mipmapped: false)
+        td.usage = [.renderTarget, .shaderRead]
+        td.storageMode = .private
+        guard let target = device.makeTexture(descriptor: td) else { return nil }
+        let rowBytes = w * 8
+        guard let buf = device.makeBuffer(length: rowBytes * h, options: .storageModeShared),
+              let cb = commandQueue.makeCommandBuffer() else { return nil }
+        cb.label = "Illuminatorama.hdrRendition"
+        encodeTonemapPass(cb, pipeline: pipeline, target: target)
+        guard let blit = cb.makeBlitCommandEncoder() else { return nil }
+        blit.copy(from: target, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                  sourceSize: MTLSize(width: w, height: h, depth: 1),
+                  to: buf, destinationOffset: 0, destinationBytesPerRow: rowBytes, destinationBytesPerImage: rowBytes * h)
+        blit.endEncoding()
+        cb.commit()
+        cb.waitUntilCompleted()   // gpu-ok: export-only readback, never the per-frame lane
+        guard cb.status == .completed else { return nil }
+        let n = w * h * 4
+        let out = [UInt16](unsafeUninitializedCapacity: n) { dst, count in
+            memcpy(dst.baseAddress!, buf.contents(), n * MemoryLayout<UInt16>.stride)
+            count = n
+        }
+        return IlluminatoramaHDRRendition(width: w, height: h, rgbaHalf: out, headroom: H)
     }
 }

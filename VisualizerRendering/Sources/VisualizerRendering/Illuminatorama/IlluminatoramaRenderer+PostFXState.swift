@@ -238,7 +238,10 @@ extension IlluminatoramaRenderer {
         let tmDesc = MTLRenderPipelineDescriptor()
         tmDesc.label = "Illuminatorama.tonemap"
         tmDesc.vertexFunction = library.makeFunction(name: "illumi_tonemap_vs")
-        tmDesc.fragmentFunction = library.makeFunction(name: "illumi_tonemap_fs")
+        // The fragment declares function constants (DH-1374's HDR rendition, 44/45): it must be SPECIALIZED even when
+        // none is set — an unspecialized function fails pipeline validation. Empty values ⇒ both undefined ⇒ the
+        // shipped pass, exactly.
+        tmDesc.fragmentFunction = try library.makeFunction(name: "illumi_tonemap_fs", constantValues: MTLFunctionConstantValues())
         tmDesc.colorAttachments[0].pixelFormat = .bgra8Unorm_srgb
         let tonemap = try device.makeRenderPipelineState(descriptor: tmDesc)
         // Phase 4.21 — auto-exposure estimator.
