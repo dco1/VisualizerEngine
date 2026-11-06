@@ -40,6 +40,42 @@ final class IlluminatoramaHeadlessTests: XCTestCase {
 @MainActor
 final class IlluminatoramaStillTests: XCTestCase {
 
+    /// **Daydream DH-1291 — a frame the GPU aborts is never averaged into a still.** The GPU cannot be made to abort on
+    /// demand, so `debugFailNextFrames` reports one frame failed exactly as a `.error` command buffer would. The still
+    /// must start over (warm-up / build / accumulation, fresh accumulators) rather than average it, and the picture it
+    /// then settles to must be the clean one — up to the jitter phase, which the restart does not rewind.
+    func testAFailedFrameRestartsTheStillInsteadOfAveragingIt() throws {
+        let cam = IlluminatoramaCamera(position: SIMD3(0, 1, 4), target: .zero, up: SIMD3(0, 1, 0),
+                                       fovYRadians: .pi / 3, aspect: 4.0 / 3.0, zNear: 0.05, zFar: 100)
+        let r = try IlluminatoramaRenderer(engine: SimEngine.shared, width: 128, height: 96, camera: cam)
+        stageScene(r)
+        let opts = IlluminatoramaStillOptions(frames: 6, jitterPixels: 1, outputSize: (160, 120), lockExposure: true)
+        let clean = try XCTUnwrap(r.renderStill(opts))
+        var rendered = 0
+        let restartedStill = try XCTUnwrap(r.renderStill(opts, step: { _ in
+            rendered += 1
+            if rendered == 3 { r.debugFailNextFrames = 1 }
+            return r.render(blocking: true)
+        }))
+        XCTAssertEqual(rendered, 3 + 6, "the failed third frame must restart the sequence: 3 frames, then all 6 again")
+        XCTAssertEqual(r.debugFailNextFrames, 0)
+        XCTAssertFalse(r.lastFrameFailed, "the frame the still ended on was a good one")
+        XCTAssertGreaterThanOrEqual(r.failedFrameCount, 1)
+        let a = clean.frame.bytes, b = restartedStill.frame.bytes
+        XCTAssertEqual(a.count, b.count)
+        var sum = 0.0
+        for i in a.indices { sum += Double(abs(Int(a[i]) - Int(b[i]))) }
+        XCTAssertLessThan(sum / Double(max(a.count, 1)), 1.0, "the restarted still settles to the clean picture (mean |Δ| in codes)")
+
+        // The budget: a still that keeps failing finishes on what it has rather than never.
+        var n = 0
+        let stubborn = r.renderStill(opts, step: { _ in n += 1; r.debugFailNextFrames = 1; return r.render(blocking: true) })
+        XCTAssertNotNil(stubborn)
+        XCTAssertEqual(n, IlluminatoramaStillSession.maxFailedFrameRestarts + 6,
+                       "each restart costs one failed frame, then the last pass runs to the end")
+        r.debugFailNextFrames = 0
+    }
+
     func testStillSettlesReadsBackAndRestoresTheRenderer() throws {
         let cam = IlluminatoramaCamera(position: SIMD3(0, 1, 4), target: .zero, up: SIMD3(0, 1, 0),
                                        fovYRadians: .pi / 3, aspect: 4.0 / 3.0, zNear: 0.05, zFar: 100)

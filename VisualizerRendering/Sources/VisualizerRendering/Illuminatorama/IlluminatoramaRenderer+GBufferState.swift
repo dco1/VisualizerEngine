@@ -137,6 +137,14 @@ final class GBufferState {
     /// have described never reached the GPU (an early return above). Nil is therefore
     /// "nothing to wait for", not an error.
     var pendingFrameCompletion: FrameCompletionSignal?
+    /// Daydream DH-1291 — the last BLOCKING or AWAITED frame's command buffer ended in error. A frame macOS
+    /// aborted under GPU contention ("Impacting Interactivity") left its targets partly written; a still
+    /// that averaged it came out darker, not just late. Cleared at the top of every `render`.
+    var lastFrameFailed = false
+    /// Every such frame this renderer has seen (diagnostics; never reset).
+    var failedFrameCount = 0
+    /// Test hook: report the next N blocking/awaited frames as failed (the GPU will not fail on demand).
+    var debugFailNextFrames = 0
 
     // Phase 2.7 — ping-ponged instance buffers so the G-buffer vertex shader
     // can read both this frame's and last frame's per-instance model matrix

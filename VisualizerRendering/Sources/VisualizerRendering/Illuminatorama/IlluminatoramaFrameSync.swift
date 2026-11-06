@@ -74,14 +74,18 @@ final class IlluminatoramaGPUMeter: @unchecked Sendable {
 final class FrameCompletionSignal: @unchecked Sendable {
     let lock = NSLock()
     var completed = false
+    /// Daydream DH-1291 — the command buffer this latch describes ended in ERROR (macOS aborts a frame —
+    /// "Impacting Interactivity" — when another process holds the GPU). Written once, before `completed`.
+    var failed = false
     var continuation: CheckedContinuation<Void, Never>?
 
     /// Called from the GPU completion handler. Resumes the awaiter OUTSIDE the lock —
     /// a continuation resume can run arbitrary code, and doing that under the lock would
     /// re-enter it if that code touched this latch again.
-    func signal() {
+    func signal(failed: Bool = false) {
         lock.lock()
         if completed { lock.unlock(); return }
+        self.failed = failed
         completed = true
         let waiter = continuation
         continuation = nil

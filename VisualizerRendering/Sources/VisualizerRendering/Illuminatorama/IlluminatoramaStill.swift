@@ -76,6 +76,8 @@ public struct IlluminatoramaStillReport {
     public let accumulatedFrames: Int
     public let internalScale: Float
     public let milliseconds: Double
+    /// Daydream DH-1291 — how many times the sequence restarted because the GPU aborted one of its frames.
+    public var failedFrameRestarts: Int = 0
 }
 
 public extension IlluminatoramaStillOptions {
@@ -120,6 +122,9 @@ public final class IlluminatoramaStillSession {
     private let o: IlluminatoramaStillOptions
     private let kinds: [IlluminatoramaStillFrame]
     private var index = 0
+    /// DH-1291 — restarts taken after a failed frame, and the most a still may take before it settles for what it has.
+    public private(set) var failedFrameRestarts = 0
+    public static let maxFailedFrameRestarts = 3
     private let t0 = DispatchTime.now().uptimeNanoseconds
     private var finished = false
 
@@ -203,13 +208,30 @@ public final class IlluminatoramaStillSession {
         // The previous frame is now an accumulate frame, so frame 1 takes no build→accumulate transition.
     }
 
+    /// **Daydream DH-1291 — a frame the GPU ABORTED is not averaged in.** Under contention macOS aborts a
+    /// command buffer ("Impacting Interactivity"); its targets are partly written, and a still that averaged it
+    /// read darker and noisier, not just late (DH-1011's many-lights twins, 2026-10-04). The failed frame may have
+    /// corrupted the radiance cache or a running mean as well as the colour, so the WHOLE sequence starts over —
+    /// warm-up, cache build, accumulation — with fresh GI and AO accumulators. Returns false once the budget
+    /// (`maxFailedFrameRestarts`) is spent, and the still then finishes on what it has rather than never.
+    @discardableResult
+    public func restartAfterFailedFrame() -> Bool {
+        guard failedFrameRestarts < Self.maxFailedFrameRestarts else { return false }
+        failedFrameRestarts += 1
+        index = 0
+        r.resetAOAccumulation()
+        r.resetRTGIAccumulation()
+        return true
+    }
+
     /// Restore everything the still changed. Safe to call twice.
     @discardableResult
     public func finish() -> IlluminatoramaStillReport {
         let report = IlluminatoramaStillReport(
             warmupFrames: warmupFrames, cacheBuildFrames: cacheBuildFrames, accumulatedFrames: accumulatedFrames,
             internalScale: r.internalRenderScale,
-            milliseconds: Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000)
+            milliseconds: Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000,
+            failedFrameRestarts: failedFrameRestarts)
         guard !finished else { return report }
         finished = true
         r.taaJitterPixels = savedJitter; r.taaHistoryBlend = savedBlend; r.ssaoTemporalBlend = savedAO
@@ -275,7 +297,10 @@ public extension IlluminatoramaRenderer {
         let step = step ?? { [unowned self] _ in self.render(blocking: true) }
         let s = IlluminatoramaStillSession(self, o)
         defer { s.finish() }
-        while let kind = s.next() { _ = step(kind) }
+        while let kind = s.next() {
+            _ = step(kind)
+            if lastFrameFailed { s.restartAfterFailedFrame() }   // DH-1291
+        }
         atEnd(self)
         return s.finish()
     }
@@ -299,6 +324,7 @@ public extension IlluminatoramaRenderer {
         defer { s.finish() }
         while let kind = s.next() {
             _ = await step(kind)
+            if lastFrameFailed { s.restartAfterFailedFrame() }   // DH-1291
             progress(Double(s.framesDone) / Double(max(s.totalFrames, 1)))
             try? await Task.sleep(nanoseconds: 1_000_000)   // a run-loop turn between frames
         }

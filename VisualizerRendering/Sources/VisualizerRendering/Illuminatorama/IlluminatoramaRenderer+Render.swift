@@ -40,6 +40,7 @@ extension IlluminatoramaRenderer {
         // `awaitCommittedFrame()` reads that as "nothing to wait for".
         let awaited = gbs.armAwaitedFrame
         gbs.armAwaitedFrame = false
+        gbs.lastFrameFailed = false   // DH-1291 — set again below once THIS frame's buffer is known
         if awaited { gbs.pendingFrameCompletion = nil }
         // Fail LOUD on a boot-relative animation clock. `time` is a Float used as a phase by
         // every GPU oscillator, so a large absolute value quantises all of them (see `time`'s
@@ -375,6 +376,7 @@ extension IlluminatoramaRenderer {
         // from a suspension instead of from `__psynch_cvwait` on the caller's thread.
         if blocking && !awaited {
             cb.waitUntilCompleted()
+            noteFrameOutcome(failed: cb.status == .error || cb.error != nil)   // DH-1291
             promoteCompletedBuffer()
         }
 
@@ -425,6 +427,7 @@ extension IlluminatoramaRenderer {
         if let signal = gbs.pendingFrameCompletion {
             gbs.pendingFrameCompletion = nil
             await signal.wait()
+            noteFrameOutcome(failed: signal.failed)   // DH-1291
         }
         promoteCompletedBuffer()
     }
@@ -441,5 +444,26 @@ extension IlluminatoramaRenderer {
             enc.endEncoding()
         }
         cb.commit()
+    }
+}
+
+// MARK: - Daydream DH-1291 — a frame the GPU aborted is not a frame
+
+public extension IlluminatoramaRenderer {
+    /// The last blocking or awaited frame's command buffer ended in error — its targets are undefined. A still
+    /// restarts its sequence on one (`IlluminatoramaStillSession.restartAfterFailedFrame()`).
+    var lastFrameFailed: Bool { gbs.lastFrameFailed }
+    /// How many blocking/awaited frames have failed on this renderer (diagnostics).
+    var failedFrameCount: Int { gbs.failedFrameCount }
+    /// Test hook: the next `n` blocking/awaited frames report failed. The GPU cannot be made to abort on demand.
+    var debugFailNextFrames: Int { get { gbs.debugFailNextFrames } set { gbs.debugFailNextFrames = max(0, newValue) } }
+}
+
+extension IlluminatoramaRenderer {
+    func noteFrameOutcome(failed: Bool) {
+        var f = failed
+        if gbs.debugFailNextFrames > 0 { gbs.debugFailNextFrames -= 1; f = true }
+        gbs.lastFrameFailed = f
+        if f { gbs.failedFrameCount += 1 }
     }
 }

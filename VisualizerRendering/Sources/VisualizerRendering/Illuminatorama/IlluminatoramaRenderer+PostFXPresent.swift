@@ -229,7 +229,7 @@ extension IlluminatoramaRenderer {
             // LAST, and after `markCompleted` above: an awaiter resumes into
             // `promoteCompletedBuffer()`, which can only find this frame once `writeIdx` is
             // published. Same ordering `waitUntilCompleted()` gives the blocking path.
-            completion?.signal()
+            completion?.signal(failed: buf.status == .error || buf.error != nil)   // DH-1291
         }
         gbs.lastCommittedFrameCB = cb
         cb.commit()
