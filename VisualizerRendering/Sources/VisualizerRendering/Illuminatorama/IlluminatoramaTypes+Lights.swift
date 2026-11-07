@@ -191,14 +191,20 @@ public struct IlluminatoramaPointLight {
     /// so the stride stays 80 on both sides. Mirrors the Metal `PointLight` / `RTPointLight
     /// .openingRadius` — keep in lockstep.
     public var openingRadius: Float = 0
-    /// Daydream DH-1363 inc. 2 — where the opening sits along the light's travel direction, from `position` (m;
-    /// a point light has no axis, so this is carried for the layout only and ignored). Size 76 → 80 = the stride.
-    public var openingOffset: Float = 0
+    /// **Room-only receivers** (Daydream DH-1616). 1 ⇒ the light reaches only fragments that belong to a
+    /// room — `layer != 0xFFFFFFFF` — on every lane that reads point lights (deferred, GI secondary hits,
+    /// path vertices). 0 (default) ⇒ unchanged. For an UNSHADOWED light whose only containment is its room
+    /// mask: the mask cannot keep it off all-bits geometry (the yard, the street, anything resolved to no
+    /// room), because `layerMask & 0xFFFFFFFF` is never zero. A bounce fill — a room's own indirect light —
+    /// sat on its storey's floor still lit the yard below an overhang through the slab. Was `openingOffset`
+    /// (a point has no axis, so that was layout only): same 4 bytes, stride 80 unchanged. Mirrors the Metal
+    /// `PointLight.roomOnly` / `RTPointLight.roomOnly` — keep in lockstep.
+    public var roomOnly: UInt32 = 0
 
     public init(position: SIMD3<Float>, radius: Float, color: SIMD3<Float>,
                 layerMask: UInt32 = 0xFFFF_FFFF,
                 castsShadow: Bool = false, softRadius: Float = 0, giVisible: Bool = true,
-                bulbRadius: Float = 0, openingRadius: Float = 0, openingOffset: Float = 0) {
+                bulbRadius: Float = 0, openingRadius: Float = 0) {
         self.position = position
         self.radius = radius
         self.color = color
@@ -208,7 +214,6 @@ public struct IlluminatoramaPointLight {
         self.giVisible = giVisible ? 1 : 0
         self.bulbRadius = bulbRadius
         self.openingRadius = openingRadius
-        self.openingOffset = openingOffset
     }
 }
 

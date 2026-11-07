@@ -732,6 +732,7 @@ static inline float pathLampSize(float softRadius, float bulb, float opening, fl
 
 static inline float3 pathPointContribution(RTPointLight pl, float3 P, float3 N, uint layerBits, float3 near) {
     if (pl.giVisible == 0u || (pl.layerMask & layerBits) == 0u) return float3(0.0);
+    if (pl.roomOnly != 0u && layerBits == 0xFFFFFFFFu) return float3(0.0);   // DH-1616 — room fragments only
     float3 toL = pl.position - P;
     float dist = length(toL);
     if (dist > pl.radius) return float3(0.0);

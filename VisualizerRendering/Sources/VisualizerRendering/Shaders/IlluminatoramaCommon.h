@@ -639,7 +639,10 @@ struct PointLight {
     // ignores it. Appended after `giVisible` (size 72 → 76) inside the stride's tail padding:
     // stride 80, unchanged. Keep in lockstep with `RTPointLight` and the Swift struct.
     float  openingRadius;
-    float  openingOffset;   // Daydream DH-1363 inc. 2 — layout only for a point (76 → 80 = the stride)
+    // Daydream DH-1616 — 1 ⇒ this light reaches only fragments that belong to a room (layer !=
+    // 0xFFFFFFFF). Was `openingOffset` (layout only for a point): same 4 bytes, stride 80 unchanged.
+    // Mirrors the Swift `IlluminatoramaPointLight.roomOnly` and `RTPointLight.roomOnly`.
+    uint   roomOnly;
 };
 #define kGIVisibleSecondaryOnly 2u
 

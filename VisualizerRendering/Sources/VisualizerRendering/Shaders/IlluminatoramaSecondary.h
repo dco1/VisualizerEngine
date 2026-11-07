@@ -124,7 +124,7 @@ struct RTPointLight {
     // falloff at path vertices (`pathLampAtten`): `1/(d² + r²)`, a disc's on-axis law. Same offset
     // and width as `PointLight.openingRadius` (size 72 → 76, stride 80 unchanged).
     float  openingRadius;
-    float  openingOffset;   // Daydream DH-1363 inc. 2 — layout only for a point (76 → 80)
+    uint   roomOnly;        // Daydream DH-1616 — mirrors `PointLight.roomOnly` (was `openingOffset`, layout only)
 };
 struct RTSpotLight {
     float3   position;   float innerCone;
@@ -665,6 +665,7 @@ static inline float3 secondaryLocalLightFill(float3 P, float3 N, uint layerBits,
         RTPointLight pl = sc.pointLights[i];
         if (pl.giVisible == 0u) continue;   // DH-0872 — see `giVisible`'s own doc comment
         if ((pl.layerMask & layerBits) == 0u) continue;
+        if (pl.roomOnly != 0u && layerBits == 0xFFFFFFFFu) continue;   // DH-1616 — room fragments only
         float3 toL = pl.position - P;
         float dist = length(toL);
         if (dist > pl.radius) continue;

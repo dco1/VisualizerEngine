@@ -1809,6 +1809,10 @@ kernel void illumi_lighting(
         // so applying the coarse position-based room mask on top would double-darken
         // and re-introduce the doorway over-block the shadow exists to fix.
         if (pl.castsShadow == 0u && (pl.layerMask & fragLayer) == 0u) continue;
+        // Daydream DH-1616 — a room-only light (an unshadowed bounce fill) never reaches a fragment that
+        // belongs to no room: no mask can exclude an all-bits fragment, so without this the fill on an
+        // upper storey's floor lit the yard under the overhang through the slab.
+        if (pl.roomOnly != 0u && fragLayer == 0xFFFFFFFFu) continue;
         // Daydream DH-1320 — `giVisible == 2`: a stand-in for light arriving at a SECONDARY hit
         // only (a lamp's first bounce, lighting the surfaces a traced GI bounce lands on); the
         // traced bounce itself delivers that light to the primary, so this pass must not.
