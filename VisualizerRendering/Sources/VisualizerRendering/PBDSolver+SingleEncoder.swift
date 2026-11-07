@@ -6,17 +6,18 @@ import Metal
 // each constraint iteration, each SDF pass, the floor — 4 + 6 × `constraintIterations` encoders a substep. Their GPU
 // work is a few microseconds; the encoders are the cost, all of it on the thread that encodes (Dad Hat Factory's
 // princess veil: ~230 a frame, ~0.9 ms of an iPhone 15 Pro's main thread). Here the same kernels run in the same
-// order in ONE compute encoder, a buffer barrier between each, after one blit that zeroes λ. Within an encoder a
-// barrier orders the dispatches the way separate encoders did, so the result is the same to the bit (Dad Hat
-// Factory's `PBDBatchedTests` steps a rope both ways and compares every particle).
+// order in ONE serial compute encoder, after one blit that zeroes λ. A serial encoder runs its dispatches in order and
+// tracks the buffers' hazards itself, so the result is the same to the bit (`PBDSingleEncoderTests`). No explicit
+// `memoryBarrier`s: between every dispatch they made Dad Hat Factory's veil ~6× the GPU time on an iPhone 15 Pro
+// (135 ms of GPU a second, from 21).
 
 extension PBDSolver {
     /// One substep as a λ-reset blit plus one compute encoder (plus a snapshot blit and a second compute encoder when
     /// `selfCollideEnabled`, whose Jacobi read needs a copy taken between two dispatches).
     ///
-    /// `before` / `after` encode the caller's own passes into the substep's compute encoder, ahead of the integration
-    /// and after the last floor clamp, each fenced by a buffer barrier — a pin, a frame kick, a collision against the
-    /// caller's own surface — so they too cost no encoder of their own.
+    /// `before` / `after` encode the caller's own passes into the substep's (serial) compute encoder, ahead of the
+    /// integration and after the last floor clamp — a pin, a frame kick, a collision against the caller's own surface —
+    /// so they too cost no encoder of their own.
     ///
     /// The uniforms are one shared buffer the GPU reads when it runs, written here at encode time, so every substep in a
     /// command buffer sees the last one written: use one `dt` (and one collider count) across a command buffer's
@@ -32,11 +33,10 @@ extension PBDSolver {
             dispatchLambdaReset(into: blit)
             blit.endEncoding()
         }
-        guard var enc = commandBuffer.makeComputeCommandEncoder() else { return }
+        guard var enc = commandBuffer.makeComputeCommandEncoder(dispatchType: .serial) else { return }
         enc.label = label
-        if let before { before(enc); enc.memoryBarrier(scope: .buffers) }
+        before?(enc)
         dispatchIntegrate(into: enc)
-        enc.memoryBarrier(scope: .buffers)
 
         let l = constraintLayout
         let groups = [(l.primaryEvenStart, l.primaryEvenCount), (l.primaryOddStart, l.primaryOddCount),
@@ -46,9 +46,8 @@ extension PBDSolver {
         for _ in 0..<constraintIterations {
             for (start, count) in groups where count > 0 {
                 dispatchConstraintSubpass(into: enc, start: start, count: count)
-                enc.memoryBarrier(scope: .buffers)
             }
-            if collides { dispatchSDFCollide(into: enc); enc.memoryBarrier(scope: .buffers) }
+            if collides { dispatchSDFCollide(into: enc) }
         }
 
         // Self-collision, once a substep after the loop (as `encodeConstraintsAndContacts`): its kernel reads a frozen
@@ -63,19 +62,14 @@ extension PBDSolver {
                           size: particleBuffer.count * MemoryLayout<PBDParticle>.stride)
                 blit.endEncoding()
             }
-            guard let next = commandBuffer.makeComputeCommandEncoder() else { return }
+            guard let next = commandBuffer.makeComputeCommandEncoder(dispatchType: .serial) else { return }
             enc = next
             enc.label = label
             dispatchSelfCollide(into: enc, snapshot: snapshot)
-            enc.memoryBarrier(scope: .buffers)
         }
 
         dispatchFloor(into: enc)
-        enc.memoryBarrier(scope: .buffers)
-        if collides {
-            dispatchSDFCollide(into: enc); enc.memoryBarrier(scope: .buffers)
-            dispatchFloor(into: enc); enc.memoryBarrier(scope: .buffers)
-        }
+        if collides { dispatchSDFCollide(into: enc); dispatchFloor(into: enc) }
         after?(enc)
         enc.endEncoding()
     }

@@ -496,8 +496,8 @@ public final class PBDSolver {
     // a handful of frames after settling.
     public var constraintIterations: Int = 10
 
-    /// Encode each substep (`encode(to:dt:)`, `advance(wallDt:)`) as a lambda blit plus ONE compute encoder with buffer
-    /// barriers between the sub-passes (`encodeSingleEncoder`), instead of an encoder per sub-pass: ~4 + 6 ×
+    /// Encode each substep (`encode(to:dt:)`, `advance(wallDt:)`) as a lambda blit plus ONE serial compute encoder
+    /// (`encodeSingleEncoder`), instead of an encoder per sub-pass: ~4 + 6 ×
     /// `constraintIterations` encoders a substep become two. Bit-exact with the default path; the encoders cost the main
     /// thread, not the GPU (a 26-link rope at 10 iterations: ~0.9 ms a frame of an iPhone 15 Pro's main thread at 4
     /// substeps, for a few microseconds of GPU work). Off by default so existing callers encode exactly as before.
