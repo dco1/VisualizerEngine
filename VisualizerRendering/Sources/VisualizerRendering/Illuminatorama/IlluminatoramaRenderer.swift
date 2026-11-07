@@ -744,6 +744,16 @@ public final class IlluminatoramaRenderer {
         didSet { if oldValue != iblBakeDesaturation { iblNeedsRebake = true } }
     }
 
+    /// GGX samples per texel when baking the prefiltered specular cube's rough mips (the mirror mip takes one).
+    /// The bake is deterministic and only redone when the sky changes (or every `iblRebakeInterval`), so TAA never
+    /// averages its error away: at the default 12, a sky with small bright sources (a product studio's light cards)
+    /// bakes into the cube as a blotchy, jagged pattern, and a glossy surface sweeping its reflection across that
+    /// pattern as the camera turns shimmers. 256 is clean on such a sky (Dad Hat Factory's cans); cost is per bake,
+    /// not per frame: ~33k cube texels × N bilinear sky reads. Default 12 keeps every existing scene byte-identical.
+    public var iblPrefilterSampleCount: Int = 12 {
+        didSet { if oldValue != iblPrefilterSampleCount { iblNeedsRebake = true } }
+    }
+
 
 
     /// TEST-OBSERVABLE (DH-0869): the specialisation flags of the lighting variant the LAST

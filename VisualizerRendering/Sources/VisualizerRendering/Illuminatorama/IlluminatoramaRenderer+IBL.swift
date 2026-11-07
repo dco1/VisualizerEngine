@@ -197,8 +197,9 @@ extension IlluminatoramaRenderer {
         )
 
         // ── GGX-prefiltered specular, one mip at a time ────────────
-        // 12 samples: TAA temporal accumulation makes this indistinguishable
-        // from 24 at 60fps. Keep 1 sample for the perfect-mirror mip 0.
+        // `iblPrefilterSampleCount` samples (default 12) on the rough mips; 1 for the
+        // perfect-mirror mip 0. (TAA does NOT average this: the bake is deterministic and
+        // held between rebakes, so its error is a fixed pattern in the cube.)
         enc.setComputePipelineState(ibls.prefilterBakePipeline)
         enc.setTexture(sky, index: 0)
         let mipCount = ibls.prefilteredMipViews.count
@@ -210,7 +211,7 @@ extension IlluminatoramaRenderer {
             var params = PrefilterBakeParams(
                 roughness: roughness,
                 faceWidth: UInt32(mipSize),
-                sampleCount: roughness <= 0.0001 ? 1 : 12,
+                sampleCount: roughness <= 0.0001 ? 1 : UInt32(max(4, min(4096, iblPrefilterSampleCount))),
                 bakeDesat: max(0.0, min(1.0, iblBakeDesaturation))
             )
             enc.setTexture(view, index: 1)
