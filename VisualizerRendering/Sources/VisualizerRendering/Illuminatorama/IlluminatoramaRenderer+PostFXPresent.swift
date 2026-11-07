@@ -82,6 +82,11 @@ extension IlluminatoramaRenderer {
         ssrs.ssrNeedsFirstFrame  = true
         rtGINeedsFirstFrame = true
         aos.aoAccumulator?.reset()
+        // The screen-resolution cumulus accumulator (and its reprojection history) is temporal state
+        // too: left alone, the first capture after a reset started from the bare dome while a later one
+        // started from an already-converged deck, so two captures of one scene differed by the whole
+        // sky band — a deterministic "drift" that swamped every A/B with sky in frame (Daydream DH-1610).
+        cumulusInView.reset()
 
         // Auto-exposure EMA — re-seed the GPU ExposureState buffer to the exact
         // cold-start values written once in the constructor:
