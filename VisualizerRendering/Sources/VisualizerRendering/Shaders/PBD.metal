@@ -1770,14 +1770,15 @@ static void rmfFrame(device const PBDParticle* spine,
     bitangent = cross(tangent, ringNorm);
 }
 
-kernel void pbdTubeExpand(
-    device const PBDParticle*    spine   [[ buffer(0) ]],
-    device packed_float3*        verts   [[ buffer(1) ]],
-    constant TubeExpandUniforms& u       [[ buffer(2) ]],
-    device packed_float3*        normals [[ buffer(3) ]],
-    device float4*               colors  [[ buffer(4) ]],  // uniform white + casing flag (a=0.75)
-    uint id [[ thread_position_in_grid ]]
-) {
+// The expand body, shared by the per-tube kernel (`pbdTubeExpand`, one dispatch per tube)
+// and the batched one (`pbdTubeExpandBatch`, one dispatch for every tube, DH-1623). Both
+// call exactly this, so a batched frank is the per-tube frank, vertex for vertex.
+static void pbdTubeExpandRing(device const PBDParticle*    spine,
+                              device packed_float3*        verts,
+                              constant TubeExpandUniforms& u,
+                              device packed_float3*        normals,
+                              device float4*               colors,
+                              uint id) {
     uint totalRings = (u.spineCount - 1u) * u.subSegments + 1u;
     if (id >= totalRings) return;
 
@@ -2101,6 +2102,19 @@ kernel void pbdTubeExpand(
     }
 }
 
+
+kernel void pbdTubeExpand(
+    device const PBDParticle*    spine   [[ buffer(0) ]],
+    device packed_float3*        verts   [[ buffer(1) ]],
+    constant TubeExpandUniforms& u       [[ buffer(2) ]],
+    device packed_float3*        normals [[ buffer(3) ]],
+    device float4*               colors  [[ buffer(4) ]],  // uniform white + casing flag (a=0.75)
+    uint id [[ thread_position_in_grid ]]
+) {
+    pbdTubeExpandRing(spine, verts, u, normals, colors, id);
+}
+
+#include "PBDFlatStages.h"
 
 // ── KERNEL: swept-tube interior confinement (Hotdog Waterslide Descent) ──────
 //

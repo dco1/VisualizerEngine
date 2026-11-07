@@ -127,6 +127,21 @@ public final class PBDTubeBatch {
     private var flatConstraintTotal = 0
     private var flatConstraintsDirty = true
 
+    // ── Every stage batched (DH-1623) ──────────────────────────────────────────
+    /// A/B lever. When true (default) and the tube set is eligible
+    /// (`PBDTubeBatchFlatStages.isEligible`, flat solve on, no `extraConstraintPass`), the
+    /// per-tube stages — integrate, capsule build, copy to/from flat, floor, SDF, expand —
+    /// run as ONE dispatch each over every tube instead of one per tube, and the SDF pass
+    /// gains a per-tube broadphase. Same arithmetic per particle in the same order (see
+    /// `Shaders/PBDFlatStages.h`); false restores the per-tube encoding for an A/B.
+    public var batchesEveryStage = true
+    /// True when the last substep ran every stage batched. Set each tick by `tick`.
+    public private(set) var everyStageBatched = false
+    private var flatStages: PBDTubeBatchFlatStages?
+    private var flatStagesReady = false
+    private var flatStagesDirty = true
+    private var flatStagesUnavailable = false
+
     // ── Static scene colliders ─────────────────────────────────────────────────
     /// Fixed collider capsules from the scene (e.g. HotdogDropUltra's mustard-tub
     /// wall ring). Written into slots [0, count) of the shared collider buffer
@@ -201,7 +216,21 @@ public final class PBDTubeBatch {
         layoutsDirty = true
         flatDirty    = true
         flatConstraintsDirty = true
+        flatStagesDirty = true
     }
+
+    /// Diagnostic: count the SDF pass's contact tests (narrow-phase capsule/static
+    /// evaluations, and broadphase tube-box tests) on the batched path. Costs an atomic per
+    /// particle per pass, so leave it off while timing.
+    public var countsContactTests: Bool {
+        get { flatStages?.countsTests ?? false }
+        set { flatStages?.countsTests = newValue }
+    }
+    /// Zero the contact-test counters. Call with the GPU idle.
+    public func resetContactTestCounts() { flatStages?.resetCounters() }
+    /// Tests counted since the last reset, and how many SDF passes they came from. Read with
+    /// the GPU idle (after waiting on the batch's queue). nil off the batched path.
+    public var contactTestCounts: (narrow: Int, box: Int, passes: Int)? { flatStages?.counted }
 
     // MARK: - Tick
 
@@ -273,6 +302,9 @@ public final class PBDTubeBatch {
             let flatRun = flatSolveEnabled && allOpenChains && hasBatchFlat
                 && rebuildFlatConstraintsIfDirty(tubes: tubes)
             flatSolveActive = flatRun
+            let stagesRun = flatRun && batchesEveryStage && extraConstraintPass == nil
+                && prepareFlatStages(tubes: tubes)
+            everyStageBatched = stagesRun
             if flatRun, let ubuf = flatConstraintUniform {
                 // Constraint + velocity kernels read only dt, ringCount(0),
                 // constraintCount(≥ any colour count), velRestitution from this.
@@ -328,6 +360,31 @@ public final class PBDTubeBatch {
                 break
             }
             enc.label = "PBDTubeBatch.compute[\(steps)]"
+
+            if stagesRun, let stages = flatStages, let flat = flatBuffer, let p = batchPipelines,
+               let solver0 = tubes.first?.solver {
+                encodeEveryStageBatched(enc, stages: stages, tubes: tubes, flat: flat,
+                                        colliders: colBuf, pipelines: p, solver0: solver0,
+                                        params: params, iters: iters, vrestActive: vrestActive)
+                enc.endEncoding()
+                let sema = inflightSemaphore
+                // The tubes' own buffers are reached through GPU addresses, not bindings —
+                // hold them until the GPU is done with this substep.
+                let resident = PBDTubeBatchFlatStages.Hold(stages.residentBuffers)
+                cb.addCompletedHandler { cb in
+                    withExtendedLifetime(resident) {}
+                    if let err = cb.error {
+                        os_log(.error, "PBDTubeBatch GPU error: %{public}@",
+                               err.localizedDescription)
+                    }
+                    sema.signal()
+                }
+                cb.commit()
+                accumulator -= fixedDt
+                steps += 1
+                substepsRun += 1
+                continue
+            }
 
             // Phase 1: integrate (Verlet, writes particle positions).
             for tube in tubes { tube.solver.dispatchIntegrate(into: enc) }
@@ -449,6 +506,80 @@ public final class PBDTubeBatch {
             substepsRun += 1
         }
 
+    }
+
+    // MARK: - Every stage batched (DH-1623)
+
+    /// Build (once per device) and lay out (once per markDirty) the batched stages. False →
+    /// the tube set is not eligible, and the substep encodes per tube as before.
+    private func prepareFlatStages(tubes: [PBDTubeRenderer]) -> Bool {
+        if flatStages == nil, !flatStagesUnavailable {
+            flatStages = PBDTubeBatchFlatStages(device: device)
+            flatStagesUnavailable = flatStages == nil   // missing kernels: don't retry per substep
+        }
+        guard let stages = flatStages, flatBuffer != nil else { return false }
+        if flatStagesDirty {
+            flatStagesDirty = false
+            flatStagesReady = PBDTubeBatchFlatStages.isEligible(tubes)
+                && stages.rebuild(tubes: tubes, colliderOffsets: cachedColliderOffsets)
+        }
+        return flatStagesReady
+    }
+
+    /// One substep with every stage a single dispatch over the flat buffer. The op sequence
+    /// is the per-tube flat path's: integrate → capsules → (colours → SDF) × iters → velocity
+    /// → floor → SDF → floor → expand. The per-tube path copied to/from the flat buffer
+    /// around each SDF pass; here particles stay flat for the whole substep and are gathered
+    /// once at the start and scattered once at the end — the floor and integrate kernels
+    /// ignore the owner stamp those copies added and removed.
+    private func encodeEveryStageBatched(_ enc: MTLComputeCommandEncoder,
+                                         stages: PBDTubeBatchFlatStages,
+                                         tubes: [PBDTubeRenderer], flat: MTLBuffer,
+                                         colliders: MTLBuffer,
+                                         pipelines p: SimPipelineCache.PBDPipelines,
+                                         solver0: PBDSolver, params: Params,
+                                         iters: Int, vrestActive: Bool) {
+        stages.makeResident(enc)
+        let radius = tubes[0].radius
+        // The per-tube integrate/floor uniforms, identical for every tube by eligibility.
+        let u = PBDUniforms(
+            dt: fixedDt, gravity: params.gravity, damping: solver0.damping,
+            floorY: params.floorY ?? radius,
+            particleCount: 0, constraintCount: 0,
+            floorBand: solver0.floorBand,
+            floorRestitution: params.floorRestitution)
+        let sdf = {
+            stages.encodeSDF(enc, flat: flat, colliders: colliders,
+                             colliderCount: self.cachedColliderTotal,
+                             staticCount: self.staticColliders.count, params: params)
+            enc.memoryBarrier(scope: .buffers)
+        }
+
+        stages.encodeGather(enc, flat: flat)
+        enc.memoryBarrier(scope: .buffers)
+        stages.encodeParticlePass(enc, pipeline: p.integrate, flat: flat, uniforms: u)
+        enc.memoryBarrier(scope: .buffers)
+        stages.encodeBuildColliders(enc, flat: flat, colliders: colliders,
+                                    radius: radius, selfRadius: params.selfRadius)
+        enc.memoryBarrier(scope: .buffers)
+        for _ in 0..<iters {
+            for c in 0..<6 { runFlatConstraintColour(enc, solver: solver0, colour: c) }
+            sdf()
+        }
+        if vrestActive {
+            for c in 0..<6 { runFlatVelocityColour(enc, solver: solver0, colour: c) }
+        }
+        stages.encodeParticlePass(enc, pipeline: p.floor, flat: flat, uniforms: u)
+        enc.memoryBarrier(scope: .buffers)
+        sdf()
+        stages.encodeParticlePass(enc, pipeline: p.floor, flat: flat, uniforms: u)
+        enc.memoryBarrier(scope: .buffers)
+        // Scatter and the batched expand both only READ the flat buffer — no barrier between.
+        stages.encodeScatter(enc, flat: flat)
+        if !stages.encodeExpand(enc, flat: flat, tubes: tubes) {
+            enc.memoryBarrier(scope: .buffers)
+            for tube in tubes { tube.dispatchTubeExpand(into: enc) }
+        }
     }
 
     // MARK: - Private helpers

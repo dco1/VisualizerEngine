@@ -299,28 +299,12 @@ public final class PBDTubeRenderer {
         )
     }
 
-    public func dispatchTubeExpand(into encoder: MTLComputeCommandEncoder) {
-        let rings = visualRingCount
-        guard rings > 0 else { return }
-        encoder.setComputePipelineState(expandPipeline)
-        encoder.setBuffer(solver.particleBuffer.buffer, offset: 0, index: 0)
-        // Batched path: redirect this tube's vertex writes into its slot of the
-        // shared buffers (bound at the slot byte-offset; the kernel's own
-        // vertex-relative indexing fills [vertexBase, vertexBase+vertsPerTube)).
-        if let ext = externalOutput {
-            encoder.setBuffer(ext.position, offset: ext.vertexBase * 12, index: 1) // packed_float3
-            encoder.setBuffer(ext.normal,   offset: ext.vertexBase * 12, index: 3)
-            encoder.setBuffer(ext.color,    offset: ext.vertexBase * 16, index: 4) // float4
-        } else {
-            encoder.setBuffer(mesh.positionBuffer.buffer, offset: 0, index: 1)
-            encoder.setBuffer(mesh.normalBuffer.buffer,   offset: 0, index: 3)
-            encoder.setBuffer(mesh.colorBuffer.buffer,    offset: 0, index: 4)
-        }
-
+    /// The expand kernel's uniforms for this tube as it stands now — ONE builder shared by the
+    /// per-tube dispatch, the per-tube encoder and the batch's one-dispatch expand
+    /// (`PBDTubeBatchFlatStages`, DH-1623), so the three cannot drift apart.
+    var expandUniforms: TubeExpandUniforms {
         let up = fixedUpAxis ?? SIMD3<Float>(0, 0, 0)
-        let uPtr = expandUniformBuffer.contents().bindMemory(to: TubeExpandUniforms.self,
-                                                              capacity: 1)
-        uPtr.pointee = TubeExpandUniforms(
+        return TubeExpandUniforms(
             ringSegments:    UInt32(ringSegments),
             spineCount:      UInt32(spineCount),
             radius:          radius,
@@ -344,6 +328,29 @@ public final class PBDTubeRenderer {
             bodyB:           bodyColorMul.z,
             useRMF:          useRotationMinimizingFrame ? 1 : 0
         )
+    }
+
+    public func dispatchTubeExpand(into encoder: MTLComputeCommandEncoder) {
+        let rings = visualRingCount
+        guard rings > 0 else { return }
+        encoder.setComputePipelineState(expandPipeline)
+        encoder.setBuffer(solver.particleBuffer.buffer, offset: 0, index: 0)
+        // Batched path: redirect this tube's vertex writes into its slot of the
+        // shared buffers (bound at the slot byte-offset; the kernel's own
+        // vertex-relative indexing fills [vertexBase, vertexBase+vertsPerTube)).
+        if let ext = externalOutput {
+            encoder.setBuffer(ext.position, offset: ext.vertexBase * 12, index: 1) // packed_float3
+            encoder.setBuffer(ext.normal,   offset: ext.vertexBase * 12, index: 3)
+            encoder.setBuffer(ext.color,    offset: ext.vertexBase * 16, index: 4) // float4
+        } else {
+            encoder.setBuffer(mesh.positionBuffer.buffer, offset: 0, index: 1)
+            encoder.setBuffer(mesh.normalBuffer.buffer,   offset: 0, index: 3)
+            encoder.setBuffer(mesh.colorBuffer.buffer,    offset: 0, index: 4)
+        }
+
+        let uPtr = expandUniformBuffer.contents().bindMemory(to: TubeExpandUniforms.self,
+                                                              capacity: 1)
+        uPtr.pointee = expandUniforms
         encoder.setBuffer(expandUniformBuffer, offset: 0, index: 2)
 
         let w = min(rings, expandPipeline.maxTotalThreadsPerThreadgroup)
@@ -369,33 +376,9 @@ public final class PBDTubeRenderer {
             encoder.setBuffer(mesh.colorBuffer.buffer,    offset: 0, index: 4)
         }
 
-        let up = fixedUpAxis ?? SIMD3<Float>(0, 0, 0)
         let uPtr = expandUniformBuffer.contents().bindMemory(to: TubeExpandUniforms.self,
                                                               capacity: 1)
-        uPtr.pointee = TubeExpandUniforms(
-            ringSegments:    UInt32(ringSegments),
-            spineCount:      UInt32(spineCount),
-            radius:          radius,
-            subSegments:     UInt32(subSegments),
-            useFixedUp:      fixedUpAxis == nil ? 0 : 1,
-            fixedUpX:        up.x,
-            fixedUpY:        up.y,
-            fixedUpZ:        up.z,
-            spineWrap:       solver.ringCount > 0 ? 1 : 0,
-            spineOffset:     UInt32(solver.ringHead),
-            taperFactor:     taperFactor,
-            useStraightLine: useStraightLine ? 1 : 0,
-            dipY:            dipY,
-            dipRadius:       dipRadius,
-            dipStrength:     dipStrength,
-            dipR:            dipColorMul.x,
-            dipG:            dipColorMul.y,
-            dipB:            dipColorMul.z,
-            bodyR:           bodyColorMul.x,
-            bodyG:           bodyColorMul.y,
-            bodyB:           bodyColorMul.z,
-            useRMF:          useRotationMinimizingFrame ? 1 : 0
-        )
+        uPtr.pointee = expandUniforms
         encoder.setBuffer(expandUniformBuffer, offset: 0, index: 2)
 
         let rings = visualRingCount
