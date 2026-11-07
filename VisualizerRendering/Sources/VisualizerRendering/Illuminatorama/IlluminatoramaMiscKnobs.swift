@@ -23,4 +23,8 @@ final class MiscKnobs {
     /// can't synthesise for arbitrary meshes.)
     var buildRTFromExtractedScene: Bool = false
     var meshes: [MeshKind: IlluminatoramaMesh] = [:]
+    /// Bumped by every change to `meshes` (the renderer's forwarder): what's derived from the table — each draw
+    /// group's mesh (`meshGroupMeshes`), the cull bounds — knows when to look again, even while the draw list holds
+    /// still and its upload is skipped.
+    var meshesVersion = 0
 }

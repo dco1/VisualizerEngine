@@ -496,6 +496,13 @@ public final class PBDSolver {
     // a handful of frames after settling.
     public var constraintIterations: Int = 10
 
+    /// Encode each substep (`encode(to:dt:)`, `advance(wallDt:)`) as a lambda blit plus ONE compute encoder with buffer
+    /// barriers between the sub-passes (`encodeSingleEncoder`), instead of an encoder per sub-pass: ~4 + 6 ×
+    /// `constraintIterations` encoders a substep become two. Bit-exact with the default path; the encoders cost the main
+    /// thread, not the GPU (a 26-link rope at 10 iterations: ~0.9 ms a frame of an iPhone 15 Pro's main thread at 4
+    /// substeps, for a few microseconds of GPU work). Off by default so existing callers encode exactly as before.
+    public var singleEncoder: Bool = false
+
     // ── SDF colliders (Phase 3) ───────────────────────────────────────────────
     //
     // A binding into a controller-owned MTLBuffer of `PBDCollider` records. The
@@ -1122,7 +1129,14 @@ public final class PBDSolver {
     /// colliders between the two — so it sees whatever's in `colliders.buffer`
     /// at the moment of the call. Use the split form when multiple bodies share
     /// a collider buffer that must be rebuilt mid-substep.
+    ///
+    /// With `singleEncoder` set, the substep goes through `encodeSingleEncoder` (a blit and one compute encoder) instead
+    /// of an encoder per sub-pass: same kernels, same order, the same result to the bit.
     public func encode(to commandBuffer: MTLCommandBuffer, dt: Float) {
+        if singleEncoder {
+            encodeSingleEncoder(to: commandBuffer, dt: dt)
+            return
+        }
         encodeIntegrate(to: commandBuffer, dt: dt)
         encodeConstraintsAndContacts(to: commandBuffer, dt: dt)
     }
@@ -1131,22 +1145,7 @@ public final class PBDSolver {
     /// After this kernel completes, `particleBuffer` holds the post-gravity
     /// positions that the collider-build kernel should read from.
     public func encodeIntegrate(to commandBuffer: MTLCommandBuffer, dt: Float) {
-        let uPtr = uniformBuffer.contents().bindMemory(to: PBDUniforms.self, capacity: 1)
-        uPtr.pointee = PBDUniforms(
-            dt: dt, gravity: gravity, damping: damping, floorY: floorY,
-            particleCount: UInt32(particleBuffer.count),
-            constraintCount: UInt32(constraintBuffer.count),
-            floorBand: floorBand,
-            colliderCount: UInt32(colliders?.count ?? 0),
-            ownerID: ownerID,
-            collideStiffness: collideStiffness,
-            collideFriction: collideFriction,
-            selfRadius: selfRadius,
-            velRestitution: velocityRestitution,
-            floorRestitution: floorRestitution,
-            ringCount: UInt32(ringCount),
-            ringHead: UInt32(ringHead)
-        )
+        writeIntegrateUniforms(dt: dt)
 
         encodePass(commandBuffer, pipeline: integratePipeline,
                    count: particleBuffer.count, label: "PBD.integrate")
@@ -1200,32 +1199,32 @@ public final class PBDSolver {
             if primaryEvenCount > 0 {
                 encodeConstraintSubpass(commandBuffer, start: 0,
                                         count: primaryEvenCount,
-                                        label: "PBD.even[\(i)]")
+                                        label: Self.passLabel("PBD.even", i))
             }
             if primaryOddCount > 0 {
                 encodeConstraintSubpass(commandBuffer, start: primaryOddStart,
                                         count: primaryOddCount,
-                                        label: "PBD.odd[\(i)]")
+                                        label: Self.passLabel("PBD.odd", i))
             }
             if bendACount > 0 {
                 encodeConstraintSubpass(commandBuffer, start: bendAStart,
                                         count: bendACount,
-                                        label: "PBD.bendA[\(i)]")
+                                        label: Self.passLabel("PBD.bendA", i))
             }
             if bendBCount > 0 {
                 encodeConstraintSubpass(commandBuffer, start: bendBStart,
                                         count: bendBCount,
-                                        label: "PBD.bendB[\(i)]")
+                                        label: Self.passLabel("PBD.bendB", i))
             }
             if bendCCount > 0 {
                 encodeConstraintSubpass(commandBuffer, start: bendCStart,
                                         count: bendCCount,
-                                        label: "PBD.bendC[\(i)]")
+                                        label: Self.passLabel("PBD.bendC", i))
             }
             if longRangeCount > 0 {
                 encodeConstraintSubpass(commandBuffer, start: longRangeStart,
                                         count: longRangeCount,
-                                        label: "PBD.longRange[\(i)]")
+                                        label: Self.passLabel("PBD.longRange", i))
             }
 
             // SDF inter-body collision (Phase 3). Run *inside* the constraint
@@ -1346,6 +1345,9 @@ public final class PBDSolver {
     /// a read-back/re-write of the uniform buffer; that's no longer needed in
     /// the batched path because the controller writes once with the final
     /// count.)
+    ///
+    /// Writes the ring seam (`ringCount` / `ringHead`) too, as `encodeIntegrate` always did: a ring solver stepped
+    /// through the batched primitives used to see `ringCount` 0 and constrain across its open seam.
     public func writeIntegrateUniforms(dt: Float) {
         let uPtr = uniformBuffer.contents().bindMemory(to: PBDUniforms.self, capacity: 1)
         uPtr.pointee = PBDUniforms(
@@ -1359,7 +1361,9 @@ public final class PBDSolver {
             collideFriction: collideFriction,
             selfRadius: selfRadius,
             velRestitution: velocityRestitution,
-            floorRestitution: floorRestitution
+            floorRestitution: floorRestitution,
+            ringCount: UInt32(ringCount),
+            ringHead: UInt32(ringHead)
         )
     }
 
@@ -1629,6 +1633,26 @@ public final class PBDSolver {
 
     // ── Internal dispatch helpers ─────────────────────────────────────────────
 
+    /// A constraint sub-pass's encoder label: `name[iteration]` in DEBUG (GPU captures), the bare name otherwise, so a
+    /// release build doesn't format a string for each of a substep's dozens of encoders.
+    @inline(__always)
+    static func passLabel(_ name: String, _ iteration: Int) -> String {
+        #if DEBUG
+        return "\(name)[\(iteration)]"
+        #else
+        return name
+        #endif
+    }
+
+    /// The frozen copy of the particles the self-collision kernel reads (Jacobi), grown to fit.
+    func selfCollideSnapshotBuffer() -> MTLBuffer? {
+        let bytes = particleBuffer.count * MemoryLayout<PBDParticle>.stride
+        if (selfCollideSnapshot?.length ?? 0) < bytes {
+            selfCollideSnapshot = device.makeBuffer(length: bytes, options: .storageModeShared)
+        }
+        return selfCollideSnapshot
+    }
+
     private func encodePass(
         _ commandBuffer: MTLCommandBuffer,
         pipeline: MTLComputePipelineState,
@@ -1660,10 +1684,7 @@ public final class PBDSolver {
         // and the compute dispatch are separate encoders in this command buffer,
         // so Metal orders the copy strictly before the kernel reads it.
         let bytes = count * MemoryLayout<PBDParticle>.stride
-        if (selfCollideSnapshot?.length ?? 0) < bytes {
-            selfCollideSnapshot = device.makeBuffer(length: bytes, options: .storageModeShared)
-        }
-        guard let snapshot = selfCollideSnapshot else { return }
+        guard let snapshot = selfCollideSnapshotBuffer() else { return }
         if let blit = commandBuffer.makeBlitCommandEncoder() {
             blit.label = "PBD.selfCollideSnapshot"
             blit.copy(from: particleBuffer.buffer, sourceOffset: 0,

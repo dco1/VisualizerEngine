@@ -102,10 +102,14 @@ extension IlluminatoramaRenderer {
         // relies on — `prevInstances[iid]` reads the same logical
         // instance as `instances[iid]` because both buffers used the
         // same grouping last → this frame.
-        gbs.meshGroups.removeAll(keepingCapacity: true)
-        gbs.meshGroupRange.removeAll(keepingCapacity: true)
-        gbs.meshGroupsVersion &+= 1   // DH-0534: the cull bounds describe the old grouping now
-        guard !instances.isEmpty else { gbs.lastSlotKeys.removeAll(); return }
+        gbs.meshGroupsVersion &+= 1   // DH-0534: the cull bounds describe the old records now
+        guard !instances.isEmpty else {
+            gbs.meshGroups.removeAll(keepingCapacity: true)
+            gbs.meshGroupRange.removeAll(keepingCapacity: true)
+            gbs.instanceLayout = InstanceLayout(serial: gbs.instanceLayout.serial &+ 1)
+            gbs.lastSlotKeys.removeAll()
+            return
+        }
 
         // VEGETATION WIND, LIVENESS. `treeWindStrength` is a global, but as of 2026-08-17 the
         // displacement also needs a per-DRAW `windScale` (see the property's own note: without
@@ -121,22 +125,16 @@ extension IlluminatoramaRenderer {
                   + "foliage draws whose vertices pack (swayWeight, phase, flutter) in tangent.")
         }
 
-        // First pass — bucket by mesh kind, preserving first-seen order
-        // so a stable scene gives a stable buffer layout.
-        var byKind: [MeshKind: [Int]] = [:]
-        byKind.reserveCapacity(8)
-        var kindOrder: [MeshKind] = []
-        kindOrder.reserveCapacity(8)
-        for (srcIdx, ref) in instances.enumerated() {
-            if byKind[ref.meshKind] == nil {
-                byKind[ref.meshKind] = []
-                kindOrder.append(ref.meshKind)
-            }
-            byKind[ref.meshKind, default: []].append(srcIdx)
+        // The grouping: kept from the last regroup while the list's make-up holds (the draws only moved), else
+        // rebuilt (`InstanceLayout`). Kinds in first-seen order, so a stable scene gives a stable buffer layout.
+        if !gbs.instanceLayout.holds(instances) {
+            gbs.instanceLayout = Self.layout(of: instances, reusing: gbs.instanceLayout)
         }
+        let layout = gbs.instanceLayout
+        gbs.meshGroups = layout.groups
+        gbs.meshGroupRange = layout.groupRange
 
-        // Second pass — write into the buffer in grouped order, building
-        // the per-group draw recipe alongside.
+        // Write into the buffer in grouped order.
         let dst = currentInstanceBuffer.contents().bindMemory(
             to: IlluminatoramaInstance.self, capacity: instances.count
         )
@@ -146,29 +144,24 @@ extension IlluminatoramaRenderer {
         let sqDst = superquadricParamBuffer.contents().bindMemory(
             to: IlluminatoramaInstance.SuperquadricParam.self, capacity: instances.count
         )
-        var dstIdx = 0
-        for kind in kindOrder {
-            guard let srcIndices = byKind[kind] else { continue }
-            let groupStart = dstIdx
-            for srcIdx in srcIndices {
-                let ref = instances[srcIdx]
-                dst[dstIdx] = ref.data
-                if let s = ref.superquadricShape {
-                    let isEllipsoid = (abs(s.x - 1) < 1e-3 && abs(s.y - 1) < 1e-3)
-                    sqDst[dstIdx] = IlluminatoramaInstance.SuperquadricParam(
-                        invModel: simd_inverse(ref.data.modelMatrix),
-                        shape: SIMD4(s.x, s.y, isEllipsoid ? 1 : 0, 0))
-                } else {
-                    sqDst[dstIdx] = IlluminatoramaInstance.SuperquadricParam(
-                        invModel: matrix_identity_float4x4, shape: .zero)
+        let none = IlluminatoramaInstance.SuperquadricParam(invModel: matrix_identity_float4x4, shape: .zero)
+        instances.withUnsafeBufferPointer { src in
+            layout.order.withUnsafeBufferPointer { order in
+                for (dstIdx, srcIdx) in order.enumerated() {
+                    let ref = src[srcIdx]
+                    dst[dstIdx] = ref.data
+                    if let s = ref.superquadricShape {
+                        let isEllipsoid = (abs(s.x - 1) < 1e-3 && abs(s.y - 1) < 1e-3)
+                        sqDst[dstIdx] = IlluminatoramaInstance.SuperquadricParam(
+                            invModel: simd_inverse(ref.data.modelMatrix),
+                            shape: SIMD4(s.x, s.y, isEllipsoid ? 1 : 0, 0))
+                    } else {
+                        sqDst[dstIdx] = none
+                    }
                 }
-                dstIdx += 1
             }
-            gbs.meshGroups.append(MeshDrawGroup(
-                kind: kind, start: groupStart, count: srcIndices.count))
-            gbs.meshGroupRange[kind] = groupStart ..< (groupStart + srcIndices.count)
         }
-        alignPreviousInstances(order: kindOrder.flatMap { byKind[$0] ?? [] })
+        alignPreviousInstances(keys: layout.slotKeys)
     }
 
     /// DH-0534 — rebuild `meshGroupCullBounds` when its inputs changed. Everything the CPU cannot
@@ -178,20 +171,20 @@ extension IlluminatoramaRenderer {
     /// built on caller-owned buffers has no CPU-visible vertices (`cpuAuthoredVertices == false`).
     func computeCullBounds() {
         let hostWritesInstances = onEncodeGPUInstances != nil
-        let key = CullBoundsKey(groupsVersion: gbs.meshGroupsVersion, wind: treeWindStrength,
-                                hostWritesInstances: hostWritesInstances,
+        let key = CullBoundsKey(groupsVersion: gbs.meshGroupsVersion, meshesVersion: kMisc.meshesVersion,
+                                wind: treeWindStrength, hostWritesInstances: hostWritesInstances,
                                 repackCount: fxs.gpuRepackTasks.count)
         if key == gbs.cullBoundsKey, gbs.meshGroupCullBounds.count == gbs.meshGroups.count { return }
         gbs.cullBoundsKey = key
         gbs.meshGroupCullBounds.removeAll(keepingCapacity: true)
         let total = gbs.meshGroups.last.map { $0.start + $0.count } ?? 0
         guard total > 0 else { return }
-        let repacked = Set(fxs.gpuRepackTasks.map(\.kind))
+        let repacked = fxs.gpuRepackTasks.isEmpty ? [] : Set(fxs.gpuRepackTasks.map(\.kind))
         let inst = currentInstanceBuffer.contents()
             .bindMemory(to: IlluminatoramaInstance.self, capacity: total)
-        for group in gbs.meshGroups {
-            guard !hostWritesInstances, !repacked.contains(group.kind),
-                  let mesh = meshes[group.kind], mesh.cpuAuthoredVertices,
+        for (gi, group) in gbs.meshGroups.enumerated() {
+            guard !hostWritesInstances, repacked.isEmpty || !repacked.contains(group.kind),
+                  let mesh = groupMesh(gi, group), mesh.cpuAuthoredVertices,
                   let local = mesh.boundingSphere else {
                 gbs.meshGroupCullBounds.append(.unbounded)
                 continue

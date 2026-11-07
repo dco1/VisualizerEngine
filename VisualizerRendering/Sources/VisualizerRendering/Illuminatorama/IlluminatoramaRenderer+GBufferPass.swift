@@ -145,10 +145,10 @@ extension IlluminatoramaRenderer {
             // Superquadric impostor box kinds are drawn by the impostor pipeline
             // below; RT-proxy kinds exist only in the TLAS; shadow-only kinds are
             // lighting occluders that draw solely into the shadow maps. All skipped here.
-            if gbs.impostorMeshKinds.contains(group.kind) ||
-               rts.rtProxyMeshKinds.contains(group.kind) ||
-               shadowOnlyMeshKinds.contains(group.kind) { continue }
-            guard let mesh = meshes[group.kind] else { continue }
+            if (!gbs.impostorMeshKinds.isEmpty && gbs.impostorMeshKinds.contains(group.kind)) ||
+               (!rts.rtProxyMeshKinds.isEmpty && rts.rtProxyMeshKinds.contains(group.kind)) ||
+               (!shadowOnlyMeshKinds.isEmpty && shadowOnlyMeshKinds.contains(group.kind)) { continue }
+            guard let mesh = groupMesh(gi, group) else { continue }
             if shouldCull(gi, group, mesh, cullClip, drawn: \.gbufferDrawn, culled: \.gbufferCulled) { continue }
             // Two-sided meshes (open / dynamic MC fluid surfaces) render cull
             // `.none` so they don't go hollow when their back side faces the

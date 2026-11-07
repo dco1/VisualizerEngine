@@ -11,29 +11,44 @@ import Metal
 // Now: each slot gets a key (`InstanceSlotKey`). When this frame's keys differ from last frame's,
 // last frame's records are copied into a buffer in THIS frame's layout and bound as the previous
 // instances for the frame. Only a frame whose make-up changed pays (one dictionary build and one
-// pass over the records); a steady list costs a key compare.
+// pass over the records); a steady list costs nothing here (its keys are last frame's array, `InstanceLayout`).
 
 extension IlluminatoramaRenderer {
-    /// Who a grouped slot holds: `(kind, persistentID)` for a named draw, `(kind, nth unnamed)` otherwise.
+    /// Who a grouped slot holds: `(kind, persistentID)` for a named draw, `(kind, nth unnamed)` otherwise. Hashed by
+    /// the kind's hash worked out once (`InstanceLayout`), not by its string.
     struct InstanceSlotKey: Hashable {
         let kind: MeshKind
+        let kindHash: Int
         let id: UInt64
         let ordinal: Int32
+        static func == (a: InstanceSlotKey, b: InstanceSlotKey) -> Bool {
+            a.id == b.id && a.ordinal == b.ordinal && a.kindHash == b.kindHash && a.kind == b.kind
+        }
+        func hash(into hasher: inout Hasher) {
+            hasher.combine(kindHash); hasher.combine(id); hasher.combine(ordinal)
+        }
     }
 
     /// The keys of `instances` taken in `order` (source indices in grouped-slot order).
     static func slotKeys(_ instances: [InstanceRef], order: [Int]) -> [InstanceSlotKey] {
-        var unnamed: [MeshKind: Int32] = [:]
+        slotKeys(instances, order: order, kindHashes: instances.map(\.meshKind.hashValue))
+    }
+
+    /// `slotKeys(_:order:)` with each source draw's kind hash already worked out (index-parallel to `instances`).
+    static func slotKeys(_ instances: [InstanceRef], order: [Int], kindHashes: [Int]) -> [InstanceSlotKey] {
+        var unnamed: [HashedKind: Int32] = [:]
         var keys: [InstanceSlotKey] = []
         keys.reserveCapacity(order.count)
         for i in order {
             let ref = instances[i]
+            let h = kindHashes[i]
             if ref.persistentID != 0 {
-                keys.append(InstanceSlotKey(kind: ref.meshKind, id: ref.persistentID, ordinal: 0))
+                keys.append(InstanceSlotKey(kind: ref.meshKind, kindHash: h, id: ref.persistentID, ordinal: 0))
             } else {
-                let n = unnamed[ref.meshKind, default: 0]
-                unnamed[ref.meshKind] = n + 1
-                keys.append(InstanceSlotKey(kind: ref.meshKind, id: 0, ordinal: n))
+                let k = HashedKind(ref.meshKind, hash: h)
+                let n = unnamed[k, default: 0]
+                unnamed[k] = n + 1
+                keys.append(InstanceSlotKey(kind: ref.meshKind, kindHash: h, id: 0, ordinal: n))
             }
         }
         return keys
@@ -47,11 +62,13 @@ extension IlluminatoramaRenderer {
 
     /// After `uploadInstances` has written this frame's grouped records: when the layout moved, lay last
     /// frame's records out like this frame's and bind them as the previous instances (`prevAlignedActive`).
-    func alignPreviousInstances(order: [Int]) {
+    ///
+    /// `keys` are this frame's slot keys (`InstanceLayout.slotKeys`). While the make-up holds they are the very array
+    /// last frame stored, so the compare below is a storage-identity check, not a walk over every key.
+    func alignPreviousInstances(keys: [InstanceSlotKey]) {
         // A host kernel may rewrite slots on the GPU after this upload, so the CPU's copy of last frame
         // would not be what was drawn: keep the plain ping-pong there (the pre-alignment behaviour).
         guard onEncodeGPUInstances == nil else { gbs.lastSlotKeys.removeAll(); return }
-        let keys = Self.slotKeys(instances, order: order)
         defer { gbs.lastSlotKeys = keys }
         guard !gbs.lastSlotKeys.isEmpty, keys != gbs.lastSlotKeys,
               let ring = alignedRing(capacity: keys.count) else { return }

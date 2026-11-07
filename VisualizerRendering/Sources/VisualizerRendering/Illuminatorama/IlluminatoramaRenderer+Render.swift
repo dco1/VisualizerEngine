@@ -135,6 +135,7 @@ extension IlluminatoramaRenderer {
         updatePointShadows()
         uploadFrameUniforms()
         uploadInstances()
+        refreshMeshGroupMeshes()
         computeCullBounds()   // DH-0534 — reads the CPU-written instance copy, before any GPU hook
         uploadPointLights()
         uploadSpotLights()

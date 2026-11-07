@@ -177,19 +177,35 @@ public final class IlluminatoramaMesh {
     /// caller building a mesh off the main thread can work it out there and hand it to `init(…bounds:)`: the scan is a
     /// pass over every vertex, ~40 ms of one frame for a few hundred thousand of them (an iPhone 15 Pro, Debug).
     public nonisolated static func boundingSphere(of vertices: [IlluminatoramaVertex]) -> (center: SIMD3<Float>, radius: Float)? {
+        cullBounds(of: vertices)?.bounds
+    }
+
+    /// The wind bound `windAttributeMax` finds on first ask (floored at 1), free of the main actor like
+    /// `boundingSphere(of:)`: a caller building a mesh off the main thread works it out there and hands it to
+    /// `init(…wind:)`, so the first frame that culls the mesh doesn't scan every vertex on the main one.
+    public nonisolated static func windAttributeMax(of vertices: [IlluminatoramaVertex]) -> (sway: Float, flutter: Float) {
+        vertices.withUnsafeBufferPointer { buf in
+            var sway: Float = 1, flutter: Float = 1
+            for v in buf { sway = max(sway, v.tangent.x); flutter = max(flutter, v.tangent.z) }
+            return (sway: sway, flutter: flutter)
+        }
+    }
+
+    /// `boundingSphere(of:)` and `windAttributeMax(of:)` in one pass over the vertices: everything visibility culling
+    /// reads of a CPU-built mesh, for `init(…bounds:wind:)`.
+    public nonisolated static func cullBounds(of vertices: [IlluminatoramaVertex])
+        -> (bounds: (center: SIMD3<Float>, radius: Float), wind: (sway: Float, flutter: Float))? {
         guard !vertices.isEmpty else { return nil }
-        return vertices.withUnsafeBufferPointer { buf -> (center: SIMD3<Float>, radius: Float) in
+        return vertices.withUnsafeBufferPointer { buf in
             var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
             var hi = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
-            var i = 0
-            let n = buf.count
-            while i < n {
-                let p = buf[i].position
-                lo = simd_min(lo, p); hi = simd_max(hi, p)
-                i += 1
+            var sway: Float = 1, flutter: Float = 1
+            for v in buf {
+                lo = simd_min(lo, v.position); hi = simd_max(hi, v.position)
+                sway = max(sway, v.tangent.x); flutter = max(flutter, v.tangent.z)
             }
             let c = (lo + hi) * 0.5
-            return (center: c, radius: simd_length(hi - c))
+            return (bounds: (center: c, radius: simd_length(hi - c)), wind: (sway: sway, flutter: flutter))
         }
     }
 
@@ -222,7 +238,8 @@ public final class IlluminatoramaMesh {
     /// `tangent.x`, `flutter` is `tangent.z`, exactly what `applyTreeWind` reads — so visibility
     /// culling (DH-0534) can bound how far the gust moves a vertex. Floored at 1: a tangent the
     /// GPU synthesis pass writes later is a unit vector, and a scan taken before it lands must not
-    /// under-bound it. nil for GPU-only vertices (the caller then treats the draw as unbounded).
+    /// under-bound it. nil for GPU-only vertices (the caller then treats the draw as unbounded). Scanned on first ask,
+    /// on the main thread, unless the init was handed it (`wind:`, from `windAttributeMax(of:)` / `cullBounds(of:)`).
     public var windAttributeMax: (sway: Float, flutter: Float)? {
         if let cached = cachedWindAttributeMax { return cached }
         guard vertexBuffer.storageMode != .private, vertexCount > 0 else { return nil }
@@ -248,11 +265,13 @@ public final class IlluminatoramaMesh {
     /// that API, and a registration-based rule left every one of them unculled.
     public private(set) var cpuAuthoredVertices: Bool = true
 
-    /// `bounds`: the vertices' bounding sphere if the caller already worked it out (`boundingSphere(of:)`, off the main
-    /// thread); left nil it's scanned on first ask.
+    /// `bounds` / `wind`: the vertices' bounding sphere and wind bound if the caller already worked them out
+    /// (`cullBounds(of:)`, off the main thread); left nil each is scanned on first ask.
     public init(device: MTLDevice, vertices: [IlluminatoramaVertex], indices: [UInt16],
-                bounds: (center: SIMD3<Float>, radius: Float)? = nil) {
+                bounds: (center: SIMD3<Float>, radius: Float)? = nil,
+                wind: (sway: Float, flutter: Float)? = nil) {
         self.cachedBoundingSphere = bounds
+        self.cachedWindAttributeMax = wind
         guard let vb = device.makeBuffer(
             bytes: vertices,
             length: MemoryLayout<IlluminatoramaVertex>.stride * vertices.count,
@@ -272,11 +291,13 @@ public final class IlluminatoramaMesh {
         self.vertexCount = vertices.count
     }
 
-    /// `bounds`: the vertices' bounding sphere if the caller already worked it out (`boundingSphere(of:)`, off the main
-    /// thread); left nil it's scanned on first ask.
+    /// `bounds` / `wind`: the vertices' bounding sphere and wind bound if the caller already worked them out
+    /// (`cullBounds(of:)`, off the main thread); left nil each is scanned on first ask.
     public init(device: MTLDevice, vertices: [IlluminatoramaVertex], indices: [UInt32],
-                bounds: (center: SIMD3<Float>, radius: Float)? = nil) {
+                bounds: (center: SIMD3<Float>, radius: Float)? = nil,
+                wind: (sway: Float, flutter: Float)? = nil) {
         self.cachedBoundingSphere = bounds
+        self.cachedWindAttributeMax = wind
         guard let vb = device.makeBuffer(
             bytes: vertices,
             length: MemoryLayout<IlluminatoramaVertex>.stride * vertices.count,

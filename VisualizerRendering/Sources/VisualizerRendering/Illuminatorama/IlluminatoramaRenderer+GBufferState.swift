@@ -178,6 +178,12 @@ final class GBufferState {
     /// per-frame `onEncodeGPUInstances` lookup is a hash probe, not a linear
     /// scan of `meshGroups`.
     var meshGroupRange: [IlluminatoramaRenderer.MeshKind: Range<Int>] = [:]
+    /// The draw list's make-up at the last regroup and what was derived from it (`InstanceLayout`).
+    var instanceLayout = IlluminatoramaRenderer.InstanceLayout()
+    /// Each entry of `meshGroups`' registered mesh, index-parallel (`refreshMeshGroupMeshes`), and what it was built for:
+    /// `(instanceLayout.serial, meshesVersion)`.
+    var meshGroupMeshes: [IlluminatoramaMesh?] = []
+    var meshGroupMeshesKey = (-1, -1)
 }
 
 // MARK: - Pipeline / resource construction (called from `init`, in the order it lists)

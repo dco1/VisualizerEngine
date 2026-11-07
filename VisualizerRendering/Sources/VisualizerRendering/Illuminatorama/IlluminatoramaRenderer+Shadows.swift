@@ -81,8 +81,9 @@ extension IlluminatoramaRenderer {
             let instStride = MemoryLayout<IlluminatoramaInstance>.stride
             let cullClip = cullVolume(lightVP)   // DH-0534
             for (gi, group) in gbs.meshGroups.enumerated() {
-                if directionalShadowExcludedKinds.contains(group.kind) { continue }  // e.g. lamps — no sun shadow
-                guard let mesh = meshes[group.kind] else { continue }
+                if !directionalShadowExcludedKinds.isEmpty,
+                   directionalShadowExcludedKinds.contains(group.kind) { continue }  // e.g. lamps — no sun shadow
+                guard let mesh = groupMesh(gi, group) else { continue }
                 if shouldCull(gi, group, mesh, cullClip, drawn: \.cascadeDrawn, culled: \.cascadeCulled) { continue }
                 let want = shadowCullMode(mesh)
                 if want != cull { cull = want; enc.setCullMode(cull) }
@@ -496,7 +497,7 @@ extension IlluminatoramaRenderer {
             let instStride = MemoryLayout<IlluminatoramaInstance>.stride
             let cullClip = cullVolume(lightVP)   // DH-0534
             for (gi, group) in gbs.meshGroups.enumerated() {
-                guard let mesh = meshes[group.kind] else { continue }
+                guard let mesh = groupMesh(gi, group) else { continue }
                 if shouldCull(gi, group, mesh, cullClip, drawn: \.spotDrawn, culled: \.spotCulled) { continue }
                 let want = shadowCullMode(mesh)
                 if want != cull { cull = want; enc.setCullMode(cull) }
@@ -649,7 +650,7 @@ extension IlluminatoramaRenderer {
 
                 let cullClip = cullVolume(lightVP)   // DH-0534
                 for (gi, group) in gbs.meshGroups.enumerated() {
-                    guard let mesh = meshes[group.kind] else { continue }
+                    guard let mesh = groupMesh(gi, group) else { continue }
                     if shouldCull(gi, group, mesh, cullClip, drawn: \.pointDrawn, culled: \.pointCulled) { continue }
                     let want = shadowCullMode(mesh)
                     if want != cull { cull = want; enc.setCullMode(cull) }
