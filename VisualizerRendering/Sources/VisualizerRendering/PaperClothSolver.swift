@@ -1120,8 +1120,10 @@ public final class PaperClothSolver {
         }
         let record = layerFrictionOn ? layerFriction : nil
         record?.encodeClear(cb, particleCount: n)
+        // `sortBuckets`: `paperSelfCollide` sums each bucket's contacts in ascending id order, and its own local sort
+        // only reaches 64 deep — a bed's king stack settles with 67-id buckets, and the bake stopped repeating (DH-1610).
         hashGrid.encodeBuild(cb, particles: particleBuffer.buffer, particleCount: n,
-                             cellSize: legacyPushout ? 0.05 : selfCellSize, label: "PaperCloth")
+                             cellSize: legacyPushout ? 0.05 : selfCellSize, sortBuckets: true, label: "PaperCloth")
         // Two Jacobi relaxation passes against the same buckets. Each pass reads
         // from a SNAPSHOT of the particle buffer and writes only its own particle —
         // without it the kernel races its own writes (whether a thread sees a

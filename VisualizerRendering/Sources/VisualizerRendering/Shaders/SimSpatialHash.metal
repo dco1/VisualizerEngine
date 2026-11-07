@@ -71,3 +71,30 @@ kernel void simHashScatter(device const uchar* records [[buffer(0)]],
     uint slot = atomic_fetch_add_explicit(&cursor[h], 1u, memory_order_relaxed);
     sorted[offsets[h] + slot] = id;
 }
+
+// DETERMINISTIC BUCKET ORDER (opt-in, `SimSpatialHash.encodeBuild(sortBuckets:)`). The scatter fills each bucket through an
+// atomic cursor, so its order differs run to run, and a self-collide that sums contacts in bucket order is then not
+// associative from run to run: the same contacts, summed in another order, drift a settle by fractions of a millimetre that
+// chaos amplifies. PaperCloth used to sort a LOCAL copy of each bucket, 64 entries deep, and walk anything past 64 in
+// scatter order — fine until a bucket overflowed. On Daydream Home's king bed (six sheets, the duvet's 33 mm hash cell,
+// two pillow skins finely sampled in it) settled buckets reach 67 (queen 61, twin 32), and the bake stopped repeating:
+// the same solve, run in three processes, matched its shipped grid exactly on the twin every time and diverged by up to
+// 35 mm on a king pillow (DH-1610). So sort every bucket here, once per build — one thread per bucket, an insertion sort
+// in place (buckets hold tens of ids) — and every consumer walks ascending ids whatever the bucket's size.
+kernel void simHashSortBuckets(device const uint* counts  [[buffer(0)]],
+                               device const uint* offsets [[buffer(1)]],
+                               device uint* sorted        [[buffer(2)]],
+                               constant uint& tableSize   [[buffer(3)]],
+                               uint id [[thread_position_in_grid]])
+{
+    if (id >= tableSize) return;
+    uint n = counts[id];
+    if (n < 2u) return;
+    device uint* b = sorted + offsets[id];
+    for (uint a = 1u; a < n; ++a) {
+        uint v = b[a];
+        uint k = a;
+        while (k > 0u && b[k - 1u] > v) { b[k] = b[k - 1u]; --k; }
+        b[k] = v;
+    }
+}

@@ -13,6 +13,7 @@ public final class SimSpatialHash {
     public let offsets: MTLBuffer     // uint[tableSize]
     public let sorted: MTLBuffer      // uint[maxParticles]
     private let clear, count, scan, scatter: MTLComputePipelineState
+    private let sortBucketsPipeline: MTLComputePipelineState?
 
     public init?(device: MTLDevice, maxParticles: Int, tableSize: Int = 1 << 14, label: String) {
         let cache = SimPipelineCache.shared
@@ -27,11 +28,16 @@ public final class SimSpatialHash {
         counts = ccBuf; offsets = coBuf; sorted = srBuf
         ccBuf.label = "\(label).hashCounts"; coBuf.label = "\(label).hashOffsets"; srBuf.label = "\(label).hashSorted"
         clear = c0; count = c1; scan = c2; scatter = c3
+        sortBucketsPipeline = cache.pipelineState(name: "simHashSortBuckets", device: device)
     }
 
     /// Clear → count → scan → scatter over `particleCount` records of `byteStride` bytes.
+    ///
+    /// `sortBuckets`: then sort every bucket's ids ascending (`simHashSortBuckets`), so a consumer that sums contacts in
+    /// bucket order sums them in the same order every run, at any bucket size — the scatter's atomic cursor does not.
+    /// Off by default: the solvers that do not ask for it keep their exact behaviour and cost.
     public func encodeBuild(_ cb: MTLCommandBuffer, particles: MTLBuffer, particleCount n: Int, cellSize: Float,
-                            byteStride: Int = 32, posOffset: Int = 0, label: String) {
+                            byteStride: Int = 32, posOffset: Int = 0, sortBuckets: Bool = false, label: String) {
         guard n > 0 else { return }
         var uniforms = SimHashBuildUniformsCPU(count: UInt32(n), tableSize: UInt32(tableSize), cellSize: cellSize,
                                                byteStride: UInt32(byteStride), posOffset: UInt32(posOffset),
@@ -66,6 +72,12 @@ public final class SimSpatialHash {
             e.setBuffer(offsets, offset: 0, index: 2); e.setBuffer(sorted, offset: 0, index: 3)
             e.setBytes(&uniforms, length: MemoryLayout<SimHashBuildUniformsCPU>.stride, index: 4)
             dispatch(e, scatter, n); e.endEncoding()
+        }
+        if sortBuckets, let sortBucketsPipeline, let e = cb.makeComputeCommandEncoder() {
+            e.label = "\(label).hashSortBuckets"; e.setComputePipelineState(sortBucketsPipeline)
+            e.setBuffer(counts, offset: 0, index: 0); e.setBuffer(offsets, offset: 0, index: 1)
+            e.setBuffer(sorted, offset: 0, index: 2); e.setBytes(&table, length: 4, index: 3)
+            dispatch(e, sortBucketsPipeline, tableSize); e.endEncoding()
         }
     }
 }

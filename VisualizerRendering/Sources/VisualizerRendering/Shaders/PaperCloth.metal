@@ -734,8 +734,10 @@ kernel void paperSelfCollide(device PBDParticle* P          [[ buffer(0) ]],
         // associative, so the same contacts summed in a different order drift the
         // bake by fractions of a millimetre that chaos then amplifies. Iterate each
         // bucket in ascending particle order instead (insertion sort of a small
-        // local copy); overflow beyond the local buffer keeps scatter order, which
-        // only a degenerate all-in-one-bucket configuration would ever hit.
+        // local copy). Past the local buffer the bucket is walked as stored — and
+        // the solver builds its hash with `sortBuckets`, so stored IS ascending
+        // (Daydream Home DH-1610: a king bed's stack settles with 67-id buckets,
+        // which this note once called degenerate, and the bake stopped repeating).
         uint bucket[64];
         uint m = min(cnt, 64u);
         for (uint k = 0u; k < m; ++k) bucket[k] = sorted[start + k];
