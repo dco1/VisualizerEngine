@@ -176,14 +176,14 @@ public final class IlluminatoramaMesh {
     /// The bounding sphere of `vertices`, the same one `boundingSphere` finds on first ask. Free of the main actor, so a
     /// caller building a mesh off the main thread can work it out there and hand it to `init(…bounds:)`: the scan is a
     /// pass over every vertex, ~40 ms of one frame for a few hundred thousand of them (an iPhone 15 Pro, Debug).
-    public nonisolated static func boundingSphere(of vertices: [IlluminatoramaVertex]) -> (center: SIMD3<Float>, radius: Float)? {
+    @inlinable public nonisolated static func boundingSphere(of vertices: [IlluminatoramaVertex]) -> (center: SIMD3<Float>, radius: Float)? {
         cullBounds(of: vertices)?.bounds
     }
 
     /// The wind bound `windAttributeMax` finds on first ask (floored at 1), free of the main actor like
     /// `boundingSphere(of:)`: a caller building a mesh off the main thread works it out there and hands it to
     /// `init(…wind:)`, so the first frame that culls the mesh doesn't scan every vertex on the main one.
-    public nonisolated static func windAttributeMax(of vertices: [IlluminatoramaVertex]) -> (sway: Float, flutter: Float) {
+    @inlinable public nonisolated static func windAttributeMax(of vertices: [IlluminatoramaVertex]) -> (sway: Float, flutter: Float) {
         vertices.withUnsafeBufferPointer { buf in
             var sway: Float = 1, flutter: Float = 1
             for v in buf { sway = max(sway, v.tangent.x); flutter = max(flutter, v.tangent.z) }
@@ -192,8 +192,9 @@ public final class IlluminatoramaMesh {
     }
 
     /// `boundingSphere(of:)` and `windAttributeMax(of:)` in one pass over the vertices: everything visibility culling
-    /// reads of a CPU-built mesh, for `init(…bounds:wind:)`.
-    public nonisolated static func cullBounds(of vertices: [IlluminatoramaVertex])
+    /// reads of a CPU-built mesh, for `init(…bounds:wind:)`. These scans are `@inlinable` so a host building the engine
+    /// as a Debug package (-Onone) still runs them at its own optimisation level.
+    @inlinable public nonisolated static func cullBounds(of vertices: [IlluminatoramaVertex])
         -> (bounds: (center: SIMD3<Float>, radius: Float), wind: (sway: Float, flutter: Float))? {
         guard !vertices.isEmpty else { return nil }
         return vertices.withUnsafeBufferPointer { buf in
