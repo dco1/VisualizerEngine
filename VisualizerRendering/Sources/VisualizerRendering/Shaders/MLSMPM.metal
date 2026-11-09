@@ -46,14 +46,23 @@ struct MLSUniforms {
     float4 gravity;          // xyz = gravity, w = pad
     // Elastoplastic "droopy sauce" params (ignored when materialMode == 0).
     float4 plasticA;         // x = mu0, y = lambda0, z = xi (hardening), w = thetaC
-    float4 plasticB;         // x = thetaS, y = materialMode (0=fluid,1=elastoplastic), zw = pad
+    float4 plasticB;         // x = thetaS, y = materialMode (0=fluid,1=elastoplastic), z = thrown-liquid J relaxation (0 = off), w = 1: the floor may be dry
     // Axisymmetric VESSEL boundary (MLSMPMSolver.vessel) — off when vesselA.x == 0, and then
     // every kernel is byte-identical to the box-only solver.
-    float4 vesselA;          // x = enabled (>0.5), y/z = axis (x, z), w = floor y
+    float4 vesselA;          // x = enabled (1; 2 = and open above its profile), y/z = axis (x, z), w = floor y
     float4 vesselB;          // x = profile y0, y = 1/dy, z = profile samples, w = wall friction
     float4 fluidC;           // x = J-from-density relaxation per substep (0 = off, byte-identical)
                              // y = 1: no tension (pressure ≥ 0 — water does not pull itself together)
+                             // z = cohesion: with y = 1, the suction still allowed, as a fraction of k
+                             // w = an open vessel's wall thickness (m)
+    // Pouring (`MLSMPMSolver.emitters`, `killBelowY`): a particle with mass 0 is DEAD (skipped by every
+    // particle kernel); the emitters revive them, the kill plane parks them.
+    float4 pourA;            // x = 1: kill plane on, y = kill plane y, z = aeration gain (0 = off), w = aeration decay (1/s)
 };
+
+// Pour statistics (a small shared uint buffer; MLSMPMSolver.pourStats reads it): the free list's length for this substep,
+// then running totals of particles emitted, emitters' particles dropped for want of a free slot, and particles killed.
+constant uint kStatFree = 0, kStatEmitted = 1, kStatDropped = 2, kStatKilled = 3;
 
 // ── Utilities ───────────────────────────────────────────────────────────────
 
@@ -90,11 +99,51 @@ inline float mls_vessel_wall(float3 x, constant MLSUniforms& U, constant float* 
     float  t   = f - float(i);
     float  r0  = prof[i], r1 = prof[min(i + 1, n - 1)];
     float  R   = mix(r0, r1, t);
-    float  dR  = (r1 - r0) * U.vesselB.y;
+    // Above (and below) the table the wall is a straight cylinder: no slope. (Carrying the last
+    // segment's slope up made a profile that ends in a step a LID: every node above the rim got a
+    // sideways-and-down wall normal, and liquid poured in from above hovered there.)
+    bool   on  = x.y >= U.vesselB.x && f < float(n - 1) - 1e-3f;
+    float  dR  = on ? (r1 - r0) * U.vesselB.y : 0.0f;
     float3 g   = float3(-er.x, dR, -er.y);
     float  gl  = length(g);
     nIn = g / gl;
-    return (R - rho) / gl;
+    float  dIn = (R - rho) / gl;
+    if (U.vesselA.x < 1.5f) return dIn;
+    // Open above (`Vessel.openAbove`): the container is a wall `fluidC.w` thick that ENDS at the profile's top — an inner face,
+    // a flat rim, an outer face — and this is the distance to the nearest of them (negative inside the wall's solid), with the
+    // normal that leads out of it. Liquid that rises past the rim runs over the rim's top and down the outside.
+    float  wt    = U.fluidC.w;
+    float  above = x.y - (U.vesselB.x + float(n - 1) / U.vesselB.y);
+    float3 e3    = float3(er.x, 0.0f, er.y), up = float3(0.0f, 1.0f, 0.0f);
+    if (above >= 0.0f) {
+        if (rho <= R) {                                   // over the opening: the rim's inner edge is the nearest thing
+            float2 q = float2(R - rho, above); float l = max(length(q), 1e-6f);
+            nIn = (-e3 * q.x + up * q.y) / l;
+            return l;
+        }
+        if (rho <= R + wt) { nIn = up; return above; }     // over the rim's top
+        float2 q = float2(rho - R - wt, above); float l = max(length(q), 1e-6f);
+        nIn = (e3 * q.x + up * q.y) / l;
+        return l;
+    }
+    if (rho <= R) return dIn;                             // in the liquid's room
+    if (rho >= R + wt) { nIn = e3; return rho - R - wt; }   // outside, beside the outer face
+    float dInner = rho - R, dTop = -above, dOuter = R + wt - rho;        // inside the wall's solid: out by the nearest face
+    if (dTop <= dInner && dTop <= dOuter) { nIn = up; return -dTop; }
+    if (dInner <= dOuter) return -dInner / gl;
+    nIn = e3;
+    return -dOuter;
+}
+
+// The floor is under the container only: with an open vessel (`Vessel.openAbove`), a point beyond the wall's outer face has
+// none (it falls past, to the host's kill plane or the domain's floor).
+inline bool mls_vessel_has_floor(float3 x, constant MLSUniforms& U, constant float* prof) {
+    if (U.vesselA.x < 1.5f) return true;
+    int   n = max(int(U.vesselB.z), 2);
+    float f = clamp((x.y - U.vesselB.x) * U.vesselB.y, 0.0f, float(n - 1) - 1e-3f);
+    int   i = int(f);
+    float R = mix(prof[i], prof[min(i + 1, n - 1)], f - float(i));
+    return length(x.xz - U.vesselA.yz) <= R + U.fluidC.w;
 }
 
 // Keep only the velocity that does not run into the wall / floor wherever either is closer
@@ -103,7 +152,7 @@ inline float3 mls_vessel_separate(float3 x, float3 v, float band, float mu,
                                   constant MLSUniforms& U, constant float* prof) {
     float3 nW;
     float dW = mls_vessel_wall(x, U, prof, nW);
-    float dF = x.y - U.vesselA.w;
+    float dF = mls_vessel_has_floor(x, U, prof) ? x.y - U.vesselA.w : 1e6f;
     if (dW < band) {
         float vn = dot(v, nW);
         if (vn < 0.0f) {
@@ -124,15 +173,18 @@ inline float3 mls_vessel_separate(float3 x, float3 v, float band, float mu,
 // always come back to the glass. (A banded "separate" cannot: inside the band motion toward the
 // wall is forbidden outright, so whatever drains off an overhanging wall never climbs back.)
 // The floor keeps its band below `floorBand` (see the G2P call); above it, the same clamp.
-inline float3 mls_vessel_approach(float3 x, float3 v, float dt, float skin, float floorBand,
+//
+// `floorOpen`: the floor's cell is not yet full (a pour onto a dry floor, a film thinner than a cell): the band would stop the
+// rain a whole cell above the floor, in a sheet the grid cannot see is crowded, so there the floor too is a speculative contact.
+inline float3 mls_vessel_approach(float3 x, float3 v, float dt, float skin, float floorBand, bool floorOpen,
                                   constant MLSUniforms& U, constant float* prof) {
     float3 nW;
     float dW = mls_vessel_wall(x, U, prof, nW);
     float vn = dot(v, nW);                                  // + = leaving the wall
     float limW = -max(0.0f, dW - skin) / dt;
     if (vn < limW) v += (limW - vn) * nW;
-    float dF = x.y - U.vesselA.w;
-    if (dF < floorBand) {
+    float dF = mls_vessel_has_floor(x, U, prof) ? x.y - U.vesselA.w : 1e6f;
+    if (dF < floorBand && !floorOpen) {
         if (v.y < 0.0f) v.y = 0.0f;
     } else {
         float limF = -max(0.0f, dF - skin) / dt;
@@ -362,6 +414,7 @@ kernel void mlsCellCount(
     if (pid >= pCount) return;
 
     MLSParticle p = particles[pid];
+    if (p.positionMass.w <= 0.0f) return;      // dead (parked, not yet emitted)
     float3 fpos = (p.positionMass.xyz - U.boundsMin.xyz) * U.dxParams.y;
     int3   base = int3(floor(fpos - 0.5f));
     int3   centre = clamp(base + int3(1), int3(0), int3(U.gridRes.xyz) - 1);
@@ -458,6 +511,7 @@ kernel void mlsScatterParticles(
     if (pid >= pCount) return;
 
     MLSParticle p = particles[pid];
+    if (p.positionMass.w <= 0.0f) return;      // dead: no bin slot, no record (the count skipped it too)
     float3 fpos = (p.positionMass.xyz - U.boundsMin.xyz) * U.dxParams.y;
     int3   base = int3(floor(fpos - 0.5f));
     int3   centre = clamp(base + int3(1), int3(0), int3(U.gridRes.xyz) - 1);
@@ -475,7 +529,17 @@ kernel void mlsScatterParticles(
         // as zero pressure, not suction — the weakly-compressible EOS's negative branch pulls
         // surface particles into clumps (the tensile instability) and compacts the liquid.
         float3x3 F = p.F;
-        if (U.fluidC.y > 0.5f && determinant(F) > 1.0f) F = float3x3(1.0f);
+        // …but for `cohesion` (fluidC.z, 0…1): the suction is kept up to that fraction of k and no further. A stream in free
+        // fall is stretched along its length, and it is this little suction that draws it in as it goes (a liquid does not
+        // thin out into a mist: it necks); it is far too weak to hold a splash together.
+        if (U.fluidC.y > 0.5f) {
+            float J = determinant(F);
+            if (J > 1.0f) {
+                float c = min(U.fluidC.z, 0.99f);
+                float Jmax = c > 0.0f ? pow(1.0f - c, -1.0f / U.matParams.y) : 1.0f;
+                F = float3x3(pow(min(J, Jmax), 1.0f / 3.0f));
+            }
+        }
         stress = fluid_stress(F, p.C, U.matParams.x, U.matParams.y, U.matParams.w);
     }
     float D_inv = 4.0f * U.dxParams.y * U.dxParams.y;
@@ -663,13 +727,16 @@ kernel void mlsG2P(
     device const MLSGridNode* grid      [[ buffer(1) ]],
     constant MLSUniforms&     U         [[ buffer(2) ]],
     constant float*           vesselR   [[ buffer(3) ]],
+    device atomic_uint*       pourStats [[ buffer(4) ]],
     uint                      pid       [[ thread_position_in_grid ]])
 {
     uint pCount = U.gridRes.w;
     if (pid >= pCount) return;
 
     MLSParticle p = particles[pid];
+    if (p.positionMass.w <= 0.0f) return;      // dead
     float3 pos = p.positionMass.xyz;
+    float3 velOld = p.velocityJp.xyz;
     float dx    = U.dxParams.x;
     float invDx = U.dxParams.y;
     float dt    = U.dxParams.z;
@@ -689,6 +756,7 @@ kernel void mlsG2P(
     float3   vel_new = float3(0);
     float3x3 C_new   = float3x3(0);
     float    density = 0;
+    float3   rowMass = float3(0);      // the mass over this particle at each of its stencil's three heights
 
     for (int i = 0; i < 3; i++)
     for (int j = 0; j < 3; j++)
@@ -702,6 +770,7 @@ kernel void mlsG2P(
         vel_new += w * gv;
         C_new   += 4.0f * invDx * invDx * w * outer3(gv, off);
         density += w * grid[idx].momentumMass.w;
+        rowMass[j] += wx[i] * wz[k] * grid[idx].momentumMass.w;
     }
 
     // Update deformation gradient: F_new = (I + dt·C) F_old  (BOTH materials).
@@ -732,6 +801,16 @@ kernel void mlsG2P(
         if (relax > 0.0f && density > 0.9f * U.matParams.z) {
             J = mix(J, clamp(U.matParams.z / density, 0.5f, 2.0f), relax);
         }
+        // …and the other way: a particle cannot be MORE compressed than even a half-empty stencil (a free surface) would make
+        // the density it gathers. Liquid that has been thrown about (a pour's splash) comes down with a J that says
+        // "compressed" in a cloud a third as dense as rest, and that phantom pressure held the cloud up for good (measured:
+        // 2.4 L poured into a cylinder settled 14 cm deep, not 7.7).
+        // (Opt-in, `MLSMPMSolver.thrownRelax` in plasticB.z: beside a wall the stencil is short by the wall's share as well,
+        // and in a channel a few cells wide that is most of the liquid.)
+        if (U.plasticB.z > 0.0f) {
+            float least = clamp(0.5f * U.matParams.z / max(density, 1e-3f), 0.5f, 2.0f);
+            if (J < least) J = mix(J, least, min(1.0f, U.plasticB.z));
+        }
         float cbrtJ = pow(J, 1.0f / 3.0f);
         p.F  = cbrtJ * I;
         p.velocityJp.w = J;
@@ -759,7 +838,22 @@ kernel void mlsG2P(
     // down off the glass could never climb back — a 6 cm gutter round a coffee pot's shoulder
     // (VesselLiquidMeshTests.testBelliedVesselSurfaceStaysLevelToTheWall).
     if (U.vesselA.x > 0.5f) {
-        vel_new = mls_vessel_approach(pos, vel_new, dt, 1e-3f, dx, U, vesselR);
+        // Is the floor's cell full? The stencil row nearest the floor plane against the row a cell above it: of a liquid
+        // standing on the floor, a row δ cells above the floor sees ½ + ¾δ − δ³/3 (the B-spline's integral over the half-space)
+        // and the next one up 1 − (½ − δ)³/6. Rain stopped a cell up, in a sheet, leaves the floor's row far short of that
+        // share. (A ratio, not an amount: beside a wall both rows are short by the wall's share of the cell, and under a
+        // column's weight both are over rest, and neither is an empty floor.)
+        bool floorOpen = false;
+        float dFloor = mls_vessel_has_floor(pos, U, vesselR) ? pos.y - U.vesselA.w : 1e6f;
+        if (dFloor < dx && U.plasticB.w > 0.5f) {       // opt-in (`MLSMPMSolver.dryFloor`): it changes how a shallow slosh runs
+            float rowY0 = gridOrigin.y + float(base.y) * dx;                 // the stencil's lowest row
+            int   jf = clamp(int(floor((U.vesselA.w - rowY0) * invDx + 0.5f)), 0, 2);
+            float delta = clamp((rowY0 + float(jf) * dx - U.vesselA.w) * invDx, -0.5f, 0.5f);
+            float share = 0.5f + 0.75f * delta - delta * delta * delta / 3.0f;
+            float above = 1.0f - pow(0.5f - delta, 3.0f) / 6.0f;
+            floorOpen = jf < 2 && rowMass[jf] * above < 0.75f * share * rowMass[jf + 1];
+        }
+        vel_new = mls_vessel_approach(pos, vel_new, dt, 1e-3f, dx, floorOpen, U, vesselR);
     }
 
     p.C            = C_new;
@@ -779,7 +873,7 @@ kernel void mlsG2P(
             float vn = dot(p.velocityJp.xyz, nW);
             if (vn < 0.0f) p.velocityJp.xyz -= vn * nW;
         }
-        float dF = p.positionMass.y - U.vesselA.w;
+        float dF = mls_vessel_has_floor(p.positionMass.xyz, U, vesselR) ? p.positionMass.y - U.vesselA.w : 1e6f;
         if (dF < skin) {
             p.positionMass.y += skin - dF;
             p.velocityJp.y = max(p.velocityJp.y, 0.0f);
@@ -793,6 +887,22 @@ kernel void mlsG2P(
                                U.boundsMin.xyz + 1e-3f,
                                U.boundsMax.xyz - 1e-3f);
 
+    // Aeration (opt-in, `MLSMPMSolver.aerationGain`): the air a particle has taken in, in misc.w — it rises with every blow
+    // the particle takes (a change of velocity gravity does not explain: the stream striking the pool, a splash landing) and
+    // decays as the bubbles rise out. The surface renderer draws it as white water.
+    if (U.pourA.z > 0.0f) {
+        float blow = length(p.velocityJp.xyz - velOld - dt * U.gravity.xyz);
+        float a = p.misc.w * exp(-dt * U.pourA.w);
+        p.misc.w = min(1.0f, a + U.pourA.z * max(0.0f, blow - 0.08f));
+    }
+
+    // Kill plane: a particle that has fallen out of the container's world (spilled over the rim
+    // and down) is retired; its slot goes back to the emitters.
+    if (U.pourA.x > 0.5f && p.positionMass.y < U.pourA.y) {
+        p.positionMass.w = 0.0f;
+        p.velocityJp.xyz = float3(0.0f);
+        atomic_fetch_add_explicit(&pourStats[kStatKilled], 1u, memory_order_relaxed);
+    }
     particles[pid] = p;
 }
 
@@ -1055,4 +1165,93 @@ kernel void mlsConveyorRecycle(
     if (particles[pid].positionMass.y > U.lipY) {
         particles[pid].positionMass.y -= U.wrapHeight;
     }
+}
+
+
+// ── POURING — emitters ─────────────────────────────────────────────────────
+//
+// A particle with mass 0 is DEAD: every particle kernel skips it, so a pool of them costs one load apiece. Each substep
+//   1. `mlsEmitBegin`    zeroes the free list's length,
+//   2. `mlsCollectFree`  appends every dead particle's index to it (an atomic cursor: the order does not matter),
+//   3. `mlsEmit`         revives the first N of them at the nozzles — N = the flow's volume over the substep in particle volumes,
+//                        counted on the host with the fraction carried, so what is poured is what was asked for.
+// A nozzle's particles are laid across its disc on a low-discrepancy sequence (R2) and through the substep's time (stratified),
+// each as if born at the nozzle when its turn came and carried on at its exit velocity: a continuous, evenly spaced stream,
+// not a burst a frame.
+
+struct MLSEmitter {
+    float4 posRadius;   // xyz = nozzle centre at the END of the substep, w = radius
+    float4 prevPos;     // xyz = centre at its START
+    float4 velJitter;   // xyz = velocity of the liquid leaving, w = velocity jitter (fraction of speed)
+    float4 basisU;      // the disc's plane
+    float4 basisV;
+    uint4  info;        // x = serial of its first particle, y = particles this substep, z = first thread index
+};
+struct MLSEmitUniforms {
+    uint4  meta;        // x = emitter count, y = total to emit
+    float4 params;      // x = dt
+    MLSEmitter e[8];
+};
+
+kernel void mlsEmitBegin(device atomic_uint* stats [[ buffer(0) ]]) {
+    atomic_store_explicit(&stats[kStatFree], 0u, memory_order_relaxed);
+}
+
+kernel void mlsCollectFree(
+    device const MLSParticle* particles [[ buffer(0) ]],
+    device uint*              freeList  [[ buffer(1) ]],
+    device atomic_uint*       stats     [[ buffer(2) ]],
+    constant uint&            count     [[ buffer(3) ]],
+    uint                      pid       [[ thread_position_in_grid ]])
+{
+    if (pid >= count) return;
+    if (particles[pid].positionMass.w > 0.0f) return;
+    uint slot = atomic_fetch_add_explicit(&stats[kStatFree], 1u, memory_order_relaxed);
+    freeList[slot] = pid;
+}
+
+inline float pour_hash(uint v) {
+    v = v * 747796405u + 2891336453u;
+    v = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+    return float((v >> 22u) ^ v) * (1.0f / 4294967296.0f);
+}
+
+kernel void mlsEmit(
+    device MLSParticle*   particles [[ buffer(0) ]],
+    device const uint*    freeList  [[ buffer(1) ]],
+    device atomic_uint*   stats     [[ buffer(2) ]],
+    constant MLSEmitUniforms& E     [[ buffer(3) ]],
+    uint                  k         [[ thread_position_in_grid ]])
+{
+    if (k >= E.meta.y) return;
+    uint ei = 0;
+    for (uint i = 1; i < E.meta.x; i++) if (k >= E.e[i].info.z) ei = i;
+    MLSEmitter em = E.e[ei];
+    uint j = k - em.info.z;
+    uint free = atomic_load_explicit(&stats[kStatFree], memory_order_relaxed);
+    if (k >= free) {
+        atomic_fetch_add_explicit(&stats[kStatDropped], 1u, memory_order_relaxed);
+        return;
+    }
+    float dt  = E.params.x;
+    float tau = (float(j) + 0.5f) / float(em.info.y);          // when in the substep this one leaves
+    uint  serial = em.info.x + j;
+    float u1 = fract(0.5f + float(serial) * 0.7548776662f);
+    float u2 = fract(0.5f + float(serial) * 0.5698402909f);
+    float rr = em.posRadius.w * sqrt(u1), ang = 6.2831853f * u2;
+    float3 off = em.basisU.xyz * (rr * cos(ang)) + em.basisV.xyz * (rr * sin(ang));
+    float3 vel = em.velJitter.xyz;
+    if (em.velJitter.w > 0.0f) {
+        float3 h = float3(pour_hash(serial * 3u + 1u), pour_hash(serial * 3u + 2u), pour_hash(serial * 3u + 3u)) - 0.5f;
+        vel += h * 2.0f * em.velJitter.w * length(vel);
+    }
+    float3 nozzle = mix(em.prevPos.xyz, em.posRadius.xyz, tau);
+    MLSParticle p;
+    p.positionMass = float4(nozzle + off + vel * (dt * (1.0f - tau)), 1.0f);
+    p.velocityJp   = float4(vel, 1.0f);
+    p.C            = float3x3(0.0f);
+    p.F            = float3x3(1.0f);
+    p.misc         = float4(0.0f);
+    particles[freeList[k]] = p;
+    atomic_fetch_add_explicit(&stats[kStatEmitted], 1u, memory_order_relaxed);
 }

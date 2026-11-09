@@ -58,6 +58,7 @@ struct FoamUniforms {
     var bounds:    SIMD4<Float>    // xyz = boundsMin, w = lifeMax (s)
     var boundsMax: SIMD4<Float>    // xyz = boundsMax, w = parkY (dead-particle park height)
     var spawn:    SIMD4<Float>     // x = minSpeed, y = maxDensity, z = spawnProb, w = velJitter
+    var extra:    SIMD4<Float>     // x = least aeration, y = upward kick, z = position jitter
 }
 
 @MainActor
@@ -127,6 +128,14 @@ public final class FoamSolver {
     /// Magnitude of gravity along -Y (m/s²). Mirrors the fluid solver's
     /// gravity by default; can diverge if you want lazy / floaty foam.
     public var gravity: Float = 9.8
+
+    /// Spawn only from fluid particles at least this aerated (`MLSMPMSolver.aerationGain`, misc.w): spray off what has just
+    /// been struck. 0 (the default) = any fast, thin particle, as before.
+    public var spawnMinAeration: Float = 0
+    /// An upward kick on a new droplet, up to this (m/s): what a splash throws goes up and out.
+    public var spawnUpKick: Float = 0
+    /// How far from its parent a droplet starts (m, the whole spread).
+    public var spawnPositionJitter: Float = 0.03
 
     /// Where to park dead particles so the renderer never sees them. The
     /// renderer always draws `capacity` points; dead ones live here, which
@@ -226,7 +235,8 @@ public final class FoamSolver {
             gravity:   SIMD4(0, -gravity, 0, drag),
             bounds:    SIMD4(boundsMin, lifeMax),
             boundsMax: SIMD4(boundsMax, parkY),
-            spawn:     SIMD4(spawnMinSpeed, spawnMaxDensity, spawnProb, spawnVelJitter)
+            spawn:     SIMD4(spawnMinSpeed, spawnMaxDensity, spawnProb, spawnVelJitter),
+            extra:     SIMD4(spawnMinAeration, spawnUpKick, spawnPositionJitter, 0)
         )
 
         // 2. Spawn pass — one thread per FLUID particle. Skipped if there are
