@@ -53,6 +53,7 @@ struct FoamUniforms {
     float4 bounds;         // xyz = boundsMin, w = lifeMax (s)
     float4 boundsMax;      // xyz = boundsMax, w = parkY (where dead particles sit)
     float4 spawn;          // x = minSpeed, y = maxDensity, z = spawnProb, w = spawnSpeedJitter
+    float4 extra;          // x = least aeration (fluid misc.w) to spawn from, y = upward kick (m/s), z = position jitter (m)
 };
 
 // ── Tiny PCG hash + RNG ─────────────────────────────────────────────────────
@@ -111,8 +112,12 @@ kernel void foamSpawn(
     float  speed = length(vel);
     float  density = p.misc.x;
 
+    if (p.positionMass.w <= 0.0f) return;          // a dead particle of a pour's pool
     if (speed < U.spawn.x) return;
     if (density > U.spawn.y) return;
+    // Spray off what has just been struck (`MLSMPMSolver.aerationGain`), not off every fast thin thing: a falling stream is
+    // fast and thin all the way down and throws nothing.
+    if (p.misc.w < U.extra.x) return;
 
     // Frame seed mixed with particle id → independent per-frame, per-particle RNG.
     uint frameSeed = U.counts.z;
@@ -133,13 +138,13 @@ kernel void foamSpawn(
     // Position: at the parent particle, with a small offset to avoid stacking
     // multiple foam particles at exactly the same point (which renders as a
     // single bright dot regardless of count).
-    float3 jitter = (rand3(pid, frameSeed ^ 0xF00Du) - 0.5f) * 0.03f;
+    float3 jitter = (rand3(pid, frameSeed ^ 0xF00Du) - 0.5f) * U.extra.z;
     float3 pos = p.positionMass.xyz + jitter;
 
     // Velocity: parent velocity plus a small random nudge so droplets fan out
     // rather than tracking the parent path.
     float3 vJit = (rand3(pid, frameSeed ^ 0xBEEFu) - 0.5f) * U.spawn.w;
-    float3 fvel = vel + vJit;
+    float3 fvel = vel + vJit + float3(0.0f, U.extra.y * rand01(pid, frameSeed ^ 0x7777u), 0.0f);
 
     // Life: spread over [0.4, 1.0] × lifeMax so they don't all die in sync.
     float life = U.bounds.w * mix(0.4f, 1.0f, rand01(pid, frameSeed ^ 0xC0FFEEu));

@@ -99,6 +99,7 @@ struct MLSUniforms {
     var vesselA:    SIMD4<Float> = .zero   // x = enabled, y/z = axis (x, z), w = floor y
     var vesselB:    SIMD4<Float> = .zero   // x = profile y0, y = 1/dy, z = samples, w = friction
     var fluidC:     SIMD4<Float> = .zero   // x = J-from-density relaxation per substep
+    var pourA:      SIMD4<Float> = .zero   // x = kill plane on, y = its y, z = aeration gain, w = aeration decay
 }
 
 // ── MLS-MPM SOLVER ───────────────────────────────────────────────────────────
@@ -133,6 +134,26 @@ public final class MLSMPMSolver {
     // ── GPU plumbing ──────────────────────────────────────────────────────────
 
     public let device: MTLDevice
+    let engine: SimEngine
+
+    // Pouring (`MLSMPMSolver+Pour.swift`): the emitters, the kill plane and the state they run on.
+    /// Nozzles that pour liquid into the domain, up to 8 (see `Emitter`). Set once per frame, the nozzles' positions at the frame's end.
+    public var emitters: [Emitter] = []
+    /// A live particle that falls below this y is retired (its slot goes back to the emitters): the container's spill, gone.
+    /// nil (the default) = no kill plane.
+    public var killBelowY: Float?
+    /// The fastest the liquid will go (m/s), if the host knows it (a pour: the fall from the nozzle to the floor). > 0 raises
+    /// `substepsPerFrame` so no particle crosses more than `cflCells` cells in a substep (it would tunnel through the grid's contact).
+    public var maxExpectedSpeed: Float = 0
+    public var cflCells: Float = 0.6
+    /// Entrained air, per particle in `misc.w` (0…1): how much a blow of 1 m/s in a substep adds (0 = off, the default, and
+    /// misc.w is left alone), and how fast it leaves (1/s). `LiquidSurfaceRenderer` draws it as white water.
+    public var aerationGain: Float = 0
+    public var aerationDecay: Float = 1.6
+    let pourStatsBuffer: MTLBuffer
+    var pour: PourState?
+    /// Live particles seeded by the `seed…` calls (the pour adds `emitted` and takes off `killed`).
+    var seededLive = 0
 
     // Bin-and-gather P2G pipeline. The old single-shot scatter P2G was the
     // bottleneck at high particle counts (108 atomic_fetch_add ops per
@@ -308,6 +329,25 @@ public final class MLSMPMSolver {
     /// not pull itself together; the suction clumps surface particles (the tensile instability),
     /// which compacts a long-sloshing liquid. Viscous / sticky sauces may want the suction.
     public var noTension = false
+    /// Thrown liquid comes down with a J that says "compressed" in a cloud a third as dense as rest, and that phantom pressure
+    /// holds the cloud up for good (a pour into an open vessel settled at twice its depth). This is the fraction per substep by
+    /// which a particle's J is taken up to the least a half-empty stencil could make of the density it gathers (0 = off, the
+    /// default; ~0.2 for a pour). Not for liquid in a channel only a few cells wide: beside a wall the stencil is short by the
+    /// wall's share too, and the liquid there would stop carrying its weight.
+    public var thrownRelax: Float = 0
+    /// The vessel's floor may be dry (a pour into an empty vessel, a film thinner than a cell). The floor's contact is a band a
+    /// cell deep in which nothing may move down (what keeps a standing column from packing into the floor): rain onto a dry
+    /// floor stops at the band's edge, a whole cell up, in a sheet the grid cannot see is crowded, and the vessel fills to twice
+    /// its depth. With this on, liquid may go on down wherever the floor's own row of the grid holds less than its share of what
+    /// is over it. false (the default) = byte-identical; it changes how a shallow slosh runs, so turn it on to pour and off after.
+    public var dryFloor = false
+    /// With `noTension`: the suction an expanded particle still feels, as a fraction of `bulkModulus` (0 = none, the default).
+    /// A hundredth or so makes a falling stream draw in as it stretches (it necks, then breaks into drops) without holding a
+    /// splash together or clumping a sloshing surface.
+    public var cohesion: Float = 0
+    /// `settleDamping` is per substep at `substepsPerFrame`; when `maxExpectedSpeed` makes a frame take more, each takes
+    /// the root that leaves a frame's damping what it was.
+    var dampingExponent: Float = 1
 
     /// Substeps per visual frame. MLS-MPM is conditionally stable; 4 substeps
     /// at dt = 1/60 ≈ 4.2 ms per substep is the working compromise on Apple
@@ -538,7 +578,7 @@ public final class MLSMPMSolver {
     /// for "honey clings to the chip as it drains."
     public var colliderTangentFriction: Float = 0.0
 
-    private var elapsed: Float = 0
+    var elapsed: Float = 0
 
     // ── Vessel boundary ─────────────────────────────────────────────────────
 
@@ -562,8 +602,18 @@ public final class MLSMPMSolver {
         public var profile: [SIMD2<Float>]
         /// Coulomb friction coefficient at the wall (0 = free slip — water).
         public var friction: Float
-        public init(axis: SIMD2<Float> = .zero, floorY: Float, profile: [SIMD2<Float>], friction: Float = 0) {
-            self.axis = axis; self.floorY = floorY; self.profile = profile; self.friction = friction
+        /// What is above the profile's last point: false (the default) = the wall goes on straight up from it, a cylinder for
+        /// ever; true = nothing — the last point is the rim, and liquid that rises past it goes over (down the outside to the
+        /// domain's box: pair with `killBelowY`, or catch it yourself).
+        public var openAbove: Bool
+        /// With `openAbove`: how thick the wall is (m): the container is then a solid wall with an inner face, a flat rim and an
+        /// outer face, and liquid that rises past the rim runs over its top and down the outside. A grid cell or more (thinner,
+        /// and a splash against the wall leaks through it).
+        public var wallThickness: Float
+        public init(axis: SIMD2<Float> = .zero, floorY: Float, profile: [SIMD2<Float>], friction: Float = 0, openAbove: Bool = false,
+                    wallThickness: Float = 0.01) {
+            self.axis = axis; self.floorY = floorY; self.profile = profile; self.friction = friction; self.openAbove = openAbove
+            self.wallThickness = wallThickness
         }
         /// r(y), linear through the profile, clamped at both ends.
         public func radius(at y: Float) -> Float {
@@ -634,6 +684,7 @@ public final class MLSMPMSolver {
             }
         }
         particleBuffer.write(particles)
+        seededLive = particles.count
         let particleMass: Float = 1.0
         let ppc = Float(particlesPerCellAxis * particlesPerCellAxis * particlesPerCellAxis)
         restDensity = particleMass * ppc
@@ -708,11 +759,14 @@ public final class MLSMPMSolver {
             let vesselBuf = device.makeBuffer(length: MemoryLayout<Float>.stride * Self.vesselProfileSamples,
                                               options: .storageModeShared),
             let records = device.makeBuffer(length: Self.p2gRecordStride * max(maxParticles, 1),
-                                            options: .storageModePrivate)
+                                            options: .storageModePrivate),
+            let pourStats = device.makeBuffer(length: 16 * MemoryLayout<UInt32>.stride, options: .storageModeShared)
         else {
             Self.log.error("MLS-MPM buffer allocation failed (cells = \(cells))")
             return nil
         }
+        pourStats.label = "MLS.pourStats"
+        memset(pourStats.contents(), 0, pourStats.length)
         gripU.label = "MLS.gripUniforms"
         recycleU.label = "MLS.recycleUniforms"
         gMass.label  = "MLS.gridMass"
@@ -722,6 +776,8 @@ public final class MLSMPMSolver {
         cOff.label   = "MLS.cellOffsets"
 
         self.device                = device
+        self.engine                = engine
+        self.pourStatsBuffer       = pourStats
         self.cellClearPipeline     = cellClear
         self.cellCountPipeline     = cellCount
         self.offsetsScanPipeline   = offsetsScan
@@ -916,6 +972,7 @@ public final class MLSMPMSolver {
     /// Reset to an empty particle buffer (count = 0). Doesn't free memory.
     public func clear() {
         particleBuffer.write([])
+        seededLive = 0
     }
 
     // ── Step ─────────────────────────────────────────────────────────────────
@@ -925,8 +982,10 @@ public final class MLSMPMSolver {
     /// splits it into `substepsPerFrame` equal substeps internally.
     public func encode(to commandBuffer: MTLCommandBuffer, wallDt: Float) {
         guard particleBuffer.count > 0 else { return }
-        let substeps = max(1, substepsPerFrame)
+        let substeps = effectiveSubsteps(wallDt: wallDt)
+        dampingExponent = Float(max(1, substepsPerFrame)) / Float(substeps)
         let dt = wallDt / Float(substeps)
+        beginPourFrame()
         // Every pass of every substep in ONE serial compute encoder (dispatches run in order,
         // each seeing the last one's writes) — a separate encoder per pass was ~9 encoder
         // boundaries a substep, each a GPU drain.
@@ -934,10 +993,12 @@ public final class MLSMPMSolver {
         stepEncoder?.label = "MLS.step"
         boundBuffers.removeAll(keepingCapacity: true)
         boundPipeline = nil
-        for _ in 0..<substeps {
+        for s in 0..<substeps {
+            encodePourEmission(into: commandBuffer, dt: dt, from: Float(s) / Float(substeps), to: Float(s + 1) / Float(substeps))
             encodeOneStep(into: commandBuffer, dt: dt)
             elapsed += dt
         }
+        endPourFrame()
         stepEncoder?.endEncoding()
         stepEncoder = nil
         // Conveyor recycle runs ONCE per frame (not per substep): teleport any
@@ -981,7 +1042,7 @@ public final class MLSMPMSolver {
             dxParams:  SIMD4(cellSize, 1.0 / cellSize, dt, elapsed),
             matParams: SIMD4(bulkModulus, gamma, restDensity, viscosity),
             boundsMin: SIMD4(boundsMin, boundaryFriction),
-            boundsMax: SIMD4(boundsMax, max(0, min(1, settleDamping))),
+            boundsMax: SIMD4(boundsMax, pow(max(0, min(1, settleDamping)), dampingExponent)),
             gravity:   SIMD4(gravityDirection.x * gravity,
                              gravityDirection.y * gravity,
                              gravityDirection.z * gravity,
@@ -989,11 +1050,12 @@ public final class MLSMPMSolver {
             plasticA:  SIMD4(lameMu, lameLambda, hardening, thetaCompress),
             plasticB:  SIMD4(thetaStretch,
                              material == .elastoplastic ? 1 : 0,
-                             0, 0),
-            vesselA:   vessel.map { SIMD4(1, $0.axis.x, $0.axis.y, $0.floorY) } ?? .zero,
+                             max(0, min(1, thrownRelax)), dryFloor ? 1 : 0),
+            vesselA:   vessel.map { SIMD4($0.openAbove ? 2 : 1, $0.axis.x, $0.axis.y, $0.floorY) } ?? .zero,
             vesselB:   vessel.map { SIMD4(vesselY0, vesselInvDY, Float(Self.vesselProfileSamples),
                                           max(0, $0.friction)) } ?? .zero,
-            fluidC:    SIMD4(max(0, min(1, volumeCorrection)), noTension ? 1 : 0, 0, 0)
+            fluidC:    SIMD4(max(0, min(1, volumeCorrection)), noTension ? 1 : 0, max(0, min(1, cohesion)), vessel?.wallThickness ?? 0),
+            pourA:     SIMD4(killBelowY == nil ? 0 : 1, killBelowY ?? 0, max(0, aerationGain), max(0, aerationDecay))
         )
 
         // ── Binning pipeline (replaces the old scatter P2G) ──────────────
@@ -1052,7 +1114,7 @@ public final class MLSMPMSolver {
         encodeParticlePass(into: cb,
                            pipeline: g2pPipeline,
                            label: "MLS.g2p",
-                           extraBuffers: [(gridNodeBuffer, 1), (vesselBuffer, 3)],
+                           extraBuffers: [(gridNodeBuffer, 1), (vesselBuffer, 3), (pourStatsBuffer, 4)],
                            uniformIndex: 2)
 
         // 9. Capsule push-out — if the host bound any colliders, push
@@ -1123,11 +1185,11 @@ public final class MLSMPMSolver {
     private var countsNeedClear = true
 
     /// The frame's shared encoder while `encode(to:wallDt:)` runs (nil otherwise).
-    private var stepEncoder: MTLComputeCommandEncoder?
+    var stepEncoder: MTLComputeCommandEncoder?
 
     /// The encoder a pass records into: the frame's shared one (the label becomes a debug
     /// group), or a fresh one of its own outside `encode(to:wallDt:)`.
-    private func beginPass(_ cb: MTLCommandBuffer, _ label: String) -> MTLComputeCommandEncoder? {
+    func beginPass(_ cb: MTLCommandBuffer, _ label: String) -> MTLComputeCommandEncoder? {
         if let e = stepEncoder { e.pushDebugGroup(label); return e }
         let e = cb.makeComputeCommandEncoder()
         e?.label = label
@@ -1136,10 +1198,10 @@ public final class MLSMPMSolver {
 
     /// What the shared encoder already has bound — re-binding the same buffer at the same
     /// index is a redundant-state warning (fatal under the test wrapper's assert mode).
-    private var boundBuffers: [Int: ObjectIdentifier] = [:]
-    private var boundPipeline: ObjectIdentifier?
+    var boundBuffers: [Int: ObjectIdentifier] = [:]
+    var boundPipeline: ObjectIdentifier?
 
-    private func bind(_ enc: MTLComputeCommandEncoder, _ buffer: MTLBuffer, _ index: Int) {
+    func bind(_ enc: MTLComputeCommandEncoder, _ buffer: MTLBuffer, _ index: Int) {
         if stepEncoder != nil {
             let id = ObjectIdentifier(buffer)
             if boundBuffers[index] == id { return }
@@ -1149,15 +1211,15 @@ public final class MLSMPMSolver {
     }
 
     /// This substep's uniforms, set by `encodeOneStep`.
-    private var stepUniforms = MLSUniforms(gridRes: .zero, dxParams: .zero, matParams: .zero, boundsMin: .zero,
+    var stepUniforms = MLSUniforms(gridRes: .zero, dxParams: .zero, matParams: .zero, boundsMin: .zero,
                                            boundsMax: .zero, gravity: .zero, plasticA: .zero, plasticB: .zero)
 
-    private func setUniforms(_ enc: MTLComputeCommandEncoder, _ index: Int) {
+    func setUniforms(_ enc: MTLComputeCommandEncoder, _ index: Int) {
         enc.setBytes(&stepUniforms, length: MemoryLayout<MLSUniforms>.stride, index: index)
         boundBuffers[index] = nil
     }
 
-    private func use(_ enc: MTLComputeCommandEncoder, _ pipeline: MTLComputePipelineState) {
+    func use(_ enc: MTLComputeCommandEncoder, _ pipeline: MTLComputePipelineState) {
         if stepEncoder != nil {
             let id = ObjectIdentifier(pipeline)
             if boundPipeline == id { return }
@@ -1166,7 +1228,7 @@ public final class MLSMPMSolver {
         enc.setComputePipelineState(pipeline)
     }
 
-    private func endPass(_ enc: MTLComputeCommandEncoder) {
+    func endPass(_ enc: MTLComputeCommandEncoder) {
         if stepEncoder != nil { enc.popDebugGroup() } else { enc.endEncoding() }
     }
 
