@@ -32,4 +32,14 @@ public struct ScatterPoint: Sendable, Equatable {
     /// scale) — what another stratum's plants keep clear of. DH-1470.
     public var stratum: Int = 0
     public var stemRadius: Double = 0
+
+    /// An individual a host places itself (a surveyed tree, not a scattered one).
+    public init(position: SIMD2<Double>, groundHeight: Double, species: Int, variant: Int, age: Double,
+                scale: Double, radius: Double, yaw: Double, tilt: Double, tiltAzimuth: Double,
+                tint: SIMD3<Float>, windPhase: Float, key: UInt64, stratum: Int = 0, stemRadius: Double = 0) {
+        self.position = position; self.groundHeight = groundHeight; self.species = species
+        self.variant = variant; self.age = age; self.scale = scale; self.radius = radius; self.yaw = yaw
+        self.tilt = tilt; self.tiltAzimuth = tiltAzimuth; self.tint = tint; self.windPhase = windPhase
+        self.key = key; self.stratum = stratum; self.stemRadius = stemRadius
+    }
 }
