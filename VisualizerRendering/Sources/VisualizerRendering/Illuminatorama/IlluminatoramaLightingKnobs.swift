@@ -223,10 +223,11 @@ final class LightingKnobs {
     /// Visualizer scene (which never sets one) is byte-identical either way. `false` = the apex point law
     /// (the shadow lookup is the apex's in both). `VIZ_ILLUMI_SPOT_DISC=0|1` overrides it process-wide.
     var spotOpeningDiscEnabled: Bool = true
-    /// **Daydream DH-1625 — per-light screen bounds in the deferred kernel.** `true` (the default): each
-    /// point / spot / area light's reach is projected to a screen rectangle once per frame, on the GPU
-    /// (`illumi_light_bounds`), and the lighting kernel skips the light for pixels outside it — conservative, so the picture is unchanged. `false` hands the
-    /// kernel whole-screen rectangles (the A/B lever). See `IlluminatoramaRenderer+LightScreenBounds.swift`.
+    /// **Daydream DH-1625 — tiled light culling in the deferred kernel.** `true` (the default): a GPU kernel
+    /// (`illumi_light_tiles`) marks, per 16 px tile and from the tile's own depth range, which point / spot /
+    /// area lights can reach a surface there, and the lighting kernel skips the rest — conservative, so the
+    /// picture is unchanged. `false` marks every light everywhere (the A/B lever).
+    /// See `IlluminatoramaRenderer+LightScreenBounds.swift`.
     var lightScreenCullEnabled: Bool = true
     /// **DH-1302 — per-material thin-sheet translucency on every lane.** `true`: an instance with
     /// `translucencyWeight > 0` lets that fraction of the light reaching its far face through, tinted

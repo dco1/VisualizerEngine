@@ -819,7 +819,7 @@ final class ShadowState {
     /// (never mutated in place — an in-flight frame may still read the old one); a 1-float placeholder when the
     /// host never calls it, so every kernel can bind it unconditionally.
     var spotProfileBuffer: MTLBuffer!
-    /// Daydream DH-1625 — per-light screen rectangles, written on the GPU by `illumi_light_bounds`; kernel buffer(12).
+    /// Daydream DH-1625 — the tiled light masks, written on the GPU by `illumi_light_tiles`; kernel buffer(12).
     var lightBoundsBuffer: MTLBuffer?
 
     var spotLightCapacity: Int!
