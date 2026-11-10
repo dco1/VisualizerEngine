@@ -333,7 +333,8 @@ public final class IlluminatoramaRenderer {
     /// storage — `readAOV` blits it.
     public var aovLightingTexture: MTLTexture? { aovs.aovTexture }
     /// Function-constant indices: `kLightingAOVEnabled` (illumi_lighting) / `kRTAOVEnabled` (TLAS kernel).
-    static let perfAB = IlluminatoramaPerfAB()
+    /// `VIZ_PERF_AB` at launch; settable so ONE test process can walk several arms (Daydream DH-1003).
+    public static var perfAB = IlluminatoramaPerfAB()
     static let lightingAOVFunctionConstantIndex = 8
 
     /// **Daydream DH-1308 — glossy path vertices.** True: a path vertex past the primary samples the
@@ -1352,11 +1353,18 @@ public final class IlluminatoramaRenderer {
 /// Env-gated pass bisector for GPU-cost audits: `VIZ_PERF_AB=nodof,nogi,nort,nosc,novol,noshadow,noglass,noref,notaa`
 /// force-disables the named pass every frame (after the scene's own per-frame setup), so a
 /// `VIZ_ILLUMI_GPUMS_PATH` p50 delta attributes cost to that pass. Inert when unset.
-struct IlluminatoramaPerfAB: Sendable {
-    let flags: Set<String>
-    init() {
-        let v = ProcessInfo.processInfo.environment["VIZ_PERF_AB"] ?? ""
-        flags = Set(v.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
+///
+/// Lighting-kernel terms (Daydream DH-1003), each a knob forced off so the `lighting` pass delta names its cost:
+/// `nodisc` (spot opening disc), `noms` (multiscatter), `nosheen`, `nocoat`, `nospec` (specular layer), `nofilm`,
+/// `notrans`, `noon` (diffuse roughness), `noggx` (relative GGX guard), `nospots` / `nopoints` / `noarea` (the
+/// light lists emptied), `nospotshadow`, `noareashadow` (portal PCF), `noltc` (area specular falls back to MRP — sticky), `nocontact` (screen-space contact march), `noibl`, `nocloudshadow`, `nossao`.
+public struct IlluminatoramaPerfAB: Sendable {
+    public let flags: Set<String>
+    public init() {
+        self.init(ProcessInfo.processInfo.environment["VIZ_PERF_AB"] ?? "")
+    }
+    public init(_ list: String) {
+        flags = Set(list.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) })
     }
     @MainActor func apply(to r: IlluminatoramaRenderer) {
         if flags.isEmpty { return }
@@ -1369,5 +1377,24 @@ struct IlluminatoramaPerfAB: Sendable {
         if flags.contains("noglass") { r.rtGlassEnabled = false }
         if flags.contains("noref") { r.rtReflectionsEnabled = false }
         if flags.contains("notaa") { r.taaEnabled = false }
+        if flags.contains("nodisc") { r.spotOpeningDiscEnabled = false }
+        if flags.contains("noms") { r.layeredMultiscatter = false }
+        if flags.contains("nosheen") { r.layeredClothSheen = false; r.layeredDyedSheen = false }
+        if flags.contains("nocoat") { r.layeredCoatEnabled = false }
+        if flags.contains("nospec") { r.layeredSpecularEnabled = false }
+        if flags.contains("nofilm") { r.thinFilmEnabled = false }
+        if flags.contains("notrans") { r.translucencyEnabled = false }
+        if flags.contains("noon") { r.diffuseRoughnessEnabled = false }
+        if flags.contains("noggx") { r.ggxRelativeGuardEnabled = false }
+        if flags.contains("nospots") { r.spotLights = [] }
+        if flags.contains("nopoints") { r.pointLights = [] }
+        if flags.contains("noarea") { r.areaLights = [] }
+        if flags.contains("nospotshadow") { r.spotShadowsEnabled = false }
+        if flags.contains("noareashadow") { r.areaLights = r.areaLights.map { var a = $0; a.castsShadow = 0; a.shadowSliceIndex = -1; return a } }
+        if flags.contains("noltc") { r.areaLTCOverride = false }
+        if flags.contains("nocontact") { r.contactShadowStrength = 0 }
+        if flags.contains("noibl") { r.iblEnabled = false }
+        if flags.contains("nocloudshadow") { r.cloudShadowEnabled = false }
+        if flags.contains("nossao") { r.ssaoIntensity = 0 }
     }
 }

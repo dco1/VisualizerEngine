@@ -1048,6 +1048,11 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
 
     // Diffuse — exact polygon clamped-cosine (LTC, M = identity).
     float  ff = ltcPolygonForm(N, p0, p1, p2, p3, twoSided);
+    // Exact early-out (Daydream DH-1003): `ff` multiplies the diffuse, windows the LTC specular
+    // (`smoothstep(0, 0.02, ff)`) and caps the MRP one (`min(π·ff, …)`), for the base lobe and the coat's
+    // alike — so a receiver whose form factor is 0 (the wall the portal sits in, anything facing away)
+    // gets exactly 0 from this light and need not run either specular integral.
+    if (ff <= 0.0) return float3(0.0);
     float3 diffuse = (1.0 - metallic) * albedo * ff;
 
     float3 F0 = layeredBaseF0(le, albedo, metallic);
