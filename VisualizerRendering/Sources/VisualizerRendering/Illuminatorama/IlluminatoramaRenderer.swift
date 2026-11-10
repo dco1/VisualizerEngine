@@ -1357,7 +1357,7 @@ public final class IlluminatoramaRenderer {
 /// Lighting-kernel terms (Daydream DH-1003), each a knob forced off so the `lighting` pass delta names its cost:
 /// `nodisc` (spot opening disc), `noms` (multiscatter), `nosheen`, `nocoat`, `nospec` (specular layer), `nofilm`,
 /// `notrans`, `noon` (diffuse roughness), `noggx` (relative GGX guard), `nospots` / `nopoints` / `noarea` (the
-/// light lists emptied), `nospotshadow`, `noareashadow` (portal PCF), `noltc` (area specular falls back to MRP — sticky), `nocontact` (screen-space contact march), `noibl`, `nocloudshadow`, `nossao`.
+/// light lists emptied), `nospotshadow`, `noareashadow` (portal PCF), `noltc` (area specular falls back to MRP — sticky), `nolightcull` (DH-1625 screen bounds off — sticky), `nocontact` (screen-space contact march), `noibl`, `nocloudshadow`, `nossao`.
 public struct IlluminatoramaPerfAB: Sendable {
     public let flags: Set<String>
     public init() {
@@ -1392,6 +1392,7 @@ public struct IlluminatoramaPerfAB: Sendable {
         if flags.contains("nospotshadow") { r.spotShadowsEnabled = false }
         if flags.contains("noareashadow") { r.areaLights = r.areaLights.map { var a = $0; a.castsShadow = 0; a.shadowSliceIndex = -1; return a } }
         if flags.contains("noltc") { r.areaLTCOverride = false }
+        if flags.contains("nolightcull") { r.lightScreenCullEnabled = false }
         if flags.contains("nocontact") { r.contactShadowStrength = 0 }
         if flags.contains("noibl") { r.iblEnabled = false }
         if flags.contains("nocloudshadow") { r.cloudShadowEnabled = false }

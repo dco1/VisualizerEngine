@@ -1424,6 +1424,10 @@ kernel void illumi_lighting(
     instance_acceleration_structure         rtSunAccel      [[buffer(8), function_constant(kLightingRTSunShadow)]],
     // Daydream DH-0540 — the host's spot-profile rows (`illumiSpotProfile`); a 1-float dummy when no spot names one.
     const device float*                     spotProfiles    [[buffer(9)]],
+    // Daydream DH-1625 — one NDC rectangle (minX, minY, maxX, maxY) per light, points then spots then area
+    // lights: the screen bounds of each light's reach. A pixel outside it is beyond the light's `radius`, where
+    // the light contributes exactly 0 — so the loops below skip the light without reading it.
+    const device float4*                    lightBounds     [[buffer(12)]],
     // Daydream DH-1462 — the cloud deck's sun transmittance (IlluminatoramaCloudShadow.h); the
     // disabled 8-float dummy when off, so every lookup is 1.
     const device float*                     cloudShadow     [[buffer(11)]],
@@ -1806,6 +1810,8 @@ kernel void illumi_lighting(
     // Point lights — inverse-square with smooth radius cutoff. (Includes the
     // synthesised emissive-as-light points from the extractor, Phase 4.27.)
     for (uint i = 0; i < frame.pointLightCount; ++i) {
+        { float4 rc = lightBounds[i];
+          if (ndc.x < rc.x || ndc.x > rc.z || ndc.y < rc.y || ndc.y > rc.w) continue; }   // DH-1625
         PointLight pl = pointLights[i];
         // Light-layer mask: skip lights that don't share a bit with this fragment's
         // layer. Default 0xFFFFFFFF on both sides ⇒ always passes (no change).
@@ -1892,6 +1898,8 @@ kernel void illumi_lighting(
                                         compare_func::less_equal,
                                         address::clamp_to_edge);
     for (uint i = 0; i < frame.spotLightCount; ++i) {
+        { float4 rc = lightBounds[frame.pointLightCount + i];
+          if (ndc.x < rc.x || ndc.x > rc.z || ndc.y < rc.y || ndc.y > rc.w) continue; }   // DH-1625
         SpotLight sl = spotLights[i];
         // Light-layer mask (same rule as point lights). Default all-bits ⇒ passes.
         if ((sl.layerMask & fragLayer) == 0u) continue;
@@ -1989,6 +1997,8 @@ kernel void illumi_lighting(
     bool skipHandedApertures = (frame.frameFlags & kFrameFlagSkipHandedApertures) != 0u
         && (frame.frameFlags & (kFrameFlagPathOwnsIndirect | kFrameFlagGIOwnsApertures)) != 0u;
     for (uint i = 0; i < frame.areaLightCount; ++i) {
+        { float4 rc = lightBounds[frame.pointLightCount + frame.spotLightCount + i];
+          if (ndc.x < rc.x || ndc.x > rc.z || ndc.y < rc.y || ndc.y > rc.w) continue; }   // DH-1625
         AreaLight al = areaLights[i];
         if (skipHandedApertures && al.isAperture > 0.5) continue;
         // Light-layer mask — same rule as point/spot. For an UNSHADOWED area light (a

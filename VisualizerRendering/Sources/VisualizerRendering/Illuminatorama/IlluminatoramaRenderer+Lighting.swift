@@ -139,6 +139,7 @@ extension IlluminatoramaRenderer {
     func encodeLightingPass(_ cb: MTLCommandBuffer) {
         // Defocus shading rate (opt-in): the tile map first, then the coarse + skip variants below.
         let rate = lightingShadingRateRequested ? encodeLightingRateTiles(cb) : nil
+        encodeLightScreenBounds(cb)   // DH-1625 — one GPU thread per light, read below at buffer(12)
         guard let enc = timedComputeEncoder(cb, "lighting") else { return }
         enc.label = "Illuminatorama.lighting"
         let pipe = currentLightingPipeline()
@@ -200,6 +201,7 @@ extension IlluminatoramaRenderer {
         enc.setBuffer(areaLightBuffer, offset: 0, index: 4)
         enc.setBuffer(extraDirectionalBuffer, offset: 0, index: 5)
         enc.setBuffer(shd.spotProfileBuffer, offset: 0, index: 9)   // DH-0540 — the spot-profile rows
+        enc.setBuffer(shd.lightBoundsBuffer, offset: 0, index: 12)  // DH-1625 — per-light screen rectangles
         enc.setBuffer(cloudShadowBinding, offset: 0, index: 11)     // DH-1462 — cloud sun transmittance
         // Point-light cube-face view-projection matrices (6 per shadowed light).
         // Placeholder-bound to `pointLightBuffer` when the feature is off / not yet
