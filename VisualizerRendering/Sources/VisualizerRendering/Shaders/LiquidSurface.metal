@@ -42,6 +42,8 @@ struct LSUniforms {
     float4 filter;           // x = sigma (world m), y = depth window (m), z = ambient light, w = spray whiteness
     float4 envRot;           // x = environment yaw (rad), y = reflection highlight cap, z = edge roundness, w = 1 / the simulation's distance
     float4 clip;             // x = 1: on, y = the height (sim) under which nothing is drawn, z = the thickness the silhouette is drawn at (m), w = this pass's sphere scale
+    float4 heightA;          // a height field to cut under (`clipSurface`): x = 1: on, y = margin over it (m), z = its cell (m)
+    float4 heightB;          // xy = the field's origin (sim x, z), zw = its columns along x and z
     float4 lightPos[4];      // xyz = position (w = 1) or direction to the light (w = 0), world
     float4 lightCol[4];      // rgb
     uint4  counts;           // x = lights
@@ -134,8 +136,27 @@ vertex LSVOut liquidDropletVS(uint vid [[vertex_id]], uint iid [[instance_id]],
     return o;
 }
 
-inline bool ls_clipped(float3 vp, constant LSUniforms& U) {
-    return U.clip.x > 0.5f && (U.simFromView * float4(vp, 1.0f)).y < U.clip.y;
+// Under the clip it is someone else's to draw: under a plane (`clipBelow`), and under a height field (`clipSurface`: a pool that
+// has a surface of its own) — the HIGHEST of the field's columns round the point (a field read off a simulation's grid thins
+// out beside a wall, where the liquid itself does not), plus a margin. Columns under −100 are dry (no surface there).
+inline bool ls_clipped(float3 vp, constant LSUniforms& U, const device float* field) {
+    if (U.clip.x < 0.5f && U.heightA.x < 0.5f) return false;
+    float3 s = (U.simFromView * float4(vp, 1.0f)).xyz;
+    float cut = U.clip.x > 0.5f ? U.clip.y : -1e9f;
+    if (U.heightA.x > 0.5f) {
+        float2 q = (s.xz - U.heightB.xy) / U.heightA.z;
+        int2 i = int2(floor(q)), res = int2(U.heightB.zw);
+        float top = -1e9f;
+        for (int dz = -1; dz <= 2; dz++)
+        for (int dx = -1; dx <= 2; dx++) {
+            int2 c = i + int2(dx, dz);
+            if (any(c < 0) || any(c >= res)) continue;
+            float h = field[c.x + res.x * c.y];
+            if (h > -100.0f) top = max(top, h);
+        }
+        if (top > -1e8f) cut = max(cut, top + U.heightA.y);
+    }
+    return s.y < cut;
 }
 
 struct LSDepthOut {
@@ -144,12 +165,13 @@ struct LSDepthOut {
 };
 
 fragment LSDepthOut liquidDepthFS(LSVOut in [[stage_in]], constant LSUniforms& U [[buffer(0)]],
+                                  const device float* clipField [[buffer(1)]],
                                   depth2d<float> sceneDepth [[texture(0)]])
 {
     float r2 = dot(in.c, in.c);
     if (r2 > 1.0f) discard_fragment();
     float3 vp = in.vpos + float3(0.0f, 0.0f, sqrt(1.0f - r2) * in.radius);
-    if (ls_clipped(vp, U)) discard_fragment();
+    if (ls_clipped(vp, U, clipField)) discard_fragment();
     float4 clip = U.proj * float4(vp, 1.0f);
     float d = clip.z / clip.w;
     if (d > sceneDepth.sample(lsNearest, in.position.xy * U.viewport.zw)) discard_fragment();
@@ -160,13 +182,14 @@ fragment LSDepthOut liquidDepthFS(LSVOut in [[stage_in]], constant LSUniforms& U
 }
 
 fragment float4 liquidThicknessFS(LSVOut in [[stage_in]], constant LSUniforms& U [[buffer(0)]],
+                                  const device float* clipField [[buffer(1)]],
                                   depth2d<float> sceneDepth [[texture(0)]])
 {
     float r2 = dot(in.c, in.c);
     if (r2 > 1.0f) discard_fragment();
     float nz = sqrt(1.0f - r2);
     float3 vp = in.vpos + float3(0.0f, 0.0f, nz * in.radius);
-    if (ls_clipped(in.vpos, U)) discard_fragment();
+    if (ls_clipped(in.vpos, U, clipField)) discard_fragment();
     float4 clip = U.proj * float4(vp, 1.0f);
     if (clip.z / clip.w > sceneDepth.sample(lsNearest, in.position.xy * U.viewport.zw)) discard_fragment();
     float t = 2.0f * nz * in.radius;
