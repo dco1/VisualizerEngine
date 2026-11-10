@@ -1,4 +1,5 @@
 import XCTest
+import Metal
 import simd
 @testable import VisualizerRendering
 
@@ -86,6 +87,39 @@ final class IlluminatoramaLTCTableTests: XCTestCase {
             XCTAssertTrue(v.x.isFinite && v.y.isFinite, "split-sum terms must be finite")
             XCTAssertGreaterThanOrEqual(v.x, 0, "specular scale can't be negative")
             XCTAssertGreaterThanOrEqual(v.y, 0, "specular bias can't be negative")
+        }
+    }
+
+    /// VZ-0144: the textures `makeLUTs` hands the shader must hold the baked table,
+    /// to half precision. `replace(region:)` does no format conversion, so uploading
+    /// the table's float32s into the `rgba16Float` textures scrambled every texel
+    /// (13/1024 matrix + 7/1024 magnitude components non-finite). Read the real
+    /// textures back and compare.
+    @MainActor
+    func testMakeLUTsTexturesHoldTheBakedTable() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
+        guard let luts = IlluminatoramaLTC.makeLUTs(device: device) else { return XCTFail("makeLUTs returned nil") }
+        let t = IlluminatoramaLTCTable.baked
+        guard luts.fromBakedTable else { throw XCTSkip("runtime fit forced; baked comparison n/a") }
+        let n = t.size
+        for (name, tex, want) in [("mat", luts.mat, t.mat), ("mag", luts.mag, t.mag)] {
+            XCTAssertEqual(tex.pixelFormat, .rgba16Float)
+            var got = [SIMD4<Float16>](repeating: .zero, count: n * n)
+            got.withUnsafeMutableBytes {
+                tex.getBytes($0.baseAddress!, bytesPerRow: n * MemoryLayout<SIMD4<Float16>>.stride,
+                             from: MTLRegionMake2D(0, 0, n, n), mipmapLevel: 0)
+            }
+            var worst: Float = 0
+            for i in 0..<(n * n) {
+                let g = SIMD4<Float>(got[i]), w = want[i]
+                for c in 0..<4 {
+                    XCTAssertTrue(g[c].isFinite, "\(name)[\(i)].\(c) non-finite")
+                    // Half precision: 11 significant bits → relative 2^-11, plus a small absolute floor.
+                    let tol = max(abs(w[c]) * 1.0 / 1024, 1e-4)
+                    worst = max(worst, abs(g[c] - w[c]) / tol)
+                }
+            }
+            XCTAssertLessThanOrEqual(worst, 1, "\(name) LUT texels differ from the baked table beyond half precision")
         }
     }
 

@@ -353,9 +353,16 @@ public enum IlluminatoramaLTC {
         matTex.label = "Illuminatorama.ltcMat"
         magTex.label = "Illuminatorama.ltcMag"
         let region = MTLRegionMake2D(0, 0, size, size)
-        let rowBytes = size * MemoryLayout<SIMD4<Float>>.stride
-        matData.withUnsafeBytes { matTex.replace(region: region, mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: rowBytes) }
-        magData.withUnsafeBytes { magTex.replace(region: region, mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: rowBytes) }
+        // `replace(region:)` copies bytes verbatim — it does NOT convert formats. The
+        // tables are 32-bit floats and the textures are `rgba16Float`, so they must be
+        // narrowed to half floats first (VZ-0144: uploading the float32s directly made
+        // each texel the two 16-bit halves of two floats — NaN / negative texels that
+        // rendered as black dots on glossy grazing edges).
+        let matHalf = matData.map { SIMD4<Float16>($0) }
+        let magHalf = magData.map { SIMD4<Float16>($0) }
+        let rowBytes = size * MemoryLayout<SIMD4<Float16>>.stride
+        matHalf.withUnsafeBytes { matTex.replace(region: region, mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: rowBytes) }
+        magHalf.withUnsafeBytes { magTex.replace(region: region, mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: rowBytes) }
         let result = LUTs(mat: matTex, mag: magTex, size: size, validated: validated,
                           maxError: maxErr, fromBakedTable: useBaked)
         cache[key] = result
