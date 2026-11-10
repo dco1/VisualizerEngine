@@ -79,6 +79,11 @@ public final class LiquidSurfaceRenderer {
     /// Draw nothing under this height (simulation space): for a pool that has a surface of its own, with this renderer drawing
     /// the stream and the splash above it, cut cleanly at that plane.
     public var clipBelow: Float?
+    /// …and nothing under a height field (simulation space): `heights` is one Float a column, `columns.x` by `columns.y` of them
+    /// along x and z from `origin`, `cell` apart, a column under −100 being dry. For a pool drawn by its own surface (read off the
+    /// same simulation): the cut follows that surface, waves and all, `margin` above it — the highest column round each point,
+    /// since such a field thins out beside a wall where the liquid does not. With `clipBelow` too, the higher of the two cuts.
+    public var clipSurface: (heights: MTLBuffer, origin: SIMD2<Float>, cell: Float, columns: SIMD2<Int>, margin: Float)?
     /// The outline: the depth pass draws each sphere this much larger, and the surface is then cut where the blurred thickness
     /// falls under `outlineThickness` radii: a smooth contour round the particles, where the plain union of their discs is
     /// scalloped (a thin stream showed its particles as beads down its sides).
@@ -104,6 +109,7 @@ public final class LiquidSurfaceRenderer {
     private var thickA: MTLTexture?, thickB: MTLTexture?
     private var sceneCopy: MTLTexture?
     private var blackEnv: MTLTexture?
+    private var noField: MTLBuffer?
 
     struct Uniforms {
         var view = matrix_identity_float4x4
@@ -121,6 +127,8 @@ public final class LiquidSurfaceRenderer {
         var filter = SIMD4<Float>.zero
         var envRot = SIMD4<Float>.zero
         var clip = SIMD4<Float>.zero
+        var heightA = SIMD4<Float>.zero
+        var heightB = SIMD4<Float>.zero
         var lightPos: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>) = (.zero, .zero, .zero, .zero)
         var lightCol: (SIMD4<Float>, SIMD4<Float>, SIMD4<Float>, SIMD4<Float>) = (.zero, .zero, .zero, .zero)
         var counts = SIMD4<UInt32>.zero
@@ -195,8 +203,9 @@ public final class LiquidSurfaceRenderer {
             compositeFormat = target.pixelFormat
         }
         if blackEnv == nil { blackEnv = texture(.rgba16Float, 1, 1, [.shaderRead], "LiquidSurface.noEnv") }
+        if noField == nil { noField = device.makeBuffer(length: 16, options: .storageModeShared) }
         return depthA != nil && depthB != nil && zBuffer != nil && thickA != nil && thickB != nil && sceneCopy != nil
-            && compositePipeline != nil && blackEnv != nil
+            && compositePipeline != nil && blackEnv != nil && noField != nil
     }
 
     /// Draw the liquid over `target`. `view` and `projection` are the scene's (depth 0 near … 1 far, the camera looking down −z);
@@ -205,7 +214,7 @@ public final class LiquidSurfaceRenderer {
                        view: simd_float4x4, projection: simd_float4x4, worldFromSim: simd_float4x4 = matrix_identity_float4x4,
                        target: MTLTexture, sceneDepth: MTLTexture) {
         guard count > 0, prepare(target: target),
-              let depthA, let depthB, let zBuffer, let thickA, let thickB, let sceneCopy, let compositePipeline, let blackEnv else { return }
+              let depthA, let depthB, let zBuffer, let thickA, let thickB, let sceneCopy, let compositePipeline, let blackEnv, let noField else { return }
         let w = Float(target.width), h = Float(target.height)
         var u = Uniforms()
         u.view = view; u.proj = projection; u.invProj = projection.inverse; u.invView = view.inverse; u.worldFromSim = worldFromSim; u.simFromView = (view * worldFromSim).inverse
@@ -221,6 +230,11 @@ public final class LiquidSurfaceRenderer {
         let simAt = (view * worldFromSim).columns.3
         u.envRot = SIMD4(look.environmentYaw, look.highlightCap, edgeRounding, 1 / max(0.05, simd_length(SIMD3(simAt.x, simAt.y, simAt.z))))
         u.clip = SIMD4(clipBelow == nil ? 0 : 1, clipBelow ?? 0, particleRadius * outlineThickness, 1)
+        if let f = clipSurface {
+            u.heightA = SIMD4(1, f.margin, f.cell, 0)
+            u.heightB = SIMD4(f.origin.x, f.origin.y, Float(f.columns.x), Float(f.columns.y))
+        }
+        let field = clipSurface?.heights ?? noField
         // Enough rounds that a round's taps are a pixel or so apart (wider, and the smoothing is noise).
         let sigmaPixels = particleRadius * smoothing * projection.columns.1.y * h * 0.5 * u.envRot.w
         let rounds = min(6, max(max(1, smoothingRounds), Int((sigmaPixels / 9 * (sigmaPixels / 9)).rounded(.up))))
@@ -254,6 +268,7 @@ public final class LiquidSurfaceRenderer {
             enc.setVertexBuffer(particles, offset: 0, index: 0)
             enc.setVertexBytes(&udepth, length: stride, index: 1)
             enc.setFragmentBytes(&udepth, length: stride, index: 0)
+            enc.setFragmentBuffer(field, offset: 0, index: 1)
             enc.setFragmentTexture(sceneDepth, index: 0)
             enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: count)
             for drops in droplets where drops.count > 0 {
@@ -280,6 +295,7 @@ public final class LiquidSurfaceRenderer {
             enc.setVertexBuffer(particles, offset: 0, index: 0)
             enc.setVertexBytes(&uh, length: stride, index: 1)
             enc.setFragmentBytes(&uh, length: stride, index: 0)
+            enc.setFragmentBuffer(field, offset: 0, index: 1)
             enc.setFragmentTexture(sceneDepth, index: 0)
             enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: count)
             for drops in droplets where drops.count > 0 {
