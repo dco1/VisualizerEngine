@@ -4,7 +4,12 @@ import simd
 // Species identity, look profiles, sRGB→linear look-up.
 extension ForestTreeGeometry {
     // ===== Species+TreeLook+look+TreeSite (lines 1057-1169) =====
-    public enum Species: CaseIterable, Sendable { case oak, birch, maple, orange, lemon, elderberry, fir }
+    public enum Species: CaseIterable, Sendable { case oak, birch, maple, orange, lemon, elderberry, fir
+        // The street trees of a warm city (DH-1649): a broad dark evergreen (fig, camphor, magnolia), the
+        // ferny jacaranda, the columnar Italian cypress, and the palms and palm-likes
+        // (`ForestTreeGeometry+Palm`).
+        case fig, jacaranda, cypress, fanPalm, kingPalm, datePalm, yucca
+    }
 
     /// Ported subset of `TreeGeometry.LookProfile` — proportions + species
     /// identity. Colours are converted sRGB→linear for the Illuminatorama
@@ -49,6 +54,9 @@ extension ForestTreeGeometry {
         /// (`ForestTreeGeometry+Conifer`), not by the broadleaf crown-arm + volumetric leaf fill
         /// that every other field above describes. `nil` for every broadleaf — byte-identical.
         public var conifer: ConiferLook? = nil
+        /// Present for a PALM (or a palm-like rosette plant): one unbranched stem and a single crown of
+        /// fronds (`ForestTreeGeometry+Palm`). `nil` for everything else.
+        public var palm: PalmLook? = nil
     }
 
     /// How a conifer is grown. Lengths are FRACTIONS of the canopy height, so a desk fir and a hall
@@ -216,7 +224,92 @@ extension ForestTreeGeometry {
                                      convexity: 0.95, reach: 0.95,
                                      needleShade: srgbToLinear(SIMD3(0.020, 0.100, 0.075)),
                                      needleLit: srgbToLinear(SIMD3(0.110, 0.330, 0.200))))
+        case .fig:
+            // Indian laurel fig / camphor / southern magnolia: the broad, dense, DARK evergreen dome
+            // of a warm-city street. An oak's habit with a heavier, glossier, smaller-leaved crown.
+            var l = look(for: .oak)
+            l.species = .fig
+            l.trunkHeightFrac = 0.30; l.primaryCountMin = 6; l.primaryCountMax = 8
+            l.leafCardSize = 0.090; l.leafDensityMult = 6.5
+            l.leafAspectW = 0.80; l.leafAspectH = 1.30; l.leafCurl = 0.20
+            l.leaf = srgbToLinear(SIMD3(0.085, 0.24, 0.085))
+            l.bark = srgbToLinear(SIMD3(0.52, 0.49, 0.44))      // smooth pale grey
+            l.crownWidthMult = 1.18
+            return l
+        case .jacaranda:
+            // Open, spreading and airy: long bare limbs, the foliage a fine light-green lace of
+            // bipinnate leaves (many small narrow blades), the crown wider than tall.
+            var l = look(for: .elderberry)
+            l.species = .jacaranda
+            l.fruit = nil
+            l.trunkHeightFrac = 0.34; l.primaryCountMin = 4; l.primaryCountMax = 6
+            l.primaryPitchMin = 0.50; l.primaryPitchRange = 0.45
+            l.leafCardSize = 0.085; l.leafDensityMult = 5.6
+            l.leafAspectW = 0.42; l.leafAspectH = 1.70; l.leafCurl = 0.30
+            l.leaf = srgbToLinear(SIMD3(0.20, 0.42, 0.14))
+            l.bark = srgbToLinear(SIMD3(0.40, 0.37, 0.33))
+            l.crownWidthMult = 1.30
+            return l
+        case .cypress:
+            // Italian cypress: a dark column a dozen metres tall and barely two wide, clothed to
+            // near the ground. A conifer whose envelope holds its width almost to the tip.
+            var l = look(for: .fir)
+            l.species = .cypress
+            l.leaf = srgbToLinear(SIMD3(0.060, 0.17, 0.085))
+            l.bark = srgbToLinear(SIMD3(0.30, 0.25, 0.20))
+            l.conifer = ConiferLook(whorlSpacing: 0.030, sprigSpacing: 0.011, sprigLength: 0.034,
+                                    sprigAspect: 0.50, branchRadius: 0.0022, baseRadius: 0.085,
+                                    convexity: 0.38, reach: 0.985,
+                                    needleShade: srgbToLinear(SIMD3(0.022, 0.075, 0.040)),
+                                    needleLit: srgbToLinear(SIMD3(0.085, 0.215, 0.105)))
+            return l
+        case .fanPalm:
+            // Mexican fan palm — the skyline palm: a very tall, very slender stem under a small
+            // round head of fans, with a short thatch of dead ones beneath it.
+            return palmLook(.fanPalm, leaf: SIMD3(0.12, 0.23, 0.10), bark: SIMD3(0.40, 0.34, 0.28),
+                            PalmLook(frond: .fan, referenceHeight: 20, trunkRadius: 0.17, baseFlare: 1.7,
+                                     frondCount: 30, frondLength: 2.3, droop: 0.45, lowestElevation: -0.75,
+                                     skirt: 0.5, skirtLength: 1.1,
+                                     leafTip: srgbToLinear(SIMD3(0.21, 0.31, 0.14)),
+                                     dead: srgbToLinear(SIMD3(0.40, 0.32, 0.21))))
+        case .kingPalm:
+            // King / queen palm: a smooth ringed grey stem, a green crownshaft, and a loose crown
+            // of long arching feathers.
+            return palmLook(.kingPalm, leaf: SIMD3(0.09, 0.21, 0.08), bark: SIMD3(0.50, 0.48, 0.44),
+                            PalmLook(frond: .feather, referenceHeight: 11, trunkRadius: 0.14, baseFlare: 1.6,
+                                     frondCount: 15, frondLength: 3.0, droop: 0.55, lowestElevation: -0.45,
+                                     crownshaft: 1.0,
+                                     leafTip: srgbToLinear(SIMD3(0.17, 0.30, 0.12)),
+                                     dead: srgbToLinear(SIMD3(0.50, 0.42, 0.24)),
+                                     shaft: srgbToLinear(SIMD3(0.30, 0.42, 0.20))))
+        case .datePalm:
+            // Canary Island date palm: a stout, rough stem and an enormous dense sphere of feathers.
+            return palmLook(.datePalm, leaf: SIMD3(0.08, 0.19, 0.08), bark: SIMD3(0.36, 0.30, 0.24),
+                            PalmLook(frond: .feather, referenceHeight: 13, trunkRadius: 0.42, baseFlare: 1.25,
+                                     frondCount: 54, frondLength: 4.4, droop: 0.38, lowestElevation: -0.70,
+                                     leafTip: srgbToLinear(SIMD3(0.15, 0.27, 0.11)),
+                                     dead: srgbToLinear(SIMD3(0.48, 0.40, 0.22))))
+        case .yucca:
+            // Spanish dagger / giant yucca: a thick stem forking into a few heads, each a rosette of
+            // stiff grey-green swords with the dead ones folded down beneath.
+            return palmLook(.yucca, leaf: SIMD3(0.15, 0.24, 0.15), bark: SIMD3(0.42, 0.37, 0.31),
+                            PalmLook(frond: .sword, referenceHeight: 4.5, trunkRadius: 0.11, baseFlare: 1.8,
+                                     frondCount: 84, frondLength: 0.75, droop: 0.5, lowestElevation: -1.0,
+                                     heads: 4,
+                                     leafTip: srgbToLinear(SIMD3(0.26, 0.34, 0.22)),
+                                     dead: srgbToLinear(SIMD3(0.55, 0.47, 0.30))))
         }
+    }
+
+    /// A palm's `TreeLook`: only the colours, species and `palm` are read — the broadleaf fields are
+    /// the oak's, unused.
+    private static func palmLook(_ sp: Species, leaf: SIMD3<Float>, bark: SIMD3<Float>, _ palm: PalmLook) -> TreeLook {
+        var l = look(for: .oak)
+        l.species = sp
+        l.leaf = srgbToLinear(leaf); l.bark = srgbToLinear(bark)
+        l.crownWidthMult = 1
+        l.palm = palm
+        return l
     }
 
 }

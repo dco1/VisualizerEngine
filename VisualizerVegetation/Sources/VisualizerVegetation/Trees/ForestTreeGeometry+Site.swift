@@ -197,6 +197,8 @@ extension ForestTreeGeometry {
         case .orange, .lemon: s.speciesMark = 2.0
         case .elderberry:     s.speciesMark = 2.0     // furrowed grey-brown: the generic plate field
         case .fir:            s.speciesMark = 2.0     // fir bark: the generic plate field (the bole is mostly hidden)
+        case .fig, .jacaranda, .cypress, .fanPalm, .kingPalm, .datePalm, .yucca:
+            s.speciesMark = 2.0                       // no bespoke bark field yet: the generic one
         }
         defer { s.speciesMark = prevSpecies }
         // Per-tree lean: tilt the whole tree about its base toward `leanAz`.
@@ -205,6 +207,11 @@ extension ForestTreeGeometry {
             : matrix_identity_float4x4
         let world = translate(site.pos) * leanTilt * rotY(site.baseYaw)
 
+        // A palm is one stem and one crown of fronds.
+        if let p = look.palm {
+            emitPalm(&s, world: world, look: look, palm: p, site: site)
+            return
+        }
         // A conifer grows by whorls of branches carrying sprigs, not by crown arms + leaf fill.
         if let c = look.conifer {
             emitConifer(&s, world: world, look: look, conifer: c, site: site)

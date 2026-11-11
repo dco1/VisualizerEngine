@@ -283,8 +283,8 @@ extension ForestTreeGeometry {
         case .oak:                         return (1, (1.066 / leafCutoutArea[1]).squareRoot())
         case .maple:                       return (2, (1.066 / leafCutoutArea[2]).squareRoot())
         case .birch:                       return (3, (1.066 / leafCutoutArea[3]).squareRoot())
-        case .orange, .lemon, .elderberry: return (4, (1.066 / leafCutoutArea[4]).squareRoot())
-        case .fir:                         return (0, 1)
+        case .orange, .lemon, .elderberry, .fig, .jacaranda: return (4, (1.066 / leafCutoutArea[4]).squareRoot())
+        case .fir, .cypress, .fanPalm, .kingPalm, .datePalm, .yucca: return (0, 1)
         }
     }
     /// Leaf area per cutout code inside the roomy card, in (v, u) card units.
@@ -517,6 +517,8 @@ extension ForestTreeGeometry {
         case .orange, .lemon: silhouette = .citrus
         case .elderberry:     silhouette = .citrus     // an entire lanceolate leaflet; the look narrows it
         case .fir:            silhouette = .citrus     // unused: a conifer's sprigs come from ForestTreeGeometry+Conifer
+        case .fig, .jacaranda: silhouette = .citrus    // an entire elliptic blade; the look sets its proportions
+        case .cypress, .fanPalm, .kingPalm, .datePalm, .yucca: silhouette = .citrus   // unused: own generators
         }
 
         // fold 0.30 — the taco cup: the margin lifts toward bentNormal ∝ u so the
