@@ -101,6 +101,11 @@ final class SkyKnobs {
     var volRTDustAdmittanceRef: Float = 0.1
     /// The admittance lattice's width in rays (height follows the aspect).
     var volRTAdmittanceGrid: Int = 64
+    /// OPEN AIR: the medium fills every sample of the march, not only roofed air — an EXTERIOR
+    /// still's god rays, cut by whatever the sun's shadow ray meets (the house, its trees, the
+    /// neighbours in the TLAS). Sun in-scatter only: outdoors the sky's veil is aerial
+    /// perspective's job, so the aperture-sky term is skipped. Off ⇒ byte-identical.
+    var volRTOpenAir: Bool = false
     // ── Spot-light beam scattering (issue: CK5 concert beams) ───────
     /// Single-scatter march of every `spotLights` cone through hazy air, so
     /// spots read as BEAMS in the air, not just pools on surfaces. Runs after

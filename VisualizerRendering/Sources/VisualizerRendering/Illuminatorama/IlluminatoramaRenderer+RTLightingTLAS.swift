@@ -146,8 +146,14 @@ extension IlluminatoramaRenderer {
         // scene that busts the mesh-group cap (thousands of groups) would
         // otherwise pay a full dictionary-lookup loop every frame purely to
         // re-confirm it is still too heavy.
+        // The group cap bounds the groups that get a BLAS — a fully ray-excluded group (a host's
+        // far-field scenery: Daydream's `site_wide_…` terrain, photo tiles, far buildings and trees)
+        // never enters the TLAS (the rebuild skips it), so it is not counted. Only walked when the
+        // raw count is over, so a scene under the cap keeps the O(1) test.
+        let tracedGroupsOver = gbs.meshGroups.count > groupCap
+            && gbs.meshGroups.lazy.filter { !self.rtGroupIsRayExcluded($0) }.count > groupCap
         var overCap = instances.count + glassInstCount > Self.rtMaxInstancesForLiveRT
-            || gbs.meshGroups.count > groupCap
+            || tracedGroupsOver
         var estTriangles = -1                     // −1 = not computed (cap already busted)
         if !overCap {
             estTriangles = 0

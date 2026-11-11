@@ -2401,6 +2401,7 @@ struct VolRTUniforms {
     float sunScatter; float skyScatter; float scotopicDesaturation; float rayTMin;
     float dustDensity; float dustAnisotropy; float dustAdmittanceRef; uint admittanceGrid;
     uint pixelStride;      // 1 ⇒ every pixel every frame; K ⇒ a random 1/K of them, weighted K
+    uint openAir;          // 1 ⇒ every sample is in the medium (exterior god rays); sun term only
 };
 
 /// The view ray through pixel `gid` and its march end (depth-terminated, capped at maxDist).
@@ -2457,7 +2458,7 @@ kernel void illumi_volumetric_rt_admittance(
         float3 X = u.cameraWorldPos + rd * ((float(i) + 0.5) * dt);
         ray up; up.origin = X; up.direction = float3(0.0, 1.0, 0.0);
         up.min_distance = 0.0; up.max_distance = u.roofReach;
-        if (isect.intersect(up, accel, u.transportMask).type == intersection_type::none) continue;
+        if (u.openAir == 0u && isect.intersect(up, accel, u.transportMask).type == intersection_type::none) continue;
         roofed += 64u;
         if (!sunOn) continue;
         ray sr; sr.origin = X; sr.direction = toSun; sr.min_distance = max(u.rayTMin, 1e-3); sr.max_distance = 1e4;
@@ -2544,11 +2545,11 @@ kernel void illumi_volumetric_rt(
         float t = (float(i) + q0.x) * dt;
         float3 X = ro + rd * t;
 
-        // Roofed air only.
+        // Roofed air only — unless the medium is OPEN AIR (an exterior still's god rays).
         isect.accept_any_intersection(true);
         ray up; up.origin = X; up.direction = float3(0.0, 1.0, 0.0);
         up.min_distance = 0.0; up.max_distance = u.roofReach;
-        if (isect.intersect(up, accel, u.transportMask).type == intersection_type::none) continue;
+        if (u.openAir == 0u && isect.intersect(up, accel, u.transportMask).type == intersection_type::none) continue;
         roofedLen += dt;
         float Tcam = exp(-sigmaT * t);
         float3 Lx = float3(0.0);
@@ -2560,7 +2561,7 @@ kernel void illumi_volumetric_rt(
             }
         }
 
-        if (u.skyScatter > 0.0 && u.areaLightCount > 0u) {
+        if (u.openAir == 0u && u.skyScatter > 0.0 && u.areaLightCount > 0u) {
             float wSum = 0.0;
             for (uint k = 0u; k < u.areaLightCount; ++k) wSum += volRTApertureWeight(areaLights[k], X);
             if (wSum > 0.0) {

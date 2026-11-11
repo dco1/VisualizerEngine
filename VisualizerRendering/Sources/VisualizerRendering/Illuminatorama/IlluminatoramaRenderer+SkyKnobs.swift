@@ -33,6 +33,7 @@ extension IlluminatoramaRenderer {
     public var volRTDustAnisotropy: Float { get { kSky.volRTDustAnisotropy } set { kSky.volRTDustAnisotropy = newValue } _modify { yield &kSky.volRTDustAnisotropy } }
     public var volRTDustAdmittanceRef: Float { get { kSky.volRTDustAdmittanceRef } set { kSky.volRTDustAdmittanceRef = newValue } _modify { yield &kSky.volRTDustAdmittanceRef } }
     public var volRTAdmittanceGrid: Int { get { kSky.volRTAdmittanceGrid } set { kSky.volRTAdmittanceGrid = newValue } _modify { yield &kSky.volRTAdmittanceGrid } }
+    public var volRTOpenAir: Bool { get { kSky.volRTOpenAir } set { kSky.volRTOpenAir = newValue } _modify { yield &kSky.volRTOpenAir } }
     public var volSpotBeamsEnabled: Bool { get { kSky.volSpotBeamsEnabled } set { kSky.volSpotBeamsEnabled = newValue } _modify { yield &kSky.volSpotBeamsEnabled } }
     public var volSpotBeamDensity: Float { get { kSky.volSpotBeamDensity } set { kSky.volSpotBeamDensity = newValue } _modify { yield &kSky.volSpotBeamDensity } }
     public var volSpotBeamStrength: Float { get { kSky.volSpotBeamStrength } set { kSky.volSpotBeamStrength = newValue } _modify { yield &kSky.volSpotBeamStrength } }

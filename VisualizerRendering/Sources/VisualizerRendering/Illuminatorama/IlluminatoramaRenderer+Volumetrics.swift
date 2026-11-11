@@ -43,6 +43,8 @@ extension IlluminatoramaRenderer {
         var sunScatter: Float; var skyScatter: Float; var scotopicDesaturation: Float; var rayTMin: Float
         var dustDensity: Float; var dustAnisotropy: Float; var dustAdmittanceRef: Float; var admittanceGrid: UInt32
         var pixelStride: UInt32 = 1
+        /// 1 ⇒ open air: every march sample is in the medium (`volRTOpenAir`).
+        var openAir: UInt32 = 0
     }
 
     /// Drive the analytic (screen-resolution) PHYSICAL night sky from the same
@@ -191,7 +193,8 @@ extension IlluminatoramaRenderer {
             dustDensity: max(0, volRTDustDensity), dustAnisotropy: max(-0.95, min(0.95, volRTDustAnisotropy)),
             dustAdmittanceRef: max(1e-4, volRTDustAdmittanceRef),
             admittanceGrid: UInt32(max(1, min(512, volRTAdmittanceGrid))),
-            pixelStride: UInt32(max(1, min(16, volRTPixelStride))))
+            pixelStride: UInt32(max(1, min(16, volRTPixelStride))),
+            openAir: volRTOpenAir ? 1 : 0)
         vols.volRTProgressiveIndex &+= 1
         guard let counts = volRTAdmittanceBuffer else { return }
         // DH-0999 — measure the direct sun entering the view's air BEFORE the march reads it. The
