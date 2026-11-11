@@ -230,7 +230,7 @@ extension ForestTreeGeometry {
             var l = look(for: .oak)
             l.species = .fig
             l.trunkHeightFrac = 0.30; l.primaryCountMin = 6; l.primaryCountMax = 8
-            l.leafCardSize = 0.090; l.leafDensityMult = 6.5
+            l.leafCardSize = 0.110; l.leafDensityMult = 4.2
             l.leafAspectW = 0.80; l.leafAspectH = 1.30; l.leafCurl = 0.20
             l.leaf = srgbToLinear(SIMD3(0.085, 0.24, 0.085))
             l.bark = srgbToLinear(SIMD3(0.52, 0.49, 0.44))      // smooth pale grey
@@ -244,7 +244,7 @@ extension ForestTreeGeometry {
             l.fruit = nil
             l.trunkHeightFrac = 0.34; l.primaryCountMin = 4; l.primaryCountMax = 6
             l.primaryPitchMin = 0.50; l.primaryPitchRange = 0.45
-            l.leafCardSize = 0.085; l.leafDensityMult = 5.6
+            l.leafCardSize = 0.100; l.leafDensityMult = 4.0
             l.leafAspectW = 0.42; l.leafAspectH = 1.70; l.leafCurl = 0.30
             l.leaf = srgbToLinear(SIMD3(0.20, 0.42, 0.14))
             l.bark = srgbToLinear(SIMD3(0.40, 0.37, 0.33))
