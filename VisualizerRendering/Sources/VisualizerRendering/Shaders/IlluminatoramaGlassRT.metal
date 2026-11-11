@@ -456,7 +456,38 @@ struct GlassRTState {
     /// slice starts at `insts[iid].emissionPad.w − 1`, and 0 there means "none — use the face
     /// normal". See `glassHitShadingNormal`.
     const device float4*         cornerN;
+    /// Per-frame work census (Daydream DH-1625), `GlassStat` slots. Written only by the `kGlassStats`
+    /// variant (the host's `glassStatsEnabled`); a bound dummy otherwise, never touched.
+    device atomic_uint*          stats;
 };
+
+/// The census variant (`IlluminatoramaRenderer.glassStatsFunctionConstantIndex`). Undefined or false ⇒ every
+/// `glassStat` compiles away: the shipped shader carries none of it — an inert load per fragment cost the
+/// pass ~50 % (24 → 37 ms on 4000 Sunset) when this was a runtime flag, because this shader is
+/// occupancy-bound.
+constant bool kGlassStatsFC [[function_constant(40)]];
+constant bool kGlassStats = is_function_constant_defined(kGlassStatsFC) && kGlassStatsFC;
+
+/// Slots of the glass work census — what one frame's RT glass fragments actually did.
+enum GlassStat : uint {
+    kGlassStatFragments = 1u,      // fragments that reached the trace (after the defocus branch)
+    kGlassStatFrontDiscard = 2u,   // …of which the front-surface any-hit ray discarded
+    kGlassStatRefrPaths = 3u,      // refraction paths started (1 per fragment, more for frosted/dispersive)
+    kGlassStatRefrSteps = 4u,      // closest-hit rays inside traceRefractionPath
+    kGlassStatRefrGlassHits = 5u,  // …that landed on a glass boundary (exit / next pane)
+    kGlassStatRefrTIR = 6u,        // …of which totally internally reflected
+    kGlassStatRefrShaded = 7u,     // paths that ended on an opaque hit and shaded it
+    kGlassStatRefrSky = 8u,        // paths that escaped to the sky
+    kGlassStatRefrBudget = 9u,     // paths that ran out of bounces
+    kGlassStatReflRays = 10u,      // reflection rays
+    kGlassStatReflShaded = 11u,    // …that shaded an opaque hit
+    kGlassStatSSReplaced = 12u,    // fragments whose traced refraction screen space replaced in full (w = 1)
+    kGlassStatCount = 16u
+};
+
+static inline void glassStat(GlassRTState st, uint slot) {
+    if (kGlassStats) atomic_fetch_add_explicit(&st.stats[slot], 1u, memory_order_relaxed);
+}
 
 /// The SMOOTH normal at a glass hit — the barycentric blend of the triangle's three vertex
 /// normals, the same normal the rasteriser interpolates for the entry surface — or `hn` (the
@@ -568,6 +599,7 @@ static float3 traceRefractionPath(
     // one shell, came out looking like clear glass). 0.1 mm is ~50 float ulps at house scale —
     // clear of self-intersection, and far below any real glass thickness.
     float eps = 1e-4;
+    glassStat(st, kGlassStatRefrPaths);
     // Refract into the glass at the entry surface.
     float3 rd = refract(-V, Ng, 1.0 / max(1.0, iorEntry));
     if (dot(rd, rd) < 1e-8) rd = reflect(-V, Ng);      // grazing guard
@@ -592,8 +624,10 @@ static float3 traceRefractionPath(
         ray r; r.origin = ro; r.direction = normalize(rd);
         r.min_distance = eps; r.max_distance = 1e4;
         auto res = isect.intersect(r, accel, 0x03u);    // opaque + glass
+        glassStat(st, kGlassStatRefrSteps);
         if (res.type != intersection_type::triangle) {
             // Escaped to the sky.
+            glassStat(st, kGlassStatRefrSky);
             outAbsorb = throughput;
             outExitDir = normalize(rd);
             return throughput * sampleSky(sky, rd, u.skyIntensity, glassNightSky(u), u.nightPixAngle);
@@ -605,6 +639,7 @@ static float3 traceRefractionPath(
 
         if (iid >= u.glassInstanceBase) {
             // Dielectric boundary (exit, or enter a nested/adjacent glass).
+            glassStat(st, kGlassStatRefrGlassHits);
             uint gi = iid - u.glassInstanceBase;
             RTGlassData gd = st.glassData[gi];
             float hitIOR = max(1.0, gd.tintIor.w);
@@ -623,6 +658,7 @@ static float3 traceRefractionPath(
             float3 t2 = refract(r.direction, n, n1 / n2);
             if (dot(t2, t2) < 1e-8) {
                 // Total internal reflection — bounce inside, same medium.
+                glassStat(st, kGlassStatRefrTIR);
                 rd = reflect(r.direction, n);
                 // A shading normal can tip a reflection through the real surface; keep it on
                 // the incoming side of the GEOMETRIC boundary it reflected from.
@@ -650,6 +686,7 @@ static float3 traceRefractionPath(
             continue;
         }
         // Opaque surface: shade it and stop.
+        glassStat(st, kGlassStatRefrShaded);
         float3 rad = shadeOpaqueHit(isect, accel, iid, res.primitive_id,
                                     res.triangle_barycentric_coord, hitP, r.direction,
                                     u, st, surfAtlas, irrCube, albedoAtlas, seed, res);
@@ -658,6 +695,7 @@ static float3 traceRefractionPath(
         return throughput * rad;
     }
     // Bounce budget exhausted — return the accumulated sky as a fallback.
+    glassStat(st, kGlassStatRefrBudget);
     outAbsorb = throughput;
     outExitDir = normalize(rd);
     return throughput * sampleSky(sky, rd, u.skyIntensity, glassNightSky(u), u.nightPixAngle);
@@ -685,6 +723,7 @@ static float3 traceReflection(
     r.min_distance = eps; r.max_distance = 1e4;
     isect.accept_any_intersection(false);
     auto res = isect.intersect(r, accel, 0x03u);
+    glassStat(st, kGlassStatReflRays);
     if (res.type != intersection_type::triangle) {
         return sampleSky(sky, dir, u.skyIntensity, glassNightSky(u), u.nightPixAngle);
     }
@@ -696,56 +735,53 @@ static float3 traceReflection(
         return sampleSky(sky, dir, u.skyIntensity, glassNightSky(u), u.nightPixAngle) * tint;
     }
     float3 hitP = r.origin + r.direction * res.distance;
+    glassStat(st, kGlassStatReflShaded);
     return shadeOpaqueHit(isect, accel, res.instance_id, res.primitive_id,
                           res.triangle_barycentric_coord, hitP, r.direction,
                           u, st, surfAtlas, irrCube, albedoAtlas, seed, res);
 }
 
-fragment float4 illumi_glass_rt_fs(
-    GlassVSOut                       in          [[stage_in]],
-    constant GlassRTUniforms&        u           [[buffer(1)]],
-    const device GlassInstance*      instances   [[buffer(2)]],
-    instance_acceleration_structure  accel       [[buffer(0)]],
-    const device RTInstanceData*     insts       [[buffer(3)]],
-    const device float4*             objNormal   [[buffer(4)]],
-    const device RTGlassData*        glassData   [[buffer(5)]],
-    const device uint*               triCard     [[buffer(6)]],
-    const device float4*             triUVa      [[buffer(7)]],
-    const device float4*             triUVc      [[buffer(8)]],
-    const device uint*               soupTriBase [[buffer(9)]],
-    const device float4*             surfCardRect[[buffer(10)]],
-    const device SurfCard*           surfCards   [[buffer(11)]],
-    const device float2*             objUV       [[buffer(12)]],
-    const device float2*             albedoUVScale [[buffer(13)]],
-    const device RTPointLight*       pointLights [[buffer(14)]],
-    const device RTSpotLight*        spotLights  [[buffer(15)]],
-    const device float4*             cornerN     [[buffer(16)]],
-    const device RTAreaLight*        areaLights  [[buffer(17)]],   // DH-0718; gated by meta.y
-    const device float*              spotProfiles [[buffer(18)]],  // DH-0540 — the spot-profile rows
-    const device float*              cloudShadow [[buffer(19)]],   // DH-1462 — cloud sun transmittance (dummy when off)
-    texture2d<float, access::sample> sky         [[texture(0)]],
-    texture2d<float, access::sample> surfAtlas   [[texture(1)]],
-    texture2d<float, access::sample> backdrop    [[texture(2)]],
-    texturecube<float, access::sample> irrCube   [[texture(3)]],
-    texture2d_array<float, access::sample> albedoAtlas [[texture(4)]],
-    // The reduced-resolution trace (defocus mode 2 only; any texture otherwise, unread).
-    texture2d<float, access::read>   defocusLo   [[texture(5)]])
-{
-    // ── Defocus trace (opt-in; mode 0 skips both branches) ───────────────────
-    uint defocusMode = uint(u.defocus.x + 0.5);
-    if (defocusMode == 2u && glassDefocusCoC(in.worldPos, u) >= u.defocus.z) {
-        // Every glass fragment covering this pixel reads the SAME low-res texels, so the result
-        // does not depend on which surface of a nested body is drawn last — no front-surface
-        // ray is needed on this path.
-        float4 lo = glassDefocusUpsample(defocusLo, in.clipPos.xy, u.defocus.y);
-        if (lo.a > 0.0) return float4(lo.rgb, 1.0);
-    } else if (defocusMode == 1u && glassDefocusCoC(in.worldPos, u) < u.defocus.w) {
-        // Low-res pass: this pane point is sharp enough that the full-res pass will trace it
-        // itself — write nothing (coverage 0).
-        discard_fragment();
-        return float4(0.0);
-    }
+/// What one glass pixel needs from the raster: the nearest pane's surface point (DH-1625). The fragment
+/// path fills it from its stage input, the compute path from the glass surface targets.
+struct GlassPixelIn {
+    float3 worldPos;
+    float3 worldNormal;
+    uint   instanceID;   // index into `instances` (the glass instance buffer the caller bound)
+    float2 pixel;        // pixel centre in the HDR composite (x + 0.5, y + 0.5)
+};
 
+/// The RT glass shade of one pixel — refraction path(s), reflection, slab Fresnel. ONE body, called by the
+/// fragment pass and the compute pass, so the two cannot drift. `frontTest` runs the any-hit "is a nearer
+/// glass surface in front of me" ray: the fragment path needs it; the compute path's raster already kept
+/// only the nearest surface. Alpha −1 ⇒ the caller discards.
+static float4 glassShadePixel(GlassPixelIn in, bool frontTest,
+    constant GlassRTUniforms&        u,
+    const device GlassInstance*      instances,
+    instance_acceleration_structure  accel,
+    const device RTInstanceData*     insts,
+    const device float4*             objNormal,
+    const device RTGlassData*        glassData,
+    const device uint*               triCard,
+    const device float4*             triUVa,
+    const device float4*             triUVc,
+    const device uint*               soupTriBase,
+    const device float4*             surfCardRect,
+    const device SurfCard*           surfCards,
+    const device float2*             objUV,
+    const device float2*             albedoUVScale,
+    const device RTPointLight*       pointLights,
+    const device RTSpotLight*        spotLights,
+    const device float4*             cornerN,
+    const device RTAreaLight*        areaLights,   // DH-0718; gated by meta.y
+    const device float*              spotProfiles,  // DH-0540 — the spot-profile rows
+    const device float*              cloudShadow,   // DH-1462 — cloud sun transmittance (dummy when off)
+    device atomic_uint*              glassStats,   // DH-1625 — work census (kGlassStats variant only)
+    texture2d<float, access::sample> sky,
+    texture2d<float, access::sample> surfAtlas,
+    texture2d<float, access::sample> backdrop,
+    texturecube<float, access::sample> irrCube,
+    texture2d_array<float, access::sample> albedoAtlas)
+{
     GlassInstance gi = instances[in.instanceID];
     float ior        = max(1.0, gi.tintIor.w);
     float3 tint      = gi.tintIor.xyz;
@@ -770,6 +806,8 @@ fragment float4 illumi_glass_rt_fs(
     st.triCard = triCard; st.triUVa = triUVa; st.triUVc = triUVc;
     st.soupTriBase = soupTriBase; st.surfCardRect = surfCardRect; st.surfCards = surfCards;
     st.cornerN = cornerN;
+    st.stats = glassStats;
+    glassStat(st, kGlassStatFragments);
 
     intersector<triangle_data, instancing> isect;
     isect.set_triangle_cull_mode(triangle_cull_mode::none);
@@ -785,7 +823,7 @@ fragment float4 illumi_glass_rt_fs(
     // looked like clear glass). One any-hit glass ray from the eye decides it, order-free and
     // without touching the scene depth the later passes read. Skipped under the soap-bubble
     // undulation, whose raster surface is displaced away from the one in the TLAS.
-    if (u.wobbleAmp <= 0.0) {
+    if (frontTest && u.wobbleAmp <= 0.0) {
         float d = length(u.cameraWorldPos - in.worldPos);
         if (d > 2e-3) {
             ray eye; eye.origin = u.cameraWorldPos; eye.direction = -V;
@@ -793,15 +831,18 @@ fragment float4 illumi_glass_rt_fs(
             isect.accept_any_intersection(true);
             auto front = isect.intersect(eye, accel, 0x02u);   // glass only
             isect.accept_any_intersection(false);
-            // `discard_fragment` does not end the invocation (the lane can live on as a helper),
-            // and a discarded lane that goes on to run the full RT walk below faulted the GPU —
-            // so leave explicitly.
-            if (front.type == intersection_type::triangle) { discard_fragment(); return float4(0.0); }
+            // Alpha −1 tells the caller to discard. (`discard_fragment` does not end the invocation —
+            // the lane can live on as a helper — and a discarded lane that went on to run the full RT
+            // walk below faulted the GPU, so this always leaves explicitly.)
+            if (front.type == intersection_type::triangle) {
+                glassStat(st, kGlassStatFrontDiscard);
+                return float4(0.0, 0.0, 0.0, -1.0);
+            }
         }
     }
 
     // Per-fragment seed for the stochastic cones; varies per frame so TAA averages.
-    uint seed = pcgHash(uint(in.clipPos.x) + uint(in.clipPos.y) * 9781u + u.frameSeed * 6151u);
+    uint seed = pcgHash(uint(in.pixel.x) + uint(in.pixel.y) * 9781u + u.frameSeed * 6151u);
 
     // ── Fresnel: a pane is a SLAB, not one interface ─────────────────────────
     // `Fs` is Schlick for ONE air–glass surface. A window has TWO of them, and the
@@ -848,56 +889,48 @@ fragment float4 illumi_glass_rt_fs(
     float3 refrAbsorb = float3(1.0);
     float3 refrExit = -V;
     bool ssAbsorbValid = false;
-    float3 refr;
-    if (u.dispersionEnabled != 0u && dispersion > 1e-4) {
-        // Normal dispersion: blue bends more (higher IOR) than red. Split the IOR
-        // and trace the path once per primary; recombine as RGB. Three full
-        // paths — gated, so only dispersive glass pays it.
-        float spread = dispersion * 0.04 * ior;         // ±IOR offset
-        uint s0 = seed;
-        float3 dropAbsorb, dropExit;
-        float r = traceRefractionPath(isect, accel, P, V, N, ior - spread, tint, density,
-                                      roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
-                                      dropAbsorb, dropExit).r;
-        seed = s0 ^ 0x1234u;
-        float g = traceRefractionPath(isect, accel, P, V, N, ior, tint, density,
-                                      roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
-                                      dropAbsorb, dropExit).g;
-        seed = s0 ^ 0x9abcu;
-        float bb = traceRefractionPath(isect, accel, P, V, N, ior + spread, tint, density,
-                                       roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
-                                       dropAbsorb, dropExit).b;
-        refr = float3(r, g, bb);
-    } else {
-        // Frosted glass jitters the refraction in a cone, so a single sample is
-        // noisy (TAA cleans it when static but it shimmers under motion). Average
-        // a few stochastic path traces — count scales with roughness, so polished
-        // glass pays for exactly one and only frosted glass pays more.
-        // Up to 12 for a truly rough (etched) pane: a hollow glass block scatters at four
-        // boundaries in a row, and at the old cap of 4 the settled live frame — one frozen
-        // sample set, no accumulation — showed chroma speckle across the whole pane (DH-0898).
-        uint nRefr = secondaryConeSamples(roughness, kGlassConeK, 24.0, 12u);
-        if (nRefr <= 1u) {
-            refr = traceRefractionPath(isect, accel, P, V, N, ior, tint, density,
-                                       roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
-                                       refrAbsorb, refrExit);
-            ssAbsorbValid = true;
-        } else {
-            float3 acc = float3(0.0);
-            // Stratified entry scatter: azimuth in even slices under one per-pixel rotation,
-            // radius on a golden-ratio sequence under another — the samples tile the cone.
-            float rotA = rnd(seed), rotR = rnd(seed);
-            for (uint s = 0u; s < nRefr; ++s) {
-                float3 coneAbsorb, coneExit;
-                float2 stratum = float2(fract(rotR + float(s) * 0.6180340),
-                                        fract(rotA + (float(s) + 0.5) / float(nRefr)));
-                acc += traceRefractionPath(isect, accel, P, V, N, ior, tint, density,
-                                           roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
-                                           coneAbsorb, coneExit, stratum);
-            }
-            refr = acc / float(nRefr);
+    // ONE call site for every refraction path (DH-1625). `traceRefractionPath` carries a whole shaded
+    // opaque hit, and this shader is occupancy-bound: written as three call sites (dispersion R/G/B, one
+    // polished path, the frosted cone loop) it was inlined five times. The paths below are exactly the
+    // ones those branches traced — same IORs, same seeds, same strata, same weights.
+    //  · Normal dispersion: blue bends more (higher IOR) than red. Split the IOR and trace once per
+    //    primary; recombine as RGB. Three full paths — gated, so only dispersive glass pays it.
+    //  · Frosted glass jitters the refraction in a cone, so a single sample is noisy (TAA cleans it
+    //    when static but it shimmers under motion). Average a few stochastic paths — the count scales
+    //    with roughness, so polished glass pays for exactly one. Up to 12 for a truly rough (etched)
+    //    pane: a hollow glass block scatters at four boundaries in a row, and at the old cap of 4 the
+    //    settled live frame — one frozen sample set, no accumulation — showed chroma speckle across the
+    //    whole pane (DH-0898). Stratified entry scatter: azimuth in even slices under one per-pixel
+    //    rotation, radius on a golden-ratio sequence under another — the samples tile the cone.
+    bool dispersive = u.dispersionEnabled != 0u && dispersion > 1e-4;
+    float spread = dispersion * 0.04 * ior;             // ±IOR offset (dispersive only)
+    uint nRefr = dispersive ? 3u : secondaryConeSamples(roughness, kGlassConeK, 24.0, 12u);
+    bool cone = !dispersive && nRefr > 1u;
+    uint s0 = seed;
+    float rotA = 0.0, rotR = 0.0;
+    if (cone) { rotA = rnd(seed); rotR = rnd(seed); }
+    float3 acc = float3(0.0);
+    for (uint s = 0u; s < nRefr; ++s) {
+        float iorS = ior;
+        float2 stratum = float2(-1.0);
+        if (dispersive) {
+            iorS = ior + spread * (float(s) - 1.0);
+            if (s == 1u) seed = s0 ^ 0x1234u;
+            if (s == 2u) seed = s0 ^ 0x9abcu;
+        } else if (cone) {
+            stratum = float2(fract(rotR + float(s) * 0.6180340),
+                             fract(rotA + (float(s) + 0.5) / float(nRefr)));
         }
+        float3 pathAbsorb, pathExit;
+        float3 c = traceRefractionPath(isect, accel, P, V, N, iorS, tint, density,
+                                       roughness, u, st, sky, surfAtlas, irrCube, albedoAtlas, seed,
+                                       pathAbsorb, pathExit, stratum);
+        if (dispersive) acc[s] = c[s];
+        else acc += c;
+        if (nRefr == 1u) { refrAbsorb = pathAbsorb; refrExit = pathExit; }
     }
+    float3 refr = dispersive ? acc : acc / float(nRefr);
+    ssAbsorbValid = !dispersive && nRefr == 1u;
 
     // ── Screen-space transmission parity ─────────────────────────────────────
     //
@@ -951,9 +984,10 @@ fragment float4 illumi_glass_rt_fs(
         // reeds' refraction was thrown away for the unbent backdrop — fluted read as clear glass.
         // 0.9990 → 0.9999 is ~2.6° → ~0.8° of deviation.
         float w = smoothstep(0.80, 0.95, cosI) * smoothstep(0.9990, 0.9999, dot(refrExit, -V));
+        if (w >= 1.0) glassStat(st, kGlassStatSSReplaced);
         if (w > 0.0) {
             constexpr sampler bdSmp(filter::linear, address::clamp_to_edge);
-            float2 uv = in.clipPos.xy / float2(u.viewW, u.viewH);
+            float2 uv = in.pixel / float2(u.viewW, u.viewH);
             // `refrAbsorb` is the traced path's own Beer–Lambert throughput over the real
             // geometric path inside this pane, so the composite is tinted by exactly the glass
             // the ray went through. A nominal thickness must NOT be substituted here: an 80 mm
@@ -984,6 +1018,128 @@ fragment float4 illumi_glass_rt_fs(
     float3 color = mix(refr, refl, F);
     return float4(color, 1.0);
 }
+
+fragment float4 illumi_glass_rt_fs(
+    GlassVSOut                       in          [[stage_in]],
+    constant GlassRTUniforms&        u           [[buffer(1)]],
+    const device GlassInstance*      instances   [[buffer(2)]],
+    instance_acceleration_structure  accel       [[buffer(0)]],
+    const device RTInstanceData*     insts       [[buffer(3)]],
+    const device float4*             objNormal   [[buffer(4)]],
+    const device RTGlassData*        glassData   [[buffer(5)]],
+    const device uint*               triCard     [[buffer(6)]],
+    const device float4*             triUVa      [[buffer(7)]],
+    const device float4*             triUVc      [[buffer(8)]],
+    const device uint*               soupTriBase [[buffer(9)]],
+    const device float4*             surfCardRect[[buffer(10)]],
+    const device SurfCard*           surfCards   [[buffer(11)]],
+    const device float2*             objUV       [[buffer(12)]],
+    const device float2*             albedoUVScale [[buffer(13)]],
+    const device RTPointLight*       pointLights [[buffer(14)]],
+    const device RTSpotLight*        spotLights  [[buffer(15)]],
+    const device float4*             cornerN     [[buffer(16)]],
+    const device RTAreaLight*        areaLights  [[buffer(17)]],   // DH-0718; gated by meta.y
+    const device float*              spotProfiles [[buffer(18)]],  // DH-0540 — the spot-profile rows
+    const device float*              cloudShadow [[buffer(19)]],   // DH-1462 — cloud sun transmittance (dummy when off)
+    device atomic_uint*              glassStats  [[buffer(21)]],   // DH-1625 — work census (kGlassStats variant only)
+    texture2d<float, access::sample> sky         [[texture(0)]],
+    texture2d<float, access::sample> surfAtlas   [[texture(1)]],
+    texture2d<float, access::sample> backdrop    [[texture(2)]],
+    texturecube<float, access::sample> irrCube   [[texture(3)]],
+    texture2d_array<float, access::sample> albedoAtlas [[texture(4)]],
+    // The reduced-resolution trace (defocus mode 2 only; any texture otherwise, unread).
+    texture2d<float, access::read>   defocusLo   [[texture(5)]])
+{
+    // ── Defocus trace (opt-in; mode 0 skips both branches) ───────────────────
+    uint defocusMode = uint(u.defocus.x + 0.5);
+    if (defocusMode == 2u && glassDefocusCoC(in.worldPos, u) >= u.defocus.z) {
+        // Every glass fragment covering this pixel reads the SAME low-res texels, so the result
+        // does not depend on which surface of a nested body is drawn last — no front-surface
+        // ray is needed on this path.
+        float4 lo = glassDefocusUpsample(defocusLo, in.clipPos.xy, u.defocus.y);
+        if (lo.a > 0.0) return float4(lo.rgb, 1.0);
+    } else if (defocusMode == 1u && glassDefocusCoC(in.worldPos, u) < u.defocus.w) {
+        // Low-res pass: this pane point is sharp enough that the full-res pass will trace it
+        // itself — write nothing (coverage 0).
+        discard_fragment();
+        return float4(0.0);
+    }
+
+    GlassPixelIn pin;
+    pin.worldPos = in.worldPos; pin.worldNormal = in.worldNormal;
+    pin.instanceID = in.instanceID; pin.pixel = in.clipPos.xy;
+    float4 c = glassShadePixel(pin, true, u, instances, accel, insts, objNormal, glassData, triCard, triUVa, triUVc, soupTriBase, surfCardRect, surfCards, objUV, albedoUVScale, pointLights, spotLights, cornerN, areaLights, spotProfiles, cloudShadow, glassStats, sky, surfAtlas, backdrop, irrCube, albedoAtlas);
+    if (c.a < 0.0) { discard_fragment(); return float4(0.0); }
+    return c;
+}
+
+// ── The compute path (DH-1625) ───────────────────────────────────────────────
+// Measured on 4000 Sunset (M1, software ray traversal): the fragment pass above spent ~25 ms on ~27 k
+// glass fragments — ~350 ns a reflection ray, against a few ns a ray in the compute TLAS lighting pass.
+// So the raster now only finds the nearest pane per pixel (`illumi_glass_surface_fs`, depth-written into
+// a copy of the scene depth: nearest wins, no any-hit ray) and `illumi_glass_rt_cs` traces it.
+
+struct GlassSurfaceOut {
+    float4 posInst [[color(0)]];   // xyz world position, w = glass instance index + 1 (0 = no glass)
+    float4 normal  [[color(1)]];   // xyz interpolated world normal
+};
+
+[[early_fragment_tests]]
+fragment GlassSurfaceOut illumi_glass_surface_fs(
+    GlassVSOut     in        [[stage_in]],
+    constant uint& groupBase [[buffer(4)]])   // this draw's first instance in the flat instance buffer
+{
+    GlassSurfaceOut o;
+    o.posInst = float4(in.worldPos, float(groupBase + in.instanceID + 1u));
+    o.normal = float4(in.worldNormal, 0.0);
+    return o;
+}
+
+kernel void illumi_glass_rt_cs(
+    uint2                            gid         [[thread_position_in_grid]],
+    constant GlassRTUniforms&        u           [[buffer(1)]],
+    const device GlassInstance*      instances   [[buffer(2)]],
+    instance_acceleration_structure  accel       [[buffer(0)]],
+    const device RTInstanceData*     insts       [[buffer(3)]],
+    const device float4*             objNormal   [[buffer(4)]],
+    const device RTGlassData*        glassData   [[buffer(5)]],
+    const device uint*               triCard     [[buffer(6)]],
+    const device float4*             triUVa      [[buffer(7)]],
+    const device float4*             triUVc      [[buffer(8)]],
+    const device uint*               soupTriBase [[buffer(9)]],
+    const device float4*             surfCardRect[[buffer(10)]],
+    const device SurfCard*           surfCards   [[buffer(11)]],
+    const device float2*             objUV       [[buffer(12)]],
+    const device float2*             albedoUVScale [[buffer(13)]],
+    const device RTPointLight*       pointLights [[buffer(14)]],
+    const device RTSpotLight*        spotLights  [[buffer(15)]],
+    const device float4*             cornerN     [[buffer(16)]],
+    const device RTAreaLight*        areaLights  [[buffer(17)]],   // DH-0718; gated by meta.y
+    const device float*              spotProfiles [[buffer(18)]],  // DH-0540 — the spot-profile rows
+    const device float*              cloudShadow [[buffer(19)]],   // DH-1462 — cloud sun transmittance (dummy when off)
+    device atomic_uint*              glassStats  [[buffer(21)]],   // DH-1625 — work census (kGlassStats variant only)
+    texture2d<float, access::sample> sky         [[texture(0)]],
+    texture2d<float, access::sample> surfAtlas   [[texture(1)]],
+    texture2d<float, access::sample> backdrop    [[texture(2)]],
+    texturecube<float, access::sample> irrCube   [[texture(3)]],
+    texture2d_array<float, access::sample> albedoAtlas [[texture(4)]],
+    texture2d<float, access::read>   surfPos     [[texture(6)]],
+    texture2d<float, access::read>   surfNormal  [[texture(7)]],
+    texture2d<float, access::write>  hdrOut      [[texture(8)]])
+{
+    if (gid.x >= hdrOut.get_width() || gid.y >= hdrOut.get_height()) return;
+    float4 pi = surfPos.read(gid);
+    if (pi.w < 0.5) return;                              // no glass at this pixel
+    GlassPixelIn pin;
+    pin.worldPos = pi.xyz;
+    pin.worldNormal = surfNormal.read(gid).xyz;
+    pin.instanceID = uint(pi.w + 0.5) - 1u;
+    pin.pixel = float2(gid) + 0.5;
+    float4 c = glassShadePixel(pin, false, u, instances, accel, insts, objNormal, glassData, triCard, triUVa, triUVc, soupTriBase, surfCardRect, surfCards, objUV, albedoUVScale, pointLights, spotLights, cornerN, areaLights, spotProfiles, cloudShadow, glassStats, sky, surfAtlas, backdrop, irrCube, albedoAtlas);
+    if (c.a < 0.0) return;
+    hdrOut.write(float4(c.rgb, 1.0), gid);   // the RT path returns alpha 1: it replaces what was there
+}
+
 
 // ── Non-RT fallback ──────────────────────────────────────────────────────────
 //

@@ -57,11 +57,81 @@ final class GlassState {
 
     /// Per-frame memo for `flattenGlass()` — nil = not yet flattened this frame.
     var glassFlatMemo: [(kind: IlluminatoramaRenderer.MeshKind, insts: [IlluminatoramaGlassInstance])]?
+
+    /// Work census (DH-1625): `glassStatsEnabled` turns it on; the shader counts into `statsBuffer`
+    /// (slots per `GlassStat` in IlluminatoramaGlassRT.metal) through its own pipeline variant
+    /// (`kGlassStatsFC`); off, the shipped variant has no census code and a dummy is bound.
+    var statsEnabled = false
+    var glassRTStatsPipeline: MTLRenderPipelineState?
+
+    /// The compute path (DH-1625, `IlluminatoramaRenderer+GlassCompute.swift`): the lever, the nearest-surface
+    /// raster's pipeline + depth state, and its targets (world position + instance, normal, depth copy).
+    var computeEnabled = true
+    var surfacePipeline: MTLRenderPipelineState?
+    var surfaceDepthState: MTLDepthStencilState?
+    var surfacePos: MTLTexture?
+    var surfaceNormal: MTLTexture?
+    var surfaceDepth: MTLTexture?
+    var statsBuffer: MTLBuffer?
+    var statsOffBuffer: MTLBuffer?
+}
+
+/// One frame's RT glass work, read back from the shader's census (DH-1625). Counts are per frame,
+/// summed over every glass fragment that reached the trace.
+public struct IlluminatoramaGlassStats: Sendable, CustomStringConvertible {
+    public let fragments, frontDiscards, refractionPaths, refractionSteps, refractionGlassHits,
+               refractionTIR, refractionShaded, refractionSky, refractionBudget,
+               reflectionRays, reflectionShaded, screenSpaceReplaced: UInt32
+    init(_ w: [UInt32]) {
+        func v(_ i: Int) -> UInt32 { i < w.count ? w[i] : 0 }
+        fragments = v(1); frontDiscards = v(2); refractionPaths = v(3); refractionSteps = v(4)
+        refractionGlassHits = v(5); refractionTIR = v(6); refractionShaded = v(7); refractionSky = v(8)
+        refractionBudget = v(9); reflectionRays = v(10); reflectionShaded = v(11); screenSpaceReplaced = v(12)
+    }
+    public var description: String {
+        "fragments \(fragments) · front-discard \(frontDiscards) · refr paths \(refractionPaths) steps \(refractionSteps) "
+            + "(glass hits \(refractionGlassHits), TIR \(refractionTIR)) → shaded \(refractionShaded) sky \(refractionSky) "
+            + "budget-out \(refractionBudget) · refl rays \(reflectionRays) shaded \(reflectionShaded) "
+            + "· screen-space replaced \(screenSpaceReplaced)"
+    }
 }
 
 // MARK: - Code moved out of the main renderer file
 
 extension IlluminatoramaRenderer {
+    /// Count what the RT glass shader does each frame (DH-1625 instrument). A debug lever: one atomic per
+    /// event, so leave it off outside a measurement.
+    public var glassStatsEnabled: Bool {
+        get { gls.statsEnabled }
+        set { gls.statsEnabled = newValue }
+    }
+
+    /// The census of the LAST glass pass that ran with `glassStatsEnabled` — read it after a blocking
+    /// render (the counters are reset when the next glass pass is encoded). nil until one has run.
+    public func glassStatsSnapshot() -> IlluminatoramaGlassStats? {
+        guard gls.statsEnabled, let b = gls.statsBuffer else { return nil }
+        let p = b.contents().bindMemory(to: UInt32.self, capacity: 16)
+        return IlluminatoramaGlassStats((0..<16).map { p[$0] })
+    }
+
+    /// The buffer bound at fragment index 21: the live census (reset) or a dummy the shipped variant never reads.
+    func glassStatsBinding() -> MTLBuffer? {
+        if gls.statsEnabled {
+            if gls.statsBuffer == nil {
+                gls.statsBuffer = device.makeBuffer(length: 16 * 4, options: .storageModeShared)
+                gls.statsBuffer?.label = "Illuminatorama.glass.stats"
+            }
+            guard let b = gls.statsBuffer else { return nil }
+            let p = b.contents().bindMemory(to: UInt32.self, capacity: 16)
+            for i in 0..<16 { p[i] = 0 }
+            return b
+        }
+        if gls.statsOffBuffer == nil {
+            gls.statsOffBuffer = device.makeBuffer(length: 16, options: .storageModeShared)   // zero-filled
+        }
+        return gls.statsOffBuffer
+    }
+
     /// Glass that uses DIFFERENT meshes in the same pass. Each group binds its own
     /// mesh and draws its instances; takes precedence over `glassInstances`. Lets
     /// one scene mix glass shapes (a lab row of spheres + prisms + a slab). List
@@ -275,7 +345,12 @@ extension IlluminatoramaRenderer {
             && gls.glassRTPipeline != nil && rts.rtTLAS != nil
             && rts.rtInstanceDataBuffer != nil && rts.rtObjNormalBuffer != nil
             && gls.rtGlassDataBuffer != nil
-        guard let pipeline = useRT ? gls.glassRTPipeline : gls.glassFallbackPipeline else { return }
+        if useRT, gls.statsEnabled, gls.glassRTStatsPipeline == nil, let library = engine.library {
+            gls.glassRTStatsPipeline = Self.makeGlassPipeline(device: device, library: library, fragment: "illumi_glass_rt_fs",
+                                                              label: "Illuminatorama.glass.rt.stats", stats: true)
+        }
+        guard let pipeline = useRT ? ((gls.statsEnabled ? gls.glassRTStatsPipeline : nil) ?? gls.glassRTPipeline)
+                                   : gls.glassFallbackPipeline else { return }
 
         // Pack every group's instances contiguously; each group draws from its own
         // byte offset (one CPU upload feeds all draws).
@@ -463,6 +538,12 @@ extension IlluminatoramaRenderer {
             }
         }
 
+        let statsBinding = glassStatsBinding()   // reset once per pass, shared by both draw passes
+        // RT glass runs on a compute pass unless the defocus trace (fragment-only) is on — DH-1625.
+        if useRT && !defocusOn && gls.computeEnabled,
+           encodeGlassCompute(cb, groups: groups, offsets: offsets, cacheOn: cacheOn, statsBinding: statsBinding) {
+            return
+        }
         /// One glass draw pass's state, bindings and draws. `lowRes` = the defocus trace's
         /// reduced-resolution pass: its uniforms go in by value, and the low-res result is not
         /// bound to itself (the full-res pass reads it at fragment texture 5).
@@ -499,51 +580,8 @@ extension IlluminatoramaRenderer {
             enc.setFragmentTexture(equirectSky ?? ibls.dummySkyTexture, index: 0)
             // Backdrop (cheap mode 2) — bind a dummy otherwise so the slot is valid.
             enc.setFragmentTexture((useBackdrop ? gls.glassBackdropTexture : nil) ?? ibls.dummySkyTexture, index: 2)
-            if useRT, let tlas = rts.rtTLAS, let instData = rts.rtInstanceDataBuffer,
-               let objN = rts.rtObjNormalBuffer, let gData = gls.rtGlassDataBuffer {
-                enc.setFragmentAccelerationStructure(tlas, bufferIndex: 0)
-                enc.setFragmentBuffer(instData, offset: 0, index: 3)
-                enc.setFragmentBuffer(objN, offset: 0, index: 4)
-                enc.setFragmentBuffer(gData, offset: 0, index: 5)
-                // Surface-cache buffers (dummies keep the bindings valid when off);
-                // optional-ternary mirrors the TLAS lighting pass — no force-unwrap.
-                let dummy: MTLBuffer = instData
-                enc.setFragmentBuffer(cacheOn ? scs.surfTriCardBuffer : dummy, offset: 0, index: 6)
-                enc.setFragmentBuffer(cacheOn ? scs.surfTriUVaBuffer : dummy, offset: 0, index: 7)
-                enc.setFragmentBuffer(cacheOn ? scs.surfTriUVcBuffer : dummy, offset: 0, index: 8)
-                enc.setFragmentBuffer(cacheOn ? rts.rtSoupTriBaseBuffer : dummy, offset: 0, index: 9)
-                enc.setFragmentBuffer(cacheOn ? scs.surfCardRectBuffer : dummy, offset: 0, index: 10)
-                enc.setFragmentBuffer(cacheOn ? scs.surfCardBuffer : (surfCardDummyBuffer ?? dummy), offset: 0, index: 11)
-                enc.setFragmentTexture(cacheOn ? surfConsumerAtlas : (equirectSky ?? ibls.dummySkyTexture), index: 1)
-                // Through-glass world parity: re-shaded opaque hits sample the SAME
-                // cosine-convolved irradiance cube the deferred lighting pass uses for
-                // its diffuse IBL, so transmitted scenery gets the sky fill (not just
-                // the flat ambient supplement) and matches the world beside the pane.
-                enc.setFragmentTexture(ibls.irradianceCube, index: 3)
-                // Through-glass TEXTURE parity: the per-triangle mesh UVs + the albedo
-                // atlas (and its per-slice letterbox table), so a re-shaded hit samples
-                // the SAME texel the G-buffer would instead of the instance's mean
-                // albedo. Without these the world behind a pane is flat slabs.
-                enc.setFragmentBuffer(rts.rtObjUVBuffer ?? instData, offset: 0, index: 12)
-                enc.setFragmentBuffer(albedoAtlas.uvScaleBuffer, offset: 0, index: 13)
-                enc.setFragmentTexture(albedoAtlas.texture, index: 4)
-                // Local lights: the deferred kernel accumulates point + spot; the glass
-                // pass used to have sun-only, so a lamp-lit room went black through a
-                // window. Same ring buffers the lighting kernel reads this frame.
-                enc.setFragmentBuffer(pointLightBuffer, offset: 0, index: 14)
-                enc.setFragmentBuffer(spotLightBuffer, offset: 0, index: 15)
-                enc.setFragmentBuffer(shd.spotProfileBuffer, offset: 0, index: 18)   // DH-0540 — the spot-profile rows
-                enc.setFragmentBuffer(cloudShadowBinding, offset: 0, index: 19)      // DH-1462 — cloud sun transmittance
-                // Smooth refraction: glass hits interpolate these corner normals (a dummy with
-                // every row's base 0 means "face normal" — see `rtGlassCornerNormalBuffer`).
-                enc.setFragmentBuffer(gls.rtGlassCornerNormalBuffer ?? instData, offset: 0, index: 16)
-                // DH-0718 — area lights at the refracted hit (buffer 17); dummy when none.
-                enc.setFragmentBuffer(secondaryAreaLightCount > 0 ? areaLightBuffer : instData,
-                                      offset: 0, index: 17)
-                // The TLAS references the BLASes which reference mesh buffers — all
-                // must be resident for the fragment-stage intersector.
-                for blas in rts.rtBLASList { enc.useResource(blas, usage: .read) }
-                for buf in rts.rtResidentBuffers { enc.useResource(buf, usage: .read) }
+            if useRT {
+                _ = bindGlassRTResources(.fragment(enc), cacheOn: cacheOn, statsBinding: statsBinding)
             }
             for (i, g) in groups.enumerated() {
                 guard let mesh = meshes[g.kind] else { continue }
@@ -632,10 +670,30 @@ extension IlluminatoramaRenderer {
         // no depth write so opaque geometry in front occludes the glass.
         // Local-capture closure (a nested `func` would implicitly capture `self`
         // before full init); `dev`/`library` are locals so this is init-safe.
-        let dev = device
-        let makeGlassPipeline: (String, String) -> MTLRenderPipelineState? = { fragName, label in
+        s.glassRTPipeline = device.supportsRaytracing
+            ? makeGlassPipeline(device: device, library: library, fragment: "illumi_glass_rt_fs",
+                                label: "Illuminatorama.glass.rt") : nil
+        s.glassFallbackPipeline = makeGlassPipeline(device: device, library: library, fragment: "illumi_glass_fallback_fs",
+                                                    label: "Illuminatorama.glass.fallback")
+        let gds = MTLDepthStencilDescriptor()
+        gds.depthCompareFunction = .lessEqual
+        gds.isDepthWriteEnabled = false
+        s.glassDepthState = device.makeDepthStencilState(descriptor: gds)
+    }
+
+    /// Function-constant index of `kGlassStatsFC` (IlluminatoramaGlassRT.metal): the census variant.
+    static let glassStatsFunctionConstantIndex = 40
+
+    /// One glass pipeline. The RT fragment shader needs a device that supports ray tracing (it references
+    /// `instance_acceleration_structure`). `stats` compiles in the DH-1625 work census — a separate variant,
+    /// so the shipped shader carries none of it.
+    static func makeGlassPipeline(device dev: MTLDevice, library: MTLLibrary, fragment fragName: String,
+                                  label: String, stats: Bool = false) -> MTLRenderPipelineState? {
+            let cv = MTLFunctionConstantValues()
+            var on = stats
+            cv.setConstantValue(&on, type: .bool, index: glassStatsFunctionConstantIndex)
             guard let gvs = library.makeFunction(name: "illumi_glass_rt_vs"),
-                  let gfs = library.makeFunction(name: fragName) else { return nil }
+                  let gfs = try? library.makeFunction(name: fragName, constantValues: cv) else { return nil }
             let gdesc = MTLRenderPipelineDescriptor()
             gdesc.label = label
             gdesc.vertexFunction = gvs
@@ -650,16 +708,5 @@ extension IlluminatoramaRenderer {
             gdesc.colorAttachments[0].destinationAlphaBlendFactor = .oneMinusSourceAlpha
             gdesc.depthAttachmentPixelFormat = .depth32Float
             return try? dev.makeRenderPipelineState(descriptor: gdesc)
-        }
-        // The RT fragment shader needs a device that supports ray tracing; build
-        // it only there (the function references `instance_acceleration_structure`).
-        s.glassRTPipeline = device.supportsRaytracing
-            ? makeGlassPipeline("illumi_glass_rt_fs", "Illuminatorama.glass.rt") : nil
-        s.glassFallbackPipeline = makeGlassPipeline("illumi_glass_fallback_fs",
-                                                       "Illuminatorama.glass.fallback")
-        let gds = MTLDepthStencilDescriptor()
-        gds.depthCompareFunction = .lessEqual
-        gds.isDepthWriteEnabled = false
-        s.glassDepthState = device.makeDepthStencilState(descriptor: gds)
     }
 }
