@@ -494,7 +494,10 @@ inline float cumulusDensityHD(float3 pos, constant SkyUniforms &u,
     float cov = saturate(u.cloudShape.x);
     // Local coverage: the weather field modulates the global amount, so cloudy and clear
     // patches alternate across the sky. Overcast (cov → 1) saturates it everywhere.
-    float lc = saturate(cov + (weather - 0.55f) * 1.3f * (1.0f - cov * cov));
+    // The modulation fades in over the first 15 % of coverage: unscaled, it alone lifted every
+    // weather patch above 0.55 to as much as 0.58 local coverage, so coverage 0 — a host's
+    // "Clear" — still drew scattered cumulus (Daydream DH-1664). From 0.15 up it is unchanged.
+    float lc = saturate(cov + (weather - 0.55f) * 1.3f * (1.0f - cov * cov) * smoothstep(0.0f, 0.15f, cov));
 
     // Cumulus profile: a fast rise off a flat base, a rounded crown whose height grows with
     // the weather (and the tower lever), so neighbouring clouds have different tops.
