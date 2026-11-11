@@ -100,7 +100,7 @@ final class SignackHierarchyTests: XCTestCase {
         // Every derived vertex is an enlarged copy of a host vertex.
         for d in h.derivedVertices {
             XCTAssertLessThan(Int(d.source), m.positions.count)
-            XCTAssertGreaterThan(d.scale, 1); XCTAssertLessThanOrEqual(d.scale, 1.4 + 1e-5)
+            XCTAssertGreaterThan(d.scale, 1); XCTAssertLessThanOrEqual(d.scale, 3 + 1e-5)
         }
         let cardOf: (UInt32) -> Int = { v in
             let src = Int(v) < m.positions.count ? Int(v) : Int(h.derivedVertices[Int(v) - m.positions.count].source)
@@ -117,6 +117,30 @@ final class SignackHierarchyTests: XCTestCase {
             last = tris.count
         }
         XCTAssertLessThan(last, 2 * 6000 / 4)
+    }
+
+    /// A simpler cut may not be a barer one: every uniform cut of a card crown carries at least
+    /// `minimumCoverage` of the source's surface area (it used to fall to 0.24 — DH-1658).
+    func testEveryFoliageCutCarriesTheCrownsLeafArea() {
+        let (m, atoms, cards) = SignackTestMeshes.cards(6000)
+        let simplifier = SignackCardSimplifier(cards: cards, seed: 7)
+        let h = SignackHierarchyBuilder().build(positions: m.positions, indices: m.indices, atoms: atoms, simplifier: simplifier)
+        struct P { var p: SIMD3<Float> }
+        let pos = h.vertices(host: m.positions.map { P(p: $0) }, position: \.p).map(\.p)
+        func area(_ idx: [UInt32]) -> Float {
+            stride(from: 0, to: idx.count - 2, by: 3).reduce(Float(0)) {
+                $0 + 0.5 * simd_length(simd_cross(pos[Int(idx[$1 + 1])] - pos[Int(idx[$1])], pos[Int(idx[$1 + 2])] - pos[Int(idx[$1])]))
+            }
+        }
+        let whole = area(h.flatten(SignackSelection.cut(h, tolerance: 0)))
+        var coarsest = Int.max
+        for tol: Float in [0.01, 0.03, 0.06, 0.1, 0.2, 0.5, 1e9] {
+            let idx = h.flatten(SignackSelection.cut(h, tolerance: tol))
+            XCTAssertGreaterThanOrEqual(area(idx) / whole, simplifier.minimumCoverage - 0.01, "cut at \(tol) is barer than the crown")
+            XCTAssertLessThanOrEqual(area(idx) / whole, 1.02, "cut at \(tol) is denser than the crown")
+            coarsest = idx.count / 3
+        }
+        XCTAssertLessThan(coarsest, 2 * 6000 / 4, "and it still gets simpler")
     }
 
     func testCutTrackerHoldsUntilTheCameraReallyMoves() {

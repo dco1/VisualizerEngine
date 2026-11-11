@@ -12,12 +12,23 @@ import simd
 /// interior thins faster but never empties) that fits the target, and every coarser level's cards
 /// are a subset of the finer level's.
 ///
-/// **Coverage.** Survivors scale about their own centre by (keptArea / sourceArea)^−exponent ≤ max,
-/// quantised DOWN to `scaleStep`. The quantisation is what keeps memory down: an enlarged card is a
-/// new set of vertices, and every card at one quantised scale is welded to ONE copy by the builder.
-/// Down, never to nearest: the first level's ~×1.14 snaps to ×1 (no copy at all), and S0 measured
-/// that over-compensating reads DENSER far than near — a pop the wrong way. Measured on a 6 000-card
-/// test crown: round-to-nearest at 0.1 cost 0.88× extra vertices, floor at 0.15 costs 0.38×.
+/// **Coverage — a simpler level may not be a barer one.** Survivors scale about their own centre
+/// until the group carries the leaf AREA it stands for: s = √(sourceArea / keptArea), quantised DOWN
+/// to `scaleStep`. Area is what the eye reads as cover (N cards of area a hide what N/2 cards of
+/// area 2a hide), so the exponent is ½ exactly. It used to be 0.22, capped at ×1.4: half the cards
+/// then carried 0.66 of the area, a quarter 0.42, an eighth 0.24 — every crown went bare as the
+/// camera pulled away (measured on every species, DH-1658).
+///
+/// Two limits, and a level that cannot hold `minimumCoverage` inside them is NOT MADE (the group's
+/// clusters become roots — the crown simply stops getting simpler there):
+/// - `maxCoverageScale`: beyond it a card reads as a plate, not a leaf;
+/// - `maxReachGrowth`: enlarging may push a card's edge outward by at most this fraction of the
+///   crown's radius, so the crown keeps its SIZE. Leaves are tiny against a crown and never meet
+///   it; a palm's frond is a card half the crown long, and may hardly grow at all — so a palm
+///   does not thin (it has few triangles to save, and a frond removed is a gap, not a detail).
+///
+/// The quantisation keeps memory down: an enlarged card is a new set of vertices, and every card
+/// at one quantised scale is welded to ONE copy by the builder.
 ///
 /// **Error.** How much farther apart the survivors stand than the cards they replace —
 /// √(sourceArea / kept) − √(sourceArea / sourceCards), in metres. Under a pixel of that, thinning is
@@ -28,9 +39,15 @@ public struct SignackCardSimplifier: SignackSimplifier {
     public let cards: [SignackCard]
     /// A region never thins below this fraction of the triangles it started with.
     public var minimumFraction: Float = 0.12
-    public var coverageExponent: Float = 0.22
-    public var maxCoverageScale: Float = 1.4
-    public var scaleStep: Float = 0.15
+    public var coverageExponent: Float = 0.5
+    public var maxCoverageScale: Float = 3
+    public var scaleStep: Float = 0.1
+    /// A level must carry at least this fraction of the leaf area it stands for, or it is not made.
+    public var minimumCoverage: Float = 0.8
+    /// Most an enlarged card's edge may move outward, as a fraction of the crown's radius.
+    public var maxReachGrowth: Float = 0.12
+    /// Half the diagonal of the box round every card's centre — the crown's size.
+    public let crownRadius: Float
 
     /// Rank `cards` (atom id = index into `cards`) by `importance`, seeded.
     public init(cards: [SignackCard], importance: SignackImportance = .foliage, seed: UInt64) {
@@ -39,6 +56,9 @@ public struct SignackCardSimplifier: SignackSimplifier {
         for (k, i) in ranking.order.enumerated() { rank[i] = k }
         self.rank = rank
         self.cards = cards
+        var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude), hi = -lo
+        for c in cards { lo = simd_min(lo, c.centroid); hi = simd_max(hi, c.centroid) }
+        crownRadius = cards.isEmpty ? 0 : simd_length(hi - lo) * 0.5
     }
 
     public func simplify(_ g: SignackGroupInput, mesh: SignackMeshView) -> SignackGroupOutput? {
@@ -58,8 +78,22 @@ public struct SignackCardSimplifier: SignackSimplifier {
         guard kept.count < present.count,
               Float(keptTris) >= minimumFraction * Float(g.sourceTriangles) else { return nil }
 
+        // How far the kept cards reach from their own centres (area-weighted mean of each card's
+        // farthest source vertex): what enlarging them pushes outward.
+        var reach: Float = 0
+        for a in kept {
+            let c = cards[Int(a)]
+            var r2: Float = 0
+            for t in trisOf[a]! {
+                for k in 0..<3 { r2 = max(r2, simd_distance_squared(mesh.positions[Int(mesh.origin[Int(g.triangles[t][k])])], c.centroid)) }
+            }
+            reach += r2.squareRoot() * c.area
+        }
+        reach /= max(keptArea, 1e-12)
         let raw = g.sourceArea > 0 ? pow(max(keptArea, 1e-12) / g.sourceArea, -coverageExponent) : 1
-        let scale = 1 + ((min(maxCoverageScale, max(1, raw)) - 1) / scaleStep + 1e-4).rounded(.down) * scaleStep
+        let limit = min(maxCoverageScale, 1 + maxReachGrowth * crownRadius / max(reach, 1e-6))
+        let scale = 1 + ((min(limit, max(1, raw)) - 1) / scaleStep + 1e-4).rounded(.down) * scaleStep
+        guard g.sourceArea <= 0 || keptArea * scale * scale >= minimumCoverage * g.sourceArea else { return nil }
 
         var out: [SIMD3<UInt32>] = []
         var outAtoms: [UInt32] = []
