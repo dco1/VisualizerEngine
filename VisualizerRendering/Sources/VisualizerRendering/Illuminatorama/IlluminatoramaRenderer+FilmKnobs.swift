@@ -42,6 +42,10 @@ extension IlluminatoramaRenderer {
     public var halationIntensity: Float { get { kFilm.halationIntensity } set { kFilm.halationIntensity = newValue } _modify { yield &kFilm.halationIntensity } }
     public var halationThreshold: Float { get { kFilm.halationThreshold } set { kFilm.halationThreshold = newValue } _modify { yield &kFilm.halationThreshold } }
     public var halationRadius: Float { get { kFilm.halationRadius } set { kFilm.halationRadius = newValue } _modify { yield &kFilm.halationRadius } }
+    public var halationConservesEnergy: Bool { get { kFilm.halationConservesEnergy } set { kFilm.halationConservesEnergy = newValue } }
+    /// η per unit of `halationIntensity` on the physical lane: 1.0 = a quarter of the red light
+    /// comes back off the base (an unbacked stock at its strongest); a backed negative's ~0.1 is 2.5 %.
+    public static let halationEnergyFraction: Float = 0.25
     public var halationTint: SIMD3<Float> { get { kFilm.halationTint } set { kFilm.halationTint = newValue } _modify { yield &kFilm.halationTint } }
     public var naturalVignetteK: Float { get { kFilm.naturalVignetteK } set { kFilm.naturalVignetteK = newValue } _modify { yield &kFilm.naturalVignetteK } }
     public internal(set) var filmLUTTexture: MTLTexture? { get { kFilm.filmLUTTexture } set { kFilm.filmLUTTexture = newValue } _modify { yield &kFilm.filmLUTTexture } }

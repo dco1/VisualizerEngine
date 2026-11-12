@@ -1073,7 +1073,16 @@ fragment float4 illumi_tonemap_fs(
         // a constant, not a per-scene tuning.
         constexpr float kHalationGain = 4.0;
         float3 halo = float3(inHalation.sample(downSampler, in.uv).rgb);
-        mixed += halo * (frame.halationParams.x * kHalationGain);
+        if (frame.halationParams.w > 0.5) {
+            // DH-1666 — the physical model: η = x of this pixel's red-weighted light LEAVES the
+            // direct image (as the colour it becomes) and the blurred halo brings η of the
+            // neighbourhood's back, so a flat field is unchanged and only contrast shows.
+            float eta = frame.halationParams.x;
+            float e = dot(max(hdr, 0.0), kHalationSourceWeight);
+            mixed = max(mixed - eta * e * illumiHalationColour(frame.halationTint.rgb), 0.0) + eta * halo;
+        } else {
+            mixed += halo * (frame.halationParams.x * kHalationGain);
+        }
     }
 
     // ── Lens flare (sun) ───────────────────────────────────────────────────────

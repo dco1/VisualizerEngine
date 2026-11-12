@@ -181,6 +181,16 @@ final class FilmKnobs {
     /// Halation TAIL tint (linear RGB) — the deep red where only red survives the round
     /// trip through the base. The core is derived from it in the shader and reads orange.
     var halationTint: SIMD3<Float> = SIMD3(1.0, 0.20, 0.07)
+    /// **Physical halation** (Daydream DH-1666). The light that comes back off the base is light
+    /// the image LOSES: a fraction η = `halationIntensity × halationEnergyFraction` of every pixel's
+    /// red-weighted light leaves the direct image and arrives as the halo, so the PSF is
+    /// (1−η)·δ + η·H and a flat field is unchanged. There is no threshold: what makes halation
+    /// show is contrast, so a big bright sky leaves a faint warm edge on a dark crown and only a
+    /// highlight many stops over a dark surround glows. Off (the legacy additive model: the halo of
+    /// the over-threshold excess, ×4, added on top) keeps every Visualizer scene byte-identical —
+    /// that model gave a frame-wide sunset sky a saturated orange rim on every edge, because the ×4
+    /// was tuned so SMALL highlights read and a big source is not diluted by the kernel.
+    var halationConservesEnergy: Bool = false
     /// **Natural (cos⁴) vignetting** — `(halfFrameDiagonalMM / focalLengthMM)²`, scaled by how
     /// much of the physical falloff the host wants (1 = all of it). Multiplies the SCENE
     /// before the exposure meter and the tonemap, because it is the lens losing light, not a

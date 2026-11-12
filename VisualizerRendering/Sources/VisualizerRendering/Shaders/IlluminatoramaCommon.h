@@ -1312,3 +1312,17 @@ static inline float3 viewPosFromDepth(float2 ndcXY, float depth, float4x4 invPro
 // tap offsets by the real input:output ratio so a 1:1 frame is resolved with one exact tap instead
 // of a [1 2 1] tent. (Bit 1 is the G-buffer's, in IlluminatoramaGBufferSurface.h.)
 constant uint kTextureFilterResolveScaled = 16u;
+
+/// How much of each channel of a highlight reaches the base and comes back as halation
+/// exposure. Normalised to sum 1, so a neutral highlight's halation exposure equals its
+/// excess radiance.
+constant float3 kHalationSourceWeight = float3(0.80, 0.18, 0.02);
+
+/// The halo colour per unit of halation exposure, integrated over the whole PSF (the four octaves'
+/// tints at their energy shares in `illumi_halation_blur_v`) — what one unit of red-weighted light
+/// turns into. The physical model (DH-1666) takes exactly this out of the direct image, so the PSF
+/// conserves energy. Keep in step with the blur's tints and shares.
+static inline float3 illumiHalationColour(float3 tail) {
+    return tail * (float3(1.0, 2.4, 1.8) * 0.30 + float3(1.0, 1.8, 1.4) * 0.28
+                   + float3(1.0, 1.3, 1.15) * 0.24 + float3(1.0) * 0.18);
+}

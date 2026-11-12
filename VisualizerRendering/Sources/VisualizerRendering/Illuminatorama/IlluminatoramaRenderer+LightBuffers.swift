@@ -257,10 +257,13 @@ extension IlluminatoramaRenderer {
         // Film halation: intensity / threshold / halo radius (fraction of frame height)
         // + tail tint. Intensity 0 (the default) → the tonemap branch is skipped AND
         // `encodeHalationPasses` doesn't dispatch, so a non-opting scene is byte-identical.
-        u.halationParams = SIMD4(max(0, pfx.easedHalationIntensity),
-                                 pfx.easedHalationThreshold * preExposureDivisor,
+        // DH-1666: w = 1 ⇒ the physical (energy-conserving) model — x is then η itself and the
+        // threshold is 0 (every pixel's light takes part; contrast is what shows).
+        let physicalHalation = halationConservesEnergy
+        u.halationParams = SIMD4(max(0, pfx.easedHalationIntensity) * (physicalHalation ? Self.halationEnergyFraction : 1),
+                                 physicalHalation ? 0 : pfx.easedHalationThreshold * preExposureDivisor,
                                  max(0, pfx.easedHalationRadius),
-                                 0)
+                                 physicalHalation ? 1 : 0)
         u.halationTint = SIMD4(pfx.easedHalationTint.x, pfx.easedHalationTint.y, pfx.easedHalationTint.z, 0)
         // Bloom pyramid (S1.2): soft knee (fraction of the threshold) / upsample
         // scatter / tent radius. Scatter is clamped to [0,1] because the up-chain

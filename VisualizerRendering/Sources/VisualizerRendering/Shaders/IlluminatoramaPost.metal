@@ -380,10 +380,8 @@ kernel void illumi_bloom_glare_tail(
 // `halationParams.x == 0` (the default) ⇒ the host does not encode these passes at
 // all AND the tonemap branch is skipped ⇒ non-opting scenes are byte-identical.
 
-/// How much of each channel of a highlight reaches the base and comes back as halation
-/// exposure. Normalised to sum 1, so a neutral highlight's halation exposure equals its
-/// excess radiance.
-constant float3 kHalationSourceWeight = float3(0.80, 0.18, 0.02);
+// `kHalationSourceWeight` (how much of each channel reaches the base) lives in
+// IlluminatoramaCommon.h — the tonemap's physical model reads it too.
 
 kernel void illumi_halation_threshold(
     texture2d<half, access::read>  inHDR     [[texture(0)]],
@@ -400,11 +398,14 @@ kernel void illumi_halation_threshold(
     // A soft knee half the threshold wide: a light easing across the bar grows its halo
     // continuously instead of popping it on (same curve bloom uses).
     float knee = 0.5 * threshold;
+    // The physical model (DH-1666, `halationParams.w == 1`) has no threshold: every pixel's light
+    // reaches the base, and the tonemap takes the same η back out of the direct image.
+    bool physical = frame.halationParams.w > 0.5;
     float e = 0.0;
     for (uint j = 0; j < 2; ++j) {
         for (uint i = 0; i < 2; ++i) {
             float3 c = max(float3(inHDR.read(min(src + uint2(i, j), maxC)).rgb), 0.0);
-            e += dot(illumiBloomKnee(c, threshold, knee), kHalationSourceWeight);
+            e += dot(physical ? c : illumiBloomKnee(c, threshold, knee), kHalationSourceWeight);
         }
     }
     outBright.write(half4(half(e * 0.25), 0.0h, 0.0h, 1.0h), gid);
@@ -476,5 +477,8 @@ kernel void illumi_halation_blur_v(
     // Energy per octave: the inner octaves a little heavier (the first bounce is the
     // brightest), summing to 1.
     float3 halo = c0 * (0.30 * s.x) + c1 * (0.28 * s.y) + c2 * (0.24 * s.z) + tail * (0.18 * s.w);
+    // Physical model: the tonemap subtracts the pixel's own η·e·(this mix at s ≡ 1), so it needs
+    // the unblurred colour too — exactly `illumiHalationColour(tail)` below.
     outTex.write(half4(half3(halo), 1.0h), gid);
 }
+
