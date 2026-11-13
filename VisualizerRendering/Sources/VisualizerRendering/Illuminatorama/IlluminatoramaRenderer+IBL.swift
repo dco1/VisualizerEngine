@@ -62,12 +62,54 @@ final class IBLState {
     var irradianceBakePipeline: MTLComputePipelineState!
     var prefilterBakePipeline: MTLComputePipelineState!
     var dfgBakePipeline: MTLComputePipelineState!
+    var iblBlendPipeline: MTLComputePipelineState!
+
+    // ── Crossfade (see `beginIBLCrossfade`) — endpoint cube sets, allocated lazily on first use.
+    var xfadeIrrA: MTLTexture?, xfadeIrrB: MTLTexture?
+    var xfadePreA: MTLTexture?, xfadePreB: MTLTexture?
+    var xfadeViewsA: [MTLTexture] = [], xfadeViewsB: [MTLTexture] = []
+    var xfadeFrom: MTLTexture?, xfadeTo: MTLTexture?
+    var xfadeActive = false
+    var xfadeBakePending = false
+    var xfadeT: Float = 0
 }
 
 // MARK: - Code moved out of the main renderer file
 
 extension IlluminatoramaRenderer {
     public func markIBLDirty() { iblNeedsRebake = true }
+
+    /// **Continuous IBL crossfade between two skies.** `equirectSky` is normally baked into the
+    /// irradiance + prefiltered cubes only when `markIBLDirty()` fires, so a host that cross-fades the
+    /// sky it feeds `equirectSky` sees the *background* move every frame while lit objects step (and
+    /// lag by up to one re-bake interval) — re-baking every frame is not an option (~1 s hitch, see
+    /// `periodic_markibldirty_hitch`). Both bakes are linear in the sky, so instead: call this once
+    /// with the two endpoint skies (each is baked ONCE, on the next frame), then each frame set
+    /// ``iblCrossfadeT`` to the same blend factor used for the sky. The cubes the lighting pass reads
+    /// become `mix(bake(from), bake(to), t)` — exactly the bake of the mixed sky — for one tiny blend
+    /// kernel per frame. The host keeps feeding the (already mixed) texture to `equirectSky` for the
+    /// background / RT / volumetrics. Call ``endIBLCrossfade()`` when finished. `from`/`to` must keep
+    /// their contents until the next frame has been encoded. Backwards compatible: never called → no change.
+    public func beginIBLCrossfade(from: MTLTexture, to: MTLTexture) {
+        ibls.xfadeFrom = from; ibls.xfadeTo = to
+        ibls.xfadeActive = true; ibls.xfadeBakePending = true
+    }
+
+    /// Blend factor for the active crossfade (0 = `from`, 1 = `to`). Ignored when none is active.
+    public var iblCrossfadeT: Float {
+        get { ibls.xfadeT }
+        set { ibls.xfadeT = min(1, max(0, newValue)) }
+    }
+
+    /// Leave crossfade mode. At t ≈ 1 the cubes already equal bake(`to`), so nothing is re-baked (no
+    /// end-of-fade hitch); ended earlier, the cubes are a blend that no longer matches `equirectSky`,
+    /// so a re-bake is scheduled.
+    public func endIBLCrossfade() {
+        guard ibls.xfadeActive else { return }
+        ibls.xfadeActive = false; ibls.xfadeBakePending = false
+        ibls.xfadeFrom = nil; ibls.xfadeTo = nil
+        if ibls.xfadeT < 0.999 { iblNeedsRebake = true }
+    }
 
     /// **S1.6 — which Smith-GGX `k` remap `illumi_dfg_bake` integrates the split
     /// sum with.** `true` = Karis's IBL form `k = α/2` (physically the right one for
@@ -175,20 +217,35 @@ extension IlluminatoramaRenderer {
     func encodeIBLBakeIfNeeded(_ cb: MTLCommandBuffer) {
         guard iblEnabled else { return }
 
+        // Host-driven sky crossfade: cubes are the per-frame blend of two once-baked endpoint sets.
+        if ibls.xfadeActive {
+            iblNeedsRebake = false           // a stray markIBLDirty must not re-bake over the blend afterwards
+            ibls.iblLastBakeTime = time      // the interval fallback must not re-bake over the blend
+            encodeIBLCrossfade(cb)
+            return
+        }
+
         // Skip if nothing has changed and the interval fallback hasn't fired.
         let timeSinceLastBake = time - ibls.iblLastBakeTime
         guard iblNeedsRebake || timeSinceLastBake >= iblRebakeInterval else { return }
         iblNeedsRebake = false
         ibls.iblLastBakeTime = time
 
-        let sky = equirectSky ?? ibls.dummySkyTexture
+        let sky: MTLTexture = equirectSky ?? ibls.dummySkyTexture
         guard let enc = timedComputeEncoder(cb, "iblBake") else { return }
         enc.label = "Illuminatorama.iblBake"
+        encodeIBLBakeBody(enc, sky: sky, irradiance: ibls.irradianceCube, mipViews: ibls.prefilteredMipViews)
+        enc.endEncoding()
+    }
 
+
+    /// Irradiance + per-mip GGX prefilter of `sky` into the given cube targets, on an open encoder.
+    private func encodeIBLBakeBody(_ enc: MTLComputeCommandEncoder, sky: MTLTexture,
+                                   irradiance: MTLTexture, mipViews: [MTLTexture]) {
         // ── Diffuse irradiance ─────────────────────────────────────
         enc.setComputePipelineState(ibls.irradianceBakePipeline)
         enc.setTexture(sky, index: 0)
-        enc.setTexture(ibls.irradianceCube, index: 1)
+        enc.setTexture(irradiance, index: 1)
         var bakeDesat = max(0.0, min(1.0, iblBakeDesaturation))
         enc.setBytes(&bakeDesat, length: MemoryLayout<Float>.stride, index: 0)
         dispatchCubeFaces(
@@ -201,8 +258,8 @@ extension IlluminatoramaRenderer {
         // from 24 at 60fps. Keep 1 sample for the perfect-mirror mip 0.
         enc.setComputePipelineState(ibls.prefilterBakePipeline)
         enc.setTexture(sky, index: 0)
-        let mipCount = ibls.prefilteredMipViews.count
-        for (mip, view) in ibls.prefilteredMipViews.enumerated() {
+        let mipCount = mipViews.count
+        for (mip, view) in mipViews.enumerated() {
             let mipSize = max(1, Self.prefilteredFaceSize >> mip)
             let roughness = mipCount > 1
                 ? Float(mip) / Float(mipCount - 1)
@@ -220,6 +277,37 @@ extension IlluminatoramaRenderer {
             dispatchCubeFaces(
                 enc, pipeline: ibls.prefilterBakePipeline, faceSize: mipSize
             )
+        }
+    }
+
+    /// Crossfade mode: (re)bake the two endpoint cube sets when `beginIBLCrossfade` asked, then blend
+    /// them into the live cubes at `xfadeT`. One encoder; ordered after any bake it just encoded.
+    private func encodeIBLCrossfade(_ cb: MTLCommandBuffer) {
+        guard let from = ibls.xfadeFrom, let to = ibls.xfadeTo else { return }
+        if ibls.xfadeIrrA == nil {
+            guard let a = try? Self.makeIBLCubes(device: device),
+                  let b = try? Self.makeIBLCubes(device: device) else { return }
+            ibls.xfadeIrrA = a.0; ibls.xfadePreA = a.1; ibls.xfadeViewsA = a.2
+            ibls.xfadeIrrB = b.0; ibls.xfadePreB = b.1; ibls.xfadeViewsB = b.2
+        }
+        guard let irrA = ibls.xfadeIrrA, let irrB = ibls.xfadeIrrB,
+              let enc = timedComputeEncoder(cb, "iblBake") else { return }
+        enc.label = "Illuminatorama.iblCrossfade"
+        if ibls.xfadeBakePending {
+            encodeIBLBakeBody(enc, sky: from, irradiance: irrA, mipViews: ibls.xfadeViewsA)
+            encodeIBLBakeBody(enc, sky: to, irradiance: irrB, mipViews: ibls.xfadeViewsB)
+            ibls.xfadeBakePending = false
+        }
+        enc.setComputePipelineState(ibls.iblBlendPipeline)
+        var t = ibls.xfadeT
+        enc.setBytes(&t, length: MemoryLayout<Float>.stride, index: 0)
+        enc.setTexture(irrA, index: 0); enc.setTexture(irrB, index: 1); enc.setTexture(ibls.irradianceCube, index: 2)
+        dispatchCubeFaces(enc, pipeline: ibls.iblBlendPipeline, faceSize: Self.irradianceFaceSize)
+        for mip in 0..<ibls.prefilteredMipViews.count {
+            enc.setTexture(ibls.xfadeViewsA[mip], index: 0)
+            enc.setTexture(ibls.xfadeViewsB[mip], index: 1)
+            enc.setTexture(ibls.prefilteredMipViews[mip], index: 2)
+            dispatchCubeFaces(enc, pipeline: ibls.iblBlendPipeline, faceSize: max(1, Self.prefilteredFaceSize >> mip))
         }
         enc.endEncoding()
     }
@@ -393,6 +481,10 @@ extension IlluminatoramaRenderer {
             throw IlluminatoramaError.pipelineCreationFailed("illumi_dfg_bake")
         }
         s.dfgBakePipeline = dfgBakePipelineBuilt
+        guard let blend = cache.pipelineState(name: "illumi_ibl_blend", device: device) else {
+            throw IlluminatoramaError.pipelineCreationFailed("illumi_ibl_blend")
+        }
+        s.iblBlendPipeline = blend
     }
 
     /// Irradiance / prefilter cubemaps and the 1x1 dummy sky.

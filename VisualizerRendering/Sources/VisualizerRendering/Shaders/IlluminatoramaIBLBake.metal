@@ -175,6 +175,26 @@ kernel void illumi_prefilter_bake(
     outMip.write(half4(half3(prefiltered), 1.0h), gid.xy, gid.z);
 }
 
+// ── IBL cube crossfade ───────────────────────────────────────────────────────
+//
+// Both bakes above are LINEAR in the sky (fixed importance weights, linear desaturation), so
+// bake(mix(skyA, skyB, t)) == mix(bake(skyA), bake(skyB), t). A host cross-fading between two skies
+// bakes each endpoint ONCE and calls this per frame per mip: the lit objects then track the blended
+// sky continuously, with no per-frame (or periodic) re-bake of the 128² GGX prefilter.
+kernel void illumi_ibl_blend(
+    texturecube<half, access::read>   a       [[texture(0)]],
+    texturecube<half, access::read>   b       [[texture(1)]],
+    texturecube<half, access::write>  o       [[texture(2)]],
+    constant float&                   t       [[buffer(0)]],
+    uint3                             gid     [[thread_position_in_grid]]
+) {
+    uint W = o.get_width();
+    if (gid.x >= W || gid.y >= W || gid.z >= 6u) return;
+    float4 va = float4(a.read(gid.xy, gid.z));
+    float4 vb = float4(b.read(gid.xy, gid.z));
+    o.write(half4(mix(va, vb, t)), gid.xy, gid.z);
+}
+
 // ── Split-sum DFG LUT bake (Phase 3.2) ──────────────────────────────────────
 //
 // Pre-integrates the specular BRDF into a 2D LUT keyed on (NdotV, roughness).
