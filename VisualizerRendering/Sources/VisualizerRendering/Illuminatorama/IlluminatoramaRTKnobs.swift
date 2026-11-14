@@ -15,12 +15,21 @@ final class RTKnobs {
     typealias GIRoomFillHandoff = IlluminatoramaRenderer.GIRoomFillHandoff
     typealias RTSunOwnership = IlluminatoramaRenderer.RTSunOwnership
 
-    /// Daydream DH-1668 — A/B lever for the TLAS SWAP rebuild (default on;
-    /// `VIZ_ILLUMI_NO_TLAS_SWAP=1` starts it off). On, a topology change that only re-points some
-    /// instances at different BLASes (same instance count, same group shape — a drag
-    /// re-registering the meshes it moved) rebuilds against the cached BLASes and does NOT count
-    /// toward the rebuild-thrash guard. Off = every topology change counts (pre-DH-1668).
+    /// Daydream DH-1668 — A/B lever for recognising a TLAS SWAP rebuild (default on;
+    /// `VIZ_ILLUMI_NO_TLAS_SWAP=1` starts it off): a topology change that only re-points some
+    /// instances at different BLASes (same instance count, same group shape — an edit
+    /// re-registering the meshes it moved). Recognised swaps are counted
+    /// (`staticSkipStats.tlasInstanceRebuilds`) and timed; whether they are EXEMPT from the
+    /// rebuild-thrash guard is `tlasSwapKeepsRTLive`. Off = no rebuild is a swap (pre-DH-1668).
     var tlasSwapRebuildEnabled: Bool = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_TLAS_SWAP"] != "1"
+    /// Daydream DH-1672 — whether a cheap swap rebuild is exempt from the rebuild-thrash guard.
+    /// **Default OFF** (Danny, 2026-11-14: "RT off on edits"): a stream of edits — an inspector
+    /// scrub, a script — trips the guard after `rtRebuildThrashLimit` rebuilds and runs on the
+    /// fallbacks (4000 Sunset: ~31 ms a frame instead of ~50 ms with RT live); RT re-arms once the
+    /// topology holds for the guard's recovery window, and a one-off edit never trips it. On
+    /// (`VIZ_ILLUMI_TLAS_SWAP_KEEPS_RT=1`) = the DH-1668 alternative: a swap costing at most
+    /// `rtSwapRebuildBudgetMs` keeps RT glass/reflections live through the stream.
+    var tlasSwapKeepsRTLive: Bool = ProcessInfo.processInfo.environment["VIZ_ILLUMI_TLAS_SWAP_KEEPS_RT"] == "1"
     /// Daydream DH-1672 — A/B lever: a TLAS rebuild encodes its BLAS + TLAS builds on the frame's own
     /// command buffer (no CPU wait). Off (`VIZ_ILLUMI_RT_BUILD_WAIT=1`) = a side buffer the CPU waits
     /// on twice, as before.

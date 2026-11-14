@@ -219,7 +219,8 @@ public final class IlluminatoramaRenderer {
         public var spotShadowPassesPartial = 0
         /// DH-1668 — full TLAS rebuilds (`rebuildRTAccel`), and how many of them were a SWAP:
         /// only some instances changed BLAS (a drag re-registering the meshes it moved), which
-        /// rebuilds against the cached BLASes and is not counted as topology thrash.
+        /// rebuilds against the cached BLASes — counted as topology thrash unless
+        /// `tlasSwapKeepsRTLive` (DH-1672).
         public var tlasRebuilds = 0
         public var tlasInstanceRebuilds = 0
     }

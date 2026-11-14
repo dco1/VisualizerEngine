@@ -8,6 +8,7 @@ import VisualizerCore
 // Forwarders for `RTKnobs` — storage lives in IlluminatoramaRTKnobs.swift.
 extension IlluminatoramaRenderer {
     public var tlasSwapRebuildEnabled: Bool { get { kRT.tlasSwapRebuildEnabled } set { kRT.tlasSwapRebuildEnabled = newValue } _modify { yield &kRT.tlasSwapRebuildEnabled } }
+    public var tlasSwapKeepsRTLive: Bool { get { kRT.tlasSwapKeepsRTLive } set { kRT.tlasSwapKeepsRTLive = newValue } _modify { yield &kRT.tlasSwapKeepsRTLive } }
     public var rtBuildOnFrameEnabled: Bool { get { kRT.rtBuildOnFrameEnabled } set { kRT.rtBuildOnFrameEnabled = newValue } _modify { yield &kRT.rtBuildOnFrameEnabled } }
     public var rtEnabled: Bool { get { kRT.rtEnabled } set { kRT.rtEnabled = newValue } _modify { yield &kRT.rtEnabled } }
     public var rtOpaqueLightingEnabled: Bool { get { kRT.rtOpaqueLightingEnabled } set { kRT.rtOpaqueLightingEnabled = newValue } _modify { yield &kRT.rtOpaqueLightingEnabled } }

@@ -1,7 +1,7 @@
 import Metal
 
-// TLAS SWAP REBUILDS ARE NOT THRASH (Daydream DH-1668)
-// ===================================================
+// TLAS SWAP REBUILDS NEED NOT BE THRASH (Daydream DH-1668, DH-1672)
+// ================================================================
 //
 // The rebuild-thrash guard turns ray tracing off after `rtRebuildThrashLimit` topology changes in
 // a row, because a scene that regenerates heavy geometry every frame (Forest's leaf field) would
@@ -26,6 +26,14 @@ import Metal
 // wait, ~5 ms the normal/UV concatenation), and exempting it held RT on at 105 ms a frame against
 // 73 ms with the guard tripped. So the last swap-shaped rebuild's cost decides whether the next one
 // is exempt: a small edit keeps RT live through the gesture, a heavy one trips the guard as before.
+//
+// …and only when the host ASKS for it (DH-1672). Once on-frame BLAS/TLAS builds and the persistent
+// normal/UV slab made 4000 Sunset's swap 2.3 ms, every swap fit the budget, so a stream of edits
+// (inspector scrub, script) kept RT live at 50.6 ms a frame (GPU 33) against 31.5 ms (GPU 17) with
+// the guard tripped. Danny chose, 2026-11-14: "RT off on edits". So `tlasSwapKeepsRTLive` defaults
+// OFF: a swap is still recognised, counted and timed, but it counts toward the guard like any other
+// rebuild; the cheap build still makes the single rebuild that re-arms RT after the stream cheap.
+// The alternative: `tlasSwapKeepsRTLive = true` / env `VIZ_ILLUMI_TLAS_SWAP_KEEPS_RT=1`.
 extension IlluminatoramaRenderer {
 
     /// The most not-yet-built BLAS triangles a rebuild may carry and still be a swap.

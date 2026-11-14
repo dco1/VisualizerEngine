@@ -202,11 +202,13 @@ extension IlluminatoramaRenderer {
             // (GPU-fed / regenerated geometry — e.g. Forest's LeafField + bark +
             // swaying branches) ⇒ a full rebuild every frame ⇒ hang + faulted-AS
             // magenta. Allow a few legitimate settle frames, then disable.
-            // DH-1668 — EXCEPT a swap: about the same instances, re-pointed at a few new small
-            // BLASes (an edit re-registering the meshes it moved). That rebuild is bounded by the
-            // swap budget, so it is not the hang this guard exists for (+RTLightingTLASSwap.swift).
+            // DH-1668 — EXCEPT, when the host opts in (`tlasSwapKeepsRTLive`, default off since
+            // DH-1672: "RT off on edits"), a swap: about the same instances, re-pointed at a few new
+            // small BLASes (an edit re-registering the meshes it moved). That rebuild is bounded by
+            // the swap budget, so it is not the hang this guard exists for (+RTLightingTLASSwap.swift).
             let swapShaped = rtTopologyChangeIsSwap()
-            let swap = swapShaped && rts.rtLastSwapRebuildMs <= Self.rtSwapRebuildBudgetMs
+            let swap = swapShaped && tlasSwapKeepsRTLive
+                && rts.rtLastSwapRebuildMs <= Self.rtSwapRebuildBudgetMs
             if !swap {
                 rts.rtConsecutiveRebuilds += 1
                 if rts.rtConsecutiveRebuilds > Self.rtRebuildThrashLimit {
@@ -219,7 +221,7 @@ extension IlluminatoramaRenderer {
                 }
             }
             staticSkipStats.tlasRebuilds += 1
-            if swap { staticSkipStats.tlasInstanceRebuilds += 1 }
+            if swapShaped { staticSkipStats.tlasInstanceRebuilds += 1 }
             let t0 = CACurrentMediaTime()
             rebuildRTAccel(cb)
             rts.rtLastRebuildMs = (CACurrentMediaTime() - t0) * 1000
