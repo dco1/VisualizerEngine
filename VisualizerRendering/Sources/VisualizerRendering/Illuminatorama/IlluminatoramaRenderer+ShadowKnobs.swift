@@ -12,6 +12,7 @@ extension IlluminatoramaRenderer {
     public var spotShadowReuseEnabled: Bool { get { kShadow.spotShadowReuseEnabled } set { kShadow.spotShadowReuseEnabled = newValue } _modify { yield &kShadow.spotShadowReuseEnabled } }
     public var spotShadowPerSliceDirtyEnabled: Bool { get { kShadow.spotShadowPerSliceDirtyEnabled } set { kShadow.spotShadowPerSliceDirtyEnabled = newValue } _modify { yield &kShadow.spotShadowPerSliceDirtyEnabled } }
     public var swapDiffEnabled: Bool { get { kShadow.swapDiffEnabled } set { kShadow.swapDiffEnabled = newValue } _modify { yield &kShadow.swapDiffEnabled } }
+    public var swapDiffRunsEnabled: Bool { get { kShadow.swapDiffRunsEnabled } set { kShadow.swapDiffRunsEnabled = newValue } _modify { yield &kShadow.swapDiffRunsEnabled } }
     public var sunCascadeRegionEnabled: Bool { get { kShadow.sunCascadeRegionEnabled } set { kShadow.sunCascadeRegionEnabled = newValue } _modify { yield &kShadow.sunCascadeRegionEnabled } }
     public var spotShadowRegionEnabled: Bool { get { kShadow.spotShadowRegionEnabled } set { kShadow.spotShadowRegionEnabled = newValue } _modify { yield &kShadow.spotShadowRegionEnabled } }
     public var sunCascadeReuseEnabled: Bool { get { kShadow.sunCascadeReuseEnabled } set { kShadow.sunCascadeReuseEnabled = newValue } _modify { yield &kShadow.sunCascadeReuseEnabled } }

@@ -20,6 +20,15 @@ import simd
 // Measured on 4000 Sunset's wall drag (63 swapped meshes a frame): ~0.5 ms, and the dirtied boxes
 // fell from 126 (largest 31.7 m) to 42 (largest 18.2 m). An order-free multiset pass over the
 // middles shrank them further (largest 12.2 m) but cost 8 ms a frame — not kept.
+//
+// SEVERAL RUNS (Daydream DH-1680). A merged group whose triangle COUNT held — the hot half of a
+// drag's opening trim, a room's baseboards, where every moved wall changes its own run in place —
+// can change two runs far apart in the list (the two walls at the dragged junction), and the one
+// prefix/suffix middle then spans everything between: a 7 m box that covered every window-portal
+// slice whole. With equal counts, triangle t of one mesh stands where triangle t of the other
+// stood, so the pairs that differ hold the whole multiset difference: one box per differing RUN is
+// exact, and costs the same single pass over the middle. Runs past `maxRuns` merge with their
+// index neighbour (smallest union first). A count that changed keeps the single middle.
 extension IlluminatoramaMesh {
 
     enum ShapeDiff: Equatable {
@@ -27,14 +36,24 @@ extension IlluminatoramaMesh {
         case identical
         /// Object-space bounds of every triangle that is not common to both.
         case region(lo: SIMD3<Float>, hi: SIMD3<Float>)
+        /// Equal triangle counts, the differing pairs in several runs: one object-space box per run
+        /// (≥ 2 boxes; their union is what `.region` would have said).
+        case regions([Box])
         /// Cannot be compared (GPU-only buffers, different raster flags, too large).
         case whole
+
+        struct Box: Equatable { var lo: SIMD3<Float>; var hi: SIMD3<Float> }
     }
 
     /// Past this many triangles (both meshes together) the comparison is not attempted.
     static let shapeDiffTriangleCap = 2_000_000
 
-    @MainActor static func shapeDiff(_ a: IlluminatoramaMesh, _ b: IlluminatoramaMesh) -> ShapeDiff {
+    /// Past this many differing runs the per-run boxes are not worth keeping: one middle box.
+    static let shapeDiffRunCap = 512
+
+    /// `maxRuns` > 1 lets an equal-count swap answer with up to that many run boxes (DH-1680).
+    @MainActor static func shapeDiff(_ a: IlluminatoramaMesh, _ b: IlluminatoramaMesh,
+                                     maxRuns: Int = 1) -> ShapeDiff {
         if a === b { return .identical }
         guard a.cpuAuthoredVertices, b.cpuAuthoredVertices,
               a.vertexBuffer.storageMode != .private, b.vertexBuffer.storageMode != .private,
@@ -53,6 +72,11 @@ extension IlluminatoramaMesh {
         var suffix = 0
         while suffix < common - prefix, ta.triangle(na - 1 - suffix) == tb.triangle(nb - 1 - suffix) { suffix += 1 }
         if prefix + suffix == na, na == nb { return .identical }
+        if maxRuns > 1, na == nb, let runs = differingRuns(ta, tb, prefix ..< (na - suffix), maxRuns: maxRuns) {
+            if runs.isEmpty { return .identical }
+            if runs.count > 1 { return .regions(runs) }
+            return .region(lo: runs[0].lo, hi: runs[0].hi)
+        }
         var lo = SIMD3<Float>(repeating: .greatestFiniteMagnitude)
         var hi = SIMD3<Float>(repeating: -.greatestFiniteMagnitude)
         var any = false
@@ -69,6 +93,42 @@ extension IlluminatoramaMesh {
         guard lo.x.isFinite, lo.y.isFinite, lo.z.isFinite, hi.x.isFinite, hi.y.isFinite, hi.z.isFinite,
               lo.x <= hi.x else { return .whole }
         return .region(lo: lo, hi: hi)
+    }
+
+    /// Equal-count meshes: one box per maximal run of index-aligned triangle pairs that differ (both
+    /// poses), merged down to `maxRuns`. nil = a non-finite position or too many runs (the caller
+    /// keeps the single middle box).
+    private static func differingRuns(_ ta: TriangleReader, _ tb: TriangleReader, _ range: Range<Int>,
+                                      maxRuns: Int) -> [ShapeDiff.Box]? {
+        var runs: [ShapeDiff.Box] = []
+        var open = false
+        for t in range {
+            let x = ta.triangle(t), y = tb.triangle(t)
+            guard x != y else { open = false; continue }
+            let lo = simd_min(simd_min(x.0, simd_min(x.1, x.2)), simd_min(y.0, simd_min(y.1, y.2)))
+            let hi = simd_max(simd_max(x.0, simd_max(x.1, x.2)), simd_max(y.0, simd_max(y.1, y.2)))
+            guard lo.x.isFinite, lo.y.isFinite, lo.z.isFinite, hi.x.isFinite, hi.y.isFinite, hi.z.isFinite else { return nil }
+            if open {
+                runs[runs.count - 1].lo = simd_min(runs[runs.count - 1].lo, lo)
+                runs[runs.count - 1].hi = simd_max(runs[runs.count - 1].hi, hi)
+            } else {
+                if runs.count >= shapeDiffRunCap { return nil }
+                runs.append(.init(lo: lo, hi: hi)); open = true
+            }
+        }
+        // Merge index neighbours, the pair whose union is smallest first, down to `maxRuns`.
+        func diag(_ lo: SIMD3<Float>, _ hi: SIMD3<Float>) -> Float { simd_length(hi - lo) }
+        while runs.count > max(1, maxRuns) {
+            var best = 0, bestCost = Float.greatestFiniteMagnitude
+            for i in 0 ..< runs.count - 1 {
+                let c = diag(simd_min(runs[i].lo, runs[i + 1].lo), simd_max(runs[i].hi, runs[i + 1].hi))
+                if c < bestCost { bestCost = c; best = i }
+            }
+            runs[best].lo = simd_min(runs[best].lo, runs[best + 1].lo)
+            runs[best].hi = simd_max(runs[best].hi, runs[best + 1].hi)
+            runs.remove(at: best + 1)
+        }
+        return runs
     }
 
     /// Resolves triangle `t` of a CPU-visible mesh to its three object-space positions.

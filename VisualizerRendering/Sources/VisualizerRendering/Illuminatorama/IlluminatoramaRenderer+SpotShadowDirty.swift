@@ -32,6 +32,8 @@ extension IlluminatoramaRenderer {
     /// Past this many changed casters since the last encode, the change is treated as unbounded:
     /// the per-slice test would cost more than it saves, and a mass change hits most slices anyway.
     static let casterChangeBoundsCap = 256
+    /// DH-1680 — at most this many boxes per swapped mesh (`IlluminatoramaMesh.shapeDiff(maxRuns:)`).
+    static let swapDiffMaxRuns = 8
 
     /// The fields the shadow depth pass reads — the same set `updateSceneStability`'s shape check
     /// compares. Two instances with equal keys rasterise identical depth.
@@ -68,8 +70,8 @@ extension IlluminatoramaRenderer {
                     shd.lastShapeChangeTally.kind += 1
                     // DH-1668 — a mesh SWAP under an otherwise identical instance: dirty only where
                     // the triangles differ, not the whole of both meshes (+ShapeDiff.swift).
-                    if let region = swapRegion(old[i], new[i], memo: &diffMemo) {
-                        if let b = region { guard addCasterChangeBounds(b, kind: new[i].meshKind) else { return } }
+                    if let regions = swapRegion(old[i], new[i], memo: &diffMemo) {
+                        for b in regions { guard addCasterChangeBounds(b, kind: new[i].meshKind) else { return } }
                         continue
                     }
                 } else if old[i].data.modelMatrix != new[i].data.modelMatrix { shd.lastShapeChangeTally.matrix += 1 }
@@ -121,11 +123,11 @@ extension IlluminatoramaRenderer {
     private struct SwapPair: Hashable { let a: ObjectIdentifier, b: ObjectIdentifier }
 
     /// For two refs that differ ONLY in their mesh (same matrix, no sway, no live wind, no field
-    /// sink): `.some(nil)` when the meshes rasterise identical depth, `.some(bounds)` = the world
-    /// bounds of the triangles that differ, `nil` = not a pure swap or not comparable (the caller
-    /// then dirties both whole meshes).
+    /// sink): `[]` when the meshes rasterise identical depth, else the world bounds of the triangles
+    /// that differ — one box, or one per differing run (DH-1680, `swapDiffRunsEnabled`); `nil` = not
+    /// a pure swap or not comparable (the caller then dirties both whole meshes).
     private func swapRegion(_ o: InstanceRef, _ n: InstanceRef,
-                            memo: inout [SwapPair: IlluminatoramaMesh.ShapeDiff]) -> IlluminatoramaCullBounds?? {
+                            memo: inout [SwapPair: IlluminatoramaMesh.ShapeDiff]) -> [IlluminatoramaCullBounds]? {
         let d = n.data
         guard swapDiffEnabled, o.data.modelMatrix == d.modelMatrix,
               o.data.swayMode == 0, d.swayMode == 0, o.data.swayJostle == d.swayJostle,
@@ -137,14 +139,21 @@ extension IlluminatoramaRenderer {
               !fxs.gpuRepackTasks.contains(where: { $0.kind == o.meshKind || $0.kind == n.meshKind })
         else { return nil }
         let key = SwapPair(a: ObjectIdentifier(ma), b: ObjectIdentifier(mb))
-        let diff = memo[key] ?? IlluminatoramaMesh.shapeDiff(ma, mb)
+        let diff = memo[key] ?? IlluminatoramaMesh.shapeDiff(ma, mb, maxRuns: swapDiffRunsEnabled ? Self.swapDiffMaxRuns : 1)
         memo[key] = diff
         switch diff {
-        case .identical: return .some(nil)
+        case .identical: return []
         case .whole: return nil
         case .region(let lo, let hi):
             guard let b = IlluminatoramaCullBounds.worldBox(lo: lo, hi: hi, model: d.modelMatrix) else { return nil }
-            return .some(b)
+            return [b]
+        case .regions(let boxes):
+            var out: [IlluminatoramaCullBounds] = []
+            for r in boxes {
+                guard let b = IlluminatoramaCullBounds.worldBox(lo: r.lo, hi: r.hi, model: d.modelMatrix) else { return nil }
+                out.append(b)
+            }
+            return out
         }
     }
 

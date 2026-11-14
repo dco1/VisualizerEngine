@@ -50,6 +50,31 @@ final class IlluminatoramaSunCascadeRegionTests: XCTestCase {
         XCTAssertEqual(IlluminatoramaMesh.shapeDiff(a, b), .whole)
     }
 
+    /// DH-1680 — two parts far apart in the list moved (the two walls at a dragged junction): one
+    /// box per run, not one box over everything between them; merged down to `maxRuns`.
+    func testShapeDiffKeepsSeparateRunsSeparate() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw XCTSkip("no Metal device") }
+        let a = strip(device, 8)
+        let b = strip(device, 8) { $0 == 1 || $0 == 6 ? 0.5 : 0 }
+        guard case .regions(let boxes) = IlluminatoramaMesh.shapeDiff(a, b, maxRuns: 8) else {
+            return XCTFail("two separated moved parts must yield two boxes")
+        }
+        XCTAssertEqual(boxes, [.init(lo: SIMD3(2, 0, 0), hi: SIMD3(3, 0.5, 1)),
+                               .init(lo: SIMD3(12, 0, 0), hi: SIMD3(13, 0.5, 1))])
+        // The single-box answer (lever off) is their union.
+        guard case .region(let lo, let hi) = IlluminatoramaMesh.shapeDiff(a, b) else { return XCTFail() }
+        XCTAssertEqual(lo, SIMD3(2, 0, 0)); XCTAssertEqual(hi, SIMD3(13, 0.5, 1))
+        // Three runs merged to two: the closest neighbours (quads 1 and 3) join first.
+        let c = strip(device, 8) { [1, 3, 7].contains($0) ? 0.5 : 0 }
+        guard case .regions(let merged) = IlluminatoramaMesh.shapeDiff(a, c, maxRuns: 2) else { return XCTFail() }
+        XCTAssertEqual(merged, [.init(lo: SIMD3(2, 0, 0), hi: SIMD3(7, 0.5, 1)),
+                                .init(lo: SIMD3(14, 0, 0), hi: SIMD3(15, 0.5, 1))])
+        // A count change keeps the single middle.
+        guard case .region = IlluminatoramaMesh.shapeDiff(a, strip(device, 9) { $0 == 1 ? 0.5 : 0 }, maxRuns: 8) else {
+            return XCTFail("a changed triangle count keeps one middle box")
+        }
+    }
+
     func testRegionFrustumKeepsExactlyWhatProjectsIntoTheRectangle() {
         // A cascade-like ortho light matrix looking down −y over a 40 m square.
         let view = IlluminatoramaRenderer.lookAtRH(eye: SIMD3(0, 50, 0), target: .zero, up: SIMD3(0, 0, 1))

@@ -38,6 +38,10 @@ final class ShadowKnobs {
     /// starts it off): a ref whose only change is its mesh dirties the bounds of the triangles that
     /// differ between the two meshes, not both meshes whole (`IlluminatoramaMesh.shapeDiff`).
     var swapDiffEnabled: Bool = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_SWAP_DIFF"] != "1"
+    /// Daydream DH-1680 — A/B lever for the swap diff's PER-RUN boxes (default on;
+    /// `VIZ_ILLUMI_NO_SWAP_RUNS=1` starts it off): an equal-count swap dirties one box per run of
+    /// differing triangles instead of one box over the whole changed middle.
+    var swapDiffRunsEnabled: Bool = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_SWAP_RUNS"] != "1"
     /// Daydream DH-1668 — A/B lever for REGION cascade re-renders (default on;
     /// `VIZ_ILLUMI_NO_CASCADE_REGION=1` starts it off): a cascade a change reaches re-rasterises only
     /// the rectangle the change projects to. Off = it re-renders whole. Needs `sunCascadeReuseEnabled`.
