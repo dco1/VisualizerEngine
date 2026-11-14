@@ -644,6 +644,10 @@ public final class PBDSolver {
     public private(set) var bendACount: Int = 0
     public private(set) var bendBCount: Int = 0
     public private(set) var bendCCount: Int = 0
+    /// The long-range constraints' colour groups, in buffer order (`configureChain`): each group
+    /// shares no particle, so it dispatches race-free. Empty = the long-range tail runs as one
+    /// uncoloured pass (layouts that never coloured it).
+    public private(set) var longRangeGroupCounts: [Int] = []
 
     // ── Fixed timestep ────────────────────────────────────────────────────────
     // NEXT STEP (XPBD): use compliance-based constraints that are truly
@@ -873,28 +877,32 @@ public final class PBDSolver {
         let ba = groups.bendA, bb = groups.bendB, bc = groups.bendC
         constraints += ba + bb + bc
 
-        // Skip-two and skip-three: optional long-range straightening (disabled by
-        // default). These are appended after the coloured bending groups and run
-        // as a single uncoloured pass; with XPBD compliance > 0 they yield to
-        // any rigid contact push, so residual races at high body counts are
-        // cosmetically harmless.
+        // Skip-three and skip-four: optional long-range straightening (disabled by default),
+        // appended after the coloured bending groups. They are GRAPH-COLOURED like every other
+        // group: (i, i+k) and (j, j+k) share a particle only when |i − j| = k, so colouring by
+        // ⌊i / k⌋ mod 2 leaves no shared particle within a colour. Run as one uncoloured pass they
+        // raced — two threads read-modify-wrote the same particle — and a settle was not
+        // repeatable: the same rope settled four times gave four shapes (DH-1670, a cord's
+        // smoothed point count 146–176 for one route).
+        var longGroups: [Int] = []
         if longRangeStiffness > 0 {
             let longCompliance = PBDSolver.stiffnessToCompliance(longRangeStiffness)
-            // Skip-three is slightly softer than skip-two (×1.43 compliance ≈
-            // ×0.7 stiffness in the legacy classic-PBD interpretation) so the
-            // chain stays bendy at long range while keeping near-range firm.
-            let skip3Compliance = longCompliance * 1.43
-            for i in 0..<(count - 3) {
-                constraints.append(PBDConstraint(i: UInt32(i), j: UInt32(i + 3),
-                                                 restLength: segLength * 3.0,
-                                                 compliance: longCompliance))
-            }
-            for i in 0..<(count - 4) {
-                constraints.append(PBDConstraint(i: UInt32(i), j: UInt32(i + 4),
-                                                 restLength: segLength * 4.0,
-                                                 compliance: skip3Compliance))
+            // Skip-four is slightly softer than skip-three (×1.43 compliance ≈ ×0.7 stiffness in
+            // the legacy classic-PBD interpretation) so the chain stays bendy at long range while
+            // keeping near-range firm.
+            for (k, compliance) in [(3, longCompliance), (4, longCompliance * 1.43)] where count > k {
+                for colour in 0..<2 {
+                    let group = (0..<(count - k)).filter { ($0 / k) % 2 == colour }.map { i in
+                        PBDConstraint(i: UInt32(i), j: UInt32(i + k),
+                                      restLength: segLength * Float(k), compliance: compliance)
+                    }
+                    guard !group.isEmpty else { continue }
+                    constraints += group
+                    longGroups.append(group.count)
+                }
             }
         }
+        longRangeGroupCounts = longGroups
 
         particleBuffer.write(particles)
         constraintBuffer.write(constraints)
@@ -963,6 +971,7 @@ public final class PBDSolver {
         primaryConstraintCount = primaryCount
         bendACount             = ba.count
         bendBCount             = bb.count
+        longRangeGroupCounts   = []
         bendCCount             = bc.count
 
         ringCount = n
@@ -1099,6 +1108,7 @@ public final class PBDSolver {
         bendACount             = bendA
         bendBCount             = bendB
         bendCCount             = bendC
+        longRangeGroupCounts   = []
     }
 
     // ── Advance (standalone) ─────────────────────────────────────────────────
@@ -1242,9 +1252,16 @@ public final class PBDSolver {
                                         label: "PBD.bendC[\(i)]")
             }
             if longRangeCount > 0 {
-                encodeConstraintSubpass(commandBuffer, start: longRangeStart,
-                                        count: longRangeCount,
-                                        label: "PBD.longRange[\(i)]")
+                // Coloured groups first (`longRangeGroupCounts`), then any uncoloured remainder.
+                var at = longRangeStart
+                for (g, n) in longRangeGroupCounts.enumerated() where at + n <= longRangeStart + longRangeCount {
+                    encodeConstraintSubpass(commandBuffer, start: at, count: n, label: "PBD.longRange\(g)[\(i)]")
+                    at += n
+                }
+                if at < longRangeStart + longRangeCount {
+                    encodeConstraintSubpass(commandBuffer, start: at, count: longRangeStart + longRangeCount - at,
+                                            label: "PBD.longRange[\(i)]")
+                }
             }
 
             // SDF inter-body collision (Phase 3). Run *inside* the constraint
