@@ -106,6 +106,24 @@ final class SkyRadianceProbeTests: XCTestCase {
         for v in r { XCTAssertEqual(v.x, 0.5, accuracy: 0.01, "a vertical plane: half sky, half ground") }
     }
 
+    /// DH-1686 — a window's sky and its ground, measured apart: each half-space returns ITS radiance
+    /// (the mean over the kept directions), and keeps half the cosine-weighted samples.
+    func testHalfSpacesSplitAWindowIntoSkyAndGround() throws {
+        let h = try makeHarness()
+        let skyC = SIMD3<Float>(0.3, 0.5, 0.9), groundC = SIMD3<Float>(0.12, 0.10, 0.06)
+        let sky = makeSky(h) { d in d.y > 0 ? skyC : groundC }
+        let n = SIMD3<Float>(0, 0, -1)
+        let r = run(h, sky, [.init(normal: n, halfSpace: .above), .init(normal: n, halfSpace: .below),
+                             .init(normal: n)])
+        for k in 0..<3 {
+            XCTAssertEqual(r[0][k], skyC[k], accuracy: skyC[k] * 0.01, "above the horizon: the sky alone")
+            XCTAssertEqual(r[1][k], groundC[k], accuracy: groundC[k] * 0.01, "below: the ground alone")
+            XCTAssertEqual(r[2][k], 0.5 * (skyC[k] + groundC[k]), accuracy: 0.01, "whole: their mean")
+        }
+        XCTAssertEqual(r[0].w, 0.5, accuracy: 0.01)
+        XCTAssertEqual(r[1].w, 0.5, accuracy: 0.01)
+    }
+
     func testCosineSkyGivesTwoThirdsOnAnUpFacingPlane() throws {
         let h = try makeHarness()
         let sky = makeSky(h) { d in SIMD3(repeating: max(0, d.y)) }

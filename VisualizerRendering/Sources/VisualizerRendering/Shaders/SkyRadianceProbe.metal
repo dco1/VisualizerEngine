@@ -21,7 +21,8 @@ using namespace metal;
 
 /// Swift mirror: `VolumetricCloudRenderer.RadianceProbeGPU` (32 bytes).
 struct SkyRadianceProbeIn {
-    float4 normal;    // xyz = unit normal (the hemisphere's axis), w unused
+    float4 normal;    // xyz = unit normal (the hemisphere's axis), w = half-space: +1 only directions
+                      // ABOVE the horizon (d.y > 0), −1 only BELOW (d.y < 0), 0 the whole hemisphere
     float4 exclude;   // xyz = unit direction of an excluded cone, w = cos(half-angle); w > 1 = none
 };
 
@@ -41,6 +42,9 @@ kernel void skyRadianceProbe(texture2d<float, access::sample> sky    [[texture(0
     const float3 B = cross(N, T);
     const float3 ex = probes[probe].exclude.xyz;
     const float exCos = probes[probe].exclude.w;
+    // DH-1686 — a window's sky (the quarter-sphere above the horizon) and its ground (below) are
+    // measured apart: the portal sends the first DOWN into the room and the second UP.
+    const float halfSpace = probes[probe].normal.w;
 
     float3 acc = float3(0.0f);
     float kept = 0.0f;
@@ -52,6 +56,7 @@ kernel void skyRadianceProbe(texture2d<float, access::sample> sky    [[texture(0
         float phi = (float(j) + 0.5f + 0.5f * float(i & 1u)) * (2.0f * M_PI_F / float(kProbePhi));
         float3 d = T * (sinT * cos(phi)) + B * (sinT * sin(phi)) + N * cosT;
         if (exCos <= 1.0f && dot(d, ex) > exCos) continue;
+        if ((halfSpace > 0.5f && d.y <= 0.0f) || (halfSpace < -0.5f && d.y >= 0.0f)) continue;
         float3 L = sampleSkyEquirect(sky, d);
         if (any(isnan(L)) || any(isinf(L))) continue;
         acc += max(L, float3(0.0f));

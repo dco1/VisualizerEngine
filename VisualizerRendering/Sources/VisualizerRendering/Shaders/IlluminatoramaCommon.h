@@ -672,7 +672,10 @@ struct AreaLight {
     // DH-0989 (was `_pad2`): 1 ⇒ this rect stands over a real OPENING onto the sky (a window
     // portal) rather than being an emitter. The path-traced lane samples an aperture as a window
     // onto the real sky and takes over its diffuse share; an emitter stays an emitter.
-    float    isAperture; float _pad3;  // close on a 16-byte boundary (stride 144)
+    float    isAperture; float _pad3;
+    // DH-1686 — `horizonSplit` 1 ⇒ `color` is the radiance above the receiver's horizon and
+    // `belowColor` below it (a window: sky above, ground below). See `areaLightSkyShare`.
+    float3   belowColor; float horizonSplit;
 };
 
 // A daylight aperture (S3.5 Stage D) — a glazed opening reduced to what the interior

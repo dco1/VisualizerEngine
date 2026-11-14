@@ -1047,8 +1047,20 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
     float3 p2 = al.center + al.ex + al.ey - worldPos;
     float3 p3 = al.center + al.ex - al.ey - worldPos;
 
-    // Diffuse — exact polygon clamped-cosine (LTC, M = identity).
-    float  ff = ltcPolygonForm(N, p0, p1, p2, p3, twoSided);
+    // Diffuse — exact polygon clamped-cosine (LTC, M = identity). DH-1686: a horizon-split
+    // light (a window portal) integrates the parts above and below the receiver's horizon with
+    // their own radiances — sky above, ground below (`areaLightHorizonForm`). The specular takes
+    // the same blend: its lobe is not split (the floor, whose reflection of a window is all sky,
+    // and a ceiling, all ground, are exact; a wall's sheen is a mix either way).
+    float  ff;
+    float3 lightColor = al.color;
+    if (al.horizonSplit > 0.5) {
+        float2 hf = areaLightHorizonForm(N, worldPos, al.center, al.ex, al.ey, twoSided);
+        ff = hf.x;
+        lightColor = mix(al.belowColor, al.color, hf.y);
+    } else {
+        ff = ltcPolygonForm(N, p0, p1, p2, p3, twoSided);
+    }
     // Exact early-out (Daydream DH-1003): `ff` multiplies the diffuse, windows the LTC specular
     // (`smoothstep(0, 0.02, ff)`) and caps the MRP one (`min(π·ff, …)`), for the base lobe and the coat's
     // alike — so a receiver whose form factor is 0 (the wall the portal sits in, anything facing away)
@@ -1074,7 +1086,7 @@ static inline float3 evalAreaLight(AreaLight al, float3 worldPos, float3 N, floa
                                    ltcMat, ltcMag, ltcEnabled, nL, p0, p1, p2, p3, ff, le.ggxRelative);
     }
 
-    return (diffuse + spec) * al.color * window;
+    return (diffuse + spec) * lightColor * window;
 }
 
 // Pull a fill colour toward its own luminance, ramped IN by how saturated it

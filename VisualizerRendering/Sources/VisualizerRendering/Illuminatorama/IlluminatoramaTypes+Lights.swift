@@ -94,6 +94,19 @@ public struct IlluminatoramaAreaLight {
     /// Was `_pad2` — same 4 bytes. Default 0 ⇒ every existing caller is an emitter, unchanged.
     public var isAperture: Float = 0
     public var _pad3: Float = 0
+    /// Daydream DH-1686 — the radiance seen through the part of the rectangle BELOW the receiver's
+    /// horizon (read only with `horizonSplit` on). A window portal stands for what a receiver sees
+    /// through the hole, and that is not one colour: looking out and UP through a window you see
+    /// the sky, looking out and DOWN you see the ground and terrace outside. Light reaching a room
+    /// surface travelling UPWARD (a ceiling, the upper wall) came from the ground; light travelling
+    /// DOWNWARD (the floor) came from the sky. With the split on, `color` is the above-horizon
+    /// (sky) radiance and this is the below-horizon (ground) radiance; for each receiver the
+    /// rectangle is cut along the horizontal plane through it and each part is integrated with its
+    /// own radiance (the exact Lambert form factor of each part — see `areaLightSkyShare`).
+    public var belowColor: SIMD3<Float> = .zero
+    /// 1 ⇒ `color` above the receiver's horizon, `belowColor` below it. 0 (the default) ⇒ one
+    /// `color` over the whole rectangle — byte-identical for every existing caller.
+    public var horizonSplit: Float = 0
 
     public init(center: SIMD3<Float>, ex: SIMD3<Float>, ey: SIMD3<Float>,
                 color: SIMD3<Float>, radius: Float, twoSided: Bool = false,

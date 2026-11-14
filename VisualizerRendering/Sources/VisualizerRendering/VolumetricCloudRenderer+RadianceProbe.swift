@@ -26,7 +26,7 @@ import simd
 extension VolumetricCloudRenderer {
 
     /// At most this many planes per bake (one threadgroup each).
-    public nonisolated static let maxRadianceProbes = 8
+    public nonisolated static let maxRadianceProbes = 24
 
     /// One plane whose sky radiance the dome bakes measure.
     public struct RadianceProbe: Sendable, Equatable {
@@ -38,11 +38,20 @@ extension VolumetricCloudRenderer {
         public var excludeDirection: SIMD3<Float>?
         /// Half-angle of the excluded cone (radians).
         public var excludeHalfAngle: Float
+        /// DH-1686 — which part of the hemisphere is averaged: `.whole`, or only the directions
+        /// above (`.above`, d.y > 0 — a window's SKY) or below (`.below` — its GROUND) the horizon.
+        /// The result is the cosine-weighted mean over the kept directions: the radiance a
+        /// uniform emitter needs to pass that part's flux.
+        public var halfSpace: HalfSpace
 
-        public init(normal: SIMD3<Float>, excludeDirection: SIMD3<Float>? = nil, excludeHalfAngle: Float = 0) {
+        public enum HalfSpace: Float, Sendable { case whole = 0, above = 1, below = -1 }
+
+        public init(normal: SIMD3<Float>, excludeDirection: SIMD3<Float>? = nil, excludeHalfAngle: Float = 0,
+                    halfSpace: HalfSpace = .whole) {
             self.normal = normal
             self.excludeDirection = excludeDirection
             self.excludeHalfAngle = excludeHalfAngle
+            self.halfSpace = halfSpace
         }
     }
 
@@ -61,14 +70,14 @@ extension VolumetricCloudRenderer {
     /// The newest completed reading (nil until the first probed bake completes on the GPU).
     public var latestRadianceProbeReading: RadianceProbeReading? { radianceProbeStore.latest }
 
-    /// The `skyRadianceProbe` kernel's `buffer(0)`: per probe, float4(normal, 0) then
+    /// The `skyRadianceProbe` kernel's `buffer(0)`: per probe, float4(normal, half-space) then
     /// float4(excluded direction, cos half-angle) — w = 2 (> 1) when nothing is excluded.
     nonisolated static func radianceProbeGPUData(_ probes: [RadianceProbe]) -> [SIMD4<Float>] {
         var gpu: [SIMD4<Float>] = []
         gpu.reserveCapacity(probes.count * 2)
         for p in probes {
             let n = simd_length(p.normal) > 0 ? simd_normalize(p.normal) : SIMD3<Float>(0, 1, 0)
-            gpu.append(SIMD4(n, 0))
+            gpu.append(SIMD4(n, p.halfSpace.rawValue))
             if let e = p.excludeDirection, simd_length(e) > 0, p.excludeHalfAngle > 0 {
                 gpu.append(SIMD4(simd_normalize(e), cos(p.excludeHalfAngle)))
             } else {

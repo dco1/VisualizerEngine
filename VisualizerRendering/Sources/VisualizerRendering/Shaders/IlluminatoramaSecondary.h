@@ -145,8 +145,8 @@ struct RTSpotLight {
     float    openingOffset;   // Daydream DH-1363 inc. 2 — the opening disc along `direction` from the apex (188 → 192)
 };
 /// Mirror of `AreaLight` (IlluminatoramaCommon.h) — the SAME Swift-uploaded
-/// `IlluminatoramaAreaLight` buffer the deferred kernel reads (stride 144). Keep in
-/// lockstep with that struct, field for field.
+/// `IlluminatoramaAreaLight` buffer the deferred kernel reads. Keep in lockstep with that
+/// struct, field for field.
 struct RTAreaLight {
     float3   center;     float twoSided;
     float3   ex;         uint  layerMask;
@@ -156,6 +156,7 @@ struct RTAreaLight {
     int      shadowSliceIndex;
     int      castsShadow;
     float    isAperture; float _pad3;   // DH-0989 (was `_pad2`) — see `AreaLight.isAperture`
+    float3   belowColor; float horizonSplit;   // DH-1686 — see `AreaLight.belowColor`
 };
 
 // ── Rectangular area light: the clamped-cosine form factor ───────────────────
@@ -206,6 +207,68 @@ static inline float ltcPolygonForm(float3 N, float3 p0, float3 p1, float3 p2, fl
                 + ltcIntegrateEdge(L2, L3) + ltcIntegrateEdge(L3, L0);
     float z = dot(vsum, N) * (1.0 / (2.0 * M_PI_F));
     return twoSided ? abs(z) : max(0.0, z);
+}
+
+// ── DH-1686 — a window's sky above the receiver's horizon, its ground below ──────────────
+//
+// A window portal is the room's view of the OUTDOORS, and that view is not one colour: a ray from
+// a room surface out through the glass that CLIMBS leaves toward the sky, one that DESCENDS meets
+// the ground and terrace outside. The dividing plane is the receiver's own horizon — the
+// horizontal plane through it (for outdoors farther than the window is tall) — so a ceiling,
+// above the head of every window, sees only ground through it, the floor only sky, a wall a mix.
+// One uniform-colour portal sent the sky's radiance up onto the ceiling as strongly as down onto
+// the floor (measured: the ceiling took +45 % from the portals, a plain wall +12 %).
+//
+// The rectangle is cut along that plane and each part's clamped-cosine form factor integrated
+// exactly (`ltcPolygonForm`'s edge integral, unclamped). The parts share the cut edge with
+// opposite orientation, so their sum is the whole rectangle's integral EXACTLY: with
+// `belowColor == color` the light is unchanged.
+
+/// The unclamped polygon form factor of the sub-rectangle `center + u·ex + v·ey`,
+/// u ∈ [u0, u1], v ∈ [v0, v1], relative to `P`, with `ltcPolygonForm`'s corner order.
+static inline float areaSubRectForm(float3 N, float3 P, float3 center, float3 ex, float3 ey,
+                                    float u0, float u1, float v0, float v1) {
+    float3 q0 = center + ex * u0 + ey * v0 - P;
+    float3 q1 = center + ex * u0 + ey * v1 - P;
+    float3 q2 = center + ex * u1 + ey * v1 - P;
+    float3 q3 = center + ex * u1 + ey * v0 - P;
+    float3 L0 = q0 * rsqrt(max(dot(q0, q0), 1e-8));
+    float3 L1 = q1 * rsqrt(max(dot(q1, q1), 1e-8));
+    float3 L2 = q2 * rsqrt(max(dot(q2, q2), 1e-8));
+    float3 L3 = q3 * rsqrt(max(dot(q3, q3), 1e-8));
+    float3 vsum = ltcIntegrateEdge(L0, L1) + ltcIntegrateEdge(L1, L2)
+                + ltcIntegrateEdge(L2, L3) + ltcIntegrateEdge(L3, L0);
+    return dot(vsum, N) * (1.0 / (2.0 * M_PI_F));
+}
+
+/// `.x` = the whole rectangle's form factor (as `ltcPolygonForm`), `.y` = the share of it that
+/// arrives through the part ABOVE the receiver's horizon (0…1). The cut runs along the edge axis
+/// with the larger vertical extent (a window: across `ey`); exact when the other axis is level,
+/// which every wall opening's is. A level rectangle (a skylight) lies wholly on one side.
+static inline float2 areaLightHorizonForm(float3 N, float3 P, float3 center, float3 ex, float3 ey,
+                                          bool twoSided) {
+    bool cutAcrossEy = abs(ey.y) >= abs(ex.y);
+    float by = cutAcrossEy ? ey.y : ex.y;               // vertical rise per unit of the cut axis
+    float h  = P.y - center.y;
+    // The cut-axis interval of the part above P's horizon: s > t when the axis climbs.
+    float upLo, upHi, dnLo, dnHi;
+    if (abs(by) > 1e-6) {
+        float t = clamp(h / by, -1.0, 1.0);
+        if (by > 0.0) { upLo = t; upHi = 1.0; dnLo = -1.0; dnHi = t; }
+        else          { upLo = -1.0; upHi = t; dnLo = t; dnHi = 1.0; }
+    } else if (h < 0.0) { upLo = -1.0; upHi = 1.0; dnLo = 1.0; dnHi = 1.0; }   // wholly above
+    else                { upLo = -1.0; upHi = -1.0; dnLo = -1.0; dnHi = 1.0; } // wholly below
+    float zU = 0.0, zD = 0.0;
+    if (upHi > upLo) zU = cutAcrossEy ? areaSubRectForm(N, P, center, ex, ey, -1.0, 1.0, upLo, upHi)
+                                      : areaSubRectForm(N, P, center, ex, ey, upLo, upHi, -1.0, 1.0);
+    if (dnHi > dnLo) zD = cutAcrossEy ? areaSubRectForm(N, P, center, ex, ey, -1.0, 1.0, dnLo, dnHi)
+                                      : areaSubRectForm(N, P, center, ex, ey, dnLo, dnHi, -1.0, 1.0);
+    float z = zU + zD;
+    float ff = twoSided ? abs(z) : max(0.0, z);
+    // A part partly behind the receiver can carry the opposite sign; the share is clamped, so
+    // the colour stays a blend of the two radiances.
+    float share = (abs(z) > 1e-9) ? saturate(zU / z) : (upHi > upLo ? 1.0 : 0.0);
+    return float2(ff, share);
 }
 
 // ── RNG + sampling ───────────────────────────────────────────────────────────
@@ -747,8 +810,13 @@ static inline float3 secondaryAreaLightFill(thread Isect& isect,
         float3 p1 = al.center - al.ex + al.ey - P;
         float3 p2 = al.center + al.ex + al.ey - P;
         float3 p3 = al.center + al.ex - al.ey - P;
-        float ff = ltcPolygonForm(N, p0, p1, p2, p3, twoSided);
-        float3 L = al.color * (ff * window);
+        float3 L;
+        if (al.horizonSplit > 0.5) {   // DH-1686 — sky above the hit's horizon, ground below
+            float2 hf = areaLightHorizonForm(N, P, al.center, al.ex, al.ey, twoSided);
+            L = mix(al.belowColor, al.color, hf.y) * (hf.x * window);
+        } else {
+            L = al.color * (ltcPolygonForm(N, p0, p1, p2, p3, twoSided) * window);
+        }
         if (dot(L, float3(0.2126, 0.7152, 0.0722)) <= kSecondaryAreaSkip) continue;
         if (al.castsShadow != 0 && p.areaShadowRays > 0u) {
             float3 offN = (dot(N, al.center - P) >= 0.0) ? N : -N;
