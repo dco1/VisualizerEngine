@@ -69,7 +69,7 @@ extension IlluminatoramaRenderer {
                     // DH-1668 — a mesh SWAP under an otherwise identical instance: dirty only where
                     // the triangles differ, not the whole of both meshes (+ShapeDiff.swift).
                     if let region = swapRegion(old[i], new[i], memo: &diffMemo) {
-                        if let b = region { guard addCasterChangeBounds(b) else { return } }
+                        if let b = region { guard addCasterChangeBounds(b, kind: new[i].meshKind) else { return } }
                         continue
                     }
                 } else if old[i].data.modelMatrix != new[i].data.modelMatrix { shd.lastShapeChangeTally.matrix += 1 }
@@ -115,7 +115,7 @@ extension IlluminatoramaRenderer {
         }
         var b = IlluminatoramaCullBounds.empty
         b.formUnion(center: s.center, radius: s.radius)
-        return addCasterChangeBounds(b)
+        return addCasterChangeBounds(b, kind: r.meshKind)
     }
 
     private struct SwapPair: Hashable { let a: ObjectIdentifier, b: ObjectIdentifier }
@@ -149,12 +149,14 @@ extension IlluminatoramaRenderer {
     }
 
     /// Add one world bound to every recording consumer; false once none is recording.
-    private func addCasterChangeBounds(_ b: IlluminatoramaCullBounds) -> Bool {
+    private func addCasterChangeBounds(_ b: IlluminatoramaCullBounds, kind: MeshKind? = nil) -> Bool {
         if spotShadowPerSliceDirtyEnabled && !shd.pendingCasterChangeUnbounded {
             if shd.pendingCasterChange.count < Self.casterChangeBoundsCap {
                 shd.pendingCasterChange.append(b)
+                shd.pendingCasterChangeKinds.append(kind)
             } else {
                 shd.pendingCasterChange.removeAll(keepingCapacity: true)
+                shd.pendingCasterChangeKinds.removeAll(keepingCapacity: true)
                 shd.pendingCasterChangeUnbounded = true
                 shd.casterChangeUnboundedReason = "more than \(Self.casterChangeBoundsCap) changed casters"
             }
@@ -173,6 +175,7 @@ extension IlluminatoramaRenderer {
     func markCasterChangeUnbounded(_ reason: String) {
         shd.casterChangeUnboundedReason = reason
         shd.pendingCasterChange.removeAll(keepingCapacity: true)
+        shd.pendingCasterChangeKinds.removeAll(keepingCapacity: true)
         shd.pendingCasterChangeUnbounded = true
         shd.cascadeChange.markUnbounded()
     }
@@ -197,6 +200,32 @@ extension IlluminatoramaRenderer {
     /// stop where recording stopped (a record that went unbounded). Diagnostic.
     public var shadowLastShapeChangeTally: (kind: Int, matrix: Int, other: Int, sameCount: Bool) { shd.lastShapeChangeTally }
 
+    /// DH-1673 — the mesh kind behind each `spotShadowLastCasterChange` box, parallel by index (nil
+    /// = a box not owned by one kind). Diagnostic: lets a host name what moved.
+    public var spotShadowLastCasterChangeKinds: [MeshKind?] { shd.lastCasterChangeKinds }
+
+    /// DH-1673 — for each slice the last spot-atlas encode tested (its light matrix), the indices
+    /// of the `spotShadowLastCasterChange` boxes its clip volume does NOT exclude: the changes that
+    /// made it re-render. Diagnostic: which caster costs which slice.
+    public var spotShadowLastSliceTouches: [[Int]] {
+        shd.lastSpotShadowMats.map { m in
+            let clip = IlluminatoramaClipVolume(m)
+            return shd.lastCasterChange.indices.filter { !clip.excludes(shd.lastCasterChange[$0]) }
+        }
+    }
+
+    /// DH-1673 — who owns each spot-atlas slice this frame, and where: "spot 3 (x, y, z)" /
+    /// "area 0 (…)" (a window portal). Diagnostic.
+    public var spotShadowSliceOwners: [String] {
+        shd.spotShadowCasters.map { c in
+            func f(_ p: SIMD3<Float>) -> String { String(format: "(%.1f, %.1f, %.1f)", p.x, p.y, p.z) }
+            switch c.owner {
+            case .spot(let i): return i < spotLights.count ? "spot \(i) \(f(spotLights[i].position))" : "spot \(i)"
+            case .area(let i): return i < areaLights.count ? "area \(i) \(f(areaLights[i].center))" : "area \(i)"
+            }
+        }
+    }
+
     /// CPU ms the last caster-change record took (the shape diff included). Diagnostic.
     public var shadowCasterRecordMs: Double { shd.lastCasterRecordMs }
 
@@ -205,8 +234,10 @@ extension IlluminatoramaRenderer {
 
     func consumeShadowCasterChanges() {
         shd.lastCasterChange = shd.pendingCasterChange
+        shd.lastCasterChangeKinds = shd.pendingCasterChangeKinds
         shd.lastCasterChangeUnbounded = shd.pendingCasterChangeUnbounded
         shd.pendingCasterChange.removeAll(keepingCapacity: true)
+        shd.pendingCasterChangeKinds.removeAll(keepingCapacity: true)
         shd.pendingCasterChangeUnbounded = false
     }
 }

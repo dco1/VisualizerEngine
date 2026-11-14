@@ -745,6 +745,10 @@ final class ShadowState {
     var pendingCasterChange: [IlluminatoramaCullBounds] = []
     var pendingCasterChangeUnbounded = false
     var lastCasterChange: [IlluminatoramaCullBounds] = []
+    /// DH-1673 — the mesh kind behind each `pendingCasterChange` / `lastCasterChange` box (nil =
+    /// not one kind). Diagnostic only — `spotShadowLastCasterChangeKinds`.
+    var pendingCasterChangeKinds: [IlluminatoramaRenderer.MeshKind?] = []
+    var lastCasterChangeKinds: [IlluminatoramaRenderer.MeshKind?] = []
     var lastCasterChangeUnbounded = false
     /// DH-1668 — the same record for the SUN CASCADES, consumed by `encodeShadowPasses` (the spot
     /// atlas and the cascades encode under different switches, so each keeps its own).
