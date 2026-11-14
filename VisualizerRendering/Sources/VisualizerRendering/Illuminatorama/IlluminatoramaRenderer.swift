@@ -205,6 +205,18 @@ public final class IlluminatoramaRenderer {
         /// cannot say what a frame paid — a rising skip count read as "more passes" once.
         public var spotShadowPassesRendered = 0
         public var pointShadowPassesSkipped = 0
+        /// Daydream DH-1668 — sun-cascade depth passes reused from an earlier frame (the cascade's
+        /// light matrix held and no changed caster reaches its volume) and actually rasterised.
+        public var sunCascadePassesSkipped = 0
+        public var sunCascadePassesRendered = 0
+        /// DH-1668 — cascades re-rasterised only in the rectangle a change reached (not counted in
+        /// `sunCascadePassesRendered`, which counts whole-slice re-renders).
+        public var sunCascadePassesPartial = 0
+        /// DH-1668 — full TLAS rebuilds (`rebuildRTAccel`), and how many of them were a SWAP:
+        /// only some instances changed BLAS (a drag re-registering the meshes it moved), which
+        /// rebuilds against the cached BLASes and is not counted as topology thrash.
+        public var tlasRebuilds = 0
+        public var tlasInstanceRebuilds = 0
     }
     /// Debug window for tests/instruments: the current stability streak lengths
     /// (frames since full-content / shape-only / glass content last changed).

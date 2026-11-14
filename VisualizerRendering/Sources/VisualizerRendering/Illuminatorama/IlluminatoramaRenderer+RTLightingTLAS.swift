@@ -202,17 +202,30 @@ extension IlluminatoramaRenderer {
             // (GPU-fed / regenerated geometry — e.g. Forest's LeafField + bark +
             // swaying branches) ⇒ a full rebuild every frame ⇒ hang + faulted-AS
             // magenta. Allow a few legitimate settle frames, then disable.
-            rts.rtConsecutiveRebuilds += 1
-            if rts.rtConsecutiveRebuilds > Self.rtRebuildThrashLimit {
-                tripRTGuard(.topologyThrashing, """
-                    TLAS rebuilt \(rts.rtConsecutiveRebuilds) frames running (topology \
-                    thrashing: GPU-fed / animated-topology / actively-edited scene). \
-                    Retrying after \(IlluminatoramaRTHangGuard.recoveryStableFrames) settled frames
-                    """)
-                return
+            // DH-1668 — EXCEPT a swap: about the same instances, re-pointed at a few new small
+            // BLASes (an edit re-registering the meshes it moved). That rebuild is bounded by the
+            // swap budget, so it is not the hang this guard exists for (+RTLightingTLASSwap.swift).
+            let swapShaped = rtTopologyChangeIsSwap()
+            let swap = swapShaped && rts.rtLastSwapRebuildMs <= Self.rtSwapRebuildBudgetMs
+            if !swap {
+                rts.rtConsecutiveRebuilds += 1
+                if rts.rtConsecutiveRebuilds > Self.rtRebuildThrashLimit {
+                    tripRTGuard(.topologyThrashing, """
+                        TLAS rebuilt \(rts.rtConsecutiveRebuilds) frames running (topology \
+                        thrashing: GPU-fed / animated-topology / actively-edited scene). \
+                        Retrying after \(IlluminatoramaRTHangGuard.recoveryStableFrames) settled frames
+                        """)
+                    return
+                }
             }
+            staticSkipStats.tlasRebuilds += 1
+            if swap { staticSkipStats.tlasInstanceRebuilds += 1 }
+            let t0 = CACurrentMediaTime()
             rebuildRTAccel()
+            rts.rtLastRebuildMs = (CACurrentMediaTime() - t0) * 1000
+            if swapShaped { rts.rtLastSwapRebuildMs = rts.rtLastRebuildMs }
             rts.rtTLASTopologyHash = topo
+            rts.rtTLASBuiltCurveVersion = rts.rtCurveSyncVersion
         } else {
             rts.rtConsecutiveRebuilds = 0   // stable topology this frame → reset
             // DH-0622 — cards otherwise bake only in `rebuildRTAccel`, i.e. on a topology change,

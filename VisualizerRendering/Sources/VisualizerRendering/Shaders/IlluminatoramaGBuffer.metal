@@ -109,6 +109,14 @@ vertex float4 illumi_shadow_vs(
     return illumiShadowClip(verts[vid], instances[iid], lightVP, shadowClock);
 }
 
+// DH-1668 — clears a SCISSORED region of a shadow slice back to the far plane, so a sun cascade
+// can re-rasterise only the rectangle a moved caster touched (the rest of the slice keeps last
+// frame's depth). One full-target triangle at depth 1.0; drawn with compare `always`, no bias.
+vertex float4 illumi_shadow_clear_vs(uint vid [[vertex_id]]) {
+    float2 p = float2(float((vid << 1) & 2), float(vid & 2));
+    return float4(p * 2.0 - 1.0, 1.0, 1.0);
+}
+
 // DH-1487 — the leaf-cutout shadow stage: the same depth, plus a fragment that drops what lies
 // outside the card's species leaf, so a cutout leaf casts its own outline (meshes flagged
 // `leafCutout` only; every other caster keeps the fragment-less pipeline).

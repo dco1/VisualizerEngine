@@ -15,6 +15,13 @@ final class RTKnobs {
     typealias GIRoomFillHandoff = IlluminatoramaRenderer.GIRoomFillHandoff
     typealias RTSunOwnership = IlluminatoramaRenderer.RTSunOwnership
 
+    /// Daydream DH-1668 — A/B lever for the TLAS SWAP rebuild (default on;
+    /// `VIZ_ILLUMI_NO_TLAS_SWAP=1` starts it off). On, a topology change that only re-points some
+    /// instances at different BLASes (same instance count, same group shape — a drag
+    /// re-registering the meshes it moved) rebuilds against the cached BLASes and does NOT count
+    /// toward the rebuild-thrash guard. Off = every topology change counts (pre-DH-1668).
+    var tlasSwapRebuildEnabled: Bool = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_TLAS_SWAP"] != "1"
+
     // ── Hardware ray tracing (soft sun shadows + 1-bounce GI) ────────
     //
     // When `rtEnabled` is true AND a static RT geometry has been supplied via

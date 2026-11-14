@@ -31,6 +31,18 @@ final class ShadowKnobs {
     /// shadow shape changed (moved, swapped mesh, re-swung) re-renders only the slices whose light
     /// frustum its old or new bounds reach. Off = any shape change re-renders every slice.
     var spotShadowPerSliceDirtyEnabled: Bool = true
+    /// Daydream DH-1668 — A/B lever for SUN-CASCADE reuse (default on; `VIZ_ILLUMI_NO_CASCADE_REUSE=1`
+    /// starts it off). On, a cascade whose light matrix held and whose volume no changed caster
+    /// reaches keeps last frame's depth. Off = every cascade re-renders every frame (pre-DH-1668).
+    /// Daydream DH-1668 — A/B lever for the SWAP DIFF (default on; `VIZ_ILLUMI_NO_SWAP_DIFF=1`
+    /// starts it off): a ref whose only change is its mesh dirties the bounds of the triangles that
+    /// differ between the two meshes, not both meshes whole (`IlluminatoramaMesh.shapeDiff`).
+    var swapDiffEnabled: Bool = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_SWAP_DIFF"] != "1"
+    /// Daydream DH-1668 — A/B lever for REGION cascade re-renders (default on;
+    /// `VIZ_ILLUMI_NO_CASCADE_REGION=1` starts it off): a cascade a change reaches re-rasterises only
+    /// the rectangle the change projects to. Off = it re-renders whole. Needs `sunCascadeReuseEnabled`.
+    var sunCascadeRegionEnabled: Bool = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_CASCADE_REGION"] != "1"
+    var sunCascadeReuseEnabled: Bool = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_CASCADE_REUSE"] != "1"
     // ── Phase 2.5 shadow knobs ───────────────────────────────────────
     /// Toggle the cascaded-shadow pass + sampling. Off = direct sun lights
     /// every pixel, regardless of occlusion (Phase 2 behaviour).

@@ -7,6 +7,10 @@ import VisualizerCore
 
 extension IlluminatoramaRenderer {
     public func setMesh(_ kind: MeshKind, _ mesh: IlluminatoramaMesh) {
+        // DH-1668 — a different mesh under a kind already in the table changes every instance's
+        // shadow WITHOUT changing any instance ref, which is all the shadow reuse compares. The
+        // old geometry's extent is gone with it, so the change cannot be bounded: re-render all.
+        if let old = meshes[kind], old !== mesh { markCasterChangeUnbounded("mesh replaced under \(kind)") }
         meshes[kind] = mesh
     }
 
@@ -55,7 +59,15 @@ extension IlluminatoramaRenderer {
     /// lifetime drive cleanup avoids accidental dangling MeshKind keys
     /// while an SCNNode still references the geometry.
     internal func removeMesh(_ kind: MeshKind) {
-        meshes.removeValue(forKey: kind)
+        // DH-1668 — a host that swaps a moved piece's mesh (Daydream's structural load drops the
+        // old handle before the next frame renders) still needs the OLD geometry's bounds to clear
+        // its shadow from the maps that hold it. Keep the departing mesh until the next stability
+        // update has diffed last frame's instances against this frame's — only a mesh last frame
+        // actually drew (`meshGroupRange` is that upload's grouping), so loads that never render
+        // cannot pile meshes up here.
+        if let gone = meshes.removeValue(forKey: kind), gbs.meshGroupRange[kind] != nil {
+            shd.departedMeshes[kind] = gone
+        }
         fxs.gpuRepackTasks.removeAll { $0.kind == kind }
     }
 }

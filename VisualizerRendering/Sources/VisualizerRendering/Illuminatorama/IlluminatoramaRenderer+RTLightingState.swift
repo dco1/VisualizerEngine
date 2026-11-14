@@ -208,6 +208,13 @@ final class RTState {
     var rtGuard = IlluminatoramaRTHangGuard()
 
     var rtConsecutiveRebuilds: Int = 0
+    /// DH-1668 — the curve-registry version the live TLAS was built with (a swap must not hide a
+    /// curve change), and the CPU ms the last `rebuildRTAccel` took (BLAS waits included).
+    var rtTLASBuiltCurveVersion: Int = .min
+    var rtLastRebuildMs: Double = 0
+    var rtLastRebuildPhases = ""
+    /// What the last swap-shaped rebuild cost; over `rtSwapRebuildBudgetMs` the next swap counts.
+    var rtLastSwapRebuildMs: Double = 0
 }
 
 // MARK: - Pipeline / resource construction (called from `init`, in the order it lists)

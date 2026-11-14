@@ -28,6 +28,9 @@ extension IlluminatoramaRenderer {
     /// TLAS. Runs on a topology change.
     func rebuildRTAccel() {
         rts.rtTLASActive = false
+        let tStart = CACurrentMediaTime()   // DH-1668 phase timing (`rtLastTLASRebuildPhases`)
+        var newBLAS = 0
+        func lap() -> Double { (CACurrentMediaTime() - tStart) * 1000 }
         // The scene's mesh set just changed — release every cached entry whose mesh is gone
         // BEFORE looking anything up below, so the cache never outlives the addresses it is
         // keyed by (see `RTMeshEntry`). Also refreshes `rtHasDeformingBLAS`.
@@ -106,6 +109,7 @@ extension IlluminatoramaRenderer {
                                     normals: mesh.objectFaceNormals(),
                                     uvs: mesh.objectFaceUVs(), refit: nil)
             pending.append((blas, d, scratch))
+            newBLAS += 1
             // Retain the descriptor + a refit-sized scratch so the per-frame refit
             // can re-encode without re-deriving sizes. Refit scratch can differ from
             // build scratch; size it explicitly.
@@ -191,6 +195,7 @@ extension IlluminatoramaRenderer {
                                            cornerNormals: mesh.objectCornerNormals())
             pending.append((blas, d, scratch))
         }
+        let tBLASPrep = lap()
         if !pending.isEmpty {
             guard let cmd = commandQueue.makeCommandBuffer(),
                   let enc = cmd.makeAccelerationStructureCommandEncoder() else { return }
@@ -203,47 +208,65 @@ extension IlluminatoramaRenderer {
             Self.recordASBuildError(cmd, "rebuildRTAccel.blas")
         }
 
+        let tBLAS = lap()
         // (b) Assemble BLAS list + concat normals + per-mesh slot for this topology.
         rts.rtBLASList.removeAll(keepingCapacity: true)
         rts.rtResidentBuffers.removeAll(keepingCapacity: true)
-        var concat: [SIMD4<Float>] = []
-        // Per-triangle mesh UVs, concatenated in LOCKSTEP with `concat` (3 entries
-        // per normal). A mesh whose UVs couldn't be read (GPU-private vertices) is
-        // padded with zeros so `normalBase * 3` stays a valid index for every later
-        // mesh — a short array here would shift every subsequent mesh's UVs.
-        var concatUV: [SIMD2<Float>] = []
-        func appendMesh(_ cached: RTMeshEntry) {
-            concat.append(contentsOf: cached.normals)
-            let want = cached.normals.count * 3
-            concatUV.append(contentsOf: cached.uvs.prefix(want))
-            if cached.uvs.count < want {
-                concatUV.append(contentsOf: repeatElement(.zero, count: want - cached.uvs.count))
-            }
-        }
+        // Per-triangle object normals + mesh UVs of every slotted mesh, concatenated in slot order
+        // (3 UVs per normal). A mesh whose UVs couldn't be read (GPU-private vertices) is padded
+        // with zeros so `normalBase * 3` stays a valid index for every later mesh — a short run
+        // here would shift every subsequent mesh's UVs. DH-1668: sized first and copied ONCE,
+        // straight into the Metal buffers — the old path appended ~400 meshes into growing Swift
+        // arrays and then copied those again (7.5 ms of an edit's 22 ms rebuild on 4000 Sunset).
+        var slotted: [RTMeshEntry] = []
+        var normalCount = 0
         var slot: [ObjectIdentifier: (asIndex: Int, normalBase: Int)] = [:]
-        for group in gbs.meshGroups {
-            guard let mesh = meshes[group.kind], !rtGroupIsRayExcluded(group) else { continue }
+        func addSlot(_ mesh: IlluminatoramaMesh) {
             let mid = ObjectIdentifier(mesh)
-            if slot[mid] != nil { continue }
-            guard let cached = rts.rtMeshCache[mid] else { continue }
-            slot[mid] = (rts.rtBLASList.count, concat.count)
+            guard slot[mid] == nil, let cached = rts.rtMeshCache[mid] else { return }
+            slot[mid] = (rts.rtBLASList.count, normalCount)
             rts.rtBLASList.append(cached.blas)
             rts.rtResidentBuffers.append(mesh.vertexBuffer); rts.rtResidentBuffers.append(mesh.indexBuffer)
-            appendMesh(cached)
+            slotted.append(cached)
+            normalCount += cached.normals.count
+        }
+        for group in gbs.meshGroups {
+            guard let mesh = meshes[group.kind], !rtGroupIsRayExcluded(group) else { continue }
+            addSlot(mesh)
         }
         // Glass meshes join the same BLAS list + concat normals (a glass hit's
         // normal resolves through `objNormal[normalBase + prim]`, same as opaque).
         for (kind, _) in glassFlat {
             guard let mesh = meshes[kind] else { continue }
-            let mid = ObjectIdentifier(mesh)
-            if slot[mid] != nil { continue }
-            guard let cached = rts.rtMeshCache[mid] else { continue }
-            slot[mid] = (rts.rtBLASList.count, concat.count)
-            rts.rtBLASList.append(cached.blas)
-            rts.rtResidentBuffers.append(mesh.vertexBuffer); rts.rtResidentBuffers.append(mesh.indexBuffer)
-            appendMesh(cached)
+            addSlot(mesh)
         }
-        guard !rts.rtBLASList.isEmpty, !concat.isEmpty else { return }
+        let concatCount = normalCount
+        guard !rts.rtBLASList.isEmpty, concatCount > 0 else { return }
+        if let nbuf = device.makeBuffer(length: MemoryLayout<SIMD4<Float>>.stride * concatCount, options: .storageModeShared),
+           let ubuf = device.makeBuffer(length: MemoryLayout<SIMD2<Float>>.stride * concatCount * 3, options: .storageModeShared) {
+            let np = nbuf.contents().bindMemory(to: SIMD4<Float>.self, capacity: concatCount)
+            let up = ubuf.contents().bindMemory(to: SIMD2<Float>.self, capacity: concatCount * 3)
+            var n = 0
+            for e in slotted {
+                e.normals.withUnsafeBufferPointer { src in
+                    if let b = src.baseAddress { (np + n).update(from: b, count: src.count) }
+                }
+                let want = e.normals.count * 3
+                let have = min(want, e.uvs.count)
+                e.uvs.withUnsafeBufferPointer { src in
+                    if have > 0, let b = src.baseAddress { (up + n * 3).update(from: b, count: have) }
+                }
+                if have < want { (up + n * 3 + have).update(repeating: .zero, count: want - have) }
+                n += e.normals.count
+            }
+            rts.rtObjNormalBuffer = nbuf
+            rts.rtObjUVBuffer = ubuf
+        } else {
+            return   // allocation failed: keep the previous (inactive) structure, as an empty scene does
+        }
+        rts.rtObjUVBuffer?.label = "Illuminatorama.rt.objUV"
+        rts.rtObjNormalCount = concatCount
+        rts.rtObjUVCount = concatCount * 3
         // Glass corner normals: one slice per distinct glass mesh, base stored +1 in each glass
         // instance's row (see `rtGlassCornerNormalBuffer`).
         var cornerConcat: [SIMD4<Float>] = []
@@ -261,15 +284,6 @@ extension IlluminatoramaRenderer {
             bytes: cornerConcat, length: MemoryLayout<SIMD4<Float>>.stride * cornerConcat.count,
             options: .storageModeShared)
         gls.rtGlassCornerNormalBuffer?.label = "Illuminatorama.rt.glassCornerNormal"
-        rts.rtObjNormalBuffer = device.makeBuffer(
-            bytes: concat, length: MemoryLayout<SIMD4<Float>>.stride * concat.count,
-            options: .storageModeShared)
-        rts.rtObjNormalCount = concat.count
-        rts.rtObjUVBuffer = device.makeBuffer(
-            bytes: concatUV, length: MemoryLayout<SIMD2<Float>>.stride * max(1, concatUV.count),
-            options: .storageModeShared)
-        rts.rtObjUVBuffer?.label = "Illuminatorama.rt.objUV"
-        rts.rtObjUVCount = concatUV.count
         // Curve pool buffers must stay resident for the intersector (the curve
         // BLASes reference them), and the shading kernels read them at hits.
         if !rts.rtCurveBLASList.isEmpty,
@@ -280,6 +294,7 @@ extension IlluminatoramaRenderer {
             rts.rtResidentBuffers.append(cseg)
         }
 
+        let tConcat = lap()
         // (c) Per-instance descriptors + data in GROUPED order (== currentInstanceBuffer).
         // Curve-set instances (#60 item 7) append after the triangle instances.
         let total = instances.count
@@ -388,6 +403,7 @@ extension IlluminatoramaRenderer {
             }
         }
 
+        let tDesc = lap()
         // (d) Build the TLAS (allocate / grow as needed).
         let tdesc = MTLInstanceAccelerationStructureDescriptor()
         tdesc.instanceDescriptorBuffer = descBuf
@@ -411,6 +427,8 @@ extension IlluminatoramaRenderer {
         enc.endEncoding(); cmd.commit()
         cmd.waitUntilCompleted()   // gpu-ok: topology-change TLAS rebuild (not per-frame for stable scenes)
         Self.recordASBuildError(cmd, "rebuildRTAccel.tlas")
+        rts.rtLastRebuildPhases = String(format: "%d new BLAS: prep %.1f + build/wait %.1f · normals/uv concat %.1f · descriptors %.1f · TLAS build + wait %.1f ms",
+                                         newBLAS, tBLASPrep, tBLAS - tBLASPrep, tConcat - tBLAS, tDesc - tConcat, lap() - tDesc)
         rts.rtTLASInstanceCount = totalInstances
         rts.rtTLASActive = true
 

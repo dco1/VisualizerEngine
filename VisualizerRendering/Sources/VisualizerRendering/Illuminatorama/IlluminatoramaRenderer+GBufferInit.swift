@@ -78,9 +78,15 @@ extension IlluminatoramaRenderer {
                         && $0.data.swayMode == $1.data.swayMode
                         && $0.data.swayLean == $1.data.swayLean
                         && $0.data.swayJostle == $1.data.swayJostle
+                        && $0.data.tagGlow.y == $1.data.tagGlow.y   // DH-1668: the shadow stage's
+                        && $0.data.tagGlow.z == $1.data.tagGlow.z   // field sink reads these
                 }
             gbs.instanceShapeStableFrames = shapeHeld ? gbs.instanceShapeStableFrames + 1 : 0
-            if !shapeHeld { recordShadowCasterChange(old: gbs.lastUploadedInstances, new: instances) }   // DH-1590
+            if !shapeHeld {   // DH-1590 (+ DH-1668: timed — the swap diff reads mesh contents)
+                let t0 = CACurrentMediaTime()
+                recordShadowCasterChange(old: gbs.lastUploadedInstances, new: instances)
+                shd.lastCasterRecordMs = (CACurrentMediaTime() - t0) * 1000
+            }
             gbs.instanceStableFrames = 0
             gbs.lastUploadedInstances = instances   // COW reference, no deep copy
             gbs.contentHasSway = instances.contains { $0.data.swayMode >= 2 }
@@ -93,6 +99,7 @@ extension IlluminatoramaRenderer {
             gls.glassStableFrames = 0
             gls.lastGlassFlat = glassNow
         }
+        shd.departedMeshes.removeAll(keepingCapacity: true)   // DH-1668 — diffed above; release them
         // Kill-switch: zeroing the counters here disables every downstream skip
         // (upload / TLAS refit / shadow reuse) in one place.
         if Self.staticSkipDisabled {

@@ -27,11 +27,23 @@ extension IlluminatoramaRenderer {
         // printed the previous frame's shadows with the toggle already off. A cleared
         // slice (depth == 1.0) compares as "lit" everywhere, so no consumer can resurrect
         // a shadow regardless of which lighting variant is live. (DH-0619)
+        // DH-1668 — a cascade whose matrix held and that no changed caster reaches keeps its map;
+        // one a change DOES reach re-rasterises only the rectangle the change projects to
+        // (+SunCascadeReuse.swift). Skipping the pass skips its `.clear` too, so the slice keeps it.
+        let plans = sunCascadePlans()
         for cascade in 0..<Self.cascadeCount {
+            let plan = shadowsEnabled ? plans[cascade] : .full
+            if case .reuse = plan {
+                staticSkipStats.sunCascadePassesSkipped += 1
+                continue
+            }
+            var region: MTLScissorRect?
+            if case .region(let r) = plan { region = r }
+            noteCascadeRendered(cascade, nil)   // re-armed once it is drawn
             let pass = MTLRenderPassDescriptor()
             pass.depthAttachment.texture = shd.shadowMap
             pass.depthAttachment.slice = cascade
-            pass.depthAttachment.loadAction = .clear
+            pass.depthAttachment.loadAction = region == nil ? .clear : .load
             pass.depthAttachment.storeAction = .store
             pass.depthAttachment.clearDepth = 1.0
 
@@ -39,6 +51,8 @@ extension IlluminatoramaRenderer {
             enc.label = "Illuminatorama.shadow.c\(cascade)"
             // Disabled → the clear above already made this a fully-lit slice; no draws.
             guard shadowsEnabled else { enc.endEncoding(); continue }
+            noteCascadeRendered(cascade, shd.cascadeVPs[cascade])
+            if let region { encodeCascadeRegionClear(enc, region) } else { staticSkipStats.sunCascadePassesRendered += 1 }
             enc.setRenderPipelineState(shd.shadowPipeline)
             var cutoutBound = false   // DH-1487 — the fragment-less pipeline is bound
             enc.setDepthStencilState(gbs.depthState)
@@ -56,6 +70,7 @@ extension IlluminatoramaRenderer {
             enc.setVertexBytes(&lightVP,
                                length: MemoryLayout<simd_float4x4>.stride,
                                index: 3)
+            let cascadeCullVP = region.map { Self.scissorFrustum(lightVP, $0, size: shd.shadowMap.width) } ?? lightVP
             // Shader-animated sway (swayMode 2 pendant, 3 wind flap) reads (time, wind, heading) so it casts
             // its swung shadow in phase with the visible mesh; no-op for modes 0/1.
             var shadowClock = SIMD4<Float>(time, treeWindStrength, treeWindHeading, fieldSinkProgress)   // (time, wind, heading, sink)
@@ -66,7 +81,7 @@ extension IlluminatoramaRenderer {
             // one draw call replaces N per-instance draws per cascade /
             // per spot.
             let instStride = MemoryLayout<IlluminatoramaInstance>.stride
-            let cullClip = cullVolume(lightVP)   // DH-0534
+            let cullClip = cullVolume(cascadeCullVP)   // DH-0534 (DH-1668: the region's own frustum)
             for (gi, group) in gbs.meshGroups.enumerated() {
                 if directionalShadowExcludedKinds.contains(group.kind) { continue }  // e.g. lamps — no sun shadow
                 guard let mesh = meshes[group.kind] else { continue }
@@ -731,6 +746,23 @@ final class ShadowState {
     var pendingCasterChangeUnbounded = false
     var lastCasterChange: [IlluminatoramaCullBounds] = []
     var lastCasterChangeUnbounded = false
+    /// DH-1668 — the same record for the SUN CASCADES, consumed by `encodeShadowPasses` (the spot
+    /// atlas and the cascades encode under different switches, so each keeps its own).
+    var cascadeChange = IlluminatoramaCasterChangeLog()
+    /// DH-1668 — meshes removed since the last stability update, by the kind they were drawn as:
+    /// last frame's instances may still name them, and their bounds are the OLD pose of a swap.
+    /// Emptied at the end of every `updateSceneStability`.
+    var departedMeshes: [IlluminatoramaRenderer.MeshKind: IlluminatoramaMesh] = [:]
+    /// Why the caster-change record last went unbounded (diagnostic; "" = it has not).
+    var casterChangeUnboundedReason = ""
+    var lastShapeChangeTally: (kind: Int, matrix: Int, other: Int, sameCount: Bool) = (0, 0, 0, true)
+    var lastCasterRecordMs: Double = 0
+    /// DH-1668 — per cascade, the light matrix its slice was last rasterised with (nil = the slice
+    /// holds nothing reusable), and the raster state it was rasterised under.
+    var lastCascadeVPs: [simd_float4x4?] = Array(repeating: nil, count: 3)
+    var lastCascadeRasterKey: IlluminatoramaRenderer.CascadeRasterKey?
+    /// DH-1668 — why each cascade re-rendered on the last frame ("" = reused). Diagnostic.
+    var lastCascadeVerdicts: [String] = []
 
     var spotShadowCasters: [IlluminatoramaRenderer.ShadowCaster] = []
     /// Point-shadow skip signature: (position, radius) per cube-holding light in
@@ -795,6 +827,9 @@ final class ShadowState {
     var shadowPipeline: MTLRenderPipelineState!
     /// DH-1487 — the leaf-cutout depth stage (a fragment that discards outside the card's leaf).
     var shadowPipelineCutout: MTLRenderPipelineState?
+    /// DH-1668 — scissored far-plane clear for partial cascade re-renders (nil = unavailable).
+    var shadowRegionClearPipeline: MTLRenderPipelineState?
+    var shadowRegionClearDepth: MTLDepthStencilState?
 
     // ── Per-frame input buffers — ring-buffered (maxFramesInFlight) ─────────────
     // These hold the frame's uniforms + lights + impostor params. They are
@@ -1098,6 +1133,19 @@ extension IlluminatoramaRenderer {
         cdesc.depthAttachmentPixelFormat = .depth32Float
         if cdesc.vertexFunction != nil, cdesc.fragmentFunction != nil {
             s.shadowPipelineCutout = try? device.makeRenderPipelineState(descriptor: cdesc)
+        }
+        // DH-1668 — the scissored far-plane clear a PARTIAL cascade re-render starts with. Optional:
+        // without it every touched cascade re-renders whole, the pre-DH-1668 behaviour.
+        let kdesc = MTLRenderPipelineDescriptor()
+        kdesc.label = "Illuminatorama.shadow.regionClear"
+        kdesc.vertexFunction = library.makeFunction(name: "illumi_shadow_clear_vs")
+        kdesc.depthAttachmentPixelFormat = .depth32Float
+        let kds = MTLDepthStencilDescriptor()
+        kds.depthCompareFunction = .always
+        kds.isDepthWriteEnabled = true
+        if kdesc.vertexFunction != nil, let clearDS = device.makeDepthStencilState(descriptor: kds) {
+            s.shadowRegionClearPipeline = try? device.makeRenderPipelineState(descriptor: kdesc)
+            s.shadowRegionClearDepth = clearDS
         }
     }
 
