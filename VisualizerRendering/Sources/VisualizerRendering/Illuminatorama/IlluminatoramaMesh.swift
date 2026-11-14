@@ -234,16 +234,12 @@ public final class IlluminatoramaMesh {
     public private(set) var cpuAuthoredVertices: Bool = true
 
     public init(device: MTLDevice, vertices: [IlluminatoramaVertex], indices: [UInt16]) {
-        guard let vb = device.makeBuffer(
-            bytes: vertices,
-            length: MemoryLayout<IlluminatoramaVertex>.stride * vertices.count,
-            options: .storageModeShared
-        ) else { preconditionFailure("MTLDevice.makeBuffer(vertices) returned nil") }
-        guard let ib = device.makeBuffer(
-            bytes: indices,
-            length: MemoryLayout<UInt16>.stride * indices.count,
-            options: .storageModeShared
-        ) else { preconditionFailure("MTLDevice.makeBuffer(indices) returned nil") }
+        guard let vb = vertices.withUnsafeBytes({ raw in   // DH-1676 — pooled when it fits
+            raw.baseAddress.flatMap { IlluminatoramaMeshBufferPool.shared(for: device).makeBuffer(bytes: $0, length: raw.count) }
+        }) else { preconditionFailure("MTLDevice.makeBuffer(vertices) returned nil") }
+        guard let ib = indices.withUnsafeBytes({ raw in
+            raw.baseAddress.flatMap { IlluminatoramaMeshBufferPool.shared(for: device).makeBuffer(bytes: $0, length: raw.count) }
+        }) else { preconditionFailure("MTLDevice.makeBuffer(indices) returned nil") }
         vb.label = "Illuminatorama.vertices"
         ib.label = "Illuminatorama.indices"
         self.vertexBuffer = vb
@@ -254,16 +250,12 @@ public final class IlluminatoramaMesh {
     }
 
     public init(device: MTLDevice, vertices: [IlluminatoramaVertex], indices: [UInt32]) {
-        guard let vb = device.makeBuffer(
-            bytes: vertices,
-            length: MemoryLayout<IlluminatoramaVertex>.stride * vertices.count,
-            options: .storageModeShared
-        ) else { preconditionFailure("MTLDevice.makeBuffer(vertices) returned nil") }
-        guard let ib = device.makeBuffer(
-            bytes: indices,
-            length: MemoryLayout<UInt32>.stride * indices.count,
-            options: .storageModeShared
-        ) else { preconditionFailure("MTLDevice.makeBuffer(indices) returned nil") }
+        guard let vb = vertices.withUnsafeBytes({ raw in   // DH-1676 — pooled when it fits
+            raw.baseAddress.flatMap { IlluminatoramaMeshBufferPool.shared(for: device).makeBuffer(bytes: $0, length: raw.count) }
+        }) else { preconditionFailure("MTLDevice.makeBuffer(vertices) returned nil") }
+        guard let ib = indices.withUnsafeBytes({ raw in
+            raw.baseAddress.flatMap { IlluminatoramaMeshBufferPool.shared(for: device).makeBuffer(bytes: $0, length: raw.count) }
+        }) else { preconditionFailure("MTLDevice.makeBuffer(indices) returned nil") }
         vb.label = "Illuminatorama.vertices"
         ib.label = "Illuminatorama.indices"
         self.vertexBuffer = vb
@@ -290,18 +282,15 @@ public final class IlluminatoramaMesh {
                      "IlluminatoramaMesh init given 0 vertices (\(label))")
         precondition(indices.count > 0 && indexCount > 0,
                      "IlluminatoramaMesh init given empty index data (\(label))")
-        guard let vb = device.makeBuffer(
-            bytes: vertices,
-            length: MemoryLayout<IlluminatoramaVertex>.stride * vertices.count,
-            options: .storageModeShared
-        ) else { preconditionFailure("MTLDevice.makeBuffer(vertices) returned nil") }
+        guard let vb = vertices.withUnsafeBytes({ raw in   // DH-1676 — pooled when it fits
+            raw.baseAddress.flatMap { IlluminatoramaMeshBufferPool.shared(for: device).makeBuffer(bytes: $0, length: raw.count) }
+        }) else { preconditionFailure("MTLDevice.makeBuffer(vertices) returned nil") }
         let ib: MTLBuffer = indices.withUnsafeBytes { raw -> MTLBuffer in
             guard let base = raw.baseAddress else {
                 preconditionFailure("Empty index data passed to IlluminatoramaMesh init")
             }
-            guard let buf = device.makeBuffer(
-                bytes: base, length: indices.count, options: .storageModeShared
-            ) else { preconditionFailure("MTLDevice.makeBuffer(indices) returned nil") }
+            guard let buf = IlluminatoramaMeshBufferPool.shared(for: device).makeBuffer(bytes: base, length: indices.count)
+            else { preconditionFailure("MTLDevice.makeBuffer(indices) returned nil") }
             return buf
         }
         vb.label = "\(label).vertices"

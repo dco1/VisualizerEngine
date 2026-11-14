@@ -21,6 +21,10 @@ final class RTKnobs {
     /// re-registering the meshes it moved) rebuilds against the cached BLASes and does NOT count
     /// toward the rebuild-thrash guard. Off = every topology change counts (pre-DH-1668).
     var tlasSwapRebuildEnabled: Bool = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_TLAS_SWAP"] != "1"
+    /// Daydream DH-1672 — A/B lever: a TLAS rebuild encodes its BLAS + TLAS builds on the frame's own
+    /// command buffer (no CPU wait). Off (`VIZ_ILLUMI_RT_BUILD_WAIT=1`) = a side buffer the CPU waits
+    /// on twice, as before.
+    var rtBuildOnFrameEnabled: Bool = ProcessInfo.processInfo.environment["VIZ_ILLUMI_RT_BUILD_WAIT"] != "1"
 
     // ── Hardware ray tracing (soft sun shadows + 1-bounce GI) ────────
     //

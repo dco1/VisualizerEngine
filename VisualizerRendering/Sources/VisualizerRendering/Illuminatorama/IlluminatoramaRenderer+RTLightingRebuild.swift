@@ -26,7 +26,13 @@ extension IlluminatoramaRenderer {
     /// mesh (one setup-time command buffer), assemble the concatenated normal
     /// buffer + per-instance descriptors/data in grouped order, and build the
     /// TLAS. Runs on a topology change.
-    func rebuildRTAccel() {
+    ///
+    /// DH-1672 — with `frameCB` (and `rtBuildOnFrameEnabled`), the BLAS and TLAS builds are encoded
+    /// on the frame's own command buffer, ahead of every pass that traces them, instead of on a side
+    /// buffer the CPU then waits on twice. The GPU does the same work; the main thread no longer
+    /// stalls for it (11 + 1.3 ms of a 4000 Sunset wall edit's ~19 ms rebuild).
+    func rebuildRTAccel(_ frameCB: MTLCommandBuffer? = nil) {
+        let onFrame = frameCB != nil && rtBuildOnFrameEnabled
         rts.rtTLASActive = false
         let tStart = CACurrentMediaTime()   // DH-1668 phase timing (`rtLastTLASRebuildPhases`)
         var newBLAS = 0
@@ -197,38 +203,46 @@ extension IlluminatoramaRenderer {
         }
         let tBLASPrep = lap()
         if !pending.isEmpty {
-            guard let cmd = commandQueue.makeCommandBuffer(),
-                  let enc = cmd.makeAccelerationStructureCommandEncoder() else { return }
-            for (blas, d, scratch) in pending {
-                enc.build(accelerationStructure: blas, descriptor: d,
-                          scratchBuffer: scratch, scratchBufferOffset: 0)
+            if onFrame, let frameCB {
+                // One encoder for the BLASes; the TLAS build below opens its own, so Metal orders
+                // it after them, and every RT pass later on this buffer after both.
+                guard let enc = frameCB.makeAccelerationStructureCommandEncoder() else { return }
+                enc.label = "Illuminatorama.rt.blasBuild"
+                for (blas, d, scratch) in pending {
+                    enc.build(accelerationStructure: blas, descriptor: d,
+                              scratchBuffer: scratch, scratchBufferOffset: 0)
+                }
+                enc.endEncoding()
+            } else {
+                guard let cmd = commandQueue.makeCommandBuffer(),
+                      let enc = cmd.makeAccelerationStructureCommandEncoder() else { return }
+                for (blas, d, scratch) in pending {
+                    enc.build(accelerationStructure: blas, descriptor: d,
+                              scratchBuffer: scratch, scratchBufferOffset: 0)
+                }
+                enc.endEncoding(); cmd.commit()
+                cmd.waitUntilCompleted()   // gpu-ok: one-time BLAS build (per newly-seen mesh / per-topology curve set)
+                Self.recordASBuildError(cmd, "rebuildRTAccel.blas")
             }
-            enc.endEncoding(); cmd.commit()
-            cmd.waitUntilCompleted()   // gpu-ok: one-time BLAS build (per newly-seen mesh / per-topology curve set)
-            Self.recordASBuildError(cmd, "rebuildRTAccel.blas")
         }
 
         let tBLAS = lap()
-        // (b) Assemble BLAS list + concat normals + per-mesh slot for this topology.
+        // (b) Assemble BLAS list + per-mesh normal/UV slots for this topology.
         rts.rtBLASList.removeAll(keepingCapacity: true)
         rts.rtResidentBuffers.removeAll(keepingCapacity: true)
-        // Per-triangle object normals + mesh UVs of every slotted mesh, concatenated in slot order
-        // (3 UVs per normal). A mesh whose UVs couldn't be read (GPU-private vertices) is padded
-        // with zeros so `normalBase * 3` stays a valid index for every later mesh — a short run
-        // here would shift every subsequent mesh's UVs. DH-1668: sized first and copied ONCE,
-        // straight into the Metal buffers — the old path appended ~400 meshes into growing Swift
-        // arrays and then copied those again (7.5 ms of an edit's 22 ms rebuild on 4000 Sunset).
+        // Per-triangle object normals + mesh UVs of every slotted mesh (3 UVs per normal), one slice per
+        // mesh at `normalBase`. DH-1672: the slices live in a persistent slab (+RTNormalSlab.swift), so
+        // a swap rebuild writes only the meshes it has not seen — it used to recopy ~400 meshes' worth
+        // (5 ms of a 4000 Sunset wall edit's rebuild).
         var slotted: [RTMeshEntry] = []
-        var normalCount = 0
         var slot: [ObjectIdentifier: (asIndex: Int, normalBase: Int)] = [:]
         func addSlot(_ mesh: IlluminatoramaMesh) {
             let mid = ObjectIdentifier(mesh)
             guard slot[mid] == nil, let cached = rts.rtMeshCache[mid] else { return }
-            slot[mid] = (rts.rtBLASList.count, normalCount)
+            slot[mid] = (rts.rtBLASList.count, 0)
             rts.rtBLASList.append(cached.blas)
             rts.rtResidentBuffers.append(mesh.vertexBuffer); rts.rtResidentBuffers.append(mesh.indexBuffer)
             slotted.append(cached)
-            normalCount += cached.normals.count
         }
         for group in gbs.meshGroups {
             guard let mesh = meshes[group.kind], !rtGroupIsRayExcluded(group) else { continue }
@@ -240,33 +254,11 @@ extension IlluminatoramaRenderer {
             guard let mesh = meshes[kind] else { continue }
             addSlot(mesh)
         }
-        let concatCount = normalCount
-        guard !rts.rtBLASList.isEmpty, concatCount > 0 else { return }
-        if let nbuf = device.makeBuffer(length: MemoryLayout<SIMD4<Float>>.stride * concatCount, options: .storageModeShared),
-           let ubuf = device.makeBuffer(length: MemoryLayout<SIMD2<Float>>.stride * concatCount * 3, options: .storageModeShared) {
-            let np = nbuf.contents().bindMemory(to: SIMD4<Float>.self, capacity: concatCount)
-            let up = ubuf.contents().bindMemory(to: SIMD2<Float>.self, capacity: concatCount * 3)
-            var n = 0
-            for e in slotted {
-                e.normals.withUnsafeBufferPointer { src in
-                    if let b = src.baseAddress { (np + n).update(from: b, count: src.count) }
-                }
-                let want = e.normals.count * 3
-                let have = min(want, e.uvs.count)
-                e.uvs.withUnsafeBufferPointer { src in
-                    if have > 0, let b = src.baseAddress { (up + n * 3).update(from: b, count: have) }
-                }
-                if have < want { (up + n * 3 + have).update(repeating: .zero, count: want - have) }
-                n += e.normals.count
-            }
-            rts.rtObjNormalBuffer = nbuf
-            rts.rtObjUVBuffer = ubuf
-        } else {
+        guard !rts.rtBLASList.isEmpty, slotted.contains(where: { !$0.normals.isEmpty }) else { return }
+        guard let bases = placeRTNormalSlices(slotted) else {
             return   // allocation failed: keep the previous (inactive) structure, as an empty scene does
         }
-        rts.rtObjUVBuffer?.label = "Illuminatorama.rt.objUV"
-        rts.rtObjNormalCount = concatCount
-        rts.rtObjUVCount = concatCount * 3
+        for (mid, s) in slot { slot[mid] = (s.asIndex, bases[mid] ?? 0) }
         // Glass corner normals: one slice per distinct glass mesh, base stored +1 in each glass
         // instance's row (see `rtGlassCornerNormalBuffer`).
         var cornerConcat: [SIMD4<Float>] = []
@@ -419,16 +411,25 @@ extension IlluminatoramaRenderer {
             rts.rtTLAS?.label = "Illuminatorama.rt.tlas"
             rts.rtTLASCapacity = totalInstances
         }
-        guard let tlas = rts.rtTLAS, let scratch = rts.rtTLASScratch,
-              let cmd = commandQueue.makeCommandBuffer(),
-              let enc = cmd.makeAccelerationStructureCommandEncoder() else { return }
-        enc.build(accelerationStructure: tlas, descriptor: tdesc,
-                  scratchBuffer: scratch, scratchBufferOffset: 0)
-        enc.endEncoding(); cmd.commit()
-        cmd.waitUntilCompleted()   // gpu-ok: topology-change TLAS rebuild (not per-frame for stable scenes)
-        Self.recordASBuildError(cmd, "rebuildRTAccel.tlas")
-        rts.rtLastRebuildPhases = String(format: "%d new BLAS: prep %.1f + build/wait %.1f · normals/uv concat %.1f · descriptors %.1f · TLAS build + wait %.1f ms",
-                                         newBLAS, tBLASPrep, tBLAS - tBLASPrep, tConcat - tBLAS, tDesc - tConcat, lap() - tDesc)
+        guard let tlas = rts.rtTLAS, let scratch = rts.rtTLASScratch else { return }
+        if onFrame, let frameCB {
+            guard let enc = frameCB.makeAccelerationStructureCommandEncoder() else { return }
+            enc.label = "Illuminatorama.rt.tlasBuild"
+            enc.build(accelerationStructure: tlas, descriptor: tdesc,
+                      scratchBuffer: scratch, scratchBufferOffset: 0)
+            enc.endEncoding()
+            frameCB.addCompletedHandler { Self.recordASBuildError($0, "rebuildRTAccel.frame") }
+        } else {
+            guard let cmd = commandQueue.makeCommandBuffer(),
+                  let enc = cmd.makeAccelerationStructureCommandEncoder() else { return }
+            enc.build(accelerationStructure: tlas, descriptor: tdesc,
+                      scratchBuffer: scratch, scratchBufferOffset: 0)
+            enc.endEncoding(); cmd.commit()
+            cmd.waitUntilCompleted()   // gpu-ok: topology-change TLAS rebuild (not per-frame for stable scenes)
+            Self.recordASBuildError(cmd, "rebuildRTAccel.tlas")
+        }
+        rts.rtLastRebuildPhases = String(format: "%d new BLAS%@: prep %.1f + build/wait %.1f · normals/uv concat %.1f · descriptors %.1f · TLAS build + wait %.1f ms",
+                                         newBLAS, onFrame ? " (encoded on the frame, no CPU wait)" : "", tBLASPrep, tBLAS - tBLASPrep, tConcat - tBLAS, tDesc - tConcat, lap() - tDesc)
         rts.rtTLASInstanceCount = totalInstances
         rts.rtTLASActive = true
 
@@ -458,7 +459,7 @@ extension IlluminatoramaRenderer {
               rts.rtTLASInstanceCount == instances.count + rts.rtCurveInstanceCount + glassFlat.count,
               glassFlat.count == gls.rtGlassInstanceCount,
               !rts.rtBLASList.isEmpty else {
-            rebuildRTAccel(); return   // topology drifted — full rebuild
+            rebuildRTAccel(cb); return   // topology drifted — full rebuild
         }
         // Curve instances keep their rebuild-time descriptors (static rigid
         // placement); the triangle (opaque) + glass instances' transforms refresh.

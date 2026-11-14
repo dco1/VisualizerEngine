@@ -31,6 +31,23 @@ extension IlluminatoramaRenderer {
         // one a change DOES reach re-rasterises only the rectangle the change projects to
         // (+SunCascadeReuse.swift). Skipping the pass skips its `.clear` too, so the slice keeps it.
         let plans = sunCascadePlans()
+        // DH-1684 — every cascade this frame rasterises gets its draws written by one GPU dispatch
+        // first (+GPUShadowDraws.swift); the loop below then draws only what that path leaves it.
+        var gpuView: [Int: Int] = [:]
+        var gpuBatch: GPUShadowBatch?
+        if shadowsEnabled {
+            var specs: [GPUShadowViewSpec] = []
+            for cascade in 0..<Self.cascadeCount {
+                if case .reuse = plans[cascade] { continue }
+                var region: MTLScissorRect?
+                if case .region(let r) = plans[cascade] { region = r }
+                let vp = shd.cascadeVPs[cascade]
+                let cullVP = region.map { Self.scissorFrustum(vp, $0, size: shd.shadowMap.width) } ?? vp
+                gpuView[cascade] = specs.count
+                specs.append(GPUShadowViewSpec(vp: vp, cullVP: visibilityCullingEnabled ? cullVP : nil, sun: true))
+            }
+            gpuBatch = encodeGPUShadowViews(cb, specs, spot: false)
+        }
         for cascade in 0..<Self.cascadeCount {
             let plan = shadowsEnabled ? plans[cascade] : .full
             if case .reuse = plan {
@@ -82,10 +99,11 @@ extension IlluminatoramaRenderer {
             // per spot.
             let instStride = MemoryLayout<IlluminatoramaInstance>.stride
             let cullClip = cullVolume(cascadeCullVP)   // DH-0534 (DH-1668: the region's own frustum)
-            for (gi, group) in gbs.meshGroups.enumerated() {
-                if directionalShadowExcludedKinds.contains(group.kind) { continue }  // e.g. lamps — no sun shadow
-                guard let mesh = meshes[group.kind] else { continue }
-                if shouldCull(gi, group, mesh, cullClip, drawn: \.cascadeDrawn, culled: \.cascadeCulled) { continue }
+            func drawGroup(_ gi: Int) {
+                let group = gbs.meshGroups[gi]
+                if directionalShadowExcludedKinds.contains(group.kind) { return }  // e.g. lamps — no sun shadow
+                guard let mesh = meshes[group.kind] else { return }
+                if shouldCull(gi, group, mesh, cullClip, drawn: \.cascadeDrawn, culled: \.cascadeCulled) { return }
                 let want = shadowCullMode(mesh)
                 if want != cull { cull = want; enc.setCullMode(cull) }
                 let off = instStride * group.start
@@ -95,6 +113,14 @@ extension IlluminatoramaRenderer {
                 bindShadowPipeline(for: mesh, enc, cutout: &cutoutBound,   // DH-1487 — near cascades only
                                    allowed: cascade < leafCutoutShadowCascades)
                 enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow, view: .cascade(cascade))
+            }
+            if let gpuBatch, let vi = gpuView[cascade] {
+                // Depth-only: the map is the per-texel minimum whatever the order, so the CPU-drawn
+                // groups go first and the GPU-written commands after them.
+                for gi in gpuBatch.fallback { drawGroup(gi) }
+                executeGPUShadowView(enc, gpuBatch, view: vi, cull: &cull)
+            } else {
+                for gi in gbs.meshGroups.indices { drawGroup(gi) }
             }
             enc.endEncoding()
         }
@@ -481,6 +507,9 @@ extension IlluminatoramaRenderer {
         }
         var verdicts = Array(repeating: "whole", count: count)
         defer { shd.lastSpotVerdicts = verdicts }
+        // DH-1684 — decide every slice first (reuse / region / whole), so the slices that do render
+        // can have their draws written by one GPU dispatch before their render encoders open.
+        var jobs: [(slice: Int, region: MTLScissorRect?)] = []
         for slice in 0..<count {
             if wholeSceneStatic && sliceHeld(slice) {
                 staticSkipStats.spotShadowPassesSkipped += 1
@@ -521,6 +550,16 @@ extension IlluminatoramaRenderer {
             } else if !sliceHeld(slice) {
                 verdicts[slice] = "whole: matrix"
             }
+            jobs.append((slice, region))
+        }
+        let instStride = MemoryLayout<IlluminatoramaInstance>.stride
+        let gpuBatch = encodeGPUShadowViews(cb, jobs.map { job in
+            let vp = shd.spotShadowCasters[job.slice].matrix
+            let cullVP = job.region.map { Self.scissorFrustum(vp, $0, size: shd.spotShadowAtlas.width) } ?? vp
+            return GPUShadowViewSpec(vp: vp, cullVP: visibilityCullingEnabled ? cullVP : nil, sun: false)
+        }, spot: true)
+        for (vi, job) in jobs.enumerated() {
+            let slice = job.slice, region = job.region
             guard let enc = timedRenderEncoder(cb, region == nil ? shd.spotShadowPassDescs[slice]
                                                                  : spotShadowRegionPassDesc(slice), "shadow.spot") else { continue }
             if let region { encodeShadowRegionClear(enc, region); staticSkipStats.spotShadowPassesPartial += 1 }
@@ -549,12 +588,12 @@ extension IlluminatoramaRenderer {
             // built in `uploadInstances`. Same win as the G-buffer pass:
             // one draw call replaces N per-instance draws per cascade /
             // per spot.
-            let instStride = MemoryLayout<IlluminatoramaInstance>.stride
             // DH-0534 (DH-1674: a region pass culls to the region's own frustum)
             let cullClip = cullVolume(region.map { Self.scissorFrustum(lightVP, $0, size: shd.spotShadowAtlas.width) } ?? lightVP)
-            for (gi, group) in gbs.meshGroups.enumerated() {
-                guard let mesh = meshes[group.kind] else { continue }
-                if shouldCull(gi, group, mesh, cullClip, drawn: \.spotDrawn, culled: \.spotCulled) { continue }
+            func drawGroup(_ gi: Int) {
+                let group = gbs.meshGroups[gi]
+                guard let mesh = meshes[group.kind] else { return }
+                if shouldCull(gi, group, mesh, cullClip, drawn: \.spotDrawn, culled: \.spotCulled) { return }
                 let want = shadowCullMode(mesh)
                 if want != cull { cull = want; enc.setCullMode(cull) }
                 let off = instStride * group.start
@@ -563,6 +602,12 @@ extension IlluminatoramaRenderer {
                 enc.setVertexBuffer(inst.buffer, offset: inst.offset, index: 2)
                 bindShadowPipeline(for: mesh, enc, cutout: &cutoutBound, allowed: true)   // DH-1487
                 enc.drawMesh(mesh, instanceCount: group.count, pass: .shadow, view: .spot(slice))
+            }
+            if let gpuBatch {   // DH-1684 — CPU-only groups first, then the GPU-written commands
+                for gi in gpuBatch.fallback { drawGroup(gi) }
+                executeGPUShadowView(enc, gpuBatch, view: vi, cull: &cull)
+            } else {
+                for gi in gbs.meshGroups.indices { drawGroup(gi) }
             }
             enc.endEncoding()
         }
@@ -1156,6 +1201,9 @@ extension IlluminatoramaRenderer {
         sdesc.vertexFunction = library.makeFunction(name: "illumi_shadow_vs")
         sdesc.fragmentFunction = nil
         sdesc.depthAttachmentPixelFormat = .depth32Float
+        // DH-1684 — the SAME pipeline object draws the CPU loop's casters and the GPU-written indirect
+        // commands (+GPUShadowDraws.swift), so the two paths cannot differ by a compile.
+        sdesc.supportIndirectCommandBuffers = true
         s.shadowPipeline = try device.makeRenderPipelineState(descriptor: sdesc)
         // DH-1487 — the same depth for leaf-cutout meshes, with the discarding fragment. Optional: a
         // failed compile leaves those meshes casting whole cards.

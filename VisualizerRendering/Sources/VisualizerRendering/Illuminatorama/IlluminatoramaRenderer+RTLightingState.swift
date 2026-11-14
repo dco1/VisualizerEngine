@@ -92,6 +92,14 @@ final class RTState {
     /// "flat slabs" fix. Nil when no mesh exposed CPU-readable vertices.
     var rtObjUVBuffer: MTLBuffer?
     var rtObjUVCount: Int = 0
+    /// DH-1672 — the persistent normal/UV slab behind `rtObjNormalBuffer` / `rtObjUVBuffer`: where
+    /// each mesh's slice starts (in normals), how much of the slab is written, how much it holds.
+    var rtSlabBase: [ObjectIdentifier: Int] = [:]
+    var rtSlabUsed = 0
+    var rtSlabCapacity = 0
+    /// A/B lever (`VIZ_ILLUMI_NO_RT_SLAB=1` starts it off): off = every rebuild rewrites every slice
+    /// into fresh buffers, as before DH-1672.
+    var rtNormalSlabEnabled = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_RT_SLAB"] != "1"
 
     // Surface cache (P1c): per-TLAS-instance base offset into the grouped soup
     // triangle list (== the `triCard`/`triUVa`/`triUVc` index space). Built

@@ -221,7 +221,7 @@ extension IlluminatoramaRenderer {
             staticSkipStats.tlasRebuilds += 1
             if swap { staticSkipStats.tlasInstanceRebuilds += 1 }
             let t0 = CACurrentMediaTime()
-            rebuildRTAccel()
+            rebuildRTAccel(cb)
             rts.rtLastRebuildMs = (CACurrentMediaTime() - t0) * 1000
             if swapShaped { rts.rtLastSwapRebuildMs = rts.rtLastRebuildMs }
             rts.rtTLASTopologyHash = topo

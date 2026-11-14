@@ -94,6 +94,8 @@ public final class IlluminatoramaRenderer {
     let vbs = VisBufferState()
     /// Per-term AOV capture.
     let aovs = AOVState()
+    /// GPU-driven shadow draw submission (DH-1684): draw tables, per-frame ICBs, pipelines.
+    let gds = GPUShadowDrawState()
 
     // ── Public knobs ──────────────────────────────────────────────────────────
     //
@@ -910,6 +912,8 @@ public final class IlluminatoramaRenderer {
     /// the shadow map itself instead of inferring it from the lit frame (the DH-0862 method).
     public var debugCascadeViewProjections: [simd_float4x4] { shd.cascadeVPs }
     public var debugShadowMapTexture: MTLTexture { shd.shadowMap }
+    /// The spot/area shadow atlas (one depth slice per caster) — the same instrument (DH-1684's truth gate).
+    public var debugSpotShadowAtlasTexture: MTLTexture { shd.spotShadowAtlas }
 
     /// Per-slice resolution of the spot/area shadow atlas.
     ///

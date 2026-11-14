@@ -377,6 +377,7 @@ extension IlluminatoramaRenderer {
         if blocking && !awaited {
             cb.waitUntilCompleted()
             noteFrameOutcome(failed: cb.status == .error || cb.error != nil)   // DH-1291
+            foldGPUShadowStats()   // DH-1684 — this frame's GPU cull census, before the caller reads it
             promoteCompletedBuffer()
         }
 
@@ -428,6 +429,7 @@ extension IlluminatoramaRenderer {
             gbs.pendingFrameCompletion = nil
             await signal.wait()
             noteFrameOutcome(failed: signal.failed)   // DH-1291
+            foldGPUShadowStats()   // DH-1684
         }
         promoteCompletedBuffer()
     }

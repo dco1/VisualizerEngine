@@ -22,7 +22,9 @@ final class MiscKnobs {
     /// (Surface cache stays opt-in/manual — it needs per-card UVs the soup
     /// can't synthesise for arbitrary meshes.)
     var buildRTFromExtractedScene: Bool = false
-    var meshes: [MeshKind: IlluminatoramaMesh] = [:]
+    var meshes: [MeshKind: IlluminatoramaMesh] = [:] { didSet { meshTableVersion &+= 1 } }
+    /// Bumped on every change to `meshes` (DH-1684: the GPU shadow draw table keys on it).
+    var meshTableVersion = 0
     /// How many meshes have left the table, ever (Daydream DH-1675).
     var meshTableRemovals = 0
 }
