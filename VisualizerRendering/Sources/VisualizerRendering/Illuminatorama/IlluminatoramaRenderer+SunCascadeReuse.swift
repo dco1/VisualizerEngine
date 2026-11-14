@@ -237,6 +237,13 @@ extension IlluminatoramaRenderer {
     /// Clear `r` of the bound slice to the far plane: the region pass loads the slice, so only the
     /// rectangle is redrawn and everything outside it keeps last frame's depth.
     func encodeCascadeRegionClear(_ enc: MTLRenderCommandEncoder, _ r: MTLScissorRect) {
+        encodeShadowRegionClear(enc, r)
+        staticSkipStats.sunCascadePassesPartial += 1
+    }
+
+    /// Clear `r` of the bound depth slice to the far plane and leave the scissor on `r` — the start
+    /// of every region re-render (sun cascades, DH-1668; spot/area slices, DH-1674).
+    func encodeShadowRegionClear(_ enc: MTLRenderCommandEncoder, _ r: MTLScissorRect) {
         guard let pipe = shd.shadowRegionClearPipeline, let ds = shd.shadowRegionClearDepth else { return }
         enc.setScissorRect(r)
         enc.setRenderPipelineState(pipe)
@@ -244,7 +251,6 @@ extension IlluminatoramaRenderer {
         enc.setCullMode(.none)
         enc.setDepthBias(0, slopeScale: 0, clamp: 0)
         enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
-        staticSkipStats.sunCascadePassesPartial += 1
     }
 
     /// Record that cascade `c` was just rasterised with its current matrix (or, when `vp` is nil,

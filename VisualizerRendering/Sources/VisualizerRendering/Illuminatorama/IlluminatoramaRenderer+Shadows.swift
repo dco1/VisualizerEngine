@@ -406,6 +406,7 @@ extension IlluminatoramaRenderer {
         // The cached pass descriptors point at the OLD texture, and the static-scene skip
         // would otherwise believe the (empty) new atlas already holds this frame's maps.
         shd.spotShadowPassDescs.removeAll()
+        shd.spotShadowRegionPassDescs.removeAll()
         shd.spotShadowPassLabels.removeAll()
         shd.lastSpotShadowMats.removeAll()
     }
@@ -438,6 +439,7 @@ extension IlluminatoramaRenderer {
         let noPendingChange = !perSliceDirty || (shd.pendingCasterChange.isEmpty && !shd.pendingCasterChangeUnbounded)
         if reuseAllowed && sceneStaticForShadows && noPendingChange && mats == shd.lastSpotShadowMats {
             staticSkipStats.spotShadowPassesSkipped += count
+            shd.lastSpotVerdicts = Array(repeating: "", count: count)
             return
         }
         // DH-1064 — reuse is decided PER SLICE against the matrix that slice was last rendered
@@ -477,30 +479,52 @@ extension IlluminatoramaRenderer {
             shd.spotShadowPassDescs.append(pass)
             shd.spotShadowPassLabels.append("Illuminatorama.spotShadow.s\(slice)")
         }
+        var verdicts = Array(repeating: "whole", count: count)
+        defer { shd.lastSpotVerdicts = verdicts }
         for slice in 0..<count {
             if wholeSceneStatic && sliceHeld(slice) {
                 staticSkipStats.spotShadowPassesSkipped += 1
+                verdicts[slice] = ""
                 continue
             }
+            // DH-1674 — a held slice a BOUNDED change reaches re-rasterises only the rectangle the
+            // change projects to (+SpotShadowRegion.swift); nil = the whole slice.
+            var region: MTLScissorRect?
             if perSliceBase && sliceHeld(slice) {
                 // (b) GPU geometry: none live, or the owner asserted none can enter its frustum.
                 // (c) Sway (DH-0637): no swaying instance's swing-sphere intersects a spot's cone; an
                 //     area-light slice has no cone to test, so it re-renders while anything sways.
                 let caster = shd.spotShadowCasters[slice]
                 let gpuOK = !gpuGeometryLive || caster.reuseBit
+                // DH-1674 — the swing spheres that reach this slice's frustum (nil = one is unbounded).
+                // An AREA slice has no cone to test; its frustum is the honest bound (it used to
+                // re-render while anything anywhere swayed).
+                let swayReach = swayBounds(reaching: caster.matrix)
                 let swayOK: Bool
                 switch caster.owner {
                 case .spot(let li): swayOK = !swayingGeometryCanEnter(spotLights[li])
-                case .area:         swayOK = shd.swayingSpheres.isEmpty
+                case .area:         swayOK = swayReach?.isEmpty ?? false
                 }
                 let changeOK = !perSliceDirty || !casterChangeTouches(caster.matrix)
                 if gpuOK && swayOK && changeOK {
                     staticSkipStats.spotShadowPassesSkipped += 1
+                    verdicts[slice] = ""
                     continue
                 }
+                if gpuOK && perSliceDirty, let swayReach {
+                    let plan = spotSliceRegion(caster.matrix, swaying: swayOK ? [] : swayReach)
+                    region = plan.rect
+                    verdicts[slice] = plan.verdict
+                } else {
+                    verdicts[slice] = !gpuOK ? "whole: gpu" : !swayOK ? "whole: sway" : "whole: caster"
+                }
+            } else if !sliceHeld(slice) {
+                verdicts[slice] = "whole: matrix"
             }
-            guard let enc = timedRenderEncoder(cb, shd.spotShadowPassDescs[slice], "shadow.spot") else { continue }
-            staticSkipStats.spotShadowPassesRendered += 1
+            guard let enc = timedRenderEncoder(cb, region == nil ? shd.spotShadowPassDescs[slice]
+                                                                 : spotShadowRegionPassDesc(slice), "shadow.spot") else { continue }
+            if let region { encodeShadowRegionClear(enc, region); staticSkipStats.spotShadowPassesPartial += 1 }
+            else { staticSkipStats.spotShadowPassesRendered += 1 }
             enc.label = shd.spotShadowPassLabels[slice]
             enc.setRenderPipelineState(shd.shadowPipeline)
             var cutoutBound = false   // DH-1487 — the fragment-less pipeline is bound
@@ -526,7 +550,8 @@ extension IlluminatoramaRenderer {
             // one draw call replaces N per-instance draws per cascade /
             // per spot.
             let instStride = MemoryLayout<IlluminatoramaInstance>.stride
-            let cullClip = cullVolume(lightVP)   // DH-0534
+            // DH-0534 (DH-1674: a region pass culls to the region's own frustum)
+            let cullClip = cullVolume(region.map { Self.scissorFrustum(lightVP, $0, size: shd.spotShadowAtlas.width) } ?? lightVP)
             for (gi, group) in gbs.meshGroups.enumerated() {
                 guard let mesh = meshes[group.kind] else { continue }
                 if shouldCull(gi, group, mesh, cullClip, drawn: \.spotDrawn, culled: \.spotCulled) { continue }
@@ -778,6 +803,10 @@ final class ShadowState {
     /// point cube-face slices) — built once, reused every re-render; the encode
     /// loops used to allocate ~35 descriptors + label strings per frame.
     var spotShadowPassDescs: [MTLRenderPassDescriptor] = []
+    /// DH-1674 — per slice, the LOAD-action twin of `spotShadowPassDescs` a region re-render opens,
+    /// and what the last encode did with each slice (`spotShadowLastVerdicts`).
+    var spotShadowRegionPassDescs: [MTLRenderPassDescriptor] = []
+    var lastSpotVerdicts: [String] = []
     var spotShadowPassLabels: [String] = []
     var pointShadowPassDescs: [MTLRenderPassDescriptor] = []
     var pointShadowPassLabels: [String] = []

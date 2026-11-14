@@ -135,6 +135,13 @@ public struct DragSwayTracker {
         return out
     }
 
+    /// True when object `id` has no eased sway and no recoil spring left — the next `update` with an
+    /// unchanged pose returns exactly zero and changes nothing. A knock's spring can return zero on
+    /// its first frame (it starts at rest position with a kicked velocity), so a zero `DragSway`
+    /// alone does not mean "settled"; this does. Lets a host persist a settled object's instance
+    /// data instead of re-deriving it every frame (Daydream DH-1675).
+    public func isAtRest(id: Int) -> Bool { states[id] == nil && impacts[id] == nil }
+
     /// Record a collision knock for object `id`: it was travelling along world-plane
     /// direction `worldDir` at `speed` (metres/frame) when something stopped it. Kicks
     /// the recoil spring so the object lurches the way it was heading, then rocks back

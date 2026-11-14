@@ -212,6 +212,9 @@ public final class IlluminatoramaRenderer {
         /// DH-1668 — cascades re-rasterised only in the rectangle a change reached (not counted in
         /// `sunCascadePassesRendered`, which counts whole-slice re-renders).
         public var sunCascadePassesPartial = 0
+        /// Daydream DH-1674 — spot/area slices re-rasterised only in the rectangle a change reached
+        /// (not counted in `spotShadowPassesRendered`, which counts whole-slice re-renders).
+        public var spotShadowPassesPartial = 0
         /// DH-1668 — full TLAS rebuilds (`rebuildRTAccel`), and how many of them were a SWAP:
         /// only some instances changed BLAS (a drag re-registering the meshes it moved), which
         /// rebuilds against the cached BLASes and is not counted as topology thrash.

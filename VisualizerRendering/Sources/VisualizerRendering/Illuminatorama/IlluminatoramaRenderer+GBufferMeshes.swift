@@ -53,6 +53,12 @@ extension IlluminatoramaRenderer {
     /// (`objectTriangleSoup()` is empty for it).
     public func registeredMesh(_ kind: MeshKind) -> IlluminatoramaMesh? { meshes[kind] }
 
+    /// How many meshes have left the table, ever — monotonic. A host that keeps instance refs across
+    /// frames (Daydream's persistent element instances, DH-1675) re-checks they still name a mesh
+    /// only when this moved, instead of hashing every kind every frame. Kinds are never reused
+    /// (`registerMesh` mints a fresh UUID kind), so an unchanged count proves every kind it saw is live.
+    public var meshTableRemovals: Int { kMisc.meshTableRemovals }
+
     /// Called by `IlluminatoramaMeshHandle.deinit` to evict the entry
     /// when the host drops its last strong reference. Internal because
     /// hosts should not call this directly — letting the handle's
@@ -65,8 +71,9 @@ extension IlluminatoramaRenderer {
         // update has diffed last frame's instances against this frame's — only a mesh last frame
         // actually drew (`meshGroupRange` is that upload's grouping), so loads that never render
         // cannot pile meshes up here.
-        if let gone = meshes.removeValue(forKey: kind), gbs.meshGroupRange[kind] != nil {
-            shd.departedMeshes[kind] = gone
+        if let gone = meshes.removeValue(forKey: kind) {
+            kMisc.meshTableRemovals &+= 1
+            if gbs.meshGroupRange[kind] != nil { shd.departedMeshes[kind] = gone }
         }
         fxs.gpuRepackTasks.removeAll { $0.kind == kind }
     }

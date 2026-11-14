@@ -23,4 +23,6 @@ final class MiscKnobs {
     /// can't synthesise for arbitrary meshes.)
     var buildRTFromExtractedScene: Bool = false
     var meshes: [MeshKind: IlluminatoramaMesh] = [:]
+    /// How many meshes have left the table, ever (Daydream DH-1675).
+    var meshTableRemovals = 0
 }
