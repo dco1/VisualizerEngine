@@ -100,6 +100,12 @@ extension IlluminatoramaRenderer {
         // A build frame needs one full walk per pixel, not `giRays` of them: the cache averages
         // millions of walks either way, and the reads are where the extra paths pay.
         if u.radCacheCell > 0 { u.giRays = min(u.giRays, UInt32(max(1, rtPathRadianceCacheBuildRays))) }
+        // DH-1326 — `kPathFlagCacheBuildStrideShift`: log2 of the build frame's pixel stride (0 ⇒ every pixel).
+        if u.radCacheCell > 0 {
+            let s = max(1, min(8, rtPathRadianceCacheBuildStride))
+            let log2s: UInt32 = s >= 8 ? 3 : s >= 4 ? 2 : s >= 2 ? 1 : 0
+            u.pathFlags |= log2s << 20
+        }
         // Surface cache read (P1c): on only when the grouped soup + cards + base
         // are all live this topology. The kernel gates every atlas read on this.
         let cacheOn = surfCacheActive && scs.surfCardCount > 0

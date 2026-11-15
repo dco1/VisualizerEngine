@@ -60,6 +60,7 @@ extension IlluminatoramaRenderer {
     public var rtGITemporalClamp: Float { get { kRT.rtGITemporalClamp } set { kRT.rtGITemporalClamp = newValue } _modify { yield &kRT.rtGITemporalClamp } }
     public var rtPathRadianceCacheCell: Float { get { kRT.rtPathRadianceCacheCell } set { kRT.rtPathRadianceCacheCell = newValue } _modify { yield &kRT.rtPathRadianceCacheCell } }
     public var rtPathRadianceCacheBuildFrames: Int { get { kRT.rtPathRadianceCacheBuildFrames } set { kRT.rtPathRadianceCacheBuildFrames = newValue } _modify { yield &kRT.rtPathRadianceCacheBuildFrames } }
+    public var rtPathRadianceCacheBuildStride: Int { get { kRT.rtPathRadianceCacheBuildStride } set { kRT.rtPathRadianceCacheBuildStride = newValue } _modify { yield &kRT.rtPathRadianceCacheBuildStride } }
     public var rtPathRadianceCacheBuildRays: Int { get { kRT.rtPathRadianceCacheBuildRays } set { kRT.rtPathRadianceCacheBuildRays = newValue } _modify { yield &kRT.rtPathRadianceCacheBuildRays } }
     public var svgfStillLuminanceStop: Bool { get { kRT.svgfStillLuminanceStop } set { kRT.svgfStillLuminanceStop = newValue } _modify { yield &kRT.svgfStillLuminanceStop } }
     public var svgfStillVarianceGate: Float { get { kRT.svgfStillVarianceGate } set { kRT.svgfStillVarianceGate = newValue } _modify { yield &kRT.svgfStillVarianceGate } }

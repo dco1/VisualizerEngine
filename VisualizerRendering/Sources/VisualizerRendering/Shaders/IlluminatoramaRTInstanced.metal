@@ -244,6 +244,10 @@ struct RTInstUniforms {
 #define kPathFlagDebugGlossyBrute 8192u
 /// Signack S5 (Daydream DH-1461 / DH-1361) — thin-sheet transmission at path vertices (see the vertex loop).
 #define kPathFlagThinTransmission 32768u
+/// Daydream DH-1326 — bits 20–21: log2 of a radiance-cache BUILD frame's pixel stride
+/// (`rtPathRadianceCacheBuildStride`). On a build frame only one 16×16 tile in 2^n walks (a per-tile hash rotated
+/// by `giProgressiveIndex`), so the cache's full walks spread over cheaper frames. 0 ⇒ every pixel (byte-identical).
+#define kPathFlagCacheBuildStrideShift 20u
 
 // ── Curve primitives (#60 item 7) ────────────────────────────────────────────
 // `kRTCurvesEnabled` specializes the kernel for a TLAS that contains curve
@@ -1821,7 +1825,14 @@ kernel void illumi_rt_lighting_tlas(
                 auto pres = isect.intersect(pr, accel, 0x01u);
                 if (pres.type == intersection_type::triangle) primaryLayer = secondaryLayerBits(pres.instance_id, insts);
             }
-            for (uint g = 0; g < u.giRays; ++g) {
+            // DH-1326 — a strided cache BUILD frame: the 16×16 tiles off this frame's stride walk nothing (the
+            // frame is held out of every accumulator; only the grid's writes matter). Whole TILES, not pixels: a
+            // SIMD group runs as long as its longest walk, so a per-pixel pick (1 in 4) still cost 1.55 s of the
+            // unstrided 2.3 s. Each tile walks exactly once every 2^n frames (its hash + the frame index).
+            uint rcStrideLog = (u.pathFlags >> kPathFlagCacheBuildStrideShift) & 3u;
+            bool rcStrideSkip = u.radCacheCell > 0.0 && rcStrideLog > 0u
+                && ((illumiPixelSeed(gid >> 4u, 0x52434253u) + u.giProgressiveIndex) & ((1u << rcStrideLog) - 1u)) != 0u;
+            for (uint g = 0; g < (rcStrideSkip ? 0u : u.giRays); ++g) {
                 float3 envPart = float3(0.0);
                 indirect += illumiPathTraceIncoming(isect, accel, Pofs - N * max(u.rayTMin, 1e-3), N, primaryLayer,
                                                     u.giProgressiveIndex * u.giRays + g, gid, u, sec,

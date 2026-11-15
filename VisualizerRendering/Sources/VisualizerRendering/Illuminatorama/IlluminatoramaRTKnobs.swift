@@ -331,6 +331,12 @@ final class RTKnobs {
     var rtPathRadianceCacheBuildFrames: Int = 4
     /// Paths per pixel on a build frame.
     var rtPathRadianceCacheBuildRays: Int = 1
+    /// Daydream DH-1326 — a build frame walks only one 16×16 pixel tile in this many (1, 2, 4 or 8; a per-tile
+    /// hash rotated by the frame), so a host can spread the cache's full walks over `stride`× as many CHEAPER frames:
+    /// the same samples reach the world-space grid, but no single GPU frame carries a whole frame's full walks.
+    /// For an interactive host (the settled canvas), where a frame cannot be preempted by a gesture. 1 ⇒ every
+    /// pixel walks (byte-identical).
+    var rtPathRadianceCacheBuildStride: Int = 1
     /// Daydream DH-1344 — whether a STILL's GI filter (`rtGIStaticAccumulation`) keeps the SVGF
     /// luminance edge-stop. The stop weighs neighbours by their NOISY luminance, so it rejects the rare
     /// bright samples a path tracer's mean depends on: against an unfiltered 256-path reference it
