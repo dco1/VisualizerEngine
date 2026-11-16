@@ -7,11 +7,12 @@
 //    · STL weld (grid-hash, 32-bit CAS table, prefix-scan compaction) + angle-weighted crease-smoothed normals
 //      (atomics), the whole import in ONE command buffer with no CPU read-back in the middle,
 //    · per-triangle volume / area / degenerate / flipped checks and a directed-edge winding table (`MeshIO.gpuReport`).
-//  What stays on the CPU, and why: OBJ and ASCII STL / PLY text (a tokenizer + float parse is bandwidth-trivial
-//  next to a serial `Double(String)`, but the branchy, variable-length grammar — n-gons, negative indices, `solid`
-//  blocks, mixed `v/vt/vn` — is where bugs live, and measured below the CPU parse is not the bottleneck on typical
-//  OBJ sizes; see the timings in `MeshIOGPUTests.testTimings1M`); binary PLY with n-gons, float64 / 32-bit-integer
-//  positions, lists other than the face list, or ASCII (a CPU reader keeps the Double precision and triangulates);
+//  What stays on the CPU, and why: OBJ and ASCII STL / PLY text. A GPU tokenizer + parallel float parse is possible
+//  (newline scan, token split, per-token parse) but the grammar is variable-length and branchy (n-gons, negative and
+//  `v/vt/vn` indices, `solid` blocks, groups that split meshes) and the meshes are assembled serially anyway. It was NOT
+//  attempted and NOT measured, so there is no evidence it would pay. Also CPU: binary PLY with n-gons, float64 /
+//  32-bit-integer positions, lists other than the face list, or ASCII (the CPU reader keeps the Double precision and
+//  triangulates);
 //  `Mesh3` itself, whose arrays are Double (Metal has no Double), so a GPU decode ends by WIDENING float to double
 //  on the CPU (parallel). Callers that can stay in float get `MeshIOFloatMesh` and skip it.
 //  Guarantees: output equals the CPU reader's — STL positions bit-identical, facet normals within 1e-6, welded
