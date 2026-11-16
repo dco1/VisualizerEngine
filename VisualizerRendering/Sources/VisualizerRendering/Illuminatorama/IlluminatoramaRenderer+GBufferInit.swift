@@ -281,6 +281,12 @@ extension IlluminatoramaRenderer {
             MemoryLayout<IlluminatoramaInteriorAperture>.stride * initLightCap,
             "Illuminatorama.interiorApertures", "interiorApertures")
         self.lts.interiorApertureCapacity = initLightCap
+        // Daydream DH-1699 — the per-room band table (lighting kernel buffer(13)): fixed size, the enable
+        // word last; zero-filled ⇒ off.
+        self.lts.interiorRoomBandRing = try makeRing(
+            MemoryLayout<SIMD4<Float>>.stride * IlluminatoramaInteriorRoomBands.count,
+            "Illuminatorama.interiorRoomBands", "interiorRoomBands")
+        for b in self.lts.interiorRoomBandRing { memset(b.contents(), 0, b.length) }
 
         self.lts.frameUniformRing = try makeRing(
             MemoryLayout<IlluminatoramaFrameUniforms>.stride,

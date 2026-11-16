@@ -141,6 +141,7 @@ extension IlluminatoramaRenderer {
         uploadAreaLights()
         uploadExtraDirectionals()
         uploadInteriorApertures()
+        uploadInteriorRoomBands()   // Daydream DH-1699
 
         // Pick a free pool buffer for this frame's tonemap output (never the
         // presented one SceneKit may sample, nor the one still in flight).

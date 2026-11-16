@@ -645,6 +645,13 @@ struct PointLight {
     uint   roomOnly;
 };
 #define kGIVisibleSecondaryOnly 2u
+// Daydream DH-1699 — 3 (spot lights): a DIFFUSE-only light at the primary — a surface's re-emitted
+// first bounce (a lamp's pool), whose specular image the room's own specular band already shows
+// (`interiorRoomBands`). Reaches secondary hits like 1.
+#define kGIVisibleDiffuseOnly 3u
+// Daydream DH-1699 — the per-room band table's layout (`IlluminatoramaInteriorRoomBands`).
+#define kInteriorRoomBandsPerRoom 6u
+#define kInteriorRoomBandsEnable 192u
 
 // Rectangular area light (#60 task 5). Mirror of Swift IlluminatoramaAreaLight.
 // Rectangle corners = center ± ex ± ey; emitting normal = normalize(cross(ex,ey)).

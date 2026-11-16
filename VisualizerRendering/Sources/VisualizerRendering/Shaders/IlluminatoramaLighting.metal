@@ -1430,6 +1430,9 @@ kernel void illumi_lighting(
     // Interior daylight apertures (S3.5 Stage D) — gates on the count/strength in
     // frame.interiorIrrDown.w / interiorIrrSide.w, both 0 unless the host opts in.
     const device InteriorAperture*          interiorApertures [[buffer(7)]],
+    // Daydream DH-1699 — each room's own bands (diffuse irradiance up/side/down + grade weight, specular
+    // radiance up/side/down), 6 float4 per light-layer bit; enable word at kInteriorRoomBandsEnable.
+    const device float4*                    interiorRoomBands [[buffer(13)]],
     // S4.1 — the TLAS for ray-traced soft sun shadows. The argument EXISTS only
     // in the kLightingRTSunShadow pipeline variant (function-constant-gated), and
     // the host binds it exactly when it selects that variant (the bit requires a
@@ -1990,6 +1993,12 @@ kernel void illumi_lighting(
             }
         }
         if (visibility <= 0.0) continue;
+        // Daydream DH-1699 — a re-emitted first bounce lights the diffuse lobe only (`kGIVisibleDiffuseOnly`).
+        if (sl.giVisible == kGIVisibleDiffuseOnly) {
+            spotSum += brdfDiffuse(N, V, L, albedo, metallic, sl.color * atten * visibility, le);
+            if (isSSS) sssDiffuse += brdfDiffuse(N, V, L, albedo, metallic, sl.color * atten * visibility, le);
+            continue;
+        }
         spotSum += brdf(N, V, L, albedo, metallic, roughness,
                         sl.color * atten * visibility,
                         0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness, le,
@@ -2288,11 +2297,39 @@ kernel void illumi_lighting(
         // rooms — the one no dial could produce while the bands were a frame uniform.
         float apBandFactor = 1.0;
         float3 irradianceCubeSat = irradianceSat;   // before the band takes its share
+        // Daydream DH-1699 — the fragment's ROOM's own bands (`interiorRoomBands`), averaged over its
+        // bits like the gain: diffuse irradiance up/side/down (w = the grade's share) and the specular
+        // radiance. A room with none (all zero), or the table off, keeps the frame's bands × its gain.
+        bool roomOwn = false;
+        float4 roomDiff[3] = { float4(0.0), float4(0.0), float4(0.0) };
+        float3 roomSpec[3] = { float3(0.0), float3(0.0), float3(0.0) };
+        if (interiorBandW > 0.0 && interiorRoomBands[kInteriorRoomBandsEnable].x > 0.5 &&
+            fragLayer != 0u && fragLayer != 0xFFFFFFFFu && (fragLayer & frame.interiorMask) != 0u) {
+            float n = 0.0;
+            uint m = fragLayer;
+            while (m != 0u) {
+                uint b = uint(ctz(m));
+                m &= (m - 1u);
+                if (b >= 32u) break;
+                const device float4 *e = interiorRoomBands + b * kInteriorRoomBandsPerRoom;
+                if (e[0].x + e[0].y + e[0].z + e[1].x + e[1].y + e[1].z + e[2].x + e[2].y + e[2].z <= 0.0) continue;
+                for (uint k = 0u; k < 3u; ++k) { roomDiff[k] += e[k]; roomSpec[k] += e[3u + k].xyz; }
+                n += 1.0;
+            }
+            if (n > 0.0) {
+                roomOwn = true;
+                for (uint k = 0u; k < 3u; ++k) { roomDiff[k] /= n; roomSpec[k] /= n; }
+            }
+        }
         if (interiorBandW > 0.0) {
-            float3 band = mix(frame.interiorIrrSide.xyz,
-                              N.y >= 0.0 ? frame.interiorIrrUp.xyz
-                                         : frame.interiorIrrDown.xyz,
-                              abs(N.y));
+            float3 band = roomOwn
+                ? mix(roomDiff[1].xyz, N.y >= 0.0 ? roomDiff[0].xyz : roomDiff[2].xyz, abs(N.y))
+                : mix(frame.interiorIrrSide.xyz,
+                      N.y >= 0.0 ? frame.interiorIrrUp.xyz
+                                 : frame.interiorIrrDown.xyz,
+                      abs(N.y));
+            // DH-1699 — how much of this room's band the window grade may move (1 off the table).
+            float gradeShare = roomOwn ? saturate(mix(roomDiff[1].w, N.y >= 0.0 ? roomDiff[0].w : roomDiff[2].w, abs(N.y))) : 1.0;
             // ── S3.5 Stage D — the bands GRADE with daylight-aperture proximity ──
             // The bands (like the scalars before them) are functions of the surface
             // NORMAL alone, so a wall point 0.5 m from its window and one 8 m away
@@ -2332,12 +2369,12 @@ kernel void illumi_lighting(
                 }
                 const float omegaRef = 0.20;
                 float factor = clamp(sqrt(omega / omegaRef), 0.55, 1.65);
-                apBandFactor = mix(1.0, factor, apStrength);
+                apBandFactor = mix(1.0, factor, apStrength * gradeShare);
             }
             // Room level × within-room gradient. Two axes, deliberately composed:
             // Stage E says how bright this ROOM is, Stage D says where in it you
-            // are standing.
-            band *= apBandFactor * roomBandGain;
+            // are standing. (A room with its own bands carries its level in them.)
+            band *= apBandFactor * (roomOwn ? 1.0 : roomBandGain);
             irradianceSat = mix(irradianceSat, band, interiorBandW);
         }
         float3 diffuseIBL = kD * irradianceSat * albedo;
@@ -2379,10 +2416,13 @@ kernel void illumi_lighting(
         // for every scene that never sets the bands.
         float specBandW = 0.0;
         if (interiorBandW > 0.0) {
-            float3 specBand = mix(frame.interiorIrrSide.xyz,
-                                  R.y >= 0.0 ? frame.interiorIrrUp.xyz
-                                             : frame.interiorIrrDown.xyz,
-                                  abs(R.y)) * apBandFactor * roomBandGain;
+            // Daydream DH-1699 — in a room with its own bands, the RADIANCE a reflection sees there (the
+            // floor's pools looking down), not the irradiance a surface facing R receives.
+            float3 specBand = roomOwn
+                ? mix(roomSpec[1], R.y >= 0.0 ? roomSpec[0] : roomSpec[2], abs(R.y)) * apBandFactor
+                : mix(frame.interiorIrrSide.xyz,
+                      R.y >= 0.0 ? frame.interiorIrrUp.xyz : frame.interiorIrrDown.xyz,
+                      abs(R.y)) * apBandFactor * roomBandGain;
             specBandW = interiorBandW * smoothstep(0.05, 0.30, roughness);
             specEnv = mix(specEnv, specBand, specBandW);
         }

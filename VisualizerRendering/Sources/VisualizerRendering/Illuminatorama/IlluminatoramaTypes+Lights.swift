@@ -309,6 +309,10 @@ public struct IlluminatoramaSpotLight {
     /// DH-0872 — see `IlluminatoramaPointLight.giVisible`; same field, same reason, same
     /// default. Mirrors the Metal `SpotLight.giVisible` (size grows 176 → 180; stride 192).
     public var giVisible: UInt32 = 1
+    /// Daydream DH-1699 — `diffuseOnly` (3): at the primary the light shades the DIFFUSE lobe only — a
+    /// surface's re-emitted first bounce (a lamp's pool), whose specular image the specular band's
+    /// radiance already carries (`IlluminatoramaRenderer.interiorRoomBands`). Reaches secondary hits like 1.
+    public static let diffuseOnly: UInt32 = 3
     /// The physical size of the lamp at this cone's apex — see `IlluminatoramaPointLight
     /// .bulbRadius`; same field, same law, read only by the path-traced still lane. Appended after
     /// `giVisible` (size 180 → 184): it sits inside the float4x4-aligned stride's tail padding, so
@@ -347,4 +351,21 @@ public struct IlluminatoramaSpotLight {
         self.softRadius = softRadius
         self.giVisible = giVisible ? 1 : 0
     }
+}
+
+/// Daydream DH-1699 — the layout of `IlluminatoramaRenderer.interiorRoomBands`: for each of the 32
+/// light-layer bits (a room — the same identity as `interiorRoomGains`), six vectors —
+/// `[b·6 + 0…2]` the irradiance an up / side / down-facing surface of that room receives (linear RGB,
+/// in the bands' units: the lighting kernel multiplies by `iblIntensity` and the band weight as it does
+/// the frame's bands, but NOT by the room gain — the table IS the room's level; `w` = the share of it
+/// the window grade (S3.5 Stage D) may move, 0…1), `[b·6 + 3…5]` the radiance a reflection in that room
+/// sees looking up / sideways / down (same units; what the specular half of the bands shows there).
+/// A room whose six vectors are all zero falls back to the frame's bands × its gain. The table is on
+/// when it holds exactly `entries` vectors; the kernel reads its enable word at `enableIndex`.
+public enum IlluminatoramaInteriorRoomBands {
+    public static let rooms = 32
+    public static let perRoom = 6
+    public static let entries = rooms * perRoom
+    public static let enableIndex = entries
+    public static let count = entries + 1
 }

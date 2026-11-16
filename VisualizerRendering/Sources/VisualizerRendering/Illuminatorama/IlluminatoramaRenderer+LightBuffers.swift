@@ -18,6 +18,8 @@ final class LightBufferState {
     var extraDirectionalRing: [MTLBuffer]!
 
     var interiorApertureRing: [MTLBuffer]!
+    /// Daydream DH-1699 — the per-room band table (lighting kernel buffer(13)), fixed size.
+    var interiorRoomBandRing: [MTLBuffer]!
 
     var interiorApertureCapacity: Int = 0
     var extraDirectionalCapacity: Int!
@@ -485,6 +487,16 @@ extension IlluminatoramaRenderer {
         buf.label = "Illuminatorama.spotProfiles"
         shd.spotProfileBuffer = buf
         spotLightProfileRowCount = rows.count
+    }
+
+    /// Daydream DH-1699 — the per-room band table (`interiorRoomBands`) into this frame's slot, with its
+    /// enable word last (`IlluminatoramaInteriorRoomBands.enableIndex`); a wrong-sized table is off.
+    func uploadInteriorRoomBands() {
+        let buf = lts.interiorRoomBandRing[lts.frameRingIndex]
+        let p = buf.contents().bindMemory(to: SIMD4<Float>.self, capacity: IlluminatoramaInteriorRoomBands.count)
+        let on = interiorRoomBands.count == IlluminatoramaInteriorRoomBands.entries
+        if on { for (i, v) in interiorRoomBands.enumerated() { p[i] = v } }
+        p[IlluminatoramaInteriorRoomBands.enableIndex] = SIMD4(on ? 1 : 0, 0, 0, 0)
     }
 
     func uploadInteriorApertures() {

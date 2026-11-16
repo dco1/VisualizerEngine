@@ -114,6 +114,11 @@ final class LightingKnobs {
     var interiorIrradianceUp: SIMD3<Float> = .zero
     var interiorIrradianceSide: SIMD3<Float> = .zero
     var interiorIrradianceDown: SIMD3<Float> = .zero
+    /// Daydream DH-1699 — each ROOM's own bands (`IlluminatoramaInteriorRoomBands`): per light-layer bit,
+    /// the irradiance an up / side / down-facing surface receives (xyz; w = how much of it the window
+    /// grade may move) and the radiance a reflection sees looking up / sideways / down. Empty (default)
+    /// ⇒ every fragment takes the frame's bands × its room's gain, byte-identical.
+    var interiorRoomBands: [SIMD4<Float>] = []
     var interiorIrradianceWeight: Float = 0
     /// Daylight apertures for the band GRADATION (S3.5 Stage D): the host's glazed
     /// openings, one rect each. With `interiorApertureGradation` > 0, interior fragments

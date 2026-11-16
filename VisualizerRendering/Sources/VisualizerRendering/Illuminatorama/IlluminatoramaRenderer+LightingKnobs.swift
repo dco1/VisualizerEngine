@@ -31,6 +31,7 @@ extension IlluminatoramaRenderer {
     public var interiorIrradianceUp: SIMD3<Float> { get { kLighting.interiorIrradianceUp } set { kLighting.interiorIrradianceUp = newValue } _modify { yield &kLighting.interiorIrradianceUp } }
     public var interiorIrradianceSide: SIMD3<Float> { get { kLighting.interiorIrradianceSide } set { kLighting.interiorIrradianceSide = newValue } _modify { yield &kLighting.interiorIrradianceSide } }
     public var interiorIrradianceDown: SIMD3<Float> { get { kLighting.interiorIrradianceDown } set { kLighting.interiorIrradianceDown = newValue } _modify { yield &kLighting.interiorIrradianceDown } }
+    public var interiorRoomBands: [SIMD4<Float>] { get { kLighting.interiorRoomBands } set { kLighting.interiorRoomBands = newValue } _modify { yield &kLighting.interiorRoomBands } }
     public var interiorIrradianceWeight: Float { get { kLighting.interiorIrradianceWeight } set { kLighting.interiorIrradianceWeight = newValue } _modify { yield &kLighting.interiorIrradianceWeight } }
     public var interiorApertures: [IlluminatoramaInteriorAperture] { get { kLighting.interiorApertures } set { kLighting.interiorApertures = newValue } _modify { yield &kLighting.interiorApertures } }
     public var interiorApertureGradation: Float { get { kLighting.interiorApertureGradation } set { kLighting.interiorApertureGradation = newValue } _modify { yield &kLighting.interiorApertureGradation } }

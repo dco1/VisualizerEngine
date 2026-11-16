@@ -212,6 +212,8 @@ extension IlluminatoramaRenderer {
         // on the count/strength packed in frame.interiorIrrDown.w / interiorIrrSide.w,
         // both 0 for every scene that never opts in.
         enc.setBuffer(interiorApertureBuffer, offset: 0, index: 7)
+        // Daydream DH-1699 — each room's own bands (`interiorRoomBands`); always bound, its enable word 0 when unset.
+        enc.setBuffer(lts.interiorRoomBandRing[lts.frameRingIndex], offset: 0, index: 13)
         // S4.1 — the TLAS for ray-traced soft sun shadows. Bound exactly when the
         // pipeline bit is set (the accel argument only exists in that variant; if
         // the specialized variant is still compiling and the uber fallback runs
