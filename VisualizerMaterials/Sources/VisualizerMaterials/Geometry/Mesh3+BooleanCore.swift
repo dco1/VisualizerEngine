@@ -256,7 +256,6 @@ final class BooleanJob: @unchecked Sendable {
         var local: [Int32: Int] = [:]
         var localId = ring
         for (i, id) in ring.enumerated() { local[id] = i }
-        localId.append(-1)                                   // the centre at index ring.count
         var centre = Vec3.zero
         for id in ring { centre += P[Int(id)] }
         centre /= Double(ring.count)
