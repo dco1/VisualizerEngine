@@ -7,6 +7,8 @@
 //  their corners, and vertices are numbered by first use (identical vertices are merged).
 //
 //  Those sums also differ in the last bits, so coordinates are snapped to 1 nm (normals, UVs to 1e-9) first.
+//  Applied only to what LEAVES the graph (`evaluate`'s target), never between nodes: snapping a boolean's output
+//  before the next boolean read it left sub-tolerance slivers and opened edges (ModelGraphBooleanChainTests).
 //  Guarantees: same surface in, same arrays out, whatever order the operator produced; winding and the per-corner
 //  normal / UV are untouched. Not guaranteed: two different surfaces never compare equal, but a surface with exactly
 //  coincident duplicate triangles keeps both. O(n log n), CPU; a mesh pass at authoring size.
