@@ -17,6 +17,21 @@ import simd
 #if canImport(Metal)
 import Metal
 
+/// `a.map(f)` on all cores (the conversions between the CPU's doubles and the GPU's floats are the CPU's share).
+func pmap<A, B>(_ a: [A], _ f: @escaping @Sendable (A) -> B) -> [B] {
+    let n = a.count
+    return [B](unsafeUninitializedCapacity: n) { buf, count in
+        nonisolated(unsafe) let out = buf.baseAddress
+        a.withUnsafeBufferPointer { ap in
+            nonisolated(unsafe) let inp = ap.baseAddress
+            BooleanParallel.chunks(n, minChunk: 16_384) { r in
+                for i in r { (out! + i).initialize(to: f(inp![i])) }
+            }
+        }
+        count = n
+    }
+}
+
 final class GPU2Run {
     let job: BooleanJob
     let g: BooleanGPU2
@@ -28,6 +43,8 @@ final class GPU2Run {
     var grids: [BoxGrid2] = []
     var bounds: [(lo: Vec3, hi: Vec3)] = []
     var failed = false
+    /// The weld's grid over the input vertices, and each vertex's pool id: new intersection points are looked up in it.
+    var weldGrid: BoxGrid2?, weldIds: [Int32] = [], weldOrg = Vec3.zero, weldL: Float = 1
     /// The two segment endpoints (float, relative to `org`) the narrow phase emitted per pair, kept for tests.
     var endpoints: MTLBuffer?
     /// Test hooks: every candidate pair and the narrow phase's verdict on it.
@@ -47,7 +64,7 @@ final class GPU2Run {
 
     func floats(_ P: [Vec3]) -> [SIMD4<Float>] {
         let o = org
-        return P.map { SIMD4(Float($0.x - o.x), Float($0.y - o.y), Float($0.z - o.z), 0) }
+        return pmap(P) { SIMD4(Float($0.x - o.x), Float($0.y - o.y), Float($0.z - o.z), 0) }
     }
     var margin: Float { 2e-6 * L }
 
@@ -101,7 +118,7 @@ final class GPU2Run {
         }
         let l = rlo - org
         return GridP(lo: SIMD4(Float(l.x), Float(l.y), Float(l.z), 0), inv: SIMD4(inv.x, inv.y, inv.z, 0),
-                     dims: SIMD4(dims.x, dims.y, dims.z, 0))
+                     dims: SIMD4(dims.x, dims.y, dims.z, 512))
     }
 
     // MARK: cut
@@ -189,6 +206,32 @@ final class GPU2Run {
             let seg = SIMD2(Int32(u), Int32(v))
             job.cons[0][Int32(pr.x), default: []].append(seg)
             job.cons[1][Int32(pr.y), default: []].append(seg)
+        }
+        var hl = Vec3(repeating: .infinity), hh = Vec3(repeating: -.infinity)
+        for h in hits.items {
+            switch h {
+            case .none: break
+            case .segment(let p, let q): hl = simd_min(hl, simd_min(p, q)); hh = simd_max(hh, simd_max(p, q))
+            case .polygon(let poly): for p in poly { hl = simd_min(hl, p); hh = simd_max(hh, p) }
+            }
+        }
+        if let wg = weldGrid, hl.x <= hh.x {
+            var newPts: [Vec3] = []
+            for h in hits.items {
+                switch h {
+                case .none: break
+                case .segment(let p, let q): newPts.append(p); newPts.append(q)
+                case .polygon(let poly): newPts += poly
+                }
+            }
+            let m3 = 3e-7 * weldL, wo = weldOrg
+            let f4 = pmap(newPts) { SIMD4<Float>(Float($0.x - wo.x), Float($0.y - wo.y), Float($0.z - wo.z), 0) }
+            let lo = f4.map { SIMD4<Float>($0.x - m3, $0.y - m3, $0.z - m3, 0) }, hi = f4.map { SIMD4<Float>($0.x + m3, $0.y + m3, $0.z + m3, 0) }
+            guard let lb = g.buf(lo), let hb = g.buf(hi),
+                  let q = g.query(grid: wg, loQ: lb, hiQ: hb, nQ: newPts.count, mode: 4, margin: m3, tris: lb, pos: lb) else { return false }
+            let cand = g.read(q.pairs, SIMD2<UInt32>.self, q.count)
+            job.pool.hashPreloaded(Array(Set(cand.map { Int(weldIds[Int($0.y)]) })).sorted())
+            job.stats.seconds["g.newPointCandidates"] = Double(cand.count)
         }
         for (k, h) in hits.items.enumerated() {
             let pr = pairs[Int(idx[k])]

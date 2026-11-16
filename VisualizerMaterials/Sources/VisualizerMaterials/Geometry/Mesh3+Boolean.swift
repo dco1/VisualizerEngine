@@ -87,7 +87,8 @@ public extension Mesh3 {
         if options.useGPU, options.useGPUPipeline, BooleanGPU2.shared != nil,
            triangleCount + other.triangleCount >= BooleanGPU2.minTriangles {
             let fast = BooleanJob(self, other, options: options)
-            if let mesh = fast.runGPU2(op) { return BooleanResult(mesh: mesh, stats: fast.stats) }
+            if let mesh = fast.runGPU2(op) { BooleanGPU2.runs += 1; return BooleanResult(mesh: mesh, stats: fast.stats) }
+            BooleanGPU2.fallbacks += 1
         }
         let job = BooleanJob(self, other, options: options)
         var clock = Date()

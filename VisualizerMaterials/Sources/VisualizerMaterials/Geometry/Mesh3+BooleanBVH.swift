@@ -103,7 +103,7 @@ enum BooleanParallel {
 struct BooleanPool {
     private(set) var points: [Vec3] = []
     let eps: Double
-    private let origin: Vec3
+    let origin: Vec3
     private let cell: Double
     private var head: [SIMD3<Int32>: Int32] = [:]
     private var next: [Int32] = []
@@ -147,5 +147,36 @@ struct BooleanPool {
     mutating func addUnshared(_ p: Vec3) -> Int {
         points.append(p); next.append(-1)
         return points.count - 1
+    }
+
+    // Lazy hashing (GPU weld, item M6b): the welded input points are stored without hashing them; only those
+    // inside the box where new points can appear are hashed, before the first `add`.
+    private var preloaded = 0
+
+    /// Stores already-welded points (distinct by more than `eps`) without hashing them.
+    mutating func preload(_ pts: [Vec3]) {
+        points = pts; next = [Int32](repeating: -1, count: pts.count); preloaded = pts.count
+    }
+
+    /// Hashes exactly these preloaded points (distinct ids) so `add` finds them.
+    mutating func hashPreloaded(_ ids: [Int]) {
+        for id in ids {
+            let k = key(points[id])
+            next[id] = head[k] ?? -1
+            head[k] = Int32(id)
+        }
+    }
+
+    /// Hashes the preloaded points inside `[lo - 2 eps, hi + 2 eps]` so `add` finds them there.
+    mutating func hashRegion(lo: Vec3, hi: Vec3) {
+        let l = lo - Vec3(repeating: 2 * eps), h = hi + Vec3(repeating: 2 * eps)
+        for id in 0..<preloaded {
+            let p = points[id]
+            guard p.x >= l.x, p.x <= h.x, p.y >= l.y, p.y <= h.y, p.z >= l.z, p.z <= h.z else { continue }
+            let k = key(p)
+            next[id] = head[k] ?? -1
+            head[k] = Int32(id)
+        }
+        preloaded = 0
     }
 }

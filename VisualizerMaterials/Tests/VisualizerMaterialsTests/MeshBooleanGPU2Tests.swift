@@ -102,10 +102,59 @@ final class MeshBooleanGPU2Tests: XCTestCase {
         }
     }
 
-    /// Prints the end-to-end union time CPU / first GPU path / GPU pipeline (median of 5, after one warm-up).
+    /// The pipeline forced onto small and awkward inputs (nested, disjoint, touching, coincident): agrees with the
+    /// CPU path and never falls back.
+    func testForcedPipelineOnSmallCases() throws {
+        guard BooleanGPU2.shared != nil else { throw XCTSkip("no Metal device") }
+        let saved = BooleanGPU2.minTriangles
+        BooleanGPU2.minTriangles = 0
+        defer { BooleanGPU2.minTriangles = saved }
+        let r0 = BooleanGPU2.runs, f0 = BooleanGPU2.fallbacks
+        let a = Self.sphere(1, rings: 24, sectors: 32)
+        let others: [Mesh3] = [Self.sphere(0.5, rings: 20, sectors: 28), Self.sphere(0.5, rings: 20, sectors: 28, at: Vec3(5, 0, 0)),
+                               Self.sphere(1, rings: 24, sectors: 32), Self.sphere(0.8, rings: 24, sectors: 32, at: Vec3(0.5, 0.2, 0.1)),
+                               Self.sphere(1, rings: 24, sectors: 32, at: Vec3(2, 0, 0)), Self.sphere(1, rings: 30, sectors: 40, at: Vec3(0, 0.3, 0))]
+        var cpu = BooleanOptions(); cpu.useGPU = false
+        for (i, b) in others.enumerated() { for op in [BooleanOp.union, .difference, .intersection] {
+            let g = a.boolean(op, b), c = a.boolean(op, b, options: cpu)
+            XCTAssertEqual(g.mesh.signedVolume, c.mesh.signedVolume, accuracy: 1e-8, "case \(i) \(op)")
+            if i != 4 { XCTAssertEqual(defects(g.mesh).boundary, 0, "case \(i) \(op)") }
+        } }
+        print("[forced pipeline] runs \(BooleanGPU2.runs - r0) fallbacks \(BooleanGPU2.fallbacks - f0)")
+        XCTAssertEqual(BooleanGPU2.fallbacks - f0, 0)
+    }
+
+    /// Triangle soup (three private vertices per triangle: every vertex has six coincident twins to weld) and a slice
+    /// by a plane (boxes far bigger than the grid's cells), both forced onto the pipeline.
+    func testSoupAndSliceOnPipeline() throws {
+        guard BooleanGPU2.shared != nil else { throw XCTSkip("no Metal device") }
+        let saved = BooleanGPU2.minTriangles
+        BooleanGPU2.minTriangles = 0
+        defer { BooleanGPU2.minTriangles = saved }
+        func soup(_ m: Mesh3) -> Mesh3 {
+            var o = Mesh3()
+            for i in m.indices { o.positions.append(m.positions[Int(i)]); o.normals.append(m.normals[Int(i)]); o.uvs.append(m.uvs[Int(i)]); o.indices.append(UInt32(o.indices.count)) }
+            return o
+        }
+        let a = Self.sphere(1, rings: 30, sectors: 40), b = Self.sphere(0.8, rings: 30, sectors: 40, at: Vec3(0.5, 0.2, 0.1))
+        var cpu = BooleanOptions(); cpu.useGPU = false
+        let g = soup(a).boolean(.union, soup(b)), c = a.boolean(.union, b, options: cpu)
+        XCTAssertEqual(g.mesh.signedVolume, c.mesh.signedVolume, accuracy: 1e-8)
+        XCTAssertEqual(defects(g.mesh).boundary, 0)
+        XCTAssertGreaterThan(g.stats.seconds["g.weldPairs"] ?? 0, 1000)
+        let big = Self.sphere(1, rings: 60, sectors: 80)
+        let before = BooleanGPU2.fallbacks
+        let (up, down) = big.slice(point: Vec3(0, 0.3, 0), normal: Vec3(0.2, 1, 0.1))
+        XCTAssertEqual(BooleanGPU2.fallbacks, before)
+        XCTAssertEqual(up.signedVolume + down.signedVolume, big.signedVolume, accuracy: 1e-8)
+        XCTAssertEqual(defects(up).boundary + defects(down).boundary, 0)
+    }
+
+    /// Prints the end-to-end union time CPU / first GPU path / GPU pipeline (best of 9, after one warm-up).
     func testBenchmarkUnion() throws {
         guard BooleanGPU2.shared != nil else { throw XCTSkip("no Metal device") }
-        let sizes: [(Int, Int)] = [(130, 200), (160, 310), (230, 440)]
+        print("[shader compile (cold start)] \(String(format: "%.0f", BooleanGPU2.shared!.compileSeconds * 1000)) ms")
+        let sizes: [(Int, Int)] = [(24, 32), (40, 56), (70, 100), (100, 140), (130, 200), (160, 310), (230, 440)]
         for (rings, sectors) in sizes {
             let a = Self.sphere(1, rings: rings, sectors: sectors), b = Self.sphere(0.9, rings: rings, sectors: sectors, at: Vec3(0.6, 0.15, 0.1))
             var cpu = BooleanOptions(); cpu.useGPU = false
@@ -116,54 +165,15 @@ final class MeshBooleanGPU2Tests: XCTestCase {
                 _ = a.boolean(.union, b, options: opt)
                 var ts: [Double] = []
                 var last: BooleanResult?
-                for _ in 0..<5 { let t = Date(); last = a.boolean(.union, b, options: opt); ts.append(Date().timeIntervalSince(t)) }
+                for _ in 0..<9 { let t = Date(); let r = a.boolean(.union, b, options: opt); let dt = Date().timeIntervalSince(t); ts.append(dt); if last == nil || dt <= ts.min()! { last = r } }
                 ts.sort()
-                line += " \(name) \(String(format: "%.0f", ts[2] * 1000)) ms"
+                line += " \(name) \(String(format: "%.0f", ts[0] * 1000)) ms"
                 meshes.append(last!.mesh)
-                if name == "GPU2" { line += " steps=" + last!.stats.seconds.filter { !$0.key.hasPrefix("g.") }.sorted { $0.key < $1.key }.map { "\($0.key)=\(String(format: "%.1f", $0.value * 1000))" }.joined(separator: ",") }
+                if name == "GPU2" { line += " steps=" + last!.stats.seconds.filter { !$0.key.hasPrefix("g.why") && !$0.key.hasPrefix("g.cc") }.sorted { $0.key < $1.key }.map { "\($0.key)=\(String(format: "%.1f", $0.value * ($0.key.hasPrefix("g.") && $0.value > 5 ? 1 : 1000)))" }.joined(separator: ",") }
             }
             print(line)
             XCTAssertEqual(meshes[2].signedVolume, meshes[0].signedVolume, accuracy: 1e-8)
             XCTAssertEqual(defects(meshes[2]).boundary, 0)
         }
-    }
-
-    func testProfileCPUStages() {
-        let a = Self.sphere(1, rings: 130, sectors: 200), b = Self.sphere(0.9, rings: 130, sectors: 200, at: Vec3(0.6, 0.15, 0.1))
-        var o = BooleanOptions(); o.useGPU = false
-        for _ in 0..<2 {
-        let job = BooleanJob(a, b, options: o)
-        var clock = Date()
-        func lap(_ n: String) { print("  \(n) \(String(format: "%.1f", Date().timeIntervalSince(clock) * 1000)) ms"); clock = Date() }
-        job.weld(); lap("weld")
-        let P = job.pool.points
-        let ba = job.boxes(0, P), bb = job.boxes(1, P); lap("boxes")
-        let pairs = job.findPairs(P, ba, bb); lap("broadphase \(pairs.count)")
-        let eps = job.eps
-        var n = 0
-        for pr in pairs {
-            let a = job.tris[0][Int(pr.x)], b = job.tris[1][Int(pr.y)]
-            if case .none = TriTri.intersect((P[Int(a.x)], P[Int(a.y)], P[Int(a.z)]), (P[Int(b.x)], P[Int(b.y)], P[Int(b.z)]), eps: eps) {} else { n += 1 }
-        }
-        lap("narrow(serial) \(n)")
-        }
-        let job = BooleanJob(a, b, options: o)
-        var clock = Date()
-        func lap(_ n: String) { print("  \(n) \(String(format: "%.1f", Date().timeIntervalSince(clock) * 1000)) ms"); clock = Date() }
-        job.weld(); lap("weld")
-        let P0 = job.pool.points
-        let ba = job.boxes(0, P0), bb = job.boxes(1, P0); lap("boxes")
-        let pairs = job.findPairs(P0, ba, bb); lap("pairs")
-        var segs: [(SIMD2<Int32>, PairHit)] = []
-        for pr in pairs { let a = job.tris[0][Int(pr.x)], b = job.tris[1][Int(pr.y)]
-            let h = TriTri.intersect((P0[Int(a.x)], P0[Int(a.y)], P0[Int(a.z)]), (P0[Int(b.x)], P0[Int(b.y)], P0[Int(b.z)]), eps: job.eps)
-            if case .none = h {} else { segs.append((pr, h)) } }
-        lap("narrow")
-        for (pr, h) in segs { if case .segment(let p, let q) = h { let u = job.pool.add(p), v = job.pool.add(q)
-            if u != v { let sg = SIMD2(Int32(u), Int32(v)); job.cons[0][pr.x, default: []].append(sg); job.cons[1][pr.y, default: []].append(sg) } } }
-        lap("pool+link")
-        job.findEdgeSplits(boxA: ba, boxB: bb); lap("edgeSplits")
-        for s in 0..<2 { job.retriangulate(s) }; lap("retri")
-        _ = job.classify(0); lap("classify0"); _ = job.classify(1); lap("classify1")
     }
 }

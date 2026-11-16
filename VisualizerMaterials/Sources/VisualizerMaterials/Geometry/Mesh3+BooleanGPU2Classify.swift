@@ -42,6 +42,7 @@ extension GPU2Run {
         let nF = faces.count, nV = job.pool.points.count
         guard let fb = g.buf(faces), let counts = g.zeros((nV + 1) * 4), let list = g.zeros(nF * 12),
               let cursor = g.zeros(nV * 4), let parent = g.zeros(nF * 4) else { return nil }
+        lap("g.patchPrep")
         let cutKeys = job.cut.sorted().map { SIMD2<UInt32>(UInt32($0 >> 32), UInt32($0 & 0xFFFF_FFFF)) }
         guard let keyBuf = g.buf(cutKeys) else { return nil }
         guard g.run({ enc in
@@ -52,6 +53,7 @@ extension GPU2Run {
             g.go(enc, "csr_fill", nF, [.buf(fb), .buf(counts), .buf(cursor), .buf(list), .val(UInt32(nF))])
             g.go(enc, "cc_init", nF, [.buf(parent), .val(UInt32(nF))])
         }) else { return nil }
+        lap("g.csr")
         // components: batches of rounds until the last round changes nothing
         var rounds = 0
         while true {
@@ -73,6 +75,7 @@ extension GPU2Run {
             guard g.run({ enc in for _ in 0..<4 { g.go(enc, "cc_jump", nF, [.buf(parent), .buf(flag), .val(UInt32(nF))]) } }) else { return nil }
             if g.u32(flag, 0) == 0 { break }
         }
+        lap("g.ccLoop")
         job.stats.seconds["g.ccRounds"] = Double(rounds)
         guard let maxA = g.zeros(nF * 4), let win = g.zeros(nF * 4), let rflags = g.zeros((nF + 1) * 4), let posB = Optional(posBuf!) else { return nil }
         g.fill(win, UInt32.max)
@@ -203,25 +206,17 @@ extension GPU2Run {
         guard let usedList = g.zeros(nUsed * 4) else { return nil }
         // pool and source tables, double-single
         func hiLo(_ v: [Vec3]) -> ([SIMD4<Float>], [SIMD4<Float>]) {
-            var h = [SIMD4<Float>](), l = [SIMD4<Float>]()
-            h.reserveCapacity(v.count); l.reserveCapacity(v.count)
-            for p in v {
-                let hx = Float(p.x), hy = Float(p.y), hz = Float(p.z)
-                h.append(SIMD4(hx, hy, hz, 0))
-                l.append(SIMD4(Float(p.x - Double(hx)), Float(p.y - Double(hy)), Float(p.z - Double(hz)), 0))
-            }
-            return (h, l)
+            (pmap(v) { SIMD4(Float($0.x), Float($0.y), Float($0.z), 0) },
+             pmap(v) { p in SIMD4(Float(p.x - Double(Float(p.x))), Float(p.y - Double(Float(p.y))), Float(p.z - Double(Float(p.z))), 0) })
         }
         let (ph, pl) = hiLo(P)
         let (sh, sl) = hiLo(mA.positions + mB.positions)
         var sn = [SIMD4<Float>](), suv = [SIMD2<Float>]()
         for m in [mA, mB] {
-            for i in 0..<m.positions.count {
-                let n = i < m.normals.count && m.normals.count == m.positions.count ? m.normals[i] : .zero
-                sn.append(SIMD4(Float(n.x), Float(n.y), Float(n.z), 0))
-                let t = i < m.uvs.count && m.uvs.count == m.positions.count ? m.uvs[i] : .zero
-                suv.append(SIMD2(Float(t.x), Float(t.y)))
-            }
+            if m.normals.count == m.positions.count { sn += pmap(m.normals) { SIMD4(Float($0.x), Float($0.y), Float($0.z), 0) } }
+            else { sn += [SIMD4<Float>](repeating: .zero, count: m.positions.count) }
+            if m.uvs.count == m.positions.count { suv += pmap(m.uvs) { SIMD2(Float($0.x), Float($0.y)) } }
+            else { suv += [SIMD2<Float>](repeating: .zero, count: m.positions.count) }
         }
         let srcIdx = mA.indices + mB.indices
         let faceSrc = job.faceSrc[0] + job.faceSrc[1]
@@ -230,6 +225,7 @@ extension GPU2Run {
               let nsum = g.zeros(nUsed * 16), let first = g.zeros(nUsed * 4), let cornerUV = g.zeros(nKept * 24),
               let outIdx = g.zeros(nKept * 12), let outN = g.zeros(nUsed * 16), let outUV = g.zeros(nUsed * 8) else { return nil }
         g.fill(first, UInt32.max)
+        lap("g.asmPrep")
         // newIndex[pid] = exclusive prefix of the used flags
         guard g.run({ enc in
             g.go(enc, "asm_used_list", P.count, [.buf(used), .buf(usedFlags), .buf(usedList), .val(UInt32(P.count))])
@@ -241,10 +237,10 @@ extension GPU2Run {
         lap("g.asmKernels")
         var out = Mesh3()
         let ul = g.read(usedList, UInt32.self, nUsed)
-        out.positions = ul.map { P[Int($0)] }
+        out.positions = pmap(ul) { P[Int($0)] }
         let nn = g.read(outN, SIMD4<Float>.self, nUsed), uu = g.read(outUV, SIMD2<Float>.self, nUsed)
-        out.normals = nn.map { Vec3(Double($0.x), Double($0.y), Double($0.z)) }
-        out.uvs = uu.map { Vec2(Double($0.x), Double($0.y)) }
+        out.normals = pmap(nn) { Vec3(Double($0.x), Double($0.y), Double($0.z)) }
+        out.uvs = pmap(uu) { Vec2(Double($0.x), Double($0.y)) }
         out.indices = g.read(outIdx, UInt32.self, nKept * 3)
         lap("g.asmReadback")
         return out
@@ -260,7 +256,8 @@ extension BooleanJob {
         guard let g = BooleanGPU2.shared else { return nil }
         let run = GPU2Run(job: self, g: g)
         let t0 = Date()
-        weld(); stats.seconds["weld"] = Date().timeIntervalSince(t0)
+        guard run.weld() else { return nil }
+        stats.seconds["weld"] = Date().timeIntervalSince(t0)
         let t1 = Date()
         guard run.cutAll() else { return nil }
         stats.seconds["cut"] = Date().timeIntervalSince(t1)

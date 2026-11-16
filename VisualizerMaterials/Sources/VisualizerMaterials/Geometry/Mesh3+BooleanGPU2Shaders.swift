@@ -85,15 +85,23 @@ enum BooleanGPU2Source {
                            constant uint& n [[buffer(4)]], uint i [[thread_position_in_grid]]) {
         if (i >= n) return;
         int3 a = cellOf(lo[i].xyz, g), b = cellOf(hi[i].xyz, g);
+        int3 d = b - a + 1;
+        if (uint(d.x) * uint(d.y) * uint(d.z) > g.dims.w) return;       // too big for the grid: in the big list
         for (int z = a.z; z <= b.z; z++) for (int y = a.y; y <= b.y; y++) for (int x = a.x; x <= b.x; x++)
             atomic_fetch_add_explicit(&counts[cellIndex(int3(x, y, z), g)], 1u, memory_order_relaxed);
     }
     kernel void grid_fill(device const float4* lo [[buffer(0)]], device const float4* hi [[buffer(1)]],
                           constant GridP& g [[buffer(2)]], device const uint* start [[buffer(3)]],
                           device atomic_uint* cursor [[buffer(4)]], device uint* entries [[buffer(5)]],
-                          constant uint& n [[buffer(6)]], uint i [[thread_position_in_grid]]) {
+                          constant uint& n [[buffer(6)]], device uint* big [[buffer(7)]],
+                          device atomic_uint* bigCount [[buffer(8)]], uint i [[thread_position_in_grid]]) {
         if (i >= n) return;
         int3 a = cellOf(lo[i].xyz, g), b = cellOf(hi[i].xyz, g);
+        int3 d = b - a + 1;
+        if (uint(d.x) * uint(d.y) * uint(d.z) > g.dims.w) {
+            big[atomic_fetch_add_explicit(bigCount, 1u, memory_order_relaxed)] = i;
+            return;
+        }
         for (int z = a.z; z <= b.z; z++) for (int y = a.y; y <= b.y; y++) for (int x = a.x; x <= b.x; x++) {
             uint c = cellIndex(int3(x, y, z), g);
             uint k = atomic_fetch_add_explicit(&cursor[c], 1u, memory_order_relaxed);
@@ -102,8 +110,8 @@ enum BooleanGPU2Source {
     }
 
     // mode 0: boxes overlap.  mode 1: Q is a point (id qid) and lies within `margin` of an edge of R's triangle
-    // (not one of its corners).  mode 3: Q and R are points; report j < i within `margin`.
-    struct QP { uint n; uint mode; uint phase; uint cap; float margin; float p0; float p1; float p2; };
+    // (not one of its corners).  mode 3: Q and R are points; report j < i within `margin`. mode 4: the same for every j.
+    struct QP { uint n; uint mode; uint phase; uint cap; float margin; uint nBig; float p1; float p2; };
     inline bool nearEdge(float3 p, uint pid, uint4 t, device const float4* pos, float margin) {
         if (t.x == pid || t.y == pid || t.z == pid) return false;
         for (int k = 0; k < 3; k++) {
@@ -118,13 +126,23 @@ enum BooleanGPU2Source {
         }
         return false;
     }
+    inline bool accept(float3 ql, float3 qh, float3 rl, float3 rh, uint i, uint j, constant QP& qp,
+                       device const uint4* triR, device const float4* pos) {
+        if (rl.x > qh.x || rh.x < ql.x || rl.y > qh.y || rh.y < ql.y || rl.z > qh.z || rh.z < ql.z) return false;
+        if (qp.mode == 1) return nearEdge((ql + qh) * 0.5f, i, triR[j], pos, qp.margin);
+        if (qp.mode == 3 || qp.mode == 4) {
+            if (qp.mode == 3 && j >= i) return false;
+            return length(rl - (ql + qh) * 0.5f) <= qp.margin;
+        }
+        return true;
+    }
     kernel void query(device const float4* loQ [[buffer(0)]], device const float4* hiQ [[buffer(1)]],
                       device const float4* loR [[buffer(2)]], device const float4* hiR [[buffer(3)]],
                       device const uint* start [[buffer(4)]], device const uint* entries [[buffer(5)]],
                       constant GridP& g [[buffer(6)]], constant QP& qp [[buffer(7)]],
                       device uint* counts [[buffer(8)]], device const uint* offs [[buffer(9)]],
                       device uint2* out [[buffer(10)]],
-                      device const uint* qid [[buffer(11)]], device const uint4* triR [[buffer(12)]],
+                      device const uint* big [[buffer(11)]], device const uint4* triR [[buffer(12)]],
                       device const float4* pos [[buffer(13)]],
                       uint i [[thread_position_in_grid]]) {
         if (i >= qp.n) return;
@@ -137,17 +155,17 @@ enum BooleanGPU2Source {
             for (uint e = start[c]; e < start[c + 1]; e++) {
                 uint j = entries[e];
                 float3 rl = loR[j].xyz, rh = hiR[j].xyz;
-                if (rl.x > qh.x || rh.x < ql.x || rl.y > qh.y || rh.y < ql.y || rl.z > qh.z || rh.z < ql.z) continue;
-                if (cellIndex(cellOf(max(ql, rl), g), g) != c) continue;
-                if (qp.mode == 1) {
-                    if (!nearEdge((ql + qh) * 0.5f, i, triR[j], pos, qp.margin)) continue;
-                } else if (qp.mode == 3) {
-                    if (j >= i) continue;
-                    if (length(rl - (ql + qh) * 0.5f) > qp.margin) continue;
-                }
+                if (cellIndex(cellOf(max(ql, rl), g), g) != c) continue;      // each pair once: in the cell of the overlap's corner
+                if (!accept(ql, qh, rl, rh, i, j, qp, triR, pos)) continue;
                 if (qp.phase == 1 && count < qp.cap) out[base + count] = uint2(i, j);
                 count++;
             }
+        }
+        for (uint e = 0; e < qp.nBig; e++) {                                    // boxes too big for the grid
+            uint j = big[e];
+            if (!accept(ql, qh, loR[j].xyz, hiR[j].xyz, i, j, qp, triR, pos)) continue;
+            if (qp.phase == 1 && count < qp.cap) out[base + count] = uint2(i, j);
+            count++;
         }
         if (qp.phase == 0) { counts[i] = count; return; }
         // insertion sort of this query's pairs by j: the order is then independent of thread scheduling

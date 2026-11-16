@@ -32,17 +32,21 @@ final class BoxGrid2 {
     let n: Int
     let lo: MTLBuffer, hi: MTLBuffer
     var start: MTLBuffer, entries: MTLBuffer
-    init(spec: GridP, n: Int, lo: MTLBuffer, hi: MTLBuffer, start: MTLBuffer, entries: MTLBuffer) {
-        self.spec = spec; self.n = n; self.lo = lo; self.hi = hi; self.start = start; self.entries = entries
+    /// Boxes covering more cells than `GridP.dims.w` are not in the cells: every query tests them directly.
+    var big: MTLBuffer, nBig: Int
+    init(spec: GridP, n: Int, lo: MTLBuffer, hi: MTLBuffer, start: MTLBuffer, entries: MTLBuffer, big: MTLBuffer, nBig: Int) {
+        self.spec = spec; self.n = n; self.lo = lo; self.hi = hi; self.start = start; self.entries = entries; self.big = big; self.nBig = nBig
     }
 }
 
 final class BooleanGPU2: @unchecked Sendable {
     static let shared: BooleanGPU2? = BooleanGPU2()
-    /// Booleans with at least this many triangles (both operands) take the GPU-heavy pipeline.
-    nonisolated(unsafe) static var minTriangles = 20_000
+    /// Booleans with at least this many triangles (both operands together) take the GPU-heavy pipeline.
+    nonisolated(unsafe) static var minTriangles = Int(ProcessInfo.processInfo.environment["VIZ_BOOLEAN_GPU2_MIN"] ?? "") ?? 15_000
     let device: MTLDevice, queue: MTLCommandQueue
     private var pso: [String: MTLComputePipelineState] = [:]
+    /// How many booleans ran on the pipeline, and how many it handed back to the CPU path (tests).
+    nonisolated(unsafe) static var runs = 0, fallbacks = 0
     /// Seconds spent compiling the shaders on first use (reported by the benchmarks as the cold-start cost).
     private(set) var compileSeconds = 0.0
 
@@ -147,20 +151,21 @@ final class BooleanGPU2: @unchecked Sendable {
             }
         }
         guard ok else { return nil }
-        var entries: [MTLBuffer] = [], cursors: [MTLBuffer] = []
+        var entries: [MTLBuffer] = [], cursors: [MTLBuffer] = [], bigs: [MTLBuffer] = [], bigCounts: [MTLBuffer] = []
         for k in 0..<sets.count {
             let total = u32(counts[k], cells)
-            guard total < 200_000_000, let e = zeros(total * 4), let c = zeros(cells * 4) else { return nil }
-            entries.append(e); cursors.append(c)
+            guard total < 200_000_000, let e = zeros(total * 4), let c = zeros(cells * 4),
+                  let b = zeros(sets[k].n * 4), let bc = zeros(16) else { return nil }
+            entries.append(e); cursors.append(c); bigs.append(b); bigCounts.append(bc)
         }
         let ok2 = run { enc in
             for (k, s) in sets.enumerated() {
                 go(enc, "grid_fill", s.n, [.buf(s.lo), .buf(s.hi), .val(spec), .buf(counts[k]), .buf(cursors[k]),
-                                           .buf(entries[k]), .val(UInt32(s.n))])
+                                           .buf(entries[k]), .val(UInt32(s.n)), .buf(bigs[k]), .buf(bigCounts[k])])
             }
         }
         guard ok2 else { return nil }
-        return sets.enumerated().map { BoxGrid2(spec: spec, n: $1.n, lo: $1.lo, hi: $1.hi, start: counts[$0], entries: entries[$0]) }
+        return sets.enumerated().map { BoxGrid2(spec: spec, n: $1.n, lo: $1.lo, hi: $1.hi, start: counts[$0], entries: entries[$0], big: bigs[$0], nBig: u32(bigCounts[$0], 0)) }
     }
 
     /// Pairs (query index, grid entry) from querying `q` boxes against `grid`. `mode`: 0 box overlap, 1 query is a
@@ -168,12 +173,12 @@ final class BooleanGPU2: @unchecked Sendable {
     /// within `margin` of earlier points. Returns the pairs as a GPU buffer in (query, entry) order.
     func query(grid: BoxGrid2, loQ: MTLBuffer, hiQ: MTLBuffer, nQ: Int, mode: UInt32, margin: Float,
                tris: MTLBuffer, pos: MTLBuffer) -> (pairs: MTLBuffer, count: Int)? {
-        guard nQ > 0, let counts = zeros((nQ + 1) * 4), let dummy = zeros(16), let one = zeros(16) else { return nil }
-        struct QP { var n: UInt32; var mode: UInt32; var phase: UInt32; var cap: UInt32; var margin: Float; var p0: Float = 0; var p1: Float = 0; var p2: Float = 0 }
+        guard nQ > 0, let counts = zeros((nQ + 1) * 4), let one = zeros(16) else { return nil }
+        struct QP { var n: UInt32; var mode: UInt32; var phase: UInt32; var cap: UInt32; var margin: Float; var nBig: UInt32; var p1: Float = 0; var p2: Float = 0 }
         func args(_ phase: UInt32, _ cap: UInt32, _ out: MTLBuffer) -> [GArg] {
             [.buf(loQ), .buf(hiQ), .buf(grid.lo), .buf(grid.hi), .buf(grid.start), .buf(grid.entries),
-             .val(grid.spec), .val(QP(n: UInt32(nQ), mode: mode, phase: phase, cap: cap, margin: margin)),
-             .buf(counts), .buf(counts), .buf(out), .buf(dummy), .buf(tris), .buf(pos)]
+             .val(grid.spec), .val(QP(n: UInt32(nQ), mode: mode, phase: phase, cap: cap, margin: margin, nBig: UInt32(grid.nBig))),
+             .buf(counts), .buf(counts), .buf(out), .buf(grid.big), .buf(tris), .buf(pos)]
         }
         guard run({ enc in
             go(enc, "query", nQ, args(0, 0, one))
@@ -188,7 +193,7 @@ final class BooleanGPU2: @unchecked Sendable {
 #else
 final class BooleanGPU2: @unchecked Sendable {
     static let shared: BooleanGPU2? = nil
-    nonisolated(unsafe) static var minTriangles = 20_000
+    nonisolated(unsafe) static var minTriangles = Int(ProcessInfo.processInfo.environment["VIZ_BOOLEAN_GPU2_MIN"] ?? "") ?? 15_000
     static func prewarm() {}
 }
 #endif
