@@ -2,10 +2,9 @@
 //
 //  Input is a triangle's boundary ring (corners plus every vertex that sits on an edge, so neighbours that were
 //  cut agree), interior points, and constraint segments (the intersection curve). Output is a triangulation of
-//  the triangle that contains every constraint as a chain of edges and uses only the given vertices plus one
-//  private centre vertex (the start of the triangulation is a star round the centroid).
+//  the triangle that contains every constraint as a chain of edges and uses only the given vertices.
 //
-//  Method: star from the centroid → Delaunay insertion of the interior points (exact `orient2d` locates) →
+//  Method: ear-clipped ring → Delaunay insertion of the interior points (exact `orient2d` locates) →
 //  constraint recovery by edge flips (Sloan), a constraint through a vertex split at it → Delaunay flips on the
 //  unconstrained edges for shape. No Steiner points on constraints or the boundary: the cut curve and the
 //  neighbours' edges are exactly the pooled vertices, which is what lets both meshes share the curve.
@@ -28,21 +27,46 @@ struct CDT2 {
 
     static func key(_ a: Int, _ b: Int) -> UInt64 { UInt64(min(a, b)) << 32 | UInt64(max(a, b)) }
 
-    /// `ring`: CCW polygon points (the triangle's boundary with its edge vertices). The centroid is vertex
-    /// `ring.count` and is private to this triangulation.
+    /// `ring`: CCW polygon points (the triangle's boundary with its edge vertices). The start is an ear-clipped
+    /// triangulation of the ring itself: no private interior vertex (a centroid could land within rounding of a
+    /// real cut vertex and leave zero-area slivers there, which the classifier and the weld then mangled).
     init(ring: [Vec2]) {
         p = ring
         let m = ring.count
+        vtri = Array(repeating: 0, count: m)
         var c = Vec2.zero
         for q in ring { c += q }
-        p.append(c / Double(m))
-        vtri = Array(repeating: 0, count: m + 1)
-        for i in 0..<m {
-            tv.append(SIMD3(Int32(i), Int32((i + 1) % m), Int32(m)))
-            tn.append(SIMD3(Int32((i + 1) % m), Int32((i + m - 1) % m), -1))
-            vtri[i] = Int32(i)
+        c /= Double(m)
+        var poly = Array(0..<m)
+        func area2(_ a: Vec2, _ b: Vec2, _ c: Vec2) -> Double { (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x) }
+        while poly.count > 3 {
+            var best = -1, bestArea = 0.0
+            let n = poly.count
+            for k in 0..<n {
+                let a = poly[(k + n - 1) % n], v = poly[k], b = poly[(k + 1) % n]
+                guard Robust.orient2d(ring[a], ring[v], ring[b]) > 0 else { continue }
+                // the rest must keep some area (never leave a collinear remainder)
+                var rest = 0.0
+                for j in 1..<(n - 1) { rest += area2(ring[poly[(k + 1) % n]], ring[poly[(k + 1 + j) % n]], ring[poly[(k + 2 + j) % n]]) }
+                let ar = area2(ring[a], ring[v], ring[b])
+                if rest > 0, ar > bestArea { best = k; bestArea = ar }
+            }
+            if best < 0 { best = 0 }                                  // pathological: clip anyway
+            let n2 = poly.count
+            tv.append(SIMD3(Int32(poly[(best + n2 - 1) % n2]), Int32(poly[best]), Int32(poly[(best + 1) % n2])))
+            poly.remove(at: best)
         }
-        vtri[m] = 0
+        tv.append(SIMD3(Int32(poly[0]), Int32(poly[1]), Int32(poly[2])))
+        var edge: [UInt64: (Int32, Int)] = [:]
+        for (t, f) in tv.enumerated() { for k in 0..<3 {
+            edge[UInt64(f[(k + 1) % 3]) << 32 | UInt64(f[(k + 2) % 3])] = (Int32(t), k)
+        } }
+        tn = tv.map { f in
+            var r = SIMD3<Int32>(-1, -1, -1)
+            for k in 0..<3 { if let o = edge[UInt64(f[(k + 2) % 3]) << 32 | UInt64(f[(k + 1) % 3])] { r[k] = o.0 } }
+            return r
+        }
+        for (t, f) in tv.enumerated() { for k in 0..<3 { vtri[Int(f[k])] = Int32(t) } }
         var ext = 0.0
         for q in ring { ext = max(ext, abs(q.x - c.x), abs(q.y - c.y)) }
         tol = ext * ext * ext * ext * 1e-13
