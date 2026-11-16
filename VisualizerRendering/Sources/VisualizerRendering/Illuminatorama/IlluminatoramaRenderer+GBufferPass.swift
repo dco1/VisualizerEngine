@@ -18,7 +18,24 @@ extension IlluminatoramaRenderer {
                                  threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1))
     }
 
+    /// DH-1685 — CPU ms `encodeGBufferPass` took, per frame, while `gbufferEncodeTimingEnabled`.
+    public var gbufferEncodeTimingEnabled: Bool {
+        get { gbs.encodeTimingEnabled }
+        set { gbs.encodeTimingEnabled = newValue; if newValue { gbs.encodeMsSamples.removeAll() } }
+    }
+    public var gbufferEncodeMsSamples: [Double] { gbs.encodeMsSamples }
+
     func encodeGBufferPass(_ cb: MTLCommandBuffer) {
+        if gbs.encodeTimingEnabled {
+            let t0 = DispatchTime.now().uptimeNanoseconds
+            defer { gbs.encodeMsSamples.append(Double(DispatchTime.now().uptimeNanoseconds - t0) / 1_000_000) }
+            encodeGBufferPassBody(cb)
+        } else {
+            encodeGBufferPassBody(cb)
+        }
+    }
+
+    private func encodeGBufferPassBody(_ cb: MTLCommandBuffer) {
         // DH-0140 — the lane was decided when this frame's uniforms were written; pick the
         // matching pipelines once. The extended variants exist whenever `extendedGBufferActive`.
         let extended = extendedGBufferActive

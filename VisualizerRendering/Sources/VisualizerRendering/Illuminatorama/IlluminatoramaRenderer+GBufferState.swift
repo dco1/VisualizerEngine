@@ -96,6 +96,9 @@ final class GBufferState {
     /// Bumped whenever `uploadInstances` regroups. NOT bumped on its static-skip frames, whose
     /// grouping is identical — which is what lets the bounds survive them for free.
     var meshGroupsVersion = 0
+    /// DH-1685 — opt-in CPU timing of `encodeGBufferPass` (ms per frame, newest last).
+    var encodeTimingEnabled = false
+    var encodeMsSamples: [Double] = []
     /// The exact view-projection the G-buffer pass rasterises with — JITTERED when TAA is. The
     /// cull contract is "the matrix the pass uses", not an unjittered approximation of it.
     var gbufferCullVP = matrix_identity_float4x4
