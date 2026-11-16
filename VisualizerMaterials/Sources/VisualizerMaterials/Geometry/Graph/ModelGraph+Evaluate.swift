@@ -15,6 +15,7 @@ import simd
 public final class GraphCache: @unchecked Sendable {
     private let lock = NSLock()
     private var entries: [UInt64: GraphValue] = [:]
+    private var canonical: [UInt64: GraphValue] = [:]
     private var log: [(id: Int, kind: NodeKind)] = []
 
     public init() {}
@@ -23,10 +24,19 @@ public final class GraphCache: @unchecked Sendable {
     public var computeCount: Int { lock.withLock { log.count } }
     public var entryCount: Int { lock.withLock { entries.count } }
     public func resetCounters() { lock.withLock { log.removeAll() } }
-    public func removeAll() { lock.withLock { entries.removeAll() } }
+    public func removeAll() { lock.withLock { entries.removeAll(); canonical.removeAll() } }
     func value(for key: UInt64) -> GraphValue? { lock.withLock { entries[key] } }
     func store(_ v: GraphValue, key: UInt64, id: Int, kind: NodeKind) { lock.withLock { entries[key] = v; log.append((id, kind)) } }
-    public func trim(keeping keys: Set<UInt64>) { lock.withLock { entries = entries.filter { keys.contains($0.key) } } }
+    /// The canonical (byte-stable) form of a result, made once per key (see GraphCanonical.swift).
+    func canonicalValue(for key: UInt64, make: () -> GraphValue) -> GraphValue {
+        if let v = lock.withLock({ canonical[key] }) { return v }
+        let v = make()
+        lock.withLock { canonical[key] = v }
+        return v
+    }
+    public func trim(keeping keys: Set<UInt64>) {
+        lock.withLock { entries = entries.filter { keys.contains($0.key) }; canonical = canonical.filter { keys.contains($0.key) } }
+    }
 }
 
 public extension ModelGraph {
@@ -73,7 +83,14 @@ public extension ModelGraph {
             done[id] = v
             return v
         }
-        let v = try run(target)
+        var v = try run(target)
+        // Nodes hand each other their RAW results (exact coordinates, whatever order the operator built them in):
+        // canonicalising between nodes snapped vertices to a grid, and that moved a boolean's cut vertices into
+        // sub-tolerance slivers its next boolean could not retriangulate (open edges). Only what leaves the graph
+        // is canonical, so it is still byte-stable.
+        if case .mesh(let m) = v, GraphEvaluator.needsCanonical(target, index: index) {
+            v = cache.canonicalValue(for: keys[target]!) { .mesh(m.canonicalized()) }
+        }
         if prune { cache.trim(keeping: Set(keys.values)) }
         return v
     }
@@ -115,10 +132,19 @@ enum GraphEvaluator {
     /// Kinds whose engine operator orders its output by dictionary iteration (see GraphCanonical.swift).
     static let unordered: Set<NodeKind> = [.modifier, .subdivide, .decimate, .bevel, .boolean]
 
+    /// Whether `id`'s mesh is, or is built from, an operator whose vertex / triangle order is not stable.
+    static func needsCanonical(_ id: Int, index: [Int: GraphNode]) -> Bool {
+        var seen = Set<Int>(), stack = [id]
+        while let i = stack.popLast() {
+            guard seen.insert(i).inserted, let n = index[i] else { continue }
+            if unordered.contains(n.kind) { return true }
+            stack.append(contentsOf: n.inputs.values)
+        }
+        return false
+    }
+
     static func compute(_ n: GraphNode, inputs ins: [String: GraphValue]) throws -> GraphValue {
-        let v = try computeRaw(n, inputs: ins)
-        if unordered.contains(n.kind), case .mesh(let m) = v { return .mesh(m.canonicalized()) }
-        return v
+        try computeRaw(n, inputs: ins)
     }
 
     private static func computeRaw(_ n: GraphNode, inputs ins: [String: GraphValue]) throws -> GraphValue {
