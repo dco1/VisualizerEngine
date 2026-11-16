@@ -35,6 +35,9 @@ public struct BooleanOptions: Sendable {
     public var tolerance: Double = 1e-9
     /// Allow the Metal broadphase / winding kernels (used only for big inputs, and only where a device exists).
     public var useGPU: Bool = true
+    /// With `useGPU`: run the GPU-heavy pipeline (grid broadphase, GPU narrow-phase filter, GPU patches and
+    /// winding, GPU assembly: `Mesh3+BooleanGPU2*.swift`) on big inputs. False keeps the first GPU path.
+    public var useGPUPipeline: Bool = true
     public init() {}
 }
 
@@ -81,6 +84,12 @@ public extension Mesh3 {
 
     /// The general entry point, with statistics.
     func boolean(_ op: BooleanOp, _ other: Mesh3, options: BooleanOptions = BooleanOptions()) -> BooleanResult {
+        if options.useGPU, options.useGPUPipeline, BooleanGPU2.shared != nil,
+           triangleCount + other.triangleCount >= BooleanGPU2.minTriangles {
+            let fast = BooleanJob(self, other, options: options)
+            if let mesh = fast.runGPU2(op) { BooleanGPU2.runs += 1; return BooleanResult(mesh: mesh, stats: fast.stats) }
+            BooleanGPU2.fallbacks += 1
+        }
         let job = BooleanJob(self, other, options: options)
         var clock = Date()
         func lap(_ name: String) { job.stats.seconds[name] = Date().timeIntervalSince(clock); clock = Date() }

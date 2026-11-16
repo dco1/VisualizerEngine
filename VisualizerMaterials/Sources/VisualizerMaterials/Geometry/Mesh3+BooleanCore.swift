@@ -135,7 +135,7 @@ final class BooleanJob: @unchecked Sendable {
 
     /// Every pool point that lies on an edge of a mesh (and is not its endpoint) splits that edge, so the
     /// triangles on both sides of it agree on the boundary.
-    private func findEdgeSplits(boxA: ([Vec3], [Vec3]), boxB: ([Vec3], [Vec3])) {
+    func findEdgeSplits(boxA: ([Vec3], [Vec3]), boxB: ([Vec3], [Vec3])) {
         let P = pool.points
         let ovLo = simd_max(boxA.0.reduce(Vec3(repeating: .infinity), simd_min), boxB.0.reduce(Vec3(repeating: .infinity), simd_min))
         let ovHi = simd_min(boxA.1.reduce(Vec3(repeating: -.infinity), simd_max), boxB.1.reduce(Vec3(repeating: -.infinity), simd_max))
@@ -176,7 +176,7 @@ final class BooleanJob: @unchecked Sendable {
 
     // MARK: retriangulate
 
-    private struct CutResult {
+    struct CutResult {
         var tris: [SIMD3<Int32>] = []          // local indices
         var localId: [Int32] = []              // local → pool id (−1: the private centre)
         var centre = Vec3.zero
@@ -184,7 +184,7 @@ final class BooleanJob: @unchecked Sendable {
         var failures = 0
     }
 
-    private func retriangulate(_ s: Int) {
+    func retriangulate(_ s: Int) {
         let P = pool.points
         let tr = tris[s]
         var work: [Int] = []
@@ -225,7 +225,7 @@ final class BooleanJob: @unchecked Sendable {
         splits[s][UInt64(min(a, b)) << 32 | UInt64(max(a, b))] != nil
     }
 
-    private static func cutOne(_ v: SIMD3<Int32>, _ P: [Vec3], _ segs: [SIMD2<Int32>],
+    static func cutOne(_ v: SIMD3<Int32>, _ P: [Vec3], _ segs: [SIMD2<Int32>],
                                _ splits: [UInt64: [(Double, Int32)]]) -> CutResult {
         let corner = [v.x, v.y, v.z]
         var ring: [Int32] = []
