@@ -19,6 +19,48 @@ import simd
 #if canImport(Metal)
 import Metal
 
+/// The clusters of a GPU weld, still on the GPU: `rep[i]` the representative (an original vertex index), `remap[i]` its
+/// new index, `repList[k]` the original index of new vertex k.
+struct WeldCore {
+    var rep: MTLBuffer, remap: MTLBuffer, repList: MTLBuffer, keys: MTLBuffer, sidx: MTLBuffer
+    var nreps: Int, p: GP
+
+    /// Cluster `n` float positions (any frame: cells are floor(p / distance)). `uv` / `nrm` (xyz) veto merges as in
+    /// `Mesh3.welded`. nil on a GPU error.
+    static func make(_ g: ModelGPU, pos: MTLBuffer, uv: MTLBuffer?, nrm: MTLBuffer?, n: Int, distance: Double,
+                     uvTolerance: Double, normalAngleDegrees: Double) -> WeldCore? {
+        var npad = 2; while npad < n { npad <<= 1 }
+        let keys = g.buffer(count: npad, UInt64.self), sidx = g.buffer(count: npad, UInt32.self)
+        let status = g.buffer(count: n, UInt32.self), rep = g.buffer(count: n, UInt32.self)
+        let counter = g.buffer(count: 1, UInt32.self)
+        memset(status.contents(), 0, n * 4)
+        let uvB = uv ?? g.buffer(count: 1, SIMD2<Float>.self), nB = nrm ?? g.buffer(count: 1, SIMD4<Float>.self)
+        let flags: UInt32 = (uv != nil ? 1 : 0) | (nrm != nil ? 2 : 0)
+        let p = GP(a: UInt32(n), b: UInt32(npad), c: flags, d: UInt32(npad), x: Float(distance),
+                   y: Float(distance * distance * (1 + 1e-5)), z: Float(uvTolerance), w: Float(cos(normalAngleDegrees * .pi / 180) - 1e-12))
+        guard g.run({ s in
+            s.go("weld_keys", npad, [pos, keys, sidx], p)
+            s.sort(keys: keys, values: sidx, pow2: npad)
+        }) else { return nil }
+        var rounds = 0
+        repeat {
+            counter.ptr(UInt32.self).pointee = 0
+            guard g.run({ s in for _ in 0 ..< 4 { s.go("weld_resolve", n, [pos, uvB, nB, keys, sidx, status, counter], p) } }) else { return nil }
+            rounds += 4
+        } while counter.ptr(UInt32.self).pointee != 0 && rounds < 4096
+        guard rounds < 4096 else { return nil }
+        let scanB = g.buffer(count: n + 1, UInt32.self), remap = g.buffer(count: n, UInt32.self)
+        let repList = g.buffer(count: n, UInt32.self)
+        guard g.run({ s in
+            s.go("weld_pick", n, [pos, uvB, nB, keys, sidx, status, rep], p)
+            s.go("weld_flag", n + 1, [rep, scanB], GP(a: UInt32(n)))
+            s.scan(scanB, n + 1)
+            s.go("weld_remap", n, [rep, scanB, remap, repList], GP(a: UInt32(n)))
+        }) else { return nil }
+        return WeldCore(rep: rep, remap: remap, repList: repList, keys: keys, sidx: sidx, nreps: Int(scanB.ptr(UInt32.self)[n]), p: p)
+    }
+}
+
 public extension Mesh3 {
 
     /// `welded` on the chosen backend. `.gpu` falls back to the CPU when there is no Metal device or the distance
@@ -34,55 +76,26 @@ public extension Mesh3 {
         let n = positions.count, tris = indices.count / 3
         guard len3(b.max - b.min) / distance < 1e8 else { return nil }
         let hasUV = uvs.count == n, hasN = normals.count == n
-        var npad = 2; while npad < n { npad <<= 1 }
-
         let posB = g.buffer(positions.map { SIMD4<Float>(Float($0.x - b.min.x), Float($0.y - b.min.y), Float($0.z - b.min.z), 0) })
-        let uvB = g.buffer(hasUV ? uvs.map { SIMD2<Float>(Float($0.x), Float($0.y)) } : [SIMD2<Float>(0, 0)])
-        let nB = g.buffer(hasN ? normals.map { SIMD4<Float>(Float($0.x), Float($0.y), Float($0.z), 0) } : [SIMD4<Float>(0, 0, 0, 0)])
-        let keys = g.buffer(count: npad, UInt64.self), sidx = g.buffer(count: npad, UInt32.self)
-        let status = g.buffer(count: n, UInt32.self), rep = g.buffer(count: n, UInt32.self)
-        let counter = g.buffer(count: 1, UInt32.self)
-        memset(status.contents(), 0, n * 4)
-        let flags: UInt32 = (hasUV ? 1 : 0) | ((hasN && normalAngleDegrees < 180) ? 2 : 0)
-        let p = GP(a: UInt32(n), b: UInt32(npad), c: flags, d: UInt32(npad), x: Float(distance),
-                   y: Float(distance * distance * (1 + 1e-5)), z: Float(uvTolerance), w: Float(cos(normalAngleDegrees * .pi / 180) - 1e-12))
-        var ok = g.run { s in
-            s.go("weld_keys", npad, [posB, keys, sidx], p)
-            s.sort(keys: keys, values: sidx, pow2: npad)
-        }
-        guard ok else { return nil }
-        var rounds = 0
-        repeat {
-            counter.ptr(UInt32.self).pointee = 0
-            ok = g.run { s in for _ in 0 ..< 4 { s.go("weld_resolve", n, [posB, uvB, nB, keys, sidx, status, counter], p) } }
-            guard ok else { return nil }
-            rounds += 4
-        } while counter.ptr(UInt32.self).pointee != 0 && rounds < 4096
-        guard rounds < 4096 else { return nil }
-
-        let scanB = g.buffer(count: n + 1, UInt32.self), remap = g.buffer(count: n, UInt32.self)
-        let repList = g.buffer(count: n, UInt32.self), outN = g.buffer(count: n, SIMD4<Float>.self)
+        let uvB = hasUV ? g.buffer(uvs.map { SIMD2<Float>(Float($0.x), Float($0.y)) }) : nil
+        let nB = hasN ? g.buffer(normals.map { SIMD4<Float>(Float($0.x), Float($0.y), Float($0.z), 0) }) : nil
+        let useN = hasN && normalAngleDegrees < 180
+        guard let core = WeldCore.make(g, pos: posB, uv: uvB, nrm: useN ? nB : nil, n: n, distance: distance,
+                                       uvTolerance: uvTolerance, normalAngleDegrees: normalAngleDegrees) else { return nil }
+        let nreps = core.nreps
+        let outN = g.buffer(count: nreps, SIMD4<Float>.self)
         let idxB = g.buffer(indices), tkeep = g.buffer(count: tris + 1, UInt32.self), outIdx = g.buffer(count: tris * 3, UInt32.self)
-        var nreps = 0, kept = 0
-        ok = g.run { s in
-            s.go("weld_pick", n, [posB, uvB, nB, keys, sidx, status, rep], p)
-            s.go("weld_flag", n + 1, [rep, scanB], GP(a: UInt32(n)))
-            s.scan(scanB, n + 1)
-            s.go("weld_remap", n, [rep, scanB, remap, repList], GP(a: UInt32(n)))
-        }
-        guard ok else { return nil }
-        nreps = Int(scanB.ptr(UInt32.self)[n])
-        ok = g.run { s in
-            if hasN { s.go("weld_normals", nreps, [posB, uvB, nB, keys, sidx, rep, repList, outN], p) }
-            s.go("weld_tri_flag", tris + 1, [idxB, remap, tkeep], GP(a: UInt32(tris)))
+        guard g.run({ s in
+            if hasN {
+                s.go("weld_normals", nreps, [posB, uvB ?? posB, nB!, core.keys, core.sidx, core.rep, core.repList, outN], core.p)
+            }
+            s.go("weld_tri_flag", tris + 1, [idxB, core.remap, tkeep], GP(a: UInt32(tris)))
             s.scan(tkeep, tris + 1)
-            s.go("weld_tri_scatter", tris, [idxB, remap, tkeep, outIdx], GP(a: UInt32(tris)))
-        }
-        guard ok else { return nil }
-        kept = Int(tkeep.ptr(UInt32.self)[tris])
-
+            s.go("weld_tri_scatter", tris, [idxB, core.remap, tkeep, outIdx], GP(a: UInt32(tris)))
+        }) else { return nil }
+        let kept = Int(tkeep.ptr(UInt32.self)[tris])
         var out = Mesh3()
-        let rl = repList.ptr(UInt32.self)
+        let rl = core.repList.ptr(UInt32.self)
         out.positions = (0 ..< nreps).map { positions[Int(rl[$0])] }
         if hasUV { out.uvs = (0 ..< nreps).map { uvs[Int(rl[$0])] } }
         if hasN {

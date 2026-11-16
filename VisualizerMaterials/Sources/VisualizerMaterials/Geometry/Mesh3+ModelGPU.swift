@@ -51,7 +51,7 @@ final class ModelGPU: @unchecked Sendable {
         (device, queue) = (d, q)
     }
 
-    static var source: String { commonSource + weldSource + collapseSource + collapseSource2 + remeshSource + remeshSource2 }
+    static var source: String { [commonSource, weldSource, collapseSource, collapseSource2, decimateSource, remeshSource, remeshSource2].joined(separator: "\n") }
 
     func pipeline(_ name: String) -> MTLComputePipelineState {
         lock.lock(); defer { lock.unlock() }
