@@ -26,7 +26,7 @@ final class GPUTriMesh {
     let hasUV: Bool
     var pos: MTLBuffer, tri: MTLBuffer, cuv: MTLBuffer
     var capV: Int, capF: Int
-    var q: MTLBuffer, moved: MTLBuffer, anchor: MTLBuffer
+    var q: MTLBuffer, moved: MTLBuffer, anchor: MTLBuffer, posAlt: MTLBuffer
     var triOut: MTLBuffer, cuvOut: MTLBuffer
     var vs: MTLBuffer, cur: MTLBuffer, vl: MTLBuffer, vfeat: MTLBuffer
     var m1: MTLBuffer, m2: MTLBuffer, vmap: MTLBuffer, rec: MTLBuffer, vuv: MTLBuffer
@@ -49,6 +49,7 @@ final class GPUTriMesh {
         keepF = g.buffer(count: capF + 1, UInt32.self)
         memset(moved.contents(), 0, capV * 4)
         anchor = g.buffer(count: capV, SIMD4<Float>.self)
+        posAlt = g.buffer(count: capV, SIMD4<Float>.self)
         memcpy(anchor.contents(), pos.contents(), V * 16)
     }
 

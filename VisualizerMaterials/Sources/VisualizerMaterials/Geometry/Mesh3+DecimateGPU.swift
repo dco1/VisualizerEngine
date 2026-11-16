@@ -51,21 +51,21 @@ public extension Mesh3 {
                   creaseDegrees: creaseDegrees, backend: backend)
     }
 
-    internal func decimateGPU(targetTriangles: Int, creaseDegrees: Double) -> (mesh: Mesh3, report: DecimationReport)? {
-        guard let g = ModelGPU.shared, let b = bounds, !indices.isEmpty else { return nil }
+    /// The input welded by position (the CPU's TriTopology does the same, at 1e-7 of the diagonal), normalised into a
+    /// unit box around the origin as Floats, as a `GPUTriMesh` with room for `capFactor`× its faces.
+    internal func gpuPrep(_ g: ModelGPU, keepUV: Bool, capFactor: Int) -> (mesh: GPUTriMesh, core: WeldCore, center: Vec3, diag: Double)? {
+        guard let b = bounds, !indices.isEmpty else { return nil }
         let n = positions.count, T = indices.count / 3
         let center = (b.min + b.max) * 0.5, diag = Swift.max(len3(b.max - b.min), 1e-9)
-        let target = Swift.max(4, targetTriangles)
-        let hasUV = uvs.count == n
-
-        // 1. weld by position (the CPU's TriTopology does the same, at 1e-7 of the diagonal) and build the face arrays
+        let hasUV = keepUV && uvs.count == n
         let posN = g.buffer(positions.map { p in let q = (p - center) / diag; return SIMD4<Float>(Float(q.x), Float(q.y), Float(q.z), 0) })
         let uvB: MTLBuffer? = hasUV ? g.buffer(uvs.map { SIMD2<Float>(Float($0.x), Float($0.y)) }) : nil
         guard let core = WeldCore.make(g, pos: posN, uv: nil, nrm: nil, n: n, distance: 1e-7, uvTolerance: 0, normalAngleDegrees: 180) else { return nil }
         let V = core.nreps
         let idxB = g.buffer(indices), flag = g.buffer(count: T + 1, UInt32.self)
-        let wpos = g.buffer(count: V, SIMD4<Float>.self), triB = g.buffer(count: 3 * T, UInt32.self)
-        let cuvB: MTLBuffer? = hasUV ? g.buffer(count: 3 * T, SIMD2<Float>.self) : nil
+        let capV = V * capFactor, capF = T * capFactor
+        let wpos = g.buffer(count: capV, SIMD4<Float>.self), triB = g.buffer(count: 3 * capF, UInt32.self)
+        let cuvB: MTLBuffer? = hasUV ? g.buffer(count: 3 * capF, SIMD2<Float>.self) : nil
         guard g.run({ s in
             s.go("dec_prep_pos", V, [posN, core.repList, wpos], GP(a: UInt32(V)))
             s.go("dec_prep_flag", T + 1, [idxB, core.remap, wpos, flag], GP(a: UInt32(T)))
@@ -74,9 +74,16 @@ public extension Mesh3 {
         }) else { return nil }
         let F0 = Int(flag.ptr(UInt32.self)[T])
         guard F0 > 0 else { return nil }
+        return (GPUTriMesh(g, V: V, F: F0, capV: capV, capF: capF, pos: wpos, tri: triB, cuv: cuvB), core, center, diag)
+    }
+
+    internal func decimateGPU(targetTriangles: Int, creaseDegrees: Double) -> (mesh: Mesh3, report: DecimationReport)? {
+        guard let g = ModelGPU.shared, !indices.isEmpty else { return nil }
+        let target = Swift.max(4, targetTriangles)
+        guard let prep = gpuPrep(g, keepUV: true, capFactor: 1) else { return nil }
+        let m = prep.mesh, V = m.V, hasUV = m.hasUV, center = prep.center, diag = prep.diag, core = prep.core
 
         // 2. quadrics once, then rounds of parallel collapses
-        let m = GPUTriMesh(g, V: V, F: F0, capV: V, capF: F0, pos: wpos, tri: triB, cuv: cuvB)
         let cp = CollapseParams(hasUV: hasUV, remesh: false, cosCrease: Float(cos(creaseDegrees * .pi / 180)),
                                 cosTurn: Float(cos(creaseDegrees * .pi / 180)))
         guard m.buildQuadrics(cp) else { return nil }

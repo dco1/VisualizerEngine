@@ -15,16 +15,24 @@ extension ModelGPU {
         float3 d1 = safe_norm(pos[w].xyz - pos[ff.y].xyz), d2 = safe_norm(pos[ff.z].xyz - pos[w].xyz);
         return dot(d1, d2) < cosTurn;
     }
-    // Would moving vertex v of face f to P fold or squash it?
+    static float tri_quality(float3 a, float3 b, float3 c) {          // 1 equilateral … 0 sliver
+        float3 n = cross(b - a, c - a);
+        float s = dot(b - a, b - a) + dot(c - b, c - b) + dot(a - c, a - c);
+        return 2 * 1.7320508f * length(n) / max(s, 1e-30f);
+    }
+    // Would moving vertex v of face f to P fold, squash or sliver it? (The CPU needs no quality guard because its
+    // exact costs never pick a sliver-making collapse; Float costs near flat patches are noise, so the GPU asks.)
     static bool flips(MA, uint f, uint v, float3 P) {
         float3 n0 = face_raw(tri, pos, f);
         float l0 = length(n0);
         if (l0 < 1e-14f) return false;
-        float3 q[3];
-        for (uint k = 0; k < 3; k++) { uint w = tri[3 * f + k]; q[k] = w == v ? P : pos[w].xyz; }
+        float3 q[3], o[3];
+        for (uint k = 0; k < 3; k++) { uint w = tri[3 * f + k]; o[k] = pos[w].xyz; q[k] = w == v ? P : o[k]; }
         float3 n1 = cross(q[1] - q[0], q[2] - q[0]);
         float l1 = length(n1);
-        return l1 < l0 * 1e-3f || dot(n0, n1) < 0.25f * l0 * l1;
+        if (l1 < l0 * 1e-3f || dot(n0, n1) < 0.25f * l0 * l1) return true;
+        float q1 = tri_quality(q[0], q[1], q[2]);
+        return q1 < 0.12f && q1 < 0.5f * tri_quality(o[0], o[1], o[2]);
     }
 
     kernel void cand_eval(MA, device const float2* cuv [[buffer(4)]], device const uint4* vfeat [[buffer(5)]],

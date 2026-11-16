@@ -112,4 +112,19 @@ final class MeshDecimateGPUTests: XCTestCase {
         XCTAssertEqual(MeshKit.openEdges(g), 0)
         XCTAssertLessThan(hausdorffToSphere(g), 3 * Swift.max(hausdorffToSphere(c), 0.002))
     }
+
+    func testGPUScales328kAndAutoBackend() {
+        let big = MeshKit.icosphere(levels: 7)
+        XCTAssertEqual(big.triangleCount, 327680)
+        let t = Date()
+        let d = big.decimated(targetTriangles: 32768, backend: .auto)
+        print("GPU only: decimate 327680 -> \(d.triangleCount) in \(String(format: "%.3f", Date().timeIntervalSince(t))) s")
+        XCTAssertLessThanOrEqual(d.triangleCount, 32800)
+        XCTAssertEqual(MeshKit.openEdges(d), 0)
+        // .cpu is the existing code path, untouched
+        let small = MeshKit.icosphere(levels: 3)
+        XCTAssertEqual(small.decimated(targetTriangles: 100, backend: .cpu).positions, small.decimated(targetTriangles: 100).positions)
+        // .auto stays on the CPU below the threshold
+        XCTAssertEqual(small.decimated(targetTriangles: 100, backend: .auto).positions, small.decimated(targetTriangles: 100).positions)
+    }
 }
