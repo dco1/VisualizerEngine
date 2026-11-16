@@ -38,6 +38,8 @@ public struct BooleanOptions: Sendable {
     /// With `useGPU`: run the GPU-heavy pipeline (grid broadphase, GPU narrow-phase filter, GPU patches and
     /// winding, GPU assembly: `Mesh3+BooleanGPU2*.swift`) on big inputs. False keeps the first GPU path.
     public var useGPUPipeline: Bool = true
+    /// Always run the closure audit / safe repairs on the result (otherwise only when the boolean flagged trouble).
+    public var audit: Bool = false
     public init() {}
 }
 
@@ -45,6 +47,13 @@ public struct BooleanStats: Sendable {
     public var trianglesA = 0, trianglesB = 0
     public var candidatePairs = 0, intersectingPairs = 0, cutTriangles = 0
     public var constraintFailures = 0
+    /// Input triangles thinner than the weld tolerance found by the pre-pass, and how many it flipped away
+    /// (`Mesh3+BooleanSlivers.swift`).
+    public var slivers = 0, sliverFlips = 0
+    /// Set when a sliver could not be removed or the post-pass found a defect it could not repair: audit the result.
+    public var repairIncomplete = false
+    /// Filled by the post-pass (`Mesh3+BooleanAudit.swift`) when it ran: what it removed and what is still wrong.
+    public var duplicatesRemoved = 0, openEdges = 0, nonManifoldEdges = 0
     public var patches = 0
     public var broadphaseOnGPU = false, windingOnGPU = false
     public var seconds: [String: Double] = [:]
@@ -87,17 +96,25 @@ public extension Mesh3 {
         if options.useGPU, options.useGPUPipeline, BooleanGPU2.shared != nil,
            triangleCount + other.triangleCount >= BooleanGPU2.minTriangles {
             let fast = BooleanJob(self, other, options: options)
-            if let mesh = fast.runGPU2(op) { BooleanGPU2.runs += 1; return BooleanResult(mesh: mesh, stats: fast.stats) }
+            if let mesh = fast.runGPU2(op) { BooleanGPU2.runs += 1; return Self.finished(BooleanResult(mesh: mesh, stats: fast.stats), options) }
             BooleanGPU2.fallbacks += 1
         }
         let job = BooleanJob(self, other, options: options)
         var clock = Date()
         func lap(_ name: String) { job.stats.seconds[name] = Date().timeIntervalSince(clock); clock = Date() }
         job.weld(); lap("weld")
+        job.cleanSlivers(); lap("slivers")
         job.cutAll(); lap("cut")
         let rel = [job.classify(0), job.classify(1)]; lap("classify")
         let mesh = job.assemble(op, rel); lap("assemble")
-        return BooleanResult(mesh: mesh, stats: job.stats)
+        return Self.finished(BooleanResult(mesh: mesh, stats: job.stats), options)
+    }
+
+    private static func finished(_ r: BooleanResult, _ options: BooleanOptions) -> BooleanResult {
+        guard options.weld == .byPosition, options.audit || r.stats.repairIncomplete || r.stats.constraintFailures > 0 else { return r }
+        var out = r
+        out.audit()
+        return out
     }
 
     /// Outward-wound box (12 triangles) spanning `±half` along `u`,`v` and `0…depth` along `w` from `origin`.

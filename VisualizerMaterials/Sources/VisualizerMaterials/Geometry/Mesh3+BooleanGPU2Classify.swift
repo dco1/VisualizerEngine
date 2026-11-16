@@ -258,6 +258,7 @@ extension BooleanJob {
         let t0 = Date()
         guard run.weld() else { return nil }
         stats.seconds["weld"] = Date().timeIntervalSince(t0)
+        cleanSlivers()
         let t1 = Date()
         guard run.cutAll() else { return nil }
         stats.seconds["cut"] = Date().timeIntervalSince(t1)
