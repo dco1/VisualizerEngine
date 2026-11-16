@@ -400,4 +400,21 @@ final class HalfEdgeMeshTests: XCTestCase {
         XCTAssertTrue(m.isValid)
         XCTAssertTrue(m.validate().contains { $0.message.contains("bow-tie") })
     }
+
+    // MARK: GPU twins
+
+    func testSoAAndGPUKernelsMatchCPU() throws {
+        var he = HalfEdgeMesh(sphereMesh(lon: 16, lat: 8))
+        he.deleteFace(he.faces[40])                                     // an open fan and a dead slot
+        let soa = he.soa()
+        XCTAssertEqual(soa.next.count, he.halfedgeSlots); XCTAssertEqual(soa.faceHalfedge.count, he.faceSlots)
+        XCTAssertEqual(soa.face.filter { $0 < 0 }.count, 3)
+        let cpuF = he.faceAreaVectors(), cpuV = he.vertexNormals()
+        for (f, v) in cpuF.enumerated() where he.isAlive(face: f) { XCTAssertEqual(len3(v) / 2, he.faceArea(f), accuracy: 1e-12) }
+        guard let gpu = HalfEdgeGPU.shared else { throw XCTSkip("no Metal device") }
+        let gf = gpu.faceVectors(soa)!, gv = gpu.vertexNormals(soa)!
+        for i in 0..<cpuF.count { XCTAssertEqual(len3(gf[i] - cpuF[i]), 0, accuracy: 1e-4) }
+        for i in 0..<cpuV.count { XCTAssertEqual(len3(gv[i] - cpuV[i]), 0, accuracy: 1e-4) }
+        XCTAssertEqual(he.vertexNormalsGPU().count, cpuV.count)
+    }
 }
