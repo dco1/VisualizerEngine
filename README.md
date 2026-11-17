@@ -9,7 +9,7 @@ under one umbrella manifest. It is the engine behind two apps — **Daydream Hom
 | --- | --- |
 | **`VisualizerRendering`** | The renderer and solvers. **Illuminatorama** — deferred PBR, image-based lighting, hardware ray tracing (RT shadows, AO, GI, glass), a radiance cache, a path-traced still lane, TAA, volumetrics and a physical-camera tonemap chain — plus GPU solvers (XPBD ropes/cloth/grass, MLS-MPM fluid, SPH foam, CoinDEM rigid bodies, marching cubes) and their mesh bridges. Ships its own Metal kernels and loads them via `Bundle.module`. |
 | **`VisualizerCore`** | The shared substrate: scene-controller / descriptor plumbing, GPU and display capability probes, a keyframe/timeline model, the Illuminatorama colour-grade / debug-view / easing settings, and deterministic geometry auditors (winding, mesh soundness, spline continuity, z-fight, penetration). |
-| **`VisualizerMaterials`** | The CPU-side procedural material engine — seeded noise, the PBR channel set, and generators for wood, stone, tile, glaze, carpet, fibre, paper, frosted glass and more, gated by `TextureAudit` / `MaterialScaleAudit`. Pure Swift with **no dependencies on purpose**, so a headless host can use it under a bare `swift test`. |
+| **`VisualizerMaterials`** | The CPU-side procedural material engine — seeded noise, the PBR channel set, and generators for wood, stone, tile, glaze, carpet, fibre, paper, frosted glass and more, gated by `TextureAudit` / `MaterialScaleAudit` — plus the **modelling kit** (half-edge edits, booleans, SDF, modifiers, UVs, sculpt, `ModelGraph`, MeshIO; see below). Pure Swift with **no dependencies on purpose**, so a headless host can use it under a bare `swift test`. |
 | **`VisualizerVegetation`** | The shared botanical construction engine — one leaf / petal / frond / needle constructor that every plant, tree and species is described against. Depends only on `VisualizerMaterials`. |
 | **`VisualizerHumans`** | A deterministic CPU human generator (spec + dataset → mesh, skeleton and skinning), with hair, clothing, eyes, a walk cycle and a GPU-skinned runtime. Depends on `VisualizerRendering`. Importer tooling lives in `tools/humans`. |
 
@@ -25,6 +25,43 @@ rules behind them — lives in
 [`VisualizerRendering/README.md`](VisualizerRendering/README.md); setting up an
 Illuminatorama scene directly is in
 [`VisualizerRendering/docs/ILLUMINATORAMA_SCENE_SETUP.md`](VisualizerRendering/docs/ILLUMINATORAMA_SCENE_SETUP.md).
+
+---
+
+## Modelling kit
+
+`VisualizerMaterials/Sources/VisualizerMaterials/Geometry/` holds Blender-parity
+modelling tools, `Mesh3` in, `Mesh3` out: half-edge topology edits and push/pull,
+robust booleans (closed, welded, outward-wound output), SDF modelling with surface
+nets, remesh / decimate / weld / hole fill, a modifier stack, UV tools, sculpt
+brushes, a procedural `ModelGraph`, and OBJ / PLY / STL import/export. The heavy
+paths run on Metal compute with CPU twins, so everything also works (slower) without
+a GPU.
+
+```swift
+var he = HalfEdgeMesh.box(size: Vec3(0.06, 0.04, 0.02))
+let top = he.faces.first { he.faceNormal($0).z > 0.9 }!
+let stem = he.extrude(faces: he.selection(.face, [top]), distance: 0.03)!
+he.pushPull(he.inset(stem, thickness: 0.006, depth: 0)!, distance: 0.008)
+let body = he.toMesh3()
+
+let bored = body.boolean(.difference, bore, options: .init()).mesh   // closed + welded
+let tex = bored.projectedUVs(UVProjection(.box, scale: Vec2(4, 4))).packedUVs()
+let data = MeshIO.write([tex], format: .obj)
+```
+
+The API cheat sheet, the Blender → engine map, the GPU/CPU table and the known gaps
+are in [`VisualizerMaterials/docs/ModellingKit.md`](VisualizerMaterials/docs/ModellingKit.md).
+Tests (from `VisualizerMaterials/`):
+
+```sh
+swift test --filter ModellingDemoTests   # one object through the whole kit
+swift test --filter GuitarCarveTests     # block to electric guitar in eight steps
+```
+
+To have an LLM agent model an object with the kit — audited watertight at every
+step and rendered — use the brief in
+[`.claude/agents/kit-modeler.md`](.claude/agents/kit-modeler.md).
 
 ---
 
