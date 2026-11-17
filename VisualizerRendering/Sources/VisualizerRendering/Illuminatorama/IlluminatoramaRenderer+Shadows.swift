@@ -27,6 +27,18 @@ extension IlluminatoramaRenderer {
         // printed the previous frame's shadows with the toggle already off. A cleared
         // slice (depth == 1.0) compares as "lit" everywhere, so no consumer can resurrect
         // a shadow regardless of which lighting variant is live. (DH-0619)
+        //
+        // Cascades past `sunShadowCascadeCount` are never sampled except by cascade
+        // `active − 1`'s blend band at the far edge of the range (where a cleared slice reads
+        // "lit", the same answer as past `shadowMaxDistance`). So they are cleared ONCE — when
+        // the count drops or the map is replaced — and then skipped: a depth clear + store of
+        // an empty slice still writes every tile of it.
+        let active = shadowsEnabled ? sunShadowCascadeCount : Self.cascadeCount
+        let inactiveKey = active < Self.cascadeCount ? ObjectIdentifier(shd.shadowMap) : nil
+        let inactiveAlreadyClear = inactiveKey != nil && shd.inactiveCascadesClearedFor == inactiveKey
+            && shd.inactiveCascadesClearedFrom <= active
+        shd.inactiveCascadesClearedFor = inactiveKey
+        shd.inactiveCascadesClearedFrom = active
         // DH-1668 — a cascade whose matrix held and that no changed caster reaches keeps its map;
         // one a change DOES reach re-rasterises only the rectangle the change projects to
         // (+SunCascadeReuse.swift). Skipping the pass skips its `.clear` too, so the slice keeps it.
@@ -37,7 +49,7 @@ extension IlluminatoramaRenderer {
         var gpuBatch: GPUShadowBatch?
         if shadowsEnabled {
             var specs: [GPUShadowViewSpec] = []
-            for cascade in 0..<Self.cascadeCount {
+            for cascade in 0..<active {
                 if case .reuse = plans[cascade] { continue }
                 var region: MTLScissorRect?
                 if case .region(let r) = plans[cascade] { region = r }
@@ -49,7 +61,9 @@ extension IlluminatoramaRenderer {
             gpuBatch = encodeGPUShadowViews(cb, specs, spot: false)
         }
         for cascade in 0..<Self.cascadeCount {
-            let plan = shadowsEnabled ? plans[cascade] : .full
+            if cascade >= active && inactiveAlreadyClear { continue }
+            // An inactive cascade is only ever cleared whole (never reused or drawn into).
+            let plan = shadowsEnabled && cascade < active ? plans[cascade] : .full
             if case .reuse = plan {
                 staticSkipStats.sunCascadePassesSkipped += 1
                 continue
@@ -67,7 +81,7 @@ extension IlluminatoramaRenderer {
             guard let enc = timedRenderEncoder(cb, pass, "shadow.sunCascades") else { continue }
             enc.label = "Illuminatorama.shadow.c\(cascade)"
             // Disabled → the clear above already made this a fully-lit slice; no draws.
-            guard shadowsEnabled else { enc.endEncoding(); continue }
+            guard shadowsEnabled, cascade < active else { enc.endEncoding(); continue }
             noteCascadeRendered(cascade, shd.cascadeVPs[cascade])
             if let region { encodeCascadeRegionClear(enc, region) } else { staticSkipStats.sunCascadePassesRendered += 1 }
             enc.setRenderPipelineState(shd.shadowPipeline)
@@ -101,8 +115,9 @@ extension IlluminatoramaRenderer {
             let cullClip = cullVolume(cascadeCullVP)   // DH-0534 (DH-1668: the region's own frustum)
             func drawGroup(_ gi: Int) {
                 let group = gbs.meshGroups[gi]
-                if directionalShadowExcludedKinds.contains(group.kind) { return }  // e.g. lamps — no sun shadow
-                guard let mesh = meshes[group.kind] else { return }
+                if !directionalShadowExcludedKinds.isEmpty,
+                   directionalShadowExcludedKinds.contains(group.kind) { return }  // e.g. lamps — no sun shadow
+                guard let mesh = groupMesh(gi, group) else { return }
                 if shouldCull(gi, group, mesh, cullClip, drawn: \.cascadeDrawn, culled: \.cascadeCulled) { return }
                 let want = shadowCullMode(mesh)
                 if want != cull { cull = want; enc.setCullMode(cull) }
@@ -132,7 +147,7 @@ extension IlluminatoramaRenderer {
     func updateCascades() {
         let near = max(camera.zNear, 0.05)
         let far = min(shadowMaxDistance, camera.zFar)
-        let count = Self.cascadeCount
+        let count = sunShadowCascadeCount   // the active ones share the whole range
         let lambda: Float = 0.5
 
         // PSSM split distances (in view-space positive distance) — log + uniform.
@@ -146,6 +161,9 @@ extension IlluminatoramaRenderer {
             let uniSplit = near + (far - near) * f
             splitsPos[i] = lambda * logSplit + (1 - lambda) * uniSplit
         }
+        // Inactive cascades (`count` < 3) end where the range does, so `pickCascade` never
+        // selects them.
+        for i in (count + 1)..<(Self.cascadeCount + 1) { splitsPos[i] = far }
         // Expose far-Z of each cascade to the lighting kernel.
         shd.cascadeSplitsView = SIMD4(splitsPos[1], splitsPos[2], splitsPos[3], 0)
 
@@ -592,7 +610,7 @@ extension IlluminatoramaRenderer {
             let cullClip = cullVolume(region.map { Self.scissorFrustum(lightVP, $0, size: shd.spotShadowAtlas.width) } ?? lightVP)
             func drawGroup(_ gi: Int) {
                 let group = gbs.meshGroups[gi]
-                guard let mesh = meshes[group.kind] else { return }
+                guard let mesh = groupMesh(gi, group) else { return }
                 if shouldCull(gi, group, mesh, cullClip, drawn: \.spotDrawn, culled: \.spotCulled) { return }
                 let want = shadowCullMode(mesh)
                 if want != cull { cull = want; enc.setCullMode(cull) }
@@ -751,7 +769,7 @@ extension IlluminatoramaRenderer {
 
                 let cullClip = cullVolume(lightVP)   // DH-0534
                 for (gi, group) in gbs.meshGroups.enumerated() {
-                    guard let mesh = meshes[group.kind] else { continue }
+                    guard let mesh = groupMesh(gi, group) else { continue }
                     if shouldCull(gi, group, mesh, cullClip, drawn: \.pointDrawn, culled: \.pointCulled) { continue }
                     let want = shadowCullMode(mesh)
                     if want != cull { cull = want; enc.setCullMode(cull) }
@@ -881,6 +899,10 @@ final class ShadowState {
     var spotShadowAtlasCapacity: Int = IlluminatoramaRenderer.spotShadowCapacityDefault
 
     var cascadeSplitsView: SIMD4<Float> = .zero
+    /// The shadow map whose slices from `inactiveCascadesClearedFrom` up were last cleared
+    /// as inactive (`sunShadowCascadeCount` < 3); nil while every cascade is drawn.
+    var inactiveCascadesClearedFor: ObjectIdentifier?
+    var inactiveCascadesClearedFrom = IlluminatoramaRenderer.cascadeCount
 
     // ── Point-light cubemap shadows (lazy — allocated on first enable) ─────────
     // A single depth 2D-array texture holds every shadowed point light's cube as

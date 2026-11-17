@@ -17,6 +17,7 @@ extension IlluminatoramaRenderer {
     public var highlightMaskInstances: [IlluminatoramaInstance] { get { kPost.highlightMaskInstances } set { kPost.highlightMaskInstances = newValue } _modify { yield &kPost.highlightMaskInstances } }
     public var taaStillAccumulation: Bool { get { kPost.taaStillAccumulation } set { kPost.taaStillAccumulation = newValue } _modify { yield &kPost.taaStillAccumulation } }
     public var taaStillKarisWeights: Bool { get { kPost.taaStillKarisWeights } set { kPost.taaStillKarisWeights = newValue } _modify { yield &kPost.taaStillKarisWeights } }
+    public var taaSkyIgnoresHistory: Bool { get { kPost.taaSkyIgnoresHistory } set { kPost.taaSkyIgnoresHistory = newValue } _modify { yield &kPost.taaSkyIgnoresHistory } }
     public var taaStillSharpen: Bool { get { kPost.taaStillSharpen } set { kPost.taaStillSharpen = newValue } _modify { yield &kPost.taaStillSharpen } }
     public var taaStillCrossfade: Float { get { kPost.taaStillCrossfade } set { kPost.taaStillCrossfade = newValue } _modify { yield &kPost.taaStillCrossfade } }
     /// Freeze the picture currently on screen as `taaStillCrossfade`'s source (taken at the next TAA resolve).

@@ -60,7 +60,7 @@ extension IlluminatoramaRenderer {
         // re-flattening 4–5×).
         gls.glassFlatMemo = nil
         let glassNow = flattenGlass()
-        if instances == gbs.lastUploadedInstances {
+        if Self.sameInstances(instances, gbs.lastUploadedInstances) {
             gbs.instanceStableFrames += 1
             gbs.instanceShapeStableFrames += 1
         } else {

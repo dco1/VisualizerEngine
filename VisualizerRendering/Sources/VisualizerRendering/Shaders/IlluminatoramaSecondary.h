@@ -125,6 +125,12 @@ struct RTPointLight {
     // and width as `PointLight.openingRadius` (size 72 → 76, stride 80 unchanged).
     float  openingRadius;
     uint   roomOnly;        // Daydream DH-1616 — mirrors `PointLight.roomOnly` (was `openingOffset`, layout only)
+    // Mirrors `PointLight.specularScale` + its pads (deferred-only; never read here): the same buffer is
+    // bound as `PointLight*` and `RTPointLight*`, so sizeof must agree — 84 → stride 96 on both.
+    float  specularScale;
+    float  _padSpecular0;
+    float  _padSpecular1;
+    float  _padSpecular2;
 };
 struct RTSpotLight {
     float3   position;   float innerCone;

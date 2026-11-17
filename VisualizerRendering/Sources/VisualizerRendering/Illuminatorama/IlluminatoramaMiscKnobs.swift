@@ -25,6 +25,10 @@ final class MiscKnobs {
     var meshes: [MeshKind: IlluminatoramaMesh] = [:] { didSet { meshTableVersion &+= 1 } }
     /// Bumped on every change to `meshes` (DH-1684: the GPU shadow draw table keys on it).
     var meshTableVersion = 0
+    /// The same counter under the name the cull-bounds and draw-group caches read: what's derived from the table —
+    /// each draw group's mesh (`meshGroupMeshes`), the cull bounds — knows when to look again, even while the draw
+    /// list holds still and its upload is skipped.
+    var meshesVersion: Int { meshTableVersion }
     /// How many meshes have left the table, ever (Daydream DH-1675).
     var meshTableRemovals = 0
 }

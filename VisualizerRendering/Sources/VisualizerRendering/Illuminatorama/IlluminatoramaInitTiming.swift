@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 import OSLog
 import VisualizerCore
 
@@ -27,7 +28,19 @@ public struct IlluminatoramaInitTiming: Sendable {
     public struct Phase: Sendable {
         public let label: String
         public let milliseconds: Double
+        /// GPU memory the phase allocated (`MTLDevice.currentAllocatedSize` delta, MB); 0 without a `device`.
+        /// Device-wide, so another thread allocating meanwhile shows up here too.
+        public var allocatedMB: Double = 0
     }
+
+    /// Set to also record each phase's GPU allocation (`Phase.allocatedMB`, `totalAllocatedMB`).
+    public var device: MTLDevice? {
+        didSet { lastAllocated = device?.currentAllocatedSize ?? 0 }
+    }
+    private var lastAllocated = 0
+
+    /// GPU memory allocated across every phase (MB); 0 without a `device`.
+    public var totalAllocatedMB: Double { phases.reduce(0) { $0 + $1.allocatedMB } }
 
     public private(set) var phases: [Phase] = []
 
@@ -59,7 +72,13 @@ public struct IlluminatoramaInitTiming: Sendable {
         let now = DispatchTime.now().uptimeNanoseconds
         let ms = Double(now &- lastMark) / 1_000_000
         lastMark = now
-        phases.append(Phase(label: label, milliseconds: ms))
+        var phase = Phase(label: label, milliseconds: ms)
+        if let device {
+            let bytes = device.currentAllocatedSize
+            phase.allocatedMB = Double(bytes - lastAllocated) / 1_048_576
+            lastAllocated = bytes
+        }
+        phases.append(phase)
         if let signposter {
             // Emit as a zero-length event rather than a begin/end pair: the marks are
             // strictly sequential, so the timeline of events already gives Instruments
@@ -75,9 +94,10 @@ public struct IlluminatoramaInitTiming: Sendable {
         let width = phases.map(\.label.count).max() ?? 0
         let slowest = dominantPhase?.milliseconds ?? 0
         return phases.map { p in
-            String(format: "  %@%@ %8.1f ms%@",
+            String(format: "  %@%@ %8.1f ms%@%@",
                    p.label, String(repeating: " ", count: width - p.label.count),
                    p.milliseconds,
+                   device == nil ? "" : String(format: " %8.1f MB", p.allocatedMB),
                    p.milliseconds == slowest ? "   ← dominant" : "")
         }.joined(separator: "\n")
     }

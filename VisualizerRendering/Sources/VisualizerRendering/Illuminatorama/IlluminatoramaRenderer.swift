@@ -154,14 +154,24 @@ public final class IlluminatoramaRenderer {
         /// pushes the matching `SuperquadricParam` into the parallel param buffer.
         /// Not uploaded into the GPU instance struct. See IlluminatoramaSuperquadric.swift.
         public var superquadricShape: SIMD2<Float>? = nil
+        /// CPU-only: who this draw is from one frame to the next, for its motion vector (TAA's
+        /// reprojection). Last frame's record is found by `(meshKind, persistentID)`; with 0 (the
+        /// default) by `meshKind` and the order among that kind's unnamed draws. So a draw list may
+        /// gain, lose or reorder whole mesh kinds between frames and every other draw still finds its
+        /// own history. Name the draws when instances SHARING a kind come and go or swap places (a
+        /// grid of objects scrolling on and off screen): unnamed, the n-th draw of a kind is paired
+        /// with last frame's n-th. Not uploaded to the GPU.
+        public var persistentID: UInt64 = 0
         public init(meshKind: MeshKind,
                     data: IlluminatoramaInstance,
                     lightEmission: SIMD3<Float> = .zero,
-                    superquadricShape: SIMD2<Float>? = nil) {
+                    superquadricShape: SIMD2<Float>? = nil,
+                    persistentID: UInt64 = 0) {
             self.meshKind = meshKind
             self.data = data
             self.lightEmission = lightEmission
             self.superquadricShape = superquadricShape
+            self.persistentID = persistentID
         }
     }
 
@@ -756,6 +766,16 @@ public final class IlluminatoramaRenderer {
         didSet { if oldValue != iblBakeDesaturation { iblNeedsRebake = true } }
     }
 
+    /// GGX samples per texel when baking the prefiltered specular cube's rough mips (the mirror mip takes one).
+    /// The bake is deterministic and only redone when the sky changes (or every `iblRebakeInterval`), so TAA never
+    /// averages its error away: at the default 12, a sky with small bright sources (a product studio's light cards)
+    /// bakes into the cube as a blotchy, jagged pattern, and a glossy surface sweeping its reflection across that
+    /// pattern as the camera turns shimmers. 256 is clean on such a sky (Dad Hat Factory's cans); cost is per bake,
+    /// not per frame: ~33k cube texels × N bilinear sky reads. Default 12 keeps every existing scene byte-identical.
+    public var iblPrefilterSampleCount: Int = 12 {
+        didSet { if oldValue != iblPrefilterSampleCount { iblNeedsRebake = true } }
+    }
+
 
 
     /// TEST-OBSERVABLE (DH-0869): the specialisation flags of the lighting variant the LAST
@@ -1195,7 +1215,12 @@ public final class IlluminatoramaRenderer {
     var frameUniformBuffer: MTLBuffer { lts.frameUniformRing[lts.frameRingIndex] }
 
     var currentInstanceBuffer: MTLBuffer { gbs.useBufferA ? gbs.instanceBufferA : gbs.instanceBufferB }
-    var previousInstanceBuffer: MTLBuffer { gbs.useBufferA ? gbs.instanceBufferB : gbs.instanceBufferA }
+    /// Last frame's records in THIS frame's grouped layout: the other ping-pong buffer, or, on a frame
+    /// whose layout moved, a copy re-ordered to match (`alignPreviousInstances`).
+    var previousInstanceBuffer: MTLBuffer {
+        if gbs.prevAlignedActive { return gbs.prevAlignedRing[lts.frameRingIndex] }
+        return gbs.useBufferA ? gbs.instanceBufferB : gbs.instanceBufferA
+    }
 
     /// Internal rendering size. All compute kernels (G-buffer rasterisation,
     /// SSAO, lighting, SSR, TAA, bloom mid-textures) dispatch over this
@@ -1220,13 +1245,24 @@ public final class IlluminatoramaRenderer {
     ///   texel — finer, less-aliased sun-shadow edges — at 4× shadow-map memory
     ///   per doubling. Safe for PCF: the lighting shader reads its texel size
     ///   from `shadowMap.get_width()`, so no shader change is needed.
+    /// - Parameter textureAtlasCapacity: Slices each of the two texture atlases (albedo,
+    ///   non-colour) starts with. Default `64` (unchanged): 2 × 64 mipmapped 512² slices
+    ///   ≈ 173 MB, allocated whether or not a texture is ever registered. The atlases double
+    ///   on demand (up to 1024), so a small renderer whose scene registers a handful of maps
+    ///   (a gallery card, a thumbnail) can start at 4 and pay ~11 MB. Clamped to ≥ 1.
+    /// - Parameter internalRenderScale: The internal-to-output scale the first targets are
+    ///   allocated at. `nil` (default) keeps `defaultInternalRenderScale` (1.5). A host that
+    ///   sets `internalRenderScale` straight after init otherwise allocates — and then frees —
+    ///   one full 1.5× target set first (~400 MB at 1280×720).
     public init(engine: SimEngine, width: Int, height: Int, camera: IlluminatoramaCamera,
-                shadowMapResolution: Int = 2048) throws {
+                shadowMapResolution: Int = 2048, textureAtlasCapacity: Int = 64,
+                internalRenderScale: Float? = nil) throws {
         // Stopwatch for the init breakdown. Kept in a LOCAL and assigned to
         // `self.initTiming` at the very end — mutating a stored property while the
         // rest of `self` is still uninitialised isn't allowed, and a local also keeps
         // the marks out of every early-throw path.
         var timing = IlluminatoramaInitTiming()
+        timing.device = engine.device
         self.engine = engine
         self.device = engine.device
         self.commandQueue = engine.commandQueue
@@ -1241,8 +1277,11 @@ public final class IlluminatoramaRenderer {
         // target is allocated — a host that can't afford the scene's authored
         // canvas must never allocate it, not shrink it afterwards. Unlimited by
         // default, so this is a no-op for hosts that haven't opted in.
+        let requestedScale = internalRenderScale.map {
+            min(Self.maxInternalRenderScale, max(Self.minInternalRenderScale, $0))
+        } ?? Self.defaultInternalRenderScale
         let budgeted = Self.budgeted(outputW: width, outputH: height,
-                                     scale: Self.defaultInternalRenderScale)
+                                     scale: requestedScale)
         let initialScale = budgeted.scale
         self.outputWidth  = budgeted.w
         self.outputHeight = budgeted.h
@@ -1327,12 +1366,13 @@ public final class IlluminatoramaRenderer {
         // to 64 MB per atlas at default 64 capacity — still well under
         // the per-app texture budget on every Apple Silicon GPU.
         let atlasSliceSize = 512
+        let atlasCapacity = max(1, textureAtlasCapacity)
         self.albedoAtlas = try IlluminatoramaTextureAtlas(
             device: device, pixelFormat: .bgra8Unorm_srgb,
-            sliceSize: atlasSliceSize)
+            sliceSize: atlasSliceSize, capacity: atlasCapacity)
         self.nonColorAtlas = try IlluminatoramaTextureAtlas(
             device: device, pixelFormat: .bgra8Unorm,
-            sliceSize: atlasSliceSize)
+            sliceSize: atlasSliceSize, capacity: atlasCapacity)
         timing.mark("texture atlases (albedo + non-colour)")
 
         // ── Targets ──────────────────────────────────────────────────────

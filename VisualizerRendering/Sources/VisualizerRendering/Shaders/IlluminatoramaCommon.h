@@ -640,9 +640,18 @@ struct PointLight {
     // stride 80, unchanged. Keep in lockstep with `RTPointLight` and the Swift struct.
     float  openingRadius;
     // Daydream DH-1616 — 1 ⇒ this light reaches only fragments that belong to a room (layer !=
-    // 0xFFFFFFFF). Was `openingOffset` (layout only for a point): same 4 bytes, stride 80 unchanged.
+    // 0xFFFFFFFF). Was `openingOffset` (layout only for a point): same 4 bytes.
     // Mirrors the Swift `IlluminatoramaPointLight.roomOnly` and `RTPointLight.roomOnly`.
     uint   roomOnly;
+    // PER-LIGHT SPECULAR SCALE (Unreal's "Specular Scale"): multiplies the SPECULAR part (base GGX and
+    // coat lobe) of this light in the deferred pass; diffuse is untouched. Default 1 ⇒ byte-identical;
+    // 0 ⇒ the light is diffuse-only (the host lets an emissive mesh carry the reflection instead).
+    // Deferred only (`RTPointLight` has no such field). Appended past the old 80-byte stride: size 84,
+    // stride 96 (float3 alignment), padded explicitly so the Swift mirror matches field for field.
+    float  specularScale;
+    float  _padSpecular0;
+    float  _padSpecular1;
+    float  _padSpecular2;
 };
 #define kGIVisibleSecondaryOnly 2u
 // Daydream DH-1699 — 3 (spot lights): a DIFFUSE-only light at the primary — a surface's re-emitted

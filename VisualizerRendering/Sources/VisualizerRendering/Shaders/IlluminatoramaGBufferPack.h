@@ -95,6 +95,11 @@ static inline __attribute__((always_inline)) GBufferOut illumiGBufferPack(
     // alone. No-op for every scene that ships opaque alpha 1.0, and dead unless the
     // scene opts in via `frame.sssStrength > 0`.
     if (in.vertexColor.a >= 0.9 && in.vertexColor.a <= 0.98) foliageFlag = 0.95h;
+    // Hair-fibre flag (FurStrandField): colour alpha in (0.99, 1.0) → 0.995h. The lighting pass reads
+    // it, treats the NORMAL slot as the strand TANGENT, and evaluates the Chiang R/TT/TRT hair BSDF
+    // (IlluminatoramaHairBSDF.h). Carved from the sliver above the SSS band (<0.99) and below opaque 1.0
+    // (so the `>= 1.0h` anisotropy branch skips it); not < 0.5h so the foliage roughness cap ignores it.
+    if (in.vertexColor.a > 0.99 && in.vertexColor.a < 1.0) foliageFlag = 0.995h;
     // Waxy-leaf sheen (#58): a real leaf cuticle is markedly smoother than the
     // matte moss / bark / stone around it, so a single soup roughness reads
     // every surface as the same dry matte and leaves never catch a glint.

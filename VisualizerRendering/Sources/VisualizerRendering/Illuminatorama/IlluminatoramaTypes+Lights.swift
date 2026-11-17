@@ -167,11 +167,14 @@ public struct IlluminatoramaPointLight {
     /// `PointLight.shadowCubeIndex`. Default `-1`.
     public var shadowCubeIndex: Int32 = -1
     /// **The physical size of the lamp at this light** (metres; 0 ⇒ a point, the shipped law).
-    /// Read ONLY by the path-traced still lane (`rtPathLampBulbs`), at path vertices: there a lamp's
+    /// **Sphere lights:** with `IlluminatoramaRenderer.sphereLightsEnabled` the DEFERRED pass also reads
+    /// this — the light shades as a luminous sphere of this radius (`color` stays the far-field intensity;
+    /// sphere-clipped diffuse + representative-point specular). Flag off ⇒ ignored there, as before.
+    /// Read by the path-traced still lane (`rtPathLampBulbs`), at path vertices: there a lamp's
     /// falloff is `1/max(d² + softRadius², bulbRadius²)` — a luminous SPHERE of this radius is
     /// exactly `1/d²` outside itself, and no surface can sit inside the glass, so this is the honest
     /// finite-bulb law rather than a clamp (Daydream DH-1293/DH-1295). The deferred pass and every
-    /// real-time kernel ignore it, so a host that sets it changes nothing off the path lane. Was the
+    /// other real-time kernel (RT secondary fill, glass) ignore it, and the deferred pass ignores it unless `sphereLightsEnabled`, so a host that sets it changes nothing off the path lane. Was the
     /// former `_padPointShadow0` (same 4 bytes, stride unchanged). Mirrors the Metal
     /// `PointLight.bulbRadius` / `RTPointLight.bulbRadius`.
     public var bulbRadius: Float = 0
@@ -201,7 +204,7 @@ public struct IlluminatoramaPointLight {
     /// pane), `1/d²` far away and finite at the rim. A host authors it per fixture from the same
     /// geometry it builds the fixture with (Daydream DH-1363); unset, the law is DH-1295's exactly.
     /// Appended after `giVisible` (size 72 → 76): inside the float3-aligned stride's tail padding,
-    /// so the stride stays 80 on both sides. Mirrors the Metal `PointLight` / `RTPointLight
+    /// so the stride stayed 80 (96 since `specularScale`). Mirrors the Metal `PointLight` / `RTPointLight
     /// .openingRadius` — keep in lockstep.
     public var openingRadius: Float = 0
     /// **Room-only receivers** (Daydream DH-1616). 1 ⇒ the light reaches only fragments that belong to a
@@ -210,14 +213,24 @@ public struct IlluminatoramaPointLight {
     /// mask: the mask cannot keep it off all-bits geometry (the yard, the street, anything resolved to no
     /// room), because `layerMask & 0xFFFFFFFF` is never zero. A bounce fill — a room's own indirect light —
     /// sat on its storey's floor still lit the yard below an overhang through the slab. Was `openingOffset`
-    /// (a point has no axis, so that was layout only): same 4 bytes, stride 80 unchanged. Mirrors the Metal
+    /// (a point has no axis, so that was layout only): same 4 bytes. Mirrors the Metal
     /// `PointLight.roomOnly` / `RTPointLight.roomOnly` — keep in lockstep.
     public var roomOnly: UInt32 = 0
+    /// **Per-light specular scale** (Unreal's "Specular Scale"; default 1 ⇒ byte-identical). Multiplies the
+    /// SPECULAR part of this light in the deferred pass — the base GGX lobe and the coat lobe — and leaves the
+    /// diffuse alone; 0 ⇒ diffuse-only. Use it when an emissive mesh already carries the light's glint in
+    /// reflections (a lamp globe) so the analytic light doesn't add a second, hotter, point-sized one.
+    /// Deferred only. Appended past the old 80-byte stride (size 84 → stride 96); mirrors the Metal
+    /// `PointLight.specularScale` and its three pads.
+    public var specularScale: Float = 1
+    var _padSpecular0: Float = 0
+    var _padSpecular1: Float = 0
+    var _padSpecular2: Float = 0
 
     public init(position: SIMD3<Float>, radius: Float, color: SIMD3<Float>,
                 layerMask: UInt32 = 0xFFFF_FFFF,
                 castsShadow: Bool = false, softRadius: Float = 0, giVisible: Bool = true,
-                bulbRadius: Float = 0, openingRadius: Float = 0) {
+                bulbRadius: Float = 0, openingRadius: Float = 0, specularScale: Float = 1) {
         self.position = position
         self.radius = radius
         self.color = color
@@ -227,6 +240,7 @@ public struct IlluminatoramaPointLight {
         self.giVisible = giVisible ? 1 : 0
         self.bulbRadius = bulbRadius
         self.openingRadius = openingRadius
+        self.specularScale = specularScale
     }
 }
 

@@ -163,6 +163,12 @@ final class LightingKnobs {
     /// uses a 1×1 black fallback (sky pixels render black, IBL contributes
     /// nothing). The texture is sampled, so it must be `.shaderRead`-capable.
     var equirectSky: MTLTexture?
+    /// Optional CAMERA-VISIBLE sky: when set, background (sky) pixels sample this instead of
+    /// `equirectSky`, while IBL, glass reflections and RT keep `equirectSky`. The standard
+    /// studio-CG "light visible to reflections, invisible to camera" split — e.g. softbox
+    /// strips that draw glass edge lines without standing as white slabs in a wide shot.
+    /// nil (default) = the background is `equirectSky`, unchanged.
+    var backgroundEquirect: MTLTexture?
     var iblNeedsRebake: Bool = true
     /// How many seconds may elapse between IBL bakes even when `iblNeedsRebake`
     /// stays false. Default 5 s — enough to keep slow cloud drift from going
@@ -198,6 +204,13 @@ final class LightingKnobs {
     /// the environment, in the traced reflection's Fresnel and the traced GI's weight, and at every path
     /// vertex. `true` (the default) changes nothing for a material that never sets them — the instance
     /// then carries no layer parameters and every lane keeps the literal F0 0.04 — so it costs one
+    /// **Sphere lights** (opt-in, default `false` ⇒ every point light is a zero-size point, byte-identical).
+    /// With it set, a deferred point light whose `bulbRadius > 0` shades as a luminous SPHERE of that
+    /// radius: horizon-clipped analytic sphere irradiance for the diffuse and Karis's representative-point
+    /// specular (+ (α/α')² energy normalisation) for the base GGX lobe — so a lamp globe reflects in glossy
+    /// glass as a soft globe-sized glint instead of a hot point-sized oval. `color` keeps its meaning
+    /// (far-field intensity: at d >> r the result equals the point law). See `illumiSphereDiffuseRatio`.
+    var sphereLightsEnabled: Bool = false
     /// G-buffer texel read per pixel. `false` makes every dielectric F0 0.04 whatever the materials carry.
     var layeredSpecularEnabled: Bool = true
     /// **DH-1309 — the coat as a real layer.** `true`: a clearcoated instance's coat is a second GGX lobe

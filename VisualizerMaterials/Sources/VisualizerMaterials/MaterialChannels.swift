@@ -367,6 +367,8 @@ public struct MaterialChannels: Equatable, Sendable {
     return x * x * (3 - 2 * x)
 }
 
+// The `Float` Hermite step lives in Math/Scalar+Float.swift.
+
 @inlinable public func mix(_ a: Vec3, _ b: Vec3, _ t: Double) -> Vec3 { a + (b - a) * t }
 @inlinable public func mix(_ a: Double, _ b: Double, _ t: Double) -> Double { a + (b - a) * t }
 

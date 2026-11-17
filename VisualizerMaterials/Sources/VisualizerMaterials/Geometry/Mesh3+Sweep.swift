@@ -17,10 +17,13 @@
 
 import simd
 
+/// `@inlinable`: an app building the engine as a package in Debug gets it at -Onone, where every `SIMD3<Double>`
+/// operation is a generic call (the chin strap's spline: 2.2 ms a frame on an iPhone 15 Pro); inlined, the caller's
+/// optimiser compiles it.
 public enum Curve3 {
 
     /// A smooth curve THROUGH `points` (Catmull-Rom, end points doubled), `samples` points per span.
-    public static func catmullRom(_ p: [Vec3], samples: Int = 12) -> [Vec3] {
+    @inlinable public static func catmullRom(_ p: [Vec3], samples: Int = 12) -> [Vec3] {
         guard p.count >= 2 else { return p }
         let n = Swift.max(1, samples)
         var q = p
@@ -41,7 +44,7 @@ public enum Curve3 {
 
     /// A circular arc about `centre` in the plane spanned by `from` (the start direction) and `to` (a direction
     /// the arc turns toward), `radius` m, sweeping `angle` radians.
-    public static func arc(centre: Vec3, from: Vec3, toward: Vec3, radius: Double, angle: Double,
+    @inlinable public static func arc(centre: Vec3, from: Vec3, toward: Vec3, radius: Double, angle: Double,
                            samples: Int = 24) -> [Vec3] {
         let u = normalize3(from)
         let w = normalize3(toward - u * dot3(toward, u))
@@ -52,14 +55,14 @@ public enum Curve3 {
     }
 
     /// A cubic Bézier through control points `a b c d`.
-    public static func bezier(_ a: Vec3, _ b: Vec3, _ c: Vec3, _ d: Vec3, samples: Int = 24) -> [Vec3] {
+    @inlinable public static func bezier(_ a: Vec3, _ b: Vec3, _ c: Vec3, _ d: Vec3, samples: Int = 24) -> [Vec3] {
         (0...Swift.max(1, samples)).map { i in
             let t = Double(i) / Double(Swift.max(1, samples)), s = 1 - t
             return a * (s * s * s) + b * (3 * s * s * t) + c * (3 * s * t * t) + d * (t * t * t)
         }
     }
 
-    public static func length(_ p: [Vec3]) -> Double {
+    @inlinable public static func length(_ p: [Vec3]) -> Double {
         zip(p, p.dropFirst()).reduce(0) { $0 + len3($1.1 - $1.0) }
     }
 }

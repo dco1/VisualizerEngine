@@ -189,6 +189,7 @@ extension IlluminatoramaRenderer {
         if skipHandedApertures && ssrIntensity <= 0 { u.shadowEnabled |= 32768 }
         // Daydream DH-1406 — `kFrameFlagSpotOpeningDisc`: spots with an opening light from their disc.
         if Self.spotOpeningDiscEnvOverride ?? spotOpeningDiscEnabled { u.shadowEnabled |= 65536 }
+        if sphereLightsEnabled { u.shadowEnabled |= 131072 }     // `kFrameFlagSphereLights` — deferred point lights with bulbRadius > 0 shade as spheres
         u.leafTransmittanceRatio = max(0, leafTransmittanceRatio)   // Signack S5
         // Tree wind (#58 #1): repurpose the two free pad floats as the vertex-
         // shader vegetation-wind knobs. _padPhase2A = strength (max canopy sway,

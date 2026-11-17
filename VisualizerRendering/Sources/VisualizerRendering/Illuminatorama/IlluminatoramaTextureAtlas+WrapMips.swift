@@ -29,7 +29,7 @@ extension IlluminatoramaTextureAtlas {
     nonisolated(unsafe) public static var wrapFilteredMips = false
 
     /// `image` tiled 3 × 3 at its own size — nine exact 1:1 copies, no resampling.
-    static func tiledSource(_ image: CGImage, space: CGColorSpace, bitmapInfo: UInt32) -> CGImage? {
+    nonisolated static func tiledSource(_ image: CGImage, space: CGColorSpace, bitmapInfo: UInt32) -> CGImage? {
         let w = image.width, h = image.height
         guard w > 0, h > 0, w <= 4096, h <= 4096,
               let ctx = CGContext(data: nil, width: 3 * w, height: 3 * h, bitsPerComponent: 8,
@@ -45,7 +45,7 @@ extension IlluminatoramaTextureAtlas {
     /// One `n × n` level, resampled from the 3 × 3 `tiled` source in a single draw and cropped to
     /// the centre period. nil (⇒ the caller's clamped draw) for a level that is a 1:1 copy of the
     /// source, where no filter footprint reaches the border and the result would be identical.
-    static func drawWrapped(tiled: CGImage, source: CGImage, n: Int,
+    nonisolated static func drawWrapped(tiled: CGImage, source: CGImage, n: Int,
                             space: CGColorSpace, bitmapInfo: UInt32) -> [UInt8]? {
         if source.width == n, source.height == n { return nil }
         let big = 3 * n

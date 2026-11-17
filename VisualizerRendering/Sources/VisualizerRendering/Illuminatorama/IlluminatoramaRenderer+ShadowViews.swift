@@ -19,7 +19,7 @@ extension IlluminatoramaRenderer {
     public func shadowViewsThisFrame() -> [(view: IlluminatoramaShadowView, viewProjection: simd_float4x4)] {
         var out: [(view: IlluminatoramaShadowView, viewProjection: simd_float4x4)] = []
         if shadowsEnabled {
-            for c in 0..<Self.cascadeCount { out.append((.cascade(c), shd.cascadeVPs[c])) }
+            for c in 0..<sunShadowCascadeCount { out.append((.cascade(c), shd.cascadeVPs[c])) }
         }
         if spotShadowsEnabled {
             for (s, caster) in shd.spotShadowCasters.enumerated() { out.append((.spot(s), caster.matrix)) }

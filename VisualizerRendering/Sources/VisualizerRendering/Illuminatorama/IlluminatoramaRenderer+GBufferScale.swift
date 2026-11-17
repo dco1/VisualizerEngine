@@ -165,6 +165,9 @@ extension IlluminatoramaRenderer {
     /// regroup, a wind-strength change, or a change in what the GPU is allowed to overwrite.
     struct CullBoundsKey: Equatable {
         var groupsVersion: Int
+        /// The mesh table's version (`MiscKnobs.meshesVersion`): a static list's upload is skipped, so a mesh
+        /// replaced under it (`setMesh`) must invalidate the bounds by itself.
+        var meshesVersion: Int
         var wind: Float
         var hostWritesInstances: Bool
         var repackCount: Int

@@ -41,6 +41,7 @@ extension IlluminatoramaRenderer {
     public var iblIntensity: Float { get { kLighting.iblIntensity } set { kLighting.iblIntensity = newValue } _modify { yield &kLighting.iblIntensity } }
     public var iblEnabled: Bool { get { kLighting.iblEnabled } set { kLighting.iblEnabled = newValue } _modify { yield &kLighting.iblEnabled } }
     public var equirectSky: MTLTexture? { get { kLighting.equirectSky } set { kLighting.equirectSky = newValue } _modify { yield &kLighting.equirectSky } }
+    public var backgroundEquirect: MTLTexture? { get { kLighting.backgroundEquirect } set { kLighting.backgroundEquirect = newValue } _modify { yield &kLighting.backgroundEquirect } }
     public var iblNeedsRebake: Bool { get { kLighting.iblNeedsRebake } set { kLighting.iblNeedsRebake = newValue } _modify { yield &kLighting.iblNeedsRebake } }
     public var iblRebakeInterval: Float { get { kLighting.iblRebakeInterval } set { kLighting.iblRebakeInterval = newValue } _modify { yield &kLighting.iblRebakeInterval } }
     public var dfgLUTEnabled: Bool { get { kLighting.dfgLUTEnabled } set { kLighting.dfgLUTEnabled = newValue } _modify { yield &kLighting.dfgLUTEnabled } }
@@ -56,5 +57,6 @@ extension IlluminatoramaRenderer {
     public var layeredClothSheen: Bool { get { kLighting.layeredClothSheen } set { kLighting.layeredClothSheen = newValue } _modify { yield &kLighting.layeredClothSheen } }
     public var layeredDyedSheen: Bool { get { kLighting.layeredDyedSheen } set { kLighting.layeredDyedSheen = newValue } _modify { yield &kLighting.layeredDyedSheen } }
     public var metalNoFlatAmbient: Bool { get { kLighting.metalNoFlatAmbient } set { kLighting.metalNoFlatAmbient = newValue } _modify { yield &kLighting.metalNoFlatAmbient } }
+    public var sphereLightsEnabled: Bool { get { kLighting.sphereLightsEnabled } set { kLighting.sphereLightsEnabled = newValue } _modify { yield &kLighting.sphereLightsEnabled } }
     public internal(set) var initTiming: IlluminatoramaInitTiming { get { kLighting.initTiming } set { kLighting.initTiming = newValue } _modify { yield &kLighting.initTiming } }
 }
