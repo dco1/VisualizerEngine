@@ -1999,7 +1999,14 @@ kernel void illumi_rt_lighting_tlas(
     // camouflage patches of 'traced' vs 'IBL-only' on a plain wall. `reflFade` ramps the contribution (and
     // the sky it replaces) smoothly to 0 over the `kReflCutoffFade` below the cutoff, so a continuous
     // roughness field gives a continuous picture.
-    const float reflFade = 1.0 - smoothstep(u.reflRoughnessCutoff - kReflCutoffFade, u.reflRoughnessCutoff, reflRough);
+    //
+    // DH-1595 — and NO fade at all when the cutoff is the top of the range (≥ 1, "trace every roughness":
+    // High, Maximum, the path refine, Standard since DH-1595). There is no lane to hand off to there, yet the
+    // ramp still ran over 0.88–1.0 — exactly where flat paint lives (0.94 ± its roller breakup) — so the traced
+    // reflection switched on and off with the paint's roughness texture: the Sunset Gallery ceiling's mottle,
+    // the same 'traced vs IBL-only' camouflage as above, one band higher.
+    const float reflFade = u.reflRoughnessCutoff >= 1.0 ? 1.0
+        : 1.0 - smoothstep(u.reflRoughnessCutoff - kReflCutoffFade, u.reflRoughnessCutoff, reflRough);
     // Daydream DH-0952 — `reflSampling` (0 ⇒ byte-identical): bit 0 draws the cone from the pixel's progressive
     // Owen-scrambled Sobol stream instead of the per-frame PCG; bits 8–15 = S > 1 traces a pixel on one frame in S
     // (whole 32-px SIMD rows together, the row's phase hashed) at S× weight, for a frozen still whose frames are

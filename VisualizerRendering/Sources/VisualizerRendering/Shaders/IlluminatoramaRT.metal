@@ -511,7 +511,9 @@ kernel void illumi_rt_lighting(
     // on, so RT owns scene-geometry reflections (no SSR double-count).
     float3 reflection = float3(0.0);
     // DH-1537 — fade, not step (see IlluminatoramaRTInstanced.metal; 0.12 = kReflCutoffFade).
-    const float reflFade = 1.0 - smoothstep(u.reflRoughnessCutoff - 0.12, u.reflRoughnessCutoff, roughness);
+    // DH-1595 — no fade at the top of the range (cutoff ≥ 1 = trace every roughness; see the TLAS kernel).
+    const float reflFade = u.reflRoughnessCutoff >= 1.0 ? 1.0
+        : 1.0 - smoothstep(u.reflRoughnessCutoff - 0.12, u.reflRoughnessCutoff, roughness);
     if (u.reflEnabled != 0 && u.reflStrength > 0.0 && reflFade > 0.0) {
         float3 V = normalize(u.cameraWorldPos - P);
         float NdotV = saturate(dot(N, V));
