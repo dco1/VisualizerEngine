@@ -15,6 +15,7 @@ extension IlluminatoramaRenderer {
     public var swapDiffRunsEnabled: Bool { get { kShadow.swapDiffRunsEnabled } set { kShadow.swapDiffRunsEnabled = newValue } _modify { yield &kShadow.swapDiffRunsEnabled } }
     public var sunCascadeRegionEnabled: Bool { get { kShadow.sunCascadeRegionEnabled } set { kShadow.sunCascadeRegionEnabled = newValue } _modify { yield &kShadow.sunCascadeRegionEnabled } }
     public var spotShadowRegionEnabled: Bool { get { kShadow.spotShadowRegionEnabled } set { kShadow.spotShadowRegionEnabled = newValue } _modify { yield &kShadow.spotShadowRegionEnabled } }
+    public var sunCascadeTexelSnapEnabled: Bool { get { kShadow.sunCascadeTexelSnapEnabled } set { kShadow.sunCascadeTexelSnapEnabled = newValue } _modify { yield &kShadow.sunCascadeTexelSnapEnabled } }
     public var sunCascadeReuseEnabled: Bool { get { kShadow.sunCascadeReuseEnabled } set { kShadow.sunCascadeReuseEnabled = newValue } _modify { yield &kShadow.sunCascadeReuseEnabled } }
     public var shadowsEnabled: Bool { get { kShadow.shadowsEnabled } set { kShadow.shadowsEnabled = newValue } _modify { yield &kShadow.shadowsEnabled } }
     public var directionalShadowExcludedKinds: Set<MeshKind> { get { kShadow.directionalShadowExcludedKinds } set { kShadow.directionalShadowExcludedKinds = newValue } _modify { yield &kShadow.directionalShadowExcludedKinds } }

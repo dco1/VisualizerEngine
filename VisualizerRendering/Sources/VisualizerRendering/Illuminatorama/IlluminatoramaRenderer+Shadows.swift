@@ -219,6 +219,24 @@ extension IlluminatoramaRenderer {
             // Y-aligned degeneracy where cross(up, forward) would collapse.
             let lightUpHint: SIMD3<Float> = abs(toLight.y) < 0.95 ? SIMD3(0, 1, 0)
                                                                   : SIMD3(0, 0, 1)
+            // Stable cascades: snap the centre to whole shadow texels in the light's own
+            // x/y. The sphere fit keeps the cascade's SIZE steady as the camera turns, but
+            // its centre still slides with every pan or turn, so the map's texel grid slid
+            // across the world by a fraction of a texel each frame and every shadow edge's
+            // staircase re-rasterised differently: shadows "quivered" during camera motion
+            // (Munimyni's orbiting board camera, TAA off). The light frame's rotation depends
+            // only on the light direction, so moving the centre by whole texels along its s/u
+            // axes keeps the grid fixed in the world. Radius steps of 1/16 (above) still
+            // re-grid, but only while the camera zooms.
+            if sunCascadeTexelSnapEnabled {
+                let texelWorld = 2 * radius / Float(max(1, shd.shadowMap.width))
+                let fwd = -toLight
+                let s = simd_normalize(simd_cross(fwd, lightUpHint))
+                let u = simd_cross(s, fwd)
+                let cs = simd_dot(center, s), cu = simd_dot(center, u)
+                center += s * ((cs / texelWorld).rounded() * texelWorld - cs)
+                        + u * ((cu / texelWorld).rounded() * texelWorld - cu)
+            }
             // Push the eye back beyond the sphere's near side and stretch the
             // far plane to match, so occluders sitting between the light and
             // the visible sub-frustum are still included in the shadow map.

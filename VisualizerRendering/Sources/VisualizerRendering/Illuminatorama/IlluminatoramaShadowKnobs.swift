@@ -47,6 +47,10 @@ final class ShadowKnobs {
     /// the rectangle the change projects to. Off = it re-renders whole. Needs `sunCascadeReuseEnabled`.
     var sunCascadeRegionEnabled: Bool = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_CASCADE_REGION"] != "1"
     var sunCascadeReuseEnabled: Bool = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_CASCADE_REUSE"] != "1"
+    /// Snap each sun cascade's centre to whole shadow texels in light space, so the map's texel
+    /// grid stays put in the world while the camera pans or turns (no shadow-edge swimming).
+    /// Default on; `VIZ_ILLUMI_NO_CASCADE_SNAP=1` starts it off for A/B.
+    var sunCascadeTexelSnapEnabled: Bool = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_CASCADE_SNAP"] != "1"
     /// Daydream DH-1674 — A/B lever for REGION spot/area-slice re-renders (default on;
     /// `VIZ_ILLUMI_NO_SPOT_REGION=1` starts it off): a slice a bounded change reaches re-rasterises
     /// only the rectangle the change projects to. Off = it re-renders whole. Needs per-slice dirtying.
