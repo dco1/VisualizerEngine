@@ -62,6 +62,12 @@ public struct IlluminatoramaReconstructionFilter: Sendable, Equatable {
         case tent = 2
         case mitchellNetravali = 3
         case blackmanHarris = 4
+        /// Catmull–Rom (B = 0, C = ½) — the UPSCALE kernel, for a frame rendered BELOW the output
+        /// (`upscale(scale:)`). The shader runs it as a fast path (`illumiCatmullRomUpscale`: five
+        /// bilinear fetches, the ≤ 1/64 corner taps dropped) and clamps the result to the 2 × 2 texels
+        /// the pixel sits between, so its negative lobes sharpen without ringing — two steps
+        /// `gather1D` does not model; it describes the full cubic.
+        case catmullRom = 5
     }
 
     public var kernel: Kernel
@@ -80,6 +86,15 @@ public struct IlluminatoramaReconstructionFilter: Sendable, Equatable {
     public static func blackmanHarris(radius: Float = 1.5) -> Self { Self(kernel: .blackmanHarris, radius: radius) }
     /// Mitchell–Netravali (B = C = ⅓) at its natural ±2 output-pixel support.
     public static func mitchellNetravali(radius: Float = 2.0) -> Self { Self(kernel: .mitchellNetravali, radius: radius) }
+
+    /// **The live canvas's upscale** (Daydream, 2026-11-16): a frame rendered at `scale` < 1 of the
+    /// output, reconstructed with Catmull–Rom over ±2 INTERNAL texels — radius `2 / scale` output
+    /// pixels, so the kernel sits on the texel grid it interpolates. The legacy 4-tap path at 0.55×
+    /// blurs every output pixel across ~2 texels ([1 2 1] of bilinear taps); this interpolates them.
+    /// `.legacy` at `scale` ≥ 1, where the frame is a supersample and the reduction is not an upscale.
+    public static func upscale(scale: Float) -> Self {
+        scale < 0.999 ? Self(kernel: .catmullRom, radius: 2 / max(scale, 0.25)) : .legacy
+    }
 
     /// The shader's tap loop bound: internal texels each side of the centre. A kernel whose
     /// `radius × scale` would reach further is narrowed to fit (`effectiveRadius`), never truncated —
@@ -106,6 +121,9 @@ public struct IlluminatoramaReconstructionFilter: Sendable, Equatable {
     /// Mitchell–Netravali B and C.
     public static let mitchellB = 1.0 / 3.0
     public static let mitchellC = 1.0 / 3.0
+    /// Catmull–Rom B and C.
+    public static let catmullRomB = 0.0
+    public static let catmullRomC = 0.5
 
     /// The kernel's 1-D weight at `x` OUTPUT pixels from the centre, unnormalised (peak need not be 1;
     /// every use divides by the sum of the weights it gathered). 0 outside ±radius, and 0 for `.legacy`
@@ -125,6 +143,15 @@ public struct IlluminatoramaReconstructionFilter: Sendable, Equatable {
             // Natural support ±2, stretched to ±radius.
             let t = ax * 2 / r
             let B = Self.mitchellB, C = Self.mitchellC
+            if t < 1 {
+                return ((12 - 9 * B - 6 * C) * t * t * t + (-18 + 12 * B + 6 * C) * t * t + (6 - 2 * B)) / 6
+            } else if t < 2 {
+                return ((-B - 6 * C) * t * t * t + (6 * B + 30 * C) * t * t + (-12 * B - 48 * C) * t + (8 * B + 24 * C)) / 6
+            }
+            return 0
+        case .catmullRom:
+            let t = ax * 2 / r
+            let B = Self.catmullRomB, C = Self.catmullRomC
             if t < 1 {
                 return ((12 - 9 * B - 6 * C) * t * t * t + (-18 + 12 * B + 6 * C) * t * t + (6 - 2 * B)) / 6
             } else if t < 2 {

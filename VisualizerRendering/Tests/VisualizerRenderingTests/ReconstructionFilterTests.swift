@@ -147,6 +147,30 @@ final class ReconstructionFilterTests: XCTestCase {
         }
     }
 
+    /// The live canvas's upscale (scale < 1) interpolates its texels — a texel centre is reproduced
+    /// exactly (Catmull–Rom is interpolating), and the legacy 4-tap path blurs it into its neighbours.
+    func testUpscaleInterpolatesWhereTheLegacyPathBlurs() {
+        let s = 0.55
+        let up = F.upscale(scale: Float(s))
+        XCTAssertEqual(up.kernel, .catmullRom)
+        XCTAssertEqual(F.upscale(scale: 1.0), .legacy)
+        XCTAssertEqual(F.upscale(scale: 2.0), .legacy)
+        // An impulse at texel 10: the output pixel whose centre lands nearest it.
+        let n = 40
+        func response(_ f: F) -> Double {
+            var best = 0.0
+            for o in 0..<Int(Double(n) / s) {
+                let taps = f.gather1D(outputPixel: o, scale: s, internalCount: n)
+                let centre = (Double(o) + 0.5) * s - 0.5
+                guard abs(centre - 10) < 0.3 else { continue }
+                best = max(best, taps.filter { $0.texel == 10 }.reduce(0) { $0 + $1.weight })
+            }
+            return best
+        }
+        XCTAssertGreaterThan(response(up), 0.8, "Catmull–Rom should keep most of a texel's own value")
+        XCTAssertLessThan(response(.legacy), 0.6, "the legacy path should be the blur this replaces")
+    }
+
     // MARK: shader mirror
 
     func testShaderSourceMirrorsTheSwiftKernelCoefficients() throws {
@@ -161,6 +185,8 @@ final class ReconstructionFilterTests: XCTestCase {
         XCTAssertTrue(src.contains("kReconMaxHalf = \(F.maxTapHalfWidth);"))
         XCTAssertTrue(src.contains("const float B = 1.0 / 3.0, C = 1.0 / 3.0;"))
         XCTAssertEqual(F.mitchellB, 1.0 / 3.0); XCTAssertEqual(F.mitchellC, 1.0 / 3.0)
+        XCTAssertTrue(src.contains("const float B = 0.0, C = 0.5;"))
+        XCTAssertEqual(F.catmullRomB, 0.0); XCTAssertEqual(F.catmullRomC, 0.5)
         for k in F.Kernel.allCases where k != .legacy {
             XCTAssertTrue(src.contains("kern == \(k.rawValue)u"), "shader has no branch for \(k)")
         }

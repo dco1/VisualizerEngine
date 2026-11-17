@@ -1361,6 +1361,7 @@ public final class IlluminatoramaRenderer {
     static let gpuMeshPrevStride = MemoryLayout<Float>.size * 3
 
     lazy var localToneMapPass = IlluminatoramaLocalToneMapPass(engine: engine)
+    lazy var spatialAAPass = IlluminatoramaSpatialAA(engine: engine)
     lazy var hdrDump = IlluminatoramaHDRDump()
 
 

@@ -335,6 +335,8 @@ extension IlluminatoramaRenderer {
         // history never sees them and they can't trail. No-op when there are
         // no emitters/fields.
         encodePostResolveFX(cb)
+        // Spatial AA of the finished HDR for a history-free frame (opt-in; IlluminatoramaSpatialAA).
+        encodeSpatialAA(cb)
         // Phase 4.21 — auto-exposure estimate. Runs AFTER TAA resolve so
         // we sample the same texture the tonemap will read, and BEFORE
         // bloom + tonemap so the smoothed exposure is fresh by the time

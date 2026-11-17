@@ -715,6 +715,13 @@ static inline float illumiReconWeight(uint kern, float r, float x) {
         if (t < 2.0) return ((-B - 6.0 * C) * t * t * t + (6.0 * B + 30.0 * C) * t * t + (-12.0 * B - 48.0 * C) * t + (8.0 * B + 24.0 * C)) / 6.0;
         return 0.0;
     }
+    if (kern == 5u) {                                                       // Catmull–Rom (B = 0, C = ½): the UPSCALE kernel
+        const float B = 0.0, C = 0.5;
+        float t = ax * 2.0 / r;
+        if (t < 1.0) return ((12.0 - 9.0 * B - 6.0 * C) * t * t * t + (-18.0 + 12.0 * B + 6.0 * C) * t * t + (6.0 - 2.0 * B)) / 6.0;
+        if (t < 2.0) return ((-B - 6.0 * C) * t * t * t + (6.0 * B + 30.0 * C) * t * t + (-12.0 * B - 48.0 * C) * t + (8.0 * B + 24.0 * C)) / 6.0;
+        return 0.0;
+    }
     if (kern == 4u) {                                                       // 4-term Blackman–Harris
         if (ax > r) return 0.0;
         float p = M_PI_F * x / r;
@@ -756,10 +763,46 @@ static inline float3 illumiReconstructGather(texture2d<half, access::sample> inH
         }
         acc += wy[b] * row;
     }
+    float3 outv = acc / (sx * sy);
     // A negative-lobed kernel (Mitchell) can undershoot below zero beside a bright source; light
     // cannot be negative. (This removes a negative PIXEL, not the dark halo — which is why the
     // Maximum contract asks for the non-negative Blackman–Harris.)
-    return max(acc / (sx * sy), float3(0.0));
+    return max(outv, float3(0.0));
+}
+
+/// **The live canvas's upscale (kernel 5, Catmull–Rom), in five bilinear fetches.** The generic gather
+/// above reads 4 × 4 texels per output pixel with per-tap weight evaluation (+5 ms at 1920 × 1200 with
+/// the presets' chromatic aberration, measured 2026-11-16); this is the same B = 0, C = ½ cubic on the
+/// TEXEL grid, folded into bilinear fetches (the middle two taps per axis merge into one; the four
+/// corner taps, whose weights are ≤ 1/64, are dropped and the rest renormalised). The result is then
+/// clamped to the 2 × 2 texels the pixel sits between (the anti-ringing clamp of FSR's EASU and of
+/// every TAA history fetch), so Catmull–Rom's negative lobes sharpen an edge without printing a dark
+/// halo beside a window 50× brighter than the wall.
+static inline float3 illumiCatmullRomUpscale(texture2d<half, access::sample> t, sampler sm, float2 uv) {
+    float2 size = float2(t.get_width(), t.get_height());
+    float2 p  = uv * size;
+    float2 t1 = floor(p - 0.5) + 0.5;
+    float2 f  = p - t1;
+    float2 w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    float2 w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 w12 = w1 + w2;
+    float2 c0  = (t1 - 1.0) / size;
+    float2 c3  = (t1 + 2.0) / size;
+    float2 c12 = (t1 + w2 / w12) / size;
+    float3 acc = float3(t.sample(sm, float2(c12.x, c0.y)).rgb)  * (w12.x * w0.y)
+               + float3(t.sample(sm, float2(c0.x,  c12.y)).rgb) * (w0.x  * w12.y)
+               + float3(t.sample(sm, c12).rgb)                  * (w12.x * w12.y)
+               + float3(t.sample(sm, float2(c3.x,  c12.y)).rgb) * (w3.x  * w12.y)
+               + float3(t.sample(sm, float2(c12.x, c3.y)).rgb)  * (w12.x * w3.y);
+    float wsum = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y;
+    float3 v = acc / max(wsum, 1e-4);
+    int2 i0 = clamp(int2(t1 - 0.5), int2(0), int2(size) - 1);
+    int2 i1 = min(i0 + 1, int2(size) - 1);
+    float3 a = float3(t.read(uint2(i0.x, i0.y)).rgb), b = float3(t.read(uint2(i1.x, i0.y)).rgb);
+    float3 d = float3(t.read(uint2(i0.x, i1.y)).rgb), e = float3(t.read(uint2(i1.x, i1.y)).rgb);
+    return max(clamp(v, min(min(a, b), min(d, e)), max(max(a, b), max(d, e))), float3(0.0));
 }
 
 // ── Daydream DH-1374 — the HDR (gain-map) rendition of the SAME picture ─────────────────────────────────────────
@@ -970,7 +1013,19 @@ fragment float4 illumi_tonemap_fs(
         uint   kern  = uint(frame.taaJitterDelta.z + 0.5);
         float  rad   = frame.taaJitterDelta.w;
         float2 recon = max(abs(float2(dfdx(in.uv.x), dfdy(in.uv.y))) * inSize, float2(1e-3));
-        if (frame.chromaticAberration > 0.0) {
+        if (kern == 5u) {
+            // The live upscale's fast path. Chromatic aberration is applied as the bilinear DIFFERENCE
+            // its lateral shift makes to red and blue (three fetches), so all three channels keep the
+            // cubic's sharpness — shifting them with plain bilinear fetches would leave red and blue
+            // softer than green and fringe every edge.
+            hdr = illumiCatmullRomUpscale(inHDR, downSampler, in.uv);
+            if (frame.chromaticAberration > 0.0) {
+                float2 caOff = (in.uv - 0.5) * (frame.chromaticAberration * 0.03);
+                float3 here = float3(inHDR.sample(downSampler, in.uv).rgb);
+                hdr.r = max(0.0, hdr.r + float(inHDR.sample(downSampler, in.uv + caOff).r) - here.r);
+                hdr.b = max(0.0, hdr.b + float(inHDR.sample(downSampler, in.uv - caOff).b) - here.b);
+            }
+        } else if (frame.chromaticAberration > 0.0) {
             // Same lateral split as the legacy CA branch below, one gather per channel.
             float2 caOff = (in.uv - 0.5) * (frame.chromaticAberration * 0.03);
             hdr.r = illumiReconstructGather(inHDR, in.uv + caOff, recon, kern, rad).r;

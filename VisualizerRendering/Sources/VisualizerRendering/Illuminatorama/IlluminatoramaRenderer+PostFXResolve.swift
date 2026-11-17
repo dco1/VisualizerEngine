@@ -78,6 +78,11 @@ extension IlluminatoramaRenderer {
     /// After the post-resolve overlay it's the display buffer; otherwise the
     /// plain resolved source.
     var displaySource: MTLTexture {
+        spatialAAPass.appliedOutput ?? displaySourceBeforeAA
+    }
+
+    /// `displaySource` before the spatial anti-aliasing pass (`IlluminatoramaSpatialAA`) — its input.
+    var displaySourceBeforeAA: MTLTexture {
         pfx.overlayApplied ? gbs.hdrTexture : postFXSource
     }
 
