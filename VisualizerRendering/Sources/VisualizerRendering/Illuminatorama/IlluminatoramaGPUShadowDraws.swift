@@ -158,7 +158,13 @@ final class GPUShadowDrawState {
 
     /// A/B lever (`VIZ_ILLUMI_NO_GPU_DRAWS=1` starts it off): off = every shadow draw is encoded by
     /// the CPU loop, exactly as before DH-1684.
+    // Off on the iOS Simulator: it has no indirect command buffers (`newIndirectCommandBuffer… not
+    // supported in the simulator` traps). The CPU-encoded shadow draws are the path it takes instead.
+    #if targetEnvironment(simulator)
+    var enabled = false
+    #else
     var enabled = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_GPU_DRAWS"] != "1"
+    #endif
     var table: GPUShadowDrawTable?
     var slots: [GPUShadowFrameSlot] = []
     var cullPipeline: MTLComputePipelineState?

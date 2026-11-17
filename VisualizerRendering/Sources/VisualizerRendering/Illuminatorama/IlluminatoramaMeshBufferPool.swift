@@ -20,7 +20,13 @@ import Metal
 public final class IlluminatoramaMeshBufferPool: @unchecked Sendable {
 
     /// A/B lever. Off = every mesh buffer comes from `device.makeBuffer`, as before DH-1676.
+    /// Always off on the iOS Simulator: its Metal requires `.private` storage for heaps and traps
+    /// (`MTLStorageModePrivate is required for heaps`) on the shared heaps this pool makes.
+    #if targetEnvironment(simulator)
+    nonisolated(unsafe) public static var enabled = false
+    #else
     nonisolated(unsafe) public static var enabled = ProcessInfo.processInfo.environment["VIZ_ILLUMI_NO_MESH_POOL"] != "1"
+    #endif
     /// Buffers larger than this go to the device (a big mesh would fragment a heap for little gain).
     static let maxPooledLength = 1 << 20
     static let heapSize = 32 << 20
