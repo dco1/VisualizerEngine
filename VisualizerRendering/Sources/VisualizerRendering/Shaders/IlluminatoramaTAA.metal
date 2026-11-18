@@ -128,6 +128,12 @@ struct TAAStillParams {
     uint _r5; uint _r6; uint _r7;   // 32 bytes, the Swift mirror's size
 };
 
+// The resolve's 3x3 depth and colour neighbourhoods come from a threadgroup tile: each 16x16 group loads its
+// 18x18 apron once (1.27 reads a pixel instead of 9 + 9). Same texels, same clamping, so the same result. The
+// host dispatches exactly 16x16 groups (`encodeTAAResolve`).
+constant int kTAATile  = 16;
+constant int kTAAApron = kTAATile + 2;
+
 kernel void illumi_taa_resolve(
     texture2d<half,  access::read>    currentHDR  [[texture(0)]],
     texture2d<half,  access::sample>  historyHDR  [[texture(1)]],
@@ -150,10 +156,26 @@ kernel void illumi_taa_resolve(
     texture2d<half,  access::read>    crossfadeSrc [[texture(7)]],
     constant FrameUniforms&           frame       [[buffer(0)]],
     constant TAAStillParams&          still       [[buffer(1)]],
-    uint2                             gid         [[thread_position_in_grid]]
+    uint2                             gid         [[thread_position_in_grid]],
+    uint2                             tid         [[thread_position_in_threadgroup]],
+    uint2                             tgp         [[threadgroup_position_in_grid]]
 ) {
     uint W = outHistory.get_width();
     uint H = outHistory.get_height();
+    threadgroup float tDepth[kTAAApron * kTAAApron];
+    threadgroup half4 tHDR[kTAAApron * kTAAApron];
+    {
+        int2 origin = int2(tgp) * kTAATile - 1;
+        int2 hi = int2(int(W) - 1, int(H) - 1);
+        for (int k = int(tid.y) * kTAATile + int(tid.x); k < kTAAApron * kTAAApron; k += kTAATile * kTAATile) {
+            uint2 c = uint2(clamp(origin + int2(k % kTAAApron, k / kTAAApron), int2(0), hi));
+            tDepth[k] = gDepth.read(c);
+            tHDR[k]   = currentHDR.read(c);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Neighbour (i, j) of this pixel in the tile (i, j in -1...1).
+    #define TAA_TILE(i, j) ((int(tid.y) + 1 + (j)) * kTAAApron + (int(tid.x) + 1 + (i)))
     if (gid.x >= W || gid.y >= H) return;
 
     float3 current = float3(currentHDR.read(gid).rgb);
@@ -218,9 +240,7 @@ kernel void illumi_taa_resolve(
     int2  closestOff   = int2(0);
     for (int j = -1; j <= 1; ++j) {
         for (int i = -1; i <= 1; ++i) {
-            int2 c = clamp(int2(gid) + int2(i, j),
-                           int2(0), int2(int(W) - 1, int(H) - 1));
-            float d = gDepth.read(uint2(c));
+            float d = tDepth[TAA_TILE(i, j)];
             if (d < closestDepth) { closestDepth = d; closestOff = int2(i, j); }
         }
     }
@@ -306,7 +326,9 @@ kernel void illumi_taa_resolve(
             // match in the 3×3 — a surface that was really there last frame is
             // within a pixel of it; one that left (a fast mover) is not. Unjittered
             // hosts keep the single read.
-            if (any(frame.taaJitterDelta.xy != 0.0)) {
+            // The 3x3 search can only lower zMiss, and at or below 0.0015 the smoothstep below is already 0:
+            // skip its nine reads where the centre texel settles it (most pixels).
+            if (zMiss > 0.0015 && any(frame.taaJitterDelta.xy != 0.0)) {
                 for (int j = -1; j <= 1; ++j) {
                     for (int i = -1; i <= 1; ++i) {
                         uint2 c = uint2(clamp(int2(hpix) + int2(i, j), int2(0), int2(int(W) - 1, int(H) - 1)));
@@ -331,9 +353,7 @@ kernel void illumi_taa_resolve(
     float3 nMin = float3(1e30), nMax = float3(-1e30);
     for (int j = -1; j <= 1; ++j) {
         for (int i = -1; i <= 1; ++i) {
-            int2 c = clamp(int2(gid) + int2(i, j),
-                           int2(0), int2(int(W) - 1, int(H) - 1));
-            float3 s = RGBtoYCoCg(float3(currentHDR.read(uint2(c)).rgb));
+            float3 s = RGBtoYCoCg(float3(tHDR[TAA_TILE(i, j)].rgb));
             m1 += s;
             m2 += s * s;
             nMin = min(nMin, s); nMax = max(nMax, s);

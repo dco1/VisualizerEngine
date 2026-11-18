@@ -39,7 +39,10 @@ extension IlluminatoramaRenderer {
                                    fade: pfx.taaCrossfadeSource == nil ? 0 : fade,
                                    skyNoHistory: taaSkyIgnoresHistory ? 1 : 0)
         enc.setBytes(&still, length: MemoryLayout<TAAStillParams>.stride, index: 1)
-        dispatch(enc, pipeline: pfx.taaResolvePipeline, width: width, height: height)
+        // Exactly 16x16 threads a group: the kernel's threadgroup tile (`kTAATile` in IlluminatoramaTAA.metal).
+        precondition(pfx.taaResolvePipeline.maxTotalThreadsPerThreadgroup >= 256, "TAA resolve needs 16x16 threadgroups")
+        enc.dispatchThreadgroups(MTLSize(width: (width + 15) / 16, height: (height + 15) / 16, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
         enc.endEncoding()
     }
 
