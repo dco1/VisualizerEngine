@@ -23,6 +23,8 @@ extension IlluminatoramaRenderer {
     public var ssaoIntensity: Float { get { kGI.ssaoIntensity } set { kGI.ssaoIntensity = newValue } _modify { yield &kGI.ssaoIntensity } }
     public var ssaoRadius: Float { get { kGI.ssaoRadius } set { kGI.ssaoRadius = newValue } _modify { yield &kGI.ssaoRadius } }
     public var ssaoFarRadius: Float { get { kGI.ssaoFarRadius } set { kGI.ssaoFarRadius = newValue } _modify { yield &kGI.ssaoFarRadius } }
+    public var ssaoSlices: Int { get { kGI.ssaoSlices } set { kGI.ssaoSlices = newValue } }
+    public var ssaoSteps: Int { get { kGI.ssaoSteps } set { kGI.ssaoSteps = newValue } }
     public var ssaoFarIntensity: Float { get { kGI.ssaoFarIntensity } set { kGI.ssaoFarIntensity = newValue } _modify { yield &kGI.ssaoFarIntensity } }
     public var ssrIntensity: Float { get { kGI.ssrIntensity } set { kGI.ssrIntensity = newValue } _modify { yield &kGI.ssrIntensity } }
     public var ssrMaxDistance: Float { get { kGI.ssrMaxDistance } set { kGI.ssrMaxDistance = newValue } _modify { yield &kGI.ssrMaxDistance } }

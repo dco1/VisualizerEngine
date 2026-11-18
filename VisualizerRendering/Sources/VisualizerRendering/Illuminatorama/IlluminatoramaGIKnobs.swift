@@ -94,6 +94,10 @@ final class GIKnobs {
     /// DH-0441 — strength of the wide AO ring. 0 (default) = OFF, the ring is never marched
     /// and the AO field is byte-identical.
     var ssaoFarIntensity: Float = 0
+    /// GTAO azimuth slices and march steps per side (default 6 x 4 = 48 depth reads per half-res pixel).
+    /// Fewer is a cheaper, noisier estimate that TAA / the AO temporal pass average over frames.
+    var ssaoSlices: Int = 6
+    var ssaoSteps: Int = 4
     /// Screen-space reflection intensity (0 = disabled).
     var ssrIntensity: Float = 0.7
     /// Max view-space ray length for SSR marches, in metres.

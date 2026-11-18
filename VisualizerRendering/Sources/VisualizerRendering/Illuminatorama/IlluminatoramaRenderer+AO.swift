@@ -91,12 +91,13 @@ extension IlluminatoramaRenderer {
         rtaoDidRunLastFrame = false
         guard let enc = timedComputeEncoder(cb, "ssao") else { return }
         enc.label = "Illuminatorama.ssao"
-        enc.setComputePipelineState(aos.ssaoPipeline)
+        let pipeline = ssaoPipelineForQuality()
+        enc.setComputePipelineState(pipeline)
         enc.setTexture(gbs.depthTexture, index: 0)
         enc.setTexture(gbs.gbufferNormalRgh, index: 1)
         enc.setTexture(aos.aoTexture, index: 2)
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
-        dispatch(enc, pipeline: aos.ssaoPipeline, width: halfW, height: halfH)
+        dispatch(enc, pipeline: pipeline, width: halfW, height: halfH)
         enc.endEncoding()
     }
 
@@ -214,6 +215,7 @@ final class AOState {
     var aoSampleCount: MTLTexture!  // half-res
 
     var ssaoPipeline: MTLComputePipelineState!
+    var ssaoVariants: [String: MTLComputePipelineState] = [:]
 
     var ssaoSpatialPipeline: MTLComputePipelineState!
     var rtaoPipeline: MTLComputePipelineState?  // nil on non-RT hardware (never dispatched there)
@@ -233,6 +235,24 @@ final class AOState {
 
 extension IlluminatoramaRenderer {
     static let rtAOVFunctionConstantIndex = 31
+    static let ssaoSlicesFunctionConstantIndex = 32
+    static let ssaoStepsFunctionConstantIndex = 33
+
+    /// The SSAO pipeline for the host's `ssaoSlices` x `ssaoSteps`. The 6 x 4 default is the stock pipeline;
+    /// any other pair compiles a variant once (first use) and keeps it. A failed compile falls back to stock.
+    func ssaoPipelineForQuality() -> MTLComputePipelineState {
+        let slices = max(1, min(12, ssaoSlices)), steps = max(1, min(12, ssaoSteps))
+        if slices == 6 && steps == 4 { return aos.ssaoPipeline }
+        let key = "ssao-\(slices)x\(steps)"
+        if let p = aos.ssaoVariants[key] { return p }
+        let cv = MTLFunctionConstantValues()
+        var sl = UInt32(slices), st = UInt32(steps)
+        cv.setConstantValue(&sl, type: .uint, index: Self.ssaoSlicesFunctionConstantIndex)
+        cv.setConstantValue(&st, type: .uint, index: Self.ssaoStepsFunctionConstantIndex)
+        let p = engine.pipelineCache.pipelineState(name: "illumi_ssao", device: device, constants: cv, variantKey: key)
+        aos.ssaoVariants[key] = p ?? aos.ssaoPipeline
+        return aos.ssaoVariants[key]!
+    }
 
     /// Restart the accumulated AO mean — for a host that changed the scene without moving the
     /// camera or the scene's topology (e.g. moved an object) and keeps accumulation on.
@@ -257,7 +277,12 @@ extension IlluminatoramaRenderer {
 extension IlluminatoramaRenderer {
     /// SSAO + RTAO compute pipelines (RTAO is nil on non-RT hardware: it is never dispatched there).
     @MainActor static func buildAOPipelines(into s: AOState, cache: SimPipelineCache, device: MTLDevice) throws {
-        guard let ssaoPipelineBuilt = cache.pipelineState(name: "illumi_ssao", device: device) else {
+        let stock = MTLFunctionConstantValues()      // a function with function constants can't be built bare
+        var sl: UInt32 = 6, st: UInt32 = 4
+        stock.setConstantValue(&sl, type: .uint, index: ssaoSlicesFunctionConstantIndex)
+        stock.setConstantValue(&st, type: .uint, index: ssaoStepsFunctionConstantIndex)
+        guard let ssaoPipelineBuilt = cache.pipelineState(name: "illumi_ssao", device: device,
+                                                          constants: stock, variantKey: "ssao-6x4") else {
             throw IlluminatoramaError.pipelineCreationFailed("illumi_ssao")
         }
         s.ssaoPipeline = ssaoPipelineBuilt

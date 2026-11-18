@@ -59,8 +59,12 @@ static inline float ssaoIGN(float2 p) {
 // live canvas's TAA + SSAO-temporal passes converge that residual, fed by the per-frame
 // azimuth advance below. The headless bench forces TAA off (`pinGrade` →
 // `sharedTAAOverride = false`) and cannot exercise that convergence.
-constant uint  kGtaoSlices = 6;
-constant uint  kGtaoSteps  = 4;
+// Quality variants (Munimyni phone budget): the host may compile fewer slices/steps through function
+// constants 32/33 (`ssaoSlices` / `ssaoSteps`); undefined = the 6 x 4 default, byte-identical to before.
+constant uint kGtaoSlicesFC [[function_constant(32)]];
+constant uint kGtaoStepsFC  [[function_constant(33)]];
+constant uint kGtaoSlices = is_function_constant_defined(kGtaoSlicesFC) ? kGtaoSlicesFC : 6;
+constant uint kGtaoSteps  = is_function_constant_defined(kGtaoStepsFC)  ? kGtaoStepsFC  : 4;
 constant float kHalfPi     = 1.5707963267948966;
 
 // Minimum march offset, in FULL-RES pixels. A horizon sample must land on a DIFFERENT

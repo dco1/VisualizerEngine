@@ -293,7 +293,7 @@ extension IlluminatoramaRenderer {
             "illumi_irradiance_bake",
             "illumi_mesh_build_adjacency", "illumi_mesh_synth", "illumi_particles_step",
             "illumi_prefilter_bake", "illumi_repack_pos_norm", "illumi_rt_denoise",
-            "illumi_rt_gi_temporal", "illumi_ssao", "illumi_ssao_spatial",
+            "illumi_rt_gi_temporal", "illumi_ssao_spatial",
             "illumi_ssao_temporal", "illumi_ssr_composite", "illumi_ssr_gather",
             "illumi_ssr_temporal", "illumi_surfcache_atrous",
             "illumi_surfcache_reframe_chart",
