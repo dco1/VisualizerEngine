@@ -25,6 +25,20 @@ extension IlluminatoramaRenderer {
     }
     public var gbufferEncodeMsSamples: [Double] { gbs.encodeMsSamples }
 
+    /// The light-layer target is read only by the lighting kernel, and only where a fragment's layer can change
+    /// its result: the point / spot / area light loops and the interior rooms. Without any, nothing reads it, so
+    /// the G-buffer pass leaves it in tile memory instead of storing 4 bytes a pixel (TBDR bandwidth).
+    var lightLayerTargetIsRead: Bool {
+        !pointLights.isEmpty || !spotLights.isEmpty || !areaLights.isEmpty || interiorLayerMask != 0
+    }
+
+    /// The material-layer target is read by the lighting kernel's layered lobes, the SSR gather and the RT
+    /// lighting passes — the same gates those readers use. Otherwise it stays in tile memory.
+    var materialLayerTargetIsRead: Bool {
+        layeredSpecularEnabled || (dfgLUTEnabled && layeredCoatEnabled) || thinFilmEnabled || translucencyEnabled
+            || ssrIntensity > 0 || rtEnabled
+    }
+
     func encodeGBufferPass(_ cb: MTLCommandBuffer) {
         if gbs.encodeTimingEnabled {
             let t0 = DispatchTime.now().uptimeNanoseconds
@@ -67,7 +81,7 @@ extension IlluminatoramaRenderer {
         // from clearColor.red.
         pass.colorAttachments[4].texture = gbs.gbufferLayer
         pass.colorAttachments[4].loadAction = .clear
-        pass.colorAttachments[4].storeAction = .store
+        pass.colorAttachments[4].storeAction = lightLayerTargetIsRead ? .store : .dontCare
         pass.colorAttachments[4].clearColor = MTLClearColor(red: Double(UInt32.max), green: 0, blue: 0, alpha: 0)
         if extended, let material = gbs.gbufferMaterial {
             // Clear to 0 = "not written": impostors and any legacy pipeline that draws into this
@@ -81,7 +95,7 @@ extension IlluminatoramaRenderer {
         // instance without layer parameters, reads "none" and keeps the legacy material model.
         pass.colorAttachments[7].texture = gbs.gbufferMaterialLayer
         pass.colorAttachments[7].loadAction = .clear
-        pass.colorAttachments[7].storeAction = .store
+        pass.colorAttachments[7].storeAction = materialLayerTargetIsRead ? .store : .dontCare
         pass.colorAttachments[7].clearColor = MTLClearColor(red: Double(UInt32.max), green: 0, blue: 0, alpha: 0)
         attachVisBufferTarget(pass)   // Signack S3: the memoryless triangle-id attachment (color 6)
         pass.depthAttachment.texture = gbs.depthTexture
