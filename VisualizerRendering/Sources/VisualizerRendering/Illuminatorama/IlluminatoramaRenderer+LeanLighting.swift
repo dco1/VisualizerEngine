@@ -121,3 +121,28 @@ extension IlluminatoramaRenderer {
         return p
     }
 }
+
+// MARK: - Prewarming other lean variants (MM-0075: night lights)
+
+extension IlluminatoramaRenderer {
+
+    /// Feature-mask bits a host may add when prewarming (`kLFPoint` / `kLFSpot` in IlluminatoramaLighting.metal).
+    public static let leanFeaturePointLights: UInt32 = 1 << 0
+    public static let leanFeatureSpotLights: UInt32 = 1 << 1
+
+    /// Compile, in the background, the lean lighting variants this scene will switch to later — e.g. the day mask
+    /// plus point and spot lights for dusk — so the switch draws its specialised kernel at once instead of the
+    /// uber fallback while it compiles. Each entry is ORed onto the CURRENT frame's feature mask, with its flags.
+    /// Returns false (nothing started) before lean lighting has run a frame.
+    @discardableResult
+    public func prewarmLeanLighting(addingFeatures extras: [UInt32]) -> Bool {
+        guard leanLightingEnabled, let now = gbs.leanMasks else { return false }
+        for extra in extras {
+            let (key, cv) = Self.lightingFeatureConstants(
+                ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
+                rtSunShadow: false, aov: false, lean: SIMD2(now.x, now.y | extra))
+            _ = engine.pipelineCache.pipelineStateAsync(name: "illumi_lighting", device: device, constants: cv, variantKey: key)
+        }
+        return true
+    }
+}

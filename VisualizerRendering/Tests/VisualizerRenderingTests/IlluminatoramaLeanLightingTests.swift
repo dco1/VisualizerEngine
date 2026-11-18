@@ -24,7 +24,10 @@ final class IlluminatoramaLeanLightingTests: XCTestCase {
         r.blockingLightingCompile = true            // the specialised variant, not the uber fallback
         r.leanLightingMaterials = .none
         r.leanLightingEnabled = lean
+        if lean { XCTAssertFalse(r.prewarmLeanLighting(addingFeatures: [IlluminatoramaRenderer.leanFeaturePointLights]),
+                                 "nothing to prewarm from before a frame") }
         let f = try XCTUnwrap(r.renderHeadless(frames: 3))
+        if lean { XCTAssertTrue(r.prewarmLeanLighting(addingFeatures: [IlluminatoramaRenderer.leanFeaturePointLights])) }
         if lean {
             let masks = try XCTUnwrap(r.activeLeanMasks, "the lean variant must be the one that ran")
             XCTAssertEqual(masks.y & 1 != 0, pointLight, "the point-light bit follows the scene")
