@@ -30,15 +30,19 @@ public enum Triangulation {
             if guardCount > guardLimit { break }
             var clipped = false
             let m = idx.count
-            for i in 0..<m {
-                let i0 = idx[(i + m - 1) % m]
-                let i1 = idx[i]
-                let i2 = idx[(i + 1) % m]
-                if isEar(poly, ring: idx, prev: i0, cur: i1, next: i2) {
-                    tris.append((i0, i1, i2))
-                    idx.remove(at: i)
-                    clipped = true
-                    break
+            // Prefer ears thick enough for Mesh3.addTriangle to keep (it drops anything thinner as degenerate, which
+            // would leave a hole in a cap); take a sliver only when no other ear is left.
+            for minOrient in [Self.keptOrient, 0] where !clipped {
+                for i in 0..<m {
+                    let i0 = idx[(i + m - 1) % m]
+                    let i1 = idx[i]
+                    let i2 = idx[(i + 1) % m]
+                    if isEar(poly, ring: idx, prev: i0, cur: i1, next: i2, minOrient: minOrient) {
+                        tris.append((i0, i1, i2))
+                        idx.remove(at: i)
+                        clipped = true
+                        break
+                    }
                 }
             }
             // No ear found (numerically tricky polygon) → clip the first corner to
@@ -315,10 +319,13 @@ public enum Triangulation {
 
     /// A corner is an ear iff it's convex (left turn for a CCW ring) and no other
     /// ring vertex lies inside the triangle (prev, cur, next).
+    /// Twice the area of the thinnest triangle `Mesh3.addTriangle` keeps (its degenerate cut-off, `len3(cross) > 1e-12`).
+    static let keptOrient = 1e-12
+
     private static func isEar(_ poly: [Vec2], ring: [Int],
-                              prev: Int, cur: Int, next: Int) -> Bool {
+                              prev: Int, cur: Int, next: Int, minOrient: Double = 0) -> Bool {
         let a = poly[prev], b = poly[cur], c = poly[next]
-        if orient(a, b, c) <= 0 { return false }          // reflex or collinear
+        if orient(a, b, c) <= minOrient { return false }  // reflex, collinear, or (when asked) a sliver
         for j in ring where j != prev && j != cur && j != next {
             let p = poly[j]
             // Hole-bridging duplicates a vertex (P, M appear twice); a duplicate that
