@@ -839,6 +839,11 @@ public final class VolumetricCloudRenderer {
         // failed as "the void is as green as the lawn" — the same family as the post-FX easing
         // trap. `markDomeDirty()` is the escape hatch: opt-in, so hosts that never call it are
         // byte-identical, and it costs one extra bake per call.
+        // An in-progress tiled bake (DH-1708) takes one strip per call. A forced bake abandons it.
+        if domeBakeActive {
+            if domeDirty { domeBakeActive = false }
+            else { continueTiledDomeBake(params: params); return }
+        }
         let now = CACurrentMediaTime()
         // `skipUnchangedDome`: a throttle tick whose sky is bit-identical to the last bake's is
         // not a bake — the dome would come out the same (see `domeKey`).
@@ -850,9 +855,18 @@ public final class VolumetricCloudRenderer {
         if !domeDirty && now - lastDomeRenderTime < minRenderInterval { return }
         if !domeDirty, let key, key == lastBakedDomeKey { return }
         guard domeSem.wait(timeout: .now()) == .success else { return }
+        let forced = domeDirty
         domeDirty = false
         lastDomeRenderTime = now
         lastBakedDomeKey = key
+        // A THROTTLED bake may be spread over several calls (`domeBakeStrips`); a forced one never is.
+        if domeBakeStrips > 1, !forced, let tile = tilePipeline(for: params) {
+            domeStripRows = max(1, (resolution.y + domeBakeStrips - 1) / domeBakeStrips)
+            domeNextRow = 0
+            domeBakeActive = true
+            bakeDomeStrip(tile, params: params)   // releases `domeSem` via its completion handler
+            return
+        }
         if !dispatchKernel(target: outputTexture,
                            resolution: resolution,
                            label: "volSkyRender.dome",
@@ -870,7 +884,8 @@ public final class VolumetricCloudRenderer {
                                  resolution: SIMD2<Int>,
                                  label: String,
                                  pipeline: MTLComputePipelineState,
-                                 sem: DispatchSemaphore) -> Bool {
+                                 sem: DispatchSemaphore,
+                                 rows: Range<Int>? = nil) -> Bool {
         guard let cmd = commandQueue.makeCommandBuffer() else { return false }
         cmd.label = label
         encodePendingAtmosphereLUT(into: cmd)
@@ -884,14 +899,16 @@ public final class VolumetricCloudRenderer {
         // binding is always valid (count 0 → kernel never reads it).
         enc.setBuffer(burstLights ?? fallbackLightBuffer, offset: 0, index: 1)
         if readsAtmosphereLUT(pipeline) { enc.setBuffer(uniformsBuffer, offset: Self.atmosphereLUTOffset, index: 2) }
+        if let rows { var first = UInt32(rows.lowerBound); enc.setBytes(&first, length: 4, index: 3) }
 
         let tgw = min(pipeline.threadExecutionWidth, resolution.x)
         let tgh = max(1, pipeline.maxTotalThreadsPerThreadgroup / max(1, tgw))
         let tgSize = MTLSize(width: tgw, height: min(tgh, resolution.y), depth: 1)
-        let grid = MTLSize(width: resolution.x, height: resolution.y, depth: 1)
+        let grid = MTLSize(width: resolution.x, height: rows?.count ?? resolution.y, depth: 1)
         enc.dispatchThreads(grid, threadsPerThreadgroup: tgSize)
         enc.endEncoding()
-        if target === outputTexture { encodeRadianceProbes(into: cmd) }
+        // The probes measure the finished dome: a tiled bake runs them with its LAST strip only.
+        if target === outputTexture, rows == nil || rows!.upperBound >= resolution.y { encodeRadianceProbes(into: cmd) }
 
         // Capture the semaphore (not self) so the completion handler can
         // run on any thread without crossing the @MainActor boundary.
@@ -1088,6 +1105,59 @@ public final class VolumetricCloudRenderer {
         if ms { lutPipelines.append(ObjectIdentifier(p)) }
         return p
     }
+    /// The row-tiled twin (`…Tile`, first row at buffer(3)) of `domePipeline(for:)`.
+    private func tilePipeline(for params: Params) -> MTLComputePipelineState? {
+        let ms = params.physicalMultipleScattering, aerosol = params.physicalAerosol
+        let cumulus = params.cloudModel == .cumulus
+        let name = "volSkyRender" + (cumulus ? "Cumulus" : "") + (ms ? "MS" : "") + (aerosol ? "Aerosol" : "") + "Tile"
+        if let p = variantPipelines[name] { return p }
+        // Compiled in the BACKGROUND (a serial compile is a 0.4–0.5 s stall on first use): nil until
+        // ready, and a nil sends the caller to the one-dispatch bake.
+        guard let p = pipelineCache.pipelineStateAsync(name: name, device: device,
+                                                       constants: MTLFunctionConstantValues(), variantKey: "tile") else { return nil }
+        variantPipelines[name] = p
+        if ms { lutPipelines.append(ObjectIdentifier(p)) }
+        return p
+    }
+
+    /// Start compiling the tiled-bake kernel for `params` in the background, so the first tiled
+    /// bake finds it ready. Cheap once built (a dictionary lookup): safe to call every frame.
+    public func prewarmTiledBake(params: Params) { _ = tilePipeline(for: params) }
+    /// Whether the strip kernel for `params` has finished compiling (a tiled bake only happens once it has).
+    public func tiledBakeReady(for params: Params) -> Bool { tilePipeline(for: params) != nil }
+
+    /// **Spread a throttled dome bake over several frames (DH-1708).** 1 = off (one dispatch, as
+    /// always). N > 1: a bake due by the throttle is done in N horizontal strips, ONE per `render`
+    /// call, so a moving sun costs ~1/N of a 25–45 ms bake in each of N frames instead of one
+    /// stall every `minRenderInterval`. Forced bakes (`markDomeDirty`) are never tiled, so a
+    /// headless capture still gets a whole dome from one call. Strips are baked from the uniforms of
+    /// their own frame: the sun/clouds drift a hair between a bake's first and last strip.
+    public var domeBakeStrips = 1
+    private var domeBakeActive = false
+    private var domeNextRow = 0
+    private var domeStripRows = 1
+
+    private func continueTiledDomeBake(params: Params) {
+        guard let tile = tilePipeline(for: params) else { domeBakeActive = false; return }
+        guard domeSem.wait(timeout: .now()) == .success else { return }
+        // Tiling switched off mid-bake: finish the rest at once.
+        if domeBakeStrips <= 1 { domeStripRows = resolution.y }
+        bakeDomeStrip(tile, params: params)
+    }
+
+    /// Bake the next strip (caller holds `domeSem`).
+    private func bakeDomeStrip(_ tile: MTLComputePipelineState, params: Params) {
+        let from = domeNextRow, to = min(resolution.y, from + domeStripRows)
+        if dispatchKernel(target: outputTexture, resolution: resolution, label: "volSkyRender.dome.strip",
+                          pipeline: tile, sem: domeSem, rows: from..<to) {
+            domeNextRow = to
+            if to >= resolution.y { domeBakeActive = false }
+        } else {
+            domeSem.signal()
+            domeBakeActive = false
+        }
+    }
+
     /// The dome kernel variants built so far, by name, and which of them read the LUT at buffer(2).
     private var variantPipelines: [String: MTLComputePipelineState] = [:]
     private var lutPipelines: [ObjectIdentifier] = []

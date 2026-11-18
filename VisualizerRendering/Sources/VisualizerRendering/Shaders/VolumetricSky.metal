@@ -3248,6 +3248,120 @@ kernel void volSkyRenderCumulusMSAerosol(
                                                     NishitaMieAerosol(u.aerosolA, u.aerosolB));
 }
 
+// ── Row-tiled twins (DH-1708) ────────────────────────────────────────────────────────────────
+// The same eight kernels with the dispatch's first row passed in (`buffer(3)`), so a host can bake the
+// dome in horizontal strips over several frames instead of one 25–45 ms stall. The originals above are
+// untouched (their compiled code and every test that dispatches them stay byte-identical).
+kernel void volSkyRenderTile(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    constant uint &rowOffset                     [[buffer(3)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    const uint2 tgid = uint2(gid.x, gid.y + rowOffset);
+    // Never dereferenced when kMS is false: any valid pointer stands in for the LUT.
+    volSkyRenderImpl<false>(outTex, noiseVol, u, burstLights,
+                            reinterpret_cast<device const float4*>(burstLights), tgid, NishitaMieBuiltin());
+}
+
+kernel void volSkyRenderMSTile(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    // The atmosphere LUT region of the SAME uniforms buffer (`VolumetricCloudRenderer`).
+    device const float4* skyLUT                  [[buffer(2)]],
+    constant uint &rowOffset                     [[buffer(3)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    const uint2 tgid = uint2(gid.x, gid.y + rowOffset);
+    volSkyRenderImpl<true>(outTex, noiseVol, u, burstLights, skyLUT, tgid, NishitaMieBuiltin());
+}
+
+kernel void volSkyRenderAerosolTile(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    constant uint &rowOffset                     [[buffer(3)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    const uint2 tgid = uint2(gid.x, gid.y + rowOffset);
+    volSkyRenderImpl<false>(outTex, noiseVol, u, burstLights,
+                            reinterpret_cast<device const float4*>(burstLights), tgid,
+                            NishitaMieAerosol(u.aerosolA, u.aerosolB));
+}
+
+kernel void volSkyRenderMSAerosolTile(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    device const float4* skyLUT                  [[buffer(2)]],
+    constant uint &rowOffset                     [[buffer(3)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    const uint2 tgid = uint2(gid.x, gid.y + rowOffset);
+    volSkyRenderImpl<true>(outTex, noiseVol, u, burstLights, skyLUT, tgid,
+                           NishitaMieAerosol(u.aerosolA, u.aerosolB));
+}
+
+kernel void volSkyRenderCumulusTile(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    constant uint &rowOffset                     [[buffer(3)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    const uint2 tgid = uint2(gid.x, gid.y + rowOffset);
+    volSkyRenderImpl<false, NishitaMieBuiltin, true>(outTex, noiseVol, u, burstLights,
+        reinterpret_cast<device const float4*>(burstLights), tgid, NishitaMieBuiltin());
+}
+
+kernel void volSkyRenderCumulusMSTile(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    device const float4* skyLUT                  [[buffer(2)]],
+    constant uint &rowOffset                     [[buffer(3)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    const uint2 tgid = uint2(gid.x, gid.y + rowOffset);
+    volSkyRenderImpl<true, NishitaMieBuiltin, true>(outTex, noiseVol, u, burstLights, skyLUT, tgid,
+                                                    NishitaMieBuiltin());
+}
+
+kernel void volSkyRenderCumulusAerosolTile(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    constant uint &rowOffset                     [[buffer(3)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    const uint2 tgid = uint2(gid.x, gid.y + rowOffset);
+    volSkyRenderImpl<false, NishitaMieAerosol, true>(outTex, noiseVol, u, burstLights,
+        reinterpret_cast<device const float4*>(burstLights), tgid, NishitaMieAerosol(u.aerosolA, u.aerosolB));
+}
+
+kernel void volSkyRenderCumulusMSAerosolTile(
+    texture2d<float, access::write>  outTex      [[texture(0)]],
+    texture3d<float, access::sample> noiseVol    [[texture(1)]],
+    constant SkyUniforms &u                      [[buffer(0)]],
+    device const VSBurstLight* burstLights       [[buffer(1)]],
+    device const float4* skyLUT                  [[buffer(2)]],
+    constant uint &rowOffset                     [[buffer(3)]],
+    uint2 gid                                    [[thread_position_in_grid]]
+) {
+    const uint2 tgid = uint2(gid.x, gid.y + rowOffset);
+    volSkyRenderImpl<true, NishitaMieAerosol, true>(outTex, noiseVol, u, burstLights, skyLUT, tgid,
+                                                    NishitaMieAerosol(u.aerosolA, u.aerosolB));
+}
+
 // ── In-view (perspective) cloud kernel ───────────────────────────────────────
 //
 // Same atmosphere + volumetric cumulus + burst-lit march as volSkyRender, but
