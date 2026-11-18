@@ -153,7 +153,10 @@ extension IlluminatoramaRenderer {
         enc.setTexture(gbs.gbufferNormalRgh, index: 2)
         enc.setTexture(aos.aoFilteredTexture, index: 3)  // output
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)
-        dispatch(enc, pipeline: aos.ssaoSpatialPipeline, width: halfW, height: halfH)
+        // Exactly 16x16 threads a group: the kernel's threadgroup tile (`kSpatialTile` in IlluminatoramaSSAO.metal).
+        precondition(aos.ssaoSpatialPipeline.maxTotalThreadsPerThreadgroup >= 256, "SSAO spatial needs 16x16 threadgroups")
+        enc.dispatchThreadgroups(MTLSize(width: (halfW + 15) / 16, height: (halfH + 15) / 16, depth: 1),
+                                 threadsPerThreadgroup: MTLSize(width: 16, height: 16, depth: 1))
         enc.endEncoding()
     }
 

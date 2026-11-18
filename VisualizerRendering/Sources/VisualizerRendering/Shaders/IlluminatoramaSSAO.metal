@@ -475,25 +475,51 @@ kernel void illumi_ssao(
 // Output feeds the temporal pass rather than lighting directly, so the spatial
 // pass only needs to be stable enough for temporal to converge cleanly.
 
+// The bilateral reads each neighbour's view depth, normal and AO from a threadgroup tile: every 16x16 group
+// computes its 18x18 apron once (unprojection and normal decode included) instead of nine times a pixel. Same
+// texels, same clamping and the same arithmetic, so the same result. The host dispatches exactly 16x16 groups.
+constant int kSpatialTile  = 16;
+constant int kSpatialApron = kSpatialTile + 2;
+
 kernel void illumi_ssao_spatial(
     texture2d<half, access::read>   rawAO      [[texture(0)]],  // half-res
     depth2d<float,  access::read>   gDepth     [[texture(1)]],  // full-res
     texture2d<half, access::read>   gNormalRgh [[texture(2)]],  // full-res
     texture2d<half, access::write>  outAO      [[texture(3)]],  // half-res
     constant FrameUniforms&         frame      [[buffer(0)]],
-    uint2                           gid        [[thread_position_in_grid]]
+    uint2                           gid        [[thread_position_in_grid]],
+    uint2                           tid        [[thread_position_in_threadgroup]],
+    uint2                           tgp        [[threadgroup_position_in_grid]]
 ) {
     uint halfW = outAO.get_width();
     uint halfH = outAO.get_height();
+    uint fullW = gDepth.get_width();
+    uint fullH = gDepth.get_height();
+    threadgroup float tZ[kSpatialApron * kSpatialApron];     // view z; NaN = sky (skipped)
+    threadgroup float4 tNA[kSpatialApron * kSpatialApron];   // world normal .xyz (float, as decoded), AO .w
+    bool filtering = frame.ssaoSpatialEnabled != 0u && frame.ssaoIntensity > 0.0;   // uniform per dispatch
+    if (filtering) {
+        int2 origin = int2(tgp) * kSpatialTile - 1;
+        int2 hi = int2(int(halfW) - 1, int(halfH) - 1);
+        for (int k = int(tid.y) * kSpatialTile + int(tid.x); k < kSpatialApron * kSpatialApron; k += kSpatialTile * kSpatialTile) {
+            int2 halfN = clamp(origin + int2(k % kSpatialApron, k / kSpatialApron), int2(0), hi);
+            uint2 fullN = min(uint2(halfN) * 2u, uint2(fullW - 1, fullH - 1));
+            float nd = gDepth.read(fullN);
+            if (nd >= 0.99999) { tZ[k] = NAN; tNA[k] = float4(0.0); continue; }
+            float2 ndcN = (float2(fullN) + 0.5) / float2(fullW, fullH) * 2.0 - 1.0;
+            ndcN.y = -ndcN.y;
+            tZ[k]  = viewPosFromDepth(ndcN, nd, frame.invProjection).z;
+            tNA[k] = float4(octDecode(float2(gNormalRgh.read(fullN).rg)), float(rawAO.read(uint2(halfN)).r));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
     if (gid.x >= halfW || gid.y >= halfH) return;
 
-    if (frame.ssaoSpatialEnabled == 0u || frame.ssaoIntensity <= 0.0) {
+    if (!filtering) {
         outAO.write(rawAO.read(gid), gid);
         return;
     }
 
-    uint fullW = gDepth.get_width();
-    uint fullH = gDepth.get_height();
     uint2 fullGid = min(gid * 2, uint2(fullW - 1, fullH - 1));
 
     float centerDepth = gDepth.read(fullGid);
@@ -516,24 +542,17 @@ kernel void illumi_ssao_spatial(
 
     for (int j = -1; j <= 1; ++j) {
         for (int i = -1; i <= 1; ++i) {
-            int2 halfN = int2(int(gid.x) + i, int(gid.y) + j);
-            halfN = clamp(halfN, int2(0), int2(int(halfW) - 1, int(halfH) - 1));
-            uint2 fullN = min(uint2(halfN) * 2u, uint2(fullW - 1, fullH - 1));
+            int t = (int(tid.y) + 1 + j) * kSpatialApron + (int(tid.x) + 1 + i);
+            float zN = tZ[t];
+            if (isnan(zN)) continue;                      // sky
+            float3 NworldN  = tNA[t].xyz;
 
-            float nd = gDepth.read(fullN);
-            if (nd >= 0.99999) continue;
-
-            float2 ndcN = (float2(fullN) + 0.5) / float2(fullW, fullH) * 2.0 - 1.0;
-            ndcN.y = -ndcN.y;
-            float3 PviewN   = viewPosFromDepth(ndcN, nd, frame.invProjection);
-            float3 NworldN  = octDecode(float2(gNormalRgh.read(fullN).rg));
-
-            float depthDiff  = abs(PviewC.z - PviewN.z);
+            float depthDiff  = abs(PviewC.z - zN);
             float wDepth     = exp(-depthDiff * kDepth);
             float wNorm      = pow(max(0.0, dot(NworldC, NworldN)), kNorm);
             float w          = wDepth * wNorm;
 
-            totalAO     += float(rawAO.read(uint2(halfN)).r) * w;
+            totalAO     += tNA[t].w * w;
             totalWeight += w;
         }
     }
