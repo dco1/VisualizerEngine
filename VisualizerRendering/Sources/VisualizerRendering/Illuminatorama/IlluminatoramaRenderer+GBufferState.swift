@@ -183,6 +183,8 @@ final class GBufferState {
     var leanMasks: SIMD2<UInt32>?
     /// The lean masks `lastLightingPipeline` was built for.
     var lastLightingLean: SIMD2<UInt32>?
+    /// Lean tonemap variants by feature mask (IlluminatoramaRenderer+LeanLighting.swift).
+    var leanTonemapPipelines: [UInt32: MTLRenderPipelineState] = [:]
 
     /// One-entry memo of `lightingShadingRatePipelines` (flags as `currentLightingPipeline` packs them).
     var lastRatePipelines: (flags: UInt8, pair: (coarse: MTLComputePipelineState, skip: MTLComputePipelineState)?) = (0xFF, nil)

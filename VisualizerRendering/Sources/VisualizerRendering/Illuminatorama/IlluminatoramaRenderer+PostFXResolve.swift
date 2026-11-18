@@ -177,7 +177,7 @@ extension IlluminatoramaRenderer {
         pass.colorAttachments[0].storeAction = .store
         guard let enc = timedRenderEncoder(cb, pass, "tonemap") else { return }
         enc.label = "Illuminatorama.tonemap"
-        enc.setRenderPipelineState(pipeline ?? pfx.tonemapPipeline)
+        enc.setRenderPipelineState(pipeline ?? leanTonemapPipeline() ?? pfx.tonemapPipeline)
         enc.setFragmentTexture(bloomTonemapSource, index: 0)
         enc.setFragmentTexture(bloomResultTexture, index: 1)
         // Issue #65 — 3D colour-grade LUT at texture(2). Always bound (identity by

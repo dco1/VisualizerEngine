@@ -1,4 +1,5 @@
 import Foundation
+import Metal
 
 /// The G-buffer material classes a scene draws, for lean lighting (`IlluminatoramaRenderer.leanLightingMaterials`).
 /// Bits match `kLFHair…kLFCoat` in IlluminatoramaLighting.metal. A class left out is compiled out of the
@@ -62,5 +63,61 @@ extension IlluminatoramaRenderer {
         if u.plushTransmission > 0 || u.plushSheen > 0 { m |= 1 << 11 }
         if u.shadeTransmission > 0 { m |= 1 << 12 }
         return m | (materials.rawValue & IlluminatoramaLeanMaterials.all.rawValue)
+    }
+}
+
+// MARK: - Lean tonemap
+
+extension IlluminatoramaRenderer {
+
+    /// The tonemap's feature mask for these uniforms: bit n set exactly when effect n's runtime test in
+    /// `illumi_tonemap_fs` can pass (`tmf(n)` in IlluminatoramaTonemap.metal).
+    static func leanTonemapMask(_ u: IlluminatoramaFrameUniforms) -> UInt32 {
+        let on: [Bool] = [
+            u.motionBlurStrength != 0,                                       // 0 motion blur / velocity overlay
+            u.debugTerm >= 10,                                               // 1 G-buffer debug views
+            u.diagramParams.x > 0,                                           // 2 diagram look
+            u.chromaticAberration > 0,                                       // 3
+            u.sphericalAberration > 0,                                       // 4
+            u.halationParams.x > 0,                                          // 5
+            u.lensFlareParams.x > 0 && u.lensFlareParams.w > 0,              // 6
+            u.liveLookMatchStrength > 0,                                     // 7
+            u.naturalVignetteK > 0,                                          // 8
+            u.sensorNoise.x > 0 || u.filmMedium.x > 0,                       // 9
+            u.displayParams.z > 0,                                           // 10
+            u.filmLUTStrength > 0.001,                                       // 11
+            u.scotopicDesaturation > 0,                                      // 12
+            u.highlightChromaRolloff > 0,                                    // 13
+            u.shadowTemperatureK != 6500 || u.highlightTemperatureK != 6500, // 14
+            u.fringe > 0,                                                    // 15
+            u.vignetteStrength > 0,                                          // 16
+            u.filmGrainStrength > 0,                                         // 17
+            u.colorLUTAmount > 0,                                            // 18
+            u.debandDitherEnabled != 0,                                      // 19
+        ]
+        var m: UInt32 = 0
+        for (i, b) in on.enumerated() where b { m |= 1 << UInt32(i) }
+        return m
+    }
+
+    /// The frame's tonemap specialised on its own effects (lean lighting on), else nil (the shipped pipeline).
+    /// Built once per mask, on first use (a scene's effects rarely change; the first board frames run under
+    /// the start screen's warm-up).
+    func leanTonemapPipeline() -> MTLRenderPipelineState? {
+        guard leanLightingEnabled, let library = engine.library else { return nil }
+        let mask = Self.leanTonemapMask(frameUniformBuffer.contents().load(as: IlluminatoramaFrameUniforms.self))
+        if let p = gbs.leanTonemapPipelines[mask] { return p }
+        let cv = MTLFunctionConstantValues()
+        var m = mask
+        cv.setConstantValue(&m, type: .uint, index: 46)
+        let d = MTLRenderPipelineDescriptor()
+        d.label = "Illuminatorama.tonemap.lean"
+        d.vertexFunction = library.makeFunction(name: "illumi_tonemap_vs")
+        guard let fs = try? library.makeFunction(name: "illumi_tonemap_fs", constantValues: cv) else { return nil }
+        d.fragmentFunction = fs
+        d.colorAttachments[0].pixelFormat = .bgra8Unorm_srgb
+        guard let p = try? device.makeRenderPipelineState(descriptor: d) else { return nil }
+        gbs.leanTonemapPipelines[mask] = p
+        return p
     }
 }

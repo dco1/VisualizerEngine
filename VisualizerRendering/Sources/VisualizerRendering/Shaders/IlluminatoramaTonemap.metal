@@ -738,6 +738,13 @@ static inline float3 illumiReconstructGather(texture2d<half, access::sample> inH
     // Narrow (never truncate) a kernel that would reach past the tap budget — `effectiveRadius`.
     float2 r = min(float2(radius), float(kReconMaxHalf) / max(s, float2(1e-3)));
     float2 c = uv * inSize - 0.5;            // continuous texel coordinate; texel j's centre is j
+    // 1:1 with a box (r <= 1/2) or tent (r <= 1): every tap but the pixel's own texel has weight 0, so the
+    // filter is the identity. Read that texel instead of running the weighted loops (whose arrays spill
+    // to memory) - the iPhone's native canvas runs exactly this case.
+    if (all(abs(s - 1.0) < 1e-3) && ((kern == 1u && radius <= 0.5) || (kern == 2u && radius <= 1.0))) {
+        int2 t = clamp(int2(rint(c)), int2(0), int2(W - 1, H - 1));
+        return max(float3(inHDR.read(uint2(t)).rgb), float3(0.0));
+    }
     float2 reach = r * s;
     int2 lo = int2(ceil(c - reach)), hi = int2(floor(c + reach));
 
@@ -831,6 +838,15 @@ static inline float illumiHDRGain(float sceneY, float sdrY, float H) {
     return clamp(mix(1.0, g, w), 1.0, H);
 }
 
+// ── Lean tonemap (Munimyni iPhone, 2026-11) ───────────────────────────────────────────────────────
+// `kTonemapFeat` (function constant 46): bit n set ⇔ effect n's uniform can be non-zero this frame
+// (IlluminatoramaRenderer+LeanTonemap.swift derives it from the frame uniforms). A cleared bit means the
+// effect's runtime test is false anyway, so the code is compiled out and the pixels are unchanged.
+// Undefined ⇒ every bit set ⇒ the shipped pass.
+constant uint kTonemapFeatFC [[function_constant(46)]];
+constant uint kTonemapFeat = is_function_constant_defined(kTonemapFeatFC) ? kTonemapFeatFC : 0xFFFFFFFFu;
+static inline bool tmf(uint bit) { return (kTonemapFeat & (1u << bit)) != 0u; }
+
 fragment float4 illumi_tonemap_fs(
     TonemapVSOut                    in       [[stage_in]],
     texture2d<half, access::sample> inHDR    [[texture(0)]],
@@ -872,7 +888,7 @@ fragment float4 illumi_tonemap_fs(
     // The ONLY reliable way to confirm which objects write motion vectors (camera,
     // ping-ponged instances) and which don't (MLS-MPM/fluid surfaces) before TAA or
     // motion blur start trusting them. Costs nothing in normal (strength ≥ 0) renders.
-    if (frame.motionBlurStrength < 0.0) {
+    if (tmf(0u) && (frame.motionBlurStrength < 0.0)) {
         constexpr sampler velSampler(filter::linear, address::clamp_to_edge, coord::normalized);
         float2 v   = float2(inVel.sample(velSampler, in.uv).rg);
         float  mag = length(v);
@@ -888,7 +904,7 @@ fragment float4 illumi_tonemap_fs(
     // defaults to the full composite for >= 10), so this branch is the ONLY place
     // these draw — and an exact no-op when `debugTerm < 10` (every scene's default
     // is 0). Nearest-texel reads (no filtering) for a faithful per-pixel channel view.
-    if (frame.debugTerm >= 10u) {
+    if (tmf(1u) && (frame.debugTerm >= 10u)) {
         uint2 gp = uint2(in.uv * float2(gAlbedoMet.get_width(), gAlbedoMet.get_height()));
         switch (frame.debugTerm) {
             case 10u: // Albedo — base colour (linear).
@@ -962,7 +978,7 @@ fragment float4 illumi_tonemap_fs(
     // Below full strength the drawing has to cross-fade against the finished image,
     // which does not exist yet — so that case falls through and blends at the end.
     // `mix == 0` (every scene's default) enters neither branch: exact no-op.
-    if (frame.diagramParams.x >= 0.999) {
+    if (tmf(2u) && (frame.diagramParams.x >= 0.999)) {
         return float4(illumiDiagramColor(in.uv, frame, gAlbedoMet, gNormalRgh, gDepth), 1.0);
     }
 
@@ -985,7 +1001,7 @@ fragment float4 illumi_tonemap_fs(
         tapK = clamp(sIn - 1.0, 0.0, 1.0);
     }
     float3 hdr = float3(0.0);
-    if (frame.motionBlurStrength > 0.0) {
+    if (tmf(0u) && (frame.motionBlurStrength > 0.0)) {
         // ── Velocity-buffer motion blur (issue #65) ──────────────────────────────
         // Gather inHDR along the per-frame screen velocity — a camera-shutter streak.
         // `inVel` stores (currNDC − prevNDC)·(0.5, −0.5) in UV, written by the
@@ -1019,13 +1035,13 @@ fragment float4 illumi_tonemap_fs(
             // cubic's sharpness — shifting them with plain bilinear fetches would leave red and blue
             // softer than green and fringe every edge.
             hdr = illumiCatmullRomUpscale(inHDR, downSampler, in.uv);
-            if (frame.chromaticAberration > 0.0) {
+            if (tmf(3u) && (frame.chromaticAberration > 0.0)) {
                 float2 caOff = (in.uv - 0.5) * (frame.chromaticAberration * 0.03);
                 float3 here = float3(inHDR.sample(downSampler, in.uv).rgb);
                 hdr.r = max(0.0, hdr.r + float(inHDR.sample(downSampler, in.uv + caOff).r) - here.r);
                 hdr.b = max(0.0, hdr.b + float(inHDR.sample(downSampler, in.uv - caOff).b) - here.b);
             }
-        } else if (frame.chromaticAberration > 0.0) {
+        } else if (tmf(3u) && (frame.chromaticAberration > 0.0)) {
             // Same lateral split as the legacy CA branch below, one gather per channel.
             float2 caOff = (in.uv - 0.5) * (frame.chromaticAberration * 0.03);
             hdr.r = illumiReconstructGather(inHDR, in.uv + caOff, recon, kern, rad).r;
@@ -1034,7 +1050,7 @@ fragment float4 illumi_tonemap_fs(
         } else {
             hdr = illumiReconstructGather(inHDR, in.uv, recon, kern, rad);
         }
-    } else if (frame.chromaticAberration > 0.0) {
+    } else if (tmf(3u) && (frame.chromaticAberration > 0.0)) {
         // Lens-style transverse chromatic aberration: split the red channel
         // outward and the blue channel inward along the radius from the frame
         // centre, growing toward the edges (zero in the middle, like a real
@@ -1065,7 +1081,7 @@ fragment float4 illumi_tonemap_fs(
     // above, which splits them) in the HDR domain so the softening wraps around
     // bright highlights before tonemapping, reading as the classic dreamy
     // soft-focus halation. 0 → branch skipped (exact no-op).
-    if (frame.sphericalAberration > 0.0) {
+    if (tmf(4u) && (frame.sphericalAberration > 0.0)) {
         float2 d     = in.uv - 0.5;
         float  rNorm = saturate(dot(d, d) * 2.0);   // 0 at centre → 1 at corners
         // Radius (in INTERNAL-resolution texels) scales with both the off-axis
@@ -1120,7 +1136,7 @@ fragment float4 illumi_tonemap_fs(
     // tail, sourced from the red end of the highlight — so this is a plain add in the
     // HDR domain, like bloom, so exposure and the display transform shape it.
     // Intensity 0 (the default) skips the branch.
-    if (frame.halationParams.x > 0.0) {
+    if (tmf(5u) && (frame.halationParams.x > 0.0)) {
         // Artistic normalisation: the halo carries only the EXCESS over the threshold,
         // spread across a kernel far larger than most highlights, so the raw add is a
         // small fraction of scene radiance. This gain makes `halationIntensity = 1.0` a
@@ -1148,7 +1164,7 @@ fragment float4 illumi_tonemap_fs(
     // dimmer than open sky and the flare fades out, exactly like a real camera.
     // Added in the HDR domain so exposure/ACES/grade shape it naturally. Strength 0
     // (the default) skips the branch — non-opting scenes are byte-for-byte unchanged.
-    if (frame.lensFlareParams.x > 0.0 && frame.lensFlareParams.w > 0.0) {
+    if (tmf(6u) && (frame.lensFlareParams.x > 0.0 && frame.lensFlareParams.w > 0.0)) {
         float2 sunUV = frame.lensFlareParams.yz;
         float3 sunTap = float3(inHDR.sample(downSampler, sunUV).rgb);
         float2 tapR = 4.0 * invInSize;
@@ -1205,7 +1221,7 @@ fragment float4 illumi_tonemap_fs(
     // of those controls. `liveLookMatchStrength` is 0 (default) for every
     // scene that never opts in, and the host zeroes it whenever a still is
     // being captured — the export always sees the real RT terms, never this.
-    if (frame.liveLookMatchStrength > 0.0) {
+    if (tmf(7u) && (frame.liveLookMatchStrength > 0.0)) {
         float lum = dot(mixed, float3(0.2126, 0.7152, 0.0722));
 
         // ── Two adaptive normalizers, so a FIXED calibration doesn't ship as a flat
@@ -1336,7 +1352,7 @@ fragment float4 illumi_tonemap_fs(
     // is where a lens actually takes the light: the shoulder is then free to recover some of
     // it, exactly as a real negative does. A post-tonemap multiply can only crush.
     // 0 ⇒ the branch never runs ⇒ byte-identical.
-    if (frame.naturalVignetteK > 0.0) {
+    if (tmf(8u) && (frame.naturalVignetteK > 0.0)) {
         float2 d   = in.uv - 0.5;
         float  r2  = dot(d, d) * 2.0;                 // 0 at centre → 1 at the corner
         float  cos2 = 1.0 / (1.0 + frame.naturalVignetteK * r2);
@@ -1372,7 +1388,7 @@ fragment float4 illumi_tonemap_fs(
     // variance-weighted mix of the dye layers' (`filmMedium.y`, 0.80) and the demosaic's
     // (`sensorNoise.w`), so a pushed, sensor-dominated pixel reads digital and a well-exposed one
     // reads as film. `filmMedium.x` 0 ⇒ the code below is DH-0992's, unchanged.
-    if (frame.sensorNoise.x > 0.0 || frame.filmMedium.x > 0.0) {
+    if (tmf(9u) && (frame.sensorNoise.x > 0.0 || frame.filmMedium.x > 0.0)) {
         float ePerUnit = max(frame.sensorNoise.y, 1.0) / max(autoBase, 1e-3);
         float g = frame.filmMedium.x;
         // The emulsion's grain has a SIZE (the `filmGrainSize` cell grid, as the old grain did);
@@ -1424,7 +1440,7 @@ fragment float4 illumi_tonemap_fs(
     // Hue-stable toe (opt-in; displayParams.z = 0 ⇒ skipped ⇒ bit-identical). `chromaW` 1 =
     // the shipped transform and saturation push; 0 = the ratio-preserving toe, no push.
     float chromaW = 1.0;
-    if (frame.displayParams.z > 0.0) {
+    if (tmf(10u) && (frame.displayParams.z > 0.0)) {
         chromaW = hueStableToeWeight(exposedScene, frame.displayParams.y, frame.displayParams.z);
         if (chromaW < 1.0) {
             // displayParams.w (opt-in, AgX only): the toe's LEVEL from AgX's own sigmoid without
@@ -1459,7 +1475,7 @@ fragment float4 illumi_tonemap_fs(
     // curve, split tone, the creative LUT, vignette, grain, dither) then grades the
     // chosen transform, which is the order a real DI runs in; the stock used to sit
     // after all of them, grading an image already dithered to 8 bits.
-    if (frame.filmLUTStrength > 0.001) {
+    if (tmf(11u) && (frame.filmLUTStrength > 0.001)) {
         constexpr sampler lutSampler(filter::linear, address::clamp_to_edge);
         // Cineon forward: cv = (685 + 300·log10(linear)) / 1023 — 10-bit printing
         // density, reference white at code 685, 300 code values per decade.
@@ -1493,7 +1509,7 @@ fragment float4 illumi_tonemap_fs(
     // lamps/moon/stars stay bright enough (lum ≳ 0.08) to keep full colour. 0
     // (DEFAULT) ⇒ the branch never runs ⇒ day frames + every non-opting scene are
     // byte-identical. Hosts fade the strength with nightBlend themselves.
-    if (frame.scotopicDesaturation > 0.0) {
+    if (tmf(12u) && (frame.scotopicDesaturation > 0.0)) {
         float scotLum = dot(mapped, float3(0.2126, 0.7152, 0.0722));
         // Knee (scotopicParams.x): the display luma by which cone vision has fully taken
         // over again — 0 keeps the legacy 0.08. Tint (yzw): the Purkinje blue shift a
@@ -1536,7 +1552,7 @@ fragment float4 illumi_tonemap_fs(
     // from luma by the same factor at 0.95 as at 0.2). Roll the chroma back off, but
     // only at the top of the scale, so the midtone chroma that multiply exists for
     // survives. 0 (DEFAULT) ⇒ the branch never runs ⇒ byte-identical.
-    if (frame.highlightChromaRolloff > 0.0) {
+    if (tmf(13u) && (frame.highlightChromaRolloff > 0.0)) {
         float hl = dot(mapped, float3(0.2126, 0.7152, 0.0722));
         // Weight starts at mid-grey and reaches full at white, so a correctly-exposed
         // midtone is untouched and only the shoulder loses colour.
@@ -1551,7 +1567,7 @@ fragment float4 illumi_tonemap_fs(
     // Reuses `whiteBalanceGain` — the same curve as the global control, normalized to
     // unit luma, so this shifts hue without changing exposure. 6500/6500 (DEFAULTS)
     // ⇒ both gains are exactly (1,1,1) ⇒ the branch never runs ⇒ byte-identical.
-    if (frame.shadowTemperatureK != 6500.0 || frame.highlightTemperatureK != 6500.0) {
+    if (tmf(14u) && (frame.shadowTemperatureK != 6500.0 || frame.highlightTemperatureK != 6500.0)) {
         float sl = dot(mapped, float3(0.2126, 0.7152, 0.0722));
         float shadowW = 1.0 - smoothstep(0.0, 0.5, sl);
         float highW   = smoothstep(0.5, 1.0, sl);
@@ -1568,7 +1584,7 @@ fragment float4 illumi_tonemap_fs(
     // edges in the HDR input, compress the (unbounded HDR) gradient to 0..1, then
     // tint: a 5-tap Laplacian's sign decides dark side (tint) vs bright side
     // (complement). 0 strength → the branch never runs (exact no-op).
-    if (frame.fringe > 0.0) {
+    if (tmf(15u) && (frame.fringe > 0.0)) {
         float2 px = invInSize;
         float lC = dot(float3(inHDR.sample(downSampler, in.uv).rgb),                       float3(0.2126, 0.7152, 0.0722));
         float lL = dot(float3(inHDR.sample(downSampler, in.uv - float2(px.x, 0.0)).rgb),   float3(0.2126, 0.7152, 0.0722));
@@ -1594,7 +1610,7 @@ fragment float4 illumi_tonemap_fs(
     // is the normalised radius (fraction of the half-diagonal) that stays fully
     // bright; beyond it the image is multiplied down by a smoothstep ramp toward
     // (1 - strength) at the very corner. 0 strength → exact no-op.
-    if (frame.vignetteStrength > 0.0) {
+    if (tmf(16u) && (frame.vignetteStrength > 0.0)) {
         float2 d = in.uv - 0.5;
         float r = length(d) * 1.41421356;            // 0 centre → 1 corner
         float ext = clamp(frame.vignetteExtent, 0.0, 0.99);
@@ -1609,7 +1625,7 @@ fragment float4 illumi_tonemap_fs(
     // luminance so it peaks in the mids and fades in highlights/blacks the way real
     // film does. `filmGrainSize` quantises the sampling grid into cells of that many
     // output pixels. 0 strength → exact no-op.
-    if (frame.filmGrainStrength > 0.0) {
+    if (tmf(17u) && (frame.filmGrainStrength > 0.0)) {
         float cell = max(frame.filmGrainSize, 1.0);
         float2 gpf = floor(max(in.position.xy, 0.0) / cell);
         // ── The hash is an INTEGER bit mix, not `fract(sin(...))` ────────────────
@@ -1700,7 +1716,7 @@ fragment float4 illumi_tonemap_fs(
     // lookup inside texel centres so the trilinear filter doesn't clamp-bias the
     // extremes. 0 amount → exact no-op (and the identity-baked default LUT is a
     // no-op even at amount 1).
-    if (frame.colorLUTAmount > 0.0) {
+    if (tmf(18u) && (frame.colorLUTAmount > 0.0)) {
         constexpr sampler lutSampler(filter::linear, address::clamp_to_edge, coord::normalized);
         float  n   = max(frame.colorLUTSize, 2.0);
         float3 src = pow(saturate(mapped), float3(1.0 / 2.2));     // linear → ~sRGB
@@ -1723,7 +1739,7 @@ fragment float4 illumi_tonemap_fs(
     //
     // TPDF = (two independent uniform randoms) differenced → triangular noise,
     // which is the optimal dither distribution (flat error, no noise modulation).
-    if (frame.debandDitherEnabled != 0u) {
+    if (tmf(19u) && (frame.debandDitherEnabled != 0u)) {
         // Interleaved-gradient-noise hashes for two decorrelated uniform samples.
         float2 px = in.position.xy;
         float n0 = fract(52.9829189 * fract(dot(px, float2(0.06711056, 0.00583715))));
@@ -1747,7 +1763,7 @@ fragment float4 illumi_tonemap_fs(
     // Partial strengths only (full strength returned above, before the tone chain).
     // The blend is against the FINISHED image, so dragging the dial reads as the
     // photograph resolving into a drawing rather than as two half-graded images.
-    if (frame.diagramParams.x > 0.0) {
+    if (tmf(2u) && (frame.diagramParams.x > 0.0)) {
         float3 diagram = illumiDiagramColor(in.uv, frame, gAlbedoMet, gNormalRgh, gDepth);
         mapped = mix(mapped, diagram, saturate(frame.diagramParams.x));
     }
