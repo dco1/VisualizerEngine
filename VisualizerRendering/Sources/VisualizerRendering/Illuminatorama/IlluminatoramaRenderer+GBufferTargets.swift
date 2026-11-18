@@ -303,9 +303,10 @@ extension IlluminatoramaRenderer {
         let historyB = try make(label: "Illuminatorama.historyB",
                                 format: .rgba16Float, w: internalW, h: internalH,
                                 usage: [.shaderRead, .shaderWrite])
+        // `.renderTarget`: the post-resolve overlay swaps it in as its display buffer instead of copying it.
         let taaResolved = try make(label: "Illuminatorama.taaResolved",
                                    format: .rgba16Float, w: internalW, h: internalH,
-                                   usage: [.shaderRead, .shaderWrite])
+                                   usage: [.shaderRead, .shaderWrite, .renderTarget])
         // AO and bloom run at half of the INTERNAL resolution (still oversampled
         // vs the output when SSAA is on).
         let halfW = max(1, internalW / 2)

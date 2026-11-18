@@ -111,7 +111,13 @@ extension IlluminatoramaRenderer {
 
         // Seed the display buffer with the resolved opaque image.
         let resolved = postFXSource
-        if resolved !== gbs.hdrTexture {
+        // The resolve's output is the same size, format and usage as `hdrTexture` and the next resolve rewrites
+        // it whole, so swap it in as the display buffer instead of copying it (a full-frame rgba16 blit). Not
+        // while a still cross-fade reads last frame's resolved image.
+        if resolved === pfx.taaResolvedTexture, resolved.usage.contains(.renderTarget),
+           !taaStillAccumulation, pfx.taaCrossfadeSource == nil, !kPost.taaStillCrossfadeCaptureRequested {
+            swap(&gbs.hdrTexture, &pfx.taaResolvedTexture)
+        } else if resolved !== gbs.hdrTexture {
             guard let blit = cb.makeBlitCommandEncoder() else { return }
             blit.label = "Illuminatorama.overlay.seed"
             blit.copy(from: resolved,
