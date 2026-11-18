@@ -15,6 +15,7 @@ let package = Package(
     products: [
         .library(name: "VisualizerCore", targets: ["VisualizerCore"]),
         .library(name: "VisualizerMaterials", targets: ["VisualizerMaterials"]),
+        .library(name: "VisualizerSolidity", targets: ["VisualizerSolidity"]),
         .library(name: "VisualizerStill", targets: ["VisualizerStill"]),
         .library(name: "VisualizerRendering", targets: ["VisualizerRendering"]),
         .library(name: "VisualizerVegetation", targets: ["VisualizerVegetation"]),
@@ -43,6 +44,19 @@ let package = Package(
         .target(
             name: "VisualizerMaterials",
             path: "VisualizerMaterials/Sources/VisualizerMaterials",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // Mesh3 → the VisualizerCore auditors (closed-solid, z-fight): the shared "is it solid?" test bridge.
+        .target(
+            name: "VisualizerSolidity",
+            dependencies: ["VisualizerCore", "VisualizerMaterials"],
+            path: "VisualizerSolidity/Sources/VisualizerSolidity",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "VisualizerSolidityTests",
+            dependencies: ["VisualizerSolidity"],
+            path: "VisualizerSolidity/Tests/VisualizerSolidityTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
         // The still/converge quality policy — pure, zero dependencies; see VisualizerStill/Package.swift.
