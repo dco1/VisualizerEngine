@@ -439,6 +439,8 @@ extension IlluminatoramaRenderer {
         extendedGBufferActive = extendedGBufferEnabled && ensureExtendedGBufferResources()
         if !extendedGBufferEnabled, gbs.gbufferMaterial != nil { gbs.gbufferMaterial = nil }   // the lane left: give the memory back
         u.extendedGBuffer = extendedGBufferActive ? 1 : 0
+        gbs.leanMasks = leanLightingEnabled
+            ? SIMD2(u.shadowEnabled, Self.leanFeatureMask(u, materials: leanLightingMaterials)) : nil
         memcpy(frameUniformBuffer.contents(), &u, MemoryLayout<IlluminatoramaFrameUniforms>.stride)
     }
 

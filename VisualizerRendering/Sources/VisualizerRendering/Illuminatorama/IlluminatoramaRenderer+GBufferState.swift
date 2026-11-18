@@ -179,6 +179,10 @@ final class GBufferState {
     // key string built. 0xFF is an impossible 6-bit value, so the first call misses.
     var lastLightingFlags: UInt8 = 0xFF
     var lastLightingPipeline: MTLComputePipelineState?
+    /// Lean lighting: this frame's (flag mask, feature mask), written with the frame uniforms; nil = off.
+    var leanMasks: SIMD2<UInt32>?
+    /// The lean masks `lastLightingPipeline` was built for.
+    var lastLightingLean: SIMD2<UInt32>?
 
     /// One-entry memo of `lightingShadingRatePipelines` (flags as `currentLightingPipeline` packs them).
     var lastRatePipelines: (flags: UInt8, pair: (coarse: MTLComputePipelineState, skip: MTLComputePipelineState)?) = (0xFF, nil)

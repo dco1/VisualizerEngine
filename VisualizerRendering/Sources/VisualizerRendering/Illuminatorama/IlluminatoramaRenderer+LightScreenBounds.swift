@@ -34,6 +34,9 @@ extension IlluminatoramaRenderer {
             shd.lightBoundsBuffer = device.makeBuffer(length: length, options: .storageModePrivate)
             shd.lightBoundsBuffer?.label = "Illuminatorama.lightTiles"
         }
+        // No point, spot or area light: the lighting kernel's light loops run zero times, so the masks are
+        // never read (the buffer stays bound). Skips a full-depth-buffer pass (5.5 ms on an iPhone 15 Pro board).
+        if pointLights.isEmpty && spotLights.isEmpty && areaLights.isEmpty { return }
         guard let masks = shd.lightBoundsBuffer, let enc = timedComputeEncoder(cb, "lighting.tiles") else {
             return allLights()
         }

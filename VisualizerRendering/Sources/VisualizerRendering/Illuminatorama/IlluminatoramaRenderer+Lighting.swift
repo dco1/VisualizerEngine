@@ -17,7 +17,8 @@ extension IlluminatoramaRenderer {
     /// uniforms written in `updateFrameUniforms` — both derive from the same Bools.
     static func lightingFeatureConstants(ibl: Bool, shadow: Bool, dfg: Bool,
                                          rtSunShadow: Bool = false,
-                                         aov: Bool = false)
+                                         aov: Bool = false,
+                                         lean: SIMD2<UInt32>? = nil)
         -> (key: String, constants: MTLFunctionConstantValues) {
         // index 5 — S4.1 ray-traced soft sun shadows. The caller passes the fully
         // derived bit (`rtSunShadowLightingActive`), never the raw flag: the RT
@@ -39,6 +40,12 @@ extension IlluminatoramaRenderer {
             var on = true
             cv.setConstantValue(&on, type: .bool, index: lightingAOVFunctionConstantIndex)
             key += "-aov"
+        }
+        if let lean {   // lean lighting: the frame's flags and features as constants (indices 11, 12)
+            var f = lean.x, m = lean.y
+            cv.setConstantValue(&f, type: .uint, index: 11)
+            cv.setConstantValue(&m, type: .uint, index: 12)
+            key += "-lean\(String(f, radix: 16))-\(String(m, radix: 16))"
         }
         return (key, cv)
     }
@@ -72,11 +79,12 @@ extension IlluminatoramaRenderer {
                         | (dfgLUTEnabled  ? 4  : 0)
                         | (rtSun          ? 32 : 0)
                         | (aov            ? 64 : 0)
-        if bits == gbs.lastLightingFlags, let p = gbs.lastLightingPipeline { return p }
+        let lean = gbs.leanMasks
+        if bits == gbs.lastLightingFlags, lean == gbs.lastLightingLean, let p = gbs.lastLightingPipeline { return p }
 
         let (key, cv) = Self.lightingFeatureConstants(
             ibl: iblEnabled, shadow: shadowsEnabled, dfg: dfgLUTEnabled,
-            rtSunShadow: rtSun, aov: aov)
+            rtSunShadow: rtSun, aov: aov, lean: lean)
         // Headless/settled lane (no runloop to land the async completion — a
         // @MainActor render loop starves the MainActor hop): compile the variant
         // BLOCKING so the frame actually runs the specialized path instead of the
@@ -86,6 +94,7 @@ extension IlluminatoramaRenderer {
             if let built = engine.pipelineCache.pipelineState(
                 name: "illumi_lighting", device: device, constants: cv, variantKey: key) {
                 gbs.lastLightingFlags = bits
+                gbs.lastLightingLean = lean
                 gbs.lastLightingPipeline = built
                 return built
             }
@@ -96,6 +105,7 @@ extension IlluminatoramaRenderer {
         if let ready = engine.pipelineCache.pipelineStateAsync(
             name: "illumi_lighting", device: device, constants: cv, variantKey: key) {
             gbs.lastLightingFlags = bits
+            gbs.lastLightingLean = lean
             gbs.lastLightingPipeline = ready
             return ready
         }
@@ -110,6 +120,7 @@ extension IlluminatoramaRenderer {
         if rtSun, let built = engine.pipelineCache.pipelineState(
             name: "illumi_lighting", device: device, constants: cv, variantKey: key) {
             gbs.lastLightingFlags = bits
+            gbs.lastLightingLean = lean
             gbs.lastLightingPipeline = built
             return built
         }

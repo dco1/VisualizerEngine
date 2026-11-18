@@ -1421,6 +1421,39 @@ static inline void aovStore(texture2d_array<float, access::read_write> aov, uint
     }
 }
 
+// ── Lean specialisation (Munimyni iPhone, 2026-11) ──────────────────────────────────────────────
+// Two uint function constants the host sets to what this frame can actually reach: `kLightingFlagMask`
+// is ANDed into `frame.frameFlags`, and `kLightingFeat` gates every scene feature (light loops, the
+// interior rooms, the tag-banded materials, …). A cleared bit means "the runtime test below is false
+// for every pixel this frame", so the compiler deletes that code and the pixels are unchanged — the
+// uber kernel's cost on a tile GPU is mostly the REGISTERS its dead branches hold, not the branches.
+// Undefined (every host that does not opt in) ⇒ all bits set ⇒ the kernel it always was.
+constant uint kLightingFlagMaskFC [[function_constant(11)]];
+constant uint kLightingFeatureMaskFC [[function_constant(12)]];
+constant uint kLightingFlagMask = is_function_constant_defined(kLightingFlagMaskFC) ? kLightingFlagMaskFC : 0xFFFFFFFFu;
+constant uint kLightingFeat = is_function_constant_defined(kLightingFeatureMaskFC) ? kLightingFeatureMaskFC : 0xFFFFFFFFu;
+// Scene bits (the host derives them from the frame uniforms):
+#define kLFPoint        (1u << 0)    // pointLightCount > 0
+#define kLFSpot         (1u << 1)    // spotLightCount > 0
+#define kLFArea         (1u << 2)    // areaLightCount > 0
+#define kLFDirs         (1u << 3)    // directionalLightCount > 0 (the fill directionals)
+#define kLFContact      (1u << 4)    // contactShadowStrength > 0
+#define kLFInterior     (1u << 5)    // interiorMask != 0
+#define kLFSSS          (1u << 6)    // sssStrength > 0 (or the debug force)
+#define kLFAerial       (1u << 7)    // aerialPerspectiveDensity > 0
+#define kLFExtGBuffer   (1u << 8)    // extendedGBuffer != 0
+#define kLFMultiBounce  (1u << 9)    // filmMedium.z > 0.5
+#define kLFLeafScene    (1u << 10)   // leafTransmittanceRatio > 0 || leafTransmission > 0
+#define kLFPlushScene   (1u << 11)   // plushTransmission > 0 || plushSheen > 0
+#define kLFShadeScene   (1u << 12)   // shadeTransmission > 0
+// Material bits (the host declares which G-buffer material classes its scene draws):
+#define kLFHair         (1u << 16)   // hair-tagged fibres
+#define kLFAniso        (1u << 17)   // brushed / grained anisotropy (normalRoughness.a > 1)
+#define kLFCasing       (1u << 18)   // the sausage-casing glaze band (0.66, 0.9)
+#define kLFSheen        (1u << 19)   // cloth sheen (negative emission alpha)
+#define kLFCoat         (1u << 20)   // clearcoat (positive emission alpha)
+static inline bool lf(uint bit) { return (kLightingFeat & bit) != 0u; }
+
 kernel void illumi_lighting(
     texture2d<half,  access::read>          gAlbedoMet      [[texture(0)]],
     texture2d<half,  access::read>          gNormalRgh      [[texture(1)]],
@@ -1518,6 +1551,7 @@ kernel void illumi_lighting(
     // top-left pixel; the skip variant leaves exactly those quads to it. Off ⇒ gid = gidIn.
     uint2 gid = kLightingCoarse ? gidIn * 2u : gidIn;
     if (gid.x >= w || gid.y >= h) return;
+    const uint frameFlags = frame.frameFlags & kLightingFlagMask;   // the lean variant's constant bits
     if (kLightingShadingRate) {
         bool coarse = lightingQuadIsCoarse(gid & ~uint2(1u), w, h, gDepth, gNormalRgh, rateTiles, frame);
         if (coarse != kLightingCoarse) return;
@@ -1555,7 +1589,7 @@ kernel void illumi_lighting(
         sky += celestials;
         lightingStore(outHDR, half4(half3(sky), 1.0h), gid);
         // Issue #65 — sky is never SSS; clear its mask so the composite skips it.
-        if (frame.sssStrength > 0.0) lightingStore(sssOut, half4(0.0h), gid);
+        if (lf(kLFSSS) && frame.sssStrength > 0.0) lightingStore(sssOut, half4(0.0h), gid);
         if (kLightingAOVEnabled) {   // DH-1304 — the background is `environment`; every other term 0
             float w = aovU.blend;
             for (uint s = 0u; s < kAOVCount; ++s) {
@@ -1585,7 +1619,7 @@ kernel void illumi_lighting(
     // material decodes strength = -a and roughness = 0.30, exactly as before the band existed.
     float  sheenStrength  = 0.0;
     float  sheenRoughness = kClothSheenRoughness;
-    if (emH.a < -0.001h) {
+    if (lf(kLFSheen) && emH.a < -0.001h) {
         float m    = float(-emH.a);
         int   band = int(floor(m + 1e-3f));
         sheenStrength  = m - float(band);
@@ -1622,7 +1656,7 @@ kernel void illumi_lighting(
     // Hair fibre (FurStrandField): the G-buffer normal slot carries the strand TANGENT. Everything that
     // follows shades with the fibre's FACING normal (the view vector minus its tangent component — the
     // cylinder normal at the strand's visible centre-line), and the sun swaps to the hair BSDF below.
-    const bool isHair = (nrH.a > kHairTagLo && nrH.a < kHairTagHi);
+    const bool isHair = lf(kLFHair) && (nrH.a > kHairTagLo && nrH.a < kHairTagHi);
     float3 hairT = float3(0.0);
     if (isHair) {
         hairT = N;
@@ -1635,18 +1669,18 @@ kernel void illumi_lighting(
     // diffuse base's share; cloth reads its sheen albedo at (N·V, sheenRoughness). Host-gated:
     // with neither flag set (or the LUT off) `le` stays `layeredOff()` and every lobe below is
     // the historical expression, so an opted-out host is byte-identical.
-    bool layeredMS    = kLightingDFGLUTEnabled && (frame.frameFlags & kFrameFlagLayeredMultiscatter) != 0u;
-    bool layeredSheen = kLightingDFGLUTEnabled && (frame.frameFlags & kFrameFlagLayeredSheen) != 0u;
+    bool layeredMS    = kLightingDFGLUTEnabled && (frameFlags & kFrameFlagLayeredMultiscatter) != 0u;
+    bool layeredSheen = kLightingDFGLUTEnabled && (frameFlags & kFrameFlagLayeredSheen) != 0u;
     // DH-1300 — the instance's layer parameters (IlluminatoramaMaterialLayers.h): the per-material
     // specular F0 every lobe below mixes from. A pixel whose instance carries none reads the
     // legacy literal 0.04, so the flag costs one texel read and changes nothing else.
     MaterialLayers ml = illumiMaterialLayersNone();
-    bool layeredCoat = kLightingDFGLUTEnabled && (frame.frameFlags & kFrameFlagLayeredCoat) != 0u;
-    bool filmOn = (frame.frameFlags & kFrameFlagThinFilm) != 0u;   // DH-1014 thin film
-    bool transOn = (frame.frameFlags & kFrameFlagTranslucency) != 0u;   // DH-1302 per-material translucency
-    if ((frame.frameFlags & kFrameFlagLayeredSpecular) != 0u || layeredCoat || filmOn || transOn)
+    bool layeredCoat = kLightingDFGLUTEnabled && (frameFlags & kFrameFlagLayeredCoat) != 0u;
+    bool filmOn = (frameFlags & kFrameFlagThinFilm) != 0u;   // DH-1014 thin film
+    bool transOn = (frameFlags & kFrameFlagTranslucency) != 0u;   // DH-1302 per-material translucency
+    if ((frameFlags & kFrameFlagLayeredSpecular) != 0u || layeredCoat || filmOn || transOn)
         ml = illumiMaterialLayersAt(layerInstances, gMaterialLayer.read(gid).r, 0xFFFFFFFFu);
-    if ((frame.frameFlags & kFrameFlagLayeredSpecular) == 0u) ml.spec = false;
+    if ((frameFlags & kFrameFlagLayeredSpecular) == 0u) ml.spec = false;
     // DH-1309 / DH-1298 — the coat's weight and roughness first: the base's F0 depends on what it is
     // under (OpenPBR's relative IOR), and the coat terms are built from them below.
     float ccW = 0.0, ccR = 0.08;
@@ -1670,18 +1704,18 @@ kernel void illumi_lighting(
         float  leSheenA = (layeredSheen && sheenStrength > 0.0)
                         ? float(dfgLUT.sample(leSampler, float2(leNdotV, sheenRoughness)).a) : 0.0;
         le = layeredEnergy(albedo, metallic, leLUT, leSheenA, sheenStrength, layeredMS, layeredSheen, dielF0,
-                           (frame.frameFlags & kFrameFlagDyedSheen) != 0u,   // DH-1316
+                           (frameFlags & kFrameFlagDyedSheen) != 0u,   // DH-1316
                            filmOn, filmTint);                                // DH-1014 thin film
     }
     // DH-1316 — the dyed sheen colour applies to the bolted-on sheen too (the layered BSDF is a host
     // opt-in of its own); `layeredOff()` leaves it false, so a host that sets neither is bit-identical.
-    le.dyedSheen = (frame.frameFlags & kFrameFlagDyedSheen) != 0u;
+    le.dyedSheen = (frameFlags & kFrameFlagDyedSheen) != 0u;
     // DH-1306 — the unclipped GGX peak (IlluminatoramaBSDF.h `kFrameFlagGGXRelativeGuard`).
-    le.ggxRelative = (frame.frameFlags & kFrameFlagGGXRelativeGuard) != 0u;
+    le.ggxRelative = (frameFlags & kFrameFlagGGXRelativeGuard) != 0u;
     // DH-1301 — diffuse roughness (EON): the lights with a direction below (sun, points, spots, fill
     // directionals, the SSS diffuse peel) evaluate the full lobe; the integrated sources (LTC area /
     // portal lights, the diffuse IBL + bands, the ambient supplement) its directional albedo.
-    if ((frame.frameFlags & kFrameFlagDiffuseRoughness) != 0u)
+    if ((frameFlags & kFrameFlagDiffuseRoughness) != 0u)
         le = layeredWithDiffuseRoughness(le, albedo, illumiUnpackDiffuseRoughness(amH.a), saturate(dot(N, V)));
     // DH-1309 — the COAT as a layer (IlluminatoramaBSDF.h). Its strength is the G-buffer's emission.a
     // when that carries a coat (> 0), else the instance's own (a coat sharing the pixel with a sheen,
@@ -1703,7 +1737,7 @@ kernel void illumi_lighting(
     // is dead for non-SSS scenes (sssStrength == 0) and non-SSS pixels (mask 0).
     bool   sssBand  = (nrH.a > 0.90h && nrH.a < 0.99h);
     bool   sssForce = (frame.sssDebugForceAll > 0.5) && (nrH.a > 0.5h); // headless verify
-    bool   isSSS    = (frame.sssStrength > 0.0) && (sssBand || sssForce);
+    bool   isSSS    = lf(kLFSSS) && (frame.sssStrength > 0.0) && (sssBand || sssForce);
     float3 sssDiffuse = float3(0.0);
 
     // Directional light, attenuated by the cascaded-shadow visibility term.
@@ -1732,7 +1766,7 @@ kernel void illumi_lighting(
     // EVERY sun-driven term below (direct BRDF, leaf/plush transmission, the
     // casing clearcoat, plush sheen) darkens consistently at object contacts.
     // Off-by-default: `contactShadowStrength == 0` skips the march entirely.
-    if (frame.contactShadowStrength > 0.0 && visibility > 0.0) {
+    if (lf(kLFContact) && frame.contactShadowStrength > 0.0 && visibility > 0.0) {
         float3 viewPos = (frame.view * float4(worldPos, 1.0)).xyz;
         float3 LviewN  = normalize((frame.view * float4(Ld, 0.0)).xyz);
         float  occ = illumiContactShadow(gDepth, frame, viewPos, LviewN,
@@ -1757,7 +1791,8 @@ kernel void illumi_lighting(
     // and nothing could say otherwise. The reconstruction is still per-instance from a world
     // reference (not per-plank), but it's the STRETCH plus the AXIS that kill the plastic look.
     float aniso; bool grainVertical;
-    if (nrH.a > 2.001h)      { aniso = float(nrH.a - 2.0h); grainVertical = true;  }
+    if (!lf(kLFAniso))       { aniso = 0.0;                 grainVertical = false; }
+    else if (nrH.a > 2.001h) { aniso = float(nrH.a - 2.0h); grainVertical = true;  }
     else if (nrH.a > 1.001h) { aniso = float(nrH.a - 1.0h); grainVertical = false; }
     else                     { aniso = 0.0;                 grainVertical = false; }
     float3 grainT = float3(0.0);
@@ -1824,10 +1859,10 @@ kernel void illumi_lighting(
     // and only when the host sets the ratio; grass and every legacy writer (tag 0) keep the #58
     // backlight just below, unchanged.
     float3 leafTau = float3(0.0);
-    if (nrH.a > half(kLeafPhysicalTagMin) && nrH.a < 0.5h && frame.leafTransmittanceRatio > 0.0) {
+    if (lf(kLFLeafScene) && nrH.a > half(kLeafPhysicalTagMin) && nrH.a < 0.5h && frame.leafTransmittanceRatio > 0.0) {
         leafTau = leafTransmittance(albedo, leafThickness(float(nrH.a)), frame.leafTransmittanceRatio);
         transmission = leafSunTransmission(N, V, Ld, frame.directionalLightColor, visibility, leafTau);
-    } else if (nrH.a < 0.5h && frame.leafTransmission > 0.0) {   // foliage + scene opt-in (legacy)
+    } else if (lf(kLFLeafScene) && nrH.a < 0.5h && frame.leafTransmission > 0.0) {   // foliage + scene opt-in (legacy)
         float back    = saturate(dot(-N, Ld));           // sun on the FAR face
         float forward = pow(saturate(dot(V, -Ld)), 3.0); // viewing toward the sun
         // ROUND-6 POLISH #3: BACKLIT-ONLY GATE. The old `through = back·(0.40+0.60·
@@ -1858,7 +1893,7 @@ kernel void illumi_lighting(
     // forward bias (the fill diffuses it). Reuses the energy-clamped leaf machinery,
     // driven by `frame.plushTransmission` (0 ⇒ skipped). Mirrors the leaf gate so
     // it never fires forward-lit. Zero for every non-plush surface / scene.
-    if (nrH.a > 0.5h && nrH.a < 0.6h && frame.plushTransmission > 0.0) {
+    if (lf(kLFPlushScene) && nrH.a > 0.5h && nrH.a < 0.6h && frame.plushTransmission > 0.0) {
         float back    = saturate(dot(-N, Ld));
         float backlit = smoothstep(0.02, 0.55, dot(V, -Ld));
         float through = back * backlit * (0.55 + 0.45 * pow(saturate(dot(V, -Ld)), 2.0));
@@ -1881,7 +1916,7 @@ kernel void illumi_lighting(
     // `frame.shadeTransmission` (0 ⇒ skipped); no Visualizer scene ships the tag OR
     // sets the scalar, so it is an exact no-op there. Mirrors the leaf gate so it
     // never fires forward-lit.
-    if (nrH.a > 0.60h && nrH.a < 0.66h && frame.shadeTransmission > 0.0) {
+    if (lf(kLFShadeScene) && nrH.a > 0.60h && nrH.a < 0.66h && frame.shadeTransmission > 0.0) {
         float back    = saturate(dot(-N, Ld));                     // light on the FAR face
         float backlit = smoothstep(0.02, 0.45, dot(V, -Ld));       // viewing toward the light
         float through = back * backlit * (0.60 + 0.40 * saturate(dot(V, -Ld)));
@@ -1908,8 +1943,8 @@ kernel void illumi_lighting(
 
     // Point lights — inverse-square with smooth radius cutoff. (Includes the
     // synthesised emissive-as-light points from the extractor, Phase 4.27.)
-    const bool sphereOn = (frame.frameFlags & kFrameFlagSphereLights) != 0u;
-    for (uint i = 0; i < frame.pointLightCount; ++i) {
+    const bool sphereOn = (frameFlags & kFrameFlagSphereLights) != 0u;
+    for (uint i = 0; lf(kLFPoint) && i < frame.pointLightCount; ++i) {
         if (!lightTileHas(lightTile, i)) continue;   // DH-1625
         PointLight pl = pointLights[i];
         // Light-layer mask: skip lights that don't share a bit with this fragment's
@@ -1998,7 +2033,7 @@ kernel void illumi_lighting(
     constexpr sampler spotShadowSampler(filter::linear,
                                         compare_func::less_equal,
                                         address::clamp_to_edge);
-    for (uint i = 0; i < frame.spotLightCount; ++i) {
+    for (uint i = 0; lf(kLFSpot) && i < frame.spotLightCount; ++i) {
         if (!lightTileHas(lightTile, frame.pointLightCount + i)) continue;   // DH-1625
         SpotLight sl = spotLights[i];
         // Light-layer mask (same rule as point lights). Default all-bits ⇒ passes.
@@ -2006,7 +2041,7 @@ kernel void illumi_lighting(
         float3 L;
         float  dist;
         float  atten;
-        if (sl.openingRadius > 0.0 && sl.giVisible != 0u && (frame.frameFlags & kFrameFlagSpotOpeningDisc) != 0u) {
+        if (sl.openingRadius > 0.0 && sl.giVisible != 0u && (frameFlags & kFrameFlagSpotOpeningDisc) != 0u) {
             // Daydream DH-1406 — from the real opening disc (the path lane's law, deterministically). Only for a
             // light the path lane SEES (`giVisible`): a light it never samples has no disc to agree with, and a
             // night window's outward glow sits in its own pane's plane, where the disc lit the muntins beside it.
@@ -2100,9 +2135,9 @@ kernel void illumi_lighting(
     // per lit portal per pixel) therefore cancel — up to the half-float rounding of that subtraction —
     // so with `kFrameFlagSkipHandedApertures` they are not computed: measured on 4000 Sunset's settled
     // refine (17 portals) this kernel went 141 → 48 ms, held frame unchanged. Clear ⇒ the loop as before.
-    bool skipHandedApertures = (frame.frameFlags & kFrameFlagSkipHandedApertures) != 0u
-        && (frame.frameFlags & (kFrameFlagPathOwnsIndirect | kFrameFlagGIOwnsApertures)) != 0u;
-    for (uint i = 0; i < frame.areaLightCount; ++i) {
+    bool skipHandedApertures = (frameFlags & kFrameFlagSkipHandedApertures) != 0u
+        && (frameFlags & (kFrameFlagPathOwnsIndirect | kFrameFlagGIOwnsApertures)) != 0u;
+    for (uint i = 0; lf(kLFArea) && i < frame.areaLightCount; ++i) {
         if (!lightTileHas(lightTile, frame.pointLightCount + frame.spotLightCount + i)) continue;   // DH-1625
         AreaLight al = areaLights[i];
         if (skipHandedApertures && al.isAperture > 0.5) continue;
@@ -2186,7 +2221,7 @@ kernel void illumi_lighting(
     // without a shadow map (SCN fill/back lights are `castsShadow = false`; the
     // primary keeps the cascade rig). `dir` is pre-normalized toward the light.
     float3 dirFillSum = float3(0.0);
-    for (uint i = 0; i < frame.directionalLightCount; ++i) {
+    for (uint i = 0; lf(kLFDirs) && i < frame.directionalLightCount; ++i) {
         DirectionalLight dl = extraDirectionals[i];
         dirFillSum += brdf(N, V, dl.dir, albedo, metallic, roughness, dl.color,
                            0.0, float3(0.0), sheenStrength, &clothSheen, sheenRoughness, le);
@@ -2203,7 +2238,7 @@ kernel void illumi_lighting(
     // block is skipped and ao is untouched, byte-identical). Evaluated on the albedo's luminance
     // (ao is a scalar through the rest of this kernel): bright surfaces get back the light the
     // occluder bounces onto them, dark ones keep their full AO.
-    if (frame.filmMedium.z > 0.5) {
+    if (lf(kLFMultiBounce) && frame.filmMedium.z > 0.5) {
         float mbA = dot(albedo, float3(0.2126, 0.7152, 0.0722));
         float a = 2.0404 * mbA - 0.3324;
         float b = -4.7951 * mbA + 0.6417;
@@ -2230,7 +2265,7 @@ kernel void illumi_lighting(
     // neighbours. Exactly 1.0 for an unstamped fragment and for every scene that
     // never fills the table, so this is a no-op multiply by default.
     float roomBandGain = 1.0;
-    if (frame.interiorMask != 0u && fragLayer != 0xFFFFFFFFu &&
+    if (lf(kLFInterior) && frame.interiorMask != 0u && fragLayer != 0xFFFFFFFFu &&
         (fragLayer & frame.interiorMask) != 0u) {
         roomBandGain = interiorRoomBandGain(fragLayer, &frame.interiorRoomGain[0],
                                             frame.interiorRoomGainMeta.x);
@@ -2258,7 +2293,7 @@ kernel void illumi_lighting(
     // DH-1302 — the same term from the material-layer record on EVERY lane (live and still), tinted by
     // the material's own transmission colour (the albedo when none): `max` with the photo lane's
     // `thinTransmission`, so a host that sets both loses nothing.
-    if ((frame.extendedGBuffer != 0.0 || (transOn && ml.trans)) && nrH.a >= 1.0h) {
+    if (((lf(kLFExtGBuffer) && frame.extendedGBuffer != 0.0) || (transOn && ml.trans)) && nrH.a >= 1.0h) {
         float tt = frame.extendedGBuffer != 0.0 ? saturate(float(gMaterial.read(gid).r)) : 0.0;
         float3 ttTint = albedo;
         if (transOn && ml.trans) {
@@ -2602,20 +2637,20 @@ kernel void illumi_lighting(
         if (le.coatOn) ambSupp *= le.underCoatEnv * le.coatDarken;                            // DH-1309
         if (layeredSheen) ambSupp *= le.baseUnderSheen;   // DH-1014 — 1.0 off cloth
         // DH-1534 — a metal has no diffuse lobe for the flat room-bounce stand-in to light.
-        if ((frame.frameFlags & kFrameFlagMetalNoAmbient) != 0u) ambSupp *= (1.0 - metallic);
+        if ((frameFlags & kFrameFlagMetalNoAmbient) != 0u) ambSupp *= (1.0 - metallic);
         indirect += ambSupp * ao * interiorAmbK;
         dbgAmbient = ambSupp * ao * interiorAmbK;
         // DH-0989 — the path-traced lane walks the light every one of these terms stands in
         // for, so it takes the WHOLE diffuse IBL (bands, room gains, interior scalars) and the
         // ambient supplement — not only the outdoor-cube share.
-        if ((frame.frameFlags & kFrameFlagPathOwnsIndirect) != 0u) {
+        if ((frameFlags & kFrameFlagPathOwnsIndirect) != 0u) {
             diffSkyInComposite = dbgDiffuseIBL + dbgAmbient;
         } else {
             // DH-1320 — the one-bounce GI's share of the same hand-off, per stand-in (see
             // `kFrameFlagGIOwns*`). Its misses are the sky through the window and its hits the lit
             // room, so a band or supplement left here would be the room's bounce counted twice.
-            if ((frame.frameFlags & kFrameFlagGIOwnsBands) != 0u) diffSkyInComposite = dbgDiffuseIBL;
-            if ((frame.frameFlags & kFrameFlagGIOwnsAmbient) != 0u) diffSkyInComposite += dbgAmbient;
+            if ((frameFlags & kFrameFlagGIOwnsBands) != 0u) diffSkyInComposite = dbgDiffuseIBL;
+            if ((frameFlags & kFrameFlagGIOwnsAmbient) != 0u) diffSkyInComposite += dbgAmbient;
         }
         // Ambient sheen — the same lobe against the flat ambient term, so a scene that lights
         // its interior with `ambientColor` rather than an IBL probe still gets fabric. Uses
@@ -2636,7 +2671,7 @@ kernel void illumi_lighting(
         if (le.coatOn) amb *= le.underCoatEnv * le.coatDarken;                            // DH-1309
         indirect = amb * ao * interiorAmbK;
         dbgAmbient = amb * ao * interiorAmbK;
-        if ((frame.frameFlags & (kFrameFlagPathOwnsIndirect | kFrameFlagGIOwnsAmbient)) != 0u) diffSkyInComposite = dbgAmbient;
+        if ((frameFlags & (kFrameFlagPathOwnsIndirect | kFrameFlagGIOwnsAmbient)) != 0u) diffSkyInComposite = dbgAmbient;
     }
 
     // Issue #65 — fold the indirect DIFFUSE (diffuse-IBL irradiance + ambient
@@ -2650,7 +2685,7 @@ kernel void illumi_lighting(
     // A second dielectric GGX lobe (F0=0.04, roughness=0.08) is added for
     // polished surfaces. Strength 0 → no cost (branch exits immediately).
     float3 clearcoat = float3(0.0);
-    float houseCC = float(emH.a);
+    float houseCC = lf(kLFCoat) ? float(emH.a) : 0.0;
     if (le.coatOn) {
         // DH-1309 — the coat's ENVIRONMENT lobe: the prefiltered radiance at its own roughness × its
         // split-sum albedo `E_env(F0c, μo)` (the base below already took `1 − w·E_env`). Raw `ao` and
@@ -2684,7 +2719,7 @@ kernel void illumi_lighting(
         if (NdotL_sun > 0.0) {
             float3 Hcc = normalize(V + Ld);
             float  Dcc = distributionGGXSource(saturate(dot(N, Hcc)), ccRough, frame.rtSunShadowAngle,
-                                               (frame.frameFlags & kFrameFlagGGXRelativeGuard) != 0u);   // DH-1306
+                                               (frameFlags & kFrameFlagGGXRelativeGuard) != 0u);   // DH-1306
             float  Gcc = geometrySmith(ccNdotV, NdotL_sun, ccRough);
             float  Fcc = ccF0 + (1.0 - ccF0) * pow(1.0 - saturate(dot(Hcc, V)), 5.0);
             float  spec = (Dcc * Gcc * Fcc) / max(4.0 * ccNdotV * NdotL_sun, 1e-4);
@@ -2734,7 +2769,7 @@ kernel void illumi_lighting(
     // Lower bound 0.6h → 0.66h: the (0.60, 0.66) sub-band belongs to the lamp-shade
     // fabric (DH-0458), which must not pick up the wet-glaze clearcoat. Casing still
     // carries exactly 0.75h, so this is a no-op for the frank.
-    if (nrH.a > 0.66h && nrH.a < 0.9h) {
+    if (lf(kLFCasing) && nrH.a > 0.66h && nrH.a < 0.9h) {
         const float ccRough    = 0.18;
         const float ccF0       = 0.04;
         const float ccStrength = 0.55;
@@ -2742,7 +2777,7 @@ kernel void illumi_lighting(
         if (NdotL_sun > 0.0) {
             float3 Hcc = normalize(V + Ld);
             float  Dcc = distributionGGXSource(saturate(dot(N, Hcc)), ccRough, frame.rtSunShadowAngle,
-                                               (frame.frameFlags & kFrameFlagGGXRelativeGuard) != 0u);   // DH-1306
+                                               (frameFlags & kFrameFlagGGXRelativeGuard) != 0u);   // DH-1306
             float  Gcc = geometrySmith(ccNdotV, NdotL_sun, ccRough);
             float  Fcc = ccF0 + (1.0 - ccF0) * pow(1.0 - saturate(dot(Hcc, V)), 5.0);
             float  spec = (Dcc * Gcc * Fcc) / max(4.0 * ccNdotV * NdotL_sun, 1e-4);
@@ -2767,7 +2802,7 @@ kernel void illumi_lighting(
     // A cheap Fresnel-weighted, NdotL-modulated sheen on the sun + ambient, gated
     // by `frame.plushSheen` (0 ⇒ skipped). No-op for every non-plush surface.
     float3 plushSheenTerm = float3(0.0);
-    if (nrH.a > 0.5h && nrH.a < 0.6h && frame.plushSheen > 0.0) {
+    if (lf(kLFPlushScene) && nrH.a > 0.5h && nrH.a < 0.6h && frame.plushSheen > 0.0) {
         float fres = pow(1.0 - saturate(dot(N, V)), 3.0);     // grazing-angle edge
         float3 sheenTint = albedo * 0.5 + float3(0.5);        // warm-white fibre tip
         // Sun-lit sheen + a soft ambient sheen so back/side fur still fuzzes.
@@ -2795,7 +2830,7 @@ kernel void illumi_lighting(
     // DH-0989 — and the area lights: in this lane they are the window APERTURES the path samples
     // directly (their glossy share comes back through the traced reflections, which see the sky
     // through the same opening).
-    if ((frame.frameFlags & (kFrameFlagPathOwnsIndirect | kFrameFlagGIOwnsApertures)) != 0u) diffSkyInComposite += apertureSum;
+    if ((frameFlags & (kFrameFlagPathOwnsIndirect | kFrameFlagGIOwnsApertures)) != 0u) diffSkyInComposite += apertureSum;
 
     // Per-term split-render: isolate ONE contribution so a flooded/flat scene
     // can be decomposed. Surfaces only — sky already returned above.
@@ -2826,7 +2861,7 @@ kernel void illumi_lighting(
     // invisible — so this is a statement about the far field, not a fog look.
     float3 aovSpecPre = float3(0.0), aovDiffSkyPre = float3(0.0);
     if (kLightingAOVEnabled) { aovSpecPre = specIBLInComposite; aovDiffSkyPre = diffSkyInComposite; }   // DH-1304
-    if (frame.aerialPerspectiveDensity > 0.0 && frame.debugTerm == 0u && kLightingIBLEnabled) {
+    if (lf(kLFAerial) && frame.aerialPerspectiveDensity > 0.0 && frame.debugTerm == 0u && kLightingIBLEnabled) {
         float viewDist = length(frame.cameraWorldPos - worldPos);
         float t = exp(-frame.aerialPerspectiveDensity * viewDist);
         if (t < 0.9999) {
@@ -2870,7 +2905,7 @@ kernel void illumi_lighting(
         // What of the composite the traced pass will REPLACE this frame: the whole `diffSkyInComposite`
         // (the hand-off flags decide its make-up), of which the outdoor-cube diffuse is always a part,
         // and the window apertures when the flags hand those over too.
-        float3 handedAp = ((frame.frameFlags & (kFrameFlagPathOwnsIndirect | kFrameFlagGIOwnsApertures)) != 0u)
+        float3 handedAp = ((frameFlags & (kFrameFlagPathOwnsIndirect | kFrameFlagGIOwnsApertures)) != 0u)
                         ? apertureSum : float3(0.0);
         float3 envShare  = aovEnvDiffuse * baseAttenForAOV;
         float3 handoff   = handed ? aovDiffSkyPre : float3(0.0);
@@ -2901,7 +2936,7 @@ kernel void illumi_lighting(
     // diffuse irradiance peeled off above; a = the SSS mask (1 = blur, 0 = leave).
     // Skipped entirely when the scene hasn't opted in (sssStrength == 0), so the
     // binding is an unread dummy and non-SSS scenes pay nothing here.
-    if (frame.sssStrength > 0.0) {
+    if (lf(kLFSSS) && frame.sssStrength > 0.0) {
         lightingStore(sssOut, half4(half3(sssDiffuse), isSSS ? 1.0h : 0.0h), gid);
     }
 }

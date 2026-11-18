@@ -189,6 +189,11 @@ final class LightingKnobs {
     /// `false` (the default) is every lobe's historical expression, byte for byte — a look
     /// change is the host's call (Daydream Home opts in).
     var layeredMultiscatter: Bool = false
+    /// Lean lighting (Munimyni iPhone, 2026-11): specialise `illumi_lighting` on the frame's own flags and
+    /// features so dead uber-kernel code is compiled out (IlluminatoramaRenderer+LeanLighting.swift).
+    var leanLightingEnabled: Bool = false
+    /// The G-buffer material classes the host draws (lean lighting only).
+    var leanLightingMaterials: IlluminatoramaLeanMaterials = .all
     /// **DH-1301 — diffuse roughness (OpenPBR `base_diffuse_roughness`, the EON lobe).** The master
     /// switch for every lane: with it set, an instance's `diffuseRoughness` (> 0, pure dielectric)
     /// shades with the energy-preserving Oren-Nayar lobe (IlluminatoramaDiffuseRoughness.h) — the full
