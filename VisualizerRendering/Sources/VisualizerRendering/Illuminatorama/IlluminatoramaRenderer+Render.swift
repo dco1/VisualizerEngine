@@ -203,6 +203,10 @@ extension IlluminatoramaRenderer {
         encodeShadowPasses(cb)
         encodeSpotShadowPasses(cb)
         encodePointShadowPasses(cb)
+        // This frame's depth becomes next frame's "previous" by swapping the two identical textures right before
+        // the G-buffer pass writes the other one, instead of a full-frame depth blit after the resolve (12 MB a
+        // frame on an iPhone's native canvas). Anything that reads depth between frames still sees the latest.
+        if taaEnabled { swap(&gbs.depthTexture, &gbs.previousDepthTexture) }
         encodeGBufferPass(cb)
         onEncodeAfterGBuffer?(cb)   // DH-1466 — nil for every host that does not opt in
         // Issue #65 — now that the G-buffer draw has read THIS frame's prev
@@ -328,10 +332,7 @@ extension IlluminatoramaRenderer {
         // one queue execute in order, so it lands before the next frame's G-buffer pass
         // overwrites `depthTexture` whatever the in-flight pool depth. Skipped when TAA is off (nothing reads it); the
         // enable-transition's taaNeedsFirstFrame covers the first re-enabled frame.
-        if taaEnabled, let blit = cb.makeBlitCommandEncoder() {
-            blit.copy(from: gbs.depthTexture, to: gbs.previousDepthTexture)
-            blit.endEncoding()
-        }
+        // (No copy: the G-buffer pass swaps the two depth textures instead, see `encodeGBufferPass`'s caller.)
         // Phase 4.43 — additive overlay FX (dust + emitter sparks) composited
         // AFTER the resolve, into a throwaway display buffer, so the temporal
         // history never sees them and they can't trail. No-op when there are
