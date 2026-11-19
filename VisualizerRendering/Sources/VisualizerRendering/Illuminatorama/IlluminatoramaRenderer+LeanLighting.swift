@@ -172,3 +172,8 @@ extension IlluminatoramaRenderer {
         return p
     }
 }
+
+extension IlluminatoramaRenderer {
+    /// The last profiled frame's GPU ms per pass (`VIZ_ILLUMI_PASS_PROFILE` set); empty otherwise.
+    public var lastPassTimesMs: [String: Double] { gbs.passTimer?.lastTimes ?? [:] }
+}

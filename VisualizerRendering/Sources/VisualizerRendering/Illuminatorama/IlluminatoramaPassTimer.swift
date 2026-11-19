@@ -54,6 +54,9 @@ final class IlluminatoramaPassTimer: @unchecked Sendable {
     // vars are safe to mutate during a frame; the completion handler reads a
     // snapshot passed into resolve()).
     private(set) var labels: [String] = []
+    private var _lastTimes: [String: Double] = [:]
+    /// The last resolved frame's per-pass GPU ms (empty unless profiling is on).
+    var lastTimes: [String: Double] { lock.lock(); defer { lock.unlock() }; return _lastTimes }
     private var nextIndex = 0
 
     // Frame counter (mutated in resolve(), on the completion thread; guarded by a
@@ -204,6 +207,7 @@ final class IlluminatoramaPassTimer: @unchecked Sendable {
         lock.lock()
         frameCount += 1
         let n = frameCount
+        _lastTimes = times
         lock.unlock()
         let perPass = times.sorted { $0.value > $1.value }
 

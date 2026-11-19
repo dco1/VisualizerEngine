@@ -88,18 +88,30 @@ static inline float sampleCascade(
     // 3×3 PCF (radius 1) or 5×5 (radius 2). The sample_compare hardware filter
     // gives us bilinear-filtered comparisons per tap, so a small grid here is
     // usually enough for nice soft contact shadows.
+    // The (2r+1)^2 grid of bilinear compares at whole-texel offsets is one fixed kernel over the
+    // (2r+2)^2 texels they touch: per axis the weights are [1-f, 1, ..., 1, f] (f = the bilinear
+    // fraction). Fetch those texels' compare results with (r+1)^2 gathers (4 each) and weight them:
+    // the same filter in under half the texture operations (9 sample_compare -> 4 gather_compare at r = 1).
     int r = int(min(pcfRadius, 2u));
-    float2 texel = 1.0 / float2(shadowMap.get_width(), shadowMap.get_height());
+    float2 size = float2(shadowMap.get_width(), shadowMap.get_height());
+    float2 pt = uv * size - 0.5;
+    float2 b = floor(pt), f = pt - b;
     float sum = 0.0;
-    int count = 0;
-    for (int j = -r; j <= r; ++j) {
-        for (int i = -r; i <= r; ++i) {
-            float2 off = float2(float(i), float(j)) * texel;
-            sum += shadowMap.sample_compare(shadowSampler, uv + off, cascade, refZ);
-            count += 1;
+    for (int qy = 0; qy <= r; ++qy) {
+        // Rows b-r+2qy (top) and b-r+2qy+1 (bottom); their weights in the [1-f, 1, ..., 1, f] pattern.
+        float wt = (qy == 0) ? 1.0 - f.y : 1.0;
+        float wb = (qy == r) ? f.y : 1.0;
+        for (int qx = 0; qx <= r; ++qx) {
+            float wl = (qx == 0) ? 1.0 - f.x : 1.0;
+            float wr = (qx == r) ? f.x : 1.0;
+            // The corner shared by the quad's four texels: a gather there returns exactly them.
+            float2 corner = (b + float2(float(2 * qx - r + 1), float(2 * qy - r + 1))) / size;
+            float4 g = shadowMap.gather_compare(shadowSampler, corner, cascade, refZ);
+            // Metal's gather order: x (left, bottom), y (right, bottom), z (right, top), w (left, top).
+            sum += g.w * wl * wt + g.z * wr * wt + g.x * wl * wb + g.y * wr * wb;
         }
     }
-    return sum / float(count);
+    return sum / float((2 * r + 1) * (2 * r + 1));
 }
 
 // ── Phase 4.42 — function-constant specialization of illumi_lighting (WWDC23 #10127) ──
