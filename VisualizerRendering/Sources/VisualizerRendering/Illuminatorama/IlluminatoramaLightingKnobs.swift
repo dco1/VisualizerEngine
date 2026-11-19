@@ -194,6 +194,8 @@ final class LightingKnobs {
     var leanLightingEnabled: Bool = false
     /// The G-buffer material classes the host draws (lean lighting only).
     var leanLightingMaterials: IlluminatoramaLeanMaterials = .all
+    /// The host's promise that every ordinary G-buffer draw is a plain vertex-colour material (IlluminatoramaRenderer+LeanLighting.swift).
+    var plainSurfacesOnly: Bool = false
     /// **DH-1301 — diffuse roughness (OpenPBR `base_diffuse_roughness`, the EON lobe).** The master
     /// switch for every lane: with it set, an instance's `diffuseRoughness` (> 0, pure dielectric)
     /// shades with the energy-preserving Oren-Nayar lobe (IlluminatoramaDiffuseRoughness.h) — the full

@@ -146,3 +146,29 @@ extension IlluminatoramaRenderer {
         return true
     }
 }
+
+// MARK: - Plain surfaces (the G-buffer's lean variant)
+
+extension IlluminatoramaRenderer {
+
+    /// The host's promise that every instance drawn by the ordinary G-buffer pipelines is a plain vertex-colour
+    /// material: no texture slices (albedo, normal, metallic, roughness, emission, detail), wood knots, pattern
+    /// panels or jitter, UV warp, leaf veins, hue cycling, surface wear, carpet macro, tag glow or detail relief,
+    /// and no mesh carrying the soil (uv.x < 0), bark (tangent.w > 1.5) or skin / casing (vertex alpha 0.5–0.9)
+    /// tags. The G-buffer fragment is then compiled without those branches (`kGBufferPlain`), drawing the pixels
+    /// the uber shader would. A scene that breaks the promise draws those surfaces plain. Interior-mapped,
+    /// leaf-cutout and photo-lane (extended) draws keep their own pipelines.
+    public var plainSurfacesOnly: Bool {
+        get { kLighting.plainSurfacesOnly }
+        set { kLighting.plainSurfacesOnly = newValue }
+    }
+
+    /// The plain G-buffer pipelines, built on first use; nil (the ordinary pipelines) if they fail to build.
+    func plainGBufferPipelines() -> (base: MTLRenderPipelineState, prev: MTLRenderPipelineState)? {
+        if let p = gbs.gbufferPipelinesPlain { return p }
+        guard let library = engine.library,
+              let p = try? Self.gbufferPipelinePair(device: device, library: library, plain: true) else { return nil }
+        gbs.gbufferPipelinesPlain = p
+        return p
+    }
+}

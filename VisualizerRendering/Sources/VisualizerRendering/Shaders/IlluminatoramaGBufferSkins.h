@@ -31,7 +31,7 @@ static inline __attribute__((always_inline)) void illumiSurfaceSkins(VSOut in, t
     // the 0.18 glossy floor of the roughness mottle approximates the glaze.
     // Lower bound raised 0.6 → 0.66 to leave the (0.60, 0.66] sub-band to the lamp
     // shade fabric (DH-0458), which must NOT pick up the sausage wet-glaze look.
-    if (in.vertexColor.a > 0.66 && in.vertexColor.a < 0.9) {
+    if (!kGBufferPlain && in.vertexColor.a > 0.66 && in.vertexColor.a < 0.9) {
         // Build a CONTINUOUS tangent frame from the surface normal.
         // Previous version used a hard branch on abs(n.y): as a horizontal frank's
         // normal swept around the tube it crossed the 0.9 threshold, snapping the
@@ -88,7 +88,7 @@ static inline __attribute__((always_inline)) void illumiSurfaceSkins(VSOut in, t
     // high-frequency normal break-up so the silhouette + specular read as short
     // fur fuzz rather than smooth rubber, and the per-instance high roughness stays
     // matte. No-op for every other scene (no other mesh ships alpha in this band).
-    if (in.vertexColor.a >= 0.5f && in.vertexColor.a <= 0.6f) {
+    if (!kGBufferPlain && in.vertexColor.a >= 0.5f && in.vertexColor.a <= 0.6f) {
         float yBlend    = smoothstep(0.75f, 0.95f, abs(n.y));
         float3 blendRef = normalize(float3(yBlend, 1.0f - yBlend, 0.0f));
         float3 fuzzTang = normalize(cross(n, blendRef));

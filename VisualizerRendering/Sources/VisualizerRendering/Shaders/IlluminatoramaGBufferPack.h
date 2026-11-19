@@ -147,7 +147,7 @@ static inline __attribute__((always_inline)) GBufferOut illumiGBufferPack(
     // additive on top of the lit colour. Sampling from the sRGB-decoded
     // albedo atlas means the bake gets linear RGB directly.
     float3 emission = inst.emission;
-    if (inst.emissionTextureSlice >= 0) {
+    if (!kGBufferPlain && inst.emissionTextureSlice >= 0) {
         // Domain-warped sampling UV. Exact no-op when `uvWarp.x == 0`.
         float2 emUV = warpUV(in.uv, inst.uvWarp, frame.time);
         float4 tx = sampleAtlasAspect(albedoAtlas, texSampler, emUV,
@@ -167,7 +167,7 @@ static inline __attribute__((always_inline)) GBufferOut illumiGBufferPack(
     // the petal emits its own final albedo, so a hue-cycling flower glows in its current colour.
     // Static per-instance weight × the frame's live gain.
     float tagGlow = inst.tagGlow.x * frame.tagGlowGain;
-    if (tagGlow > 0.0f && in.worldTangent.w > 0.5f && in.worldTangent.w < 1.5f) {
+    if (!kGBufferPlain && tagGlow > 0.0f && in.worldTangent.w > 0.5f && in.worldTangent.w < 1.5f) {
         emission += albedo * tagGlow;
     }
     // Phase 7 — pack clearcoat (≥0) OR cloth sheen (<0) into emission.alpha (was always 1.0,
@@ -178,7 +178,7 @@ static inline __attribute__((always_inline)) GBufferOut illumiGBufferPack(
     // byte-for-byte the pre-band encoding, so every non-opting material is unchanged.
     // A carpet's sheen swells with the pile lay (same field as the tone swell above): the nap that
     // leans toward the eye is lighter and glossier, the nap that leans away is darker and flatter.
-    float sheenStrength = inst.sheen * carpetLaySheenScale(in.uv, inst.carpetMacro);
+    float sheenStrength = inst.sheen * (kGBufferPlain ? 1.0f : carpetLaySheenScale(in.uv, inst.carpetMacro));
     float sheenAlpha = (inst.sheen > 0.0f)
         ? float(clothSheenBandForRoughness(inst.sheenRoughness)) + min(sheenStrength, 0.98f)
         : 0.0f;

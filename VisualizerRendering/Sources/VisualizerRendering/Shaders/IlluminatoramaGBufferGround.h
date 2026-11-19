@@ -22,7 +22,7 @@ static inline __attribute__((always_inline)) void illumiSurfaceGround(VSOut in, 
     // roughness (#12), wetness darkening/smoothing (#12 — wet = darker, smoother,
     // more reflective), and world-space macro/micro normal relief (#13, #11 —
     // world-space so no UV stretching on slopes).
-    if (inst.albedoTextureSlice < 0 && inst.roughnessTextureSlice < 0 &&
+    if (!kGBufferPlain && inst.albedoTextureSlice < 0 && inst.roughnessTextureSlice < 0 &&
         inst.normalTextureSlice < 0 && in.uv.x < -0.005) {
         float soilRough = saturate(-in.uv.x - 0.01);
         float wet = saturate(in.uv.y);

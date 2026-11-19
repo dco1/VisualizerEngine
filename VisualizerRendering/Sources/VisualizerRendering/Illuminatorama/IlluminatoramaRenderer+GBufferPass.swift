@@ -53,8 +53,9 @@ extension IlluminatoramaRenderer {
         // DH-0140 — the lane was decided when this frame's uniforms were written; pick the
         // matching pipelines once. The extended variants exist whenever `extendedGBufferActive`.
         let extended = extendedGBufferActive
-        let basePipe: MTLRenderPipelineState = (extended ? gbs.gbufferPipelineExt : nil) ?? gbs.gbufferPipeline
-        let prevPipe: MTLRenderPipelineState = (extended ? gbs.gbufferPipelinePrevVertsExt : nil) ?? gbs.gbufferPipelinePrevVerts
+        let plain = (!extended && plainSurfacesOnly) ? plainGBufferPipelines() : nil
+        let basePipe: MTLRenderPipelineState = plain?.base ?? (extended ? gbs.gbufferPipelineExt : nil) ?? gbs.gbufferPipeline
+        let prevPipe: MTLRenderPipelineState = plain?.prev ?? (extended ? gbs.gbufferPipelinePrevVertsExt : nil) ?? gbs.gbufferPipelinePrevVerts
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = gbs.gbufferAlbedoMet
         pass.colorAttachments[0].loadAction = .clear

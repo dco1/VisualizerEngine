@@ -71,7 +71,7 @@ static inline __attribute__((always_inline)) float2 illumiSurfaceMaterialUV(VSOu
     // It rides on `matUV` (not `in.uv`), so it moves the figure without sliding the plank-cell
     // grid or the soil marker; the derivatives above are taken from the un-phased `in.uv`, which
     // is correct because a constant offset has zero screen-space derivative.
-    knot = sampleWoodKnots(in.uv, inst.woodKnots, inst.patternCells);
+    knot = sampleWoodKnots(in.uv, kGBufferPlain ? float4(0.0f) : inst.woodKnots, inst.patternCells);
     // DH-0513 — per-panel FIGURE phase: `antiTilingScale < 0` flags a coherent wall veneer (the hex
     // blend treats any strength ≤ 0 as the exact single read, so the sign is free to carry this).
     // Each physical panel — `floor(uv.x · patternCells.x)` — samples the seamless slice shifted along
@@ -79,14 +79,14 @@ static inline __attribute__((always_inline)) float2 illumiSurfaceMaterialUV(VSOu
     // of the figure in every panel instead of printing at the panel pitch. A deliberate grain
     // discontinuity at each panel edge, like a real joint. Every other instance adds exactly zero.
     float2 panelPhase = float2(0.0f);
-    if (inst.antiTilingScale < 0.0f && inst.patternJitter != 0.0f && inst.patternCells.x >= 1.0f) {
+    if (!kGBufferPlain && inst.antiTilingScale < 0.0f && inst.patternJitter != 0.0f && inst.patternCells.x >= 1.0f) {
         panelPhase.y = panelFigureShift(floor(in.uv.x * inst.patternCells.x));
     }
     float2 matUV = in.uv + knot.warp + inst.uvPhase + panelPhase;
     // `uvWarp.w >= 0.5` extends the animated domain warp to the MATERIAL maps
     // (albedo/roughness/normal) as well as emission. Default 0 = emission only,
     // which is the common case: a glow that morphs on a surface that does not.
-    if (inst.uvWarp.w >= 0.5f) matUV = warpUV(matUV, inst.uvWarp, frame.time);
+    if (!kGBufferPlain && inst.uvWarp.w >= 0.5f) matUV = warpUV(matUV, inst.uvWarp, frame.time);
     return matUV;
 }
 
@@ -122,7 +122,7 @@ static inline __attribute__((always_inline)) void illumiSurfaceNormalMap(
     // world via TBN. When no normal map is bound, fall through to the
     // geometric normal `n`.
 
-    if (inst.normalTextureSlice >= 0 &&
+    if (!kGBufferPlain && inst.normalTextureSlice >= 0 &&
         length_squared(in.worldTangent.xyz) > 1e-4) {
         float3 T = normalize(in.worldTangent.xyz);
         float3 B = cross(n, T) * in.worldTangent.w;
@@ -218,7 +218,7 @@ static inline __attribute__((always_inline)) void illumiSurfaceBase(
     texture2d_array<float, access::sample> nonColorAtlas, sampler texSampler
 ) {
     albedo = inst.albedo;
-    if (inst.albedoTextureSlice >= 0) {
+    if (!kGBufferPlain && inst.albedoTextureSlice >= 0) {
         // Phase 7 hex-stochastic anti-tiling: floor/wall surfaces tile seamlessly but
         // don't repeat visibly — three blended samples from stochastically-offset
         // lattice cells. `in.uv` is already in tile-space (world ÷ uvMetres), so
@@ -259,7 +259,7 @@ static inline __attribute__((always_inline)) void illumiSurfaceBase(
     // — every instance that never sets it — skips this entirely; the uv RANGE check keeps the
     // pattern off the plant's petioles and anything else in the group that carries no blade
     // coordinates.
-    if (inst.leafVenation == 1 && in.uv.x >= 10.0f && in.uv.x < 11.0f) {
+    if (!kGBufferPlain && inst.leafVenation == 1 && in.uv.x >= 10.0f && in.uv.x < 11.0f) {
         float vein = leafVeinMask(in.uv.x - 10.5f, in.uv.y, duvdx, duvdy);
         albedo = mix(albedo, albedo * 1.5f + float3(0.018f, 0.022f, 0.0f), vein * 0.6f);
     }
@@ -267,7 +267,7 @@ static inline __attribute__((always_inline)) void illumiSurfaceBase(
     // Rodrigues rotation about the grey axis: hue turns, brightness and saturation hold.
     // Tag = tangent.w ≈ 1 exactly (0.5…1.5): a mesh's own tangent handedness (±1 on normal-mapped
     // geometry) or other packed codes (forest species 2–5) must not be read as the tag.
-    if (inst.hueCycle.x > 0.0f && in.worldTangent.w > 0.5f && in.worldTangent.w < 1.5f) {
+    if (!kGBufferPlain && inst.hueCycle.x > 0.0f && in.worldTangent.w > 0.5f && in.worldTangent.w < 1.5f) {
         float theta = inst.hueCycle.y + frame.time * inst.hueCycle.z
                     + dot(in.worldPos.xz, float2(0.6f, 0.8f)) * inst.hueCycle.w;
         const float3 k = float3(0.57735027f);
@@ -281,7 +281,7 @@ static inline __attribute__((always_inline)) void illumiSurfaceBase(
     albedo *= inst.macroTone;
 
     metallic = inst.metallic;
-    if (inst.metallicTextureSlice >= 0) {
+    if (!kGBufferPlain && inst.metallicTextureSlice >= 0) {
         // SCN-style packed metallic-roughness usually puts metallic in B
         // (Blue) and roughness in G — but the exact channel depends on
         // how the asset was authored. Falling back to R keeps single-
@@ -292,7 +292,7 @@ static inline __attribute__((always_inline)) void illumiSurfaceBase(
     }
 
     roughness = inst.roughness;
-    if (inst.roughnessTextureSlice >= 0) {
+    if (!kGBufferPlain && inst.roughnessTextureSlice >= 0) {
         // Hex-stochastic roughness — same three-cell blend as albedo so
         // roughness variation doesn't lag the albedo tile seam.
         float4 tx = sampleAtlasHex(nonColorAtlas, texSampler, matUV,

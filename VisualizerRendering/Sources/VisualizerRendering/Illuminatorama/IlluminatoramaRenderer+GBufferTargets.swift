@@ -89,7 +89,7 @@ extension IlluminatoramaRenderer {
     /// `illumi_fs` specialised for one lane (DH-0140): `extended` selects the six-target output
     /// struct. The fragment carries a function constant now, so it can no longer be made by name alone.
     static func makeGBufferFragment(library: MTLLibrary, extended: Bool, interior: Bool = false,
-                                    leafCutout: Bool = false) throws -> MTLFunction {
+                                    leafCutout: Bool = false, plain: Bool = false) throws -> MTLFunction {
         let c = MTLFunctionConstantValues()
         var ext = extended
         c.setConstantValue(&ext, type: .bool, index: 11)
@@ -97,6 +97,10 @@ extension IlluminatoramaRenderer {
         c.setConstantValue(&imap, type: .bool, index: 12)
         var cut = leafCutout
         c.setConstantValue(&cut, type: .bool, index: 13)
+        if plain {   // `kGBufferPlain` (IlluminatoramaGBufferDeform.h); left undefined otherwise
+            var on = true
+            c.setConstantValue(&on, type: .bool, index: 14)
+        }
         return try library.makeFunction(name: "illumi_fs", constantValues: c)
     }
 

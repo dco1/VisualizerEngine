@@ -183,6 +183,8 @@ final class GBufferState {
     var leanMasks: SIMD2<UInt32>?
     /// The lean masks `lastLightingPipeline` was built for.
     var lastLightingLean: SIMD2<UInt32>?
+    /// Plain-surface G-buffer pipelines (base, prev-verts), built on first use (`plainSurfacesOnly`).
+    var gbufferPipelinesPlain: (base: MTLRenderPipelineState, prev: MTLRenderPipelineState)?
     /// Lean tonemap variants by feature mask (IlluminatoramaRenderer+LeanLighting.swift).
     var leanTonemapPipelines: [UInt32: MTLRenderPipelineState] = [:]
 
@@ -206,11 +208,13 @@ final class GBufferState {
 // MARK: - Pipeline / resource construction (called from `init`, in the order it lists)
 
 extension IlluminatoramaRenderer {
-    /// G-buffer, superquadric-impostor pipelines and the opaque depth state (init order step 1).
-    @MainActor static func buildGBufferPipelines(into s: GBufferState, device: MTLDevice, library: MTLLibrary) throws {
+    /// The two ordinary G-buffer pipelines (static and prev-verts vertex stages); `plain` specialises the
+    /// fragment on `kGBufferPlain` (IlluminatoramaRenderer+LeanLighting.swift, `plainSurfacesOnly`).
+    @MainActor static func gbufferPipelinePair(device: MTLDevice, library: MTLLibrary, plain: Bool) throws
+        -> (base: MTLRenderPipelineState, prev: MTLRenderPipelineState) {
         // G-buffer render pipeline (vertex + fragment).
         let pdesc = MTLRenderPipelineDescriptor()
-        pdesc.label = "Illuminatorama.gbuffer"
+        pdesc.label = plain ? "Illuminatorama.gbuffer.plain" : "Illuminatorama.gbuffer"
         // Issue #65 — `illumi_vs` now references function_constant(10) kUsePrevVerts,
         // so even the BASE variant must be specialized (a plain makeFunction(name:)
         // aborts at pipeline validation for any referenced-but-unset constant). The
@@ -221,7 +225,7 @@ extension IlluminatoramaRenderer {
         vsBaseConsts.setConstantValue(&userPrevVertsFalse, type: .bool, index: 10)
         pdesc.vertexFunction = try library.makeFunction(name: "illumi_vs",
                                                         constantValues: vsBaseConsts)
-        pdesc.fragmentFunction = try Self.makeGBufferFragment(library: library, extended: false)
+        pdesc.fragmentFunction = try Self.makeGBufferFragment(library: library, extended: false, plain: plain)
         pdesc.colorAttachments[0].pixelFormat = .rgba16Float
         pdesc.colorAttachments[1].pixelFormat = .rgba16Float
         pdesc.colorAttachments[2].pixelFormat = gbufferEmissionFormat
@@ -235,7 +239,7 @@ extension IlluminatoramaRenderer {
         // No vertex descriptor — the shader reads from a device-buffer of
         // Vertex via [[vertex_id]]. Simpler than wiring a vertex descriptor
         // and matches the Swift/Metal struct mirror more directly.
-        s.gbufferPipeline = try device.makeRenderPipelineState(descriptor: pdesc)
+        let base = try device.makeRenderPipelineState(descriptor: pdesc)
 
         // Issue #65 — second G-buffer pipeline with kUsePrevVerts = true. Reuses
         // the SAME descriptor (identical attachment formats / fragment); only the
@@ -243,10 +247,17 @@ extension IlluminatoramaRenderer {
         let vsPrevConsts = MTLFunctionConstantValues()
         var usePrevVertsTrue = true
         vsPrevConsts.setConstantValue(&usePrevVertsTrue, type: .bool, index: 10)
-        pdesc.label = "Illuminatorama.gbuffer.prevVerts"
+        pdesc.label = plain ? "Illuminatorama.gbuffer.prevVerts.plain" : "Illuminatorama.gbuffer.prevVerts"
         pdesc.vertexFunction = try library.makeFunction(name: "illumi_vs",
                                                         constantValues: vsPrevConsts)
-        s.gbufferPipelinePrevVerts = try device.makeRenderPipelineState(descriptor: pdesc)
+        return (base, try device.makeRenderPipelineState(descriptor: pdesc))
+    }
+
+    /// G-buffer, superquadric-impostor pipelines and the opaque depth state (init order step 1).
+    @MainActor static func buildGBufferPipelines(into s: GBufferState, device: MTLDevice, library: MTLLibrary) throws {
+        let pair = try gbufferPipelinePair(device: device, library: library, plain: false)
+        s.gbufferPipeline = pair.base
+        s.gbufferPipelinePrevVerts = pair.prev
 
         // Perfect analytic superquadric impostor — same G-buffer attachment
         // formats so it renders into the SAME G-buffer pass/encoder (no extra

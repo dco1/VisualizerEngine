@@ -50,7 +50,7 @@ static inline __attribute__((always_inline)) void illumiSurfaceDetail(
     // moiré or low-frequency mottle at any distance. Walls and risers streak vertically (furniture
     // and shoulders), tops streak along x (things dragged across them); a second, shorter set at
     // another angle breaks the parallel look.
-    if (inst.surfaceWear > 0.0f) {
+    if (!kGBufferPlain && inst.surfaceWear > 0.0f) {
         float fw = length(worldPosFwidth);                      // metres per pixel
         float fade = 1.0f - smoothstep(0.0012f, 0.0035f, fw);
         if (fade > 0.0f) {
@@ -105,5 +105,5 @@ static inline __attribute__((always_inline)) void illumiSurfaceDetail(
     // here, on `in.uv`, so it never repeats at the tile period — the wood-knot mechanism, one scale
     // up. `carpetMacro.x == 0` (the default, every other material) makes `sampleCarpetMacro` return
     // 1.0, so this is an exact no-op for every existing scene and surface.
-    albedo *= sampleCarpetMacro(in.uv, inst.carpetMacro);
+    if (!kGBufferPlain) albedo *= sampleCarpetMacro(in.uv, inst.carpetMacro);
 }

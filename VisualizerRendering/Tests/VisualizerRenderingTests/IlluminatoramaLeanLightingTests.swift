@@ -9,7 +9,7 @@ import simd
 @MainActor
 final class IlluminatoramaLeanLightingTests: XCTestCase {
 
-    private func frame(lean: Bool, pointLight: Bool) throws -> IlluminatoramaFrame {
+    private func frame(lean: Bool, pointLight: Bool, plain: Bool = false) throws -> IlluminatoramaFrame {
         let cam = IlluminatoramaCamera(position: SIMD3(0, 1, 4), target: .zero, up: SIMD3(0, 1, 0),
                                        fovYRadians: .pi / 3, aspect: 4.0 / 3.0, zNear: 0.05, zFar: 100)
         let r = try IlluminatoramaRenderer(engine: SimEngine.shared, width: 128, height: 96, camera: cam)
@@ -24,6 +24,7 @@ final class IlluminatoramaLeanLightingTests: XCTestCase {
         r.blockingLightingCompile = true            // the specialised variant, not the uber fallback
         r.leanLightingMaterials = .none
         r.leanLightingEnabled = lean
+        r.plainSurfacesOnly = plain
         if lean { XCTAssertFalse(r.prewarmLeanLighting(addingFeatures: [IlluminatoramaRenderer.leanFeaturePointLights]),
                                  "nothing to prewarm from before a frame") }
         let f = try XCTUnwrap(r.renderHeadless(frames: 3))
@@ -44,6 +45,15 @@ final class IlluminatoramaLeanLightingTests: XCTestCase {
             for i in 0..<uber.bytes.count { worst = max(worst, abs(Int(uber.bytes[i]) - Int(lean.bytes[i]))) }
             XCTAssertLessThanOrEqual(worst, 1, "lean lighting changed pixels (point light: \(point)), worst \(worst)/255")
         }
+    }
+
+    /// The studio rig's boxes are plain vertex-colour materials: the plain-surface G-buffer draws the same frame.
+    func testPlainSurfaceGBufferDrawsTheSameFrame() throws {
+        let uber = try frame(lean: false, pointLight: true)
+        let plain = try frame(lean: false, pointLight: true, plain: true)
+        var worst = 0
+        for i in 0..<uber.bytes.count { worst = max(worst, abs(Int(uber.bytes[i]) - Int(plain.bytes[i]))) }
+        XCTAssertLessThanOrEqual(worst, 1, "plain surfaces changed pixels, worst \(worst)/255")
     }
 
     func testMasksKeepEveryReachableFeature() {

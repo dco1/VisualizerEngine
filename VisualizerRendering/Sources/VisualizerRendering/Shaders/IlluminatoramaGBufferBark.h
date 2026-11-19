@@ -24,7 +24,7 @@ static inline __attribute__((always_inline)) void illumiSurfaceBark(VSOut in, In
     // is an exact no-op for foliage, ground, every prop without a marker, and every
     // other scene. The detail is COMPUTED (the soup has no texture atlas) and is far
     // crisper than the coarse 18-radial trunk mesh could carry.
-    if (inst.normalTextureSlice < 0 && in.worldTangent.w > 1.5) {
+    if (!kGBufferPlain && inst.normalTextureSlice < 0 && in.worldTangent.w > 1.5) {
         float species = in.worldTangent.w;                 // 2/3/4/5
         float ang = atan2(n.z, n.x);                       // sweeps around the trunk
         float3 tang = normalize(cross(n, float3(0.0, 1.0, 0.0)) + float3(1e-4, 0, 0));

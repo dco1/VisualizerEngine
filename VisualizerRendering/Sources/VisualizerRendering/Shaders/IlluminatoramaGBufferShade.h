@@ -82,7 +82,7 @@ static inline GBufferOut illumiGBufferShade(
     // 1.0 = fully open = the exact pre-S2.4 result; every path that doesn't bind a detail
     // slice leaves it at 1.0, and ×1.0 / +0.0 are IEEE no-ops.
     float detailOcc = 1.0;
-    const bool wantsDetailRelief = (inst.detailOcclusionStrength > 0.0 ||
+    const bool wantsDetailRelief = !kGBufferPlain && (inst.detailOcclusionStrength > 0.0 ||
                                     inst.detailRoughnessStrength > 0.0);
     illumiSurfaceNormalMap(in, inst, frame, matUV, duvdx, duvdy, wantsDetailRelief, n, detailOcc,
                            nonColorUVScale, nonColorSliceMean, nonColorAtlas, texSampler);

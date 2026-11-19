@@ -113,6 +113,13 @@ constant bool kInteriorMap [[function_constant(12)]];
 // (IlluminatoramaLeafCutout.h) is discarded. Only meshes flagged `leafCutout` draw with it; the
 // discard costs early depth for those draws alone.
 constant bool kLeafCutout [[function_constant(13)]];
+// PLAIN SURFACES (Munimyni iPhone, 2026-11): the host promises every instance in this draw is a plain
+// vertex-colour material — no texture slices, wood knots, pattern panels, UV warp, leaf veins, hue cycling,
+// wear, carpet, tag glow or detail relief, and no soil / bark / skin vertex tags. Each of those branches is
+// gated on `!kGBufferPlain`, so this variant draws the pixels the uber shader would and compiles the rest
+// out. Undefined (every other pipeline) ⇒ false ⇒ the shader as it always was.
+constant bool kGBufferPlainFC [[function_constant(14)]];
+constant bool kGBufferPlain = is_function_constant_defined(kGBufferPlainFC) && kGBufferPlainFC;
 
 /// Host mirror: `IlluminatoramaInteriorMapping.GPU`. Metres, in the PANE's frame: u along the
 /// mesh tangent (the pane's width), v world-up, w into the room (−normal).
