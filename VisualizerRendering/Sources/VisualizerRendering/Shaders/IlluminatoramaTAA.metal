@@ -342,8 +342,11 @@ kernel void illumi_taa_resolve(
 
     // ── 5-tap Catmull-Rom history sample ─────────────────────────────────────
     constexpr sampler historySampler(filter::linear, address::clamp_to_edge);
-    float3 history = sampleCatmullRom(historyHDR, historySampler,
-                                      historyUV, float2(W, H));
+    // No motion (a still camera over a still surface: most pixels of most frames): the history sample
+    // sits on this texel's centre, where the Catmull-Rom weights are exactly (0, 1, 0, 0) per axis and the
+    // filter returns the texel itself. Read it instead of the nine filtered taps.
+    float3 history = all(vel == 0.0) ? max(float3(0.0), float3(historyHDR.read(gid).rgb))
+                                     : sampleCatmullRom(historyHDR, historySampler, historyUV, float2(W, H));
 
     // ── 3×3 neighborhood statistics in YCoCg ─────────────────────────────────
     float3 currentYCoCg = RGBtoYCoCg(current);
