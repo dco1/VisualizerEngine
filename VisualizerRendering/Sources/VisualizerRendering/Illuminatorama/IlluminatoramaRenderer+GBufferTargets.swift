@@ -268,7 +268,7 @@ extension IlluminatoramaRenderer {
                           format: .rgba16Float, w: internalW, h: internalH,
                           usage: [.renderTarget, .shaderRead])
         let em = try make(label: "Illuminatorama.gbuffer.emission",
-                          format: .rgba16Float, w: internalW, h: internalH,
+                          format: gbufferEmissionFormat, w: internalW, h: internalH,
                           usage: [.renderTarget, .shaderRead])
         let depth = try make(label: "Illuminatorama.depth",
                              format: .depth32Float, w: internalW, h: internalH,
