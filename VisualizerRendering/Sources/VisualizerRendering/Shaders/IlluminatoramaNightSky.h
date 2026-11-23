@@ -808,7 +808,10 @@ static inline float3 nightCelestialsPhysical(float3 rayDir, NightSkyParams p, fl
 /// it sets the star point-spread and the moon's limb anti-aliasing. `background` is the
 /// sky radiance behind this pixel (read by the physical model's washout only).
 static inline float3 nightCelestials(float3 rayDir, NightSkyParams p, float pixAngle, float3 background) {
-    if (p.model > 0.5f) return nightCelestialsPhysical(rayDir, p, pixAngle, background);
+    if (p.model > 0.5f) {
+        if (p.model > 1.5f) rayDir.y = fabs(rayDir.y);   // model 2: the sky folded about the horizon, for a camera looking down
+        return nightCelestialsPhysical(rayDir, p, pixAngle, background);
+    }
     if (p.starBrightness <= 0.0f && p.moonIntensity <= 0.0f) return float3(0.0f);
     if (rayDir.y <= -0.05f) return float3(0.0f);
     return nightStarField(rayDir, p.starBrightness, pixAngle)

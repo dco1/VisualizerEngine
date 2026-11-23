@@ -1596,7 +1596,24 @@ kernel void illumi_lighting(
         // TAA's jittered projection supersamples the sub-pixel star cores.
         // Angular size of one pixel from the projection: tan(fovY/2) = 1/P[1][1].
         float pixAngle = (2.0f / frame.projection[1][1]) / float(h);
-        float3 celestials = nightCelestials(dir, night, pixAngle, sky);
+        float3 celestials;
+        if (night.model > 1.5f) {
+            // Model 2, the toy diorama's sky: an orthographic view sees a sliver of sky, so lay the whole dome across the
+            // screen instead (about 110° wide), turning with the camera's heading, and size a pixel to match.
+            float4 cxw = frame.invViewProjection * float4(1.0, 0.0, 1.0, 1.0);
+            float3 cx = cxw.xyz / cxw.w;
+            float4 c0w = frame.invViewProjection * float4(0.0, 0.0, 1.0, 1.0);
+            float3 c0 = c0w.xyz / c0w.w;
+            float3 R = normalize(cx - c0); R.y = 0.0f; R = normalize(R);
+            float3 U = float3(-R.z, 0.0f, R.x);                 // horizontal, across the screen's vertical
+            float K = 1.4f, aspect = float(w) / float(h);
+            float3 d = R * (ndc.x * K * aspect * 0.5f) + U * (ndc.y * K * 0.5f * 2.0f) + float3(0.0f, 1.0f, 0.0f);
+            float3 dd = normalize(d);
+            pixAngle = 2.0f * K / float(h);
+            celestials = nightCelestials(dd, night, pixAngle, sky);
+        } else {
+            celestials = nightCelestials(dir, night, pixAngle, sky);
+        }
         if (night.model > 0.5f) celestials *= saturate(skySample.a);
         sky += celestials;
         lightingStore(outHDR, half4(half3(sky), 1.0h), gid);

@@ -187,6 +187,9 @@ final class SkyKnobs {
     /// Physical model only — the faintest star drawn (visual magnitude); 0 (default) = no limit
     /// beyond the per-pixel washout. See `VolumetricCloudRenderer.Params.starLimitingMagnitude`.
     var nightSkyStarLimitingMagnitude: Float = 0
+    /// Physical model only — fold the sky about the horizon so a camera looking DOWN (a top-down or isometric diorama
+    /// whose backdrop is the far side of the table) sees the same stars, Milky Way and moon as one looking up. Off by default.
+    var nightSkyMirrored = false
     /// When true AND the three handles below are set, the in-view cloud pass
     /// composites crisp camera-ray clouds into the HDR target (issue #61). OFF
     /// by default → every scene + the dome/IBL path is byte-identical.

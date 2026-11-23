@@ -83,7 +83,7 @@ extension IlluminatoramaRenderer {
         guard nightSkyModel == .physical else { return (.zero, .zero, .zero) }
         let q = nightSkyCelestialOrientation
         let qn = simd_length(q) > 1e-6 ? q / simd_length(q) : SIMD4<Float>(0, 0, 0, 1)
-        return (SIMD4(1, max(0, nightSkyMoonHalo), max(0, nightSkyEarthshine), max(0, nightSkyMilkyWay)),
+        return (SIMD4(nightSkyMirrored ? 2 : 1, max(0, nightSkyMoonHalo), max(0, nightSkyEarthshine), max(0, nightSkyMilkyWay)),
                 SIMD4(max(0, nightSkyTwinkle), max(0, nightSkyRadiance), time, max(0, nightSkyStarLimitingMagnitude)),
                 qn)
     }

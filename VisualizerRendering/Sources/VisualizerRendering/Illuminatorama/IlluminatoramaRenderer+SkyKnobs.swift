@@ -49,6 +49,7 @@ extension IlluminatoramaRenderer {
     public var nightSkySunDirection: SIMD3<Float> { get { kSky.nightSkySunDirection } set { kSky.nightSkySunDirection = newValue } _modify { yield &kSky.nightSkySunDirection } }
     public var nightSkyMoonAngularRadius: Float { get { kSky.nightSkyMoonAngularRadius } set { kSky.nightSkyMoonAngularRadius = newValue } _modify { yield &kSky.nightSkyMoonAngularRadius } }
     public var nightSkyModel: VolumetricCloudRenderer.Params.NightSkyModel { get { kSky.nightSkyModel } set { kSky.nightSkyModel = newValue } _modify { yield &kSky.nightSkyModel } }
+    public var nightSkyMirrored: Bool { get { kSky.nightSkyMirrored } set { kSky.nightSkyMirrored = newValue } _modify { yield &kSky.nightSkyMirrored } }
     public var nightSkyMoonHalo: Float { get { kSky.nightSkyMoonHalo } set { kSky.nightSkyMoonHalo = newValue } _modify { yield &kSky.nightSkyMoonHalo } }
     public var nightSkyEarthshine: Float { get { kSky.nightSkyEarthshine } set { kSky.nightSkyEarthshine = newValue } _modify { yield &kSky.nightSkyEarthshine } }
     public var nightSkyMilkyWay: Float { get { kSky.nightSkyMilkyWay } set { kSky.nightSkyMilkyWay = newValue } _modify { yield &kSky.nightSkyMilkyWay } }
