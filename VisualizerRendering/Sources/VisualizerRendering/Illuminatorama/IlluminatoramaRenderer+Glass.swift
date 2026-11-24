@@ -467,7 +467,7 @@ extension IlluminatoramaRenderer {
         // carried the whole star field. All-zero (any non-night host) ⇒ shader no-op.
         u.nightSkyParams = SIMD4(max(0, nightSkyStarBrightness),
                                  max(0, nightSkyMoonIntensity),
-                                 max(0, nightSkyMoonAngularRadius), 0)
+                                 max(0, nightSkyMoonAngularRadius), nightSkyAllDirections ? 1 : 0)
         u.nightMoonDir = SIMD4(nightSkyMoonDirection == .zero
                                ? SIMD3<Float>(0, 1, 0) : simd_normalize(nightSkyMoonDirection), 0)
         u.nightSunDir = SIMD4(nightSkySunDirection == .zero

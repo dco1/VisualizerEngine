@@ -400,7 +400,7 @@ extension IlluminatoramaRenderer {
         // exact no-op; hosts fade the brightnesses with nightBlend themselves.
         u.nightSkyParams = SIMD4(max(0, nightSkyStarBrightness),
                                  max(0, nightSkyMoonIntensity),
-                                 max(0, nightSkyMoonAngularRadius), 0)
+                                 max(0, nightSkyMoonAngularRadius), nightSkyAllDirections ? 1 : 0)
         let moonDirSafe = nightSkyMoonDirection == .zero
             ? SIMD3<Float>(0, 1, 0) : simd_normalize(nightSkyMoonDirection)
         let sunDirSafe = nightSkySunDirection == .zero

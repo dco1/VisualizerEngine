@@ -213,6 +213,7 @@ static inline NightSkyParams glassNightSky(constant GlassRTUniforms& u) {
     p.starBrightness = u.nightSkyParams.x;
     p.moonIntensity  = u.nightSkyParams.y;
     p.moonAngRadius  = u.nightSkyParams.z;
+    p.allSky         = u.nightSkyParams.w;
     p.moonDir        = u.nightMoonDir.xyz;
     p.toSun          = u.nightSunDir.xyz;
     p.model          = u.nightSkyExtra.x;

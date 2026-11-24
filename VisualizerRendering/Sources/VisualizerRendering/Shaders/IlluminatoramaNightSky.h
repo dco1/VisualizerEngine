@@ -85,6 +85,7 @@ struct NightSkyParams {
     float  radiance;       // scene radiance of a magnitude-0 flux over 1 sr
     float4 celestial;      // world → equatorial quaternion (xyz imaginary, w real); 0 ⇒ identity
     float  limitMag;       // physical: stars fainter than this are not drawn (0 ⇒ no limit)
+    float  allSky;         // 1 = draw the stars and Milky Way in EVERY direction (a scene in space has no ground to hide them); 0 = above the horizon only
 };
 
 /// Zeroed params — the exact no-op every non-night scene gets.
@@ -94,7 +95,7 @@ static inline NightSkyParams nightSkyOff() {
     p.starBrightness = 0; p.moonIntensity = 0; p.moonAngRadius = 0;
     p.model = 0; p.moonHalo = 0; p.earthshine = 0; p.milkyWay = 0;
     p.twinkle = 0; p.clock = 0; p.radiance = 0; p.celestial = float4(0);
-    p.limitMag = 0;
+    p.limitMag = 0; p.allSky = 0;
     return p;
 }
 
@@ -765,7 +766,9 @@ static inline float3 nightMoonHalo(float3 rayDir, NightSkyParams p) {
 /// `background` is the sky radiance behind the celestials (atmosphere + clouds) — the
 /// washout reference.
 static inline float3 nightCelestialsPhysical(float3 rayDir, NightSkyParams p, float pixAngle, float3 background) {
-    if (rayDir.y <= 0.0f) return float3(0.0f);
+    if (rayDir.y <= 0.0f && p.allSky < 0.5f) return float3(0.0f);
+    // In space there is no horizon to be near: the air's extinction is read as if the ray were well up.
+    const float elev = p.allSky > 0.5f ? max(abs(rayDir.y), 0.6f) : rayDir.y;
     float3 halo = nightMoonHalo(rayDir, p);
     float4 moon = float4(0.0f);
     if (p.moonIntensity > 0.0f) {
@@ -777,14 +780,14 @@ static inline float3 nightCelestialsPhysical(float3 rayDir, NightSkyParams p, fl
         float3 dEq = nightQuatRotate(p.celestial, rayDir);
         float bgLum = dot(max(background, 0.0f) + halo, kNightLuma);
         if (p.starBrightness > 0.0f)
-            behind += nightStarsPhysical(dEq, rayDir.y, pixAngle, p.radiance * p.starBrightness,
+            behind += nightStarsPhysical(dEq, elev, pixAngle, p.radiance * p.starBrightness,
                                          bgLum, p.twinkle, p.clock, p.limitMag);
         if (p.milkyWay > 0.0f) {
             // Visibility from the PHYSICAL band against the sky behind it (a gibbous moon's sky
             // is ~5× the Milky Way's brightest clouds — it vanishes, as it does outdoors); the
             // host gain is then a PERCEPTUAL lift: the dark-adapted eye sees the band by
             // summing over degrees, which a pixel does not.
-            float3 ext = nightExtinction(rayDir.y);
+            float3 ext = nightExtinction(elev);
             if (nightMilkyWayBound(dEq) * p.radiance * max(ext.r, ext.g) > 0.05f * bgLum) {
                 float3 mw = nightMilkyWay(dEq) * p.radiance * ext;
                 float vis = smoothstep(0.05f, 0.8f, dot(mw, kNightLuma) / max(bgLum, 1e-9f));
@@ -813,7 +816,7 @@ static inline float3 nightCelestials(float3 rayDir, NightSkyParams p, float pixA
         return nightCelestialsPhysical(rayDir, p, pixAngle, background);
     }
     if (p.starBrightness <= 0.0f && p.moonIntensity <= 0.0f) return float3(0.0f);
-    if (rayDir.y <= -0.05f) return float3(0.0f);
+    if (rayDir.y <= -0.05f && p.allSky < 0.5f) return float3(0.0f);
     return nightStarField(rayDir, p.starBrightness, pixAngle)
          + nightMoonDisk(rayDir, normalize(p.moonDir), p.toSun,
                          p.moonAngRadius, p.moonIntensity, pixAngle);

@@ -151,6 +151,9 @@ final class SkyKnobs {
     /// Fade both brightness values with `VolumetricCloudRenderer.nightBlend(sunDir:)`
     /// so the analytic sky and the dome share ONE day/night ramp.
     var nightSkyStarBrightness: Float = 0
+    /// Draw the stars (and, in the physical model, the Milky Way) in EVERY direction, below the horizon too: for a scene in space, with no ground
+    /// to hide them. Default false: stars above the horizon only, byte-identical for every existing host.
+    var nightSkyAllDirections = false
     /// Moon disk brightness (HDR). 0 = no moon. ~1.5–3 reads as a luminous moon
     /// that blooms gently at night exposure.
     var nightSkyMoonIntensity: Float = 0

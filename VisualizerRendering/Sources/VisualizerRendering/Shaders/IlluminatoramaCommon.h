@@ -1304,6 +1304,7 @@ static inline NightSkyParams frameNightSky(constant FrameUniforms& f) {
     p.clock          = f.nightSkyExtra2.z;
     p.celestial      = f.nightCelestial;
     p.limitMag       = f.nightSkyExtra2.w;
+    p.allSky         = f.nightSkyParams.w;
     return p;
 }
 

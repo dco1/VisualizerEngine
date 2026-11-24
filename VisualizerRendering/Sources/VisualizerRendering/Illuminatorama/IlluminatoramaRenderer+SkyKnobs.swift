@@ -44,6 +44,7 @@ extension IlluminatoramaRenderer {
     public var volSpotBeamSpotLimit: Int { get { kSky.volSpotBeamSpotLimit } set { kSky.volSpotBeamSpotLimit = newValue } _modify { yield &kSky.volSpotBeamSpotLimit } }
     public var volEmissiveColumn: EmissiveColumn? { get { kSky.volEmissiveColumn } set { kSky.volEmissiveColumn = newValue } _modify { yield &kSky.volEmissiveColumn } }
     public var nightSkyStarBrightness: Float { get { kSky.nightSkyStarBrightness } set { kSky.nightSkyStarBrightness = newValue } _modify { yield &kSky.nightSkyStarBrightness } }
+    public var nightSkyAllDirections: Bool { get { kSky.nightSkyAllDirections } set { kSky.nightSkyAllDirections = newValue } _modify { yield &kSky.nightSkyAllDirections } }
     public var nightSkyMoonIntensity: Float { get { kSky.nightSkyMoonIntensity } set { kSky.nightSkyMoonIntensity = newValue } _modify { yield &kSky.nightSkyMoonIntensity } }
     public var nightSkyMoonDirection: SIMD3<Float> { get { kSky.nightSkyMoonDirection } set { kSky.nightSkyMoonDirection = newValue } _modify { yield &kSky.nightSkyMoonDirection } }
     public var nightSkySunDirection: SIMD3<Float> { get { kSky.nightSkySunDirection } set { kSky.nightSkySunDirection = newValue } _modify { yield &kSky.nightSkySunDirection } }
