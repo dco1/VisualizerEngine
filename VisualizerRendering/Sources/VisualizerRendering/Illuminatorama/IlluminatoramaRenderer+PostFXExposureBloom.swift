@@ -78,7 +78,31 @@ extension IlluminatoramaRenderer {
     /// (a frame too small for a second mip), where the prefilter output is the
     /// whole effect.
     var bloomResultTexture: MTLTexture {
-        pfx.bloomUpChain.first ?? pfx.bloomDownChain[0]
+        if bloomSkipped, let black = pfx.bloomOffTexture { return black }
+        return pfx.bloomUpChain.first ?? pfx.bloomDownChain[0]
+    }
+
+    /// Bloom off: `bloomIntensity` 0 and no physical glare. The tonemap multiplies the pyramid by 0 then (and reads its alpha only
+    /// under glare), so the whole chain is skipped — prefilter, down and up, ~7% of a phone frame — and the tonemap samples a 1×1
+    /// black texel instead of the pyramid's stale contents (uninitialised before a first bloom frame: 0 × NaN is NaN).
+    var bloomSkipped: Bool { bloomIntensity <= 0 && lastBloomGlareFit == nil }
+
+    /// The black texel, made once and zeroed by a blit on this frame's command buffer (ahead of the tonemap that reads it).
+    private func ensureBloomOffTexture(_ cb: MTLCommandBuffer) -> Bool {
+        if pfx.bloomOffTexture != nil { return true }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba16Float, width: 1, height: 1, mipmapped: false)
+        d.usage = [.shaderRead]; d.storageMode = .private
+        guard let t = device.makeTexture(descriptor: d),
+              let zero = device.makeBuffer(length: 8, options: .storageModeShared),
+              let blit = cb.makeBlitCommandEncoder() else { return false }
+        memset(zero.contents(), 0, 8)
+        t.label = "Illuminatorama.bloom.off"
+        blit.copy(from: zero, sourceOffset: 0, sourceBytesPerRow: 8, sourceBytesPerImage: 8,
+                  sourceSize: MTLSize(width: 1, height: 1, depth: 1), to: t, destinationSlice: 0, destinationLevel: 0,
+                  destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding()
+        pfx.bloomOffTexture = t
+        return true
     }
 
     /// The Karis / Call-of-Duty dual-filter pyramid (S1.2): prefilter the HDR to
@@ -90,6 +114,7 @@ extension IlluminatoramaRenderer {
     /// dispatch encoder, so Metal inserts the level-to-level barriers itself —
     /// each dispatch reads a resource the previous one wrote.
     func encodeBloomPasses(_ cb: MTLCommandBuffer) {
+        if bloomSkipped, ensureBloomOffTexture(cb) { return }      // off: nothing to blur (falls through only if the texel can't be made)
         guard let enc = timedComputeEncoder(cb, "bloom") else { return }
         enc.label = "Illuminatorama.bloom"
         enc.setBuffer(frameUniformBuffer, offset: 0, index: 0)

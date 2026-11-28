@@ -85,6 +85,8 @@ final class PostFXState {
     /// `bloomUpChain[0]` (== internal/2) is what the tonemap samples.
     var bloomDownChain: [MTLTexture]!
     var bloomUpChain: [MTLTexture]!
+    /// A 1×1 black texel the tonemap samples while bloom is off (`bloomSkipped`); made and zeroed on the first such frame.
+    var bloomOffTexture: MTLTexture?
     // Halation runs at HALF the internal resolution — the halo's tight orange core is a
     // few output pixels wide, which a quarter-res grid cannot carry.
     var halationBright: MTLTexture!
